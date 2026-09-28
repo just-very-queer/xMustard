@@ -173,11 +173,11 @@ func TestMigrationUpgradesV1FileToRunOutcomes(t *testing.T) {
 	}
 	defer s.Close()
 	info, err := s.SchemaInfo(ctx)
-	if err != nil || info.Version != 2 {
+	if err != nil || info.Version != LatestSchemaVersion() {
 		t.Fatalf("schema after upgrade = %+v, %v", info, err)
 	}
-	if n := countRows(t, s, "SELECT count(*) FROM schema_migrations"); n != 2 {
-		t.Fatalf("migration rows = %d, want 2", n)
+	if n := countRows(t, s, "SELECT count(*) FROM schema_migrations"); n != len(all) {
+		t.Fatalf("migration rows = %d, want %d", n, len(all))
 	}
 	if fb, _ := s.GetFeedback(ctx, "ws1", []string{"a.go"}); fb["a.go"].RunFail != 1 {
 		t.Fatalf("v1 data lost in the upgrade: %+v", fb)

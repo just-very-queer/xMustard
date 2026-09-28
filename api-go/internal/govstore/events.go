@@ -55,6 +55,9 @@ const (
 	// name no entry, and they enforce nothing: branch protection does.
 	EventMergeApproval        = "merge_approval"
 	EventMergeApprovalRevoked = "merge_approval_revoked"
+	// EventCorroborate records a principal restating a served memory instead of adding
+	// a duplicate (WS-27): its first restatement, or one citing new evidence.
+	EventCorroborate = "corroborate"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
@@ -62,7 +65,7 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
 	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
-	EventMergeApproval, EventMergeApprovalRevoked)
+	EventMergeApproval, EventMergeApprovalRevoked, EventCorroborate)
 
 // Event is one immutable history record.
 type Event struct {

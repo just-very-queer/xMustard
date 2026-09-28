@@ -194,6 +194,7 @@ type Reader interface {
 	EvidenceReader
 	SearchReader
 	RankingReader
+	DedupeReader
 }
 
 // Tx is a write transaction: every read plus every write. Methods are valid only
@@ -213,6 +214,7 @@ type Tx interface {
 	JobWriter
 	FeedbackWriter
 	EvidenceWriter
+	DedupeWriter
 }
 
 // Store is the governance store.

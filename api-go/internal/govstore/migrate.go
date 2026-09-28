@@ -18,6 +18,9 @@ var schemaV1 string
 //go:embed schema_v2_run_outcomes.sql
 var schemaV2RunOutcomes string
 
+//go:embed schema_v4_dedupe.sql
+var schemaV4Dedupe string
+
 // migration is one forward-only schema step. Migrations are append-only: an applied
 // migration's SQL may never change, which Open verifies through its checksum. Later
 // workstreams add a step here (for example 0002) and keep every earlier one.
@@ -30,6 +33,8 @@ type migration struct {
 var migrations = []migration{
 	{version: 1, name: "governance store v1", sql: schemaV1},
 	{version: 2, name: "run-independent outcomes", sql: schemaV2RunOutcomes},
+	// 4, not 3: WS-66 adds migration 3 in parallel; versions need not be contiguous.
+	{version: 4, name: "dedupe postings, corroborations and quotas", sql: schemaV4Dedupe},
 }
 
 // applicationID marks the file as a govstore database ("xGOV" in ASCII).

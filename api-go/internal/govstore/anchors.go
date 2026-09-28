@@ -16,10 +16,12 @@ const (
 	AnchorConfig     = "config"
 	AnchorErrorCode  = "error_code"
 	AnchorURL        = "url"
+	// AnchorCode is quoted code placed on lines of a file: "path#Lstart-Lend" (WS-27).
+	AnchorCode = "code"
 )
 
 var validAnchorKinds = set(AnchorPath, AnchorSymbol, AnchorIdentifier, AnchorCommand, AnchorEnv, AnchorConfig,
-	AnchorErrorCode, AnchorURL)
+	AnchorErrorCode, AnchorURL, AnchorCode)
 
 // Baseline states: a hash, or the path was missing when the baseline was taken (so its
 // later appearance is drift too).
@@ -34,6 +36,9 @@ type AnchorInput struct {
 	Kind      string
 	Value     string
 	SymbolUID string // resolved against the code index, when known
+	// Extracted: found in the memory's text rather than declared by its author. An
+	// extracted anchor feeds the inverted index but is not one of the entry's paths.
+	Extracted bool
 }
 
 // Anchor is a stored anchor with its drift baseline.
@@ -74,6 +79,8 @@ type AnchorQuery struct {
 	Kind        string
 	Values      []string
 	ServedOnly  bool
+	// NewestFirst orders hits by the newest entry instead of by value.
+	NewestFirst bool
 	Limit       int
 }
 
@@ -83,6 +90,7 @@ type AnchorHit struct {
 	EntryID       string `json:"entry_id"`
 	Kind          string `json:"kind"`
 	Value         string `json:"value"`
+	Declared      bool   `json:"declared"`
 	BaselineState string `json:"baseline_state"`
 	StaleSince    string `json:"stale_since,omitempty"`
 	Fanout        int    `json:"fanout"`
@@ -94,6 +102,9 @@ type AnchorReader interface {
 	// AnchorsFor returns ListAnchors for many entries at once, keyed by entry id.
 	AnchorsFor(ctx context.Context, ids []string) (map[string][]Anchor, error)
 	EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHit, error)
+	// AnchorFanout counts, per value of one anchor kind, the workspace's active entries
+	// holding it.
+	AnchorFanout(ctx context.Context, workspaceID, kind string, values []string) (map[string]int, error)
 }
 
 // AnchorWriter writes anchors, baselines and drift observations.
@@ -157,7 +168,7 @@ func (t *txn) insertAnchors(ctx context.Context, entryID string, paths []string,
 		}
 		seen[ref] = true
 		if _, err := t.exec(ctx, `INSERT INTO anchors (entry_id, ordinal, kind, value, declared, symbol_uid)
-			VALUES (?, ?, ?, ?, 1, ?)`, entryID, ordinal, a.Kind, a.Value, a.SymbolUID); err != nil {
+			VALUES (?, ?, ?, ?, ?, ?)`, entryID, ordinal, a.Kind, a.Value, boolInt(!a.Extracted), a.SymbolUID); err != nil {
 			return "", err
 		}
 		ordinal++
@@ -254,11 +265,15 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 		args = append(args, r.nowText())
 	}
 	args = append(args, clampLimit(q.Limit))
-	rows, err := r.query(ctx, `SELECT a.entry_id, a.kind, a.value, a.baseline_state, coalesce(a.stale_since, ''),
+	order := "a.value, e.pk"
+	if q.NewestFirst {
+		order = "e.pk DESC, a.value"
+	}
+	rows, err := r.query(ctx, `SELECT a.entry_id, a.kind, a.value, a.declared, a.baseline_state, coalesce(a.stale_since, ''),
 		count(*) OVER (PARTITION BY a.kind, a.value)
 		FROM anchors a JOIN entries e ON e.id = a.entry_id
 		WHERE a.kind = ? AND a.value IN (`+placeholders(len(q.Values))+`) AND e.workspace_id = ?`+served+`
-		ORDER BY a.value, e.pk LIMIT ?`, args...)
+		ORDER BY `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -266,12 +281,39 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 	var out []AnchorHit
 	for rows.Next() {
 		var h AnchorHit
-		if err := rows.Scan(&h.EntryID, &h.Kind, &h.Value, &h.BaselineState, &h.StaleSince, &h.Fanout); err != nil {
+		if err := rows.Scan(&h.EntryID, &h.Kind, &h.Value, &h.Declared, &h.BaselineState, &h.StaleSince, &h.Fanout); err != nil {
 			return nil, err
 		}
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// AnchorFanout counts the active entries holding each value.
+func (r *reader) AnchorFanout(ctx context.Context, workspaceID, kind string, values []string) (map[string]int, error) {
+	if err := validID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	out := map[string]int{}
+	for start := 0; start < len(values); start += maxInArgs {
+		chunk := values[start:min(start+maxInArgs, len(values))]
+		args := []any{kind}
+		for _, v := range chunk {
+			args = append(args, v)
+		}
+		rows, err := r.query(ctx, `SELECT a.value, count(*) FROM anchors a JOIN entries e ON e.id = a.entry_id
+			WHERE a.kind = ? AND a.value IN (`+placeholders(len(chunk))+`) AND e.workspace_id = ? AND e.lifecycle = 'active'
+			GROUP BY a.value`, append(args, workspaceID)...)
+		if err != nil {
+			return nil, err
+		}
+		var v string
+		var n int
+		if err := eachRow(rows, func() { out[v] = n }, func() error { return rows.Scan(&v, &n) }); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
 }
 
 func (t *txn) liveEntry(ctx context.Context, id string) (Entry, error) {
