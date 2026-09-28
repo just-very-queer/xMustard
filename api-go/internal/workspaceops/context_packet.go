@@ -4,6 +4,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1633,427 +1634,329 @@ func buildIssueContextPrompt(
 	repoConfig *RepoConfigRecord,
 	matchedPathInstructions []RepoPathInstructionMatch,
 ) string {
-	evidenceLines := make([]string, 0, min(len(issue.Evidence)+len(issue.VerificationEvidence), 16))
-	for _, evidence := range append(append([]evidenceRef{}, issue.Evidence[:min(len(issue.Evidence), 8)]...), issue.VerificationEvidence[:min(len(issue.VerificationEvidence), 8)]...) {
-		ref := evidence.Path
-		if evidence.Line != nil {
-			ref += fmt.Sprintf(":%d", *evidence.Line)
-		}
-		evidenceLines = append(evidenceLines, "- "+ref)
-	}
-	if len(evidenceLines) == 0 {
-		evidenceLines = append(evidenceLines, "- None listed.")
-	}
-
-	focusLines := "- Inspect the workspace tree around the bug."
-	if len(treeFocus) > 0 {
-		items := make([]string, 0, min(len(treeFocus), 12))
-		for _, path := range treeFocus[:min(len(treeFocus), 12)] {
-			items = append(items, "- "+path)
-		}
-		focusLines = strings.Join(items, "\n")
-	}
-
-	fixLines := []string{}
-	for _, fix := range recentFixes[:min(len(recentFixes), 4)] {
-		actorLabel := fix.Actor.Label
-		if actorLabel == "" {
-			actorLabel = fix.Actor.Name
-		}
-		changed := "no files recorded"
-		if len(fix.ChangedFiles) > 0 {
-			changed = strings.Join(fix.ChangedFiles[:min(len(fix.ChangedFiles), 4)], ", ")
-		}
-		fixLines = append(fixLines, "- "+fix.FixID+" ["+fix.Status+"] by "+actorLabel+": "+fix.Summary+" ("+changed+")")
-	}
-	if len(fixLines) == 0 {
-		fixLines = append(fixLines, "- No prior fixes recorded.")
-	}
-
-	historyLines := []string{}
-	for _, entry := range recentActivity[:min(len(recentActivity), 6)] {
-		beforeAfter, ok := entry.Details["before_after"].(map[string]any)
-		if ok && len(beforeAfter) > 0 {
-			keys := make([]string, 0, len(beforeAfter))
-			for field := range beforeAfter {
-				keys = append(keys, field)
-			}
-			slices.Sort(keys)
-			fragments := make([]string, 0, len(keys))
-			for _, field := range keys {
-				diff, ok := beforeAfter[field].(map[string]any)
-				if ok {
-					fragments = append(fragments, field+" "+toText(diff["from"])+" -> "+toText(diff["to"]))
-				} else {
-					fragments = append(fragments, field+" "+toText(beforeAfter[field]))
-				}
-			}
-			historyLines = append(historyLines, "- "+entry.CreatedAt+": "+strings.Join(fragments, ", "))
-			continue
-		}
-		historyLines = append(historyLines, "- "+entry.CreatedAt+": "+entry.Summary)
-	}
-	if len(historyLines) == 0 {
-		historyLines = append(historyLines, "- No recent issue history.")
-	}
-
-	guidanceLines := []string{}
-	for _, item := range guidance[:min(len(guidance), replayGuidanceLimit)] {
-		mode := "optional"
-		if item.AlwaysOn {
-			mode = "always-on"
-		}
-		guidanceLines = append(guidanceLines, "- "+item.Path+" ["+item.Kind+", "+mode+"]: "+fallbackString(item.Summary, item.Title))
-	}
-	if len(guidanceLines) == 0 {
-		guidanceLines = append(guidanceLines, "- No repository guidance files were found.")
-	}
-
-	verificationLines := []string{}
-	for _, profile := range verificationProfiles[:min(len(verificationProfiles), 4)] {
-		coverageBits := []string{}
-		if profile.CoverageCommand != nil && strings.TrimSpace(*profile.CoverageCommand) != "" {
-			coverageBits = append(coverageBits, "coverage command: "+*profile.CoverageCommand)
-		}
-		if profile.CoverageReportPath != nil && strings.TrimSpace(*profile.CoverageReportPath) != "" {
-			coverageBits = append(coverageBits, "report: "+*profile.CoverageReportPath)
-		}
-		if profile.CoverageFormat != "" && profile.CoverageFormat != "unknown" {
-			coverageBits = append(coverageBits, "format: "+profile.CoverageFormat)
-		}
-		coverageSummary := ""
-		if len(coverageBits) > 0 {
-			coverageSummary = " (" + strings.Join(coverageBits, "; ") + ")"
-		}
-		verificationLines = append(verificationLines, "- "+profile.Name+": "+profile.TestCommand+coverageSummary)
-	}
-	if len(verificationLines) == 0 {
-		verificationLines = append(verificationLines, "- No verification profiles configured yet.")
-	}
-
-	ticketLines := []string{}
-	for _, item := range ticketContexts[:min(len(ticketContexts), 4)] {
-		headerBits := []string{item.Provider}
-		if item.ExternalID != nil && strings.TrimSpace(*item.ExternalID) != "" {
-			headerBits = append(headerBits, *item.ExternalID)
-		}
-		if item.Status != nil && strings.TrimSpace(*item.Status) != "" {
-			headerBits = append(headerBits, *item.Status)
-		}
-		criteria := "No acceptance criteria recorded."
-		if len(item.AcceptanceCriteria) > 0 {
-			criteria = strings.Join(item.AcceptanceCriteria[:min(len(item.AcceptanceCriteria), 3)], "; ")
-		}
-		summary := item.Summary
-		if strings.TrimSpace(summary) == "" {
-			summary = "No summary."
-		}
-		ticketLines = append(ticketLines, "- "+item.Title+" ["+strings.Join(headerBits, " / ")+"]: "+summary+" Acceptance criteria: "+criteria)
-	}
-	if len(ticketLines) == 0 {
-		ticketLines = append(ticketLines, "- No linked ticket context recorded.")
-	}
-
-	threatLines := []string{}
-	for _, item := range threatModels[:min(len(threatModels), 3)] {
-		assets := "No assets listed."
-		if len(item.Assets) > 0 {
-			assets = strings.Join(item.Assets[:min(len(item.Assets), 3)], ", ")
-		}
-		abuseCases := "No abuse cases listed."
-		if len(item.AbuseCases) > 0 {
-			abuseCases = strings.Join(item.AbuseCases[:min(len(item.AbuseCases), 2)], "; ")
-		}
-		mitigations := "No mitigations listed."
-		if len(item.Mitigations) > 0 {
-			mitigations = strings.Join(item.Mitigations[:min(len(item.Mitigations), 2)], "; ")
-		}
-		summary := item.Summary
-		if strings.TrimSpace(summary) == "" {
-			summary = "No summary."
-		}
-		threatLines = append(threatLines, "- "+item.Title+" ["+item.Methodology+" / "+item.Status+"]: "+summary+" Assets: "+assets+". Abuse cases: "+abuseCases+". Mitigations: "+mitigations)
-	}
-	if len(threatLines) == 0 {
-		threatLines = append(threatLines, "- No threat model recorded yet.")
-	}
-
-	vulnerabilityLines := []string{}
-	threatModelLookup := map[string]string{}
+	evidence := append(append([]evidenceRef{}, issue.Evidence[:min(len(issue.Evidence), 8)]...), issue.VerificationEvidence[:min(len(issue.VerificationEvidence), 8)]...)
+	threatTitles := map[string]string{}
 	for _, item := range threatModels {
-		threatModelLookup[item.ThreatModelID] = item.Title
+		threatTitles[item.ThreatModelID] = item.Title
 	}
-	for _, item := range vulnerabilityFindings[:min(len(vulnerabilityFindings), 4)] {
-		location := "No file location recorded."
-		if item.LocationPath != nil && strings.TrimSpace(*item.LocationPath) != "" {
-			location = *item.LocationPath
-		}
-		if item.LocationLine != nil {
-			location += fmt.Sprintf(":%d", *item.LocationLine)
-		}
-		ruleBits := []string{}
-		if item.RuleID != nil && strings.TrimSpace(*item.RuleID) != "" {
-			ruleBits = append(ruleBits, *item.RuleID)
-		}
-		if len(item.CWEIDs) > 0 {
-			ruleBits = append(ruleBits, strings.Join(item.CWEIDs[:min(len(item.CWEIDs), 3)], ", "))
-		}
-		if len(item.CVEIDs) > 0 {
-			ruleBits = append(ruleBits, strings.Join(item.CVEIDs[:min(len(item.CVEIDs), 2)], ", "))
-		}
-		ruleSummary := "No rule or taxonomy ids recorded."
-		if len(ruleBits) > 0 {
-			ruleSummary = strings.Join(ruleBits, " | ")
-		}
-		evidenceSummary := "No scanner evidence recorded."
-		if len(item.Evidence) > 0 {
-			evidenceSummary = strings.Join(item.Evidence[:min(len(item.Evidence), 2)], "; ")
-		}
-		linked := []string{}
-		for _, threatModelID := range item.ThreatModelIDs {
-			if title, ok := threatModelLookup[threatModelID]; ok {
-				linked = append(linked, title)
-			}
-		}
-		linkageSummary := ""
-		if len(linked) > 0 {
-			linkageSummary = " Linked threat models: " + strings.Join(linked, ", ") + "."
-		}
-		summary := item.Summary
-		if strings.TrimSpace(summary) == "" {
-			summary = "No summary."
-		}
-		vulnerabilityLines = append(vulnerabilityLines, "- "+item.Title+" ["+item.Scanner+" / "+item.Source+" / "+item.Severity+" / "+item.Status+"]: "+summary+" Location: "+location+". IDs: "+ruleSummary+". Evidence: "+evidenceSummary+"."+linkageSummary)
-	}
-	if len(vulnerabilityLines) == 0 {
-		vulnerabilityLines = append(vulnerabilityLines, "- No vulnerability findings recorded yet.")
-	}
-
-	browserLines := []string{}
-	for _, item := range browserDumps[:min(len(browserDumps), 3)] {
-		pageBits := []string{}
-		if item.PageTitle != nil && strings.TrimSpace(*item.PageTitle) != "" {
-			pageBits = append(pageBits, *item.PageTitle)
-		}
-		if item.PageURL != nil && strings.TrimSpace(*item.PageURL) != "" {
-			pageBits = append(pageBits, *item.PageURL)
-		}
-		pageSummary := "No page metadata recorded."
-		if len(pageBits) > 0 {
-			pageSummary = strings.Join(pageBits, " — ")
-		}
-		consoleExcerpt := "No console messages recorded."
-		if len(item.ConsoleMessages) > 0 {
-			consoleExcerpt = strings.Join(item.ConsoleMessages[:min(len(item.ConsoleMessages), 2)], "; ")
-		}
-		networkExcerpt := "No network requests recorded."
-		if len(item.NetworkRequests) > 0 {
-			networkExcerpt = strings.Join(item.NetworkRequests[:min(len(item.NetworkRequests), 2)], "; ")
-		}
-		domExcerpt := "No DOM snapshot recorded."
-		if strings.TrimSpace(item.DOMSnapshot) != "" {
-			domExcerpt = strings.TrimSpace(strings.ReplaceAll(item.DOMSnapshot[:min(len(item.DOMSnapshot), 220)], "\n", " "))
-		}
-		summary := item.Summary
-		if strings.TrimSpace(summary) == "" {
-			summary = pageSummary
-		}
-		browserLines = append(browserLines, "- "+item.Label+" ["+item.Source+"]: "+summary+". Page: "+pageSummary+". Console: "+consoleExcerpt+". Network: "+networkExcerpt+". DOM: "+domExcerpt)
-	}
-	if len(browserLines) == 0 {
-		browserLines = append(browserLines, "- No browser dumps recorded yet.")
-	}
-
-	repoConfigLines := []string{}
-	if repoConfig != nil {
-		if strings.TrimSpace(repoConfig.Description) != "" {
-			repoConfigLines = append(repoConfigLines, "- Description: "+repoConfig.Description)
-		}
-		if len(repoConfig.CodeGuidelines) > 0 {
-			repoConfigLines = append(repoConfigLines, "- Code guidelines: "+strings.Join(repoConfig.CodeGuidelines[:min(len(repoConfig.CodeGuidelines), 6)], ", "))
-		}
-		if len(repoConfig.PathFilters) > 0 {
-			repoConfigLines = append(repoConfigLines, "- Path filters: "+strings.Join(repoConfig.PathFilters[:min(len(repoConfig.PathFilters), 6)], ", "))
-		}
-		for _, item := range repoConfig.MCPServers[:min(len(repoConfig.MCPServers), 3)] {
-			detail := firstNonEmptyRepoConfig(item.Description, item.Usage, "Configured MCP context source.")
-			repoConfigLines = append(repoConfigLines, "- MCP "+item.Name+": "+detail)
-		}
-	}
-	if len(repoConfigLines) == 0 {
-		repoConfigLines = append(repoConfigLines, "- No .xmustard config loaded.")
-	}
-
-	repoDirLines := []string{}
+	var topDirs []rustcore.RepoMapDirectoryRecord
 	if repoMap != nil {
-		for _, item := range repoMap.TopDirectories[:min(len(repoMap.TopDirectories), 5)] {
-			repoDirLines = append(repoDirLines, "- "+item.Path+": "+toText(item.SourceFileCount)+" source files, "+toText(item.TestFileCount)+" test files")
-		}
+		topDirs = repoMap.TopDirectories
 	}
-	if len(repoDirLines) == 0 {
-		repoDirLines = append(repoDirLines, "- No repo map available.")
-	}
-
-	relatedLines := "- No related paths ranked yet."
-	if len(relatedPaths) > 0 {
-		items := make([]string, 0, min(len(relatedPaths), 8))
-		for _, path := range relatedPaths[:min(len(relatedPaths), 8)] {
-			items = append(items, "- "+path)
-		}
-		relatedLines = strings.Join(items, "\n")
-	}
-
-	symbolLines := []string{}
-	semanticMatchLines := []string{}
-	relatedArtifactLines := []string{}
+	dynamic := DynamicContextBundle{}
 	if dynamicContext != nil {
-		for _, item := range dynamicContext.SymbolContext[:min(len(dynamicContext.SymbolContext), 6)] {
-			location := item.Path
-			if item.LineStart != nil {
-				location = fmt.Sprintf("%s:%d", item.Path, *item.LineStart)
-			}
-			scope := ""
-			if item.EnclosingScope != nil && strings.TrimSpace(*item.EnclosingScope) != "" {
-				scope = " in " + *item.EnclosingScope
-			}
-			reason := ""
-			if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
-				reason = " (" + *item.Reason + ")"
-			}
-			symbolLines = append(symbolLines, "- "+item.Kind+" "+item.Symbol+scope+" @ "+location+reason)
-		}
-		for _, item := range dynamicContext.SemanticMatches[:min(len(dynamicContext.SemanticMatches), 6)] {
-			location := item.Path
-			if item.LineStart != nil {
-				location = fmt.Sprintf("%s:%d", item.Path, *item.LineStart)
-			}
-			language := "unknown"
-			if item.Language != nil && strings.TrimSpace(*item.Language) != "" {
-				language = *item.Language
-			}
-			reason := ""
-			if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
-				reason = " (" + *item.Reason + ")"
-			}
-			matchedText := item.MatchedText
-			if len(matchedText) > 120 {
-				matchedText = matchedText[:120]
-			}
-			semanticMatchLines = append(semanticMatchLines, "- "+location+" ["+language+"]"+reason+": "+matchedText)
-		}
-		for _, item := range dynamicContext.RelatedContext[:min(len(dynamicContext.RelatedContext), 6)] {
-			matched := ""
-			if len(item.MatchedTerms) > 0 {
-				matched = " matches " + strings.Join(item.MatchedTerms[:min(len(item.MatchedTerms), 3)], ", ")
-			}
-			reason := ""
-			if item.Reason != nil && strings.TrimSpace(*item.Reason) != "" {
-				reason = " " + strings.TrimSpace(*item.Reason)
-			}
-			path := ""
-			if item.Path != nil && strings.TrimSpace(*item.Path) != "" {
-				path = " [" + *item.Path + "]"
-			}
-			line := "- " + item.ArtifactType + " " + item.Title + path + ":" + reason + matched
-			relatedArtifactLines = append(relatedArtifactLines, strings.TrimRight(line, ":"))
-		}
+		dynamic = *dynamicContext
 	}
-	if len(symbolLines) == 0 {
-		symbolLines = append(symbolLines, "- No symbol context ranked yet.")
-	}
-	if len(semanticMatchLines) == 0 {
-		semanticMatchLines = append(semanticMatchLines, "- No semantic matches ranked yet.")
-	}
-	if len(relatedArtifactLines) == 0 {
-		relatedArtifactLines = append(relatedArtifactLines, "- No related artifacts ranked yet.")
-	}
-	retrievalLines := []string{}
-	for _, item := range retrievalLedger[:min(len(retrievalLedger), 10)] {
-		path := ""
-		if item.Path != nil && strings.TrimSpace(*item.Path) != "" {
-			path = " [" + *item.Path + "]"
-		}
-		matched := ""
-		if len(item.MatchedTerms) > 0 {
-			matched = " matches " + strings.Join(item.MatchedTerms[:min(len(item.MatchedTerms), 3)], ", ")
-		}
-		retrievalLines = append(
-			retrievalLines,
-			fmt.Sprintf("- %s %s%s: %s%s (score %d)", item.SourceType, item.Title, path, item.Reason, matched, item.Score),
-		)
-	}
-	if len(retrievalLines) == 0 {
-		retrievalLines = append(retrievalLines, "- No retrieval ledger entries recorded yet.")
+	identity := func(s string) string { return s }
+	sections := []struct {
+		title string
+		lines []string
+	}{
+		{"Evidence references", bullets(evidence, len(evidence), "None listed.", evidenceRefLine)},
+		{"Recent issue history", bullets(recentActivity, 6, "No recent issue history.", historyLine)},
+		{"Prior fix history", bullets(recentFixes, 4, "No prior fixes recorded.", fixLine)},
+		{"Ticket context", bullets(ticketContexts, 4, "No linked ticket context recorded.", ticketLine)},
+		{"Threat model", bullets(threatModels, 3, "No threat model recorded yet.", threatLine)},
+		{"Vulnerability findings", bullets(vulnerabilityFindings, 4, "No vulnerability findings recorded yet.", func(item VulnerabilityFindingRecord) string {
+			return vulnerabilityLine(item, threatTitles)
+		})},
+		{"Browser context", bullets(browserDumps, 3, "No browser dumps recorded yet.", browserLine)},
+		{"Repo config", repoConfigLines(repoConfig)},
+		{"Path-specific guidance", bullets(matchedPathInstructions, 6, "No path-specific instructions matched the current issue paths.", pathInstructionLine)},
+		{"Semantic freshness", semanticStatusLines(semanticStatus)},
+		{"Structural context", bullets(topDirs, 5, "No repo map available.", func(item rustcore.RepoMapDirectoryRecord) string {
+			return item.Path + ": " + toText(item.SourceFileCount) + " source files, " + toText(item.TestFileCount) + " test files"
+		})},
+		{"Ranked related paths", bullets(relatedPaths, 8, "No related paths ranked yet.", identity)},
+		{"Symbol context", bullets(dynamic.SymbolContext, 6, "No symbol context ranked yet.", symbolLine)},
+		{"Semantic matches", bullets(dynamic.SemanticMatches, 6, "No semantic matches ranked yet.", semanticMatchLine)},
+		{"Related artifacts", bullets(dynamic.RelatedContext, 6, "No related artifacts ranked yet.", relatedArtifactLine)},
+		{"Retrieval ledger", bullets(retrievalLedger, 10, "No retrieval ledger entries recorded yet.", retrievalLine)},
+		{"Repository guidance", bullets(guidance, replayGuidanceLimit, "No repository guidance files were found.", guidanceLine)},
+		{"Known verification profiles", bullets(verificationProfiles, 4, "No verification profiles configured yet.", verificationLine)},
+		{"Priority files", bullets(treeFocus, 12, "Inspect the workspace tree around the bug.", identity)},
 	}
 
-	pathInstructionLines := []string{}
-	for _, item := range matchedPathInstructions[:min(len(matchedPathInstructions), 6)] {
-		label := item.Path
-		if item.Title != nil && strings.TrimSpace(*item.Title) != "" {
-			label = *item.Title
-		}
-		pathInstructionLines = append(pathInstructionLines, "- "+label+" ["+strings.Join(item.MatchedPaths[:min(len(item.MatchedPaths), 4)], ", ")+"]: "+item.Instructions)
-	}
-	if len(pathInstructionLines) == 0 {
-		pathInstructionLines = append(pathInstructionLines, "- No path-specific instructions matched the current issue paths.")
-	}
-
-	semanticStatusLines := []string{}
-	if semanticStatus != nil {
-		semanticStatusLines = append(semanticStatusLines, "- status: "+semanticStatus.Status)
-		for _, reason := range semanticStatus.StaleReasons[:min(len(semanticStatus.StaleReasons), 3)] {
-			semanticStatusLines = append(semanticStatusLines, "- reason: "+reason)
-		}
-		for _, warning := range semanticStatus.Warnings[:min(len(semanticStatus.Warnings), 3)] {
-			semanticStatusLines = append(semanticStatusLines, "- warning: "+warning)
-		}
-	}
-	if len(semanticStatusLines) == 0 {
-		semanticStatusLines = append(semanticStatusLines, "- No semantic index freshness status available.")
-	}
-
-	summary := firstNonEmptyPtr(issue.Summary)
-	if summary == "" {
-		summary = "No summary supplied."
-	}
-	impact := firstNonEmptyPtr(issue.Impact)
-	if impact == "" {
-		impact = "No impact supplied."
-	}
-
-	return "You are fixing bug " + issue.BugID + " in workspace " + workspace.RootPath + ".\n" +
+	var b strings.Builder
+	b.WriteString("You are fixing bug " + issue.BugID + " in workspace " + workspace.RootPath + ".\n" +
 		"Title: " + issue.Title + "\n" +
 		"Severity: " + issue.Severity + "\n" +
 		"Doc status: " + issue.DocStatus + "\n" +
 		"Code status: " + issue.CodeStatus + "\n" +
 		"Tracker source: " + issue.Source + "\n" +
-		"Summary: " + summary + "\n" +
-		"Impact: " + impact + "\n\n" +
-		"Evidence references:\n" + strings.Join(evidenceLines, "\n") + "\n\n" +
-		"Recent issue history:\n" + strings.Join(historyLines, "\n") + "\n\n" +
-		"Prior fix history:\n" + strings.Join(fixLines, "\n") + "\n\n" +
-		"Ticket context:\n" + strings.Join(ticketLines, "\n") + "\n\n" +
-		"Threat model:\n" + strings.Join(threatLines, "\n") + "\n\n" +
-		"Vulnerability findings:\n" + strings.Join(vulnerabilityLines, "\n") + "\n\n" +
-		"Browser context:\n" + strings.Join(browserLines, "\n") + "\n\n" +
-		"Repo config:\n" + strings.Join(repoConfigLines, "\n") + "\n\n" +
-		"Path-specific guidance:\n" + strings.Join(pathInstructionLines, "\n") + "\n\n" +
-		"Semantic freshness:\n" + strings.Join(semanticStatusLines, "\n") + "\n\n" +
-		"Structural context:\n" + strings.Join(repoDirLines, "\n") + "\n\n" +
-		"Ranked related paths:\n" + relatedLines + "\n\n" +
-		"Symbol context:\n" + strings.Join(symbolLines, "\n") + "\n\n" +
-		"Semantic matches:\n" + strings.Join(semanticMatchLines, "\n") + "\n\n" +
-		"Related artifacts:\n" + strings.Join(relatedArtifactLines, "\n") + "\n\n" +
-		"Retrieval ledger:\n" + strings.Join(retrievalLines, "\n") + "\n\n" +
-		"Repository guidance:\n" + strings.Join(guidanceLines, "\n") + "\n\n" +
-		"Known verification profiles:\n" + strings.Join(verificationLines, "\n") + "\n\n" +
-		"Priority files:\n" + focusLines + "\n\n" +
-		"Required workflow:\n" +
+		"Summary: " + fallbackString(firstNonEmptyPtr(issue.Summary), "No summary supplied.") + "\n" +
+		"Impact: " + fallbackString(firstNonEmptyPtr(issue.Impact), "No impact supplied.") + "\n\n")
+	for _, sec := range sections {
+		b.WriteString(sec.title + ":\n" + strings.Join(sec.lines, "\n") + "\n\n")
+	}
+	b.WriteString("Required workflow:\n" +
 		"1. Reproduce or validate the bug against the current code.\n" +
 		"2. Make the minimal safe fix.\n" +
 		"3. Add or update tests.\n" +
 		"4. Record exact files changed, tests run, and how the fix works back into the tracker.\n" +
-		"Return a concise engineering result, not a conversation."
+		"Return a concise engineering result, not a conversation.")
+	return b.String()
+}
+
+// bullets renders the first limit items as "- " lines, or the fallback line when
+// there are none.
+func bullets[T any](items []T, limit int, fallback string, line func(T) string) []string {
+	items = items[:min(len(items), limit)]
+	if len(items) == 0 {
+		return []string{"- " + fallback}
+	}
+	out := make([]string, 0, len(items))
+	for _, item := range items {
+		out = append(out, "- "+line(item))
+	}
+	return out
+}
+
+// present is *value when it holds more than whitespace, else "".
+func present(value *string) string {
+	if value == nil || strings.TrimSpace(*value) == "" {
+		return ""
+	}
+	return *value
+}
+
+// joinFirst joins the first n items.
+func joinFirst(items []string, n int, sep string) string {
+	return strings.Join(items[:min(len(items), n)], sep)
+}
+
+// joinFirstOr joins the first n items, or returns empty when there are none.
+func joinFirstOr(items []string, n int, sep, empty string) string {
+	if len(items) == 0 {
+		return empty
+	}
+	return joinFirst(items, n, sep)
+}
+
+func evidenceRefLine(evidence evidenceRef) string {
+	if evidence.Line != nil {
+		return fmt.Sprintf("%s:%d", evidence.Path, *evidence.Line)
+	}
+	return evidence.Path
+}
+
+func historyLine(entry activityRecord) string {
+	beforeAfter, ok := entry.Details["before_after"].(map[string]any)
+	if !ok || len(beforeAfter) == 0 {
+		return entry.CreatedAt + ": " + entry.Summary
+	}
+	fragments := make([]string, 0, len(beforeAfter))
+	for _, field := range slices.Sorted(maps.Keys(beforeAfter)) {
+		if diff, ok := beforeAfter[field].(map[string]any); ok {
+			fragments = append(fragments, field+" "+toText(diff["from"])+" -> "+toText(diff["to"]))
+		} else {
+			fragments = append(fragments, field+" "+toText(beforeAfter[field]))
+		}
+	}
+	return entry.CreatedAt + ": " + strings.Join(fragments, ", ")
+}
+
+func fixLine(fix FixRecord) string {
+	actorLabel := fallbackString(fix.Actor.Label, fix.Actor.Name)
+	changed := joinFirstOr(fix.ChangedFiles, 4, ", ", "no files recorded")
+	return fix.FixID + " [" + fix.Status + "] by " + actorLabel + ": " + fix.Summary + " (" + changed + ")"
+}
+
+func guidanceLine(item RepoGuidanceRecord) string {
+	mode := "optional"
+	if item.AlwaysOn {
+		mode = "always-on"
+	}
+	return item.Path + " [" + item.Kind + ", " + mode + "]: " + fallbackString(item.Summary, item.Title)
+}
+
+func verificationLine(profile rustcore.VerificationProfileInput) string {
+	var coverageBits []string
+	if command := present(profile.CoverageCommand); command != "" {
+		coverageBits = append(coverageBits, "coverage command: "+command)
+	}
+	if report := present(profile.CoverageReportPath); report != "" {
+		coverageBits = append(coverageBits, "report: "+report)
+	}
+	if profile.CoverageFormat != "" && profile.CoverageFormat != "unknown" {
+		coverageBits = append(coverageBits, "format: "+profile.CoverageFormat)
+	}
+	coverageSummary := ""
+	if len(coverageBits) > 0 {
+		coverageSummary = " (" + strings.Join(coverageBits, "; ") + ")"
+	}
+	return profile.Name + ": " + profile.TestCommand + coverageSummary
+}
+
+// orNoSummary is summary, or "No summary." when it is blank.
+func orNoSummary(summary string) string {
+	if strings.TrimSpace(summary) == "" {
+		return "No summary."
+	}
+	return summary
+}
+
+func ticketLine(item TicketContextRecord) string {
+	headerBits := []string{item.Provider}
+	for _, bit := range []string{present(item.ExternalID), present(item.Status)} {
+		if bit != "" {
+			headerBits = append(headerBits, bit)
+		}
+	}
+	criteria := joinFirstOr(item.AcceptanceCriteria, 3, "; ", "No acceptance criteria recorded.")
+	return item.Title + " [" + strings.Join(headerBits, " / ") + "]: " + orNoSummary(item.Summary) + " Acceptance criteria: " + criteria
+}
+
+func threatLine(item ThreatModelRecord) string {
+	assets := joinFirstOr(item.Assets, 3, ", ", "No assets listed.")
+	abuseCases := joinFirstOr(item.AbuseCases, 2, "; ", "No abuse cases listed.")
+	mitigations := joinFirstOr(item.Mitigations, 2, "; ", "No mitigations listed.")
+	return item.Title + " [" + item.Methodology + " / " + item.Status + "]: " + orNoSummary(item.Summary) +
+		" Assets: " + assets + ". Abuse cases: " + abuseCases + ". Mitigations: " + mitigations
+}
+
+func vulnerabilityLine(item VulnerabilityFindingRecord, threatTitles map[string]string) string {
+	location := fallbackString(present(item.LocationPath), "No file location recorded.")
+	if item.LocationLine != nil {
+		location += fmt.Sprintf(":%d", *item.LocationLine)
+	}
+	var ruleBits []string
+	if ruleID := present(item.RuleID); ruleID != "" {
+		ruleBits = append(ruleBits, ruleID)
+	}
+	if len(item.CWEIDs) > 0 {
+		ruleBits = append(ruleBits, joinFirst(item.CWEIDs, 3, ", "))
+	}
+	if len(item.CVEIDs) > 0 {
+		ruleBits = append(ruleBits, joinFirst(item.CVEIDs, 2, ", "))
+	}
+	ruleSummary := joinFirstOr(ruleBits, len(ruleBits), " | ", "No rule or taxonomy ids recorded.")
+	evidenceSummary := joinFirstOr(item.Evidence, 2, "; ", "No scanner evidence recorded.")
+	var linked []string
+	for _, threatModelID := range item.ThreatModelIDs {
+		if title, ok := threatTitles[threatModelID]; ok {
+			linked = append(linked, title)
+		}
+	}
+	linkageSummary := ""
+	if len(linked) > 0 {
+		linkageSummary = " Linked threat models: " + strings.Join(linked, ", ") + "."
+	}
+	return item.Title + " [" + item.Scanner + " / " + item.Source + " / " + item.Severity + " / " + item.Status + "]: " + orNoSummary(item.Summary) +
+		" Location: " + location + ". IDs: " + ruleSummary + ". Evidence: " + evidenceSummary + "." + linkageSummary
+}
+
+func browserLine(item BrowserDumpRecord) string {
+	var pageBits []string
+	for _, bit := range []string{present(item.PageTitle), present(item.PageURL)} {
+		if bit != "" {
+			pageBits = append(pageBits, bit)
+		}
+	}
+	pageSummary := joinFirstOr(pageBits, len(pageBits), " — ", "No page metadata recorded.")
+	consoleExcerpt := joinFirstOr(item.ConsoleMessages, 2, "; ", "No console messages recorded.")
+	networkExcerpt := joinFirstOr(item.NetworkRequests, 2, "; ", "No network requests recorded.")
+	domExcerpt := "No DOM snapshot recorded."
+	if strings.TrimSpace(item.DOMSnapshot) != "" {
+		domExcerpt = strings.TrimSpace(strings.ReplaceAll(item.DOMSnapshot[:min(len(item.DOMSnapshot), 220)], "\n", " "))
+	}
+	summary := item.Summary
+	if strings.TrimSpace(summary) == "" {
+		summary = pageSummary
+	}
+	return item.Label + " [" + item.Source + "]: " + summary + ". Page: " + pageSummary + ". Console: " + consoleExcerpt +
+		". Network: " + networkExcerpt + ". DOM: " + domExcerpt
+}
+
+func repoConfigLines(repoConfig *RepoConfigRecord) []string {
+	var lines []string
+	if repoConfig != nil {
+		if strings.TrimSpace(repoConfig.Description) != "" {
+			lines = append(lines, "- Description: "+repoConfig.Description)
+		}
+		if len(repoConfig.CodeGuidelines) > 0 {
+			lines = append(lines, "- Code guidelines: "+joinFirst(repoConfig.CodeGuidelines, 6, ", "))
+		}
+		if len(repoConfig.PathFilters) > 0 {
+			lines = append(lines, "- Path filters: "+joinFirst(repoConfig.PathFilters, 6, ", "))
+		}
+		for _, item := range repoConfig.MCPServers[:min(len(repoConfig.MCPServers), 3)] {
+			lines = append(lines, "- MCP "+item.Name+": "+firstNonEmptyRepoConfig(item.Description, item.Usage, "Configured MCP context source."))
+		}
+	}
+	if len(lines) == 0 {
+		return []string{"- No .xmustard config loaded."}
+	}
+	return lines
+}
+
+func semanticStatusLines(status *SemanticIndexStatus) []string {
+	if status == nil {
+		return []string{"- No semantic index freshness status available."}
+	}
+	lines := []string{"- status: " + status.Status}
+	for _, reason := range status.StaleReasons[:min(len(status.StaleReasons), 3)] {
+		lines = append(lines, "- reason: "+reason)
+	}
+	for _, warning := range status.Warnings[:min(len(status.Warnings), 3)] {
+		lines = append(lines, "- warning: "+warning)
+	}
+	return lines
+}
+
+// atLine is path, or path:line when a line is known.
+func atLine(path string, line *int) string {
+	if line != nil {
+		return fmt.Sprintf("%s:%d", path, *line)
+	}
+	return path
+}
+
+// wrapPresent is prefix+value+suffix when value holds more than whitespace, else "".
+func wrapPresent(prefix string, value *string, suffix string) string {
+	if v := present(value); v != "" {
+		return prefix + v + suffix
+	}
+	return ""
+}
+
+func symbolLine(item RepoMapSymbolRecord) string {
+	return item.Kind + " " + item.Symbol + wrapPresent(" in ", item.EnclosingScope, "") + " @ " + atLine(item.Path, item.LineStart) + wrapPresent(" (", item.Reason, ")")
+}
+
+func semanticMatchLine(item SemanticPatternMatchRecord) string {
+	language := fallbackString(present(item.Language), "unknown")
+	matchedText := item.MatchedText
+	if len(matchedText) > 120 {
+		matchedText = matchedText[:120]
+	}
+	return atLine(item.Path, item.LineStart) + " [" + language + "]" + wrapPresent(" (", item.Reason, ")") + ": " + matchedText
+}
+
+func relatedArtifactLine(item RelatedContextRecord) string {
+	matched := ""
+	if len(item.MatchedTerms) > 0 {
+		matched = " matches " + joinFirst(item.MatchedTerms, 3, ", ")
+	}
+	reason := ""
+	if r := present(item.Reason); r != "" {
+		reason = " " + strings.TrimSpace(r)
+	}
+	line := item.ArtifactType + " " + item.Title + wrapPresent(" [", item.Path, "]") + ":" + reason + matched
+	return strings.TrimRight(line, ":")
+}
+
+func retrievalLine(item ContextRetrievalLedgerEntry) string {
+	matched := ""
+	if len(item.MatchedTerms) > 0 {
+		matched = " matches " + joinFirst(item.MatchedTerms, 3, ", ")
+	}
+	return fmt.Sprintf("%s %s%s: %s%s (score %d)", item.SourceType, item.Title, wrapPresent(" [", item.Path, "]"), item.Reason, matched, item.Score)
+}
+
+func pathInstructionLine(item RepoPathInstructionMatch) string {
+	label := fallbackString(present(item.Title), item.Path)
+	return label + " [" + joinFirst(item.MatchedPaths, 4, ", ") + "]: " + item.Instructions
 }
 
 func readWorktreeStatus(root string) *WorktreeStatus {
