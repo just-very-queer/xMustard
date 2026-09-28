@@ -30,6 +30,7 @@ type routeSpec struct {
 func apiRouteAreas() [][]routeSpec {
 	return [][]routeSpec{
 		authRoutes,
+		operatorRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }
