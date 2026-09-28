@@ -120,13 +120,16 @@ func LimitsFromEnv() Limits {
 
 // Observation is the persisted, audit-complete record of one captured original.
 type Observation struct {
-	Version        string `json:"version"`
-	WorkspaceID    string `json:"workspace_id"`
-	RepoScope      string `json:"repo_scope"` // canonical repository root (trust scope)
-	Actor          string `json:"actor,omitempty"`
-	AuthEnforced   bool   `json:"auth_enforced"`
-	Issuer         string `json:"issuer"` // mcp | pi | http
-	SessionID      string `json:"session_id,omitempty"`
+	Version      string `json:"version"`
+	WorkspaceID  string `json:"workspace_id"`
+	RepoScope    string `json:"repo_scope"` // canonical repository root (trust scope)
+	Actor        string `json:"actor,omitempty"`
+	AuthEnforced bool   `json:"auth_enforced"`
+	Issuer       string `json:"issuer"` // mcp | pi | http
+	SessionID    string `json:"session_id,omitempty"`
+	// AgentID is the client's subagent that ran the tool (a hook body's agent_id),
+	// recorded with the session for attribution (PAR-PROV-07); never authorization.
+	AgentID        string `json:"agent_id,omitempty"`
 	CallID         string `json:"call_id,omitempty"`
 	Tool           string `json:"tool"`
 	ToolVersion    string `json:"tool_version,omitempty"`
@@ -157,6 +160,7 @@ type CaptureRequest struct {
 	AuthEnforced bool
 	Issuer       string
 	SessionID    string
+	AgentID      string
 	CallID       string
 	Tool         string
 	ToolVersion  string
@@ -498,7 +502,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	obs := Observation{
 		Version: DeliveryVersion, WorkspaceID: req.WorkspaceID, RepoScope: req.RepoScope,
 		Actor: req.Actor, AuthEnforced: req.AuthEnforced, Issuer: req.Issuer, SessionID: req.SessionID,
-		CallID: req.CallID, Tool: req.Tool, ToolVersion: req.ToolVersion, ArgsDigest: req.ArgsDigest,
+		AgentID: req.AgentID, CallID: req.CallID, Tool: req.Tool, ToolVersion: req.ToolVersion, ArgsDigest: req.ArgsDigest,
 		CapturedAt: now.Format(time.RFC3339Nano), Status: req.Status, IsError: req.IsError,
 		ContentType: req.ContentType, RawSHA256: sum, RawBytes: sp.n,
 		ExpiresAt: now.Add(s.limits.Retention).Format(time.RFC3339Nano), WorkspaceQuota: s.limits.WorkspaceQuota,

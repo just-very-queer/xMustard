@@ -1,0 +1,25 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Edit",
+  "tool_input": {
+    "file_path": "${ROOT}/src/billing.go",
+    "old_string": "return x",
+    "new_string": "return roundHalfEven(x",
+    "replace_all": false
+  },
+  "tool_response": {
+    "filePath": "${ROOT}/src/billing.go",
+    "oldString": "return x",
+    "newString": "return roundHalfEven(x",
+    "originalFile": "package billing\n",
+    "structuredPatch": [],
+    "userModified": false,
+    "replaceAll": false
+  },
+  "tool_use_id": "toolu_04Edit",
+  "duration_ms": 2
+}

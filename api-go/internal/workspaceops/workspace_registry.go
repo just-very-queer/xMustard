@@ -204,22 +204,30 @@ func evictOldestRegistryEntry() {
 // registryRecord returns a workspace's record from workspaces.json, parsed once per
 // file change. ok is false when the file is missing or has no such workspace.
 func registryRecord(dataDir, workspaceID string, mark fileMark, now time.Time) (rec workspaceRecord, ok bool, err error) {
+	byID, err := registryRecords(dataDir, mark, now)
+	rec, ok = byID[workspaceID]
+	return rec, ok, err
+}
+
+// registryRecords returns every workspaces.json record by id, parsed once per file
+// change; nil when the file is missing. Callers must not modify the map.
+func registryRecords(dataDir string, mark fileMark, now time.Time) (map[string]workspaceRecord, error) {
 	if !mark.exists {
-		return workspaceRecord{}, false, nil
+		return nil, nil
 	}
 	registry.mu.Lock()
 	if e := registry.records[dataDir]; e != nil && e.trusted && e.mark == mark {
-		rec, ok := e.byID[workspaceID]
+		byID := e.byID
 		registry.mu.Unlock()
-		return rec, ok, nil
+		return byID, nil
 	}
 	registry.mu.Unlock()
 	var items []workspaceRecord
 	if err := readJSON(filepath.Join(dataDir, "workspaces.json"), &items); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return workspaceRecord{}, false, nil
+			return nil, nil
 		}
-		return workspaceRecord{}, false, err
+		return nil, err
 	}
 	byID := make(map[string]workspaceRecord, len(items))
 	for _, it := range items {
@@ -231,8 +239,7 @@ func registryRecord(dataDir, workspaceID string, mark fileMark, now time.Time) (
 	}
 	registry.records[dataDir] = &recordsEntry{mark: mark, trusted: mark.trusted(now), byID: byID}
 	registry.mu.Unlock()
-	rec, ok = byID[workspaceID]
-	return rec, ok, nil
+	return byID, nil
 }
 
 // lookupWorkspaceRecord is getWorkspaceRecord without a snapshot parse: the

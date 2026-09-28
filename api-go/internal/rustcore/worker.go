@@ -431,6 +431,19 @@ func (s *workerSupervisor) acquire(ctx context.Context, key workerKey, set worke
 	}
 }
 
+// acquireLive is acquire without a start: the live worker for key, counted active on
+// it (release must follow), or nil when none is running for key right now.
+func (s *workerSupervisor) acquireLive(key workerKey) *workerProc {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	p := s.proc
+	if p == nil || p.key != key.id || p.isDead() {
+		return nil
+	}
+	p.active++
+	return p
+}
+
 // release ends a caller's use of p. ok reports a completed call, which clears the
 // crash backoff. When p goes idle it is retired if the governor asked for its memory
 // while it was busy, or if it is above the runaway line; otherwise its idle exit and
@@ -1121,8 +1134,13 @@ func runViaWorker(parent context.Context, sub string, args []string) (out []byte
 	}
 	ctx, cancel := context.WithTimeout(parent, coreCallTimeout)
 	defer cancel()
-	p, err := s.acquire(ctx, key, settings)
-	if err != nil {
+	var p *workerProc
+	if residentOnly(parent) {
+		// a resident-only call never starts a worker (and never falls back)
+		if p = s.acquireLive(key); p == nil {
+			return nil, false, nil
+		}
+	} else if p, err = s.acquire(ctx, key, settings); err != nil {
 		if cerr := callerError(parent, ctx, sub); cerr != nil {
 			return nil, true, cerr
 		}
@@ -1198,6 +1216,25 @@ func runViaWorker(parent context.Context, sub string, args []string) (out []byte
 		}
 	}
 	return r.result, true, nil
+}
+
+// ErrNotResident is the answer to a resident-only call (WithResidentOnly) that no live
+// worker could take: the worker is off, not running, or does not run the subcommand.
+var ErrNotResident = errors.New("no resident rust-core worker is running for this call")
+
+type residentOnlyKey struct{}
+
+// WithResidentOnly marks ctx so that bridge calls made under it run only on a resident
+// worker that is already running: none starts a worker or a one-shot child, so the
+// caller spawns no process (PAR-RT-12, the hook hot path). A call no live worker can
+// take fails with ErrNotResident at once.
+func WithResidentOnly(ctx context.Context) context.Context {
+	return context.WithValue(ctx, residentOnlyKey{}, true)
+}
+
+func residentOnly(ctx context.Context) bool {
+	on, _ := ctx.Value(residentOnlyKey{}).(bool)
+	return on
 }
 
 // callerError maps a finished caller context onto the one-shot path's errors.

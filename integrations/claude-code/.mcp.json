@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "xmustard": {
+      "type": "http",
+      "url": "${XMUSTARD_API_BASE:-http://127.0.0.1:8042}/mcp",
+      "headers": {
+        "Authorization": "Bearer ${XMUSTARD_API_TOKEN:-}"
+      }
+    }
+  }
+}

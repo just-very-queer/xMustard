@@ -71,6 +71,8 @@ pub const MAX_WATCH_FILE_BYTES: u64 = 32 << 20;
 /// inotify watches (one per directory) per root. Past it the root is `degraded`, as
 /// when the kernel's limit is hit.
 pub const MAX_WATCH_DIRS: usize = 32_768;
+/// Paths one `watch note` feeds to a watcher.
+pub const MAX_NOTED_PATHS: usize = 256;
 /// How long a take waits for its cookie.
 pub const SYNC_TIMEOUT: Duration = Duration::from_millis(500);
 /// Full verification period (same-size edits within a coarse mtime pass a stat check).
@@ -1190,6 +1192,35 @@ impl Registry {
         }
     }
 
+    /// Feed changes a client reported (a Claude Code hook's FileChanged, edit or Bash
+    /// changed files, PAR-FRESH-07) to `root`'s watcher as one native modify event, so
+    /// they join its pending batch like any other: classified, size-checked, debounced.
+    /// Only root-relative paths inside the root are taken, at most
+    /// [`MAX_NOTED_PATHS`]. Err when the root is not watched.
+    pub fn note(&self, root: &Path, rels: &[String]) -> Result<usize, String> {
+        let r = self.find(root).ok_or("not watched by this process")?;
+        let inside = |rel: &&String| {
+            !rel.is_empty()
+                && Path::new(rel.as_str())
+                    .components()
+                    .all(|c| matches!(c, std::path::Component::Normal(_)))
+        };
+        let paths: Vec<PathBuf> = rels
+            .iter()
+            .filter(inside)
+            .take(MAX_NOTED_PATHS)
+            .map(|rel| r.root.join(rel))
+            .collect();
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let n = paths.len();
+        let mut ev = Event::new(EventKind::Modify(ModifyKind::Any));
+        ev.paths = paths;
+        r.tx.send(Ok(ev)).map_err(|_| "the watcher stopped".to_string())?;
+        Ok(n)
+    }
+
     /// Feed `ev` to `root`'s watcher as if its native watcher had sent it (tests reach
     /// the error paths, such as an OS watch limit, this way). False when not watched.
     #[doc(hidden)]
@@ -1263,11 +1294,12 @@ pub fn memo(root: &Path, observe: impl FnOnce() -> Arc<RepoState>) -> (Arc<RepoS
 // `xmustard-core watch ...`
 // ---------------------------------------------------------------------------
 
-const USAGE: &str = "xmustard-core watch <start|stop|take|done|status> [<root>] \
-    [--force] [<batch-id> <ok|failed> [<report-json>]]";
+const USAGE: &str = "xmustard-core watch <start|stop|take|done|status|note> [<root>] \
+    [--force] [<batch-id> <ok|failed> [<report-json>]] [<relative-path>...]";
 
-/// `watch <start|stop|take|done|status>`: the orchestrator's side of the loop. Runs
-/// inside `serve`; one-shot, `status` answers `absent` and the rest fail.
+/// `watch <start|stop|take|done|status|note>`: the orchestrator's side of the loop
+/// (`note` feeds a client's reported changes to the watcher). Runs inside `serve`;
+/// one-shot, `status` answers `absent` and the rest fail.
 pub fn run(args: Args) -> CmdResult {
     let args: Vec<String> = args.collect();
     let reg = registry();
@@ -1296,6 +1328,7 @@ pub fn run(args: Args) -> CmdResult {
             reg.done(&need_root()?, id, ok, report).map_err(failed)?
         }
         Some("status") => reg.status(root.as_deref()),
+        Some("note") => json!({ "noted": reg.note(&need_root()?, &args[2..]).map_err(failed)? }),
         _ => return Err(CmdError::usage(USAGE)),
     };
     json_out(&out)

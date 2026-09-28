@@ -1,0 +1,6 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "SubagentStart",
+    "additionalContext": "[xmustard ground] workspace wsHooks at ${ROOT}: 2 (<outcome>, <outcome>) failed run(s), 0 stale memory, 0 pending memory await your verification. Changes, drift and index coverage are not sampled by hooks; the xmustard ground tool reports them."
+  }
+}

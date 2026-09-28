@@ -699,3 +699,42 @@ fn fresh_within_a_second_on_5000_files() {
     );
     assert!(samples[9] <= Duration::from_secs(1), "{samples:?}");
 }
+
+// A change a client reports (a Claude Code hook's FileChanged or edit, PAR-FRESH-07)
+// joins the watcher's next batch like a native event; paths outside the root are not
+// taken, and an unwatched root refuses.
+#[test]
+fn a_client_noted_path_joins_the_next_batch() {
+    let _g = serial();
+    let r = repo(&ts_files(2));
+    index::build(r.path(), &cfg()).unwrap();
+    let _u = Unwatch(r.path());
+    watched(r.path());
+    let noted = watch::registry()
+        .note(
+            r.path(),
+            &[
+                "pkg/m001.ts".to_string(),
+                "../outside.ts".to_string(),
+                "/etc/passwd".to_string(),
+                String::new(),
+            ],
+        )
+        .unwrap();
+    assert_eq!(noted, 1);
+    wait_due(r.path(), Duration::from_secs(5));
+    let (taken, _) = refresh(r.path(), false);
+    let paths: Vec<&str> = taken["batch"]["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|p| p.as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["pkg/m001.ts"], "{taken}");
+    let elsewhere = TempDir::new().unwrap();
+    assert!(
+        watch::registry()
+            .note(elsewhere.path(), &["a.ts".to_string()])
+            .is_err()
+    );
+}

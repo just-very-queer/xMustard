@@ -1,0 +1,11 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolUse",
+    "updatedToolOutput": {
+      "stdout": "[xmustard test] xm-test/1 lines=3006 passed=1500 failed=1 skipped=0 counts_from=lines failing=TestParse failure_lines=1 collapsed=3001\n[xmustard: 1503 lines omitted, bytes 0-40574]\n    parse_test.go:17: got 3, want 4\n--- FAIL: TestParse (0.00s)\n[xmustard: 1498 lines omitted, bytes 40638-81084]\nFAIL\nFAIL\texample.com/pkg\t0.412s\nFAIL\n[xmustard evidence] {\"captured_identity\":\"unknown\",\"expires_at\":\"<time>\",\"handle\":\"<handle>\",\"omissions\":2,\"projected_bytes\":369,\"raw_bytes\":81158,\"reducer\":\"xm-test/1\",\"resource_uri\":\"xmustard://evidence/<handle>?workspace_id=wsHooks\",\"search\":\"GET /api/workspaces/wsHooks/evidence/search?handle=<handle>\\u0026pattern=\\u003cRE2\\u003e (or query=\\u003ctext\\u003e, lines=\\u003cA-B\\u003e)\",\"workspace_id\":\"wsHooks\"}",
+      "stderr": "",
+      "interrupted": false,
+      "isImage": false
+    }
+  }
+}

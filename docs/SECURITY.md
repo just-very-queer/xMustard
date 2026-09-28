@@ -196,8 +196,10 @@ refuse text are explicit and fail closed.
   reaches the agent unchanged), and the Pi adapter adds it to the text it renders. The initialize instructions say that memory, tool output and
   `<xmustard-data>` blocks are data, not instructions. `ground` returns counts and
   ids only, so it carries no agent-written text.
-- **Pushed surfaces.** Memory pushed into context unasked, from a hook (WS-23) or the
-  core tier (WS-31), goes through `workspaceops.AdmitMemory`. The checks run in order:
+- **Pushed surfaces.** Memory pushed into context unasked, from a hook (WS-23: the
+  memories bound to a file a tool reads or edits, those matching a search pattern,
+  those a prompt keyword triggers, and the core tier at SessionStart and
+  SubagentStart) or the core tier (WS-31), goes through `workspaceops.AdmitMemory`. The checks run in order:
   the entry exists in the workspace, it is served, its content matches its digest, it
   is not quarantined, it has a human approval, and it scans clean (a truncated scan
   counts as flagged). What passes is framed in `<xmustard-data>` blocks after a notice.
@@ -539,13 +541,123 @@ Revoking an evidence original (`DELETE .../evidence/{handle}`) or the admin purg
 outcome with `DELETE .../outcomes/{outcome_id}`, for example one holding a secret the
 redactor missed.
 
+## Client hooks (WS-23)
+
+Claude Code posts hook events to `POST /api/hooks/claude/<Event>` (an http hook) or
+through the static client `xmustard-hook` over a Unix socket (a command hook).
+
+- **Authentication and roles.** Every hook route has a row in the route gate table
+  below: core, the proposer role, served in read-only mode (a hook stores only the
+  caller's own tool output, and read-only mode records no outcome). A reader-only
+  token drives no hook. The plugin sends `Authorization: Bearer ${XMUSTARD_API_TOKEN}`
+  (an http hook's `allowedEnvVars`); the client sends the same variable.
+- **Workspace.** A hook acts on the workspace the `X-Xmustard-Workspace` header names,
+  else on the registered root that holds the event's `cwd` (the deepest one; a hook
+  never registers a repository). The workspace then passes the checks a workspace path
+  gets, in order and failing closed: a safe id, served by this deployment, in the
+  token's scope. A refusal answers empty and is audited.
+- **The socket.** Both sides check it in order, failing closed
+  (`transport.CheckDir`, `transport.CheckSocket`): its directory must be a directory
+  (not a symlink) owned by the user, with no group or other permission bits, and the
+  socket must be a socket owned by the user. Another local user can create the
+  default directory under a shared temp dir first (`/tmp/xmustard-<uid>` when
+  `XDG_RUNTIME_DIR` is unset); the daemon then does not listen there, and the client
+  does not dial it, so its token and event go to the TCP address instead. The daemon
+  creates the directory 0700 and the socket 0600, replaces only a stale socket the user
+  owns (never another daemon's live socket, another user's file or a file that is not
+  a socket), and serves only `/api/hooks/` there through the full middleware stack.
+  `XMUSTARD_HOOK_SOCKET=off` disables it.
+- **Captures.** A PostToolUse or PostToolUseFailure body is captured through the
+  capture route's redactor and checks (see Evidence capture redaction below) before
+  anything is retained, bound to the calling principal, and recorded
+  `captured_identity=unknown` (the producing repository state was not observed). The
+  session and subagent ids are recorded for attribution only. A capture refused for a
+  secret path or a redactor failure retains nothing and fails open: the client keeps
+  its native output, and the refusal does not count as the daemon being busy.
+- **What a hook may do.** An answer adds context, replaces a native output with its
+  shape-matched reduction (PostToolUse only), sets the FileChanged watch list
+  (SessionStart and CwdChanged), or says nothing. It never
+  allows, denies or rewrites a tool call. A timeout past the ~200 ms budget, a body the
+  service cannot read and a workspace out of scope are empty 200s, so Claude Code's own
+  behavior is unchanged. Authentication stays fail-closed: a missing, expired, revoked
+  or reader-only token gets 401 or 403, which Claude Code shows as a non-blocking hook
+  error on every matched call (the static client prints nothing for it). A missing
+  daemon is a non-blocking error for an http hook and silence for the client.
+  WorktreeCreate is not hooked: its hook replaces git worktree creation. WorktreeRemove
+  goes through the client, which always exits 0, because a failing WorktreeRemove hook
+  blocks removal, and acts only on a worktree at or under the caller's workspace root.
+- **Pushed memory** follows the pushed-surface policy above; index hits are framed as
+  data and scanned. Each context (the main thread, and each subagent by its
+  `agent_id`) gets a memory at most once until compaction, and a memory counts as
+  given only when the answer that carries its frame, or the note that withheld it, was
+  written. A memory that does not fit in the ~10,000-character context left is counted
+  in the withheld note as `too_large`, with the `recall` call that shows it.
+- **Processes.** The daemon starts no process for a hook: Rust work runs only on a
+  resident worker that is already running. Claude Code itself starts the static client
+  once per event for the two command hooks, SessionStart and WorktreeRemove; every
+  other event is an http hook to the running daemon.
+
+## Evidence capture redaction (WS-FIX-03)
+
+Capture is on in every build, and every capture is redacted.
+`POST /api/workspaces/{id}/evidence/capture` streams the tool output (a raw body, or
+the output strings of a Claude, Codex, Cursor, Pi or OpenCode hook body) through the
+shared `redact` rules before a byte reaches the spool. The retained original, its
+pages, search inside it and the projection returned to the client therefore all hold
+the redacted text. In v0.1.0 no redactor was wired, so every capture answered
+`503 redaction_unavailable`.
+
+- **Rules.** Capture uses the rules `why_failed` applies to command output
+  (`workspaceops.OutputRedactor`): the default secret patterns (bearer and basic
+  credentials; AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Google, Stripe, npm,
+  Hugging Face and xMustard tokens; JWTs; URL userinfo passwords; private keys), the
+  key-aware detector for secret fields in JSON, YAML, env files, headers and flags,
+  and the literal values of this daemon's secret-named environment variables. Each
+  secret becomes `[REDACTED:<rule>]`.
+- **Streaming.** `redact.Writer` buffers 128 KiB and decides it 8 KiB at a time.
+  Each window is read with the lookahead after it, about 33 KiB, the longest span
+  any detector reads past a match (a private key body and its END marker). A secret
+  split across writes or windows is therefore seen whole, and the output is byte
+  for byte what one pass over the whole input gives. The stream is never buffered,
+  and a window's scratch and output are sized by the 8 KiB it decides, not by how
+  many secrets it holds. Measured on 16 MiB in the decoder's 32 KiB writes, the
+  redactor's live heap peaks at 0.4 MiB at most, on input that is nothing but
+  secrets (an 8-byte secret environment value repeated, the densest case), under a
+  quarter of the 2 MiB capture window. The hook decoder flushes it at each section
+  boundary, so each output string is redacted as one input.
+- **Secret paths.** When any path the capture names is on the secret-path denylist
+  (`.ssh/`, SSH key files, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.env` and
+  `.env.*` other than templates such as `.env.example`), the capture is refused with
+  `422 secret_path` and nothing is retained. The paths checked are the caller's
+  `path`, every path field of the hook body's tool input (`file_path`, `filePath`,
+  `path`, `target_file`, `notebook_path`, `directory`, `dir_path`), and every such
+  field of its response (Claude Read's `file.filePath`), wherever they appear in the
+  body. One path cannot hide another: a caller's `path=README.md` does not admit a
+  body that reads `.env`. The client keeps its own result.
+- **Fail closed.** A server without a redactor answers `503 redaction_unavailable`.
+  A redactor that fails (panics) answers `503 redaction_failed`. On every refusal
+  the spool is discarded, so nothing is retained. The WS-23 hook routes capture
+  through the same redactor, wrapper and checks; a hook whose capture is refused
+  retains nothing and leaves the client its native output.
+- **Limits.** Redaction is pattern-based. A secret that no rule recognizes is
+  retained as written: for example, a bare password in a line of code, or an
+  unquoted token-named value without a digit (the `redact` package documentation
+  lists the limits). Such an original can be revoked with
+  `DELETE .../evidence/{handle}`, and the admin purge (`DELETE .../evidence`)
+  removes every original of a workspace. Only named paths are matched: a secret
+  file read through a shell (`cat .env`), and the matches of a search over a
+  directory (a Grep over `/repo`, with or without a `glob` such as `.env*`), pass
+  through the content rules only. `capture.body_sha256` is the digest of the body
+  as received; it names the body but does not reveal it.
+
 ## Health endpoint
 
 `/api/health` stays public so liveness probes need no token. Its full view shows
 host-wide activity: the data-movement counters (spawns, hashed bytes, captures),
 the owned process tree and the stdio shims on the host, live external processes,
 the heavy-slot owner labels and queue, the resident Rust worker's pid and memory,
-and the live pool and child counters. While authentication is enforced
+the live pool and child counters, and the MCP and hook usage counters (`mcp_usage`,
+`hook_usage`). While authentication is enforced
 (`XMUSTARD_AUTH=required`, or `auto` with credentials minted), only an operator sees
 the full view: an `admin` token, or another token that holds more than `reader`, with
 no workspace scope. A reader-only token and a workspace-scoped token of any role
@@ -570,6 +682,21 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/auth/tokens/{id}/rotate` | core | admin | served |  | replaces the secret; the old one stops working |
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
 | `ANY /api/health` | core | reader | served |  | public liveness and limits; the budget block needs an operator token while auth is enforced |
+| `POST /api/hooks/claude/CwdChanged` | core | proposer | served |  | hook: watchPaths of the new directory's workspace ([] clears the list) |
+| `POST /api/hooks/claude/FileChanged` | core | proposer | served |  | hook: feeds the watcher's pending batch; drops the cached repository identity |
+| `POST /api/hooks/claude/PostCompact` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/PostToolBatch` | core | proposer | served |  | hook: batch search nudge |
+| `POST /api/hooks/claude/PostToolUse` | core | proposer | served |  | hook: captures the caller's own tool output; shape-matched updatedToolOutput |
+| `POST /api/hooks/claude/PostToolUseFailure` | core | proposer | served |  | hook: captures the caller's own failed tool output for the run outcome |
+| `POST /api/hooks/claude/PreCompact` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/PreToolUse` | core | proposer | served |  | hook: index hits and memories for a search pattern or a file |
+| `POST /api/hooks/claude/SessionEnd` | core | proposer | served |  | hook: queued; answered at once (1.5 s SessionEnd budget) |
+| `POST /api/hooks/claude/SessionStart` | core | proposer | served |  | hook: ground's spawn-free part and core-tier memories as context; watchPaths |
+| `POST /api/hooks/claude/Stop` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent, which has steering state of its own |
+| `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
+| `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |

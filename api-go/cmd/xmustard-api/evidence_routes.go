@@ -41,6 +41,7 @@ func newAPIHandlerFor(p exposurePosture) http.Handler {
 	registerEvidenceRoutes(mux, store)
 	registerEvidenceCaptureRoutes(mux, store)
 	registerOutcomeRoutes(mux, store)
+	registerHookRoutes(mux, store)
 	return routeGateMiddleware(p, mux, evidenceDeliveryMiddleware(store, mux))
 }
 

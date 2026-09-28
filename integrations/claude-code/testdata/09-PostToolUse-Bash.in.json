@@ -1,0 +1,20 @@
+{
+  "session_id": "sess-7f3a",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-7f3a.jsonl",
+  "cwd": "${ROOT}",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Bash",
+  "tool_input": {
+    "command": "go test ./...",
+    "description": "Run the tests"
+  },
+  "tool_response": {
+    "stdout": "${BIG_TEST_LOG}",
+    "stderr": "",
+    "interrupted": false,
+    "isImage": false
+  },
+  "tool_use_id": "toolu_06Bash",
+  "duration_ms": 5120
+}

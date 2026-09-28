@@ -29,6 +29,12 @@ type InjectedMemory struct {
 	Content string `json:"content"`
 }
 
+// Block is the memory as the data frame a pushed surface carries (injection.Frame).
+// A surface that budgets its text frames the admitted memories one at a time.
+func (m InjectedMemory) Block() injection.Block {
+	return injection.Block{Kind: "memory", ID: m.ID, Trust: m.Basis, Text: m.Title + "\n" + m.Content}
+}
+
 // WithheldMemory is a candidate the surface refused, and why: an injection reason
 // (quarantined, needs_human_approved, instruction_pattern) or one of withheldNotFound,
 // withheldNotServed and withheldContentChanged.
@@ -118,8 +124,9 @@ func AdmitMemory(ctx context.Context, dataDir, workspaceID string, surface injec
 				out.Withheld = append(out.Withheld, WithheldMemory{ID: e.ID, Reason: d.Reason, Flags: d.Flags})
 				continue
 			}
-			out.Admitted = append(out.Admitted, InjectedMemory{ID: e.ID, Title: e.Title, Basis: basis.String(), Content: c.Content})
-			blocks = append(blocks, injection.Block{Kind: "memory", ID: e.ID, Trust: basis.String(), Text: e.Title + "\n" + c.Content})
+			m := InjectedMemory{ID: e.ID, Title: e.Title, Basis: basis.String(), Content: c.Content}
+			out.Admitted = append(out.Admitted, m)
+			blocks = append(blocks, m.Block())
 		}
 		return nil
 	})

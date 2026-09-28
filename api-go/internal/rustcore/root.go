@@ -62,6 +62,12 @@ func (r *Refusal) Error() string { return "rust-core " + r.Sub + " refused the r
 // reservation kills the child and returns budget.ErrOverloaded. Whole-repository
 // builds first take the governor's heavy slot (heavy.go).
 func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, error) {
+	if residentOnly(parent) {
+		if out, handled, err := runViaWorker(parent, sub, args); handled {
+			return out, err
+		}
+		return nil, fmt.Errorf("rust-core %s: %w", sub, ErrNotResident)
+	}
 	heavyDone, err := acquireHeavyCore(parent, sub, args)
 	if err != nil {
 		return nil, err
