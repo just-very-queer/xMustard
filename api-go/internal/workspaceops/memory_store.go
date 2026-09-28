@@ -45,24 +45,40 @@ type memoryStoreHandle struct {
 var memoryStores = struct {
 	sync.Mutex
 	open map[string]*memoryStoreHandle
-}{open: map[string]*memoryStoreHandle{}}
+	// faults holds the stores that failed an integrity check, by path.
+	faults map[string]error
+}{open: map[string]*memoryStoreHandle{}, faults: map[string]error{}}
 
 // acquireMemoryStore returns the data dir's store and the function that hands it back.
 func acquireMemoryStore(ctx context.Context, dataDir string) (*govstore.SQLStore, func(), error) {
+	return acquireGovStore(ctx, dataDir, false)
+}
+
+// acquireGovStore is acquireMemoryStore; with check it also runs PRAGMA quick_check before
+// handing the store out (at open on a short-lived connection, or on the open store). A
+// store that failed its check is refused from then on (memory_store_health.go).
+func acquireGovStore(ctx context.Context, dataDir string, check bool) (*govstore.SQLStore, func(), error) {
 	path, err := filepath.Abs(memoryStorePath(dataDir))
 	if err != nil {
 		return nil, nil, err
 	}
 	memoryStores.Lock()
 	defer memoryStores.Unlock()
+	if err := memoryStores.faults[path]; err != nil {
+		return nil, nil, err
+	}
 	h := memoryStores.open[path]
 	if h == nil {
-		s, err := govstore.Open(ctx, path, govstore.Options{})
+		s, err := govstore.Open(ctx, path, govstore.Options{QuickCheckOnOpen: check})
 		if err != nil {
-			return nil, nil, fmt.Errorf("open memory store: %w", err)
+			return nil, nil, noteStoreFault(path, fmt.Errorf("open memory store: %w", err))
 		}
 		h = &memoryStoreHandle{store: s}
 		memoryStores.open[path] = h
+	} else if check {
+		if err := h.store.QuickCheck(ctx); err != nil {
+			return nil, nil, noteStoreFault(path, fmt.Errorf("check memory store: %w", err))
+		}
 	}
 	h.refs++
 	var once sync.Once
