@@ -16,7 +16,7 @@ import (
 type SecurityDisposition struct {
 	FindingID                  string   `json:"finding_id"`
 	WorkspaceID                string   `json:"workspace_id"`
-	Disposition                string   `json:"disposition"`   // open|confirmed|false_positive|mitigated|accepted_risk|suppressed
+	Disposition                string   `json:"disposition"`    // open|confirmed|false_positive|mitigated|accepted_risk|suppressed
 	Exploitability             string   `json:"exploitability"` // unknown|none|theoretical|poc|exploited
 	Suppressed                 bool     `json:"suppressed"`
 	SuppressionReason          string   `json:"suppression_reason,omitempty"`
