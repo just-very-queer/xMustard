@@ -1,0 +1,213 @@
+You are fixing bug BUG-7 in workspace /repo/demo.
+Title: Export drops rows
+Severity: high
+Doc status: open
+Code status: confirmed
+Tracker source: tracker
+Summary: CSV export loses the last row.
+Impact: No impact supplied.
+
+Evidence references:
+- api/export.go:42
+- api/rows.go
+- extra/ea.go
+- extra/eb.go
+- extra/ec.go
+- extra/ed.go
+- extra/ee.go
+- extra/ef.go
+- api/export_test.go:7
+
+Recent issue history:
+- 2026-09-01: labels  -> [x], severity high, status open -> triaged
+- 2026-09-02: commented
+- 2026-09-03: no details
+- 2026-09-10: later
+- 2026-09-11: later
+- 2026-09-12: later
+
+Prior fix history:
+- fix-1 [merged] by Codex: clamp index (fa, fb, fc, fd)
+- fix-2 [draft] by alice: retry (no files recorded)
+- fix-x [x] by x:  (no files recorded)
+- fix-x [x] by x:  (no files recorded)
+
+Ticket context:
+- Export [jira / APP-1 / In Progress]: fix it Acceptance criteria: ca; cb; cc
+- Bare [github]: No summary. Acceptance criteria: No acceptance criteria recorded.
+
+Threat model:
+- Export abuse [STRIDE / draft]: exfil Assets: asset-a, asset-b, asset-c. Abuse cases: abuse-a; abuse-b. Mitigations: mit-a; mit-b
+- Empty model [LINDDUN / new]: No summary. Assets: No assets listed.. Abuse cases: No abuse cases listed.. Mitigations: No mitigations listed.
+- Third [ / ]: No summary. Assets: No assets listed.. Abuse cases: No abuse cases listed.. Mitigations: No mitigations listed.
+
+Vulnerability findings:
+- SQLi [semgrep / sast / critical / open]: tainted query Location: api/q.go:9. IDs: go.sqli | CWE-a, CWE-b, CWE-c | CVE-a, CVE-b. Evidence: ev-a; ev-b. Linked threat models: Export abuse, Fourth.
+- Bare [x / y / low / new]: No summary. Location: No file location recorded.:3. IDs: No rule or taxonomy ids recorded.. Evidence: No scanner evidence recorded..
+
+Browser context:
+- export page [playwright]: Export — /api/export. Page: Export — /api/export. Console: console-a; console-b. Network: GET /ra; GET /rb. DOM: <div> row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row row r
+- bare [manual]: user report. Page: No page metadata recorded.. Console: No console messages recorded.. Network: No network requests recorded.. DOM: No DOM snapshot recorded.
+
+Repo config:
+- Description: Demo service
+- Code guidelines: ga, gb, gc, gd, ge, gf
+- Path filters: pa, pb
+- MCP docs: Docs server
+- MCP db: query rows
+- MCP bare: Configured MCP context source.
+
+Path-specific guidance:
+- API rules [api/a, api/b, api/c, api/d]: keep handlers thin
+- web/** [web/a.tsx]: no inline styles
+
+Semantic freshness:
+- status: stale
+- reason: reason-a
+- reason: reason-b
+- reason: reason-c
+- warning: warn-a
+- warning: warn-b
+- warning: warn-c
+
+Structural context:
+- api: 12 source files, 4 test files
+- web: 30 source files, 0 test files
+- a: 0 source files, 0 test files
+- b: 0 source files, 0 test files
+- c: 0 source files, 0 test files
+
+Ranked related paths:
+- related/a
+- related/b
+- related/c
+- related/d
+- related/e
+- related/f
+- related/g
+- related/h
+
+Symbol context:
+- func Export in Handler @ api/export.go:40 (named in the issue)
+- var rows @ api/rows.go
+
+Semantic matches:
+- api/export.go:44 [go] (loop bound): mmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmmm
+- api/rows.go [unknown]: rows[i]
+
+Related artifacts:
+- run run 3 [runs/3.log]: failed on export matches ta, tb, tc
+- fix fix 1
+
+Retrieval ledger:
+- file export.go [api/export.go]: evidence matches xa, xb, xc (score 9)
+- fix fix-1: prior fix (score 3)
+
+Repository guidance:
+- docs/ga.md [doc, always-on]: Guide
+- docs/gb.md [doc, optional]: summary
+- docs/gc.md [doc, always-on]: summary
+- docs/gd.md [doc, optional]: Guide
+- docs/ge.md [doc, always-on]: summary
+- docs/gf.md [doc, optional]: summary
+
+Known verification profiles:
+- unit: go test ./... (coverage command: go test -cover; report: cover.out; format: go)
+- blank: make test
+- plain: npm test
+- fourth: t4
+
+Priority files:
+- focus/a
+- focus/b
+- focus/c
+- focus/d
+- focus/e
+- focus/f
+- focus/g
+- focus/h
+- focus/i
+- focus/j
+- focus/k
+- focus/l
+
+Required workflow:
+1. Reproduce or validate the bug against the current code.
+2. Make the minimal safe fix.
+3. Add or update tests.
+4. Record exact files changed, tests run, and how the fix works back into the tracker.
+Return a concise engineering result, not a conversation.
+
+=== empty inputs ===
+You are fixing bug B in workspace /r.
+Title: 
+Severity: 
+Doc status: 
+Code status: 
+Tracker source: 
+Summary: No summary supplied.
+Impact: No impact supplied.
+
+Evidence references:
+- None listed.
+
+Recent issue history:
+- No recent issue history.
+
+Prior fix history:
+- No prior fixes recorded.
+
+Ticket context:
+- No linked ticket context recorded.
+
+Threat model:
+- No threat model recorded yet.
+
+Vulnerability findings:
+- No vulnerability findings recorded yet.
+
+Browser context:
+- No browser dumps recorded yet.
+
+Repo config:
+- No .xmustard config loaded.
+
+Path-specific guidance:
+- No path-specific instructions matched the current issue paths.
+
+Semantic freshness:
+- No semantic index freshness status available.
+
+Structural context:
+- No repo map available.
+
+Ranked related paths:
+- No related paths ranked yet.
+
+Symbol context:
+- No symbol context ranked yet.
+
+Semantic matches:
+- No semantic matches ranked yet.
+
+Related artifacts:
+- No related artifacts ranked yet.
+
+Retrieval ledger:
+- No retrieval ledger entries recorded yet.
+
+Repository guidance:
+- No repository guidance files were found.
+
+Known verification profiles:
+- No verification profiles configured yet.
+
+Priority files:
+- Inspect the workspace tree around the bug.
+
+Required workflow:
+1. Reproduce or validate the bug against the current code.
+2. Make the minimal safe fix.
+3. Add or update tests.
+4. Record exact files changed, tests run, and how the fix works back into the tracker.
+Return a concise engineering result, not a conversation.

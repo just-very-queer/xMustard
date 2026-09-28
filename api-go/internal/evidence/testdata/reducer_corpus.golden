@@ -1,0 +1,85 @@
+# case target bytes sha256 first-line
+grep/numbered@2048 8143 89f85322a8695215 [xmustard grep] xm-grep/1 matches=196 files=30 shown=26 per_file=5
+grep/numbered@8192 11368 d9c9d42914ad1922 [xmustard grep] xm-grep/1 matches=196 files=30 shown=40 per_file=5
+grep/heading@2048 10210 71408365a031db45 [xmustard grep] xm-grep/1 matches=300 files=40 shown=33 per_file=5
+grep/heading@8192 11942 aff9cb114cb48bf1 [xmustard grep] xm-grep/1 matches=300 files=40 shown=40 per_file=5
+grep/count@2048 6018 4b42d2e643f2e0fa [xmustard grep] xm-grep/1 matches=4194 files=646 shown=21 per_file=5
+grep/count@8192 9762 de3c70f54855087b [xmustard grep] xm-grep/1 matches=4194 files=646 shown=40 per_file=5
+grep/files@2048 5660 37958495fd707fa4 [xmustard grep] xm-grep/1 matches=900 files=900 shown=40 per_file=5
+grep/files@8192 5660 37958495fd707fa4 [xmustard grep] xm-grep/1 matches=900 files=900 shown=40 per_file=5
+grep/unnumbered@2048 8504 66891de9f32e7e91 [xmustard grep] xm-grep/1 matches=330 files=330 shown=20 per_file=5
+grep/unnumbered@8192 15138 f170ec992de91b31 [xmustard grep] xm-grep/1 matches=330 files=330 shown=40 per_file=5
+grep/notices@2048 9031 54d0ff581eac43db [xmustard grep] xm-grep/1 matches=180 files=60 shown=38 per_file=5
+grep/notices@8192 9391 430cb6d09e4f8f2b [xmustard grep] xm-grep/1 matches=180 files=60 shown=40 per_file=5
+grep/no-matches@2048 6644 4a9969681cd51d56 [xmustard grep] xm-grep/1 matches=6503 files=3504 shown=40 per_file=5
+grep/no-matches@8192 6644 4a9969681cd51d56 [xmustard grep] xm-grep/1 matches=6503 files=3504 shown=40 per_file=5
+grep/array@2048 5597 d4247f3fbcff289d [xmustard grep] xm-grep/1 matches=700 files=700 shown=40 per_file=5
+grep/array@8192 5597 d4247f3fbcff289d [xmustard grep] xm-grep/1 matches=700 files=700 shown=40 per_file=5
+grep/sections@2048 8501 220885c72ff153dc [xmustard grep] xm-grep/1 matches=314 files=100 shown=25 per_file=5
+grep/sections@8192 12431 11e37bd7a8ce3ad1 [xmustard grep] xm-grep/1 matches=314 files=100 shown=40 per_file=5
+lint/diagnostics@2048 9761 f061f290884a57d3 [xmustard lint] xm-lint/1 diagnostics=480 errors=96 warnings=384 files=12 shown=26 per_file=5
+lint/diagnostics@8192 13903 4e1c77f175b99a48 [xmustard lint] xm-lint/1 diagnostics=480 errors=96 warnings=384 files=12 shown=40 per_file=5
+lint/stylish@2048 8568 a481573c409bbb26 [xmustard lint] xm-lint/1 diagnostics=480 errors=120 warnings=360 files=40 shown=13 per_file=5
+lint/stylish@8192 21562 a990c562e84e6ae8 [xmustard lint] xm-lint/1 diagnostics=480 errors=120 warnings=360 files=40 shown=40 per_file=5
+lint/tsc-and-vet@2048 7789 d4b75989890fc0fc [xmustard lint] xm-lint/1 diagnostics=300 errors=100 warnings=100 files=30 shown=12 per_file=5
+lint/tsc-and-vet@8192 19733 b8edc3fe83c6bbdf [xmustard lint] xm-lint/1 diagnostics=300 errors=100 warnings=100 files=30 shown=40 per_file=5
+lint/fallback@2048 5257 b1afa175735b9c37 [xmustard lint] xm-build/1 lines=902 errors=31 warnings=120 failure_lines=31 (shown 6; search the or
+lint/fallback@8192 21727 ac7390f389798331 [xmustard lint] xm-build/1 lines=902 errors=31 warnings=120 failure_lines=31 (shown 28; search the o
+diff/many-files@2048 10314 db2ffe6336ddd266 [xmustard diff] xm-diff/1 files=80 +480 -240 hunks=240
+diff/many-files@8192 20253 e673bd049744bcdd [xmustard diff] xm-diff/1 files=80 +480 -240 hunks=240
+diff/log-p@2048 10000 2e5a3d377a5334dc [xmustard diff] xm-diff/1 commits=40 file_changes=80 +480 -240 hunks=240
+diff/log-p@8192 19635 0d3ebde143762ce3 [xmustard diff] xm-diff/1 commits=40 file_changes=80 +480 -240 hunks=240
+diff/unified@2048 8488 cec4fb4cae332f92 [xmustard diff] xm-diff/1 files=50 +298 -149 hunks=149
+diff/unified@8192 15831 17361567caff6685 [xmustard diff] xm-diff/1 files=50 +298 -149 hunks=149
+diff/meta@2048 7564 a8a66f40381a3235 [xmustard diff] xm-diff/1 commits=1 file_changes=40 +30 -60 hunks=30
+diff/meta@8192 12247 3e6bd2ab71991b4a [xmustard diff] xm-diff/1 commits=1 file_changes=40 +30 -60 hunks=30
+diff/no-hunks@2048 3375 e756ce947c74fb90 [xmustard git] xm-git/1 lines=601
+diff/no-hunks@8192 15571 48bbb639daa23168 [xmustard git] xm-git/1 lines=601
+diff/big-hunk@2048 3089 8f037d4bc4a159e2 [xmustard diff] xm-diff/1 files=2 +501 -1 hunks=2
+diff/big-hunk@8192 7834 54359b74740912ba [xmustard diff] xm-diff/1 files=2 +501 -1 hunks=2
+diff/mangled@2048 8230 cea65452bed7ac3f [xmustard diff] xm-diff/1 files=60 +60 -60 hunks=60
+diff/mangled@8192 13098 8dbfeef39bcd38e8 [xmustard diff] xm-diff/1 files=60 +60 -60 hunks=60
+test/unittest@2048 4261 3c846b9bc9c16dec [xmustard test] xm-test/1 exit=1 lines=3136 passed=3000 failed=1 skipped=0 counts_from=summary faili
+test/unittest@8192 11931 d3dfbcdc37175c57 [xmustard test] xm-test/1 exit=1 lines=3136 passed=3000 failed=1 skipped=0 counts_from=summary faili
+test/go@2048 1748 a2efc0d3de75000f [xmustard test] xm-test/1 lines=6006 passed=3000 failed=1 skipped=0 counts_from=lines failing=TestPa
+test/go@8192 1748 a2efc0d3de75000f [xmustard test] xm-test/1 lines=6006 passed=3000 failed=1 skipped=0 counts_from=lines failing=TestPa
+test/jest@2048 4138 a9106e1584b93d7e [xmustard test] xm-test/1 lines=3052 passed=3000 failed=1 skipped=0 counts_from=summary failing=pars
+test/jest@8192 6316 47df1feeb7d686b5 [xmustard test] xm-test/1 lines=3052 passed=3000 failed=1 skipped=0 counts_from=summary failing=pars
+test/cargo@2048 2302 6ca800118916478f [xmustard test] xm-test/1 lines=3019 passed=3000 failed=1 skipped=0 counts_from=summary failing=test
+test/cargo@8192 2302 6ca800118916478f [xmustard test] xm-test/1 lines=3019 passed=3000 failed=1 skipped=0 counts_from=summary failing=test
+test/go-panic@2048 3960 9f20f39bc4e82a86 [xmustard test] xm-test/1 lines=4050 passed=2000 failed=0 skipped=0 counts_from=lines failure_lines=
+test/go-panic@8192 4565 1277981db21e7829 [xmustard test] xm-test/1 lines=4050 passed=2000 failed=0 skipped=0 counts_from=lines failure_lines=
+shell/noisy@2048 4079 a8a92e927be96dfd [xmustard shell] xm-shell/1 exit=3 lines=6503 failure_lines=1 collapsed=3000
+shell/noisy@8192 15954 433284b54d7474e1 [xmustard shell] xm-shell/1 exit=3 lines=6503 failure_lines=1 collapsed=3000
+shell/traceback@2048 3625 9bed8f329835a3a1 [xmustard shell] xm-shell/1 lines=2059 failure_lines=5
+shell/traceback@8192 15706 f3a5facf24262b6c [xmustard shell] xm-shell/1 lines=2059 failure_lines=5
+shell/exit-text@2048 3695 4e13cf4969e35015 [xmustard shell] xm-shell/1 exit=2 lines=908 failure_lines=1 collapsed=6
+shell/exit-text@8192 15817 17abaad00d0439b4 [xmustard shell] xm-shell/1 exit=2 lines=908 failure_lines=1 collapsed=6
+shell/sections@2048 3504 06d5b9019c0519ff [xmustard shell] xm-shell/1 lines=1805 failure_lines=2
+shell/sections@8192 15574 c3abf8932e5f2228 [xmustard shell] xm-shell/1 lines=1805 failure_lines=2
+build/make@2048 3722 b7dddece7060a62f [xmustard build] xm-build/1 exit=1 lines=1211 errors=2 warnings=6 failure_lines=2
+build/make@8192 15937 1f2e13de3af74d8b [xmustard build] xm-build/1 exit=1 lines=1211 errors=2 warnings=6 failure_lines=2
+log/app@2048 4590 b0b843ccb5d3fccf [xmustard log] xm-log/1 lines=4010 errors=2 warnings=8 repeats=3990 failure_lines=2 collapsed=3990
+log/app@8192 5690 8a0595b178921c30 [xmustard log] xm-log/1 lines=4010 errors=2 warnings=8 repeats=3990 failure_lines=2 collapsed=3990
+git/status@2048 3510 d052fdddb11d9cc0 [xmustard git] xm-git/1 lines=807 failure_lines=2
+git/status@8192 15825 3f570920bc21b5b0 [xmustard git] xm-git/1 lines=807 failure_lines=2
+read/source@2048 3333 890795ee3e10e60e [xmustard read] xm-read/1 big.go lines 20-4223 (4204 lines): excerpt 20-70, outline 2 lines, tail 42
+read/source@8192 12747 c1884dbb482fee37 [xmustard read] xm-read/1 big.go lines 20-4223 (4204 lines): excerpt 20-269, outline 14 lines, tail 
+list/ls@2048 4991 9db690a679eb11e4 [xmustard list] xm-list/1 (unnamed) entries=1500 dirs=167 shown=27
+list/ls@8192 6701 b8ce969cc0fac538 [xmustard list] xm-list/1 (unnamed) entries=1500 dirs=167 shown=40
+glob/paths@2048 6084 eda4367e1de09e3f [xmustard glob] xm-glob/1 (unnamed) entries=2000 shown=60
+glob/paths@8192 6084 eda4367e1de09e3f [xmustard glob] xm-glob/1 (unnamed) entries=2000 shown=60
+structured/status@2048 3567 32933c0e6825a53e {"ok":false,"status":"failed","exit_code":2,"runs":[{"id":0,"job":"job-00000","state":"passed","log"
+structured/status@8192 11568 fbfcc81aad05f9a5 {"ok":false,"status":"failed","exit_code":2,"runs":[{"id":0,"job":"job-00000","state":"passed","log"
+json/salient-array@2048 2694 8ed1982eca432ca1 [[0,1,2],{"i":1,"result":"ok","note":"item 1 is fine"},{"i":2,"result":"ok","note":"item 2 is fine"}
+json/salient-array@8192 8866 896d16ac70510666 [[0,1,2],{"i":1,"result":"ok","note":"item 1 is fine"},{"i":2,"result":"ok","note":"item 2 is fine"}
+json/nested@2048 2566 0f3557eddd6a3806 {"exit_code":3,"groups":[{"blob":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+json/nested@8192 6943 27644a1ab1c8d9a5 {"exit_code":3,"groups":[{"blob":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+json/big-first@2048 1409 f578b5be38a55468 [{"payload":"large large large large large large large large large large large large large large lar
+json/big-first@8192 4482 49fdc6a857363b03 [{"payload":"large large large large large large large large large large large large large large lar
+text/log@2048 1231 db873a01787081da 2026-09-25T12:00:00.000Z INFO request id=00000000 served in 0ms
+text/log@8192 3697 53c757ebee1f1d5d 2026-09-25T12:00:00.000Z INFO request id=00000000 served in 0ms
+text/long-lines@2048 9908 f9f7333c17c5a60f [xmustard: 149 lines omitted, bytes 0-3317]
+text/long-lines@8192 9908 f9f7333c17c5a60f [xmustard: 149 lines omitted, bytes 0-3317]
+text/traceback@2048 1125 9307d84e0360c1cc [xmustard: 1198 lines omitted, bytes 0-37226]
+text/traceback@8192 2500 3bdb428a32d3efd2 INFO loading shard 0 of 1200
