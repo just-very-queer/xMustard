@@ -276,6 +276,14 @@ bearer_token_env_var = "XMUSTARD_API_TOKEN"
 http_headers = { "X-Xmustard-Workspace" = "<id>" }
 ```
 
+Codex hooks ([`integrations/codex`](integrations/codex/README.md)) add the output reduction and
+pushed memory that the Claude Code plugin gives. They were merged after v0.1.1, so they need a
+source checkout (`make build`) until the next release.
+`xmustard-ops codex-hooks config --hook-bin <absolute path to xmustard-hook> > ~/.codex/hooks.json`
+writes them. Codex runs them only once you trust them, and xMustard never does that for you:
+review them in Codex's `/hooks` view, or run `xmustard-ops codex-hooks trust` with the same
+`--hook-bin` in your own terminal and type `trust`.
+
 </details>
 
 <details>
@@ -480,10 +488,11 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md).
   watcher that keeps the resident index fresh, a background service (launchd or systemd) with
   store backup and restore, file-level `impact`, and a tag-triggered release workflow.
 - **Merged since v0.1.1, not yet released:** impact v2 (depth tiers, risk, a completeness
-  label, typed filters, diff-to-symbol scopes and import cycles) and memory review at propose
-  time (duplicates, corroborations, code anchors, tiered conflicts and structured claims). The
-  [changelog](docs/CHANGELOG.md#unreleased) lists them.
-- **Next:** Codex hooks, an OpenCode plugin and Cursor hooks; the hook client in the release
+  label, typed filters, diff-to-symbol scopes and import cycles), memory review at propose
+  time (duplicates, corroborations, code anchors, tiered conflicts and structured claims) and
+  Codex hooks with consent-gated trust. The [changelog](docs/CHANGELOG.md#unreleased) lists
+  them.
+- **Next:** an OpenCode plugin and Cursor hooks; the hook client in the release
   archive; a Homebrew formula on the prebuilt Linux archive.
 - **Later:** a static-embedding search lane, symbol resolvers for Rust, Python and Java, session
   handoff between clients, and an evaluation suite for memory and context reduction.
@@ -507,7 +516,7 @@ local one (`brew tap-new`) until a public tap exists.
 - [Documentation map](docs/README.md), [vision](docs/VISION.md), [architecture](docs/ARCHITECTURE.md) and [status](docs/STATUS.md)
 - [Security model](docs/SECURITY.md), [v0.1.1 release notes](docs/releases/v0.1.1.md) and [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Benchmarks and gates](scripts/bench/README.md) and the [measurement records](docs/benchmarks/)
-- [Claude Code plugin](integrations/claude-code/README.md) and [Pi extension](integrations/pi/README.md)
+- [Claude Code plugin](integrations/claude-code/README.md), [Codex hooks](integrations/codex/README.md) (unreleased) and [Pi extension](integrations/pi/README.md)
 
 **Contributing.** Start with [AGENTS.md](AGENTS.md). Run `make check-backend` (Go tests and build,
 Rust tests and Clippy) before you open a pull request.

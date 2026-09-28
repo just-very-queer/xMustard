@@ -153,10 +153,12 @@ one applies and the tool's arguments; an unknown tool is a JSON-RPC `-32602`.
   Its built-in tool reduction, masking and compaction go through evidence capture,
   which works in release builds since v0.1.1; its end-to-end test passes 9 of 18 tests
   (nine need a large-result fixture, a WS-24 follow-up).
-- **Codex, OpenCode and Cursor: MCP configuration only.** There is no Codex hook
-  package, OpenCode plugin or Cursor hook yet. The server already decodes their hook
+- **Codex, OpenCode and Cursor: MCP configuration only.** v0.1.1 has no Codex hook
+  package, OpenCode plugin or Cursor hook. The server already decodes their hook
   bodies and shapes results for each through one shaper registry
-  (`api-go/internal/evidence/`). Adapters for these clients are planned (WS-40).
+  (`api-go/internal/evidence/`). Codex hooks were merged after v0.1.1
+  ([changelog](CHANGELOG.md#unreleased)); the OpenCode and Cursor adapters are planned
+  (WS-40).
 
 ## Security and governance
 

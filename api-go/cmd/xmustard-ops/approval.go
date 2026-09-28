@@ -26,16 +26,22 @@ import (
 // places agent processes of this user can read. Nothing here merges, changes branch
 // protection or posts anywhere.
 
-// opsEnv is what the approval commands read and write, so tests can drive them.
+// opsEnv is what the approval and codex-hooks commands read and write, so tests can
+// drive them.
 type opsEnv struct {
 	stdout, stderr io.Writer
 	getenv         func(string) string
 	// prompt reads a secret typed at the controlling terminal.
 	prompt func(label string) (string, error)
+	// confirm reads a line typed at the controlling terminal (echo on).
+	confirm func(label string) (string, error)
+	// codex starts `codex app-server` (codex_hooks.go).
+	codex func(bin string) (*appServer, func(), error)
 }
 
 func defaultOpsEnv() opsEnv {
-	return opsEnv{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv, prompt: readTerminalSecret}
+	return opsEnv{stdout: os.Stdout, stderr: os.Stderr, getenv: os.Getenv, prompt: readTerminalSecret,
+		confirm: readTerminalLine, codex: startAppServer}
 }
 
 // approvalCommands are the subcommands this file adds to xmustard-ops.

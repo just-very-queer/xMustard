@@ -769,7 +769,11 @@ lines also mask credential-shaped words. Capture refuses the output of a secret 
 ## Client hooks (WS-23)
 
 Claude Code posts hook events to `POST /api/hooks/claude/<Event>` (an http hook) or
-through the static client `xmustard-hook` over a Unix socket (a command hook).
+through the static client `xmustard-hook` over a Unix socket (a command hook). After
+v0.1.1, Codex hooks (WS-40a) join them. Codex has no http hook handler, so it runs the
+client for every event (`xmustard-hook codex <Event>`), which posts to
+`POST /api/hooks/codex/<Event>`. Both clients' routes share the handlers and every rule
+below.
 
 - **Authentication and roles.** Every hook route has a row in the route gate table
   below: core, the proposer role, served in read-only mode (a hook stores only the
@@ -821,7 +825,43 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
 - **Processes.** The daemon starts no process for a hook: Rust work runs only on a
   resident worker that is already running. Claude Code itself starts the static client
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
-  other event is an http hook to the running daemon.
+  other event is an http hook to the running daemon. Codex starts the client, through
+  `$SHELL -lc`, for each event its hooks.json registers.
+- **Codex answers** carry only the keys of Codex's output schema for the event (its
+  wires deny unknown fields; `hooks.ValidateCodexAnswer` checks every golden and live
+  answer). A PostToolUse `decision: "block"` replaces the tool output the model sees
+  with the reduction, and nothing else is decided: no `permissionDecision`,
+  `updatedInput` or `continue`. A block reason says that a shell command's exit
+  status is unknown, because the block also hides Codex's own header, which carries
+  it.
+- **Codex hook trust.** Codex runs a user or project hook only while the hash of its
+  definition is trusted (`hooks.state.<key>.trusted_hash` in its config.toml), and
+  xMustard never writes that on its own. `xmustard-ops codex-hooks trust` asks
+  `codex app-server` for the hooks Codex would run (`hooks/list`). It offers only
+  xMustard's own untrusted or modified hooks: synchronous command hooks whose command
+  parses as exactly `<client> codex <Event> [--workspace <id>]` for the event it is
+  registered on, where `<client>` is the one `--hook-bin` names (default
+  `xmustard-hook`, found on Codex's `PATH`).
+  - The client must be `xmustard-hook` itself or an absolute path to a file of that
+    name, every character printable (`hooks.ValidCodexClient`). A relative path or a
+    `NAME=value` prefix would run what the repository holds, since Codex runs the
+    command in the session's cwd. `config` refuses such a `--hook-bin` too.
+  - A hook for another `xmustard-hook`, say one a repository's `.codex/hooks.json`
+    points at, is not offered. The report counts these and names their clients.
+  - The pin must be a safe id (`transport.ValidWorkspaceID`, the client's own check);
+    `config --workspace-id` refuses anything else. The daemon checks the header it
+    becomes like any other.
+  - Every command, source path and Codex message is printed quoted, with control
+    characters escaped, so a file cannot repaint the listing.
+  - The hashes are recorded (`config/batchWrite`, `hooks.state`) only after the user
+    types `trust` at the controlling terminal. No flag skips the prompt, and without a
+    terminal it refuses. A terminal proves less than a secret: Codex can run a command
+    on a pty that becomes its controlling terminal and type into it. So `trust` also
+    refuses when the environment shows an agent's shell (`CODEX_THREAD_ID`,
+    `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED` or `CLAUDECODE`). An agent with
+    full access could still edit config.toml directly, which no prompt prevents.
+  - A hook changed afterwards has a new hash, and Codex stops running it until it is
+    trusted again.
 
 ## Daemon service (WS-58)
 
@@ -910,6 +950,14 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/claude/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
 | `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity |
+| `POST /api/hooks/codex/PostCompact` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/codex/PostToolUse` | core | proposer | served |  | hook: captures the caller's own tool output; decision=block with the projection as reason |
+| `POST /api/hooks/codex/PreToolUse` | core | proposer | served |  | hook: index hits and memories for a Bash search or the files of an apply_patch |
+| `POST /api/hooks/codex/SessionEnd` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/codex/SessionStart` | core | proposer | served |  | hook: ground's spawn-free part and core-tier memories as context |
+| `POST /api/hooks/codex/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent, which has steering state of its own |
+| `POST /api/hooks/codex/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/codex/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |

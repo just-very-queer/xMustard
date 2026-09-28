@@ -233,6 +233,10 @@ As of 2026-09-28. Workstream numbers refer to the
   `index update` rewrites it.
 - **WS-27**: dedupe, code anchors, tiered conflicts and structured claims for memory.
   The governance store moves to schema version 4, which v0.1.1 cannot open.
+- **WS-40a**: Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
+  eight Codex events to `/api/hooks/codex/<Event>`, and `xmustard-ops codex-hooks
+  config|status|trust` writes `hooks.json` and records trust only after the user types
+  `trust` at their own terminal. Needs a source build until the next release.
 
 **On workstream branches, not yet merged**
 
@@ -240,7 +244,7 @@ As of 2026-09-28. Workstream numbers refer to the
 - **WS-33** (`parity/ws-33`): session ledger, compaction snapshot and cross-client
   handoff.
 - **WS-36** (`parity/ws-36`): symbol navigation behind search, explain and impact.
-- **WS-40a and WS-40b** (`parity/ws-40a`, `parity/ws-40b`): Codex and OpenCode adapters.
+- **WS-40b** (`parity/ws-40b`): OpenCode adapter.
 - **WS-42** (`parity/ws-42`): repeat guard and revision-keyed result cache.
 - **WS-CQ-01** (`parity/ws-cq-01`): one route list for the API.
 

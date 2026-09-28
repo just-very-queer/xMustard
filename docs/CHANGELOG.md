@@ -35,6 +35,32 @@ review are listed in [Status](STATUS.md#in-progress).
   (100,000) bound pending proposals per principal and active memories per workspace.
 - `make check-rss-lines`, run by `make check-backend`: the release build's heavy-slot
   and index-service RSS lines.
+- Codex hooks (WS-40a, [integrations/codex](../integrations/codex/README.md)). Codex
+  runs the static client for every hooked event (`xmustard-hook codex <Event>
+  [--workspace <id>]`), which posts it to `POST /api/hooks/codex/<Event>`: SessionStart,
+  SubagentStart, UserPromptSubmit, PreToolUse, PostToolUse, PostCompact, SubagentStop
+  and SessionEnd. A large Bash or MCP output comes back as a PostToolUse
+  `decision: "block"` whose reason is the redacted reduction, within Codex's
+  10,000-byte spill limit and with the recovery line last; pre-tool hooks add index
+  hits and approved memory, and `apply_patch` edits feed the watcher and the syntax
+  delta. Answers carry only the keys Codex's output schema takes.
+  `xmustard-ops codex-hooks config|status|trust` writes Codex's `hooks.json`, reports
+  which events are registered and trusted (`status` exits 3 until all are), and
+  records the hooks' hashes as trusted only after you type `trust` at your own
+  terminal. Trust is never set automatically, and `trust` refuses inside an agent's
+  shell. To install, from a source checkout:
+  1. `make build` (or `make install PREFIX=$HOME/.local`), and put
+     `api-go/bin/xmustard-hook` on Codex's `PATH` or note its absolute path. The v0.1.1
+     archive's client and API do not serve Codex.
+  2. Run the API with `XMUSTARD_CORE_WORKER=1`, register the repository
+     (`xmustard-ops workspace load --root-path "$PWD"`), and once tokens exist export
+     an agent token as `XMUSTARD_API_TOKEN` for Codex.
+  3. `xmustard-ops codex-hooks config --hook-bin <absolute path to xmustard-hook> >
+     ~/.codex/hooks.json`, or `--root "$PWD"` into `<repo>/.codex/hooks.json` to pin
+     one project. `--hook-bin` must be `xmustard-hook` itself or an absolute path.
+  4. Review and trust the hooks in Codex's `/hooks` view, or run
+     `xmustard-ops codex-hooks trust --cwd "$PWD" --hook-bin <the same path>` in your
+     own terminal and type `trust`.
 
 ### Changed
 - `impact` refuses an argument of another form (for example `scope=` beside
