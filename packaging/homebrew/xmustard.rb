@@ -9,19 +9,19 @@
 class Xmustard < Formula
   desc "Governed runtime memory and grounding for coding agents (MCP server)"
   homepage "https://github.com/just-very-queer/xMustard"
-  license "MIT"
+  license all_of: ["MIT", "Apache-2.0"]
 
   stable do
-    version "0.1.0"
+    version "0.1.1"
 
     on_macos do
       on_arm do
-        url "https://github.com/just-very-queer/xMustard/releases/download/v0.1.0/xmustard-v0.1.0-darwin-arm64.tar.gz"
-        sha256 "68775ed049c3198e78633333dcb8db308b917b357d9d1bd281a619b45b7fc479"
+        url "https://github.com/just-very-queer/xMustard/releases/download/v0.1.1/xmustard-v0.1.1-darwin-arm64.tar.gz"
+        sha256 "20cc1dfaf29d9b925f0f0d306d433ef20d5161f475fcc95bc2ac952e5a322112"
       end
       on_intel do
-        url "https://github.com/just-very-queer/xMustard/archive/refs/tags/v0.1.0.tar.gz"
-        sha256 "e47990365fdd23c7e9e63a2005058c14e6d116934fee511ec1d467e275dac0d4"
+        url "https://github.com/just-very-queer/xMustard/archive/refs/tags/v0.1.1.tar.gz"
+        sha256 "f3c21a95ee719c38fc34f8abc9eb85ebcfa2851dd5f0be3bf5f0abd32910ed7d"
 
         depends_on "go" => :build
         depends_on "rust" => :build
@@ -29,8 +29,8 @@ class Xmustard < Formula
     end
 
     on_linux do
-      url "https://github.com/just-very-queer/xMustard/archive/refs/tags/v0.1.0.tar.gz"
-      sha256 "e47990365fdd23c7e9e63a2005058c14e6d116934fee511ec1d467e275dac0d4"
+      url "https://github.com/just-very-queer/xMustard/archive/refs/tags/v0.1.1.tar.gz"
+      sha256 "f3c21a95ee719c38fc34f8abc9eb85ebcfa2851dd5f0be3bf5f0abd32910ed7d"
 
       depends_on "go" => :build
       depends_on "rust" => :build
@@ -45,17 +45,17 @@ class Xmustard < Formula
   end
 
   def install
-    # A release archive holds the five binaries. A source tree (the tagged tarball or HEAD)
+    # A release archive holds the six binaries. A source tree (the tagged tarball or HEAD)
     # builds them: the Rust core does the semantic work and the Go binaries shell out to it.
     unless File.exist?("rust-core/Cargo.toml")
-      bin.install %w[xmustard-api xmustard-core xmustard-mcp xmustard-ops xmustard-relay]
+      bin.install %w[xmustard-api xmustard-core xmustard-hook xmustard-mcp xmustard-ops xmustard-relay]
       return
     end
 
     # cargo install puts both crate binaries in bin: xmustard-core and xmustard-relay.
     system "cargo", "install", *std_cargo_args(path: "rust-core")
     cd "api-go" do
-      %w[xmustard-api xmustard-mcp xmustard-ops].each do |cmd|
+      %w[xmustard-api xmustard-hook xmustard-mcp xmustard-ops].each do |cmd|
         system "go", "build", *std_go_args(output: bin/cmd), "./cmd/#{cmd}"
       end
     end
