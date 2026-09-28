@@ -36,6 +36,7 @@ func apiRouteAreas() [][]routeSpec {
 		postgresRoutes,
 		workspaceRoutes,
 		issueRoutes,
+		runRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }
