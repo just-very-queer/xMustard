@@ -729,12 +729,11 @@ func (s *hookServer) postToolUse(ctx context.Context, c *hookCall) hookResult {
 
 // --- the session ledger ---
 
-// ledgerKinds is the ledger row a tool call of each class appends (WS-33); an xMustard
-// remember or verify call appends its memory action instead (hooks.OwnMemoryCall).
-var ledgerKinds = map[hooks.ToolClass]string{
+// ledgerFileKinds are the file tools' ledger rows (WS-33); any other call is a
+// tool_call, and an xMustard remember or verify call its memory action
+// (hooks.OwnMemoryCall).
+var ledgerFileKinds = map[hooks.ToolClass]string{
 	hooks.ToolRead: workspaceops.LedgerFileRead, hooks.ToolEdit: workspaceops.LedgerFileModified,
-	hooks.ToolSearch: workspaceops.LedgerToolCall, hooks.ToolShell: workspaceops.LedgerToolCall,
-	hooks.ToolCapture: workspaceops.LedgerToolCall, hooks.ToolOther: workspaceops.LedgerToolCall,
 }
 
 // hookMaxChangedRows bounds the file_modified rows one shell call appends.
@@ -762,7 +761,7 @@ func ledgerBase(c *hookCall) *workspaceops.LedgerSession {
 // file it read or changed, the handle of its captured output, and for a shell call the
 // command (redacted) and a failure's signature.
 func (s *hookServer) recordCall(c *hookCall, status string, obs *evidence.ObservationResult) {
-	ev := workspaceops.LedgerEvent{Kind: ledgerKinds[hooks.ClassOf(c.in.ToolName)], Tool: c.in.ToolName,
+	ev := workspaceops.LedgerEvent{Kind: fallback(ledgerFileKinds[hooks.ClassOf(c.in.ToolName)], workspaceops.LedgerToolCall), Tool: c.in.ToolName,
 		Args: hooks.ArgsDigest(c.in, c.body), Status: status, Path: workspaceops.RelativeToRoot(c.ws, c.in.ToolInput.TargetPath())}
 	if kind, id, ok := hooks.OwnMemoryCall(c.in.ToolName, c.body); ok {
 		ev.Kind, ev.EntryID = kind, id

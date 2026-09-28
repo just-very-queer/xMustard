@@ -21,7 +21,7 @@ const ledgerWS = "wsLedger"
 
 // newLedgerFixture is a data dir with a registered workspace whose root holds two files.
 // The ledger writer is flushed before the data dir is removed.
-func newLedgerFixture(t *testing.T, requireMulti bool) (dir, root string) {
+func newLedgerFixture(t testing.TB, requireMulti bool) (dir, root string) {
 	t.Helper()
 	dir = t.TempDir()
 	t.Cleanup(func() { FlushSessionLedger(dir, 10*time.Second) })
@@ -45,7 +45,7 @@ func ledgerSession(root, client, session, principal string) LedgerSession {
 }
 
 // recordAll queues the events for one session and waits until they are written.
-func recordAll(t *testing.T, dir string, s LedgerSession, evs ...LedgerEvent) {
+func recordAll(t testing.TB, dir string, s LedgerSession, evs ...LedgerEvent) {
 	t.Helper()
 	for _, ev := range evs {
 		ev.LedgerSession = s
@@ -56,7 +56,7 @@ func recordAll(t *testing.T, dir string, s LedgerSession, evs ...LedgerEvent) {
 	flushLedger(t, dir)
 }
 
-func flushLedger(t *testing.T, dir string) {
+func flushLedger(t testing.TB, dir string) {
 	t.Helper()
 	if !FlushSessionLedger(dir, 10*time.Second) {
 		t.Fatal("the ledger did not settle")
@@ -544,4 +544,57 @@ func TestLedgerBoundsHold(t *testing.T) {
 	if last := rows[len(rows)-1]; last.RetentionClass != "session" {
 		t.Fatalf("retention class %q", last.RetentionClass)
 	}
+}
+
+// BenchmarkSessionHandoff measures what a session start and ground pay for the session
+// section: a prior session with a full ledger tail (512 rows), a stored snapshot, a
+// capsule naming two paths, and two pending proposals.
+func BenchmarkSessionHandoff(b *testing.B) {
+	dir, root := newLedgerFixture(b, true)
+	handle := retainedEvidence(b, dir, ledgerWS, "agent-a")
+	s := ledgerSession(root, "claude", "prior", "agent-a")
+	evs := []LedgerEvent{{Kind: LedgerPrompt, Text: "fix the rounding bug in billing"}}
+	for i := range 600 {
+		evs = append(evs, LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: fmt.Sprintf("d%d", i%40), Status: []string{LedgerOK, LedgerError}[i%2],
+			Text: fmt.Sprintf("go test ./pkg%02d/...", i%40), Handle: handle, ExpiresAt: future()},
+			LedgerEvent{Kind: LedgerFileRead, Tool: "Read", Path: fmt.Sprintf("src/f%03d.go", i%100)})
+	}
+	for i := 0; i < len(evs); i += 500 {
+		recordAll(b, dir, s, evs[i:min(i+500, len(evs))]...)
+	}
+	for range 2 {
+		if _, err := Remember(dir, ledgerWS, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t", Content: "pending",
+			Permission: "readwrite"}}, ContextActor{ID: "agent-a"}); err != nil {
+			b.Fatal(err)
+		}
+	}
+	if _, err := RememberHandoff(dir, ledgerWS, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: validCapsule(""),
+		Paths: []string{"src/a.go", "src/b.go"}}}, "claude:prior", ContextActor{ID: "agent-a"}); err != nil {
+		b.Fatal(err)
+	}
+	RecordBoundary(dir, BoundaryPreCompact, LedgerEvent{LedgerSession: s, Text: "auto"})
+	flushLedger(b, dir)
+	ctx := context.Background()
+	b.Run("hook-handoff", func(b *testing.B) {
+		for b.Loop() {
+			if h, err := HookSessionHandoff(ctx, dir, ledgerWS, "claude:next", false, true); err != nil || h == nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	b.Run("ground-session-section", func(b *testing.B) {
+		for b.Loop() {
+			var g SessionGrounding
+			if u := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "", nil); u != nil || g.SessionHandoff == nil {
+				b.Fatal(u)
+			}
+		}
+	})
+	b.Run("build-snapshot", func(b *testing.B) {
+		for b.Loop() {
+			if _, err := BuildSessionSnapshot(ctx, dir, ledgerWS, "claude:prior"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }

@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func writeSnapshotWithRoot(t *testing.T, dataDir, ws, root string) {
+func writeSnapshotWithRoot(t testing.TB, dataDir, ws, root string) {
 	t.Helper()
 	if err := writeJSON(filepath.Join(dataDir, "workspaces", ws, "snapshot.json"),
 		map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": root}}); err != nil {

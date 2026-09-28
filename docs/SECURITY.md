@@ -597,6 +597,55 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
   other event is an http hook to the running daemon.
 
+## Session ledger and handoff (WS-33)
+
+Hooks record what a session does in the session ledger (govstore `sessions` and
+`session_events`), and ground hands it to the next session.
+
+- **What a row keeps.** The tool name, a digest of its arguments (never the
+  arguments), the evidence handle of its captured output, its status, the
+  workspace-relative file it read or changed, and the memory id of a remember or
+  verify call. A prompt, a shell command and a failure signature are kept only as
+  excerpts: redacted with the shared secret rules, whitespace folded, cut to 240 bytes.
+  No tool output is kept beyond the evidence handle, whose original stays under the
+  evidence store's owner and scope checks.
+- **Attribution, not authorization.** A session row is an execution key
+  (`<client>:<session>[:agent:<agent>]`, a component that is not a plain id becomes a
+  digest) bound to the principal that started it. Rows, capsules and the end of a
+  session from another principal are refused as conflicts (`AppendSessionEvent`,
+  `EndSession`). The key and the principal are audit metadata; they grant nothing.
+- **Visibility.** ground returns the session state of the workspace to any caller in
+  the workspace's scope, reader included: the prior session's snapshot (its goal is the
+  first prompt's redacted excerpt), its open failures and files, handles, proposals
+  and capsules, and the last sessions' summaries. Treat prompts as visible to every
+  token scoped to the workspace. Expanding a handle still checks the reader's scope and
+  the original's owner.
+- **Injection.** A snapshot and a capsule are data an agent or a tool produced. The
+  SessionStart context scans each (WS-56) and frames it in `<xmustard-data>` with its
+  trust label (`derived` for the ledger's, `unverified` for an agent's capsule); a
+  flagged one is withheld with a note, never injected. ground returns a capsule with
+  its `injection_flags`. Neither is ever memory: a capsule is not proposed, verified or
+  pushed as memory, and the snapshot is a derived row.
+- **Handoff capsules.** `remember(kind=handoff)` is schema-checked (closed members, at
+  most 500 words, 20 items per list, 1000 bytes per text; every violation is named in
+  the 400), redacted like any remember write, and its paths are confined to the
+  workspace root before they are hashed. It goes into the caller's own session: a
+  `session_id` naming another principal's session is refused.
+- **Candidate mining.** A Stop or SessionEnd proposes what the session completed (a
+  failure fixed by edits and a passing run; a workflow command that passed twice) as a
+  `kind=candidate` memory authored by the session's principal and asking for peer
+  verification, so neither single-agent nor open mode promotes it. Each finding is
+  proposed once (a `mined-<digest>` tag), even after a rejection.
+- **Transcript references.** At SessionEnd the client's transcript is hashed as an
+  upstream reference only when its path is absolute, ends in `.jsonl`, resolves
+  (symlinks followed) inside the client's transcript root (`$CLAUDE_CONFIG_DIR/projects`
+  or `~/.claude/projects`) and opens as that same regular file; the first 64 MiB are
+  streamed through SHA-256. Only the digest, the byte count and the path are kept.
+- **Bounds.** One writer per data dir; its queue holds 1,024 operations and drops
+  (and counts, `hook_usage.ledger_dropped`) past that, so a hook never waits. A
+  session keeps its newest 2,048 activity rows, 4 snapshots and 8 capsules; the
+  `session` retention class removes rows after 30 days.
+
 ## Evidence capture redaction (WS-FIX-03)
 
 Capture is on in every build, and every capture is redacted.
@@ -684,24 +733,24 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `ANY /api/health` | core | reader | served |  | public liveness and limits; the budget block needs an operator token while auth is enforced |
 | `POST /api/hooks/claude/CwdChanged` | core | proposer | served |  | hook: watchPaths of the new directory's workspace ([] clears the list) |
 | `POST /api/hooks/claude/FileChanged` | core | proposer | served |  | hook: feeds the watcher's pending batch; drops the cached repository identity |
-| `POST /api/hooks/claude/PostCompact` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/PostCompact` | core | proposer | served |  | hook: queued; answered at once; a ledger row |
 | `POST /api/hooks/claude/PostToolBatch` | core | proposer | served |  | hook: batch search nudge |
 | `POST /api/hooks/claude/PostToolUse` | core | proposer | served |  | hook: captures the caller's own tool output; shape-matched updatedToolOutput |
 | `POST /api/hooks/claude/PostToolUseFailure` | core | proposer | served |  | hook: captures the caller's own failed tool output for the run outcome |
-| `POST /api/hooks/claude/PreCompact` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/PreCompact` | core | proposer | served |  | hook: queued; answered at once; the ledger takes the compaction snapshot |
 | `POST /api/hooks/claude/PreToolUse` | core | proposer | served |  | hook: index hits and memories for a search pattern or a file |
-| `POST /api/hooks/claude/SessionEnd` | core | proposer | served |  | hook: queued; answered at once (1.5 s SessionEnd budget) |
-| `POST /api/hooks/claude/SessionStart` | core | proposer | served |  | hook: ground's spawn-free part and core-tier memories as context; watchPaths |
-| `POST /api/hooks/claude/Stop` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/SessionEnd` | core | proposer | served |  | hook: queued; answered at once (1.5 s SessionEnd budget); the ledger closes the session |
+| `POST /api/hooks/claude/SessionStart` | core | proposer | served |  | hook: ground's spawn-free part, core-tier memories and the restored snapshot or prior session's handoff as context; watchPaths |
+| `POST /api/hooks/claude/Stop` | core | proposer | served |  | hook: queued; answered at once; the ledger mines pending candidates |
 | `POST /api/hooks/claude/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent, which has steering state of its own |
-| `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
+| `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once; ends the subagent's ledger session |
 | `POST /api/hooks/claude/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
 | `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |
 | `GET /api/workspaces/{workspace_id}/context` | core | admin | served |  | full memory history |
-| `POST /api/workspaces/{workspace_id}/context` | core | proposer | refused | remember | author is the principal |
+| `POST /api/workspaces/{workspace_id}/context` | core | proposer | refused | remember | author is the principal; kind=handoff appends a capsule to the principal's own session |
 | `GET /api/workspaces/{workspace_id}/context/active` | core | reader | served | recall | scope=all needs admin; unverified text and history need verifier or human-approver |
 | `DELETE /api/workspaces/{workspace_id}/context/{entry_id}` | core | human-approver | refused |  | retract; purge=true deletes the text and keeps a digest tombstone |
 | `PUT /api/workspaces/{workspace_id}/context/{entry_id}` | core | proposer | refused |  | memory edit; author or admin only |
@@ -720,7 +769,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}` | core | admin | refused |  | removes one outcome (a secret the redactor missed in its command or tail) |
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
 | `GET /api/workspaces/{workspace_id}/search` | core | reader | served | search |  |
-| `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground |  |
+| `GET /api/workspaces/{workspace_id}/session-grounding` | core | reader | served | ground | session state of the workspace's recent sessions (WS-33) |
 | `POST /api/workspaces/{workspace_id}/why-failed` | core | proposer | refused | why_failed | reads an evidence tail or a log and records the outcome; a command runs only with XMUSTARD_WHY_FAILED_COMMANDS=1 and an authenticated admin (host-code execution; the closed program table is not a sandbox) |
 | `DELETE /mcp` | core | reader | served |  | ends the caller's own MCP session |
 | `GET /mcp` | core | reader | served |  | no server-initiated stream: 405 |

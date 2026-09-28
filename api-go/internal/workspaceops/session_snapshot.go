@@ -380,10 +380,11 @@ func proposalState(ctx context.Context, r govstore.Reader, workspaceID string, i
 	if len(ids) == 0 {
 		return nil, nil, nil
 	}
-	pending, err := pendingByID(ctx, r, workspaceID)
+	view, err := pendingRanking(ctx, r, workspaceID)
 	if err != nil {
 		return nil, nil, err
 	}
+	pending := pendingByID(view)
 	var props []SnapshotProposal
 	var decisions []string
 	for i := len(ids) - 1; i >= 0; i-- { // newest first
@@ -401,18 +402,23 @@ func proposalState(ctx context.Context, r govstore.Reader, workspaceID string, i
 	return props, decisions, nil
 }
 
-// pendingByID is the workspace's pending memory with the peer votes each still needs.
-func pendingByID(ctx context.Context, r govstore.Reader, workspaceID string) (map[string]SnapshotProposal, error) {
-	view, err := r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: []string{govstore.RankPending}})
-	if err != nil {
-		return nil, err
-	}
+// pendingRanking is the workspace's pending memory, oldest first.
+func pendingRanking(ctx context.Context, r govstore.Reader, workspaceID string) ([]govstore.RankEntry, error) {
+	return r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: []string{govstore.RankPending}})
+}
+
+// proposalOf is a pending memory with the peer votes it still needs.
+func proposalOf(e govstore.RankEntry) SnapshotProposal {
+	return SnapshotProposal{ID: e.ID, Title: cutBytes(e.Title, snapTitleMax), VotesNeeded: max(1, e.RequiredVerifications-e.PeerApprovals)}
+}
+
+// pendingByID indexes pending memory by id.
+func pendingByID(view []govstore.RankEntry) map[string]SnapshotProposal {
 	out := make(map[string]SnapshotProposal, len(view))
 	for _, e := range view {
-		out[e.ID] = SnapshotProposal{ID: e.ID, Title: cutBytes(e.Title, snapTitleMax),
-			VotesNeeded: max(1, e.RequiredVerifications-e.PeerApprovals)}
+		out[e.ID] = proposalOf(e)
 	}
-	return out, nil
+	return out
 }
 
 // storeSnapshot builds a session's snapshot and appends it as a derived ledger row. It

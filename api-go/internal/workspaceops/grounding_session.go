@@ -137,18 +137,22 @@ func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspace
 			return err
 		}
 		main := mainSessions(sessions)
+		view, err := pendingRanking(ctx, r, workspaceID)
+		if err != nil {
+			return err
+		}
 		for _, ss := range main[:min(len(main), groundLastSessions)] {
 			s.LastSessions = append(s.LastSessions, SessionBrief{ID: ss.ID, Client: ss.Client, Principal: ss.Principal,
 				Status: ss.Status, Branch: ss.Branch, StartedAt: ss.StartedAt, LastSeenAt: ss.LastSeenAt,
 				Summary: cutBytes(ss.Summary, groundViewTextMax)})
 		}
-		if s.SessionHandoff, err = handoffFrom(ctx, r, root, workspaceID, sessionID, sessionID != "", true, main, now); err != nil {
+		if s.SessionHandoff, err = handoffFrom(ctx, r, root, workspaceID, sessionID, sessionID != "", true, main, view, now); err != nil {
 			return err
 		}
 		if s.SessionHandoff != nil {
 			s.SessionHandoff.DriftStale = driftStale
 		}
-		if s.Continuity, err = continuity(ctx, r, workspaceID, main, now); err != nil {
+		if s.Continuity, err = continuity(ctx, r, workspaceID, main, pendingByID(view), now); err != nil {
 			return err
 		}
 		recs, err := latestHandoffs(ctx, r, root, workspaceID, groundHandoffs)
@@ -189,7 +193,11 @@ func HookSessionHandoff(ctx context.Context, dataDir, workspaceID, key string, o
 		if err != nil {
 			return err
 		}
-		h, err = handoffFrom(ctx, r, contextRoot(dataDir, workspaceID), workspaceID, key, own, prior, mainSessions(sessions), time.Now().UTC())
+		view, err := pendingRanking(ctx, r, workspaceID)
+		if err != nil {
+			return err
+		}
+		h, err = handoffFrom(ctx, r, contextRoot(dataDir, workspaceID), workspaceID, key, own, prior, mainSessions(sessions), view, time.Now().UTC())
 		return err
 	})
 	return h, err
@@ -198,7 +206,8 @@ func HookSessionHandoff(ctx context.Context, dataDir, workspaceID, key string, o
 // handoffFrom picks the session to hand over and builds its handoff: with own, the
 // caller's session (sessionID) when it has a ledger; with prior (and no own session),
 // the most recently seen other session.
-func handoffFrom(ctx context.Context, r govstore.Reader, root, workspaceID, sessionID string, own, prior bool, main []govstore.Session, now time.Time) (*SessionHandoff, error) {
+func handoffFrom(ctx context.Context, r govstore.Reader, root, workspaceID, sessionID string, own, prior bool,
+	main []govstore.Session, pending []govstore.RankEntry, now time.Time) (*SessionHandoff, error) {
 	var from *govstore.Session
 	restore := false
 	if own && sessionID != "" {
@@ -223,9 +232,7 @@ func handoffFrom(ctx context.Context, r govstore.Reader, root, workspaceID, sess
 	if h.Handles, err = recentHandles(ctx, r, workspaceID, from.ID, now); err != nil {
 		return nil, err
 	}
-	if h.PendingProposals, err = awaitingVerifier(ctx, r, workspaceID, from.Principal, snap.PendingProposals); err != nil {
-		return nil, err
-	}
+	h.PendingProposals = awaitingVerifier(pending, from.Principal, snap.PendingProposals)
 	if _, row, ok := latestCapsule(ctx, r, workspaceID, from.ID); ok {
 		h.Capsule, _ = capsuleRecord(ctx, r, root, workspaceID, row)
 	}
@@ -253,21 +260,14 @@ func recentHandles(ctx context.Context, r govstore.Reader, workspaceID, key stri
 
 // awaitingVerifier is what a new session can verify first: the proposals the prior
 // session recorded, then the other pending memory its principal wrote, newest first.
-func awaitingVerifier(ctx context.Context, r govstore.Reader, workspaceID, principal string, recorded []SnapshotProposal) ([]SnapshotProposal, error) {
+func awaitingVerifier(pending []govstore.RankEntry, principal string, recorded []SnapshotProposal) []SnapshotProposal {
 	out := append([]SnapshotProposal(nil), recorded...)
-	view, err := r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: []string{govstore.RankPending}})
-	if err != nil {
-		return nil, err
-	}
-	for i := len(view) - 1; i >= 0 && len(out) < snapMaxProposals; i-- {
-		e := view[i]
-		if !strings.EqualFold(e.Author, principal) || containsProposal(out, e.ID) {
-			continue
+	for i := len(pending) - 1; i >= 0 && len(out) < snapMaxProposals; i-- {
+		if e := pending[i]; strings.EqualFold(e.Author, principal) && !containsProposal(out, e.ID) {
+			out = append(out, proposalOf(e))
 		}
-		out = append(out, SnapshotProposal{ID: e.ID, Title: cutBytes(e.Title, snapTitleMax),
-			VotesNeeded: max(1, e.RequiredVerifications-e.PeerApprovals)})
 	}
-	return out, nil
+	return out
 }
 
 func containsProposal(list []SnapshotProposal, id string) bool {
@@ -280,14 +280,10 @@ func containsProposal(list []SnapshotProposal, id string) bool {
 }
 
 // continuity reads what the most recent sessions left open.
-func continuity(ctx context.Context, r govstore.Reader, workspaceID string, main []govstore.Session, now time.Time) (*Continuity, error) {
+func continuity(ctx context.Context, r govstore.Reader, workspaceID string, main []govstore.Session, pending map[string]SnapshotProposal,
+	now time.Time) (*Continuity, error) {
 	c := &Continuity{RecentActionable: []ContinuityItem{}, OpenItems: []ContinuityItem{}}
-	recent := main[:min(len(main), groundRecentWindow)]
-	pending, err := pendingByID(ctx, r, workspaceID)
-	if err != nil {
-		return nil, err
-	}
-	for _, sess := range recent {
+	for _, sess := range main[:min(len(main), groundRecentWindow)] {
 		rows, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: sess.ID,
 			Kinds: []string{LedgerToolCall, LedgerMemoryProposed}, Limit: groundRecentCalls / groundRecentWindow})
 		if err != nil {

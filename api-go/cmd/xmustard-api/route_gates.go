@@ -76,9 +76,9 @@ var routeGateTable = map[string]routeGate{
 	"POST /api/workspaces/{workspace_id}/index": coreGate(roleIndexer, "", "rebaseline the index; agents cannot reset it"),
 
 	// --- core: the nine MCP tools ---
-	"GET /api/workspaces/{workspace_id}/session-grounding":           coreGate(roleReader, "ground", ""),
+	"GET /api/workspaces/{workspace_id}/session-grounding":           coreGate(roleReader, "ground", "session state of the workspace's recent sessions (WS-33)"),
 	"GET /api/workspaces/{workspace_id}/context/active":              coreGate(roleReader, "recall", "scope=all needs admin; unverified text and history need verifier or human-approver"),
-	"POST /api/workspaces/{workspace_id}/context":                    coreGate(roleProposer, "remember", "author is the principal"),
+	"POST /api/workspaces/{workspace_id}/context":                    coreGate(roleProposer, "remember", "author is the principal; kind=handoff appends a capsule to the principal's own session"),
 	"POST /api/workspaces/{workspace_id}/context/{entry_id}/verify":  coreGate(roleVerifier, "verify", "verifier is the principal"),
 	"GET /api/workspaces/{workspace_id}/search":                      coreGate(roleReader, "search", ""),
 	"GET /api/workspaces/{workspace_id}/explain-path":                coreGate(roleReader, "explain", ""),
@@ -109,7 +109,7 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/workspaces/{workspace_id}/evidence/search":      coreGate(roleReader, "", "issuer-bound search in an original"),
 
 	// --- core: Claude Code hook service (hooks_routes.go, WS-23) ---
-	"POST /api/hooks/claude/SessionStart":       hookGate("ground's spawn-free part and core-tier memories as context; watchPaths"),
+	"POST /api/hooks/claude/SessionStart":       hookGate("ground's spawn-free part, core-tier memories and the restored snapshot or prior session's handoff as context; watchPaths"),
 	"POST /api/hooks/claude/SubagentStart":      hookGate("the same context for a subagent, which has steering state of its own"),
 	"POST /api/hooks/claude/UserPromptSubmit":   hookGate("memories a prompt keyword triggers"),
 	"POST /api/hooks/claude/PreToolUse":         hookGate("index hits and memories for a search pattern or a file"),
@@ -119,11 +119,11 @@ var routeGateTable = map[string]routeGate{
 	"POST /api/hooks/claude/CwdChanged":         hookGate("watchPaths of the new directory's workspace ([] clears the list)"),
 	"POST /api/hooks/claude/FileChanged":        hookGate("feeds the watcher's pending batch; drops the cached repository identity"),
 	"POST /api/hooks/claude/WorktreeRemove":     hookGate("forgets the worktree's cached identity"),
-	"POST /api/hooks/claude/PreCompact":         hookGate("queued; answered at once"),
-	"POST /api/hooks/claude/PostCompact":        hookGate("queued; answered at once"),
-	"POST /api/hooks/claude/Stop":               hookGate("queued; answered at once"),
-	"POST /api/hooks/claude/SubagentStop":       hookGate("queued; answered at once"),
-	"POST /api/hooks/claude/SessionEnd":         hookGate("queued; answered at once (1.5 s SessionEnd budget)"),
+	"POST /api/hooks/claude/PreCompact":         hookGate("queued; answered at once; the ledger takes the compaction snapshot"),
+	"POST /api/hooks/claude/PostCompact":        hookGate("queued; answered at once; a ledger row"),
+	"POST /api/hooks/claude/Stop":               hookGate("queued; answered at once; the ledger mines pending candidates"),
+	"POST /api/hooks/claude/SubagentStop":       hookGate("queued; answered at once; ends the subagent's ledger session"),
+	"POST /api/hooks/claude/SessionEnd":         hookGate("queued; answered at once (1.5 s SessionEnd budget); the ledger closes the session"),
 
 	// --- platform: operator configuration ---
 	"GET /api/runtimes":                platformGate(roleReader, ""),
