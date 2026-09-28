@@ -23,7 +23,7 @@ func (s *Spec) Markdown() string {
 		fmt.Fprintf(&b, "\n%s:\n\n| rung | reduces | what changes |\n|---|---|---|\n", l.Shape)
 		for _, r := range l.Rungs {
 			target := r.List
-			if r.Op == opSignals {
+			if r.Op == opSignals || r.Op == opFlags {
 				target = strings.Join(l.Signals, ", ")
 			}
 			if r.Op == opOmit {
@@ -37,8 +37,9 @@ func (s *Spec) Markdown() string {
 	}
 	b.WriteString("\nA list that returns fewer items than its page holds sets `has_more`; a paged list's `next_cursor` continues " +
 		"at the first item not returned, so fewer items loses nothing. Signals are never dropped silently: `signal_counts` " +
-		"keeps every flag and count of coverage and freshness and moves their lists' lengths to `output_budget.signals`; " +
-		"any member no rung names is returned as is. When anything was reduced on an MCP call, the unbudgeted result is " +
+		"and `signal_flags` keep every flag, count and short text of coverage and freshness (and coverage.loss_counts) and " +
+		"move the lengths of the lists and the sizes of the nested objects they remove to `output_budget.signals`; any " +
+		"member no rung names is returned as is. When anything was reduced on an MCP call, the unbudgeted result is " +
 		"retained as evidence: `recover_uri` pages or searches it with resources/read and `recover_handle` names it for " +
 		"clients that expand by handle; `recover_unavailable` says why there is none.\n\n")
 	fmt.Fprintf(&b, "A budgeted result ends with `%s`: `max_chars`, `used_chars` (the result's own size), `degraded_stage` (the "+

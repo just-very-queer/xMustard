@@ -22,8 +22,11 @@ func envelopeMembers(losses, dirty int) map[string]any {
 	}
 	return map[string]any{
 		"coverage": map[string]any{"complete": false, "truncated": false, "indexed_files": 568,
-			"loss_counts": map[string]any{"lexical_fallback": losses}, "losses": lossList},
-		"freshness": map[string]any{"source": "index", "status": "current", "dirty_paths_touching_result": dirtyList},
+			"loss_counts": map[string]any{"lexical_fallback": losses}, "losses": lossList,
+			"languages": map[string]any{"go": map[string]int{"supported": 590, "failed": 6}, "rust": map[string]int{"supported": 77, "failed": 5},
+				"python": map[string]int{"supported": 8, "failed": 2}}},
+		"freshness": map[string]any{"source": "index", "status": "current", "dirty_paths_touching_result": dirtyList,
+			"refresh": map[string]any{"reparsed": 568, "reresolved": 568, "escalated": false}},
 	}
 }
 
@@ -39,7 +42,7 @@ func searchResult(hits, nameLen int) map[string]any {
 			snip = append(snip, map[string]any{"line": 10 + w, "text": fmt.Sprintf("%d: func %s() {\n%d:   body line of the function %03d\n%d: }", 9+w, name, 10+w, i, 11+w)})
 		}
 		list[i] = map[string]any{
-			"kind": "symbol", "name": name, "path": "pkg/" + strings.Repeat("d", nameLen/3) + fmt.Sprintf("/file_%03d.go", i%4), "line": 10 + i, "lines": []int{9, 30},
+			"kind": "symbol", "name": name, "path": "pkg/" + strings.Repeat("d", nameLen) + fmt.Sprintf("/file_%03d.go", i%4), "line": 10 + i, "lines": []int{9, 30},
 			"uid": "Function:pkg/file.go:" + name, "score": 0.05, "scores": map[string]any{"bm25": 8.9, "name": 7.9, "rrf": 0.02},
 			"lanes_matched": []string{"bm25", "name"}, "reasons": reasons, "reason": strings.Join(reasons, " · "), "snippet": snip,
 		}
@@ -96,6 +99,13 @@ func run(t *testing.T, tool string, result map[string]any, req Request, page Pag
 
 func cursorAt(offset int) string { return fmt.Sprintf("C%d", offset) }
 
+// fullSize is the size of result budgeted at the largest max_chars: where a walk down
+// the ladder starts.
+func fullSize(t *testing.T, tool string, result map[string]any) int {
+	t.Helper()
+	return len(run(t, tool, result, Request{MaxChars: MaxMaxChars}, Page{Cursor: cursorAt}, nil).raw)
+}
+
 func TestSmallResultIsReturnedInFull(t *testing.T) {
 	r := searchResult(2, 0)
 	a := run(t, "search", r, Request{MaxChars: 65536}, Page{Cursor: cursorAt}, nil)
@@ -117,7 +127,7 @@ func TestEachSearchStageIsReachedAndNamed(t *testing.T) {
 	rungs := searchLadders[0].Rungs
 	seen := map[string]bool{}
 	last := -1
-	for mc := MaxMaxChars; mc >= MinMaxChars; mc -= 50 {
+	for mc := fullSize(t, "search", r); mc >= MinMaxChars; mc -= 50 {
 		a := run(t, "search", r, Request{MaxChars: mc}, Page{Cursor: cursorAt}, nil)
 		stage := a.rep.DegradedStage
 		idx := slices.IndexFunc(rungs, func(x Rung) bool { return x.Name == stage })
@@ -234,7 +244,7 @@ func TestCountsRungGroupsByPath(t *testing.T) {
 
 func TestSignalCountsKeepFlagsAndReportLengths(t *testing.T) {
 	r := searchResult(10, 600)
-	for mc := MaxMaxChars; mc >= MinMaxChars; mc -= 50 {
+	for mc := fullSize(t, "search", r); mc >= MinMaxChars; mc -= 50 {
 		a := run(t, "search", r, Request{MaxChars: mc}, Page{Cursor: cursorAt}, nil)
 		if a.rep.DegradedStage != "signal_counts" {
 			continue
@@ -254,9 +264,38 @@ func TestSignalCountsKeepFlagsAndReportLengths(t *testing.T) {
 	t.Fatal("signal_counts never reached")
 }
 
+func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
+	r := searchResult(10, 600)
+	for mc := fullSize(t, "search", r); mc >= MinMaxChars; mc -= 50 {
+		a := run(t, "search", r, Request{MaxChars: mc}, Page{Cursor: cursorAt}, nil)
+		if a.rep.DegradedStage != "signal_flags" {
+			continue
+		}
+		cov := a.out["coverage"].(map[string]any)
+		if _, ok := cov["languages"]; ok {
+			t.Fatal("signal_flags keeps coverage.languages")
+		}
+		if cov["loss_counts"] == nil || cov["complete"] != false || cov["indexed_files"] != float64(568) {
+			t.Fatalf("signal_flags dropped a kept member: %v", cov)
+		}
+		fr := a.out["freshness"].(map[string]any)
+		if _, ok := fr["refresh"]; ok || fr["status"] != "current" {
+			t.Fatalf("freshness: %v", fr)
+		}
+		if a.rep.Signals["coverage.languages"] != 3 || a.rep.Signals["freshness.refresh"] != 3 || a.rep.Signals["coverage.losses"] != 6 {
+			t.Fatalf("signals %v", a.rep.Signals)
+		}
+		if _, ok := a.rep.Signals["coverage.loss_counts"]; ok {
+			t.Fatal("a kept member is not reported as removed")
+		}
+		return
+	}
+	t.Fatal("signal_flags never reached")
+}
+
 // explain pages its list itself: the page is cut first, then fitted.
 func TestSlicedPageAndCursor(t *testing.T) {
-	long := strings.Repeat("n", 400)
+	long := strings.Repeat("n", 1800)
 	syms := make([]map[string]any, 12)
 	for i := range syms {
 		syms[i] = map[string]any{"name_path": fmt.Sprintf("Type%02d%s", i, long), "kind": "Struct", "lines": []int{i * 10, i*10 + 9},
@@ -285,7 +324,7 @@ func TestSlicedPageAndCursor(t *testing.T) {
 	}
 	// budgeted: the cluster trims first, then children go, then fewer symbols
 	var stages []string
-	for mc := 20000; mc >= MinMaxChars; mc -= 20 {
+	for mc := 40000; mc >= MinMaxChars; mc -= 20 {
 		b := run(t, "explain", res, Request{MaxChars: mc}, Page{Slice: true, Offset: 2, Limit: 8, Cursor: cursorAt}, nil)
 		if !slices.Contains(stages, b.rep.DegradedStage) {
 			stages = append(stages, b.rep.DegradedStage)
@@ -444,12 +483,12 @@ func TestStaleReportAndNonObjects(t *testing.T) {
 	}
 	spec, _ := For("search")
 	for _, in := range []string{`[1,2]`, `"text"`, `null`} {
-		out, err := spec.Apply([]byte(in), Request{MaxChars: 1000}, Page{}, nil)
+		out, err := spec.Apply([]byte(in), Request{MaxChars: MinMaxChars}, Page{}, nil)
 		if err != nil || string(out) != in {
 			t.Fatalf("%s: %s %v", in, out, err)
 		}
 	}
-	if _, err := spec.Apply([]byte(`{"a":`), Request{MaxChars: 1000}, Page{}, nil); err == nil {
+	if _, err := spec.Apply([]byte(`{"a":`), Request{MaxChars: MinMaxChars}, Page{}, nil); err == nil {
 		t.Fatal("invalid JSON must fail")
 	}
 }
@@ -462,7 +501,7 @@ func TestParseRequestRejectsNeverClamps(t *testing.T) {
 		q    string
 		arg  string
 	}{
-		{search, "max_chars=999", "max_chars"},
+		{search, "max_chars=1999", "max_chars"},
 		{search, "max_chars=65537", "max_chars"},
 		{search, "max_chars=abc", "max_chars"},
 		{search, "max_chars=2000&max_chars=3000", "max_chars"},
@@ -479,9 +518,9 @@ func TestParseRequestRejectsNeverClamps(t *testing.T) {
 			t.Fatalf("%s: %v", c.q, aerr)
 		}
 	}
-	q, _ := url.ParseQuery("max_chars=1000&limit=500&cursor=x")
+	q, _ := url.ParseQuery("max_chars=2000&limit=500&cursor=x")
 	req, aerr := explain.ParseRequest(q)
-	if aerr != nil || req.MaxChars != 1000 || req.Limit != 500 || req.Cursor != "x" || !req.Active() {
+	if aerr != nil || req.MaxChars != 2000 || req.Limit != 500 || req.Cursor != "x" || !req.Active() {
 		t.Fatalf("%+v %v", req, aerr)
 	}
 	req, _ = search.ParseRequest(q)
@@ -510,7 +549,7 @@ func TestLadderTablesAreConsistent(t *testing.T) {
 				}
 				names[r.Name] = true
 				switch r.Op {
-				case opSignals, opOmit:
+				case opSignals, opFlags, opOmit:
 					if r.List != "" {
 						t.Errorf("%s %s: rung %s names a list", tool, l.Shape, r.Name)
 					}

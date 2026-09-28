@@ -118,7 +118,7 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 		"/explain-path?path=src",                                 // explain, directory outline (WS-36)
 		"/explain-path?symbol=ComputeTotal",                      // explain, symbol context (WS-36)
 		"/search?q=ComputeTotal&mode=symbol",                     // search, name path (WS-36)
-		"/search?q=ComputeTotal&max_chars=1000",                  // search, output budget (WS-36)
+		"/search?q=ComputeTotal&max_chars=2000",                  // search, output budget (WS-36)
 	}
 	for round := 0; round < 2; round++ {
 		for _, route := range routes {

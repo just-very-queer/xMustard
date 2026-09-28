@@ -379,6 +379,15 @@ type member struct {
 	nested map[string]*listState // ladder lists inside this object, by key
 	signal bool
 	lens   map[string]int // a signal object's list lengths, by member
+	keys   map[string]int // a signal object's nested object sizes (keys), by member
+}
+
+// dropsSignal reports whether a signal object's member key goes at signal level sig:
+// its lists at sigCounts, its nested objects (but the ladder's Keep ones) at sigFlags.
+func (m *member) dropsSignal(key string, sig int) bool {
+	_, list := m.lens[key]
+	_, obj := m.keys[key]
+	return sig >= sigCounts && list || sig >= sigFlags && obj
 }
 
 type budgeter struct {
@@ -392,7 +401,8 @@ type budgeter struct {
 	origCursor string
 	more       bool
 
-	compact  bool
+	// sig is how far signal objects are reduced: sigFull, sigCounts or sigFlags.
+	sig      int
 	omitted  map[string]bool
 	applied  []string
 	recovery *Recovery
@@ -511,12 +521,14 @@ func (b *budgeter) load(top []kv) {
 		if !m.signal {
 			continue
 		}
+		m.lens, m.keys = map[string]int{}, map[string]int{}
 		for _, s := range m.sub {
-			if isArray(s.raw) {
-				if m.lens == nil {
-					m.lens = map[string]int{}
-				}
+			switch {
+			case isArray(s.raw):
 				m.lens[s.key] = len(elements(s.raw))
+			case isObject(s.raw) && !b.ladder.keeps(m.key+"."+s.key):
+				o, _ := parseObject(s.raw)
+				m.keys[s.key] = len(o)
 			}
 		}
 	}
@@ -564,7 +576,7 @@ func (b *budgeter) reset() {
 	for _, l := range b.lists {
 		l.reset()
 	}
-	b.compact, b.omitted, b.applied = false, map[string]bool{}, nil
+	b.sig, b.omitted, b.applied = sigFull, map[string]bool{}, nil
 }
 
 // fit runs the ladder's rungs in order until the result fits max_chars. A rung is
@@ -586,7 +598,9 @@ func (b *budgeter) fit() {
 func (b *budgeter) step(r Rung) bool {
 	switch r.Op {
 	case opSignals:
-		return b.changes(func() { b.compact = true }, func() { b.compact = false })
+		return b.signals(sigCounts)
+	case opFlags:
+		return b.signals(sigFlags)
 	case opOmit:
 		return b.changes(func() { b.setOmit(r.Omit, true) }, func() { b.setOmit(r.Omit, false) })
 	}
@@ -632,6 +646,22 @@ func (b *budgeter) toMode(l *listState, mode int) bool {
 	}
 	l.mode = mode
 	return true
+}
+
+// Signal reduction levels (the signal_counts and signal_flags rungs).
+const (
+	sigFull   = iota
+	sigCounts // lists inside signal objects become their lengths
+	sigFlags  // signal objects keep their scalars and Keep members
+)
+
+// signals reduces signal objects to level when that shrinks the result.
+func (b *budgeter) signals(level int) bool {
+	if b.sig >= level {
+		return false
+	}
+	prev := b.sig
+	return b.changes(func() { b.sig = level }, func() { b.sig = prev })
 }
 
 // changes applies do and keeps it when the result without its report got smaller;
@@ -812,7 +842,7 @@ func (b *budgeter) writeMember(w *bytes.Buffer, m *member) {
 		if b.omitted[m.key+"."+s.key] {
 			return false
 		}
-		if b.compact && m.signal && isArray(s.raw) {
+		if m.dropsSignal(s.key, b.sig) {
 			return false
 		}
 		if l := m.nested[s.key]; l != nil {
@@ -963,9 +993,15 @@ func (b *budgeter) report(used int) []byte {
 		}
 	}
 	sort.Strings(rep.Omitted)
-	if b.compact {
-		for _, m := range b.members {
-			for key, n := range m.lens {
+	for _, m := range b.members {
+		for _, sizes := range []struct {
+			on bool
+			of map[string]int
+		}{{b.sig >= sigCounts, m.lens}, {b.sig >= sigFlags, m.keys}} {
+			for key, n := range sizes.of {
+				if !sizes.on {
+					continue
+				}
 				if rep.Signals == nil {
 					rep.Signals = map[string]int{}
 				}

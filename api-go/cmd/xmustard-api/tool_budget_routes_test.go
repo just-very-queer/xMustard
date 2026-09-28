@@ -49,23 +49,23 @@ func TestToolBudgetIsOptInOverHTTP(t *testing.T) {
 		if _, ok := out["output_budget"]; ok {
 			t.Fatalf("%s: budgeted without max_chars: %v", route, out)
 		}
-		code, out = budgetGet(t, base+route+"&max_chars=1000", nil)
+		code, out = budgetGet(t, base+route+"&max_chars=2000", nil)
 		if code != http.StatusOK {
 			t.Fatalf("%s budgeted: %d %v", route, code, out)
 		}
 		rep := report(t, out)
-		if rep["max_chars"] != float64(1000) || rep["degraded_stage"] == nil {
+		if rep["max_chars"] != float64(2000) || rep["degraded_stage"] == nil {
 			t.Fatalf("%s: report %v", route, rep)
 		}
-		if rep["over_budget"] != true && rep["used_chars"].(float64) > 1000 {
-			t.Fatalf("%s: %v chars over 1000 without over_budget", route, rep["used_chars"])
+		if rep["over_budget"] != true && rep["used_chars"].(float64) > 2000 {
+			t.Fatalf("%s: %v chars over 2000 without over_budget", route, rep["used_chars"])
 		}
 		if st, _ := rep["stages"].([]any); len(st) > 0 && !strings.HasPrefix(rep["recover_unavailable"].(string), "not a delivered call") {
 			t.Fatalf("%s: a plain HTTP call is told how to get the original: %v", route, rep)
 		}
 	}
 	// out-of-range values are rejected, never clamped, naming the argument
-	for _, q := range []string{"/search?q=x&max_chars=999", "/explain-path?path=src&max_chars=70000", "/explain-path?path=src&limit=0",
+	for _, q := range []string{"/search?q=x&max_chars=1999", "/explain-path?path=src&max_chars=70000", "/explain-path?path=src&limit=0",
 		"/explain-path?symbol=ComputeTotal&limit=2", "/changes/since-index?max_chars=abc", "/search?q=x&max_chars=2000&max_chars=3000"} {
 		code, out := budgetGet(t, base+q, nil)
 		if code != http.StatusBadRequest || out["argument"] == nil {
@@ -155,7 +155,7 @@ func TestSymbolNavigationRoutes(t *testing.T) {
 // evidence and names it in output_budget.
 func TestBudgetedDeliveredCallNamesItsRecovery(t *testing.T) {
 	base := budgetServer(t)
-	code, out := budgetGet(t, base+"/search?q=ComputeTotal&max_chars=1000", deliver)
+	code, out := budgetGet(t, base+"/search?q=ComputeTotal&max_chars=2000", deliver)
 	if code != http.StatusOK {
 		t.Fatalf("%d %v", code, out)
 	}
@@ -165,7 +165,7 @@ func TestBudgetedDeliveredCallNamesItsRecovery(t *testing.T) {
 	}
 	rep := report(t, result)
 	if st, _ := rep["stages"].([]any); len(st) == 0 {
-		t.Skipf("the result fit 1000 chars on this fixture: %v", rep)
+		t.Skipf("the result fit 2000 chars on this fixture: %v", rep)
 	}
 	if uri, _ := rep["recover_uri"].(string); !strings.HasPrefix(uri, "xmustard://evidence/") || rep["recover_handle"] == nil {
 		t.Fatalf("recovery: %v", rep)

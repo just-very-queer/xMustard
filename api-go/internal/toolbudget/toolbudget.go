@@ -25,9 +25,9 @@ import (
 // Budget bounds, in characters of the JSON result (enforced on its UTF-8 bytes, which
 // are never fewer than its characters).
 const (
-	// MinMaxChars is the smallest budget accepted: the signals of a result and its
-	// report fit in it.
-	MinMaxChars = 1000
+	// MinMaxChars is the smallest budget accepted: a result reduced to its signals
+	// and its report fits in it (a search at the total rung measured 1,549 bytes).
+	MinMaxChars = 2000
 	// MaxMaxChars is the evidence projection target (64 KiB): a larger result would be
 	// projected by evidence delivery anyway.
 	MaxMaxChars = groundbudget.MaxMaxChars
