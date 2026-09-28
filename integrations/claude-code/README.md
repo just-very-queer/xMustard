@@ -76,6 +76,13 @@ it.
    call does it), hooks add no index hits and no syntax report. Memory, capture and
    ground work without it.
 
+   To run it as a per-user service instead, use
+   `xmustard-ops setup --env XMUSTARD_CORE_WORKER=1` (the default port, 8042, is the
+   one the hook URLs name). That daemon keeps its tokens in the service's data dir, so
+   mint them with `XMUSTARD_DATA_DIR` set to it. Its hook socket follows the service's
+   environment, which may differ from your shell's; `xmustard-hook` then posts over
+   TCP, or `--env XMUSTARD_HOOK_SOCKET=<path>` pins the socket.
+
 3. Register the repository with the daemon (the MCP tools register the client's root
    on first use; `POST /api/workspaces/load` does it directly), and give Claude Code
    an agent token:
