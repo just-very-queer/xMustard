@@ -3,12 +3,15 @@
 A [Pi](https://github.com/earendil-works/pi) extension that gives Pi xMustard's nine
 tools (`ground`, `recall`, `remember`, `verify`, `search`, `explain`, `impact`,
 `diagnostics`, `why_failed`) as direct HTTP calls to the xMustard Go API, with the same
-names, descriptions and argument schemas as the stdio MCP server. Large results are
+names, descriptions and lean argument schemas as xMustard's MCP server
+(`api-go/internal/mcpserver`, served at `/mcp`). Large results are
 projected by Go's shared evidence module; the model gets a bounded projection plus a
 recovery handle, and `xmustard_expand` (inactive until a handle exists) pages the exact
 original in 64 KiB pages until it expires.
 
-It also reduces what Pi's own tools put into context:
+It is also built to reduce what Pi's own tools put into context, through the evidence
+capture route. **In `v0.1.0` release builds these three fall back to Pi's own
+behavior**, because the API refuses capture; see the note after the list.
 
 - **Built-in tools** (`bash`, `read`, `grep`, `find`, `ls`, `edit`, `write`): a result
   larger than the projection target goes through Go's universal capture route and is
@@ -19,9 +22,22 @@ It also reduces what Pi's own tools put into context:
   advances only in polling windows. The latest failure and files being edited are
   never masked.
 - **Compaction** at `session_before_compact`: a deterministic snapshot of at most 2 KB
-  replaces Pi's model-written summary. Every output it removes stays recoverable:
+  replaces Pi's model-written summary. Every text output it removes stays recoverable:
   larger outputs by their own handle, everything else through one retained index
   document that the snapshot names.
+
+> **Why they fall back, and what still works.** In `v0.1.0` release builds,
+> `POST .../evidence/capture` answers `503 redaction_unavailable`, because no streaming
+> secret redactor is wired into the API's `captureRedactor`
+> (`api-go/cmd/xmustard-api/evidence_capture_routes.go`). It fails closed on purpose:
+> a captured original is retained and searchable, so it must be redacted first. Large
+> built-in results then reach the model as Pi produced them, with the reason in
+> `details.xmustard.reason`; masking masks only results that already carry a handle
+> (xMustard's own reduced tool results and `xmustard_expand` pages); and Pi's own compaction
+> runs whenever a summarized output or the index would need a new handle.
+> The nine tools and `xmustard_expand` do not use the capture route, so they are
+> unaffected. Only the e2e build (`-tags xmustard_e2e`) wires a test redactor; see
+> [Tests](#tests). The production redactor is the next fix, planned for v0.1.1.
 
 ## Pin
 
@@ -29,7 +45,7 @@ It also reduces what Pi's own tools put into context:
 | --- | --- |
 | Researched source | `earendil-works/pi` @ `8676a0dcd8f9f6bca78835e63c8cd31493c4154d` (package.json version `0.87.1`) |
 | Installed package | `@earendil-works/pi-coding-agent@0.87.1` (npm, gitHead `f07218c4`), locked in `package-lock.json` |
-| Compatibility | `8676a0d` is 17 commits after the `0.87.1` publish. Diffing the two revisions shows the extension API this adapter uses (`registerTool`, `on("tool_result")`, `getActiveTools`/`setActiveTools`, `ExtensionContext.signal`, `registerProvider`) is unchanged; the only extension-surface addition is a `provider_stream_event` event. The masking and compaction hooks (`turn_end` with `context_edit` boundary entries, `session_before_compact` with a custom `CompactionResult`) are read from the installed 0.87.1 `dist` (`core/extensions/types.d.ts`, `core/agent-session.js`) and exercised by the e2e. |
+| Compatibility | `8676a0d` is 17 commits after the `0.87.1` publish. Diffing the two revisions shows the extension API this adapter uses (`registerTool`, `on("tool_result")`, `getActiveTools`/`setActiveTools`, `ExtensionContext.signal`) is unchanged, and `registerProvider` (used by the test fixture) changed only compatibly (model configs gained a `type` that defaults to chat); the extension-surface additions are a `provider_stream_event` event, image and classifier provider configs, and extension-loader warnings. The masking and compaction hooks (`turn_end` with `context_edit` boundary entries, `session_before_compact` with a custom `CompactionResult`) are read from the installed 0.87.1 `dist` (`core/extensions/types.d.ts`, `core/agent-session.js`) and exercised by the e2e. |
 | Node | >= 22.18 (tests run `.ts` directly with default type stripping) |
 
 ## Use
@@ -45,7 +61,7 @@ Or list this directory as a Pi package (`package.json` declares `pi.extensions`)
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `XMUSTARD_API_BASE` | `http://127.0.0.1:8042` | Go API base URL |
-| `XMUSTARD_TOKEN` | unset | Bearer token (needs `agent` role for capture). Sent as a header, never logged or echoed. Required when the API enforces auth. |
+| `XMUSTARD_TOKEN` | unset | Bearer token. `remember`, capture and `hook` delivery need the `proposer` role, `verify` the `verifier` role; `agent` holds both. Sent as a header, never logged or echoed. Required when the API enforces auth. MCP clients read `XMUSTARD_API_TOKEN` instead; this adapter reads only `XMUSTARD_TOKEN`. |
 | `XMUSTARD_WORKSPACE_ID` | unset | Workspace for calls that omit `workspace_id`. Unset: the registered workspace whose root contains Pi's working directory (longest root wins). The adapter never registers a repository; an unregistered directory is an explicit error. |
 | `XMUSTARD_PI_DELIVERY` | `source` | `source` or `hook`; see below |
 | `XMUSTARD_PI_TOOL_TIMEOUT_MS` | `60000` | Per-call deadline for tools and `xmustard_expand`; may only be lowered |
@@ -53,14 +69,14 @@ Or list this directory as a Pi package (`package.json` declares `pi.extensions`)
 | `XMUSTARD_PI_BUILTINS` | all seven | Comma-separated built-ins projected through capture (`bash,read,grep,find,ls,edit,write`), or `none` |
 | `XMUSTARD_PI_PROJECTION_TARGET_BYTES` | `32768` | Built-in results at or below this pass through; larger ones are projected to about it. Go's Pi policy target; may only be lowered (min 1024) |
 | `XMUSTARD_PI_MASK` | on | `off` disables `turn_end` masking |
-| `XMUSTARD_PI_MASK_AFTER_TURNS` | `10` | A result older than this many turns may be masked |
+| `XMUSTARD_PI_MASK_AFTER_TURNS` | `10` | A result at least this many turns old may be masked |
 | `XMUSTARD_PI_MASK_EVERY_TURNS` | `5` | The mask advances only on turns divisible by this (the polling window) |
 | `XMUSTARD_PI_MASK_MIN_BYTES` | `2048` | Smaller results are never masked (min 1025) |
 | `XMUSTARD_PI_COMPACTION` | on | `off` keeps Pi's own compaction |
 
 Loading the extension only registers tools and handlers: it starts no sidecar,
 socket, timer or network call. At `session_start` it asks `GET /api/auth/whoami` (2 s
-bound) which of the nine tools this caller may use, as the MCP shim does for
+bound) which of the nine tools this caller may use, as the MCP server does for
 `tools/list`, and deactivates the rest: a reader token is not offered `remember` or
 `verify`. When the API cannot say (unreachable, 401, an older API) all nine stay active
 and the API still enforces every call.
@@ -70,7 +86,8 @@ and the API still enforces every call.
 - **source** (default): `execute` calls the tool route with
   `X-Xmustard-Delivery: xmustard.evidence/v1`. Go captures the handler's output and
   samples repository identity before and after it, so results are
-  `captured_identity: "bound"` and pages report `current` or `stale`.
+  `captured_identity: "bound"` when the two samples agree, and their pages then report
+  `current` or `stale` (otherwise `unknown`).
 - **hook**: `execute` fetches the raw result and the `tool_result` hook POSTs it to
   `/api/workspaces/{ws}/evidence`. Go receives bytes produced earlier by an untrusted
   client, so these observations are always `captured_identity: "unknown"` and every
@@ -81,7 +98,8 @@ and the API still enforces every call.
 These two paths serve the nine xMustard tools. Pi's built-ins go through the capture
 route (below); results of any other tool pass through unchanged. A reduced result ends
 with one line
-`[xmustard evidence] {"handle": …, "captured_identity": …, "expires_at": …}`;
+`[xmustard evidence] {"handle": …, "captured_identity": …, "expires_at": …}`
+(then an `[xmustard injection-check]` line if the projection matched instruction patterns);
 `xmustard_expand` answers with a `[xmustard page] {…}` header (offset, next_offset,
 eof, freshness, captured/current key) followed by the bytes, as text when the page is
 valid UTF-8 on its own and standard base64 otherwise. Tool `details` always carry the
@@ -123,8 +141,9 @@ bytes, reducer, family). Captured bytes arrive after the fact, so they are alway
 `captured_identity: "unknown"`.
 
 Smaller results, results with images, and results of other tools are not projected
-and do not reach Go here (Go would return a small result unchanged); only compaction's
-index (below) carries them, so that nothing compacted away is lost. The session's
+and do not reach Go here (Go would return a small result unchanged); masking and
+compaction (below) retain the text of the ones they remove later, so that nothing
+masked or compacted away is lost. The session's
 workspace is resolved as for the nine tools, within the projection deadline. Built-in
 captures send `tool_version=pi-coding-agent/<Pi VERSION>`.
 
@@ -136,12 +155,12 @@ reloaded or forked session can still recover what it masked or compacted.
 
 Each `turn_end`, the adapter counts the assistant turns on the branch. On turns
 divisible by `XMUSTARD_PI_MASK_EVERY_TURNS` (the polling window), it appends a
-`context_edit` for every tool result that is older than `XMUSTARD_PI_MASK_AFTER_TURNS`
-turns and at least `XMUSTARD_PI_MASK_MIN_BYTES`. The edit replaces the result's
+`context_edit` for every tool result that is at least `XMUSTARD_PI_MASK_AFTER_TURNS`
+turns old and at least `XMUSTARD_PI_MASK_MIN_BYTES`. The edit replaces the result's
 model-visible content with a stub:
 
 ```text
-[xmustard masked: 800 lines, 3092 bytes of bash output; turn 1; handle xm1.…; workspace_id w] Recover it with xmustard_expand(workspace_id="w", handle="xm1.…", offset=0), or search it with pattern=<RE2> or lines=A-B.
+[xmustard masked: 800 lines, 3092 bytes of bash output; turn 1; handle xm1.…; workspace_id w; expires …] Recover it with xmustard_expand(workspace_id="w", handle="xm1.…", offset=0), or search it with pattern=<RE2> or lines=A-B.
 ```
 
 A masked error keeps `isError` and adds its first and last non-empty lines to the stub.
@@ -158,6 +177,7 @@ A result that already has a handle reuses it: a built-in or xMustard projection,
 `xmustard_expand` page, whose stub then names the page offset. Any other result is
 first retained through the capture route with `format=raw&target=1024`, so the handle
 recovers exactly the text the model saw. If that fails, the result stays unmasked.
+At most 64 results are retained per window; the rest wait for the next one.
 Handles expire (24 h by default). A handle that expires within an hour counts as
 absent, so the text is retained again under a fresh one, and the stub names the
 expiry (`; expires <RFC 3339>`). When a stub's handle has expired, the next `turn_end`
@@ -249,7 +269,7 @@ the next model request; errors staying errors;
 `xmustard_expand` activation and exact 64 KiB paging; bound, stale and unknown labels;
 API restart; expiry; two concurrent Pi processes; RPC abort; tool and projection
 deadlines; unreachable Go, including an activated `xmustard_expand` whose endpoint
-fails; pass-through of successful and failing `read`/`bash`; auth (401 without a token,
+fails; pass-through of a successful and a failing `read` and a successful `bash`; auth (401 without a token,
 principal binding, token rotation, cross-principal denial, no token in output). The
 e2e also samples RSS every 100 ms per process tree (xMustard, Pi, Postgres fixture);
 see `summary.json` → `resources`.

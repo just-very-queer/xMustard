@@ -1,248 +1,400 @@
 # xMustard
 
-xMustard provides shared, verified memory and repository intelligence for existing
-coding agents. It combines a small MCP interface with a Go API and Rust semantic
-core, so agents can recover prior knowledge and check it against the current repo.
+**Shared, verified memory for your coding agents, grounded in the repository they work on.**
 
-An implementation candidate now adds bounded, recoverable delivery for
-xMustard's own MCP results and one version-pinned Pi extension. It is not a
-provider gateway and does not intercept other MCP servers or host-native tools.
-The candidate source is now imported into the main working tree and remains
-uncommitted. Current implementation verification is complete; the exact diff
-still awaits human review and merge. See
-[status](docs/STATUS.md), [architecture](docs/ARCHITECTURE.md),
-and the [implementation report](docs/reviews/2026-09-24-implementation-results.md).
-Agents prepare and verify work; humans retain final merge authority.
+[![Release](https://img.shields.io/github/v/release/just-very-queer/xMustard)](https://github.com/just-very-queer/xMustard/releases/latest)
+[![License: MIT](https://img.shields.io/github/license/just-very-queer/xMustard)](LICENSE)
+[![check](https://github.com/just-very-queer/xMustard/actions/workflows/check.yml/badge.svg)](https://github.com/just-very-queer/xMustard/actions/workflows/check.yml)
 
-The current focus is MCP, CLI, and backend behavior. The default design target is
-local operation without Docker, at roughly 50–100 MB process-tree memory. That
-candidate workload falls below 100 MB in two same-source sampled runs; this is
-not a universal RSS ceiling or proof across workloads. Broader task-quality
-benefit and hardware memory bandwidth remain unmeasured. UI development is
-outside the current focus.
+> Monday, Claude Code learns that `make test` needs `DB_URL` and remembers it, anchored to the
+> `Makefile`. Tuesday, Codex recalls it before running the tests. Wednesday someone edits the
+> `Makefile`, and the next `recall` flags the memory as stale.
 
-Start with [vision](docs/VISION.md), [current status](docs/STATUS.md),
-[architecture](docs/ARCHITECTURE.md), and [roadmap](docs/ROADMAP.md).
-The [documentation map](docs/README.md) separates current guidance from history.
+This is Wednesday's `recall` from the v0.1.0 release, trimmed with `jq`. Step 3 of the
+[Quickstart](#quickstart) reproduces it.
 
-## What xMustard Is
+```json
+{
+  "content": "make test needs DB_URL set",
+  "trust": "self_asserted_open_mode",
+  "stale": true,
+  "stale_paths": [
+    "Makefile"
+  ]
+}
+```
 
-xMustard is **governed runtime memory for coding agents**: a small MCP server that
-gives agents such as Claude Code, Codex, and OpenCode two related capabilities:
+xMustard is a small MCP server that runs on your machine. The coding agents you already use
+share one memory of the repository through it, and each memory says how it was checked: one
+agent proposes a fact, other agents approve it, and `recall` checks it again against the files
+it cites. Claude Code, Codex, Cursor and other MCP clients connect over MCP, and
+[Pi](https://github.com/earendil-works/pi), an MIT-licensed coding agent CLI, gets its own
+extension.
 
-1. **Grounding** — what changed, what's stale, what's broken, and what's blocked
-   since the last baseline, plus the verified facts the agent should trust.
-2. **Memory with a trust lifecycle** — an agent proposes a durable fact; other
-   agents verify it; only then is it promoted into shared context. Promoted memory
-   is re-checked against referenced source paths on recall (drift detection), and
-   overlapping memories are surfaced for reconciliation. Current correctness and
-   resource-limit gaps are recorded in [status](docs/STATUS.md).
+The same server answers the code questions agents ask all day: what changed, where is it, what
+does this file do, what breaks if I touch it, why did that fail. Memory and code tools read the
+same repository, so `ground` reports stale memory next to changed files and signatures. It runs
+as one API on `127.0.0.1`, a Rust core and SQLite. No Docker. MIT licensed.
 
-The agent-facing surface has **nine tools**. They use modes/params (e.g.
-`search?mode=pattern`, `impact
-symbol=/from=/to=`, `recall query=`) rather than split into more tools, and
-`tools/call` strictly validates arguments — unknown/wrong-typed/non-scalar/
-out-of-enum args are rejected with a JSON-RPC `-32602`, never silently coerced.
-The historical narrowing decision is recorded in [`docs/RETHINK.md`](docs/RETHINK.md).
+**v0.1.0 is out.** Prebuilt binaries for macOS arm64 and Linux x86_64 are on the
+[release page](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.0). Read the
+[release notes](docs/releases/v0.1.0.md).
 
-The candidate also advertises MCP `resources` for authorized original-evidence
-reads; this does not add a tenth core tool. The Pi extension registers those nine
-tools over the Go HTTP API and a separate `xmustard_expand` client tool when a
-recovery handle is available. See [`integrations/pi`](integrations/pi/README.md).
+## Why xMustard
 
-Under the hood it sits on a Rust semantic core (tree-sitter symbol graph, change
-tracking, hybrid search, live LSP) and a Go HTTP/persistence shell. JSON holds
-operational state; Postgres is an optional queryable materialization. The broader
-HTTP API supports retained operator workflows; MCP exposes the nine tools.
+- **Memory that says how it was checked.** Give each agent a token, and a memory is shared only
+  after other agents approve it: by default, two approvals from agents other than its author.
+  Every recalled entry carries a [trust label](#one-agent-two-or-a-team).
+- **Memory that notices drift.** Anchor a fact to the files it is about. xMustard hashes them
+  when the fact is promoted, and `recall` flags it stale when one of them changes, appears or
+  disappears. In v0.1.0, files at an even path depth, such as `pkg/auth.go`, are recorded as
+  missing, so their changes are never flagged ([known limits](#known-limits-in-v010)).
+- **Orientation in one call.** `ground` reports what changed, went stale, broke or got blocked
+  since the baseline (the state recorded when you registered the repository), including
+  contract breaks: changed parameters or return types. Its output fits a budget (6,000
+  characters by default), and failure and stale signals survive as counts or flags.
+- **Search that reads function bodies.** Hybrid ranking fuses BM25 over bodies, comments, names,
+  paths and docs with identifier and typo-tolerant matching. Hits come back as `path:line` with
+  snippets and the reasons they ranked. 15 tree-sitter grammars cover Go, Rust, TypeScript, TSX,
+  JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash.
+- **Light enough to leave running.** Two agents on the relay peaked at 68.8 MiB for the whole
+  process tree on the release commit (Linux x86_64). The relay itself uses about 2 MiB per agent.
+- **Failures explained and remembered.** `why_failed` reads a run, a pasted log or an evidence
+  handle, points at the error lines, and records the failure so the next `ground` lists it.
 
-## Using the MCP tools
+## How it compares
 
-The API serves the nine tools over MCP Streamable HTTP at `http://127.0.0.1:8042/mcp`,
-from its own process. Clients that take a URL connect to it directly; clients that
-can only launch a command use `xmustard-relay`, a native stdio relay of about 2 MiB
-RSS (measured: [2026-09-26 relay RSS](docs/benchmarks/2026-09-26-ws13-relay-rss.md)).
-The older Go stdio shim `xmustard-mcp` still works but is deprecated: it costs about
-13.5 MiB per agent and will be removed.
+- **Instruction files** (`AGENTS.md`, `CLAUDE.md`) are loaded as written, and nothing flags a
+  line when the code it describes changes. xMustard does not replace them; it holds the facts
+  agents learn while they work.
+- **Memory servers** such as Mem0 and Zep/Graphiti store and search agent memory and keep its
+  history or provenance. xMustard keeps memory per repository: an entry can be anchored to the
+  repository's files, and `recall` checks it against them.
+- **Code-intelligence servers** such as Serena, GitNexus and Sourcegraph offer symbol-level code
+  navigation over MCP; Serena works through language servers or a JetBrains backend, and
+  GitNexus adds impact analysis. xMustard's code tools do not edit code. They exist so that
+  memory and `ground` rest on the current code.
 
-### Register it
+A [review of seven memory and code-context tools](docs/research/COMPETITOR_PARITY_2026-09-24.md)
+on 2026-09-24 found none whose documentation described both approval by distinct agents before
+a memory is shared and a check of the memory's repository files on recall. The review read
+documentation and source only; no tool was installed or benchmarked.
 
-`xmustard-ops mcp-config` prints the entry for one project. It binds the session to
-the project's workspace, because HTTP has no working directory to resolve it from:
+## Quickstart
+
+You need macOS on Apple silicon, or Linux x86_64 with glibc 2.39+ (Ubuntu 24.04+, Debian 13+).
+Elsewhere, you can try [building from source](#build-from-source). You also need `git` and
+`jq`. Run all four steps in one shell.
+
+**1. Install the binaries.**
 
 ```bash
-xmustard-ops mcp-config --root "$PWD" [--client claude-code] [--mode readonly] [--transport relay]
+V=v0.1.0
+A=xmustard-$V-darwin-arm64            # Linux: A=xmustard-$V-linux-x86_64
+curl -fsSLO https://github.com/just-very-queer/xMustard/releases/download/$V/$A.tar.gz
+curl -fsSLO https://github.com/just-very-queer/xMustard/releases/download/$V/$A.tar.gz.sha256
+shasum -a 256 -c $A.tar.gz.sha256     # Linux: sha256sum -c $A.tar.gz.sha256
+tar xzf $A.tar.gz
+mkdir -p ~/.local/bin && cp $A/xmustard-* ~/.local/bin/
+export PATH="$HOME/.local/bin:$PATH"  # add this line to your shell profile as well
 ```
 
-```jsonc
-// .mcp.json / client config: URL-capable client
-{
-  "mcpServers": {
-    "xmustard": {
-      "type": "http",
-      "url": "http://127.0.0.1:8042/mcp?workspace=<id>&client=claude-code",
-      "headers": { "Authorization": "Bearer ${XMUSTARD_API_TOKEN}", "X-Xmustard-Workspace": "<id>" }
-    }
-  }
-}
-// stdio-only client: the relay (plain http:// only; loopback, or a local TLS proxy)
-{
-  "mcpServers": {
-    "xmustard": {
-      "command": "xmustard-relay",
-      "args": ["--url", "http://127.0.0.1:8042/mcp", "--workspace", "<id>"],
-      "env": { "XMUSTARD_API_TOKEN": "${XMUSTARD_API_TOKEN}" }
-    }
-  }
-}
+The archive holds all five binaries: `xmustard-api`, `xmustard-ops`, `xmustard-relay`,
+`xmustard-core` and `xmustard-mcp`. The macOS ones are ad-hoc signed, not notarized: `curl`
+downloads run as they are, but after a browser download run
+`xattr -d com.apple.quarantine ~/.local/bin/xmustard-*`.
+
+**2. Start the API.**
+
+```bash
+export XMUSTARD_DATA_DIR="$HOME/.xmustard"          # add this line to your shell profile as well
+mkdir -p "$XMUSTARD_DATA_DIR"
+xmustard-api > "$XMUSTARD_DATA_DIR/api.log" 2>&1 &  # runs in the background on 127.0.0.1:8042
+curl -fs --retry 5 --retry-connrefused http://127.0.0.1:8042/api/health > /dev/null && echo "API is up"
 ```
 
-Query parameters on `/mcp` (the relay's flags of the same names): `workspace=<id>`
-(or the `X-Xmustard-Workspace` header) binds the session; `mode=readonly` lists and
-serves only the seven read tools; `client=claude-code|codex|cursor|opencode|pi|letta`
-attributes usage; `schema=lean|full` picks the tools/list schema profile. The token
-always travels in `Authorization`, never in the URL. A session belongs to the
-principal that opened it; each tool call re-enters the API as that principal, so
-caller-scoped tools/list, route gates, evidence resources and registration scope
-apply as they do for any other caller. The API holds at most 64 sessions and 16 per
-principal: past its share a principal's least recently used idle session ends, and a
-full table ends an idle session of the largest holder, so one principal cannot lock
-the others out. The relay sends the token only to a loopback host unless it is given
-`--allow-insecure-remote`. Per-tool usage counters are in
-`/api/health` under `mcp_usage` (shown to authenticated callers).
+Set `XMUSTARD_DATA_DIR` wherever you run `xmustard-api` or `xmustard-ops`. Its default,
+`../backend/data`, is relative to the current directory, so a shell without it reads and writes
+a different store. With no tokens minted, the API runs in open mode: every caller shares one
+identity, and a memory is promoted at once as `self_asserted_open_mode`.
 
-Each agent should authenticate with an `XMUSTARD_API_TOKEN` (mint one with
-`xmustard-api mint-token <principal-id> agent`). The authenticated stable
-`Principal.ID`, not the bearer secret, is the identity counted by the
-multi-agent verification gate. Rotating a token while retaining its principal ID
-does not create a new verifier. Never share one principal between verifiers.
+**3. Watch a memory go stale.** This uses a throwaway repository, so your own files stay
+untouched.
 
-**Open vs authenticated trust.** With no tokens minted, the loopback-only API runs
-in open mode: every caller is one identity (`anonymous`), so `remember` promotes a
-memory at once as `verification_mode: self_asserted_open_mode` instead of leaving it
-pending forever. Once tokens exist, every call must authenticate, and a memory becomes
-`peer_verified` only after enough distinct principals other than its author approve it
-(or is promoted at once as `single_agent` if the operator turned multi-agent
-verification off). Open mode is a property of each write: once tokens exist, an
-open-mode memory stays self-asserted until a full quorum of distinct principals
-approves it, and any authenticated dissent or edit puts it back under that quorum, so
-one principal cannot rewrite and re-promote it alone. The id `anonymous` is reserved
-and cannot be minted. `recall` shows each entry's mode and counts them in
-`verification_modes`; `ground` reports `memory_verification_modes`.
+```bash
+cd "$(mktemp -d)" && git init -q
+printf 'test:\n\tgo test ./...\n' > Makefile
+WS=$(xmustard-ops workspace load --root-path "$PWD" | jq -r .workspace.workspace_id)
 
-### The nine tools
+# xm <tool> '<json arguments>': one MCP tool call through the stdio relay
+xm() { printf '%s\n' \
+  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"sh","version":"0"}}}' \
+  "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"$1\",\"arguments\":$2}}" |
+  xmustard-relay --workspace "$WS" | jq 'select(.id==1) | .result.structuredContent // .result.content[0].text // .error'; }
 
-All tools take `workspace_id` (`?` marks an optional arg). The first four are the
-governed-memory loop; the last five are narrow retrieval. `remember` sends its
-content in the JSON request body (not the URL), so durable text never leaks into
-access logs.
+xm remember '{"content":"make test needs DB_URL set","paths":"Makefile"}' | jq -c '{status, verification_mode}'
+printf 'lint:\n\tgo vet ./...\n' >> Makefile       # someone edits the Makefile
+xm recall '{"q":"make test"}' | jq '.entries[0] | {content, trust, stale, stale_paths}'
+xm ground '{}' | jq -r .summary
+```
 
-| Tool | Args | What it does |
-|------|------|--------------|
-| `ground` | — | Orientation before acting: changed / stale / broken / blocked since baseline, with index-trust (drift), contract breaks, and stale-memory count. |
-| `recall` | `query?`, `paths?` | The promoted shared context, ranked to your task (lexical + path overlap + approval count). With `query` and/or `paths`, entries matching neither are dropped (query terms need 3+ characters); with no args, nothing is dropped, entries touching working-tree changes are boosted, and recency breaks ties. Each entry carries its `verification_mode` (`peer_verified`, `single_agent`, or `self_asserted_open_mode`) and is re-checked against the live tree; stale ones are flagged. `conflicts` lists memories that cite the same file: path overlap, not semantic contradiction. |
-| `remember` | `content`, `title?`, `paths?` | Propose a durable memory (fact / decision / gotcha). `paths` are the files it's about, so recall can flag it stale when they change. Pending until verified; in open mode it is promoted at once as self-asserted. |
-| `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct principals approve. |
-| `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Code search returning `path:line` slices, not a dump. Default `hybrid` ranks symbol names, file paths and doc chunks, not function bodies: RRF over lexical IDF, char-trigram fuzzy matching (typo tolerance; conceptual matching only when built with the optional `semantic-onnx` feature and `XMUSTARD_EMBED_MODEL` names a local ONNX model directory), inbound-reference degree, and graph proximity to `seed=<symbol>`. `mode=pattern` runs an ast-grep structural query over code. |
-| `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
-| `impact` | `symbol?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → files that reference the file(s) defining that name, up to 4 hops (file-level, so a hit may use a different symbol from the same file); `from=`&`to=` → shortest undirected path between the files defining the two names. |
-| `diagnostics` | — | Current normalized errors/warnings for the workspace. |
-| `why_failed` | `run_id?`; advanced: `command`, `cwd`, `timeout_seconds`, `evidence_handle`, `log` | Explain a failure without a platform run: failure signals, salient error lines from the output's last MiB, the changed files it implicates and the promoted memories on them. `run_id` reads a platform run or a recorded outcome. `command` runs a test, build or lint command from a closed table (argv, no shell, inside the workspace root, without the daemon's secrets, one at a time, its process group killed at the timeout; on a loopback bind, or anywhere with `XMUSTARD_WHY_FAILED_COMMANDS=1`); `evidence_handle` and `log` explain a captured or pasted output. Each records a run-independent outcome that `ground` lists in `recent_failed_runs` until a later run of the same command resolves it. Captured failing test/build/lint outputs are recorded the same way. |
-
-### A typical session
+`remember` promotes the memory at once
+(`{"status":"verified","verification_mode":"self_asserted_open_mode"}`), `recall` prints the
+stale entry shown [at the top of this page](#xmustard), and `ground` counts it:
 
 ```text
-ground                       → orient: 3 changed files, 1 stale memory
-recall                       → read the verified facts (skip the stale one)
-search "where is auth"       → find the relevant slice
-explain api-go/.../auth.go   → understand it
-…do the work…
-remember content="auth identity = stable Principal.ID; bearer token is a rotating credential" paths="api-go/.../auth.go"
-                             → propose what you learned; peers verify it next
+1 changed file(s), 0 dirty symbol(s), 0 contract break(s), 0 failed run(s), 1 stale memory. 1 memory self-asserted in open mode (not peer-verified).
 ```
 
-### Quick check from a shell
+**4. Connect your repository to Claude Code.**
 
 ```bash
-printf '%s\n%s\n%s\n' \
-  '{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}' \
-  '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' \
-  '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"ground","arguments":{"workspace_id":"my-ws"}}}' \
-  | xmustard-relay --url http://127.0.0.1:8042/mcp
+cd /path/to/your/repo
+WS=$(xmustard-ops workspace load --root-path "$PWD" | jq -r .workspace.workspace_id)   # register it and record its baseline
+claude mcp add --transport http xmustard "http://127.0.0.1:8042/mcp?workspace=$WS&client=claude-code"
+claude mcp list                          # the xmustard line ends in "Connected"
 ```
 
-## Supporting capabilities
+Ask Claude to run `ground` at the start of a task and `recall` before it edits. From this shell,
+`xm ground '{}'` makes the same call.
 
-The source also contains workspace snapshots, issue/run/plan records, verification
-profiles, diagnostic history, guidance discovery, provider routing, evaluation
-statistics, and review handoffs. These support the memory and intelligence
-product; their presence is not evidence that every workflow is complete.
+## The nine tools
 
-Go owns delivery and persistence. Rust owns semantic meaning and systems-heavy
-helpers. The Python backend was retired in June 2026. Current ownership is mapped
-in [architecture](docs/ARCHITECTURE.md).
+Eight of them work with nothing beyond the Quickstart. `diagnostics` needs a Postgres database in
+v0.1.0.
 
-## Repo Layout
+| Tool | What it answers | Example |
+|---|---|---|
+| `ground` | What changed, went stale, broke or got blocked since the baseline? Includes index drift and contract breaks. | no arguments |
+| `recall` | What do we already know about this task or these files? Ranked by BM25, path overlap, trust, recency and feedback. | `q="make test"` `paths="Makefile"` |
+| `remember` | Propose a fact, decision or gotcha, anchored to the files it is about. | `content="make test needs DB_URL set"` `paths="Makefile"` |
+| `verify` | Approve or reject another agent's proposed memory. | `entry_id="ctx_..."` `approve=true` |
+| `search` | Where is it? `path:line` hits with snippets and reasons. `mode=pattern` runs an ast-grep query (needs `ast-grep` on `PATH`). | `q="session expiry"` |
+| `explain` | What is this file for, what are its key symbols, and how do I run or verify it? Files only in v0.1.0; a directory returns an error. | `path="src/server.ts"` |
+| `impact` | What might break if I change this? A lexical reference graph up to 4 hops, so treat edges as leads, not proof. | `symbol="parseConfig"` |
+| `diagnostics` | Which errors and warnings does the workspace have now? Needs Postgres in v0.1.0. | no arguments |
+| `why_failed` | Why did this fail? Error lines and implicated files from a run, a pasted log or an evidence handle. | `log="<test output>"` |
 
-- `api-go/`: Go HTTP backend, stdio MCP server, operator CLI, persistence, and Rust bridge
-- `rust-core/`: Rust core — scanner, repo map, verification, diagnostics, lsp, goal runtime, semantic search
-- `backend/`: runtime data (`data/`) and SQL schema (`sql/`) only; the Python FastAPI/Typer stack was retired to `archive/2026-06-16-python-backend/`
-- `frontend/`: React and TypeScript UI surface (proxies `/api` → `:8042`)
-- `integrations/pi/`: version-pinned Pi extension (implementation candidate)
-- `archive/`: retired implementations, including the legacy Python backend
-- `research/`: local reference repos used for product and architecture study; ignored from git
-- `docs/`: current product documents, audits, research, and indexed history
+`workspace_id` is optional everywhere. It resolves from the connection's binding,
+`XMUSTARD_WORKSPACE_ID`, the client's roots or the working directory. `mode=readonly` hides
+`remember` and `verify`. In the default lean schema, advanced arguments stay out of
+`tools/list`, which keeps the list of all nine tools under 9 KB. They are documented in the MCP
+resource `xmustard://docs/tools`.
 
-## Build and run
+## Connect your agent
 
-Use a source checkout with Go 1.26+ and a Rust toolchain supporting edition 2024.
-Node/npm is required for the Pi extension and optional frontend.
+The API serves MCP over Streamable HTTP at `http://127.0.0.1:8042/mcp`. A client that takes a URL
+needs no extra process. A client that can only launch a command uses `xmustard-relay`, a small
+stdio bridge. `xmustard-ops mcp-config --root "$PWD" [--transport http|relay] [--client NAME]
+[--mode readonly]` prints a ready `mcpServers` entry for either. The entry refers to
+`${XMUSTARD_API_TOKEN}` and never contains the token itself. The workspace id comes from the
+checkout's absolute path, so generate an entry per checkout. The examples below use `$WS` from
+step 4 of the Quickstart.
+
+| Client | What v0.1.0 ships |
+|---|---|
+| Claude Code | MCP over HTTP or the relay |
+| Codex | MCP configuration only; no Codex hook package yet |
+| Pi | An in-repo extension that calls the API directly |
+| Cursor, OpenCode, other MCP clients | The generic `mcp-config` entry; no OpenCode plugin yet |
+
+<details>
+<summary><b>Claude Code: with a token, through the relay, or as a project file</b></summary>
+
+Pick one.
 
 ```bash
-make build
-export XMUSTARD_CORE_BIN="$PWD/rust-core/target/release/xmustard-core"
-export XMUSTARD_DATA_DIR="$PWD/backend/data"
-./api-go/bin/xmustard-api                     # 127.0.0.1:8042
+# HTTP, no extra process. Add the header once tokens are minted.
+claude mcp add --transport http xmustard "http://127.0.0.1:8042/mcp?workspace=$WS&client=claude-code" \
+  -H 'Authorization: Bearer ${XMUSTARD_API_TOKEN}'
+# stdio, through the relay (xmustard-relay must be on the PATH Claude Code starts with)
+claude mcp add xmustard -e 'XMUSTARD_API_TOKEN=${XMUSTARD_API_TOKEN}' -- xmustard-relay --workspace "$WS" --client claude-code
+# project scope: Claude asks you to approve it on the next run, and warns if XMUSTARD_API_TOKEN is unset
+xmustard-ops mcp-config --root "$PWD" --client claude-code > .mcp.json
 ```
 
-In another shell with the same data-directory configuration, load a repository:
+</details>
+
+<details>
+<summary><b>Codex</b></summary>
 
 ```bash
-./api-go/bin/xmustard-ops workspace load --root-path /absolute/path/to/repository
+# Codex stores the variable's name in config.toml, not the token. Leave the flag out in open mode.
+codex mcp add xmustard --url "http://127.0.0.1:8042/mcp?workspace=$WS&client=codex" \
+  --bearer-token-env-var XMUSTARD_API_TOKEN
 ```
 
-Use the returned `workspace_id` in MCP calls (or bind it with `xmustard-ops
-mcp-config`). Point a URL-capable MCP client at `http://127.0.0.1:8042/mcp`, or a
-stdio-only one at `rust-core/target/release/xmustard-relay`; or put the binaries on
-`PATH`. Use an explicit
-absolute `XMUSTARD_DATA_DIR` when running outside the source checkout; the current
-fallback is relative to the process working directory.
+</details>
 
-`make backend` starts the development API. `make check-backend` runs the Go tests
-and build plus Rust tests and Clippy. `make check-frontend` runs the separate
-frontend lint/build checks when UI changes are in scope.
+<details>
+<summary><b>Pi</b></summary>
 
-`make install PREFIX=/your/prefix` copies the five binaries. Optional Postgres
-bootstrap still needs the SQL schema from the checkout. The Homebrew formula is
-a development packaging starting point: there is no published tagged release or
-tap verified by the [September audit](docs/STATUS.md).
+Pi gets an in-repo extension instead of MCP: the nine tools as direct HTTP calls, plus
+`xmustard_expand` to page back full outputs. From a source checkout, with Node 22.19+:
 
-## Current Status
+```bash
+cd integrations/pi && npm ci --ignore-scripts
+XMUSTARD_API_BASE=http://127.0.0.1:8042 XMUSTARD_TOKEN=<token> ./node_modules/.bin/pi -e ./src/index.ts
+```
 
-The September 24 candidate is imported and uncommitted. Current main-worktree
-checks pass: backend, provenance-bound MCP and retrieval gates, the pinned Pi
-runtime on the current Rust core, and the sampled RSS gate. The current RSS run
-measured 80.6 MB; two same-source candidate runs measured 72.3 MB and 84.9 MB.
-These are fixed-workload sampled peaks, not a universal RSS ceiling. Human review
-of the exact diff and final merge remain yours; held-out task benefit, broad
-competitor parity, and hardware memory bandwidth are unproven. See [current
-checks and findings](docs/STATUS.md), the [resource benchmark](docs/benchmarks/2026-09-24-lean-context.md),
-and the [evidence-gated backlog](docs/ROADMAP.md).
+Pi reads `XMUSTARD_TOKEN`, not `XMUSTARD_API_TOKEN`, and needs it only once auth is on. It never
+registers a repository, so run `workspace load` first. The nine tools work in release builds;
+the extension's built-in tool reduction, masking and compaction are limited there
+([known limits](#known-limits-in-v010)). See [integrations/pi](integrations/pi/README.md).
 
-## Architecture
+</details>
 
-- **Rust core** (`rust-core`) — semantic meaning: tree-sitter symbol graph, change
-  tracking/drift, hybrid search, diagnostics, live LSP, the goal runtime.
-- **Go shell** (`api-go`) — HTTP API, persistence, auth, and the `xmustard-mcp`
-  stdio server; calls the Rust core for the heavy work.
-- **Postgres** — durable semantic and operational index (JSON files remain the
-  source of truth; Postgres is the queryable materialization).
+<details>
+<summary><b>Cursor, OpenCode and other MCP clients</b></summary>
+
+Put the `mcp-config` output (`--client cursor` or `--client opencode`; add `--transport relay`
+for a command-only client) into the client's MCP config, in its format and token syntax.
+`--client` only labels usage.
+
+</details>
+
+## One agent, two, or a team
+
+Every recalled memory carries one of three trust labels:
+
+- `peer_verified`: approved by enough agents other than its author.
+- `single_agent`: promoted on one authenticated agent's word, because the operator set
+  `"require_multi_agent_verification": false` in `<data dir>/settings.json`.
+- `self_asserted_open_mode`: written in open mode, where no tokens exist and every caller shares
+  one identity.
+
+Pick the setup that matches how many agents you run:
+
+- **One agent.** Stay in open mode. You get `ground`, `search`, `explain`, `impact`,
+  `why_failed`, and memory that persists across sessions with drift checks. Every memory is
+  labelled `self_asserted_open_mode`.
+- **Two agents**, say Claude Code and Codex. Mint a token for each, and set
+  `"context_verification_threshold": 1` in `<data dir>/settings.json` before they start
+  proposing (no restart needed). A memory one agent proposes becomes `peer_verified` when the
+  other approves it with `verify`.
+- **Three or more agents.** Mint a token for each and keep the default: two approvals from
+  agents other than the author.
+
+```bash
+xmustard-api mint-token alice agent    # prints a token (xmt_...); mint one per agent
+xmustard-api mint-token bob agent
+xmustard-api mint-token carol agent
+```
+
+Run these with the API's `XMUSTARD_DATA_DIR`. The running API picks the tokens up without a
+restart, and from then on every call must authenticate: give each agent its own token through
+`XMUSTARD_API_TOKEN` and add the header shown under [Connect your agent](#connect-your-agent).
+When `alice` proposes a memory, it becomes `peer_verified` after `bob` and `carol` approve it.
+The roles are `admin`, `human-approver`, `indexer`, `verifier`, `proposer` and `reader`; `agent`
+means proposer plus verifier.
+
+## Known limits in v0.1.0
+
+- **Drift is never flagged for files at an even path depth.** When a memory is promoted, an
+  anchor with an even number of path components, such as `pkg/auth.go`, is recorded as missing,
+  so later edits to that file never mark the memory stale. Odd depths such as `main.go` and
+  `src/api/auth.go` are checked. To spot an affected memory, look at `path_hashes` in `recall`
+  output: an existing file recorded as `"\u0000missing"` is not being checked. A fix is written
+  and not yet merged.
+- **Evidence capture is refused in release builds.** `POST .../evidence/capture` answers
+  `503 redaction_unavailable`. Capture keeps originals, so it stays closed until a streaming
+  secret redactor is wired in, and v0.1.0 release builds have none. The nine tools are
+  unaffected. Pi's built-in tool reduction and compaction fall back to Pi's own behavior,
+  masking covers only results that already carry a handle, and no hook client can post tool
+  output yet. The redactor is planned for v0.1.1.
+- **`diagnostics` needs Postgres.** Without `postgres_dsn` in `<data dir>/settings.json` it
+  returns "Postgres DSN is required to read diagnostics". The `XMUSTARD_PG_DSN` environment
+  variable does not supply it.
+- **`explain` takes files only.** A directory path returns an error, although the tool
+  description mentions directories.
+- **Platforms.** Prebuilt archives cover macOS arm64 and Linux x86_64 with glibc 2.39+. Neither
+  CI nor the release covers any other system, so elsewhere a source build is the only option,
+  and it is untested. There is no public Homebrew tap yet.
+- **Heavier workloads.** A larger benchmark suite (4 agents, 2 repositories, 4 worktrees) has
+  not passed its 95.4 MiB line yet.
+
+## How it works
+
+```mermaid
+flowchart LR
+  A["Claude Code, Codex, Cursor, ..."] -- "MCP over HTTP" --> API
+  S["stdio-only client"] -- stdio --> R["xmustard-relay"] -- "HTTP /mcp" --> API
+  P["Pi extension"] -- HTTP --> API
+  API["xmustard-api (Go)<br/>127.0.0.1:8042<br/>nine tools, auth, roles"] --> G[("memory database (SQLite)<br/>memory, votes, outcomes")]
+  API -- "per call, or resident worker" --> C["xmustard-core (Rust)<br/>index, search, impact, drift"]
+  C --> I[("code index<br/>.git/xmustard-cache")]
+```
+
+The Go API (`api-go`) owns MCP, auth, roles and the memory database, a SQLite file in your data
+directory. The Rust core (`rust-core`) owns the tree-sitter index, hybrid search, impact and
+change tracking. The API starts it per call; `XMUSTARD_CORE_WORKER=1` keeps a resident worker
+(opt-in). [Architecture](docs/ARCHITECTURE.md) has the full picture.
+
+## By the numbers
+
+Measured, with the conditions that matter. Each source has the details, and
+[status](docs/STATUS.md#measured) lists more.
+
+| Result | What was measured | Conditions |
+|---|---|---|
+| 68.8 MiB | Peak RSS of the whole process tree with 2 agents on the relay (budget gate line: 95.4 MiB) | Release commit, Linux x86_64 ([release notes](docs/releases/v0.1.0.md)) |
+| 2.1–2.2 MiB vs 13.5 MiB | RSS per stdio agent: relay vs the older Go `xmustard-mcp` shim | macOS arm64, 3 runs ([relay RSS](docs/benchmarks/2026-09-26-ws13-relay-rss.md)) |
+| 25.0 MiB | Peak RSS to index all 2,660 files (51,263 symbols) of the cline repo with no file cap, segment write included | Apple M1 ([index RSS](docs/benchmarks/2026-09-25-ws07-index-rss.md), [resident index](docs/benchmarks/2026-09-26-ws14-resident-index.md)) |
+| 28.5 ms / 31.0 ms | `recall` p50 / p95 over 1,000 memories, through the API | Linux, 6 cores ([status](docs/STATUS.md#measured)) |
+| 19,544 B → 4,550 B | `ground` output with the default budget, all 200 contract breaks still counted | pi-mono clone, 1,929 files, 60 files with a changed signature ([status](docs/STATUS.md#measured)) |
+
+**Not measured yet:** token savings or task success on real agent tasks. The evaluation harness
+(`xmustard-eval`) exists, but the repository records no real-model run yet. None of these numbers
+compares xMustard with another tool.
+
+## Safe by default
+
+- **Local first.** The API binds `127.0.0.1:8042`. A non-loopback bind is refused unless auth
+  is required, tokens exist and TLS is configured (or delegated to a TLS proxy).
+- **Least privilege.** Tokens carry roles, roles gate every route, and `tools/list` shows each
+  caller only its tools. `why_failed` runs no commands unless you set
+  `XMUSTARD_WHY_FAILED_COMMANDS=1` and call it with an admin token; command mode is host-code
+  execution, not a sandbox.
+- **Secrets stay out.** Memory is redacted on ingest. Search refuses secret paths and masks
+  credential-shaped words in snippets. Capture fails closed without a secret redactor. By
+  default, the relay sends the token only to loopback hosts.
+- **Memory is data, not instructions.** Recalled memory carries `injection_flags` from an
+  instruction-pattern scan (a pattern check, not a classifier), and content from untrusted
+  captures is quarantined.
+
+The full model is in [docs/SECURITY.md](docs/SECURITY.md).
+
+## Roadmap
+
+- **v0.1.1:** the streaming secret redactor, so that evidence capture, and with it Pi's built-in
+  tool reduction, masking and compaction, work in release builds.
+- **Next:** a file watcher that keeps the resident index fresh, a Claude Code plugin with hooks,
+  a background service (launchd or systemd) with store backup and restore, and a tag-triggered
+  release workflow with a Homebrew formula that installs the prebuilt archives.
+- **Later:** Codex hooks, an OpenCode plugin and Cursor hooks, a static-embedding search lane,
+  impact analysis with risk tiers, symbol resolvers for Rust, Python and Java, session handoff
+  between clients, and an evaluation suite for memory and context reduction.
+
+What is under way now is in [status](docs/STATUS.md#in-progress). The roadmap's working plan, by
+workstream: [build plan](docs/plans/2026-09-25-parity-build-plan.md).
+
+## Build from source
+
+With Go 1.26 and Rust 1.89 or newer, `make build` builds all five binaries. `make install`
+copies them into `$PREFIX/bin`; the default `PREFIX=/usr/local` usually needs `sudo`, and
+`make install PREFIX=$HOME/.local` does not. The Homebrew formula in
+[`packaging/homebrew/xmustard.rb`](packaging/homebrew/xmustard.rb) builds the v0.1.0 tag from
+source; Homebrew installs formulae only from a tap, so copy it into a local one (`brew tap-new`)
+until a public tap exists.
+
+## Learn more
+
+- [Documentation map](docs/README.md), [vision](docs/VISION.md), [architecture](docs/ARCHITECTURE.md) and [status](docs/STATUS.md)
+- [Security model](docs/SECURITY.md) and [v0.1.0 release notes](docs/releases/v0.1.0.md)
+- [Benchmarks and gates](scripts/bench/README.md) and the [measurement records](docs/benchmarks/)
+- [Pi extension](integrations/pi/README.md)
+
+**Contributing.** Start with [AGENTS.md](AGENTS.md). Run `make check-backend` (Go tests and build,
+Rust tests and Clippy) before you open a pull request.
+
+**License.** [MIT](LICENSE).
