@@ -1,0 +1,14 @@
+{
+  "about": "The arguments the nine tools of the June 2026 install advertised in tools/list (advertised: api-go/cmd/xmustard-mcp/main.go at 1a4ec87, whose lean and full lists were the same), and calls that use every one of them with a value of its type. TestOldInstallArgumentsStillAccepted makes each call and fails when an argument is rejected or its value does not reach the API: old agent prompts, skills and memories still send these names. A renamed argument keeps working through a hidden alias (recall and search query, now q). Never drop an entry to make the test pass.",
+  "tools": {
+    "ground": {"advertised": ["workspace_id"], "calls": [{"workspace_id": "ws"}]},
+    "recall": {"advertised": ["paths", "query", "workspace_id"], "calls": [{"workspace_id": "ws", "query": "auth", "paths": "a.go"}]},
+    "remember": {"advertised": ["content", "paths", "title", "workspace_id"], "calls": [{"workspace_id": "ws", "content": "fact", "title": "heading", "paths": "a.go"}]},
+    "verify": {"advertised": ["approve", "entry_id", "workspace_id"], "calls": [{"workspace_id": "ws", "entry_id": "ctx_1", "approve": false}]},
+    "search": {"advertised": ["lang", "mode", "query", "seed", "workspace_id"], "calls": [{"workspace_id": "ws", "query": "Handler", "mode": "pattern", "lang": "go", "seed": "Serve"}]},
+    "explain": {"advertised": ["path", "workspace_id"], "calls": [{"workspace_id": "ws", "path": "a.go"}]},
+    "impact": {"advertised": ["from", "symbol", "to", "workspace_id"], "calls": [{"workspace_id": "ws", "symbol": "Add"}, {"workspace_id": "ws", "from": "Start", "to": "Finish"}]},
+    "diagnostics": {"advertised": ["workspace_id"], "calls": [{"workspace_id": "ws"}]},
+    "why_failed": {"advertised": ["run_id", "workspace_id"], "calls": [{"workspace_id": "ws", "run_id": "run_1"}]}
+  }
+}

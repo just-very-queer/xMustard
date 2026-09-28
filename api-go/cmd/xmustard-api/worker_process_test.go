@@ -114,6 +114,7 @@ func TestAPIWithTheCoreWorkerServesToolRoutesWithoutPerCallExecs(t *testing.T) {
 		"/changes/since-index",                                   // impact, current changes
 		"/changes/since-index?symbol=ComputeTotal",               // impact, symbol
 		"/changes/since-index?from=HandleRequest&to=helperValue", // impact, trace
+		"/changes/since-index?path=src%2Fengine.go",              // impact, file
 	}
 	for round := 0; round < 2; round++ {
 		for _, route := range routes {

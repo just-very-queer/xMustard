@@ -74,6 +74,33 @@ func SymbolImpactCtx(ctx context.Context, dataDir, workspaceID, symbol string, m
 	return read.annotate(out), nil
 }
 
+// FileImpactCtx is impact(path=): the files that reference a symbol defined in path,
+// up to maxDepth hops, with the graph's freshness and coverage. The walk is
+// SymbolImpact's, started from the file instead of a symbol's defining files; found
+// is false when the graph does not hold the file. The path is confined to the
+// workspace before it reaches the core, which only looks it up in the graph.
+func FileImpactCtx(ctx context.Context, dataDir, workspaceID, path string, maxDepth int) (json.RawMessage, error) {
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := ConfineWorkspacePath(root, path)
+	if err != nil {
+		return nil, err
+	}
+	if maxDepth <= 0 {
+		maxDepth = 4
+	}
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"impact-file"}
+	args = append(append(args, read.flags()...), root, workspaceID, rel, strconv.Itoa(maxDepth))
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return read.annotate(out), nil
+}
+
 // TraceSymbols returns the shortest dependency path between two symbols.
 func TraceSymbols(dataDir, workspaceID, from, to string) (json.RawMessage, error) {
 	return TraceSymbolsCtx(context.Background(), dataDir, workspaceID, from, to)

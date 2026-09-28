@@ -149,6 +149,26 @@ func call(t *testing.T, s *Session, name string, args map[string]any) (map[strin
 	return res.(map[string]any), nil
 }
 
+// argErr calls a tool whose arguments must be rejected and returns the error's text
+// and its _meta["xmustard/argument_error"]: a tool result with isError, never a
+// JSON-RPC error (MCP 2025-11-25).
+func argErr(t *testing.T, s *Session, name string, args map[string]any) (string, map[string]any) {
+	t.Helper()
+	res, rerr := call(t, s, name, args)
+	if rerr != nil {
+		t.Fatalf("%s %v: an argument error must be a tool result, got JSON-RPC error %v", name, args, rerr)
+	}
+	if res["isError"] != true {
+		t.Fatalf("%s %v: want an isError result, got %v", name, args, res)
+	}
+	meta, _ := res["_meta"].(map[string]any)
+	data, _ := meta["xmustard/argument_error"].(map[string]any)
+	if data == nil {
+		t.Fatalf("%s %v: no xmustard/argument_error in _meta: %v", name, args, res)
+	}
+	return text(res), data
+}
+
 func text(res map[string]any) string {
 	content := res["content"].([]map[string]any)
 	return content[0]["text"].(string)
@@ -415,53 +435,53 @@ func TestInstructionsStateWorkflowWithinBudget(t *testing.T) {
 
 func TestBuildArgsRejectsUnknownArgument(t *testing.T) {
 	tl, _ := ToolByName("recall")
-	_, _, rerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "bogus": "x"})
-	if rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("expected -32602 for unknown argument, got %v", rerr)
+	_, _, aerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "bogus": "x"})
+	if aerr == nil || aerr.Reason != "unknown" || aerr.Argument != "bogus" {
+		t.Fatalf("expected an unknown-argument error, got %v", aerr)
 	}
 }
 
 func TestBuildArgsRejectsNonScalar(t *testing.T) {
 	tl, _ := ToolByName("recall")
-	_, _, rerr := BuildArgs(tl, map[string]any{"workspace_id": map[string]any{"nested": 1}})
-	if rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("expected -32602 for object-valued arg, got %v", rerr)
+	_, _, aerr := BuildArgs(tl, map[string]any{"workspace_id": map[string]any{"nested": 1}})
+	if aerr == nil || aerr.Argument != "workspace_id" {
+		t.Fatalf("expected an error for an object-valued arg, got %v", aerr)
 	}
-	_, _, rerr = BuildArgs(tl, map[string]any{"workspace_id": "ws", "q": []any{"a", "b"}})
-	if rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("expected -32602 for array-valued arg, got %v", rerr)
+	_, _, aerr = BuildArgs(tl, map[string]any{"workspace_id": "ws", "q": []any{"a", "b"}})
+	if aerr == nil || aerr.Argument != "q" {
+		t.Fatalf("expected an error for an array-valued arg, got %v", aerr)
 	}
 }
 
 func TestBuildArgsBooleanCoercion(t *testing.T) {
 	tl, _ := ToolByName("verify")
-	args, _, rerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "entry_id": "ctx_1", "approve": false})
-	if rerr != nil {
-		t.Fatalf("unexpected error: %v", rerr)
+	args, _, aerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "entry_id": "ctx_1", "approve": false})
+	if aerr != nil {
+		t.Fatalf("unexpected error: %v", aerr)
 	}
 	if args["approve"] != "false" {
 		t.Fatalf("boolean false should coerce to \"false\", got %q", args["approve"])
 	}
 	// a boolean passed as a string is a type error, not silently accepted
-	_, _, rerr = BuildArgs(tl, map[string]any{"workspace_id": "ws", "entry_id": "ctx_1", "approve": "false"})
-	if rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("expected -32602 for string-typed boolean, got %v", rerr)
+	_, _, aerr = BuildArgs(tl, map[string]any{"workspace_id": "ws", "entry_id": "ctx_1", "approve": "false"})
+	if aerr == nil || aerr.Reason != "must be a boolean" {
+		t.Fatalf("expected a type error for a string-typed boolean, got %v", aerr)
 	}
 }
 
 func TestBuildArgsEnforcesEnum(t *testing.T) {
 	tl, _ := ToolByName("search")
-	if _, _, rerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "q": "x", "mode": "pattern"}); rerr != nil {
-		t.Fatalf("valid enum value rejected: %v", rerr)
+	if _, _, aerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "q": "x", "mode": "pattern"}); aerr != nil {
+		t.Fatalf("valid enum value rejected: %v", aerr)
 	}
-	_, _, rerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "q": "x", "mode": "bogus"})
-	if rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("expected -32602 for out-of-enum mode, got %v", rerr)
+	_, _, aerr := BuildArgs(tl, map[string]any{"workspace_id": "ws", "q": "x", "mode": "bogus"})
+	if aerr == nil || aerr.Detail["enum"] == nil {
+		t.Fatalf("expected an enum error for mode, got %v", aerr)
 	}
 }
 
-// Out-of-range bounds are rejected with -32602 naming the range, never clamped; the
-// in-range edge values reach the API unchanged.
+// Out-of-range bounds are rejected with a tool error naming the range, never
+// clamped; the in-range edge values reach the API unchanged.
 func TestOutOfRangeArgumentsAreRejectedNotClamped(t *testing.T) {
 	api := &fakeAPI{}
 	s := newSession(t, api, Options{}, nil, "2025-06-18")
@@ -478,23 +498,23 @@ func TestOutOfRangeArgumentsAreRejectedNotClamped(t *testing.T) {
 		{"search", map[string]any{"q": "x", "limit": -1}},
 		{"impact", map[string]any{"symbol": "S", "max_depth": 5}},
 		{"impact", map[string]any{"symbol": "S", "depth": 0}}, // through the hidden alias too
+		{"impact", map[string]any{"path": strings.Repeat("p", maxPathArg+1)}},
 		{"verify", map[string]any{"entry_id": "e", "note": strings.Repeat("n", maxVerifyNote+1)}},
 		{"recall", map[string]any{"session_id": strings.Repeat("s", recallMaxSessionID+1)}},
 	}
 	for _, c := range bad {
 		c.args["workspace_id"] = "ws"
-		_, rerr := call(t, s, c.tool, c.args)
-		if rerr == nil || rerr.Code != CodeInvalidParams {
-			t.Fatalf("%s %v: want -32602, got %v", c.tool, c.args, rerr)
-		}
+		argErr(t, s, c.tool, c.args)
 	}
 	if n := len(api.toolRequests()); n != 0 {
 		t.Fatalf("rejected calls reached the API %d times", n)
 	}
-	var e *RPCError
-	_, e = call(t, s, "recall", map[string]any{"workspace_id": "ws", "limit": 51})
-	if d := e.Data.(map[string]any); d["minimum"] != 1 || d["maximum"] != maxRecallLimit || d["argument"] != "limit" {
-		t.Fatalf("error data must name the argument and range: %v", e.Data)
+	msg, d := argErr(t, s, "recall", map[string]any{"workspace_id": "ws", "limit": 51})
+	if d["minimum"] != 1 || d["maximum"] != maxRecallLimit || d["argument"] != "limit" || d["tool"] != "recall" {
+		t.Fatalf("error data must name the tool, argument and range: %v", d)
+	}
+	if !strings.Contains(msg, "must be between 1 and 50 (got 51)") || !strings.Contains(msg, "not clamped") {
+		t.Fatalf("the text must name the range: %q", msg)
 	}
 	good := []struct {
 		tool string
@@ -510,15 +530,15 @@ func TestOutOfRangeArgumentsAreRejectedNotClamped(t *testing.T) {
 	}
 	for _, c := range good {
 		c.args["workspace_id"] = "ws"
-		if _, rerr := call(t, s, c.tool, c.args); rerr != nil {
-			t.Fatalf("%s %v rejected: %v", c.tool, c.args, rerr)
+		if res, rerr := call(t, s, c.tool, c.args); rerr != nil || res["isError"] != false {
+			t.Fatalf("%s %v rejected: %v %v", c.tool, c.args, rerr, res)
 		}
 		if p := api.lastTool(t).Path; !strings.Contains(p, c.want) {
 			t.Fatalf("%s: %q not forwarded unchanged in %s", c.tool, c.want, p)
 		}
 	}
-	if _, rerr := call(t, s, "verify", map[string]any{"workspace_id": "ws", "entry_id": "e", "note": strings.Repeat("é", maxVerifyNote)}); rerr != nil {
-		t.Fatalf("a %d-character note is within bounds: %v", maxVerifyNote, rerr)
+	if res, rerr := call(t, s, "verify", map[string]any{"workspace_id": "ws", "entry_id": "e", "note": strings.Repeat("é", maxVerifyNote)}); rerr != nil || res["isError"] != false {
+		t.Fatalf("a %d-character note is within bounds: %v %v", maxVerifyNote, rerr, res)
 	}
 }
 
@@ -567,8 +587,8 @@ func TestHiddenQueryAliasAcceptedButNotAdvertised(t *testing.T) {
 	if _, rerr := call(t, s, "search", map[string]any{"workspace_id": "ws", "q": "a", "query": "a"}); rerr != nil {
 		t.Fatalf("agreeing alias rejected: %v", rerr)
 	}
-	if _, rerr := call(t, s, "search", map[string]any{"workspace_id": "ws", "q": "a", "query": "b"}); rerr == nil || rerr.Code != CodeInvalidParams {
-		t.Fatalf("conflicting alias accepted: %v", rerr)
+	if msg, _ := argErr(t, s, "search", map[string]any{"workspace_id": "ws", "q": "a", "query": "b"}); !strings.Contains(msg, "conflicts with") {
+		t.Fatalf("conflicting alias: %q", msg)
 	}
 	// impact's API name "depth" folds onto max_depth
 	if _, rerr := call(t, s, "impact", map[string]any{"workspace_id": "ws", "symbol": "S", "depth": 2}); rerr != nil {

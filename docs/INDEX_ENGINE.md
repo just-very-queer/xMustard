@@ -78,8 +78,9 @@ See `docs/plans/2026-06-20-deep-graph-loop.md` (S1–S6, all complete).
 Don't hash every symbol on every query (hash once at index time). Don't keep two
 divergent search paths (one engine; Postgres optional replica). Don't add more MCP
 tools (the surface is a fixed **9**, enriched with modes/params — `search?mode=`,
-`impact symbol=/from=/to=`, `recall query=`; `tools/call` strictly validates them
-and rejects malformed/unknown/wrong-typed args with `-32602`). Don't rebuild
+`impact symbol=/path=/from=/to=`, `recall query=`; `tools/call` strictly validates
+them: a malformed request or unknown tool is `-32602`, an unknown or wrong-typed
+argument a tool error with `isError`). Don't rebuild
 GitNexus from scratch (borrow the model: structure → parse → graph → query,
 incrementally in Rust).
 

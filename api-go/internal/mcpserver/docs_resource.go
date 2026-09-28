@@ -38,7 +38,8 @@ func renderToolsDoc(tools []*Tool) string {
 	b.WriteString("# xMustard tool arguments not listed in tools/list\n\n")
 	b.WriteString("tools/list advertises a lean schema so every session's prompt prefix stays small; its size is capped by a " +
 		"test per protocol version and role. tools/call also accepts the arguments below, validated exactly like listed " +
-		"ones: unknown names, wrong types and out-of-range values are rejected, never clamped. A client that validates " +
+		"ones: unknown names, wrong types and out-of-range values are rejected, never clamped, with a tool error " +
+		"(isError) that says what was wrong and lists the tool's arguments. A client that validates " +
 		"calls against the closed inputSchema before sending them can start the MCP server with XMUSTARD_MCP_SCHEMA=full " +
 		"to list them.\n")
 	for _, t := range tools {

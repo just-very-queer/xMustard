@@ -346,6 +346,42 @@ func TestHookCaptureIsRedactedAndAttributed(t *testing.T) {
 	}
 }
 
+// A capture the redaction refuses fails open: the output of a secret path (WS-72
+// denylist, evidence.ErrSecretPath) and a redactor that fails (redaction_failed) leave
+// the client its native output, retain nothing, and are not counted as the daemon
+// being busy.
+func TestHookRefusedCaptureFailsOpenWithoutBusyNote(t *testing.T) {
+	f := newHookFixture(t)
+	content := strings.Repeat("API_URL=https://internal.example.test\nFEATURE=on\n", 1000)
+	read := func(path string) string {
+		return hookEvent(map[string]any{"session_id": "refused", "cwd": f.root, "hook_event_name": "PostToolUse", "tool_name": "Read",
+			"tool_input":    map[string]any{"file_path": path},
+			"tool_response": map[string]any{"type": "text", "file": map[string]any{"filePath": path, "content": content}}, "tool_use_id": "toolu_read"})
+	}
+	check := func(name string, code int, body []byte, retained int) {
+		t.Helper()
+		if code != 200 || bytes.Contains(body, []byte("daemon was busy")) {
+			t.Fatalf("%s: %d %.300s", name, code, body)
+		}
+		if obs := capturedObservations(t, f.dir, f.ws); len(obs) != retained {
+			t.Fatalf("%s: %d observations retained, want %d", name, len(obs), retained)
+		}
+	}
+	code, body := f.post(t, f.agent, "PostToolUse", read(filepath.Join(f.root, ".env")))
+	if bytes.Contains(body, []byte("updatedToolOutput")) {
+		t.Fatalf("secret path: the output was replaced: %.300s", body)
+	}
+	check("secret path", code, body, 0)
+	code, body = f.post(t, f.agent, "PostToolUse", read(filepath.Join(f.root, "config.txt"))) // the same output elsewhere is captured
+	check("control", code, body, 1)
+	withCaptureRedactor(t, func(w io.Writer) evidence.StreamRedactor { return panicRedactor{w} })
+	code, body = f.post(t, f.agent, "PostToolUse", postToolUseBash(f.root, "refused", "", goTestLog(1500)))
+	if bytes.Contains(body, []byte("updatedToolOutput")) {
+		t.Fatalf("redactor failure: the output was replaced: %.300s", body)
+	}
+	check("redactor failure", code, body, 1)
+}
+
 // A payload the Bash schema rejects falls back to the original output (with a notice
 // as context), within the budget.
 func TestHookShapeMismatchFallsBackWithinBudget(t *testing.T) {
