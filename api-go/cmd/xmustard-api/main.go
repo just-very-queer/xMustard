@@ -714,16 +714,6 @@ func writeJSON(w http.ResponseWriter, status int, payload any) {
 	_ = json.NewEncoder(w).Encode(payload)
 }
 
-// registerInlineRoutes mounts the routes not yet moved to an area's table.
-func registerInlineRoutes(mux routeRegistrar) {
-	registerEvalRoutes(mux, envDefault("XMUSTARD_DATA_DIR", "../backend/data"))
-	registerRepoConfigRoutes(mux, envDefault("XMUSTARD_DATA_DIR", "../backend/data"))
-	registerIntegrationRoutes(mux, envDefault("XMUSTARD_DATA_DIR", "../backend/data"))
-	registerMemoryRoutes(mux)
-	registerGroundRoutes(mux)
-	registerMCPRoutes(mux)
-}
-
 // maxRecallLimit caps a caller-supplied recall limit so the bounded path stays bounded.
 const maxRecallLimit = 50
 

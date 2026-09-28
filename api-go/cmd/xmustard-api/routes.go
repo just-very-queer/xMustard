@@ -25,17 +25,22 @@ type routeSpec struct {
 	handler http.HandlerFunc
 }
 
-// apiRouteAreas lists the route table of every area registerRoutes mounts. The
-// evidence, capture, outcome and hook areas share the evidence store, so
-// newAPIHandlerFor mounts them. Areas that register through a routeRegistrar join
-// through routesOf.
+// apiRouteAreas lists the route table of every area registerRoutes mounts: the core
+// areas, then the platform's. The evidence, capture, outcome and hook areas share the
+// evidence store, so newAPIHandlerFor mounts them. The areas that register through a
+// routeRegistrar join through routesOf.
 func apiRouteAreas() [][]routeSpec {
+	dir := dataDir() // the eval, repo-config and integration handlers keep the directory read here
 	return [][]routeSpec{
 		authRoutes,
 		toolRoutes,
+		routesOf(registerMemoryRoutes),
+		routesOf(registerGroundRoutes),
+		routesOf(registerMCPRoutes),
+		diagnosticsRoutes, // repo_diagnostics_routes.go: all of the diagnostics wiring
+		workspaceRoutes,
 		operatorRoutes,
 		postgresRoutes,
-		workspaceRoutes,
 		issueRoutes,
 		runRoutes,
 		verificationRoutes,
@@ -43,8 +48,9 @@ func apiRouteAreas() [][]routeSpec {
 		governanceRoutes,
 		codeIntelRoutes,
 		terminalRoutes,
-		diagnosticsRoutes, // repo_diagnostics_routes.go: all of the diagnostics wiring
-		routesOf(registerInlineRoutes),
+		routesOf(func(m routeRegistrar) { registerEvalRoutes(m, dir) }),
+		routesOf(func(m routeRegistrar) { registerRepoConfigRoutes(m, dir) }),
+		routesOf(func(m routeRegistrar) { registerIntegrationRoutes(m, dir) }),
 	}
 }
 
