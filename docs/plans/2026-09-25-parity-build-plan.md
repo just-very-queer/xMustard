@@ -1983,6 +1983,94 @@ Export verified memories to .clinerules paths:, Cursor rules, .claude/rules, AGE
 
 Tasks with hidden oracles validated to fail on baseline and pass on the reference, on Apache/MIT repos; budgeted real-model run as an operator step.
 
+**Implementation record (branch parity/ws-63, 2026-09-28).** The section above is one line, so the workstream direction was the spec. It asked for:
+
+- tasks with hidden oracles for WS-11's `xmustard-eval`, each validated to fail on the starting state and pass on its reference, on Apache/MIT repositories (research/cline, research/pi-mono);
+- EVAL-02 stale-memory-harm and WS-56 adversarial-injection fixtures where they fit;
+- a stale-memory task anchored at an even path depth, the case v0.1.0 missed;
+- WS-76 (AACR-Bench pilot) folded in only as an optional corpus, outside the WS-50 gate;
+- the budgeted real-model run left to the operator, with a fake-driver dry-run proof and the exact operator command.
+
+This record describes tasks by id and class only. `docs/` is readable by an agent under evaluation, so solutions, gold files and seeded facts stay in the hidden corpus files.
+
+- *Corpus (`eval/tasks/parity/`).* `corpus.yaml` (`parity-v1`) holds eight tasks on pi-mono (MIT) at `5fd446ca` and cline (Apache-2.0) at `ee59f817`, both pinned to full shas. `fetch-repos.sh` makes both commits available under `research/`: it clones a missing repository shallowly and only fetches into an existing clone.
+  - Classes: three bug fixes of defects present at those commits (`pi-truncate-reason`, `cline-hub-ipv6-url`, `cline-reasoning-effort-keys`), one feature (`pi-fuzzy-camel-humps`), one localization task (`cline-edit-preview-hunk-header`) and three memory-lifecycle tasks (`pi-retry-cap-decision`, `pi-protocol-limits-doc`, `cline-schedule-preset-decision`).
+  - Oracles: each task has a hidden `node:test` oracle (`oracles/*.test.mts`, staged as `.xmustard-oracle/<task>.test.mts`) and a reference patch written against the drifted tree. Each oracle imports only modules whose import graph is dependency-free, so it needs Node 22.18 or later (type stripping on by default) and no `npm install`.
+  - Visible verify: only `pi-fuzzy-camel-humps` has one, the package's own `node --test` fuzzy tests. cline's smoke script needs bun or a resolve hook, so its tasks have no visible verify.
+  - Memory fixtures:
+    - Stale-memory harm, with a drifted stale memory at an even path depth in both repositories: `packages/protocol/src/framing.ts` (depth 4) with an odd-depth control (depth 5), and `apps/cline-hub/src/options.ts` (depth 4). These tasks can be solved from the code, so a failure after an unflagged stale delivery is attributable harm.
+    - Adversarial injection memories in `pi-truncate-reason`, where harm is attributable, and in `pi-retry-cap-decision`.
+    - Two decision tasks whose answer exists only in shared memory. `pi-retry-cap-decision` carries every label except stale; `cline-schedule-preset-decision` carries current, superseded, duplicate, contradiction, pending and foreign_scope.
+  - `README.md` (readable at run time, so answer-free) holds provenance, licences, requirements, the dry-run commands and the operator command.
+- *Executor changes (WS-11 code, `api-go/cmd/xmustard-eval`).*
+  - A memory label `adversarial`: verified memory whose content carries an injection payload. `adversarial_served` counts its deliveries. `adversarial_unflagged` counts deliveries without `injection_flags`; it must be 0, and the report warns `INJECTION SAFETY`. Any delivery is harmful for stale-memory harm: `injection_flags` label such a memory but do not withhold it.
+  - The harmful-label rule is now a table (`harmfulLabels`) with a stale-flag excuse per label, replacing the switch.
+  - Injection flags are read like the stale flag, from the entry holding the marker (its `content`, or its `text` in a compact render).
+  - Drift gains `substitute`: exactly one occurrence of `old` becomes `new`, and missing or repeated text fails the run. A drift in a large file of a path repository then names only the changed lines. The drift-op count is `DriftEdit.ops()` instead of an if-ladder.
+  - The stub stack labels seeded memory with the product's own `injection.Scan`.
+  - Tests:
+    - memory metrics: labelled, unlabelled, stale-flagged and compact deliveries;
+    - substitute: exactly once, repeated, absent, mode kept;
+    - the report's adversarial column and warning;
+    - the stub's labels;
+    - `TestParityCorpusAuthoring`, on any checkout: pinned shas, reference patches that change every gold file, prompts that never name the oracle, even- and odd-depth drifted stale memories, adversarial fixtures the WS-56 scan flags, four classes and two repositories;
+    - `TestParityCorpusOracles`: `validate --oracles` under containment where the clones and Node are present, skipped otherwise and under `-short`.
+- *Validation (build box, Linux, Node 22.23.3, bwrap).* `xmustard-eval validate --corpus eval/tasks/parity/corpus.yaml --oracles` marks all eight tasks valid in 20.5 s, and the visible verify passes on the reference. Every baseline failure is an assertion failure (`ERR_ASSERTION`), never an import or syntax error. Failing tests on the starting state: truncate 8 of 30, fuzzy 4 of 8, retry 4 of 5, protocol 2 of 3, IPv6 4 of 7, reasoning effort 4 of 10, hunk header 4 of 6, preset 1 of 1. A stale-memory answer (the drifted limits written with their old values) fails the protocol oracle. `TestParityCorpusOracles` takes 23.5 s.
+- *Dry-run proof (fake driver, no model, no credentials; build box).*
+  - **Stub stack**, all arms, `fake:claude`, `fake:codex` and `fake:pi`. Each run completes 29 runs and skips 11 (8 hook placeholders until WS-23, 3 memory arms of tasks without a fixture), and every completed run resolves. Each takes 56 to 89 s depending on box load, with an executor peak of 41.4 MiB. Adversarial memories: 2 served, 0 unflagged. The results were the same before and after the feat/parity-v2 merge (db04d40).
+  - **Harm attribution.** With `--fake-fail-arms xmustard_memory`, stale-memory harm is 3: the adversarial and superseded or contradicted deliveries of the truncate, retry and preset tasks. The stale tasks count 0 because the stub flags drifted memory.
+  - **Real stack** (`xmustard-api`, the Go stdio shim and the release core from this branch), `xmustard_mcp` and `xmustard_memory` on the five memory tasks. There were three runs, two before the feat/parity-v2 merge and one after it; each completed and resolved 10 runs in 91 to 113 s. The v0.1.0 drift miss shows as designed:
+    - `ground` reports `stale_memory` 1 of 3 on the protocol task (only the odd-depth memory) and 0 of 2 on cline-hub;
+    - recall delivers the even-depth memories without `stale` (protocol stale-served rate 0.5, cline-hub 1.0; arm mean 0.75), and both runs count as harmful deliveries. The odd-depth memory is flagged, and recall's stale penalty drops it below the relevance gate for the fake agent's query;
+    - the arm's other lifecycle numbers: current-fact recall 0.8, superseded served 0, duplicate rate 0, contradiction precision 0.5 and recall 1.0, scope leakage 0, pending served 0, promotion errors 0.
+  - **With 7d380c4 (parity/ws-23) applied** only to a scratch API build: `ground` reports 2 of 3 and 1 of 2, recall flags both even-depth memories `stale: true`, the stale-served rate is 0 and no delivery is harmful. The corpus therefore separates the bug from the fix.
+  - Both adversarial memories arrive with `injection_flags` (`override_instructions`; `override_instructions`, `authority_claim`, `secrecy`). Superseded memory is never served (0), and duplicate pairs are never served together.
+- *Measured on the real stack (sampled ps-RSS, v1 method, fake agent; WS-10 and WS-50 are authoritative).* Peaks of the xMustard tree during the agent phase ranged from 91.7 to 120.9 MiB over three runs of 10. By process:
+  - the core: 61.3 to 61.9 MiB on pi-mono (1,929 files) and 74.4 to 74.9 MiB on cline (3,454 files);
+  - the API: 19.5 to 20.1 MiB;
+  - the Go stdio shim: 10.5 to 11.0 MiB;
+  - a concurrent `git` child, when sampled: 8.1 to 16.3 MiB.
+
+  Five, 8 and 7 of 10 runs were over the 95.4 MiB gate. Every over-gate cline run is over even without a git child. This is a lead for WS-50 on real repositories of this size. It is not a gate result.
+- *Other real-stack observations (recorded, not fixed; outside WS-63).* With the fake agent's single query (the prompt's first line):
+  - in `pi-truncate-reason`, recall returned only the adversarial memory, and the relevant current memory fell below the relevance gate;
+  - in `pi-retry-cap-decision`, the adversarial memory (flagged) ranked above the current decision.
+
+  Both are ranking leads for the recall owners. A real agent issues its own queries.
+- *WS-76 (`eval/tasks/aacr/`, optional corpus, outside the WS-50 gate, not run).*
+  - Gate 0 is recorded in `pilot.json`:
+    - the dataset `Alibaba-Aone/aacr-bench` at revision `47be1d6d`, licensed Apache-2.0 in its card metadata;
+    - the SHA-256 of `dataset.json` (2,145 comments, 1,505 correct) and of the card;
+    - a 7-PR pilot in 7 languages from MIT, Apache-2.0 and BSD-3-Clause repositories (GitHub `spdx_id`): 73 correct and 30 incorrect comments over 1,249 changed lines.
+  - The README sets the protocol: PR-cluster bootstrap instead of per-issue McNemar; judge agreement by Cohen's kappa over two passes, with no judged F1 below 0.6; tokens split by kind; a USD 50 pilot cap (claude `max_budget_usd` 2.0 x 7 x 3, plus USD 8 for the judge); a later cap of 1.25 x the pilot's mean cost per run x the planned runs.
+  - It also names what the executor lacks to run a review task.
+- *Operator step (real model; not run).*
+
+  ```
+  sh eval/tasks/parity/fetch-repos.sh
+  cd api-go && go build -o /tmp/xm/xmustard-eval ./cmd/xmustard-eval && go build -o /tmp/xm/xmustard-api ./cmd/xmustard-api && go build -o /tmp/xm/xmustard-mcp ./cmd/xmustard-mcp
+  (cd ../rust-core && cargo build --release --bin xmustard-core)
+  cp ../eval/tasks/run-config.example.yaml /tmp/xm/parity-run.yaml   # model, repeats: 3, seed, max_budget_usd: 2.0, stack binaries, thresholds
+  /tmp/xm/xmustard-eval validate --corpus ../eval/tasks/parity/corpus.yaml --oracles
+  /tmp/xm/xmustard-eval run --corpus ../eval/tasks/parity/corpus.yaml --config /tmp/xm/parity-run.yaml --out /tmp/xm/parity-$(date +%Y%m%d)
+  ```
+
+  One repetition is 29 runs; at `repeats: 3` that is 87 runs. The claude spend is capped at USD 174, and the worst case is about 22 h of wall time.
+- *Checks.* After merging feat/parity-v2 at db04d40 (WS-FIX-04, WS-26; no conflict), `xm-remote-check.sh all -count=1` was run twice.
+  - **First run: failed.** Every Go package passed, and the only failure was `index_build::build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib` at 25.2 MiB against its 25 MiB line. This branch changes no Rust. The test is the debug-binary RSS test that WS-15 recorded as flaky under load. Re-run alone on the box at load average 16.8, it failed once more (25.2 MiB) and then passed twice.
+  - **Second run: passed** (remote_exit=0): every Rust test target, 6 clippy warnings (the base count), go vet and every Go package, including `TestParityCorpusOracles`.
+  - Pi is unchanged, so its node tests were not run. gofmt is clean on the changed Go files.
+- *Deviations.*
+  - **Eight tasks, not a gate-sized corpus.** The exact McNemar test reaches p < 0.05 only with six or more discordant tasks, all in one direction. WS-50 needs more tasks before a parity decision. The authoring rules and `TestParityCorpusAuthoring` are there to grow the corpus.
+  - **Tasks are authored at the pinned commits, not mined from history.** The clones are shallow, so no SWE-bench-style base/fix pairs were available. The bug fixes target defects confirmed at the pinned commits: the truncation helpers misreport the reason, `HOST=::1` crashes cline-hub, lowercase inherited keys pass as reasoning efforts, and empty-range hunk headers are off by one. The feature and the two decisions are synthetic by design. One candidate, CLI compaction aliases, was dropped because the project's own tests reject those aliases on purpose.
+  - **Only dependency-free oracles.** Tasks whose checks need an `npm install` (cline's bun and vitest suites, most pi-mono packages' vitest tests) are out. Only one task has a visible verify.
+  - **Schema additions.** The spec asked for fixtures, not executor changes. The injection fixtures, however, needed a label and its metrics, and path-repository drift needed `substitute`. Both are small WS-11 changes with tests. Drift stays an uncommitted working-tree edit, as the schema defines, so `git status` shows it to the agent.
+  - **Not authored:** EVAL-03 reduction fixtures and an expiry fixture. The latter still needs a product expiry field, as `eval/tasks/README.md` says.
+  - **Fake-agent query.** The fake agent recalls with the prompt's first line. The protocol task's first line names frame and CBOR limits so the dry run reaches its stale memories. A real agent is not bound to that query.
+  - **The even-depth fix is not in this branch.** It is 7d380c4 on parity/ws-23 and was applied only to a scratch build for the comparison above. On feat/parity-v2 the corpus reports the bug.
+  - **WS-76** is a licence-checked pilot manifest and a protocol only. `xmustard-eval` has no review task type, so nothing was run. Its numbers (the pilot cap, the kappa threshold) are proposals for the owner.
+  - **No paid model run.** That step belongs to the operator.
+
 
 ## Open Code Review adoption (added 2026-09-25)
 
