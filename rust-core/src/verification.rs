@@ -63,8 +63,12 @@ impl BoundedCapture {
         let mut out = self.head;
         if self.total > captured {
             out.extend_from_slice(
-                format!("\n...[dropped {} bytes of {} total]\n", self.total - captured, self.total)
-                    .as_bytes(),
+                format!(
+                    "\n...[dropped {} bytes of {} total]\n",
+                    self.total - captured,
+                    self.total
+                )
+                .as_bytes(),
             );
         }
         out.extend(self.tail);
@@ -97,7 +101,7 @@ fn spawn_bounded_reader<R: Read + Send + 'static>(
 /// non-unix this degrades to a no-op (the caller's child.kill() handles the direct child).
 #[cfg(unix)]
 fn signal_child_group(pid: u32, sig: rustix::process::Signal) {
-    use rustix::process::{kill_process_group, Pid};
+    use rustix::process::{Pid, kill_process_group};
     if let Some(p) = Pid::from_raw(pid as i32) {
         let _ = kill_process_group(p, sig);
     }
@@ -1165,13 +1169,19 @@ mod tests {
             60,
         )
         .expect("should run");
-        assert!(result.stdout_excerpt.contains("dropped"), "the middle was dropped");
+        assert!(
+            result.stdout_excerpt.contains("dropped"),
+            "the middle was dropped"
+        );
         assert!(
             result.stdout_excerpt.ends_with("FINAL-SUMMARY-LINE\n"),
             "the last line survives the excerpt: {:?}",
             &result.stdout_excerpt[result.stdout_excerpt.len().saturating_sub(80)..]
         );
-        assert!(!result.stdout_excerpt.contains("[truncated"), "the excerpt holds the whole capture");
+        assert!(
+            !result.stdout_excerpt.contains("[truncated"),
+            "the excerpt holds the whole capture"
+        );
     }
 
     // P1-A: a command that exits NORMALLY but leaves a grandchild holding the stdout pipe
@@ -1182,12 +1192,9 @@ mod tests {
     fn managed_command_does_not_hang_on_grandchild_holding_pipe() {
         let temp_dir = TempDir::new().expect("temp dir");
         let start = Instant::now();
-        let result = run_verification_command(
-            temp_dir.path(),
-            "( sleep 300 ) & echo hi; exit 0",
-            120,
-        )
-        .expect("should run");
+        let result =
+            run_verification_command(temp_dir.path(), "( sleep 300 ) & echo hi; exit 0", 120)
+                .expect("should run");
         assert!(result.success);
         assert!(result.stdout_excerpt.contains("hi"));
         assert!(
@@ -1247,7 +1254,11 @@ mod tests {
         let result = run_verification_profile(temp_dir.path(), &profile, None, None)
             .expect("profile should run");
         assert!(!result.success);
-        assert_eq!(result.attempts.len(), 1, "a timed-out command must not be retried");
+        assert_eq!(
+            result.attempts.len(),
+            1,
+            "a timed-out command must not be retried"
+        );
         assert!(result.attempts[0].timed_out);
         let contents = std::fs::read_to_string(&side).unwrap_or_default();
         assert_eq!(
