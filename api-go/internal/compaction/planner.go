@@ -195,29 +195,31 @@ func todoKey(t todo, i int) string {
 	return fmt.Sprintf("index:%d", i)
 }
 
+// nextAction names the next action a planner result recommends: its title (or else its
+// type) and the tool to use.
 func (s *plannerState) nextAction() string {
-	title := anyString(s.next["title"])
-	tool, kind := cleanText(anyString(s.next["recommended_tool"]), 40), cleanText(anyString(s.next["type"]), 40)
-	switch {
-	case title != "" && tool != "":
-		return fmt.Sprintf("next %s via %s", cleanText(title, 80), tool)
-	case title != "":
-		return "next " + cleanText(title, 80)
-	case kind != "" && tool != "":
-		return fmt.Sprintf("next_action %s via %s", kind, tool)
-	case kind != "":
-		return "next_action " + kind
+	head := firstNonEmpty(prefixed("next ", cleanText(anyString(s.next["title"]), 80)),
+		prefixed("next_action ", cleanText(anyString(s.next["type"]), 40)))
+	if tool := cleanText(anyString(s.next["recommended_tool"]), 40); head != "" && tool != "" {
+		head += " via " + tool
 	}
-	return ""
+	return head
 }
 
-func planSummary(plan map[string]any) string {
-	if len(plan) == 0 {
-		return "planner state"
+// prefixed is prefix+s, or "" when s is empty.
+func prefixed(prefix, s string) string {
+	if s == "" {
+		return ""
 	}
+	return prefix + s
+}
+
+// planSummary names a plan by its title (or summary) and counts its steps, phases and
+// todos.
+func planSummary(plan map[string]any) string {
 	label := "planner state"
-	if title := firstNonEmpty(anyString(plan["title"]), anyString(plan["summary"])); title != "" {
-		label = `plan "` + cleanText(title, 72) + `"`
+	if title := cleanText(firstNonEmpty(anyString(plan["title"]), anyString(plan["summary"])), 72); title != "" {
+		label = `plan "` + title + `"`
 	}
 	parts := []string{label}
 	for _, member := range []string{"steps", "phases", "todos"} {
