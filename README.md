@@ -66,6 +66,28 @@ RSS (measured: [2026-09-26 relay RSS](docs/benchmarks/2026-09-26-ws13-relay-rss.
 The older Go stdio shim `xmustard-mcp` still works but is deprecated: it costs about
 13.5 MiB per agent and will be removed.
 
+### Run it as a service
+
+`xmustard-ops setup` installs the API as a per-user service and waits until it
+answers `/api/health`. On macOS it is a launchd agent, started at login and restarted
+after a crash. On Linux it is a systemd socket and service: the first connection starts
+the daemon, and connections made while it restarts wait instead of being refused (on
+macOS the relay waits up to 10 s for a restarting daemon). Rerun
+setup after an upgrade to restart the daemon on the new binaries; the daemon migrates
+and checks the governance store as it starts (`store` on `/api/health`). It logs to a
+size-capped, rotated file, and its unit never carries a token.
+
+```bash
+xmustard-ops setup [--root "$PWD" --client claude-code]  # --root also prints the entry below
+xmustard-ops daemon status|restart|stop
+xmustard-ops store backup                 # a verified copy, safe while the daemon runs
+xmustard-ops store check [--file PATH]    # identity, schema and quick_check, read-only
+xmustard-ops store restore <backup>       # stops the daemon, swaps the store, starts it
+xmustard-ops uninstall                    # keeps the data dir and the logs
+```
+
+On Linux, `loginctl enable-linger` keeps the daemon running without a login session.
+
 ### Register it
 
 `xmustard-ops mcp-config` prints the entry for one project. It binds the session to

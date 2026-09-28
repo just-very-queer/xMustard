@@ -44,8 +44,19 @@ func main() {
 		return
 	}
 
+	if err := prepareDaemon(); err != nil { // log file, env hygiene (daemon_lifecycle.go)
+		log.Fatal(err)
+	}
 	cfg := loadServerConfig(dataDir())
+	activated, err := adoptActivatedSocket(&cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := validateStartup(cfg); err != nil {
+		log.Fatal(err)
+	}
+	ln, err := listen(cfg, activated)
+	if err != nil {
 		log.Fatal(err)
 	}
 	applyRuntimeHygiene()
@@ -71,10 +82,13 @@ func main() {
 	// (interrupted-run persistence, worker/terminal teardown, service close) to finish
 	// before the process exits.
 	shutdownDone := make(chan struct{})
+	// Registered before serving, not in the goroutine: a service manager may stop the
+	// daemon as soon as it answers, and a SIGTERM that beat the goroutine to Notify
+	// would kill it without the drain.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 	go func() {
 		defer close(shutdownDone)
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, os.Interrupt, syscall.SIGTERM)
 		<-sigCh
 		log.Printf("shutdown: signal received; draining")
 		ctx, cancel := context.WithTimeout(context.Background(), shutdownDrain())
@@ -106,11 +120,12 @@ func main() {
 	}()
 	go serveHookSocket(srv.Handler) // the static hook client's Unix socket (WS-23)
 	log.Printf("xmustard api-go listening on %s (tls=%v)", cfg.addr(), cfg.hasTLS())
+	go checkStoreAtStart(baseCtx)
 	var serveErr error
 	if cfg.hasTLS() {
-		serveErr = srv.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey)
+		serveErr = srv.ServeTLS(ln, cfg.tlsCert, cfg.tlsKey)
 	} else {
-		serveErr = srv.ListenAndServe()
+		serveErr = srv.Serve(ln)
 	}
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatal(serveErr)

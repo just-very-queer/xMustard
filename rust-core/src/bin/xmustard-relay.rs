@@ -25,17 +25,23 @@
 //! never blocks a cancellation or a roots/list answer behind it; notifications and
 //! answers are relayed in order on the reading thread. When the API forgets
 //! the session (a restart), the relay replays the client's initialize and retries once.
+//! While the API is down for a restart (an upgrade or a crash under its service
+//! manager), a request waits up to `RESTART_GRACE` for it to listen again instead of
+//! failing at once; the connection is refused before anything is sent, so the wait
+//! never repeats a request.
 
 use std::env;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Largest stdin message relayed (the stdio shim's framing cap).
 const MAX_MESSAGE_BYTES: usize = 8 << 20;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a request waits for a refusing API to come back (a daemon restart).
+const RESTART_GRACE: Duration = Duration::from_secs(10);
 const THREAD_STACK: usize = 256 << 10;
 
 fn main() {
@@ -59,6 +65,8 @@ struct Config {
     target: String,
     token: Option<String>,
     workspace: Option<String>,
+    /// How long a request waits while the API refuses connections (RESTART_GRACE).
+    restart_grace: Duration,
 }
 
 impl Config {
@@ -124,6 +132,7 @@ impl Config {
             target,
             token,
             workspace,
+            restart_grace: RESTART_GRACE,
         })
     }
 }
@@ -546,13 +555,19 @@ impl Response {
     }
 }
 
-/// Sends one request on a fresh connection (Connection: close).
+/// Sends one request on a fresh connection (Connection: close). A POST waits out a
+/// restarting API; the session DELETE at exit does not.
 fn send(cfg: &Config, method: &str, body: &[u8], session: Option<&str>) -> io::Result<Response> {
     let addr = (cfg.host.as_str(), cfg.port)
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no address"))?;
-    let mut stream = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
+    let grace = if method == "POST" {
+        cfg.restart_grace
+    } else {
+        Duration::ZERO
+    };
+    let mut stream = connect(&addr, grace)?;
     let _ = stream.set_nodelay(true);
     let mut req = format!(
         "{method} {} HTTP/1.1\r\nHost: {}:{}\r\nAccept: application/json, text/event-stream\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
@@ -579,6 +594,25 @@ fn send(cfg: &Config, method: &str, body: &[u8], session: Option<&str>) -> io::R
     stream.write_all(body)?;
     stream.flush()?;
     read_response(BufReader::new(stream))
+}
+
+/// Connects to addr, retrying a refused connection (nothing listens: the API is
+/// restarting) with backoff until grace has passed.
+fn connect(addr: &SocketAddr, grace: Duration) -> io::Result<TcpStream> {
+    let deadline = Instant::now() + grace;
+    let mut wait = Duration::from_millis(50);
+    loop {
+        match TcpStream::connect_timeout(addr, CONNECT_TIMEOUT) {
+            Err(e)
+                if e.kind() == io::ErrorKind::ConnectionRefused
+                    && Instant::now() + wait < deadline =>
+            {
+                thread::sleep(wait);
+                wait = (wait * 2).min(Duration::from_millis(500));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn read_response<R: BufRead + Send + 'static>(mut r: R) -> io::Result<Response> {
@@ -945,7 +979,64 @@ mod tests {
             target: "/mcp".into(),
             token: Some("tok".into()),
             workspace: None,
+            restart_grace: Duration::ZERO,
         })
+    }
+
+    #[test]
+    fn a_request_waits_for_a_restarting_api() {
+        // the API is down: its port refuses connections
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let restarted = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(300));
+            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            let (stream, _) = listener.accept().unwrap();
+            let seen = read_request(&stream);
+            let body = r#"{"jsonrpc":"2.0","id":9,"result":{}}"#;
+            respond(
+                &stream,
+                "200 OK",
+                "Content-Type: application/json\r\n",
+                body,
+            );
+            seen
+        });
+        let cfg = Config {
+            restart_grace: Duration::from_secs(5),
+            ..(*config(port)).clone()
+        };
+        let sink = Sink::default();
+        let out: Output = Arc::new(Mutex::new(Box::new(sink.clone())));
+        let ping = r#"{"jsonrpc":"2.0","id":9,"method":"ping"}"#;
+        relay(
+            &cfg,
+            &Shared::default(),
+            &out,
+            ping,
+            &scan_top_level(ping),
+            false,
+        );
+        assert_eq!(restarted.join().unwrap().body, ping);
+        assert_eq!(
+            lines(&sink),
+            vec![r#"{"jsonrpc":"2.0","id":9,"result":{}}"#.to_string()]
+        );
+        // with no grace a refused connection fails the request at once
+        let started = Instant::now();
+        relay(
+            &config(port),
+            &Shared::default(),
+            &out,
+            ping,
+            &scan_top_level(ping),
+            false,
+        );
+        assert!(lines(&sink).last().unwrap().contains("unreachable"));
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     #[test]
