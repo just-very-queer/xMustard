@@ -14,6 +14,7 @@ import (
 	"sync"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/injection"
 )
 
 // Evidence delivery over MCP. Tool calls ask the API for the evidence envelope: the
@@ -106,10 +107,12 @@ type envelope struct {
 	CapturedIdentity string            `json:"captured_identity"`
 	Omissions        []json.RawMessage `json:"omissions"`
 	TokensEst        int               `json:"delivered_tokens_est"`
+	InjectionFlags   []string          `json:"injection_flags"`
 }
 
 // EnvelopeResult turns an evidence envelope into the MCP tool result: the projection
-// as the tool text (errors stay errors), plus an expansion note and _meta when reduced.
+// as the tool text (errors stay errors), a data-framing note when the projection holds
+// instruction-like text (WS-56), plus an expansion note and _meta when reduced.
 func (e *Evidence) EnvelopeResult(ctx context.Context, body, ws string) (map[string]any, *RPCError) {
 	// decoding copies the projection once and encoding the reply copies it again
 	if err := ReserveReply(ctx, 2*len(body)); err != nil {
@@ -123,6 +126,9 @@ func (e *Evidence) EnvelopeResult(ctx context.Context, body, ws string) (map[str
 		return nil, OverloadError(budget.ErrOverloaded) // retryable: a protocol overload, not a tool error
 	}
 	content := []map[string]any{{"type": "text", "text": env.Projection}}
+	if len(env.InjectionFlags) > 0 {
+		content = append(content, map[string]any{"type": "text", "text": injection.Note(env.Tool, env.InjectionFlags)})
+	}
 	res := map[string]any{"content": content, "isError": env.IsError}
 	if !env.Reduced || env.Handle == "" {
 		return res, nil
@@ -133,6 +139,9 @@ func (e *Evidence) EnvelopeResult(ctx context.Context, body, ws string) (map[str
 		"projection_mode": env.ProjectionMode, "captured_identity": env.CapturedIdentity,
 		"omissions": len(env.Omissions), "tool": env.Tool, "call_id": env.CallID, "status": env.Status,
 		"delivered_tokens_est": env.TokensEst,
+	}
+	if len(env.InjectionFlags) > 0 {
+		meta["injection_flags"] = env.InjectionFlags
 	}
 	e.remember(env.Handle, ws, meta)
 	note := fmt.Sprintf("[xmustard evidence] %s result reduced from %d to %d bytes (%d omitted regions, identity %s). "+

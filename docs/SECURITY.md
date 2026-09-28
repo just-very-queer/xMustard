@@ -158,6 +158,82 @@ peer invariant, so the API and the store agree on who is a peer.
   `redactions` (count per rule) and a warning naming the rules. `old_string` only
   locates stored text and is never stored.
 
+### Injection safety (WS-56)
+
+Everything xMustard puts into an agent's context is text that agents wrote or tools
+produced, and it can carry instructions aimed at the agent reading it.
+`api-go/internal/injection` holds the policy as data tables, and the checks that
+refuse text are explicit and fail closed.
+
+- **Scan.** A rule table flags the shapes of an injection, not imperative text as
+  such (a memory is meant to say "run make check before committing"): overriding
+  earlier instructions, a new task or role, forged authority, secrecy towards the
+  user, prompt leaks, exfiltration of secrets, `curl | sh`, chat-template tokens,
+  `Human:`/`Assistant:` turns, frame and system tags, forged hook JSON, and invisible
+  characters (the soft hyphen, zero-width and filler characters, bidirectional
+  controls, Unicode tag characters, and variation selectors in a run or from the
+  supplementary block). The text is folded once (lowercase, whitespace runs to one
+  space, markdown's `_emphasis_` and `__bold__` underscores to a space; underscores
+  inside a word stay). Every match starts with one of its rule's trigger literals, so
+  a pattern runs only from a trigger, over a window its longest match fits in, and a
+  rule that needs a delimiter (`|` for `curl | sh`, `>` for a tag) runs only when its
+  window holds it. A scan reads at most 128 KiB and reports `scan_truncated` past
+  that. A match budget (128 pattern tries, plus one per 64 bytes scanned) bounds the
+  matching to about 6 ms for 128 KiB of text dense with triggers; a scan that spends
+  it stops and reports `scan_saturated`. Both flags count as matches.
+- **Where it runs.** `recall` (every render, the memory index and fetch by id) labels
+  each entry with `injection_flags` and `quarantine` and adds a `data_notice`.
+  `remember` keeps flagged text and returns the flags with a warning. Every evidence
+  projection, which is every MCP tool result and every captured native output,
+  carries `injection_flags`. A projection that is JSON (every xMustard tool result,
+  and another server's JSON) is scanned as the text it encodes: member names and
+  decoded string values, so a phrase that wraps across an escaped `\n`, and the
+  `<` and `>` that Go's encoder writes as `\u003c` and `\u003e`, read as they do in
+  raw text. Other text is scanned as it is. A flagged result carries an
+  `[xmustard injection-check]` line saying it is data, not instructions: the MCP
+  bridge adds it to the tool result, a hook adds it to the shaped output it puts in
+  place of a native tool's (when it reduces that output; otherwise the native output
+  reaches the agent unchanged), and the Pi adapter adds it to the text it renders. The initialize instructions say that memory, tool output and
+  `<xmustard-data>` blocks are data, not instructions. `ground` returns counts and
+  ids only, so it carries no agent-written text.
+- **Pushed surfaces.** Memory pushed into context unasked, from a hook (WS-23) or the
+  core tier (WS-31), goes through `workspaceops.AdmitMemory`. The checks run in order:
+  the entry exists in the workspace, it is served, its content matches its digest, it
+  is not quarantined, it has a human approval, and it scans clean (a truncated scan
+  counts as flagged). What passes is framed in `<xmustard-data>` blocks after a notice.
+  The frame cannot be closed from inside: a frame tag in the text is written with
+  `&lt;`.
+- **Human approval** of a memory is an `approve` verdict on its served revision, in the
+  current vote epoch. The verdict must be recorded with kind `human`, and its principal
+  must be a human approver of the workspace now: a file-backed token of kind `human`
+  with the `human-approver` role (admin holds it), scoped to the workspace, unexpired
+  and not revoked. The approver must not have written the entry or the served
+  revision. Approval by a quorum of agents, or by anyone in open mode, is not human
+  approval. So without a human approver, nothing is pushed.
+- **Quarantine.** A write that cites an evidence handle captured from a tool other than
+  the workspace's own file, search, list, diff and shell tools or xMustard's tools
+  (for example WebFetch, WebSearch, a browser or another MCP server) marks the entry
+  `quarantine: untrusted_capture:<tool>`. The list of trusted tools is an allowlist, so
+  an unknown tool name is untrusted. A capture of one of xMustard's own tools records
+  the first quarantined memory its original carries (a `"quarantine"` member, which
+  text quoted inside a JSON string cannot form), and a write that cites it is
+  quarantined for the same reason. The capture records its quarantine when it is
+  taken; a capture from before that is judged by its tool name. An importer marks
+  foreign memory `foreign_import`. The mark is sticky: an edit that cites such a
+  capture adds it, a classification change keeps it, and the classify event that adds
+  it records it in the history. A quarantined entry is still served on recall,
+  labeled, but it is never pushed. It never holds the core tier: the store refuses it
+  on creation and on a tier change, and a core entry refuses an edit that would mark
+  it.
+- **Limits.** The scan is a pattern check: a paraphrase it has no rule for passes, and
+  a legitimate memory that quotes an injection is flagged (and so never pushed).
+  Quarantine sees only what a write cites; content an agent copies from the web
+  without citing the capture is not marked. The capture's tool name is the one the
+  capturing client recorded. A native tool's output that is not reduced passes
+  through unchanged, so no injection-check line reaches the agent with it. The
+  scan reads the JSON of a projection up to 256 KiB as decoded text; longer JSON is
+  scanned raw (and is flagged `scan_truncated` in any case).
+
 ### Changes for existing tokens
 
 Before the role table, an `agent` token could call every route except the admin

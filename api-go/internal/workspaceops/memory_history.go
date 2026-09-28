@@ -9,6 +9,7 @@ import (
 	"strings"
 
 	"xmustard/api-go/internal/govstore"
+	"xmustard/api-go/internal/injection"
 )
 
 // Memory history and the administrative lifecycle (WS-19A, PAR-GOV-04/05/06/12). An
@@ -52,12 +53,13 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer boo
 		if err != nil {
 			return err
 		}
-		out = map[string]any{"workspace_id": workspaceID, "content_digest": e.ContentDigest}
+		out = map[string]any{"workspace_id": workspaceID, "content_digest": e.ContentDigest, "data_notice": injection.DataNotice}
 		if withheld, err := servedContent(ctx, r, e, &ce, reviewer); err != nil {
 			return err
 		} else if withheld != "" {
 			out["content_withheld"] = withheld
 		}
+		ce.InjectionFlags = injection.Scan(ce.Title, ce.Content).Flags
 		ce.ContentDigest = ""
 		out["entry"] = ce
 		if err := addDerivation(ctx, r, e, out); err != nil {
@@ -116,10 +118,14 @@ func pendingRevisionView(ctx context.Context, r govstore.Reader, e govstore.Entr
 	if err != nil {
 		return nil, err
 	}
-	return map[string]any{
+	out := map[string]any{
 		"revision": rv.Revision, "base_revision": rv.BaseRevision, "op": rv.Op, "reason": rv.Reason,
 		"author": rv.Author, "content_digest": rv.ContentDigest, "diff": diff, "votes": votes,
-	}, nil
+	}
+	if flags := injection.Scan(rv.Content).Flags; len(flags) > 0 {
+		out["injection_flags"] = flags
+	}
+	return out, nil
 }
 
 // addDerivation adds how the entry was derived and what its verification rests on

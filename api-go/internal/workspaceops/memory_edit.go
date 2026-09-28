@@ -199,6 +199,10 @@ func EditContext(dataDir, workspaceID, entryID string, req EditRequest, editor C
 		if err != nil {
 			return err
 		}
+		// an edit derived from an untrusted capture quarantines the entry for good (WS-56)
+		if err := markQuarantined(ctx, tx, e, editor.Quarantine, actor); err != nil {
+			return err
+		}
 		if note := selfAssertion(editor.OpenMode, ce.RequireVerification, requireMulti); note != "" {
 			if _, err := tx.RecordVote(ctx, govstore.VoteInput{EntryID: entryID, Revision: rv.Revision,
 				Verdict: govstore.VerdictApprove, Note: note}, actor); err != nil {

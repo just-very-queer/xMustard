@@ -33,9 +33,9 @@ export const MASK_PREFIX = "[xmustard masked: ";
 // the model can use it. Such results are retained again under a fresh handle.
 export const EXPIRY_MARGIN_MS = 60 * 60_000;
 
-// Lines the adapter itself adds to a result (recovery footer, page and search
-// headers): never the tool's own first or last line.
-const ADAPTER_LINE = /^\[xmustard (evidence|page|search)\] /;
+// Lines the adapter itself adds to a result (recovery footer, injection-check note,
+// page and search headers): never the tool's own first or last line.
+const ADAPTER_LINE = /^\[xmustard (evidence|injection-check|page|search)\] /;
 export const isAdapterLine = (line: string): boolean => ADAPTER_LINE.test(line);
 
 // Tools whose results may be masked: Pi's built-ins, the nine xMustard tools and

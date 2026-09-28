@@ -181,7 +181,7 @@ function lastLine(text: string, max: number): string {
 function memoryOf(r: ResultRecord): Record<string, unknown> | undefined {
 	if (r.isError || r.masked) return undefined;
 	try {
-		const v = JSON.parse(r.text.split("\n[xmustard evidence] ")[0]) as unknown;
+		const v = JSON.parse(r.text.split(/\n\[xmustard (?:evidence|injection-check)\] /)[0]) as unknown;
 		return isObject(v) ? v : undefined;
 	} catch {
 		return undefined;

@@ -118,7 +118,7 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int) (groundMe
 		if e.VerificationMode != "" {
 			scan.modes[e.VerificationMode]++
 		}
-		if e.Tier == "core" {
+		if e.Tier == govstore.TierCore {
 			core++
 		}
 	}
