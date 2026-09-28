@@ -168,7 +168,7 @@ token, it prints nothing and exits 0, so Codex keeps its own output.
   own hooks and config are not touched:
 
   ```sh
-  repo=$PWD scratch=$(mktemp -d)
+  repo=$PWD scratch=$(cd "$(mktemp -d)" && pwd -P)
   export CODEX_HOME="$scratch/home"
   mkdir -p "$CODEX_HOME" "$scratch/app" && cp ~/.codex/auth.json "$CODEX_HOME/"
   hook="node $repo/api-go/internal/evidence/testdata/codex/record/hook.mjs $scratch/subagent.jsonl"
