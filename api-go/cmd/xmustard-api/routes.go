@@ -2,7 +2,9 @@ package main
 
 import (
 	"cmp"
+	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"slices"
@@ -33,6 +35,7 @@ func apiRouteAreas() [][]routeSpec {
 		operatorRoutes,
 		postgresRoutes,
 		workspaceRoutes,
+		issueRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }
@@ -190,6 +193,15 @@ func itemBodyCall[B, T any](item string, op func(dataDir, workspaceID, id string
 		result, err := op(dataDir(), r.PathValue("workspace_id"), r.PathValue(item), body)
 		reply(w, result, err, fail)
 	}
+}
+
+// decodeJSONBodyIfPresent is decodeJSONBody for a route whose body may be absent.
+func decodeJSONBodyIfPresent(w http.ResponseWriter, r *http.Request, dst any) bool {
+	if err := json.NewDecoder(r.Body).Decode(dst); err != nil && !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid JSON body"})
+		return false
+	}
+	return true
 }
 
 // queryInt reads an integer query parameter, keeping def when it is absent or not a
