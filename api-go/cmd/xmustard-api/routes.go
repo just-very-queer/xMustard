@@ -38,6 +38,7 @@ func apiRouteAreas() [][]routeSpec {
 		issueRoutes,
 		runRoutes,
 		verificationRoutes,
+		goalRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }
