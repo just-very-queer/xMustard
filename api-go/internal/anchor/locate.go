@@ -36,7 +36,7 @@ func locate(path, content string, s Snippet, prefer int) Anchor {
 // added line on the new side, a deleted line on the old side (blank ones included).
 // An anchor outside the change, or unanchored, touches nothing.
 func (s *Set) Touches(a Anchor) bool {
-	f := s.byPath[a.Path]
+	f := s.byPath[a.Side][a.Path]
 	if f == nil || a.StartLine <= 0 {
 		return false
 	}

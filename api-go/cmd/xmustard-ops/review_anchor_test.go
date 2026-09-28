@@ -122,9 +122,11 @@ func TestReviewAnchorFromEvidence(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		presence := mintIdentity(t, dir, "erin", workspaceops.TokenIdentity{Kind: workspaceops.PrincipalHuman, PresenceOnly: true})
 		handle := capture(t, dir, ws, "agent-a", anchorFindings)
 		args := []string{"review", "anchor", ws, "--base", "main", "--evidence", handle, "--data-dir", dir}
-		for name, tok := range map[string]string{"no token": "", "an unknown token": "nope", "another principal": other, "another workspace": elsewhere} {
+		for name, tok := range map[string]string{"no token": "", "an unknown token": "nope", "another principal": other,
+			"another workspace": elsewhere, "a presence-only token": presence} {
 			e, _, errOut := testEnv(map[string]string{"XMUSTARD_API_TOKEN": tok}, "")
 			if code := runOps(e, args...); code != exitError {
 				t.Errorf("%s: exit %d, want %d (%s)", name, code, exitError, errOut)

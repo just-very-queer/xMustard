@@ -175,17 +175,40 @@ func TestPlaceTriesAFileOutsideTheChangeFirst(t *testing.T) {
 		{"twice.go", "shared()", Anchor{Path: "twice.go", Status: Unanchored, Reason: ReasonAmbiguous, Candidates: 2}},
 		{"missing.go", "shared()", Anchor{Path: "a.go", StartLine: 2, EndLine: 2, Side: New, Status: Relocated, RefiledFrom: "missing.go"}},
 		{"a.go", "x", Anchor{Path: "a.go", StartLine: 1, EndLine: 1, Side: New, Status: ExactNew}},
+		{"out.go", "func F() {", Anchor{Path: "out.go", StartLine: 3, EndLine: 3, Side: New, Status: InFile}},
+		{"missing.go", "absent()", Unplaced("missing.go", ReasonNotFound)},
 	} {
 		if got := place(set, tc.path, tc.code); got != tc.want {
 			t.Errorf("%s: got %+v, want %+v", tc.path, got, tc.want)
 		}
 	}
 	if want := []string{"out.go", "twice.go", "missing.go"}; !slices.Equal(asked, want) {
-		t.Errorf("Outside asked for %q, want %q (a changed file never goes through it)", asked, want)
+		t.Errorf("Outside asked for %q, want %q (each path once; a changed file never goes through it)", asked, want)
 	}
 	set.Outside = nil
 	if got := place(set, "out.go", "shared()"); got.Status != Relocated || got.Path != "a.go" {
 		t.Errorf("without Outside: %+v", got)
+	}
+}
+
+// A renamed file's old name can be a new file's path in the same change. A finding on
+// that name is the new file's, whatever the diff order, and an old-side anchor on it
+// still counts the renamed file's deleted lines.
+func TestSetKeepsAReusedOldNameApart(t *testing.T) {
+	renamed := NewFile("a.go", "b.go", "@@ -1,2 +1,2 @@\n keep()\n-old()\n+moved()\n", nil)
+	added := NewFile("", "a.go", "@@ -0,0 +1,2 @@\n+fresh()\n+again()\n", nil)
+	for _, files := range [][]*File{{renamed, added}, {added, renamed}} {
+		set := NewSet(files)
+		if got, want := place(set, "a.go", "fresh()"), (Anchor{Path: "a.go", StartLine: 1, EndLine: 1, Side: New, Status: ExactNew}); got != want {
+			t.Errorf("the new file: got %+v, want %+v", got, want)
+		}
+		old := place(set, "b.go", "keep()\nold()")
+		if want := (Anchor{Path: "a.go", StartLine: 1, EndLine: 2, Side: Old, Status: ExactOld}); old != want || !set.Touches(old) {
+			t.Errorf("the renamed file's old side: got %+v (touches %v), want %+v touching", old, set.Touches(old), want)
+		}
+		if set.File("a.go") != added || set.File("b.go") != renamed {
+			t.Error("File does not prefer the path at head")
+		}
 	}
 }
 

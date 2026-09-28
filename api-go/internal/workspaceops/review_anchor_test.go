@@ -149,6 +149,23 @@ func TestReviewAnchorBounds(t *testing.T) {
 	}
 }
 
+// Findings on one file outside the change read it at head once: repeated reads would
+// spend the head bound and leave the later findings unsupported.
+func TestReviewAnchorReadsAFileOutsideTheChangeOnce(t *testing.T) {
+	dir, ws := anchorRepo(t)
+	batch := findingsBatch(t, [2]string{"keep.go", "var kept = 1"}, [2]string{"keep.go", "package a"}, [2]string{"keep.go", "var kept = 1"})
+
+	defer func(v int64) { headTotalLimit = v }(headTotalLimit)
+	headTotalLimit = int64(len("package a\n\nvar kept = 1\n")) + 1
+	got, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Counts.Supported != 3 || got.Counts.ByStatus[anchor.InFile] != 3 || got.HeadReads.Files != 1 || got.HeadReads.Skipped != 0 {
+		t.Fatalf("counts %+v, head reads %+v", got.Counts, got.HeadReads)
+	}
+}
+
 func TestReviewAnchorRefusesBadInput(t *testing.T) {
 	dir, ws := anchorRepo(t)
 	batch := findingsBatch(t, [2]string{"a.go", "x"})

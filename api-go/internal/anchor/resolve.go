@@ -161,6 +161,7 @@ func contentLines(content string) []line {
 type File struct {
 	Path    string // at head; the old path of a deleted file
 	OldPath string // "" for an added file
+	deleted bool   // no version at head
 
 	newSide, oldSide [][]line       // per hunk
 	changed          map[Side][]int // added (new) and deleted (old) line numbers, ascending
@@ -174,7 +175,7 @@ type File struct {
 func NewFile(oldPath, newPath, diff string, head func() string) *File {
 	f := &File{Path: newPath, OldPath: oldPath, head: head, changed: map[Side][]int{}}
 	if f.Path == "" {
-		f.Path, f.head = oldPath, nil
+		f.Path, f.head, f.deleted = oldPath, nil, true
 	}
 	for _, h := range ParseHunks(diff) {
 		var nw, od []line

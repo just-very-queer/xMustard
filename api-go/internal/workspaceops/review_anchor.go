@@ -172,21 +172,23 @@ func (h *headBlobs) skip(path string) string {
 	return ""
 }
 
-func (h *headBlobs) start() error {
+func (h *headBlobs) start() (err error) {
 	ctx, cancel := context.WithTimeout(h.ctx, reviewDiffTimeout)
+	defer func() {
+		if err != nil {
+			cancel()
+		}
+	}()
 	cmd := reviewGitCommand(ctx, h.root, "cat-file", "--batch")
 	in, err := cmd.StdinPipe()
 	if err != nil {
-		cancel()
 		return err
 	}
 	out, err := cmd.StdoutPipe()
 	if err != nil {
-		cancel()
 		return err
 	}
-	if err := cmd.Start(); err != nil {
-		cancel()
+	if err = cmd.Start(); err != nil {
 		return err
 	}
 	h.cmd, h.in, h.out, h.cancel = cmd, in, bufio.NewReader(out), cancel
@@ -233,12 +235,14 @@ func (h *headBlobs) next(path string) (content string, ok bool, err error) {
 }
 
 // close ends the batch reader. Its exit status does not matter once every read it
-// answered was checked.
+// answered was checked, so it is stopped before the wait: after a malformed answer it
+// may still be writing one nobody reads, and would otherwise hold the wait until the
+// timeout.
 func (h *headBlobs) close() {
 	if h.cmd == nil {
 		return
 	}
 	_ = h.in.Close()
-	_ = h.cmd.Wait()
 	h.cancel()
+	_ = h.cmd.Wait()
 }
