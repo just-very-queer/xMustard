@@ -1,0 +1,6 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolUse",
+    "additionalContext": "[xmustard] src/billing.go: 1 new syntax error(s) after this edit (tree-sitter): line 4 col 24: missing \")\"."
+  }
+}

@@ -1,0 +1,303 @@
+{
+  "description": "xMustard: shape-matched reductions of native tool output with recoverable handles, verified memory and index hits before searches and file reads, ground at session start, and the dirty set from edits. Every hook fails open: a missing or slow daemon leaves Claude Code's own behavior unchanged.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/xmustard-hook",
+            "args": [
+              "claude",
+              "SessionStart"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/SubagentStart",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/UserPromptSubmit",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Grep|Glob|Bash|Read|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PreToolUse",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash|Read|Grep|Glob|WebFetch|Edit|Write|NotebookEdit",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PostToolUse",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      },
+      {
+        "matcher": "^mcp__(?!xmustard__|plugin_xmustard_)",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PostToolUse",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PostToolUseFailure",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostToolBatch": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PostToolBatch",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "CwdChanged": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/CwdChanged",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "FileChanged": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/FileChanged",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "WorktreeRemove": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/bin/xmustard-hook",
+            "args": [
+              "claude",
+              "WorktreeRemove"
+            ],
+            "timeout": 1
+          }
+        ]
+      }
+    ],
+    "PreCompact": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PreCompact",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/PostCompact",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/Stop",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/SubagentStop",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8042/api/hooks/claude/SessionEnd",
+            "headers": {
+              "Authorization": "Bearer ${XMUSTARD_API_TOKEN}",
+              "X-Xmustard-Workspace": "${XMUSTARD_WORKSPACE_ID}"
+            },
+            "allowedEnvVars": [
+              "XMUSTARD_API_TOKEN",
+              "XMUSTARD_WORKSPACE_ID"
+            ],
+            "timeout": 1
+          }
+        ]
+      }
+    ]
+  }
+}

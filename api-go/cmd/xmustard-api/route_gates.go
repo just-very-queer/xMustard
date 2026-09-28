@@ -53,6 +53,15 @@ func coreGate(role, tool, note string) routeGate {
 
 func platformGate(role, note string) routeGate { return routeGate{Role: role, Note: note} }
 
+// hookGate is a hook route's row: core, and served in read-only mode, because a hook
+// changes no shared state beyond the caller's own capture (the outcome a capture would
+// record is skipped in read-only mode). A hook runs on behalf of an agent session, so
+// every hook route needs the proposer role: a reader-only token drives no hook, and no
+// non-GET route grants reader (TestNoWriteRouteGrantsReader).
+func hookGate(note string) routeGate {
+	return routeGate{Core: true, Role: roleProposer, ReadSafe: true, Note: "hook: " + note}
+}
+
 var routeGateTable = map[string]routeGate{
 	// --- core: liveness, identity and token administration ---
 	"/api/health":                               coreGate(roleReader, "", "public liveness and limits; the budget block needs an operator token while auth is enforced"),
@@ -98,6 +107,23 @@ var routeGateTable = map[string]routeGate{
 	"DELETE /api/workspaces/{workspace_id}/evidence":          coreGate(roleAdmin, "", "workspace-wide purge of every principal's originals"),
 	"POST /api/workspaces/{workspace_id}/evidence/capture":    {Core: true, Role: roleProposer, ReadSafe: true, Note: "any tool's output (raw or a client hook body), the caller's own"},
 	"GET /api/workspaces/{workspace_id}/evidence/search":      coreGate(roleReader, "", "issuer-bound search in an original"),
+
+	// --- core: Claude Code hook service (hooks_routes.go, WS-23) ---
+	"POST /api/hooks/claude/SessionStart":       hookGate("ground's spawn-free part and core-tier memories as context; watchPaths"),
+	"POST /api/hooks/claude/SubagentStart":      hookGate("the same context for a subagent; records its id for attribution"),
+	"POST /api/hooks/claude/UserPromptSubmit":   hookGate("memories a prompt keyword triggers"),
+	"POST /api/hooks/claude/PreToolUse":         hookGate("index hits and memories for a search pattern or a file"),
+	"POST /api/hooks/claude/PostToolUse":        hookGate("captures the caller's own tool output; shape-matched updatedToolOutput"),
+	"POST /api/hooks/claude/PostToolUseFailure": hookGate("captures the caller's own failed tool output for the run outcome"),
+	"POST /api/hooks/claude/PostToolBatch":      hookGate("batch search nudge"),
+	"POST /api/hooks/claude/CwdChanged":         hookGate("watchPaths of the new directory's workspace"),
+	"POST /api/hooks/claude/FileChanged":        hookGate("dirty set; drops the cached repository identity"),
+	"POST /api/hooks/claude/WorktreeRemove":     hookGate("forgets the worktree's cached identity and dirty set"),
+	"POST /api/hooks/claude/PreCompact":         hookGate("queued; answered at once"),
+	"POST /api/hooks/claude/PostCompact":        hookGate("queued; answered at once"),
+	"POST /api/hooks/claude/Stop":               hookGate("queued; answered at once"),
+	"POST /api/hooks/claude/SubagentStop":       hookGate("queued; answered at once"),
+	"POST /api/hooks/claude/SessionEnd":         hookGate("queued; answered at once (1.5 s SessionEnd budget)"),
 
 	// --- platform: operator configuration ---
 	"GET /api/runtimes":                platformGate(roleReader, ""),

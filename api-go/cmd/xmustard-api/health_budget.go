@@ -61,6 +61,7 @@ func healthResponse(r *http.Request) map[string]any {
 	body["budget"] = healthBudgetBlock()
 	// the /mcp endpoint's per-tool and per-client counters are activity too
 	body["mcp_usage"] = mcpserver.Usage()
+	body["hook_usage"] = hookUsage() // the Claude Code hook service (WS-23)
 	return body
 }
 
