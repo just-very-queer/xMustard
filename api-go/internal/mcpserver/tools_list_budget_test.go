@@ -194,16 +194,15 @@ func TestAdvancedArgumentsAreValidated(t *testing.T) {
 		{map[string]any{"sections": true}, "array of strings"},
 		{map[string]any{"sections": strings.Repeat("runs,", 60)}, "at most 256"},
 	} {
-		_, rerr := call(t, s, "ground", tc.args)
-		if rerr == nil || rerr.Code != CodeInvalidParams || !strings.Contains(rerr.Message, tc.want) {
-			t.Fatalf("ground %v: want -32602 mentioning %q, got %v", tc.args, tc.want, rerr)
+		if msg, _ := argErr(t, s, "ground", tc.args); !strings.Contains(msg, tc.want) {
+			t.Fatalf("ground %v: want an argument error mentioning %q, got %q", tc.args, tc.want, msg)
 		}
 	}
 	// blank and duplicate elements are canonicalized, not rejected
 	tl, _ := ToolByName("ground")
-	args, _, rerr := BuildArgs(tl, map[string]any{"sections": " runs,,memory "})
-	if rerr != nil || args["sections"] != "runs,memory" {
-		t.Fatalf("canonical sections: %v %v", args, rerr)
+	args, _, aerr := BuildArgs(tl, map[string]any{"sections": " runs,,memory "})
+	if aerr != nil || args["sections"] != "runs,memory" {
+		t.Fatalf("canonical sections: %v %v", args, aerr)
 	}
 }
 

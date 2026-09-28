@@ -952,14 +952,14 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
 /// `symbolgraph <build|hotspots|blast-radius|...> ...` — the semantic symbol graph.
 /// The read-only queries run on the code index's snapshot when the root has an index
 /// (resident when serving) and on the legacy graph otherwise (see
-/// `symbolgraph::query_source`); impact, trace and cluster-of carry freshness and
-/// coverage.
+/// `symbolgraph::query_source`); impact, impact-file, trace and cluster-of carry
+/// freshness and coverage.
 fn run_symbolgraph_command(mut args: Args) -> CmdResult {
     use xmustard_core::symbolgraph as sg;
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|trace|blast-radius> [--identity-key=K] ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|blast-radius> [--identity-key=K] ...",
     )?;
     let (key, mut args) = identity_flag(args);
     let source = |root: &str, ws: &str| sg::query_source_for(Path::new(root), ws, key.as_deref());
@@ -1032,6 +1032,26 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             (out.freshness, out.coverage) = src.annotate(paths.map(String::as_str));
             json(&out)
         }
+        "impact-file" => {
+            // impact(path=): the file-level walk; the caller confines the path to the
+            // root, and it is only looked up in the graph
+            let u = usage(" <path> [max_depth]");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let path = need(&mut args, &u)?;
+            let depth = args
+                .next()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(4);
+            let src = source(&root, &ws);
+            let mut out = src.graph.file_impact(&path, depth).map_err(failed)?;
+            let start = out.found.then_some(&out.path);
+            let paths = start
+                .into_iter()
+                .chain(out.impacted.iter().map(|i| &i.path));
+            (out.freshness, out.coverage) = src.annotate(paths.map(String::as_str));
+            json(&out)
+        }
         "trace" => {
             let u = usage(" <from_symbol> <to_symbol>");
             let root = need(&mut args, &u)?;
@@ -1095,6 +1115,7 @@ mod tests {
         ("parse-coverage", &[]),
         ("symbolgraph", &["hotspots"]),
         ("symbolgraph", &["impact"]),
+        ("symbolgraph", &["impact-file"]),
         ("symbolgraph", &["trace"]),
         ("symbolgraph", &["clusters"]),
         ("symbolgraph", &["cluster-of"]),

@@ -40,9 +40,11 @@ gives agents such as Claude Code, Codex, and OpenCode two related capabilities:
 
 The agent-facing surface has **nine tools**. They use modes/params (e.g.
 `search?mode=pattern`, `impact
-symbol=/from=/to=`, `recall query=`) rather than split into more tools, and
+symbol=/path=/from=/to=`, `recall query=`) rather than split into more tools, and
 `tools/call` strictly validates arguments — unknown/wrong-typed/non-scalar/
-out-of-enum args are rejected with a JSON-RPC `-32602`, never silently coerced.
+out-of-enum args are rejected, never silently coerced, with a tool error
+(`isError`) that says what was wrong and lists the tool's arguments; an unknown
+tool or a malformed request is a JSON-RPC `-32602`.
 The historical narrowing decision is recorded in [`docs/RETHINK.md`](docs/RETHINK.md).
 
 The candidate also advertises MCP `resources` for authorized original-evidence
@@ -63,6 +65,28 @@ can only launch a command use `xmustard-relay`, a native stdio relay of about 2 
 RSS (measured: [2026-09-26 relay RSS](docs/benchmarks/2026-09-26-ws13-relay-rss.md)).
 The older Go stdio shim `xmustard-mcp` still works but is deprecated: it costs about
 13.5 MiB per agent and will be removed.
+
+### Run it as a service
+
+`xmustard-ops setup` installs the API as a per-user service and waits until it
+answers `/api/health`. On macOS it is a launchd agent, started at login and restarted
+after a crash. On Linux it is a systemd socket and service: the first connection starts
+the daemon, and connections made while it restarts wait instead of being refused (on
+macOS the relay waits up to 10 s for a restarting daemon). Rerun
+setup after an upgrade to restart the daemon on the new binaries; the daemon migrates
+and checks the governance store as it starts (`store` on `/api/health`). It logs to a
+size-capped, rotated file, and its unit never carries a token.
+
+```bash
+xmustard-ops setup [--root "$PWD" --client claude-code]  # --root also prints the entry below
+xmustard-ops daemon status|restart|stop
+xmustard-ops store backup                 # a verified copy, safe while the daemon runs
+xmustard-ops store check [--file PATH]    # identity, schema and quick_check, read-only
+xmustard-ops store restore <backup>       # stops the daemon, swaps the store, starts it
+xmustard-ops uninstall                    # keeps the data dir and the logs
+```
+
+On Linux, `loginctl enable-linger` keeps the daemon running without a login session.
 
 ### Register it
 
@@ -177,7 +201,7 @@ access logs.
 | `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct principals approve. |
 | `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Code search returning `path:line` slices, not a dump. Default `hybrid` ranks symbol names, file paths and doc chunks, not function bodies: RRF over lexical IDF, char-trigram fuzzy matching (typo tolerance; conceptual matching only when built with the optional `semantic-onnx` feature and `XMUSTARD_EMBED_MODEL` names a local ONNX model directory), inbound-reference degree, and graph proximity to `seed=<symbol>`. `mode=pattern` runs an ast-grep structural query over code. |
 | `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
-| `impact` | `symbol?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → files that reference the file(s) defining that name, up to 4 hops (file-level, so a hit may use a different symbol from the same file); `from=`&`to=` → shortest undirected path between the files defining the two names. |
+| `impact` | `symbol?`, `path?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → files that reference the file(s) defining that name, up to 4 hops (file-level, so a hit may use a different symbol from the same file); `path=` → the same walk from one file (`found: false` when the graph does not hold it); `from=`&`to=` → shortest undirected path between the files defining the two names. |
 | `diagnostics` | — | Current normalized errors/warnings for the workspace. |
 | `why_failed` | `run_id?`; advanced: `command`, `cwd`, `timeout_seconds`, `evidence_handle`, `log` | Explain a failure without a platform run: failure signals, salient error lines from the output's last MiB, the changed files it implicates and the promoted memories on them. `run_id` reads a platform run or a recorded outcome. `command` runs a test, build or lint command from a closed table (argv, no shell, inside the workspace root, without the daemon's secrets, one at a time, its process group killed at the timeout; on a loopback bind, or anywhere with `XMUSTARD_WHY_FAILED_COMMANDS=1`); `evidence_handle` and `log` explain a captured or pasted output. Each records a run-independent outcome that `ground` lists in `recent_failed_runs` until a later run of the same command resolves it. Captured failing test/build/lint outputs are recorded the same way. |
 

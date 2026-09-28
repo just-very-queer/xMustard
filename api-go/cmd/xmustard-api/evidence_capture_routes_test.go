@@ -145,14 +145,14 @@ func TestCaptureRouteClaudeBashAndSearch(t *testing.T) {
 }
 
 // A capture body is streamed, not reserved or buffered: a 16 MiB chunked hook body
-// (no Content-Length) goes through while the transient pool never holds more than
-// the capture window, where the generic route would have to buffer it whole.
+// (no Content-Length) goes through the production redactor while the transient pool
+// never holds more than the capture window, where the generic route would have to
+// buffer it whole.
 func TestCaptureRouteStreamsLargeChunkedBody(t *testing.T) {
 	prev := budget.TransientBytes
 	pool := budget.NewByteBudget(8 << 20)
 	budget.TransientBytes = pool
 	defer func() { budget.TransientBytes = prev }()
-	withCaptureRedactor(t, nil)
 	f := newEvidenceFixture(t, true)
 	var stdout strings.Builder
 	for stdout.Len() < 15<<20 {
@@ -213,11 +213,10 @@ func TestCaptureRouteRefusesWithoutRedactor(t *testing.T) {
 	}
 }
 
-// With a redactor wired, a secret in any tool output is neither retained nor
-// searchable through the route.
+// A secret in any tool output is neither retained nor searchable through the route
+// (the production redactor; see capture_redactor_test.go for the rule set).
 func TestCaptureRouteRedactsSecrets(t *testing.T) {
-	const secret = "ghp_0123456789abcdefghijklmnopqrstuvwxyzAB"
-	withCaptureRedactor(t, func(w io.Writer) evidence.StreamRedactor { return &secretRedactor{dst: w, secret: []byte(secret)} })
+	secret := "gh" + "p_0123456789abcdefghijklmnopqrstuvwxyzAB"
 	f := newEvidenceFixture(t, true)
 	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
 	log := strings.Replace(goTestLog(4000), "got 3, want 4", "got 3, want 4 (token "+secret+")", 1)
@@ -238,26 +237,6 @@ func TestCaptureRouteRedactsSecrets(t *testing.T) {
 	if code != 200 || sr.Matches != 1 {
 		t.Fatalf("the redacted line: %d %s", code, b)
 	}
-}
-
-// secretRedactor replaces one secret. It holds a section's bytes until Flush (the
-// decoder flushes at every section boundary), so a secret split across writes is
-// still seen whole; a test-only simplification of a streaming redactor.
-type secretRedactor struct {
-	dst     io.Writer
-	secret  []byte
-	pending []byte
-}
-
-func (r *secretRedactor) Write(p []byte) (int, error) {
-	r.pending = append(r.pending, p...)
-	return len(p), nil
-}
-
-func (r *secretRedactor) Flush() error {
-	_, err := r.dst.Write(bytes.ReplaceAll(r.pending, r.secret, []byte("[REDACTED]")))
-	r.pending = r.pending[:0]
-	return err
 }
 
 // 100,000 content blocks through the real route: a 200 with a projection within the

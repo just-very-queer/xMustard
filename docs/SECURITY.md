@@ -568,9 +568,12 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   a socket), and serves only `/api/hooks/` there through the full middleware stack.
   `XMUSTARD_HOOK_SOCKET=off` disables it.
 - **Captures.** A PostToolUse or PostToolUseFailure body is captured through the
-  streaming redactor before anything is retained, bound to the calling principal, and
-  recorded `captured_identity=unknown` (the producing repository state was not
-  observed). The session and subagent ids are recorded for attribution only.
+  capture route's redactor and checks (see Evidence capture redaction below) before
+  anything is retained, bound to the calling principal, and recorded
+  `captured_identity=unknown` (the producing repository state was not observed). The
+  session and subagent ids are recorded for attribution only. A capture refused for a
+  secret path or a redactor failure retains nothing and fails open: the client keeps
+  its native output, and the refusal does not count as the daemon being busy.
 - **What a hook may do.** An answer adds context, replaces a native output with its
   shape-matched reduction (PostToolUse only), sets the FileChanged watch list
   (SessionStart and CwdChanged), or says nothing. It never
@@ -593,6 +596,59 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   resident worker that is already running. Claude Code itself starts the static client
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
   other event is an http hook to the running daemon.
+
+## Evidence capture redaction (WS-FIX-03)
+
+Capture is on in every build, and every capture is redacted.
+`POST /api/workspaces/{id}/evidence/capture` streams the tool output (a raw body, or
+the output strings of a Claude, Codex, Cursor, Pi or OpenCode hook body) through the
+shared `redact` rules before a byte reaches the spool. The retained original, its
+pages, search inside it and the projection returned to the client therefore all hold
+the redacted text. In v0.1.0 no redactor was wired, so every capture answered
+`503 redaction_unavailable`.
+
+- **Rules.** Capture uses the rules `why_failed` applies to command output
+  (`workspaceops.OutputRedactor`): the default secret patterns (bearer and basic
+  credentials; AWS, GitHub, GitLab, Slack, OpenAI, Anthropic, Google, Stripe, npm,
+  Hugging Face and xMustard tokens; JWTs; URL userinfo passwords; private keys), the
+  key-aware detector for secret fields in JSON, YAML, env files, headers and flags,
+  and the literal values of this daemon's secret-named environment variables. Each
+  secret becomes `[REDACTED:<rule>]`.
+- **Streaming.** `redact.Writer` buffers 128 KiB and decides it 8 KiB at a time.
+  Each window is read with the lookahead after it, about 33 KiB, the longest span
+  any detector reads past a match (a private key body and its END marker). A secret
+  split across writes or windows is therefore seen whole, and the output is byte
+  for byte what one pass over the whole input gives. The stream is never buffered,
+  and a window's scratch and output are sized by the 8 KiB it decides, not by how
+  many secrets it holds. Measured on 16 MiB in the decoder's 32 KiB writes, the
+  redactor's live heap peaks at 0.4 MiB at most, on input that is nothing but
+  secrets (an 8-byte secret environment value repeated, the densest case), under a
+  quarter of the 2 MiB capture window. The hook decoder flushes it at each section
+  boundary, so each output string is redacted as one input.
+- **Secret paths.** When any path the capture names is on the secret-path denylist
+  (`.ssh/`, SSH key files, `.netrc`, `.npmrc`, `.pypirc`, `.dockercfg`, `.env` and
+  `.env.*` other than templates such as `.env.example`), the capture is refused with
+  `422 secret_path` and nothing is retained. The paths checked are the caller's
+  `path`, every path field of the hook body's tool input (`file_path`, `filePath`,
+  `path`, `target_file`, `notebook_path`, `directory`, `dir_path`), and every such
+  field of its response (Claude Read's `file.filePath`), wherever they appear in the
+  body. One path cannot hide another: a caller's `path=README.md` does not admit a
+  body that reads `.env`. The client keeps its own result.
+- **Fail closed.** A server without a redactor answers `503 redaction_unavailable`.
+  A redactor that fails (panics) answers `503 redaction_failed`. On every refusal
+  the spool is discarded, so nothing is retained. The WS-23 hook routes capture
+  through the same redactor, wrapper and checks; a hook whose capture is refused
+  retains nothing and leaves the client its native output.
+- **Limits.** Redaction is pattern-based. A secret that no rule recognizes is
+  retained as written: for example, a bare password in a line of code, or an
+  unquoted token-named value without a digit (the `redact` package documentation
+  lists the limits). Such an original can be revoked with
+  `DELETE .../evidence/{handle}`, and the admin purge (`DELETE .../evidence`)
+  removes every original of a workspace. Only named paths are matched: a secret
+  file read through a shell (`cat .env`), and the matches of a search over a
+  directory (a Grep over `/repo`, with or without a `glob` such as `.env*`), pass
+  through the content rules only. `capture.body_sha256` is the digest of the body
+  as received; it names the body but does not reveal it.
 
 ## Health endpoint
 

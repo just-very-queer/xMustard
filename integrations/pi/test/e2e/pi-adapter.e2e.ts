@@ -619,13 +619,17 @@ describe("Pi adapter against the real xMustard API", () => {
 // ---- WS-24: Pi built-ins through capture, turn_end masking, snapshot compaction ------
 
 const MASKED = "[xmustard masked: ";
-const stubHandle = (text: string) => /; handle (xm1\.[A-Za-z0-9_-]+)(?:; offset \d+)?; workspace_id ([^\]\s;]+)\]/.exec(text);
+// the stub's shape is masking.ts STUB_RE: an expiry follows the workspace when Go gave one
+const stubHandle = (text: string) => /; handle (xm1\.[A-Za-z0-9_-]+)(?:; offset \d+)?; workspace_id ([^\]\s;]+)(?:; expires [^\]\s;]+)?\]/.exec(text);
 
 describe("Pi built-ins, masking and compaction through xMustard (WS-24)", () => {
 	test("built-in results above the target are projected through capture: handle, isError and details kept, redacted, recoverable", async () => {
 		const big = `${Array.from({ length: 1500 }, (_, i) => `big line ${String(i).padStart(5, "0")} ${"x".repeat(30)}`).join("\n")}\n`;
 		writeFileSync(join(repo, "big.txt"), big);
-		const cmd = "for i in $(seq 1 3000); do printf 'ok line %05d padding-padding-padding-padding\\n' $i; done; echo '--- FAIL: TestBuiltin (0.00s)'; echo 'token XM_E2E_SECRET_abc123'; exit 3";
+		// a GitHub-shaped token (assembled here, so the source holds none) that only the
+		// production rules know, beside the e2e build's own marker
+		const ghToken = `gh${"p_"}${"E2e".repeat(12)}`;
+		const cmd = `for i in $(seq 1 3000); do printf 'ok line %05d padding-padding-padding-padding\\n' $i; done; echo '--- FAIL: TestBuiltin (0.00s)'; echo 'token XM_E2E_SECRET_abc123'; echo 'push with ${ghToken}'; exit 3`;
 		const run = await pi("builtins", [
 			{ calls: [{ name: "read", args: { path: "big.txt" } }, { name: "ls", args: { path: "web" } }] },
 			{ calls: [{ name: "bash", args: { command: cmd } }] },
@@ -656,6 +660,7 @@ describe("Pi built-ins, masking and compaction through xMustard (WS-24)", () => 
 		assert.match(bt, /--- FAIL: TestBuiltin/);
 		assert.match(bt, /Command exited with code 3/);
 		assert.ok(!bt.includes("XM_E2E_SECRET_abc123"), "the secret never reaches the model");
+		assert.ok(!bt.includes(ghToken), "a secret the production rules know never reaches the model");
 		assert.ok(Buffer.byteLength(bt) < 34 << 10, `projection is bounded (${Buffer.byteLength(bt)} bytes)`);
 		assert.equal(bash.details?.xmustard?.path, "capture");
 		assert.equal(bf.captured_identity, "unknown");
@@ -669,6 +674,8 @@ describe("Pi built-ins, masking and compaction through xMustard (WS-24)", () => 
 		assert.match(ot, /--- FAIL: TestBuiltin \(0\.00s\)/);
 		assert.match(ot, /token \[REDACTED:e2e\]/, "redacted before retention");
 		assert.ok(!ot.includes("XM_E2E_SECRET_abc123"));
+		assert.match(ot, /push with \[REDACTED:github_token\]/, "the production redactor ran before retention");
+		assert.ok(!ot.includes(ghToken));
 		assert.match(ot, /Command exited with code 3$/);
 		// expansion activates between the read result and the next model request
 		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "read"));

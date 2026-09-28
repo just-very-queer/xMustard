@@ -682,9 +682,12 @@ func (s *hookServer) afterShell(ctx context.Context, c *hookCall) string {
 	return hooks.GitNotice(verb)
 }
 
-// capture stream-decodes the hook body into the spool through the capture redactor,
-// reduces it by tool family and shapes it for Claude Code. nil when capture is not
-// possible now (no redactor, memory refused, an error): the client keeps its output.
+// capture stream-decodes the hook body into the spool through the capture redactor
+// (fail-closed as on the capture route: a redactor failure retains nothing), reduces
+// it by tool family and shapes it for Claude Code. nil when capture is not possible
+// now (no redactor, memory refused, the output of a secret path, a redactor failure,
+// another error): the client keeps its output. Only a refusal for memory counts as a
+// busy skip; a secret path or a redactor failure is not the daemon being busy.
 func (s *hookServer) capture(ctx context.Context, c *hookCall) *evidence.ObservationResult {
 	redact := captureRedactor
 	if redact == nil {
@@ -702,7 +705,7 @@ func (s *hookServer) capture(ctx context.Context, c *hookCall) *evidence.Observa
 	res, err := s.store.Observe(ctx, s.reg, evidence.ObservationInput{
 		WorkspaceID: c.ws.WorkspaceID, RepoScope: c.ws.Scope, Actor: actor, AuthEnforced: enforced,
 		Format: evidence.FormatClaude, Body: bytes.NewReader(c.body), Meta: evidence.CaptureMeta{Client: hooks.Client},
-		Redact: redact,
+		Redact: func(w io.Writer) evidence.StreamRedactor { return &failClosed{next: redact(w)} },
 	})
 	if err != nil {
 		if errors.Is(err, budget.ErrOverloaded) {

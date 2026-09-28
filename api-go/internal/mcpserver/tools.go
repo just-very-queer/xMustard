@@ -12,6 +12,15 @@ func Tools() []*Tool {
 	return []*Tool{groundTool, recallTool, rememberTool, verifyTool, searchTool, explainTool, impactTool, diagnosticsTool, whyFailedTool}
 }
 
+// toolNames lists the tools in their advertised order.
+func toolNames() []string {
+	names := make([]string, 0, len(Tools()))
+	for _, t := range Tools() {
+		names = append(names, t.Name)
+	}
+	return names
+}
+
 // ToolByName returns the named tool. Hidden aliases name arguments, never tools.
 func ToolByName(name string) (*Tool, bool) {
 	for _, t := range Tools() {
