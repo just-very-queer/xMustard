@@ -1445,7 +1445,7 @@ No Rust or git spawn happens per hook.
 
 **Goal.** Once the in-flight local diagnostics store lands, which is owned by another session, add: path, symbol, min_severity, range, with_references and since=checkpoint|baseline (new and resolved sets), grouping by path, severity and owner name path, structural import-cycle findings from WS-35, and precision provenance.
 
-**Requirements.** PAR-HAR-07, PAR-IMP-08
+**Requirements.** PAR-HAR-07; PAR-IMP-08 as a consumer only (closing owner: WS-35, decided 2026-09-28; see WS-35's implementation record)
 
 **Files.** `api-go/internal/workspaceops/diagnostics.go`, `api-go/internal/workspaceops/diagnostics_query.go`, `api-go/internal/mcpserver/tool_diagnostics.go`, `api-go/internal/workspaceops/diagnostics_query_test.go`  
 **New modules.** `api-go/internal/workspaceops/diagnostics_query.go`
