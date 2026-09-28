@@ -16,6 +16,13 @@ func RunWiki(ctx context.Context, args ...string) ([]byte, error) {
 	return runCore(ctx, "wiki", args...)
 }
 
+// RunSyntaxCheck runs `xmustard-core syntax-check <root> <relative_path>...`: the
+// tree-sitter syntax errors of a few files, by position (the hook service's post-edit
+// diagnostics delta).
+func RunSyntaxCheck(ctx context.Context, args ...string) ([]byte, error) {
+	return runCore(ctx, "syntax-check", args...)
+}
+
 // RunIndex runs `xmustard-core index <build|update|stats> <root> [flags]`, the code
 // index worker. It is one-shot by design: its parse and write peak runs in a transient
 // process under the heavy slot, never in the resident worker, which only reads the

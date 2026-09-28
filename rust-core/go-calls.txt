@@ -53,7 +53,9 @@ called symbolgraph coverage
 called symbolgraph hotspots
 called symbolgraph impact
 called symbolgraph trace
+called syntax-check
 called watch done
+called watch note
 called watch start
 called watch take
 called wiki
