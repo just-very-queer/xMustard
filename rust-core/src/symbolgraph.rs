@@ -2440,7 +2440,8 @@ impl From<&IndexCoverage> for CoverageSummary {
 
 enum Answered {
     Index(crate::index::reader::Opened),
-    Legacy(Relation),
+    /// The legacy graph answered, for this root.
+    Legacy(Relation, std::path::PathBuf),
 }
 
 /// The graph one query reads, with the coverage and freshness it reports. The code
@@ -2499,11 +2500,12 @@ pub fn query_source_for(
         },
         behind_by: None,
         at: std::time::Instant::now(),
+        git_epoch: None,
     };
     QuerySource {
         graph,
         coverage,
-        answered: Answered::Legacy(relation),
+        answered: Answered::Legacy(relation, root.to_path_buf()),
     }
 }
 
@@ -2512,7 +2514,7 @@ impl QuerySource {
     pub fn index(&self) -> Option<&crate::index::reader::Opened> {
         match &self.answered {
             Answered::Index(opened) => Some(opened),
-            Answered::Legacy(_) => None,
+            Answered::Legacy(..) => None,
         }
     }
 
@@ -2520,8 +2522,9 @@ impl QuerySource {
     pub fn freshness<'a>(&self, paths: impl IntoIterator<Item = &'a str>) -> Freshness {
         match &self.answered {
             Answered::Index(opened) => opened.freshness(paths),
-            Answered::Legacy(rel) => Freshness::from_relation(
+            Answered::Legacy(rel, root) => Freshness::from_relation(
                 "legacy_graph",
+                root,
                 rel,
                 crate::indexcache::INDEX_FORMAT_VERSION.to_string(),
                 None,

@@ -105,6 +105,13 @@ const COMMANDS: &[Command] = &[
     cmd("search", Residency::Resident, search),
     cmd("repo-key", Residency::Resident, repo_key),
     cmd("wiki", Residency::Resident, wiki),
+    // The watcher's orchestrator side (WS-15): start/stop watching a root, take a due
+    // refresh batch, report it done. Runs inside serve, where the watchers live.
+    cmd(
+        "watch",
+        Residency::Resident,
+        xmustard_core::index::watch::run,
+    ),
 ];
 
 const fn cmd(name: &'static str, residency: Residency, run: fn(Args) -> CmdResult) -> Command {
@@ -961,8 +968,16 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let u = usage("");
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
-            let cov = source(&root, &ws).coverage;
-            json(&serde_json::json!({ "complete": cov.complete, "languages": cov.languages }))
+            // with the freshness of the source it came from: the snapshot generation,
+            // the watcher state and the last index run's counters (WS-15)
+            let src = source(&root, &ws);
+            let freshness = src.freshness(std::iter::empty());
+            let cov = src.coverage;
+            json(&serde_json::json!({
+                "complete": cov.complete,
+                "languages": cov.languages,
+                "freshness": freshness,
+            }))
         }
         "clusters" => {
             let u = usage("");

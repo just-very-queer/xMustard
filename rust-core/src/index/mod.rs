@@ -33,6 +33,10 @@
 //! writes for its generation before the generation becomes visible (meta
 //! `graph_segment` names it); `reader` holds segments as snapshots and `envelope`
 //! reports their freshness.
+//!
+//! Inside `serve`, `watch` keeps registered roots under a native watcher and feeds
+//! `refresh_queue`, whose debounced batches the orchestrator turns into `index update
+//! --paths ...` runs (WS-15, PAR-FRESH-03).
 
 pub mod chunks;
 pub mod config;
@@ -50,11 +54,13 @@ pub mod lexical;
 pub mod meta;
 pub mod names;
 pub mod reader;
+pub mod refresh_queue;
 pub mod rerank;
 pub mod resolve;
 pub mod scan;
 pub mod schema;
 pub mod uid;
+pub mod watch;
 pub mod writer;
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};

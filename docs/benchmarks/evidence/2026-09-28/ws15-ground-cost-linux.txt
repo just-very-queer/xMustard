@@ -1,0 +1,56 @@
+ 10:25:37 up  1:08,  4 users,  load average: 0.85, 1.76, 2.83
+== pi-mono-3fc4c67d0781
+git status alone: 9 ms
+tracked files 1929, bytes 25119852
+base drift, no stat cache       57.4 ms  - stale=False changed_files_total=None
+base drift                      35.4 ms  - stale=False changed_files_total=None
+base drift                      32.2 ms  - stale=False changed_files_total=None
+base drift                      31.8 ms  - stale=False changed_files_total=None
+base drift                      32.0 ms  - stale=False changed_files_total=None
+base drift                      33.1 ms  - stale=False changed_files_total=None
+base working-changes            15.0 ms  - stale=None changed_files_total=0
+base working-changes            16.0 ms  - stale=None changed_files_total=0
+base working-changes            15.2 ms  - stale=None changed_files_total=0
+head drift, no stat cache       27.8 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      24.6 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      21.2 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      19.8 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      19.6 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      18.4 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head working-changes            18.2 ms  - stale=None changed_files_total=0
+head working-changes            19.6 ms  - stale=None changed_files_total=0
+head working-changes            19.7 ms  - stale=None changed_files_total=0
+base drift (dirty)              54.9 ms  - stale=True changed_files_total=None
+base drift (dirty)              32.7 ms  - stale=True changed_files_total=None
+base drift (dirty)              31.6 ms  - stale=True changed_files_total=None
+head drift (dirty)              20.0 ms  {"mode":"identity","hashed":4,"stat_skipped":0,"compared":3} stale=True changed_files_total=None
+head drift (dirty)              20.3 ms  {"mode":"identity","hashed":0,"stat_skipped":4,"compared":3} stale=True changed_files_total=None
+head drift (dirty)              19.0 ms  {"mode":"identity","hashed":0,"stat_skipped":4,"compared":3} stale=True changed_files_total=None
+== parity-composite-af14f5727242
+git status alone: 18 ms
+tracked files 7288, bytes 85362159
+base drift, no stat cache      164.0 ms  - stale=False changed_files_total=None
+base drift                     103.7 ms  - stale=False changed_files_total=None
+base drift                     106.1 ms  - stale=False changed_files_total=None
+base drift                     108.7 ms  - stale=False changed_files_total=None
+base drift                     106.3 ms  - stale=False changed_files_total=None
+base drift                     107.0 ms  - stale=False changed_files_total=None
+base working-changes            37.4 ms  - stale=None changed_files_total=0
+base working-changes            35.6 ms  - stale=None changed_files_total=0
+base working-changes            38.5 ms  - stale=None changed_files_total=0
+head drift, no stat cache       42.9 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      42.8 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      42.4 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      43.7 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      45.8 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head drift                      42.3 ms  {"mode":"identity","hashed":0,"stat_skipped":0,"compared":0} stale=False changed_files_total=None
+head working-changes            41.5 ms  - stale=None changed_files_total=0
+head working-changes            40.6 ms  - stale=None changed_files_total=0
+head working-changes            42.5 ms  - stale=None changed_files_total=0
+base drift (dirty)             163.1 ms  - stale=True changed_files_total=None
+base drift (dirty)             102.5 ms  - stale=True changed_files_total=None
+base drift (dirty)             101.4 ms  - stale=True changed_files_total=None
+head drift (dirty)              43.7 ms  {"mode":"identity","hashed":4,"stat_skipped":0,"compared":3} stale=True changed_files_total=None
+head drift (dirty)              43.1 ms  {"mode":"identity","hashed":0,"stat_skipped":4,"compared":3} stale=True changed_files_total=None
+head drift (dirty)              45.2 ms  {"mode":"identity","hashed":0,"stat_skipped":4,"compared":3} stale=True changed_files_total=None
+ 10:26:12 up  1:08,  4 users,  load average: 0.79, 1.65, 2.75
