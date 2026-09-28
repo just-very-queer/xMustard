@@ -26,8 +26,9 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 		"search": {"bm25", "function bodies", "doc sections", "typo tolerance (not meaning)", "rrf (k=60)", "ast-grep"},
 		// symbol= is a file-level walk from the defining files; from=&to= ignores direction.
 		"impact": {"lexical reference graph", "import lines", "leads to confirm, not proof", "defining files", "undirected"},
-		// paths alone gate results; no args ranks by working-tree overlap.
-		"recall": {"conflicts", "path overlap, not contradiction", "non-matches dropped", "working-tree overlap"},
+		// paths alone gate results; no args ranks by working-tree overlap; conflicts are
+		// labeled candidates (WS-27), so a shared path is its own tier, not a contradiction.
+		"recall": {"conflicts: claim/contradiction/path overlap", "non-matches dropped", "working-tree overlap"},
 	}
 	for name, phrases := range want {
 		tl, ok := ToolByName(name)
@@ -44,7 +45,7 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 	stale := map[string][]string{
 		"search": {"lexical+semantic", "not function bodies", "semantic"},
 		"impact": {"transitive dependents", "dependency path"},
-		"recall": {"recency top-n"},
+		"recall": {"recency top-n", "path overlap, not contradiction"},
 	}
 	for name, phrases := range stale {
 		tl, _ := ToolByName(name)

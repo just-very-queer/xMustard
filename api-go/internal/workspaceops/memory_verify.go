@@ -207,16 +207,24 @@ func castVerdict(ctx context.Context, tx govstore.Tx, dataDir, workspaceID, root
 		return out, promoted, err
 	}
 	out, promoted, err := settleEntry(ctx, tx, workspaceID, in.EntryID, threshold, root, actor)
-	if err != nil || in.Verdict != govstore.VerdictRetract {
-		return out, promoted, err
+	if move, ok := onQuorum[in.Verdict]; ok && err == nil {
+		return move(ctx, tx, workspaceID, out, in, actor)
 	}
-	return retractOnQuorum(ctx, tx, workspaceID, out, in.Note, actor)
+	return out, promoted, err
+}
+
+// onQuorum are the lifecycle moves a served-revision verdict makes once as many distinct
+// principals as the entry's gate requires have cast it.
+var onQuorum = map[string]func(ctx context.Context, tx govstore.Tx, workspaceID string, ce ContextEntry,
+	in govstore.VoteInput, actor govstore.Actor) (ContextEntry, bool, error){
+	govstore.VerdictRetract:     retractOnQuorum,
+	govstore.VerdictDuplicateOf: mergeOnQuorum,
 }
 
 // retractOnQuorum retracts an entry once as many distinct principals have retracted its
 // served revision as its gate requires. A retracted entry leaves recall, keeps its
 // history and can be restored by an admin, after which it must be verified again.
-func retractOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce ContextEntry, reason string,
+func retractOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce ContextEntry, in govstore.VoteInput,
 	actor govstore.Actor) (ContextEntry, bool, error) {
 	tally, err := tx.Tally(ctx, ce.ID, 0)
 	if err != nil {
@@ -225,7 +233,43 @@ func retractOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce
 	if tally.Retractions < max(ce.RequiredVerifications, 1) {
 		return ce, false, nil
 	}
-	if _, err := tx.Transition(ctx, ce.ID, govstore.TransitionInput{To: govstore.LifecycleRetracted, Reason: reason}, actor); err != nil {
+	if _, err := tx.Transition(ctx, ce.ID, govstore.TransitionInput{To: govstore.LifecycleRetracted, Reason: in.Note}, actor); err != nil {
+		return ContextEntry{}, false, err
+	}
+	out, err := entryAfter(ctx, tx, workspaceID, ce.ID)
+	return out, false, err
+}
+
+// mergeOnQuorum merges an entry into the target of its duplicate_of verdicts once as many
+// distinct principals as its gate requires named that target on its served revision
+// (PAR-GOV-03). The merged entry is kept and hidden: recall(include_merged) shows it
+// when it had been promoted, and a restore brings it back unverified. Dedupe never
+// launders quarantine: a quarantined duplicate passes its mark to the survivor, and a
+// core survivor, which may not hold one, refuses the merge.
+func mergeOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce ContextEntry, in govstore.VoteInput,
+	actor govstore.Actor) (ContextEntry, bool, error) {
+	votes, err := tx.ServedVotes(ctx, []string{ce.ID})
+	if err != nil {
+		return ContextEntry{}, false, err
+	}
+	named := 0
+	for _, v := range votes[ce.ID] {
+		if v.Verdict == govstore.VerdictDuplicateOf && v.Target == in.Target {
+			named++
+		}
+	}
+	if named < max(ce.RequiredVerifications, 1) {
+		return ce, false, nil
+	}
+	target, _, err := loadEntryTx(ctx, tx, workspaceID, in.Target)
+	if err != nil {
+		return ContextEntry{}, false, err
+	}
+	if err := markQuarantined(ctx, tx, target, ce.Quarantine, actor); err != nil {
+		return ContextEntry{}, false, err
+	}
+	if _, err := tx.Transition(ctx, ce.ID, govstore.TransitionInput{To: govstore.LifecycleMerged, Target: in.Target,
+		Reason: fallbackString(in.Note, "duplicate of "+in.Target)}, actor); err != nil {
 		return ContextEntry{}, false, err
 	}
 	out, err := entryAfter(ctx, tx, workspaceID, ce.ID)

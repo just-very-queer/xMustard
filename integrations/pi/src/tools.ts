@@ -78,7 +78,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "recall",
 		description:
-			"Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified | single_agent | self_asserted_open_mode (no auth/quorum). conflicts: path overlap, not contradiction.",
+			"Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified|single_agent|self_asserted_open_mode (no auth/quorum). conflicts: claim/contradiction/path overlap.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", desc: "task query to rank memories by" },

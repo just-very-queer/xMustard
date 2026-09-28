@@ -1,12 +1,15 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
+	"os"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -147,6 +150,17 @@ type ContextEntry struct {
 	VotesNeeded      *int          `json:"votes_needed,omitempty"`
 	ScoreDetails     *ScoreDetails `json:"score_details,omitempty"`
 	ContentTruncated bool          `json:"content_truncated,omitempty"`
+	// Propose report (WS-27), set only on a proposal's result: whether it created an
+	// entry or corroborated a served one (DuplicateOf, with the count of principals that
+	// restated it), the active entries it may duplicate or conflict with, the anchors
+	// read from it, and the served entries it may be meant to supersede.
+	Outcome             string              `json:"outcome,omitempty"`
+	DuplicateOf         string              `json:"duplicate_of,omitempty"`
+	Corroborations      int                 `json:"corroborations,omitempty"`
+	PossibleDuplicates  []PossibleDuplicate `json:"possible_duplicates,omitempty"`
+	PossibleConflicts   []MemoryConflict    `json:"possible_conflicts,omitempty"`
+	Anchors             []MemoryAnchor      `json:"anchors,omitempty"`
+	SuggestedSupersedes []string            `json:"suggested_supersedes,omitempty"`
 }
 
 type ProposeContextRequest struct {
@@ -158,6 +172,11 @@ type ProposeContextRequest struct {
 	// RequireVerification can only TIGHTEN the gate: true requires the multi-agent
 	// threshold even in single-agent or open mode; false or nil uses the setting.
 	RequireVerification *bool `json:"require_verification,omitempty"`
+	// Claims are structured statements {subject, predicate, object} (PAR-GOV-10);
+	// Relations are typed edges to existing memories (refines, contradicts, duplicates,
+	// references).
+	Claims    []MemoryClaim    `json:"claims,omitempty"`
+	Relations []MemoryRelation `json:"relations,omitempty"`
 	// Supersedes lists active entries this proposal replaces (PAR-GOV-04). Nothing
 	// changes until the proposal is promoted; then every listed entry that is still
 	// active becomes superseded in the same transaction, and is never deleted.
@@ -250,6 +269,13 @@ func cleanPaths(paths []string) []string {
 // ProposeContext creates a pending context entry. It is promoted immediately, on the
 // proposer's own assertion, in single-agent mode (the operator setting) and in open
 // mode (req.OpenMode), unless the request explicitly asks for peer verification.
+//
+// Before anything is written the proposal is reviewed (WS-27): an exact restatement of
+// served memory corroborates that entry instead of adding one (Outcome corroborated,
+// DuplicateOf), and otherwise the entry is created with the possible duplicates and
+// conflict candidates the review found, the anchors read from it, and the served
+// entries it may be meant to supersede. A created entry must fit the principal's
+// pending quota and the workspace's active-memory envelope.
 func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
@@ -257,11 +283,20 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if strings.TrimSpace(req.Content) == "" {
 		return nil, fmt.Errorf("content is required: %w", ErrInvalidInput)
 	}
-	anchors, err := confineAnchorPaths(dataDir, workspaceID, cleanPaths(req.Paths))
+	declared, err := confineAnchorPaths(dataDir, workspaceID, cleanPaths(req.Paths))
 	if err != nil {
 		return nil, err
 	}
+	declared = cleanPaths(declared)
 	supersedes, err := cleanSupersedes(req.Supersedes)
+	if err != nil {
+		return nil, err
+	}
+	claims, err := cleanClaims(req.Claims)
+	if err != nil {
+		return nil, err
+	}
+	relations, err := cleanRelations(req.Relations)
 	if err != nil {
 		return nil, err
 	}
@@ -294,6 +329,12 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	caller.ID, caller.OpenMode = source, req.OpenMode
 	actor := caller.storeActor(root)
 	title := strings.TrimSpace(req.Title)
+	// read outside the transaction: resolving identifiers asks the core worker
+	extracted, warnings := proposalAnchors(ctx, root, workspaceID, title+"\n"+req.Content, declared)
+	review := reviewInput{workspaceID: workspaceID, scope: "workspace", content: req.Content, declared: declared, anchors: extracted,
+		claims: claims, intent: len(supersedes)+len(claims)+len(relations) > 0, quarantine: caller.Quarantine,
+		kind: req.Kind, topic: normalizeTopic(req.Topic), tags: cleanPaths(req.Tags), expires: strings.TrimSpace(req.Expires)}
+	quota := currentMemoryQuota()
 	var out ContextEntry
 	var promoted bool
 	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
@@ -307,9 +348,21 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			}
 			supersededGate = max(supersededGate, old.RequiredVerifications)
 		}
+		rv, err := reviewProposal(ctx, tx, review)
+		if err != nil {
+			return err
+		}
+		if rv.corroborate != "" {
+			out, err = corroborateEntry(ctx, tx, workspaceID, rv.corroborate, actor)
+			out.PossibleDuplicates = rv.duplicates
+			return err
+		}
 		peersOnly := tighten || supersededGate > 1
 		// selfNote, when set, promotes the entry on the proposer's own assertion.
 		selfNote := selfAssertion(req.OpenMode, peersOnly, requireMulti)
+		if err := quota.check(ctx, tx, workspaceID, source, selfNote == ""); err != nil {
+			return err
+		}
 		required := max(threshold, supersededGate)
 		if selfNote != "" {
 			required = 1
@@ -318,11 +371,18 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			ID:          "ctx_" + hashID(workspaceID, req.Title, req.Content+nowUTC())[:12],
 			WorkspaceID: workspaceID, Title: title, Content: req.Content, Permission: permission,
 			RequiredVerifications: required, RequireVerification: peersOnly,
-			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
+			Paths: declared, Anchors: extracted, SearchTokens: memoryTokenList(title + " " + req.Content),
 			ExpiresAt: expiresAt, Metadata: proposalMetadata(supersedes, caller.Quarantine),
 			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags),
 		}, actor)
 		if err != nil {
+			return err
+		}
+		stored, err := recordClaims(ctx, tx, e.ID, claims, actor)
+		if err != nil {
+			return err
+		}
+		if err := recordRelations(ctx, tx, workspaceID, e.ID, relations, actor); err != nil {
 			return err
 		}
 		if selfNote != "" {
@@ -331,13 +391,18 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 				return err
 			}
 		}
-		out, promoted, err = settleEntry(ctx, tx, workspaceID, e.ID, threshold, root, actor)
-		return err
+		if out, promoted, err = settleEntry(ctx, tx, workspaceID, e.ID, threshold, root, actor); err != nil {
+			return err
+		}
+		return rv.report(ctx, tx, &out, req.Content, stored, supersedes)
 	})
 	if err != nil {
 		return nil, err
 	}
-	out.Content = req.Content
+	if out.Outcome == OutcomeCreated {
+		out.Content = req.Content
+	}
+	out.Warnings = append(out.Warnings, warnings...)
 	if !expiresOK {
 		out.Warnings = append(out.Warnings, fmt.Sprintf("expires %q is not a date or RFC 3339 time; no expiry set", req.Expires))
 	}
@@ -345,6 +410,115 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		recordVerifyFeedback(dataDir, workspaceID, out.ID, out.Paths)
 	}
 	return &out, nil
+}
+
+// report fills a created entry's propose report: its anchors with their fan-out, its
+// possible duplicates and conflicts, and the served entries it may supersede.
+func (rv *proposalReview) report(ctx context.Context, r govstore.Reader, out *ContextEntry, content string,
+	claims []govstore.Claim, supersedes []string) error {
+	anchors, err := r.AnchorsFor(ctx, []string{out.ID})
+	if err != nil {
+		return err
+	}
+	if out.Anchors, err = anchorsWithFanout(ctx, r, out.WorkspaceID, anchors[out.ID]); err != nil {
+		return err
+	}
+	view := *out
+	view.Content = content
+	self := newConflictSide(view, claims, anchorRefs(anchors[out.ID]))
+	out.Outcome, out.PossibleDuplicates = OutcomeCreated, rv.duplicates
+	out.PossibleConflicts, out.SuggestedSupersedes = rv.conflictsWith(self, supersedes)
+	out.Warnings = append(out.Warnings, rv.notes...)
+	return nil
+}
+
+// corroborateEntry records actor restating the served entry id and returns it with its
+// content, labeled corroborated.
+func corroborateEntry(ctx context.Context, tx govstore.Tx, workspaceID, id string, actor govstore.Actor) (ContextEntry, error) {
+	if _, _, err := tx.Corroborate(ctx, id, actor); err != nil {
+		return ContextEntry{}, err
+	}
+	all, err := tx.Corroborations(ctx, id)
+	if err != nil {
+		return ContextEntry{}, err
+	}
+	_, ce, err := loadEntryTx(ctx, tx, workspaceID, id)
+	if err != nil {
+		return ContextEntry{}, err
+	}
+	withContent, _, err := attachContent(ctx, tx, []ContextEntry{ce})
+	if err != nil || len(withContent) == 0 {
+		return ContextEntry{}, cmp.Or(err, fmt.Errorf("entry %s: content withheld", id))
+	}
+	out := withContent[0]
+	out.Outcome, out.DuplicateOf, out.Corroborations = OutcomeCorroborated, id, len(all)
+	return out, nil
+}
+
+// anchorsWithFanout renders an entry's anchors with how many active memories share each.
+func anchorsWithFanout(ctx context.Context, r govstore.Reader, workspaceID string, anchors []govstore.Anchor) ([]MemoryAnchor, error) {
+	byKind := map[string][]string{}
+	for _, a := range anchors {
+		byKind[a.Kind] = append(byKind[a.Kind], a.Value)
+	}
+	fanout := map[govstore.AnchorRef]int{}
+	for _, kind := range slices.Sorted(maps.Keys(byKind)) {
+		counts, err := r.AnchorFanout(ctx, workspaceID, kind, byKind[kind])
+		if err != nil {
+			return nil, err
+		}
+		for v, n := range counts {
+			fanout[govstore.AnchorRef{Kind: kind, Value: v}] = n
+		}
+	}
+	out := make([]MemoryAnchor, len(anchors))
+	for i, a := range anchors {
+		out[i] = MemoryAnchor{Kind: a.Kind, Value: a.Value, SymbolUID: a.SymbolUID, Declared: a.Declared,
+			Fanout: fanout[govstore.AnchorRef{Kind: a.Kind, Value: a.Value}]}
+	}
+	return out, nil
+}
+
+// Write quotas (WS-27 critic correction): a principal's pending proposals per workspace,
+// and a workspace's active memories. Both are counted in the store, in the transaction
+// that would add the entry. XMUSTARD_MEMORY_PENDING_QUOTA and
+// XMUSTARD_MEMORY_ACTIVE_ENVELOPE override them; a value that is not a positive integer
+// keeps the default.
+const (
+	defaultPendingQuota   = 500
+	defaultActiveEnvelope = 100_000
+)
+
+type memoryQuota struct{ pending, active int }
+
+func currentMemoryQuota() memoryQuota {
+	return memoryQuota{pending: positiveEnv("XMUSTARD_MEMORY_PENDING_QUOTA", defaultPendingQuota),
+		active: positiveEnv("XMUSTARD_MEMORY_ACTIVE_ENVELOPE", defaultActiveEnvelope)}
+}
+
+func positiveEnv(name string, def int) int {
+	if n, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
+// check refuses a new entry past the envelope, and a new pending entry past the
+// principal's quota. A corroboration adds no entry and is never refused.
+func (q memoryQuota) check(ctx context.Context, r govstore.Reader, workspaceID, principal string, pending bool) error {
+	c, err := r.MemoryCounts(ctx, workspaceID, principal)
+	if err != nil {
+		return err
+	}
+	if c.Active >= q.active {
+		return Conflict(fmt.Sprintf("workspace %s holds %d active memories, its envelope (XMUSTARD_MEMORY_ACTIVE_ENVELOPE); "+
+			"retire, merge or supersede memories first", workspaceID, c.Active))
+	}
+	if pending && c.Pending >= q.pending {
+		return Conflict(fmt.Sprintf("%s has %d pending proposals in workspace %s, its quota (XMUSTARD_MEMORY_PENDING_QUOTA); "+
+			"wait for them to be verified, or retire some", principal, c.Pending, workspaceID))
+	}
+	return nil
 }
 
 // MemoryKinds are the kinds a memory may declare (PAR-GOV-09).
