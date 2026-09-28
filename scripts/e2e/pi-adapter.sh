@@ -60,9 +60,9 @@ have="$(node -p 'require(process.argv[1]).version' "$PI_DIR/node_modules/@earend
 echo "pi-coding-agent $have"
 
 echo "== build xmustard-api (-tags xmustard_e2e) / xmustard-mcp"
-# The xmustard_e2e tag wires a test-only capture redactor (one fixed marker; see
-# api-go/cmd/xmustard-api/capture_redactor_e2e.go): production builds have none until
-# the WS-05 streaming redactor is wired, so POST .../evidence/capture answers 503.
+# Every build redacts captures with the WS-05 secret rules; the xmustard_e2e tag chains
+# a test-only marker (XM_E2E_SECRET_*) in front of them (see
+# api-go/cmd/xmustard-api/capture_redactor_e2e.go).
 (cd "$ROOT/api-go" && go build -tags xmustard_e2e -o "$WORK/bin/xmustard-api" ./cmd/xmustard-api && go build -o "$WORK/bin/xmustard-mcp" ./cmd/xmustard-mcp)
 
 if [[ -z "${XMUSTARD_CORE_BIN:-}" ]]; then

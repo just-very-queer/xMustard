@@ -214,7 +214,7 @@ Failure behavior of the capture paths:
 | Case | Result |
 | --- | --- |
 | Capture refused (`503 redaction_unavailable`, or 401/403 for this principal), Go unreachable or hung | Pi's own result stays; the reason goes into `details.xmustard.reason`; capture pauses for 30 s |
-| Capture refused for one output (507 quota, 413 size) | Pi's own result stays, with the reason; capture stays on |
+| Capture refused for one output (507 quota, 413 size, `422 secret_path` for a file under the secret-path denylist, `503 redaction_failed`) | Pi's own result stays, with the reason; capture stays on |
 | Go could not shape a Pi payload (`shape.mode` not `replace`) | Pi's own result stays; the reason goes into `details.xmustard.reason` |
 | Workspace not resolved | Pi's own result stays, with the reason; masking only masks results that already have a handle |
 | Retaining one masked result fails | That result stays unmasked; the others are masked |
@@ -254,13 +254,15 @@ principal binding, token rotation, cross-principal denial, no token in output). 
 e2e also samples RSS every 100 ms per process tree (xMustard, Pi, Postgres fixture);
 see `summary.json` → `resources`.
 
-The e2e builds the API with `-tags xmustard_e2e`, which wires a test-only capture
-redactor (`api-go/cmd/xmustard-api/capture_redactor_e2e.go`, one fixed marker). A
-production build has no capture redactor until the WS-05 streaming redactor is wired,
-so there `POST .../evidence/capture` answers `503 redaction_unavailable` and built-in
-results, masking and compaction fall back as described above. WS-24 coverage: a
-failing `bash` and a large `read` projected with handles (isError and Pi's `details`
-kept, the secret marker redacted before retention, the original paged back exactly),
+Every API build redacts captures with the WS-05 secret rules
+(`api-go/cmd/xmustard-api/capture_redactor.go`), so built-in results, masking and
+compaction work against a production API; a server without a redactor answers
+`503 redaction_unavailable` and they fall back as described above. The e2e builds the
+API with `-tags xmustard_e2e`, which chains a test-only marker
+(`capture_redactor_e2e.go`, `XM_E2E_SECRET_*`) in front of the production redactor.
+WS-24 coverage: a failing `bash` and a large `read` projected with handles (isError
+and Pi's `details` kept, the e2e marker and a GitHub-shaped token redacted before
+retention, the original paged back exactly),
 small built-ins untouched, masking stubs appearing only after the window turns while
 the latest failure and a file edited in the window stay, stubs recovering their
 originals and the raw session entries kept (`get_entries`), a snapshot compaction via
