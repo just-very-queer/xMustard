@@ -168,7 +168,7 @@ func TestReviewAnchorUsage(t *testing.T) {
 		if code := runOps(e, args...); code != exitUsage {
 			t.Errorf("%s: exit %d, want %d", name, code, exitUsage)
 		}
-		if name == "unknown verb" && !strings.Contains(errOut.String(), "<anchor|approve|gate|revoke>") {
+		if name == "unknown verb" && !strings.Contains(errOut.String(), "<anchor|approve|gate|record|revoke|show|triage>") {
 			t.Errorf("usage lists %q", errOut)
 		}
 	}

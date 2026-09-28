@@ -257,3 +257,26 @@ func TestAnchorLeavesAnUnreadHeadUnknown(t *testing.T) {
 		t.Errorf("counts = %+v", counts)
 	}
 }
+
+// A coverage report is read under the findings' rules: an array, exact and closed member
+// names, repository-relative paths (cleaned).
+func TestDecodeCoverageIsClosed(t *testing.T) {
+	got, err := DecodeCoverage([]byte(`[{"path": "./a.go", "status": "reviewed"}, {"path": "go.sum", "status": "not_reviewed", "reason": "lockfile"}]`))
+	if err != nil || len(got) != 2 || got[0] != (Coverage{Path: "a.go", Status: "reviewed"}) || got[1].Reason != "lockfile" {
+		t.Fatalf("DecodeCoverage = %+v, %v", got, err)
+	}
+	for name, in := range map[string]string{
+		"not an array":   `{"path": "a.go"}`,
+		"unknown member": `[{"path": "a.go", "status": "reviewed", "waived": true}]`,
+		"another case":   `[{"Path": "a.go", "status": "reviewed"}]`,
+		"a member twice": `[{"path": "a.go", "path": "b.go", "status": "reviewed"}]`,
+		"escaping path":  `[{"path": "../a.go", "status": "reviewed"}]`,
+		"absolute path":  `[{"path": "/a.go", "status": "reviewed"}]`,
+		"a wrong type":   `[{"path": "a.go", "status": 1}]`,
+		"over the bound": `[` + strings.Repeat(" ", MaxFindingsBytes) + `]`,
+	} {
+		if _, err := DecodeCoverage([]byte(in)); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: %v", name, err)
+		}
+	}
+}

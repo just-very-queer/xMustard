@@ -151,7 +151,7 @@ func runApprovalQueue(e opsEnv, args []string) int {
 }
 
 // reviewCommands are the `review` subcommands. The review build tag adds anchor
-// (review_anchor.go).
+// (review_anchor.go) and record, show and triage (review_record.go).
 var reviewCommands = map[string]func(opsEnv, string, []string) int{
 	"approve": runReviewApprove,
 	"revoke":  runReviewRevoke,

@@ -45,6 +45,12 @@ const (
 // maxReviewRecords bounds the review record ids one attestation cites.
 const maxReviewRecords = 32
 
+// ErrReviewerNotDistinct: an attestation cites a review record its approver wrote, one
+// written in open mode (whose author cannot be told apart from anyone), or, under the
+// owner-distinct policy, one written under the approver's owner.
+var ErrReviewerNotDistinct = errors.New("a merge approval cannot rest on a review record written by the approver, " +
+	"in open mode, or, under the owner-distinct policy, under the approver's owner")
+
 // reviewDiffTimeout bounds each git run of a review diff.
 const reviewDiffTimeout = 2 * time.Minute
 
@@ -71,15 +77,18 @@ func (c ReviewedChange) same(o ReviewedChange) bool {
 type MergeApproval struct {
 	Seq int64 `json:"seq"`
 	ReviewedChange
-	ReviewRecords []string         `json:"review_records"`
-	Approver      string           `json:"approver"`
-	ApproverOwner string           `json:"approver_owner"`
-	ApproverKind  string           `json:"approver_kind"`
-	Assurance     string           `json:"assurance"`
-	Note          string           `json:"note,omitempty"`
-	At            string           `json:"at"`
-	Enforcement   string           `json:"enforcement"`
-	Revoked       *MergeRevocation `json:"revoked,omitempty"`
+	ReviewRecords []string `json:"review_records"`
+	// ReviewRecordsUnknown are the cited ids that named no review record of the workspace
+	// (WS-66) when the attestation was made: bound as given, their authors unchecked.
+	ReviewRecordsUnknown []string         `json:"review_records_unknown,omitempty"`
+	Approver             string           `json:"approver"`
+	ApproverOwner        string           `json:"approver_owner"`
+	ApproverKind         string           `json:"approver_kind"`
+	Assurance            string           `json:"assurance"`
+	Note                 string           `json:"note,omitempty"`
+	At                   string           `json:"at"`
+	Enforcement          string           `json:"enforcement"`
+	Revoked              *MergeRevocation `json:"revoked,omitempty"`
 }
 
 // MergeRevocation withdraws an attestation.
@@ -113,9 +122,10 @@ type MergeApprovalStatus struct {
 // mergeApprovalData is the event record of an attestation.
 type mergeApprovalData struct {
 	ReviewedChange
-	ReviewRecords []string `json:"review_records"`
-	Assurance     string   `json:"assurance"`
-	Enforcement   string   `json:"enforcement"`
+	ReviewRecords        []string `json:"review_records"`
+	ReviewRecordsUnknown []string `json:"review_records_unknown,omitempty"`
+	Assurance            string   `json:"assurance"`
+	Enforcement          string   `json:"enforcement"`
 }
 
 // mergeRevocationData is the event record of a revocation.
@@ -258,7 +268,9 @@ func (l *limitedBuffer) Write(p []byte) (int, error) {
 }
 
 // ApproveMerge records h's attestation that they reviewed the change from the merge
-// base of baseRef to headRef, citing reviews (review record ids, at most 32).
+// base of baseRef to headRef, citing reviews (review record ids, at most 32). A cited
+// review record must be distinct from the approver (checkReviewAuthors); an id that
+// names no review record is bound as given and listed as unknown.
 func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanApprover, baseRef, headRef string,
 	reviews []string, note string) (*MergeApproval, error) {
 	if len(reviews) > maxReviewRecords {
@@ -278,13 +290,17 @@ func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanAppro
 	}
 	var red ingestRedaction
 	red.scrub(&note)
-	data, err := eventObject(mergeApprovalData{ReviewedChange: change, ReviewRecords: append([]string{}, reviews...),
-		Assurance: h.Assurance, Enforcement: MergeApprovalEnforcement})
-	if err != nil {
-		return nil, err
-	}
 	var ev govstore.Event
 	err = memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		unknown, err := checkReviewAuthors(ctx, tx, dataDir, workspaceID, h, reviews)
+		if err != nil {
+			return err
+		}
+		data, err := eventObject(mergeApprovalData{ReviewedChange: change, ReviewRecords: append([]string{}, reviews...),
+			ReviewRecordsUnknown: unknown, Assurance: h.Assurance, Enforcement: MergeApprovalEnforcement})
+		if err != nil {
+			return err
+		}
 		ev, err = tx.AppendEvent(ctx, govstore.EventInput{WorkspaceID: workspaceID, Type: govstore.EventMergeApproval,
 			Note: note, Data: data}, h.storeActor(change.Head))
 		return err
@@ -293,6 +309,35 @@ func ApproveMerge(ctx context.Context, dataDir, workspaceID string, h HumanAppro
 		return nil, err
 	}
 	return mergeApprovalFrom(ev)
+}
+
+// checkReviewAuthors applies the WS-19B distinctness rule to the review records an
+// attestation cites, failing closed: the approver may not rest a merge on a record they
+// wrote, whatever the policy, nor on one written in open mode, whose author is no one in
+// particular, nor, under the owner-distinct policy, on one written under their owner (the
+// owner the record recorded, else the token store's). It returns the ids that name no
+// review record of the workspace (WS-57 binds those as given), in order.
+func checkReviewAuthors(ctx context.Context, r govstore.Reader, dataDir, workspaceID string, h HumanApprover, ids []string) ([]string, error) {
+	ownerPolicy := principalDistinctness(dataDir) == DistinctOwner
+	mine := fallbackString(h.Principal.Owner, h.Principal.ID)
+	var unknown []string
+	for _, id := range ids {
+		rec, err := r.GetReviewRecord(ctx, workspaceID, id)
+		switch {
+		case errors.Is(err, govstore.ErrNotFound):
+			unknown = append(unknown, id)
+		case err != nil:
+			return nil, err
+		case sameOwner(rec.Author, h.Principal.ID):
+			return nil, fmt.Errorf("%w: %s wrote review record %s", ErrReviewerNotDistinct, h.Principal.ID, id)
+		case IsOpenModeIdentity(rec.Author):
+			return nil, fmt.Errorf("%w: review record %s was written in open mode", ErrReviewerNotDistinct, id)
+		case ownerPolicy && sameOwner(recordedOwner(dataDir, rec.AuthorOwner, rec.Author), mine):
+			return nil, fmt.Errorf("%w: review record %s was written by %s, owned by %s like the approver", ErrReviewerNotDistinct,
+				id, rec.Author, mine)
+		}
+	}
+	return unknown, nil
 }
 
 // storeActor is the approver as the principal of an attestation event.
@@ -492,6 +537,6 @@ func mergeApprovalFrom(ev govstore.Event) (*MergeApproval, error) {
 		return nil, fmt.Errorf("merge approval %d is malformed: %w", ev.Seq, errors.New("no head or diff digest"))
 	}
 	return &MergeApproval{Seq: ev.Seq, ReviewedChange: d.ReviewedChange, ReviewRecords: d.ReviewRecords,
-		Approver: ev.Principal, ApproverOwner: d.Provenance.Owner, ApproverKind: d.Provenance.Kind,
-		Assurance: d.Assurance, Note: ev.Note, At: ev.At, Enforcement: MergeApprovalEnforcement}, nil
+		ReviewRecordsUnknown: d.ReviewRecordsUnknown, Approver: ev.Principal, ApproverOwner: d.Provenance.Owner,
+		ApproverKind: d.Provenance.Kind, Assurance: d.Assurance, Note: ev.Note, At: ev.At, Enforcement: MergeApprovalEnforcement}, nil
 }
