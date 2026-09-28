@@ -156,7 +156,6 @@ func registerIntegrationRoutes(mux routeRegistrar, dataDir string) {
 	})
 }
 
-
 func writeIntegrationError(w http.ResponseWriter, err error) bool {
 	if err == nil {
 		return false

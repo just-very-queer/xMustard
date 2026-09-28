@@ -8,15 +8,15 @@ package workspaceops
 // a PR description, or a Linear/Jira sync can consume without re-reading raw artifacts.
 // Composed from the existing builders, so each dimension stays single-sourced.
 type VersionedHandoff struct {
-	Version          int                  `json:"version"`
-	IssueID          string               `json:"issue_id"`
-	WorkspaceID      string               `json:"workspace_id"`
-	ReadyForHandoff  bool                 `json:"ready_for_handoff"`
-	Review           *ReviewPacket        `json:"review"`              // fix + quality + verification + residual risk
+	Version          int                   `json:"version"`
+	IssueID          string                `json:"issue_id"`
+	WorkspaceID      string                `json:"workspace_id"`
+	ReadyForHandoff  bool                  `json:"ready_for_handoff"`
+	Review           *ReviewPacket         `json:"review"`             // fix + quality + verification + residual risk
 	Security         *SecurityReviewPacket `json:"security"`           // security disposition rollup
-	LatestRunInsight *RunSessionInsight   `json:"latest_run_insight"`  // acceptance review + policy + risks
-	MissingSections  []string             `json:"missing_sections"`    // dimensions with no data yet (honesty)
-	GeneratedAt      string               `json:"generated_at"`
+	LatestRunInsight *RunSessionInsight    `json:"latest_run_insight"` // acceptance review + policy + risks
+	MissingSections  []string              `json:"missing_sections"`   // dimensions with no data yet (honesty)
+	GeneratedAt      string                `json:"generated_at"`
 }
 
 // handoffSchemaVersion bumps when the merged shape changes, so a stored/synced handoff

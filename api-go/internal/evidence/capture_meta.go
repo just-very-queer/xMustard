@@ -103,6 +103,9 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	if meta.Client == string(FormatRaw) || meta.Client == "" {
 		meta.Client = "http"
 	}
+	if p, ok := LookupClient(meta.Client); ok {
+		meta.Client = p.Client // an alias (claude-code) is recorded as its client
+	}
 	meta.Format = string(in.Format)
 	var body *HookBody
 	if in.Format == FormatRaw || in.Format == "" {
@@ -132,6 +135,8 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	meta.CallID = pick(body.CallID, meta.CallID)
 	meta.SessionID = pick(body.SessionID, meta.SessionID)
 	meta.AgentID = pick(body.AgentID, meta.AgentID)
+	meta.TurnID = pick(body.TurnID, meta.TurnID)
+	meta.TranscriptPath = pick(body.TranscriptPath, meta.TranscriptPath)
 	meta.ArgsDigest = pick(body.ArgsDigest, meta.ArgsDigest)
 	meta.HookEvent = body.Event
 	meta.IsError = meta.IsError || body.IsError
@@ -169,7 +174,7 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	}
 	hook := &reduceHook{reducer: red, argv0: argv0, shape: meta.OutputShape, meta: &meta,
 		in: Input{Sel: sel, Sections: body.Sections, Target: target}}
-	if sel.Family == "" && NamespacedTool(meta.Tool) {
+	if sel.Family == "" && pol.ForeignTool(meta.Tool) {
 		// another server's tool: its name selects a family only for non-JSON output
 		hook.structured, _ = reg.Lookup(FamilyStructured)
 	}
@@ -193,16 +198,18 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 		d.Reducer = reducerName(hook.reducer)
 	}
 	res.Facts, res.Structured = proj.Facts, proj.Structured
+	var recovery, note string
 	if d.Handle != "" {
-		res.Footer = evidenceFooter(d, in.WorkspaceID)
+		recovery = evidenceFooter(d, in.WorkspaceID)
 	}
 	if len(d.InjectionFlags) > 0 {
 		// the shaped output xMustard puts in place of the native one carries the same
 		// data-framing line as an MCP result (WS-56)
-		res.Footer = strings.TrimPrefix(res.Footer+"\n"+injection.Note(meta.Tool, d.InjectionFlags), "\n")
+		note = injection.Note(meta.Tool, d.InjectionFlags)
 	}
+	res.Footer = joinLines(recovery, note)
 	res.Shape = ShapeOutput(ShapeInput{Client: meta.Client, Tool: meta.Tool, Body: bodyForShape(in.Format, body),
-		Proj: proj, Reduced: d.Reduced, Footer: res.Footer, RawBytes: d.RawBytes, IsError: meta.IsError})
+		Proj: proj, Reduced: d.Reduced, Footer: recovery, Note: note, RawBytes: d.RawBytes, IsError: meta.IsError})
 	// the model reads the projection text and the recovery line (a shaped payload
 	// carries the same text in its fields; its JSON escaping is not model-visible)
 	res.DeliveredTokensEst = EstimateTokens(d.Projection)

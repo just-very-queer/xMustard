@@ -156,6 +156,7 @@ func TestHarnessRepairs(t *testing.T) {
 		{"claude grep glob", KindGrep, `{"pattern":"TODO","glob":".go"}`, "glob", "*.go"},
 		{"opencode filePath", KindWriteFile, `{"filePath":"./x/../y.go","content":"package y"}`, "path", "y.go"},
 		{"pi oldText", KindApplyPatch, `{"path":"a.go","oldText":"a","newText":"b"}`, "old_string", "a"},
+		{"opencode patchText", KindApplyPatch, `{"patchText":"*** Begin Patch\n*** End Patch"}`, "patch", "*** Begin Patch\n*** End Patch"},
 		{"prompt server not name", KindGetMCPPrompt, `{"name":"summarize","server":"docs"}`, "prompt", "summarize"},
 		{"resource object uri", KindReadMCPResource, `{"server":"docs","resource":{"uri":"docs://a"}}`, "uri", "docs://a"},
 		{"model provider join", KindTask, `{"description":"d","model":"m1","provider":"acme"}`, "model", "acme/m1"},

@@ -20,7 +20,8 @@ import (
 // recovers through byte pages (GET .../evidence/{handle}) or search.
 //
 //   POST /api/workspaces/{ws}/evidence/capture?format=raw|claude|codex|cursor|pi|opencode
-//        &client=&tool=&tool_version=&call_id=&session_id=&agent_id=&args_digest=
+//        &client=<a client policy name or alias; blank takes the format's>
+//        &tool=&tool_version=&call_id=&session_id=&agent_id=&args_digest=
 //        &is_error=&exit_code=&content_type=&command=&path=&lines=A-B&start_line=&family=
 //        &target=<bytes>
 //   GET  /api/workspaces/{ws}/evidence/search?handle=&pattern=|query=&lines=A-B
@@ -96,6 +97,13 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 		if !formats[format] {
 			badCapture(w, "invalid_format", fmt.Sprintf("format must be raw or one of %v", evidence.HookFormats()))
 			return
+		}
+		if c := q.Get("client"); c != "" {
+			if _, ok := evidence.LookupClient(c); !ok {
+				// an unknown client would silently get another client's payload shape
+				badCapture(w, "invalid_client", fmt.Sprintf("unknown client %q; use one of %v", c, evidence.ClientNames()))
+				return
+			}
 		}
 		meta := evidence.CaptureMeta{Client: q.Get("client"), Tool: q.Get("tool"), ToolVersion: q.Get("tool_version"),
 			CallID: q.Get("call_id"), SessionID: q.Get("session_id"), AgentID: q.Get("agent_id"),
