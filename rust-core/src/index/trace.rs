@@ -6,7 +6,7 @@
 //! the same [`Graph`] and layer rule as impact. Its caps: depth 10 by default and 30 at
 //! most, 200 edges followed per node, 5,000 nodes per level and 50,000 visited. When no
 //! path exists within them, the answer names the furthest node the downstream search
-//! reached and its depth, and says which caps were hit.
+//! reached and its depth, and says which caps either search hit.
 
 use std::collections::{BTreeSet, HashMap};
 
@@ -133,6 +133,16 @@ impl CapHits {
     fn any(&self) -> bool {
         self.fanout > 0 || self.rows_per_level || self.visited || self.depth
     }
+
+    /// The caps either of two searches hit.
+    fn merge(self, other: CapHits) -> CapHits {
+        CapHits {
+            fanout: self.fanout + other.fanout,
+            rows_per_level: self.rows_per_level || other.rows_per_level,
+            visited: self.visited || other.visited,
+            depth: self.depth || other.depth,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -160,8 +170,10 @@ pub struct Trace {
     /// The furthest node the downstream search reached, when no path was found.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub furthest: Option<Furthest>,
-    /// A cap cut the search short, so a longer path may exist.
+    /// A cap cut a search short, so a longer path may exist.
     pub truncated: bool,
+    /// The caps hit by the searches that ran (downstream, then upstream when downstream
+    /// found no path).
     pub caps_hit: CapHits,
     pub caps: Caps,
     pub from_targets: usize,
@@ -291,15 +303,17 @@ pub fn run<G: Graph + ?Sized>(g: &G, q: &TraceQuery) -> Result<Trace, String> {
         return Ok(out);
     }
     let down = search(g, q, Direction::Downstream, &from, &to)?;
+    // caps_hit names the caps of every search that ran
     let (found, dir) = match down.hit {
         Some(_) => (down, Direction::Downstream),
         None => {
-            let up = search(g, q, Direction::Upstream, &from, &to)?;
+            let mut up = search(g, q, Direction::Upstream, &from, &to)?;
+            up.caps = down.caps.merge(up.caps);
             match up.hit {
                 Some(_) => (up, Direction::Upstream),
                 None => {
-                    out.caps_hit = down.caps;
-                    out.truncated = down.caps.any() || up.caps.any();
+                    out.caps_hit = up.caps;
+                    out.truncated = up.caps.any();
                     out.furthest = down
                         .furthest
                         .map(|(n, depth)| end(g, n).map(|end| Furthest { end, depth }))

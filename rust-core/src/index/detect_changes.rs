@@ -169,27 +169,54 @@ struct Entry {
     binary: bool,
 }
 
+/// Why [`detect`] gave no answer.
+#[derive(Debug)]
+pub enum DetectError {
+    /// The request names what is not there: a worktree that is not a checkout of the
+    /// repository, a revision that names no commit, base and head without a merge base,
+    /// or a revision the scope does not take. The message names only what the caller
+    /// gave.
+    Refused(String),
+    Failed(String),
+}
+
+impl From<String> for DetectError {
+    fn from(e: String) -> Self {
+        DetectError::Failed(e)
+    }
+}
+
 /// The checkout the diff runs in: the root, or a worktree of the same repository at the
-/// root's place in it. Checked in order, fail closed.
+/// root's place in it. Checked in order, fail closed; a refusal names the worktree as
+/// the caller gave it.
 fn checkout(root: &Path, worktree: Option<&Path>) -> Result<PathBuf, String> {
-    let Some(wt) = worktree else {
+    let Some(given) = worktree else {
         return Ok(root.to_path_buf());
     };
-    let wt = std::fs::canonicalize(wt).map_err(|e| format!("worktree {}: {e}", wt.display()))?;
+    let refuse = |why: &str| format!("worktree {}: {why}", given.display());
+    let wt = std::fs::canonicalize(given).map_err(|e| refuse(&e.to_string()))?;
     if !wt.is_dir() {
-        return Err(format!("worktree {} is not a directory", wt.display()));
+        return Err(refuse("not a directory"));
     }
     let top = gitdiff::run_small(&wt, &["rev-parse", "--show-toplevel"], 4096)
-        .map_err(|_| format!("worktree {} is not a Git checkout", wt.display()))?;
-    let top = PathBuf::from(String::from_utf8_lossy(&top).trim());
-    if gitdiff::common_dir(&top)? != gitdiff::common_dir(root)? {
-        return Err(format!(
-            "worktree {} is not a checkout of the workspace's repository",
-            wt.display()
+        .map_err(|_| refuse("not a Git checkout"))?;
+    let top = std::fs::canonicalize(String::from_utf8_lossy(&top).trim())
+        .map_err(|e| refuse(&e.to_string()))?;
+    let repo = |d: &Path| gitdiff::common_dir(d).ok();
+    let ours = repo(root);
+    if ours.is_none() || repo(&top) != ours {
+        return Err(refuse("not a checkout of the workspace's repository"));
+    }
+    let prefix = gitdiff::prefix(root).map_err(|_| refuse("the workspace has no place in it"))?;
+    let dir = std::fs::canonicalize(top.join(prefix)).map_err(|e| refuse(&e.to_string()))?;
+    // The root's place there may be a symlink committed on that checkout's branch: every
+    // Git child and confined read must still run inside the checkout, in its repository.
+    if !dir.starts_with(&top) || repo(&dir) != ours {
+        return Err(refuse(
+            "the workspace's directory there leaves the checkout",
         ));
     }
-    let dir = top.join(gitdiff::prefix(root)?);
-    std::fs::canonicalize(&dir).map_err(|e| format!("worktree {}: {e}", dir.display()))
+    Ok(dir)
 }
 
 /// The changed entries of `r` under the root's `prefix`, untracked files included.
@@ -210,8 +237,9 @@ fn entries(
     )?;
     out.changed_files_total = parsed.total;
     if parsed.unreadable > 0 {
+        out.partial = true;
         out.notes.push(format!(
-            "{} changed file header(s) could not be read",
+            "{} changed file(s) have a name that could not be decoded, so their symbols are missing",
             parsed.unreadable
         ));
     }
@@ -412,9 +440,10 @@ pub fn detect<G: Graph + ?Sized>(
     q: &ChangesQuery,
     g: &G,
     losses: &BTreeMap<String, usize>,
-) -> Result<Changes, String> {
-    let dir = checkout(root, q.worktree.as_deref())?;
-    let r = gitdiff::resolve(&dir, q.scope, q.base.as_deref(), q.head.as_deref())?;
+) -> Result<Changes, DetectError> {
+    let dir = checkout(root, q.worktree.as_deref()).map_err(DetectError::Refused)?;
+    let r = gitdiff::resolve(&dir, q.scope, q.base.as_deref(), q.head.as_deref())
+        .map_err(DetectError::Refused)?;
     let prefix = gitdiff::prefix(&dir)?;
     let mut out = Changes {
         scope: r.clone(),

@@ -29,10 +29,23 @@ const MAX_COMPONENT_FILES: usize = 20;
 const MAX_LISTED_CYCLES: usize = 20;
 /// Components larger than this are not enumerated (the count becomes null).
 const MAX_ENUMERATED_SIZE: usize = 200;
-/// Elementary cycles counted before the enumeration gives up.
+/// Elementary cycles the enumeration may count in all, over every component.
 const MAX_CYCLES: usize = 10_000;
 /// Edge steps the enumeration may take in all.
 const STEP_BUDGET: u64 = 2_000_000;
+
+/// What the enumeration has spent, shared by every start of every component.
+#[derive(Debug, Default)]
+struct Budget {
+    steps: u64,
+    cycles: usize,
+}
+
+impl Budget {
+    fn spent(&self) -> bool {
+        self.steps > STEP_BUDGET || self.cycles > MAX_CYCLES
+    }
+}
 
 /// One strongly connected component of the import graph.
 #[derive(Debug, Clone, Serialize)]
@@ -206,9 +219,10 @@ struct Johnson<'a> {
     blocked: Vec<bool>,
     b: Vec<Vec<usize>>,
     path: Vec<usize>,
-    found: Vec<Vec<usize>>,
-    count: usize,
-    steps: &'a mut u64,
+    /// The cycles kept for the listing, at most `room`.
+    found: &'a mut Vec<Vec<usize>>,
+    room: usize,
+    budget: &'a mut Budget,
     blown: bool,
 }
 
@@ -229,8 +243,8 @@ impl Johnson<'_> {
         self.blocked[v] = true;
         for i in 0..self.adj[v].len() {
             let w = self.adj[v][i];
-            *self.steps += 1;
-            if self.blown || *self.steps > STEP_BUDGET || self.count > MAX_CYCLES {
+            self.budget.steps += 1;
+            if self.blown || self.budget.spent() {
                 self.blown = true;
                 break;
             }
@@ -238,8 +252,8 @@ impl Johnson<'_> {
                 continue;
             }
             if w == self.start {
-                self.count += 1;
-                if self.found.len() < MAX_LISTED_CYCLES {
+                self.budget.cycles += 1;
+                if self.found.len() < self.room {
                     self.found.push(self.path.clone());
                 }
                 closed = true;
@@ -262,8 +276,13 @@ impl Johnson<'_> {
 }
 
 /// The elementary cycles of component `members` (sorted file ids), within the shared
-/// step budget: their count and the first few, or None when the budget ran out.
-fn enumerate(members: &[u32], adj: &[Vec<u32>], steps: &mut u64) -> Option<(usize, Vec<Vec<u32>>)> {
+/// budget: their count and the first `room` of them, or None when the budget ran out.
+fn enumerate(
+    members: &[u32],
+    adj: &[Vec<u32>],
+    budget: &mut Budget,
+    room: usize,
+) -> Option<(usize, Vec<Vec<u32>>)> {
     if members.len() > MAX_ENUMERATED_SIZE {
         return None;
     }
@@ -272,32 +291,30 @@ fn enumerate(members: &[u32], adj: &[Vec<u32>], steps: &mut u64) -> Option<(usiz
         .iter()
         .map(|f| adj[*f as usize].iter().filter_map(|t| local(*t)).collect())
         .collect();
-    let (mut count, mut found) = (0, Vec::new());
-    for start in 0..members.len() {
-        let k = members.len();
+    let (before, k) = (budget.cycles, members.len());
+    let mut found = Vec::new();
+    for start in 0..k {
         let mut j = Johnson {
             adj: &ladj,
             start,
             blocked: vec![false; k],
             b: vec![Vec::new(); k],
             path: Vec::new(),
-            found: Vec::new(),
-            count: 0,
-            steps,
+            found: &mut found,
+            room,
+            budget,
             blown: false,
         };
         j.circuit(start);
         if j.blown {
             return None;
         }
-        count += j.count;
-        found.extend(
-            j.found
-                .into_iter()
-                .map(|c| c.into_iter().map(|i| members[i]).collect()),
-        );
     }
-    Some((count, found))
+    let found = found
+        .into_iter()
+        .map(|c| c.into_iter().map(|i| members[i]).collect())
+        .collect();
+    Some((budget.cycles - before, found))
 }
 
 /// The shortest cycle through `members[0]` within the component.
@@ -339,20 +356,19 @@ pub fn compute<G: Graph + ?Sized>(g: &G) -> Result<CycleReport, String> {
     // files are numbered in path order, so this is path order of first files
     comps.sort();
     report.component_count = comps.len();
-    let mut steps = 0u64;
+    let mut budget = Budget::default();
     let mut total = Some(0usize);
     let paths =
         |ids: &[u32]| -> Vec<String> { ids.iter().map(|f| g.path(*f).to_string()).collect() };
     for members in comps {
-        match enumerate(&members, &adj, &mut steps) {
+        let room = MAX_LISTED_CYCLES - report.cycles.len();
+        match enumerate(&members, &adj, &mut budget, room) {
             Some((count, found)) => {
                 total = total.map(|t| t + count);
                 for c in found {
-                    if report.cycles.len() < MAX_LISTED_CYCLES {
-                        let mut closed = paths(&c);
-                        closed.push(g.path(c[0]).to_string());
-                        report.cycles.push(closed);
-                    }
+                    let mut closed = paths(&c);
+                    closed.push(g.path(c[0]).to_string());
+                    report.cycles.push(closed);
                 }
             }
             None => total = None,
@@ -414,10 +430,48 @@ mod tests {
             }
         }
         let adj = g(&e, 4);
-        let mut steps = 0;
-        let (count, found) = enumerate(&[0, 1, 2, 3], &adj, &mut steps).unwrap();
+        let mut budget = Budget::default();
+        let (count, found) =
+            enumerate(&[0, 1, 2, 3], &adj, &mut budget, MAX_LISTED_CYCLES).unwrap();
         assert_eq!(count, 20);
         assert_eq!(found.len(), MAX_LISTED_CYCLES);
+        // the listing keeps only the room it is given, over every start
+        let (_, few) = enumerate(&[0, 1, 2, 3], &adj, &mut Budget::default(), 3).unwrap();
+        assert_eq!(few.len(), 3);
+    }
+
+    // The cycle cap is shared by every start and every component, as the step budget
+    // is: components that each stay under it are cut short together.
+    #[test]
+    fn the_cycle_cap_is_shared_across_starts_and_components() {
+        // six disjoint complete digraphs on 7 nodes, 2,365 elementary cycles each: every
+        // one fits under the cap alone, the six together do not
+        let k = 7u32;
+        let comps = 6u32;
+        let mut e = Vec::new();
+        for c in 0..comps {
+            for a in 0..k {
+                for b in 0..k {
+                    if a != b {
+                        e.push((c * k + a, c * k + b));
+                    }
+                }
+            }
+        }
+        let adj = g(&e, (k * comps) as usize);
+        let mut budget = Budget::default();
+        let mut total = 0;
+        let mut cut = false;
+        for c in 0..comps {
+            let members: Vec<u32> = (c * k..(c + 1) * k).collect();
+            match enumerate(&members, &adj, &mut budget, 0) {
+                Some((n, _)) => total += n,
+                None => cut = true,
+            }
+        }
+        assert!(cut, "{total} cycles counted past the shared cap");
+        assert_eq!(budget.cycles, MAX_CYCLES + 1, "cut by the cycle cap");
+        assert!(budget.steps <= STEP_BUDGET);
     }
 
     #[test]
@@ -425,8 +479,7 @@ mod tests {
         let n = MAX_ENUMERATED_SIZE + 5;
         let adj: Vec<Vec<u32>> = (0..n).map(|i| vec![((i + 1) % n) as u32]).collect();
         let members: Vec<u32> = (0..n as u32).collect();
-        let mut steps = 0;
-        assert!(enumerate(&members, &adj, &mut steps).is_none());
+        assert!(enumerate(&members, &adj, &mut Budget::default(), 0).is_none());
         let rep = representative(&members, &adj);
         assert_eq!(rep.len(), n + 1);
         assert_eq!((rep[0], rep[n]), (0, 0));

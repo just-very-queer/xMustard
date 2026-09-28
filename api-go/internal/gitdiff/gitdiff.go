@@ -3,8 +3,9 @@
 //
 // The Rust core owns the policy (rust-core/src/gitdiff.rs), which also parses the -U0
 // symbol diff impact reads; this package is its copy of the parts Go runs: the
-// environment scrub, the isolation variables, the -c pins and the review mode. Both are
-// tested against rust-core/src/testdata/gitdiff_policy.golden, so the two cannot drift.
+// environment scrub, the isolation variables, the -c pins, the review mode and the scope
+// vocabulary impact's scope= form is checked against. Both are tested against
+// rust-core/src/testdata/gitdiff_policy.golden, so the two cannot drift.
 //
 // Every Git child here ignores the system, global and XDG configuration and the system
 // attributes, has every GIT_* and XMUSTARD_* variable removed from its environment (an
@@ -21,6 +22,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"slices"
 	"strings"
 	"time"
 	"unicode"
@@ -60,6 +62,59 @@ var ReviewFlags = []string{
 	"--no-color", "--no-ext-diff", "--no-textconv", "--binary", "--full-index", "--no-renames",
 	"--no-relative", "--diff-algorithm=myers", "--indent-heuristic", "--inter-hunk-context=0", "-U3",
 	"--src-prefix=a/", "--dst-prefix=b/", "--ignore-submodules=none", "--submodule=short", "-O" + os.DevNull,
+}
+
+// Need says whether a scope requires, allows or refuses a revision.
+type Need string
+
+const (
+	Refused  Need = "refused"
+	Optional Need = "optional"
+	Required Need = "required"
+)
+
+// Scope is one name of the shared scope vocabulary and the revisions it takes.
+type Scope struct {
+	Name       string
+	Base, Head Need
+}
+
+// Scopes is rust-core's scope table (SCOPE_NAMES with Scope::needs), in its order;
+// workspace is the review vocabulary's name for all.
+var Scopes = []Scope{
+	{"unstaged", Refused, Refused},
+	{"staged", Refused, Refused},
+	{"all", Refused, Refused},
+	{"workspace", Refused, Refused},
+	{"compare", Required, Optional},
+	{"commit", Refused, Optional},
+	{"range", Required, Optional},
+}
+
+// ErrBadScope is returned for a scope name outside Scopes, or a base or head the scope
+// does not take or needs.
+var ErrBadScope = errors.New("bad diff scope")
+
+// CheckScope refuses an unknown scope, a revision the scope does not take and a missing
+// one it needs, before any Git runs.
+func CheckScope(scope, base, head string) error {
+	i := slices.IndexFunc(Scopes, func(s Scope) bool { return s.Name == scope })
+	if i < 0 {
+		return fmt.Errorf("unknown scope %q: %w", scope, ErrBadScope)
+	}
+	for _, r := range []struct {
+		name  string
+		need  Need
+		given bool
+	}{{"base", Scopes[i].Base, base != ""}, {"head", Scopes[i].Head, head != ""}} {
+		switch {
+		case r.need == Required && !r.given:
+			return fmt.Errorf("scope %s needs %s: %w", scope, r.name, ErrBadScope)
+		case r.need == Refused && r.given:
+			return fmt.Errorf("scope %s takes no %s: %w", scope, r.name, ErrBadScope)
+		}
+	}
+	return nil
 }
 
 // ErrBadRef is returned for a revision refused before Git sees it or one that names no
@@ -169,6 +224,9 @@ func RenderPolicy() string {
 	}
 	for _, f := range ReviewFlags {
 		fmt.Fprintf(&b, "review\t%s\n", null(f))
+	}
+	for _, sc := range Scopes {
+		fmt.Fprintf(&b, "scope\t%s\tbase=%s\thead=%s\n", sc.Name, sc.Base, sc.Head)
 	}
 	return b.String()
 }

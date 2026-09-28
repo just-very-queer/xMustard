@@ -1087,11 +1087,17 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let cfg = xmustard_core::index::config::IndexConfig::load(&canonical)
                 .map_err(|e| failed(format!("config: {e}")))?;
             let src = source(&root, &ws);
-            let mut out = Err("the graph was not walked".to_string());
+            let mut out = Err(detect_changes::DetectError::Failed(
+                "the graph was not walked".into(),
+            ));
             src.graph.with_walk_graph(&mut |g| {
                 out = detect_changes::detect(&canonical, &cfg, &q, g, &src.coverage.loss_counts);
             });
-            let out = out.map_err(failed)?;
+            // a refusal exits 2, which the Go side answers as the caller's error (400)
+            let out = out.map_err(|e| match e {
+                detect_changes::DetectError::Refused(why) => bad_flag(why),
+                detect_changes::DetectError::Failed(why) => failed(why),
+            })?;
             let paths = out.changed_files.iter().map(|f| f.path.as_str());
             annotated(&out, src.annotate(paths))
         }

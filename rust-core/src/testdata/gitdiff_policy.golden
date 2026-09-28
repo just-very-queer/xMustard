@@ -1,6 +1,7 @@
 # The hardened Git diff policy (WS-64 in WS-35). rust-core/src/gitdiff.rs renders every
-# line; api-go/internal/gitdiff renders the lines it implements (scrub, env, config and
-# the review mode). Tab-separated: kind, value. Paths are the Unix null device.
+# line; api-go/internal/gitdiff renders the lines it implements (scrub, env, config, the
+# review mode and the scopes). Tab-separated: kind, value; a scope line adds whether it
+# takes base and head. Paths are the Unix null device.
 scrub	GIT_
 scrub	XMUSTARD_
 env	GIT_CONFIG_NOSYSTEM=1
@@ -47,3 +48,10 @@ symbols	--dst-prefix=b/
 symbols	--ignore-submodules=none
 symbols	--submodule=short
 symbols	-O/dev/null
+scope	unstaged	base=refused	head=refused
+scope	staged	base=refused	head=refused
+scope	all	base=refused	head=refused
+scope	workspace	base=refused	head=refused
+scope	compare	base=required	head=optional
+scope	commit	base=refused	head=optional
+scope	range	base=required	head=optional

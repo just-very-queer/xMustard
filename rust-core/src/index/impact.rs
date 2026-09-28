@@ -1150,7 +1150,8 @@ fn envelope<G: Graph + ?Sized>(
     })
 }
 
-/// The import-cycle components through a seed's file.
+/// The import-cycle components through a seed's file: every component, listed in the
+/// report or not, matched on all its members (its listed files are capped).
 fn cycles_through<G: Graph + ?Sized>(
     g: &G,
     seeds: &[Seed],
@@ -1160,12 +1161,12 @@ fn cycles_through<G: Graph + ?Sized>(
     };
     let mut files = BTreeSet::new();
     for s in seeds {
-        files.insert(g.path(g.file_of(s.node)?).to_string());
+        files.insert(g.file_of(s.node)?);
     }
     Ok(report
-        .components
+        .all
         .iter()
-        .filter(|c| c.files.iter().any(|f| files.contains(f)))
+        .filter(|c| files.iter().any(|f| c.members.binary_search(f).is_ok()))
         .cloned()
         .collect())
 }

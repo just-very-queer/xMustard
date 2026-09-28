@@ -339,7 +339,10 @@ fn a_file_target_is_seeded_with_its_declared_symbols() {
 #[test]
 fn an_unmapped_import_alias_makes_the_answer_a_lower_bound() {
     let r = repo(&files(&[
-        ("src/core/api.ts", "export function buildHandler(): number { return 1; }\n"),
+        (
+            "src/core/api.ts",
+            "export function buildHandler(): number { return 1; }\n",
+        ),
         (
             "src/app.ts",
             "import { buildHandler } from '@core/api';\nexport function start(): number { return buildHandler(); }\n",
@@ -416,6 +419,18 @@ fn trace_reports_hops_direction_furthest_and_caps() {
     let shallow = sg("trace", r.path(), &["--max-depth=1"], &["start", "end"]);
     assert_eq!(shallow["found"], false);
     assert_eq!(shallow["caps_hit"]["depth"], true, "{shallow:#}");
+    // cut short by the upstream search alone (end calls nothing; middle calls end): the
+    // cap it hit is named, not only the downstream search's
+    let up_only = sg("trace", r.path(), &["--max-depth=1"], &["end", "island"]);
+    assert_eq!(
+        (
+            up_only["found"].as_bool(),
+            up_only["truncated"].as_bool(),
+            up_only["caps_hit"]["depth"].as_bool()
+        ),
+        (Some(false), Some(true), Some(true)),
+        "{up_only:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -558,8 +573,36 @@ fn changes_read_commits_ranges_and_compare_and_refuse_bad_revisions() {
         args.extend(bad.iter().copied());
         args.extend([root, "ws"]);
         let out = run(&args);
-        assert!(!out.status.success(), "{bad:?} must be refused");
+        // a refusal exits 2, which the API answers as the caller's error
+        assert_eq!(out.status.code(), Some(2), "{bad:?} must be refused");
     }
+}
+
+// A changed file whose name is not UTF-8 (the symbol diff prints names raw) is counted
+// and makes the answer partial; its hunks never land on the file listed before it.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_changed_file_whose_name_is_not_utf8_is_counted_and_partial() {
+    use std::os::unix::ffi::OsStrExt;
+    let two = |a: u32, b: u32| {
+        format!(
+            "export function alpha(): number {{\n  return {a};\n}}\n\nexport function beta(): number {{ return {b}; }}\n"
+        )
+    };
+    let first = two(1, 2);
+    let r = repo(&files(&[("a.ts", first.as_str())]));
+    let raw = r.path().join(std::ffi::OsStr::from_bytes(b"z\xff.ts"));
+    fs::write(&raw, "1\n2\n3\n4\n5\n").unwrap();
+    commit(r.path(), "raw name");
+    build(r.path());
+    write(r.path(), "a.ts", &two(10, 2));
+    fs::write(&raw, "1\n2\n3\n4\nfive\n").unwrap();
+    commit(r.path(), "edit line 2 of a.ts and line 5 of the raw name");
+    let v = changes(r.path(), &["--scope=commit"]);
+    let names: BTreeSet<String> = changed(&v).into_iter().map(|c| c.0).collect();
+    assert_eq!(names, ["alpha".to_string()].into(), "{v:#}");
+    assert_eq!(v["changed_files_total"], 2, "{v:#}");
+    assert_eq!(v["partial"], true, "{v:#}");
 }
 
 /// A repository configuration that changes what `git diff` prints.
@@ -688,8 +731,46 @@ fn a_worktree_must_be_a_checkout_of_the_same_repository() {
     for bad in [other.path().to_path_buf(), parent.path().join("missing")] {
         let flag = format!("--worktree={}", bad.display());
         let out = run(&["symbolgraph", "changes", "--scope=all", &flag, root, "ws"]);
-        assert!(!out.status.success(), "{} must be refused", bad.display());
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{} must be refused",
+            bad.display()
+        );
     }
+}
+
+// The root's place in the other checkout must stay inside it: a symlink committed on
+// that checkout's branch cannot move the diff and its reads into another repository.
+#[cfg(unix)]
+#[test]
+fn a_worktree_whose_root_directory_links_out_of_it_is_refused() {
+    let r = repo(&files(&[("sub/a.ts", "export function a() {}\n")]));
+    let elsewhere = repo(&files(&[("a.ts", "export function b() {}\n")]));
+    git(r.path(), &["checkout", "-q", "-b", "away"]);
+    fs::remove_dir_all(r.path().join("sub")).unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), r.path().join("sub")).unwrap();
+    commit(r.path(), "sub links elsewhere");
+    git(r.path(), &["checkout", "-q", "-"]);
+    let parent = TempDir::new().unwrap();
+    let wt = parent.path().join("wt");
+    git(
+        r.path(),
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "away"],
+    );
+    let root = r.path().join("sub");
+    let flag = format!("--worktree={}", wt.display());
+    let out = run(&[
+        "symbolgraph",
+        "changes",
+        "--scope=all",
+        &flag,
+        root.to_str().unwrap(),
+        "ws",
+    ]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("leaves the checkout"), "{err}");
 }
 
 // ---------------------------------------------------------------------------
@@ -779,5 +860,37 @@ fn a_cycle_blowup_keeps_the_component_count_and_one_representative() {
         rep.len(),
         3,
         "the shortest cycle through m0 is m0 -> m1 -> m0"
+    );
+}
+
+#[test]
+fn impact_lists_cycles_past_the_listed_files_and_components() {
+    // a ring of 22 modules: the component lists 20 files, and the 21st still sees it
+    let names: Vec<String> = (0..22).map(|i| format!("m{i:02}")).collect();
+    let mut list: Vec<(String, String)> = names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| module(n, &[(names[(i + 1) % names.len()].as_str(), "value")]))
+        .collect();
+    // then 21 two-file cycles: 22 components in all, the last past the 20 listed
+    for i in 0..21 {
+        let (a, b) = (format!("p{i:02}a"), format!("p{i:02}b"));
+        list.push(module(&a, &[(b.as_str(), "value")]));
+        list.push(module(&b, &[(a.as_str(), "value")]));
+    }
+    let r = repo(&list);
+    build(r.path());
+    let cov = sg("coverage", r.path(), &[], &[]);
+    assert_eq!(cov["import_cycles"]["component_count"], 22, "{cov:#}");
+    let last = sg("impact", r.path(), &[], &["v_p20a"]);
+    assert_eq!(last["import_cycles"][0]["size"], 2, "{last:#}");
+    let v = sg("impact", r.path(), &[], &["v_m20"]);
+    let comp = &v["import_cycles"][0];
+    assert_eq!(comp["size"], 22, "{v:#}");
+    assert_eq!(comp["files"].as_array().unwrap().len(), 20);
+    assert_eq!(comp["files_truncated"], true);
+    assert!(
+        !comp["files"].to_string().contains("m20.ts"),
+        "the target's file is past the listed ones"
     );
 }

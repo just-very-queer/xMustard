@@ -169,6 +169,14 @@ pub fn render_policy() -> String {
             out.push_str(&format!("{}\t{f}\n", p.name));
         }
     }
+    for (name, scope) in SCOPE_NAMES {
+        let (base, head) = scope.needs();
+        out.push_str(&format!(
+            "scope\t{name}\tbase={}\thead={}\n",
+            base.as_str(),
+            head.as_str()
+        ));
+    }
     out
 }
 
@@ -477,6 +485,16 @@ enum Need {
     Refused,
     Optional,
     Required,
+}
+
+impl Need {
+    fn as_str(self) -> &'static str {
+        match self {
+            Need::Refused => "refused",
+            Need::Optional => "optional",
+            Need::Required => "required",
+        }
+    }
 }
 
 impl Scope {
@@ -813,17 +831,20 @@ impl Parser {
             }
             return;
         }
-        let Ok(text) = std::str::from_utf8(line) else {
-            return;
-        };
-        if let Some(rest) = text.strip_prefix("diff --git ") {
+        // The header is matched on bytes: under core.quotePath=false Git prints a name's
+        // bytes raw, so a name that is not UTF-8 still opens its file, which then has no
+        // readable path and is counted as unreadable (its hunks never reach another file).
+        if let Some(rest) = line.strip_prefix(b"diff --git ") {
             self.flush();
             self.cur = Some(Pending {
-                header: header_path(rest),
+                header: std::str::from_utf8(rest).ok().and_then(header_path),
                 ..Default::default()
             });
             return;
         }
+        let Ok(text) = std::str::from_utf8(line) else {
+            return; // a `---`/`+++` line of such a name
+        };
         let Some(cur) = self.cur.as_mut() else {
             return;
         };
@@ -1343,6 +1364,34 @@ mod tests {
                 new_len: 2
             }
         );
+    }
+
+    // A name that is not UTF-8 (printed raw under core.quotePath=false) opens its own
+    // file, which is counted as unreadable; its hunks never land on the file before it.
+    #[test]
+    fn a_header_that_is_not_utf8_is_unreadable_and_keeps_its_hunks() {
+        let mut p = Parser::new(Limits::default());
+        let lines: [&[u8]; 12] = [
+            b"diff --git a/a.ts b/a.ts",
+            b"--- a/a.ts",
+            b"+++ b/a.ts",
+            b"@@ -2 +2 @@",
+            b"-x",
+            b"+y",
+            b"diff --git a/z\xff.ts b/z\xff.ts",
+            b"--- a/z\xff.ts",
+            b"+++ b/z\xff.ts",
+            b"@@ -5 +5 @@",
+            b"-p",
+            b"+q",
+        ];
+        for l in lines {
+            p.line(l);
+        }
+        let d = p.finish();
+        assert_eq!((d.total, d.unreadable, d.files.len()), (2, 1, 1));
+        assert_eq!(d.files[0].path, "a.ts");
+        assert_eq!(d.files[0].hunks.len(), 1, "{:?}", d.files[0].hunks);
     }
 
     #[test]
