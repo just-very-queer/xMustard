@@ -10,6 +10,7 @@ BINDIR := $(PREFIX)/bin
 .PHONY: build install relay backend backend-platform go-api frontend go-api-build rust-core-check \
 	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend
 .PHONY: bench-test bench-gate bench-parity bench-retrieval
+.PHONY: release
 
 build:
 	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay
@@ -29,6 +30,30 @@ install: build
 # the API's Streamable HTTP endpoint (/mcp), std-only Rust, about 2 MiB RSS.
 relay:
 	cd rust-core && cargo build --release --bin xmustard-relay
+
+# Release archive for this host: `make release VERSION=v0.2.0`. It builds the Rust core
+# and relay with cargo --locked and the Go binaries with -trimpath and CGO off, checks
+# that the built binaries start, and writes $(DIST)/xmustard-<version>-<os>-<arch>.tar.gz
+# (the five binaries and LICENSE) with its .sha256. The tag workflow
+# (.github/workflows/release.yml) runs it once per platform.
+DIST ?= dist
+VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+RELEASE_NAME := xmustard-$(VERSION)-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
+RELEASE_DIR := $(abspath $(DIST))/$(RELEASE_NAME)
+RUST_BINS := xmustard-core xmustard-relay
+GO_BINS := xmustard-api xmustard-mcp xmustard-ops
+
+release:
+	rm -rf "$(RELEASE_DIR)" "$(RELEASE_DIR).tar.gz" "$(RELEASE_DIR).tar.gz.sha256"
+	mkdir -p "$(RELEASE_DIR)"
+	cd rust-core && cargo build --release --locked $(RUST_BINS:%=--bin %)
+	cp $(RUST_BINS:%=rust-core/target/release/%) LICENSE "$(RELEASE_DIR)/"
+	cd api-go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$(RELEASE_DIR)/" $(GO_BINS:%=./cmd/%)
+	"$(RELEASE_DIR)/xmustard-core" 2>&1 | grep -q usage
+	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$(RELEASE_DIR)/xmustard-mcp" | grep -q '"remember"'
+	cd "$(DIST)" && COPYFILE_DISABLE=1 tar --owner=0 --group=0 --numeric-owner -czf "$(RELEASE_NAME).tar.gz" "$(RELEASE_NAME)"
+	cd "$(DIST)" && shasum -a 256 "$(RELEASE_NAME).tar.gz" > "$(RELEASE_NAME).tar.gz.sha256"
+	cat "$(RELEASE_DIR).tar.gz.sha256"
 
 # The API defaults to the core profile (the nine tools, memory, evidence, auth).
 # The UI calls platform routes, so the UI targets start it with XMUSTARD_PROFILE=platform.
