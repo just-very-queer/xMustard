@@ -140,7 +140,7 @@ func TestReviewAnchorFromEvidence(t *testing.T) {
 		if code := runOps(e, append(args, "--token-file", tokenFile)...); code != 0 {
 			t.Fatalf("the capturing principal: exit %d: %s", code, errOut)
 		}
-		if c := decodeOut(t, out)["counts"].(map[string]any); c["supported"] != float64(1) {
+		if c := decodeOut(t, out)["counts"].(map[string]any); c["by_support"].(map[string]any)["supported"] != float64(1) {
 			t.Fatalf("counts = %v", c)
 		}
 	})

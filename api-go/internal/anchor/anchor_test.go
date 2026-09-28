@@ -7,16 +7,29 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
 )
 
 type fixtureFile struct {
-	OldPath string  `json:"old_path"`
-	NewPath string  `json:"new_path"`
-	Diff    string  `json:"diff"`
-	Head    *string `json:"head"`
+	OldPath    string  `json:"old_path"`
+	NewPath    string  `json:"new_path"`
+	Diff       string  `json:"diff"`
+	Head       *string `json:"head"`
+	HeadUnread bool    `json:"head_unread"`
+}
+
+// headOf is a fixture file's head: none, content, or a head the caller did not read.
+func (f fixtureFile) headOf() func() (string, bool) {
+	switch {
+	case f.HeadUnread:
+		return func() (string, bool) { return "", false }
+	case f.Head != nil:
+		return func() (string, bool) { return *f.Head, true }
+	}
+	return nil
 }
 
 // place anchors code filed against path the way a caller does: a refused snippet is
@@ -30,7 +43,7 @@ func place(set *Set, path, code string) Anchor {
 }
 
 // TestFixtures runs testdata/fixtures.json: CRLF, ambiguity, every tier, re-filing,
-// added and deleted files, and the snippet bounds.
+// added and deleted files, heads that were not read, and the snippet bounds.
 func TestFixtures(t *testing.T) {
 	raw, err := os.ReadFile("testdata/fixtures.json")
 	if err != nil {
@@ -55,11 +68,7 @@ func TestFixtures(t *testing.T) {
 		t.Run(c.Name, func(t *testing.T) {
 			var files []*File
 			for _, f := range c.Files {
-				var head func() string
-				if f.Head != nil {
-					head = func() string { return *f.Head }
-				}
-				files = append(files, NewFile(f.OldPath, f.NewPath, f.Diff, head))
+				files = append(files, NewFile(f.OldPath, f.NewPath, f.Diff, f.headOf()))
 			}
 			if got := place(NewSet(files), c.Path, c.Snippet); got != c.Want {
 				t.Errorf("got  %+v\nwant %+v", got, c.Want)
@@ -132,7 +141,7 @@ func TestLocateAndReanchor(t *testing.T) {
 // anchored range, on the anchor's side.
 func TestTouches(t *testing.T) {
 	diff := "@@ -1,6 +1,7 @@\n ctx1\n-gone\n+came\n+\n ctx2\n ctx3\n ctx4\n ctx5\n"
-	set := NewSet([]*File{NewFile("t.go", "t.go", diff, func() string { return "ctx1\ncame\n\nctx2\nctx3\nctx4\nctx5\n" })})
+	set := NewSet([]*File{NewFile("t.go", "t.go", diff, func() (string, bool) { return "ctx1\ncame\n\nctx2\nctx3\nctx4\nctx5\n", true })})
 	for _, tc := range []struct {
 		code string
 		want bool
@@ -166,7 +175,7 @@ func TestPlaceTriesAFileOutsideTheChangeFirst(t *testing.T) {
 	heads := map[string]string{"out.go": "package p\n\nfunc F() {\n\tshared()\n}\n", "twice.go": "shared()\nshared()\n"}
 	var asked []string
 	set := NewSet([]*File{changed})
-	set.Outside = func(p string) string { asked = append(asked, p); return heads[p] }
+	set.Outside = func(p string) (string, bool) { asked = append(asked, p); return heads[p], true }
 	for _, tc := range []struct {
 		path, code string
 		want       Anchor
@@ -215,7 +224,7 @@ func TestSetKeepsAReusedOldNameApart(t *testing.T) {
 // The head is read once, and only when a snippet reaches the whole-file tier.
 func TestHeadIsLoadedLazilyAndOnce(t *testing.T) {
 	loads := 0
-	f := NewFile("l.go", "l.go", "@@ -1 +1 @@\n-a\n+b\n", func() string { loads++; return "b\nc\n" })
+	f := NewFile("l.go", "l.go", "@@ -1 +1 @@\n-a\n+b\n", func() (string, bool) { loads++; return "b\nc\n", true })
 	set := NewSet([]*File{f})
 	if place(set, "l.go", "b").Status != ExactNew || loads != 0 {
 		t.Fatalf("hunk match loaded the head %d times", loads)
@@ -227,6 +236,72 @@ func TestHeadIsLoadedLazilyAndOnce(t *testing.T) {
 	}
 	if loads != 1 {
 		t.Fatalf("head loaded %d times, want 1", loads)
+	}
+}
+
+// A head the caller did not read was never searched. A snippet no hunk holds there is
+// head_unread (unknown), never not_found, and is not re-filed past it; and re-filing
+// takes that file for a possible home, so a single hit elsewhere is not unique while it
+// is left. Two hits elsewhere are ambiguous whatever it holds.
+func TestAnUnreadHeadIsNeverAbsence(t *testing.T) {
+	read := func(content string) func() (string, bool) { return func() (string, bool) { return content, true } }
+	big := NewFile("big.go", "big.go", "@@ -1 +1,2 @@\n x\n+added()\n", func() (string, bool) { return "", false })
+	o := NewFile("o.go", "o.go", "@@ -1 +1,2 @@\n y\n+mine()\n", read("y\nmine()\nboth()\n"))
+	t3 := NewFile("t.go", "t.go", "@@ -1 +1,2 @@\n z\n+theirs()\n", read("z\ntheirs()\nboth()\nshared()\n"))
+	set := NewSet([]*File{big, o, t3})
+	for _, tc := range []struct {
+		path, code string
+		want       Anchor
+	}{
+		{"big.go", "added()", Anchor{Path: "big.go", StartLine: 2, EndLine: 2, Side: New, Status: ExactNew}}, // a hunk needs no head
+		{"big.go", "theirs()", Unplaced("big.go", ReasonHeadUnread)},                                         // its own head could hold it
+		{"o.go", "shared()", Unplaced("o.go", ReasonHeadUnread)},                                             // t.go holds it, and so could big.go
+		{"o.go", "nowhere()", Unplaced("o.go", ReasonHeadUnread)},                                            // only big.go could hold it
+		{"o.go", "added()", Anchor{Path: "big.go", StartLine: 2, EndLine: 2, Side: New, Status: Relocated, RefiledFrom: "o.go"}},
+		{"elsewhere.go", "both()", Anchor{Path: "elsewhere.go", Status: Unanchored, Reason: ReasonAmbiguousAcrossFiles, Candidates: 2}},
+	} {
+		got := place(set, tc.path, tc.code)
+		if got != tc.want {
+			t.Errorf("%s %q: got %+v, want %+v", tc.path, tc.code, got, tc.want)
+		}
+		if got.Unchecked() != (got.Reason == ReasonHeadUnread) || (got.Unchecked() && got.Present()) {
+			t.Errorf("%s %q: Unchecked %v, Present %v", tc.path, tc.code, got.Unchecked(), got.Present())
+		}
+	}
+}
+
+// PlaceAll tries every query's own file before it re-files any, so under a shared head
+// budget one finding's re-filing cannot spend the read another finding's own file needs,
+// whatever order they come in; re-filing then reads the rest in diff order.
+func TestPlaceAllReadsTheNamedFilesFirst(t *testing.T) {
+	heads := map[string]string{"a.go": "a\n", "b.go": "b\nfound()\n", "c.go": "c\n"}
+	build := func() (*Set, *[]string) {
+		left, read := 2, &[]string{} // heads the budget allows, and those read
+		var files []*File
+		for _, p := range []string{"a.go", "c.go", "b.go"} {
+			files = append(files, NewFile(p, p, "@@ -1 +1 @@\n-old\n+"+p[:1]+"\n", func() (string, bool) {
+				if left == 0 {
+					return "", false
+				}
+				left--
+				*read = append(*read, p)
+				return heads[p], true
+			}))
+		}
+		return NewSet(files), read
+	}
+	a, b := Query{"a.go", mustSnippet(t, "nowhere()")}, Query{"b.go", mustSnippet(t, "found()")}
+	want := map[string]Anchor{"a.go": Unplaced("a.go", ReasonHeadUnread), "b.go": {Path: "b.go", StartLine: 2, EndLine: 2, Side: New, Status: InFile}}
+	for _, order := range [][]Query{{a, b}, {b, a}} {
+		set, read := build()
+		for i, got := range set.PlaceAll(order) {
+			if w := want[order[i].Path]; got != w {
+				t.Errorf("order %s first, %s: got %+v, want %+v", order[0].Path, order[i].Path, got, w)
+			}
+		}
+		if want := []string{order[0].Path, order[1].Path}; !slices.Equal(*read, want) {
+			t.Errorf("order %s first: read %q, want %q (the named files, in query order)", order[0].Path, *read, want)
+		}
 	}
 }
 
@@ -271,7 +346,7 @@ func BenchmarkPlace(b *testing.B) {
 	for b.Loop() {
 		files := make([]*File, 0, len(specs))
 		for _, sp := range specs {
-			files = append(files, NewFile(sp.path, sp.path, sp.diff, func() string { return sp.head }))
+			files = append(files, NewFile(sp.path, sp.path, sp.diff, func() (string, bool) { return sp.head, true }))
 		}
 		set := NewSet(files)
 		for _, q := range qs {
@@ -280,4 +355,49 @@ func BenchmarkPlace(b *testing.B) {
 			}
 		}
 	}
+}
+
+// BenchmarkPlaceAtTheBounds is the worst case AnchorReviewFindings admits: 16 files at
+// its bounds (a diff of 262,144 lines and 8 MiB, all context, so every line is on both
+// sides; 524,288 head lines and 16 MiB, 1 MiB a file), every line the same 31 bytes,
+// and 50 findings of 39 such lines and one other, in no file. Each finding searches
+// every side and head, where a sliding window would compare 40 lines at every line. It
+// reports the live heap once the findings are placed.
+func BenchmarkPlaceAtTheBounds(b *testing.B) {
+	const files, diffLines, headLines = 16, 1 << 18, 1 << 19
+	text := strings.Repeat("x", 31)
+	diff := fmt.Sprintf("@@ -1,%d +1,%d @@\n", diffLines/files, diffLines/files) + strings.Repeat(" "+text+"\n", diffLines/files)
+	head := strings.Repeat(text+"\n", headLines/files)
+	s, err := NewSnippet(strings.Repeat(text+"\n", MaxSnippetLines-1) + "y")
+	if err != nil {
+		b.Fatal(err)
+	}
+	qs := make([]Query, 50)
+	for i := range qs {
+		qs[i] = Query{fmt.Sprintf("f%02d.go", i%files), s}
+	}
+	run := func() *Set {
+		fs := make([]*File, 0, files)
+		for i := range files {
+			p, h := fmt.Sprintf("f%02d.go", i), strings.Clone(head) // each file's own content, as git gives it
+			fs = append(fs, NewFile(p, p, strings.Clone(diff), func() (string, bool) { return h, true }))
+		}
+		set := NewSet(fs)
+		for _, a := range set.PlaceAll(qs) {
+			if a.Reason != ReasonNotFound {
+				b.Fatalf("%+v", a)
+			}
+		}
+		return set
+	}
+	var m runtime.MemStats
+	set := run()
+	runtime.GC()
+	runtime.ReadMemStats(&m)
+	runtime.KeepAlive(set)
+	b.ReportAllocs()
+	for b.Loop() {
+		run()
+	}
+	b.ReportMetric(float64(m.HeapAlloc)/(1<<20), "live_MiB") // after the loop, which drops earlier metrics
 }

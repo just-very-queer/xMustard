@@ -11,6 +11,7 @@
 package anchor
 
 import (
+	"math/rand/v2"
 	"slices"
 	"testing"
 )
@@ -21,7 +22,7 @@ const handlerDiff = "diff --git a/pkg/example/handler.go b/pkg/example/handler.g
 
 // oneFile is a change of one file, test.go, with an optional head content.
 func oneFile(diff, head string) []*File {
-	return []*File{NewFile("test.go", "test.go", diff, func() string { return head })}
+	return []*File{NewFile("test.go", "test.go", diff, func() (string, bool) { return head, true })}
 }
 
 func mustSnippet(t *testing.T, code string) Snippet {
@@ -202,12 +203,63 @@ func TestFind(t *testing.T) {
 		{"at the start", seg(1, "a", 2, "b", 3, "c"), []string{"a", "b"}, span{1, 2}, 1},
 		{"the whole side", seg(1, "a", 2, "b"), []string{"a", "b"}, span{1, 2}, 1},
 		{"never across segments", append(seg(1, "a"), seg(2, "b")...), []string{"a", "b"}, span{}, 0},
+		{"overlapping matches", seg(1, "x", 2, "x", 3, "x"), []string{"x", "x"}, span{1, 2}, 2},
+		{"a repeated prefix", seg(1, "a", 2, "a", 3, "a", 4, "b", 5, "a", 6, "a", 7, "b"), []string{"a", "a", "b"}, span{2, 4}, 2},
+		{"a partial match that restarts", seg(1, "a", 2, "b", 3, "a", 4, "b", 5, "c"), []string{"a", "b", "c"}, span{3, 5}, 1},
+		{"a snippet repeating its own start", seg(1, "a", 2, "b", 3, "a", 4, "b", 5, "a", 6, "c"), []string{"a", "b", "a", "c"}, span{3, 6}, 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			first, _, n := find(tc.segs, tc.want, 0)
+			first, _, n := find(tc.segs, snippetOf(tc.want), 0)
 			if first != tc.first || n != tc.n {
 				t.Errorf("find = %v, %d; want %v, %d", first, n, tc.first, tc.n)
 			}
 		})
+	}
+}
+
+// find is Knuth-Morris-Pratt; it must count exactly what upstream's sliding window
+// counts, overlapping matches included, over segments and snippets of a small alphabet.
+func TestFindMatchesTheSlidingWindow(t *testing.T) {
+	naive := func(segs [][]line, want []string, prefer int) (first, preferred span, n int) {
+		for _, seg := range segs {
+			for i := 0; i+len(want) <= len(seg); i++ {
+				if !slices.EqualFunc(seg[i:i+len(want)], want, func(l line, w string) bool { return l.text == w }) {
+					continue
+				}
+				sp := span{seg[i].num, seg[i+len(want)-1].num}
+				if n == 0 {
+					first = sp
+				}
+				if sp.start == prefer {
+					preferred = sp
+				}
+				n++
+			}
+		}
+		return first, preferred, n
+	}
+	r := rand.New(rand.NewPCG(65, 65))
+	word := func() string { return string(rune('a' + r.IntN(2))) }
+	for range 2000 {
+		var segs [][]line
+		num := 1
+		for range 1 + r.IntN(3) {
+			var seg []line
+			for range r.IntN(12) {
+				seg = append(seg, line{num, word()})
+				num += 1 + r.IntN(2)
+			}
+			segs = append(segs, seg)
+		}
+		want := make([]string, 1+r.IntN(4))
+		for i := range want {
+			want[i] = word()
+		}
+		prefer := 1 + r.IntN(num)
+		f1, p1, n1 := find(segs, snippetOf(want), prefer)
+		f2, p2, n2 := naive(segs, want, prefer)
+		if f1 != f2 || p1 != p2 || n1 != n2 {
+			t.Fatalf("find(%v, %q, %d) = %v %v %d, the sliding window gives %v %v %d", segs, want, prefer, f1, p1, n1, f2, p2, n2)
+		}
 	}
 }

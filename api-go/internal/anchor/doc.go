@@ -11,9 +11,11 @@
 // blank lines dropped, and at most MaxSnippetLines lines and MaxSnippetBytes bytes.
 // A File is one changed file of a unified diff. File.Resolve slides the snippet over
 // the hunks' new side, then their old side, then the whole file at head; the first tier
-// with a match decides, and several matches anchor nothing (ambiguous). Set.Place adds
-// the cross-file re-filing: a snippet found nowhere in its own file moves to another
-// file of the change only when exactly one place holds it.
+// with a match decides, and several matches anchor nothing (ambiguous). A head the
+// caller did not read leaves a snippet no hunk holds head_unread: unknown, not absent.
+// Set.PlaceAll adds the cross-file re-filing: a snippet absent from its own file moves
+// to another file of the change only when exactly one of them holds it, and no file's
+// head is left unread.
 //
 // Locate (a memory's quoted-code anchor, WS-27) and Reanchor (refs_stale re-anchoring,
 // WS-28) work on file content alone. Set.Touches says whether an anchored range holds a

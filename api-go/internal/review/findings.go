@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"reflect"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
@@ -96,6 +98,19 @@ type wireFinding struct {
 	Thinking       string `json:"thinking"`
 }
 
+// itemKeys are the member names of the item schema, from wireFinding's tags.
+var itemKeys = func() []string {
+	t := reflect.TypeFor[wireFinding]()
+	keys := make([]string, t.NumField())
+	for i := range keys {
+		keys[i] = t.Field(i).Tag.Get("json")
+	}
+	return keys
+}()
+
+// envelopeKeys are the members an envelope object is read for.
+var envelopeKeys = []string{"findings", "comments"}
+
 // Source says where a batch came from: its kind (findings_file or evidence_handle), the
 // file or handle, and the size and SHA-256 of the bytes read.
 type Source struct {
@@ -126,7 +141,9 @@ func Read(r io.Reader) (*Batch, error) {
 // "comments" (OCR's `--format json --output`; the envelope's other members are ignored).
 // A findings array sent as a JSON string is decoded once and the repair recorded. The
 // input is refused whole when it is over MaxFindingsBytes, holds more than MaxFindings
-// findings, or a finding has an unknown member, a wrong type or an unusable path.
+// findings, or a finding has an unknown member, a wrong type or an unusable path. Member
+// names are read exactly (exactKeys), so any JSON reader sees the findings that
+// Source.SHA256 names.
 func Decode(data []byte) (*Batch, error) {
 	if len(data) > MaxFindingsBytes {
 		return nil, fmt.Errorf("%w: over %d bytes", ErrInvalid, MaxFindingsBytes)
@@ -142,6 +159,9 @@ func Decode(data []byte) (*Batch, error) {
 	}
 	thinking := 0
 	for i, raw := range items {
+		if err := exactKeys(raw, itemKeys, true); err != nil {
+			return nil, fmt.Errorf("%w: finding %d: %v", ErrInvalid, i, err)
+		}
 		var w wireFinding
 		dec := json.NewDecoder(bytes.NewReader(raw))
 		dec.DisallowUnknownFields()
@@ -187,6 +207,9 @@ func (b *Batch) items(data []byte) ([]json.RawMessage, error) {
 	if err := json.Unmarshal(data, &env); err != nil {
 		return nil, fmt.Errorf("%w: expected a JSON array or an object with findings or comments: %v", ErrInvalid, err)
 	}
+	if err := exactKeys(data, envelopeKeys, false); err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrInvalid, err)
+	}
 	var list json.RawMessage
 	switch {
 	case len(env.Findings) > 0 && len(env.Comments) > 0:
@@ -204,6 +227,40 @@ func (b *Batch) items(data []byte) ([]json.RawMessage, error) {
 		return nil, fmt.Errorf("%w: findings must be an array", ErrInvalid)
 	}
 	return b.items(list)
+}
+
+// exactKeys refuses an object whose member names one of names in another case, or names
+// one twice: encoding/json would accept either, matching a name in any case and letting
+// the last repeat win, so another reader could see different values in the same bytes.
+// closed also refuses a member that is not in names.
+func exactKeys(object []byte, names []string, closed bool) error {
+	dec := json.NewDecoder(bytes.NewReader(object))
+	if t, err := dec.Token(); err != nil || t != json.Delim('{') {
+		return errors.New("not a JSON object")
+	}
+	seen := map[string]bool{}
+	for dec.More() {
+		t, err := dec.Token()
+		if err != nil {
+			return err
+		}
+		key, _ := t.(string) // an object's member names are strings, or Token failed
+		i := slices.IndexFunc(names, func(n string) bool { return strings.EqualFold(n, key) })
+		switch {
+		case i < 0 && closed:
+			return fmt.Errorf("unknown member %q", key)
+		case i >= 0 && names[i] != key:
+			return fmt.Errorf("member %q must be written %q", key, names[i])
+		case i >= 0 && seen[key]:
+			return fmt.Errorf("member %q appears twice", key)
+		}
+		seen[key] = true
+		var skip json.RawMessage
+		if err := dec.Decode(&skip); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // unquoteArray decodes a JSON string that holds an array; a string of anything else is

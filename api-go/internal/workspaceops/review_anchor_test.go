@@ -17,6 +17,22 @@ import (
 	"xmustard/api-go/internal/review"
 )
 
+// aAtHead is a.go at the feature head reviewRepo commits.
+const aAtHead = "package a\n\nfunc A() int { return 2 }\n"
+
+// bigOnMain is big.go on main: 40 lines. The feature edits line 20 (bigAtHead).
+func bigOnMain() string {
+	var big strings.Builder
+	for i := 1; i <= 40; i++ {
+		fmt.Fprintf(&big, "\tv%02d := step(%d)\n", i, i)
+	}
+	return big.String()
+}
+
+func bigAtHead() string {
+	return strings.Replace(bigOnMain(), "v20 := step(20)", "v20 := step(20) + drift", 1)
+}
+
 // anchorRepo is reviewRepo with more files on main (a 40-line file, a name with a space,
 // a non-ASCII name, a file the feature deletes and one it leaves alone) and a feature
 // commit that edits and deletes them, rebased so main is the merge base.
@@ -29,12 +45,8 @@ func anchorRepo(t testing.TB) (dataDir, ws string) {
 			t.Fatal(err)
 		}
 	}
-	var big strings.Builder
-	for i := 1; i <= 40; i++ {
-		fmt.Fprintf(&big, "\tv%02d := step(%d)\n", i, i)
-	}
 	git("checkout", "-q", "main")
-	write("big.go", big.String())
+	write("big.go", bigOnMain())
 	write("my file.go", "package a\n\nvar spaced = 1\n")
 	write("café.go", "package a\n\nvar accent = 1\n")
 	write("gone.go", "package a\n\nfunc Gone() {}\n")
@@ -43,7 +55,7 @@ func anchorRepo(t testing.TB) (dataDir, ws string) {
 	git("commit", "-q", "-m", "more")
 	git("checkout", "-q", "feature")
 	git("rebase", "-q", "main")
-	write("big.go", strings.Replace(big.String(), "v20 := step(20)", "v20 := step(20) + drift", 1))
+	write("big.go", bigAtHead())
 	write("my file.go", "package a\n\nvar spaced = 2\n")
 	write("café.go", "package a\n\nvar accent = 2\n")
 	git("rm", "-q", "gone.go")
@@ -94,18 +106,19 @@ func TestReviewAnchorBindsTheSealedChange(t *testing.T) {
 		path            string
 		status          anchor.Status
 		lines           [2]int
-		inHunk, inScope bool
+		inHunk, inScope review.Fact
 	}
+	yes, no := review.Yes, review.No
 	wantRows := []row{
-		{"a.go", anchor.ExactNew, [2]int{3, 3}, true, true},
-		{"big.go", anchor.InFile, [2]int{5, 6}, false, true},
-		{"my file.go", anchor.ExactNew, [2]int{3, 3}, true, true},
-		{"café.go", anchor.ExactNew, [2]int{3, 3}, true, true},
-		{"gone.go", anchor.ExactOld, [2]int{3, 3}, true, true},
-		{"big.go", anchor.Relocated, [2]int{20, 20}, true, true},
-		{"a.go", anchor.Unanchored, [2]int{}, false, true},
-		{"keep.go", anchor.InFile, [2]int{3, 3}, false, false},
-		{"nowhere.go", anchor.Unanchored, [2]int{}, false, false},
+		{"a.go", anchor.ExactNew, [2]int{3, 3}, yes, yes},
+		{"big.go", anchor.InFile, [2]int{5, 6}, no, yes},
+		{"my file.go", anchor.ExactNew, [2]int{3, 3}, yes, yes},
+		{"café.go", anchor.ExactNew, [2]int{3, 3}, yes, yes},
+		{"gone.go", anchor.ExactOld, [2]int{3, 3}, yes, yes},
+		{"big.go", anchor.Relocated, [2]int{20, 20}, yes, yes},
+		{"a.go", anchor.Unanchored, [2]int{}, no, yes},
+		{"keep.go", anchor.InFile, [2]int{3, 3}, no, no},
+		{"nowhere.go", anchor.Unanchored, [2]int{}, no, no},
 	}
 	if len(got.Findings) != len(wantRows) {
 		t.Fatalf("%d findings, want %d", len(got.Findings), len(wantRows))
@@ -116,36 +129,91 @@ func TestReviewAnchorBindsTheSealedChange(t *testing.T) {
 			t.Errorf("finding %d: got %+v, want %+v (%+v)", i, g, wantRows[i], f.Anchor)
 		}
 	}
-	if got.Counts.Supported != 7 || got.Counts.Unsupported != 2 || got.Findings[6].Support != review.Unsupported ||
-		got.Findings[7].Support != review.Supported || got.Findings[8].Support != review.Unsupported {
+	if s := got.Counts.BySupport; s[review.Supported] != 7 || s[review.Unsupported] != 2 || s[review.Unchecked] != 0 ||
+		got.Findings[6].Support != review.Unsupported || got.Findings[7].Support != review.Supported || got.Findings[8].Support != review.Unsupported {
 		t.Errorf("counts = %+v", got.Counts)
 	}
-	// big.go and keep.go needed their heads (a.go's miss reads a.go and b.go too, found
-	// nowhere); nowhere.go is not at head.
-	if got.HeadReads.Files < 2 || got.HeadReads.Skipped != 0 || got.HeadReads.Missing != 1 || got.Files != 6 || got.Label != ReviewEvidenceLabel {
+	// Re-filing a.go's miss reads every changed head (a.go, b.go, big.go, my file.go,
+	// café.go) and keep.go is read as a file outside the change; nowhere.go is not at head.
+	if r := got.HeadReads; r.Files != 6 || r.Lines < 40 || r.Skipped != 0 || r.Missing != 1 || got.Files != 6 || got.Label != ReviewEvidenceLabel {
 		t.Errorf("files %d, head reads %+v", got.Files, got.HeadReads)
 	}
 }
 
+// lower sets a bound for a test and returns what restores it.
+func lower[T any](bound *T, v T) (restore func()) {
+	old := *bound
+	*bound = v
+	return func() { *bound = old }
+}
+
+// A head over a bound is not read, so a finding outside the hunks of big.go is
+// unchecked (its code is there, but nobody looked), never unsupported. A diff over a
+// bound refuses the anchoring.
 func TestReviewAnchorBounds(t *testing.T) {
 	dir, ws := anchorRepo(t)
 	batch := findingsBatch(t, [2]string{"big.go", "v05 := step(5)"})
-
-	defer func(v int64) { headFileLimit = v }(headFileLimit)
-	headFileLimit = 64
-	got, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch)
-	if err != nil {
-		t.Fatal(err)
+	for _, tc := range []struct {
+		name  string
+		bound *int64
+		v     int64
+	}{{"bytes per file", &headFileLimit, 64}, {"lines", &headLinesLimit, 39}} {
+		restore := lower(tc.bound, tc.v)
+		got, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch)
+		restore()
+		if err != nil {
+			t.Fatal(err)
+		}
+		f := got.Findings[0]
+		if f.Anchor != anchor.Unplaced("big.go", anchor.ReasonHeadUnread) || f.Checks.CodePresent != review.Unknown ||
+			f.Support != review.Unchecked || !slices.Contains(got.HeadReads.SkippedPaths, "big.go") {
+			t.Errorf("a head over its %s bound: %+v, reads %+v", tc.name, f, got.HeadReads)
+		}
 	}
-	if a := got.Findings[0].Anchor; a.Status != anchor.Unanchored || !slices.Contains(got.HeadReads.SkippedPaths, "big.go") {
-		t.Fatalf("a head over its bound: anchor %+v, reads %+v", a, got.HeadReads)
+	for _, tc := range []struct {
+		name  string
+		bound *int
+		v     int
+	}{{"bytes", &anchorDiffLimit, 64}, {"lines", &anchorDiffLineLimit, 5}} {
+		restore := lower(tc.bound, tc.v)
+		_, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch)
+		restore()
+		if !errors.Is(err, errAnchorTooLarge) {
+			t.Errorf("a diff over its %s bound: %v", tc.name, err)
+		}
 	}
-	headFileLimit = 1 << 20
+}
 
-	defer func(v int) { anchorDiffLimit = v }(anchorDiffLimit)
-	anchorDiffLimit = 64
-	if _, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch); !errors.Is(err, errAnchorTooLarge) {
-		t.Fatalf("a diff over its bound: %v", err)
+// Under a head budget that holds a.go and big.go and nothing else, a finding on big.go
+// is supported whether or not a finding on a.go that must be re-filed comes first: the
+// files findings name are read before re-filing spends the budget. The re-filing, left
+// with unread heads, is unchecked either way.
+func TestReviewAnchorDoesNotDependOnFindingOrder(t *testing.T) {
+	dir, ws := anchorRepo(t)
+	defer lower(&headTotalLimit, int64(len(aAtHead)+len(bigAtHead())))()
+	nowhere, big := [2]string{"a.go", "quoted_nowhere()"}, [2]string{"big.go", "v05 := step(5)"}
+	type result struct {
+		anchor  anchor.Anchor
+		present review.Fact
+		support string
+	}
+	want := map[string]result{
+		"a.go":   {anchor.Unplaced("a.go", anchor.ReasonHeadUnread), review.Unknown, review.Unchecked},
+		"big.go": {anchor.Anchor{Path: "big.go", StartLine: 5, EndLine: 5, Side: anchor.New, Status: anchor.InFile}, review.Yes, review.Supported},
+	}
+	for _, order := range [][][2]string{{nowhere, big}, {big, nowhere}} {
+		got, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", findingsBatch(t, order...))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, f := range got.Findings {
+			if (result{f.Anchor, f.Checks.CodePresent, f.Support}) != want[f.Path] {
+				t.Errorf("%s first, %s: %+v %+v %s", order[0][0], f.Path, f.Anchor, f.Checks, f.Support)
+			}
+		}
+		if !slices.Contains(got.HeadReads.SkippedPaths, "b.go") || got.HeadReads.Files != 2 {
+			t.Errorf("%s first: head reads %+v", order[0][0], got.HeadReads)
+		}
 	}
 }
 
@@ -155,13 +223,12 @@ func TestReviewAnchorReadsAFileOutsideTheChangeOnce(t *testing.T) {
 	dir, ws := anchorRepo(t)
 	batch := findingsBatch(t, [2]string{"keep.go", "var kept = 1"}, [2]string{"keep.go", "package a"}, [2]string{"keep.go", "var kept = 1"})
 
-	defer func(v int64) { headTotalLimit = v }(headTotalLimit)
-	headTotalLimit = int64(len("package a\n\nvar kept = 1\n")) + 1
+	defer lower(&headTotalLimit, int64(len("package a\n\nvar kept = 1\n"))+1)()
 	got, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Counts.Supported != 3 || got.Counts.ByStatus[anchor.InFile] != 3 || got.HeadReads.Files != 1 || got.HeadReads.Skipped != 0 {
+	if got.Counts.BySupport[review.Supported] != 3 || got.Counts.ByStatus[anchor.InFile] != 3 || got.HeadReads.Files != 1 || got.HeadReads.Skipped != 0 {
 		t.Fatalf("counts %+v, head reads %+v", got.Counts, got.HeadReads)
 	}
 }
@@ -245,7 +312,7 @@ func BenchmarkReviewAnchor(b *testing.B) {
 			b.Fatal(err)
 		}
 	}
-	if res.Counts.Supported != 45 || res.Counts.ByStatus[anchor.Relocated] != 5 {
+	if res.Counts.BySupport[review.Supported] != 45 || res.Counts.ByStatus[anchor.Relocated] != 5 {
 		b.Fatalf("counts %+v", res.Counts)
 	}
 	b.ReportMetric(float64(res.Change.DiffBytes), "diff_bytes")

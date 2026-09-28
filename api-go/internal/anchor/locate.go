@@ -22,7 +22,7 @@ func locate(path, content string, s Snippet, prefer int) Anchor {
 	if len(s.lines) == 0 {
 		return Unplaced(path, ReasonNoSnippet)
 	}
-	first, preferred, n := find([][]line{contentLines(content)}, s.lines, prefer)
+	first, preferred, n := find([][]line{contentLines(content)}, s, prefer)
 	if n > 1 && preferred.start > 0 {
 		first, n = preferred, 1
 	}

@@ -54,24 +54,29 @@ func TestDecodeRefusesMalformedInput(t *testing.T) {
 		return "[" + strings.Replace(oneFinding, `"path"`, `"`+k+`":`+v+`,"path"`, 1) + "]"
 	}
 	for name, input := range map[string]string{
-		"not JSON":                "nope",
-		"a number":                "42",
-		"an unknown member":       withField("confidence", "0.9"),
-		"a wrong type":            withField("start_line", `"4"`),
-		"no path":                 `[{"content":"x"}]`,
-		"no content":              `[{"path":"a.go","content":"  "}]`,
-		"an absolute path":        `[{"path":"/etc/passwd","content":"x"}]`,
-		"a path escaping":         `[{"path":"../x.go","content":"x"}]`,
-		"a path that is the root": `[{"path":"./","content":"x"}]`,
-		"a NUL in the path":       `[{"path":"a\u0000b","content":"x"}]`,
-		"both arrays":             `{"findings":[],"comments":[` + oneFinding + `]}`,
-		"no array":                `{"status":"complete"}`,
-		"a findings object":       `{"findings":{"path":"a.go"}}`,
-		"a string of an object":   `"{}"`,
-		"a string of a string":    `"\"[]\""`,
-		"too many findings":       many,
-		"over the byte bound":     huge,
-		"an item that is a list":  `[[]]`,
+		"not JSON":                           "nope",
+		"a number":                           "42",
+		"an unknown member":                  withField("confidence", "0.9"),
+		"a wrong type":                       withField("start_line", `"4"`),
+		"no path":                            `[{"content":"x"}]`,
+		"no content":                         `[{"path":"a.go","content":"  "}]`,
+		"an absolute path":                   `[{"path":"/etc/passwd","content":"x"}]`,
+		"a path escaping":                    `[{"path":"../x.go","content":"x"}]`,
+		"a path that is the root":            `[{"path":"./","content":"x"}]`,
+		"a NUL in the path":                  `[{"path":"a\u0000b","content":"x"}]`,
+		"both arrays":                        `{"findings":[],"comments":[` + oneFinding + `]}`,
+		"no array":                           `{"status":"complete"}`,
+		"a findings object":                  `{"findings":{"path":"a.go"}}`,
+		"a string of an object":              `"{}"`,
+		"a string of a string":               `"\"[]\""`,
+		"too many findings":                  many,
+		"over the byte bound":                huge,
+		"an item that is a list":             `[[]]`,
+		"a member in another case":           `[{"PATH":"a.go","content":"x","path":"b.go"}]`,
+		"a member twice":                     `[{"path":"a.go","content":"x","content":"y"}]`,
+		"a member folded by Unicode":         "[" + strings.Replace(oneFinding, `"severity"`, `"\u017feverity"`, 1) + "]",
+		"an envelope member in another case": `{"Findings":[` + oneFinding + `]}`,
+		"an envelope member twice":           `{"findings":[],"findings":[` + oneFinding + `]}`,
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := Decode([]byte(input)); !errors.Is(err, ErrInvalid) {
@@ -81,6 +86,10 @@ func TestDecodeRefusesMalformedInput(t *testing.T) {
 	}
 	if b, err := Decode([]byte(strings.Replace(many, oneFinding+",", "", 1))); err != nil || len(b.Findings) != MaxFindings {
 		t.Fatalf("exactly %d findings: %v", MaxFindings, err)
+	}
+	// Envelope members that are not read may repeat or take any case.
+	if _, err := Decode([]byte(`{"Status":"a","status":"b","comments":[` + oneFinding + `]}`)); err != nil {
+		t.Fatalf("an envelope's other members: %v", err)
 	}
 }
 
@@ -143,14 +152,17 @@ func TestSplitDiff(t *testing.T) {
 	}
 }
 
+// unread, as a head's content, is a head the caller did not read.
+const unread = "\x00unread"
+
 // change is a set over split diff text with head contents by path.
 func change(diff string, heads map[string]string) *anchor.Set {
 	var files []*anchor.File
 	for _, s := range SplitDiff(diff) {
 		h, ok := heads[s.NewPath]
-		var head func() string
+		var head func() (string, bool)
 		if ok {
-			head = func() string { return h }
+			head = func() (string, bool) { return h, h != unread }
 		}
 		files = append(files, anchor.NewFile(s.OldPath, s.NewPath, s.Diff, head))
 	}
@@ -180,22 +192,21 @@ func TestAnchorChecksEveryFinding(t *testing.T) {
 	}
 	got, counts := Anchor(b.Findings, set)
 	type row struct {
-		status          anchor.Status
-		path            string
-		lines           [2]int
-		present, inHunk bool
-		inScope         bool
-		support         string
+		status                   anchor.Status
+		path                     string
+		lines                    [2]int
+		present, inHunk, inScope Fact
+		support                  string
 	}
 	want := []row{
-		{anchor.ExactNew, "a.go", [2]int{2, 3}, true, true, true, Supported},
-		{anchor.ExactNew, "a.go", [2]int{4, 5}, true, false, true, Supported},
-		{anchor.ExactOld, "a.go", [2]int{2, 2}, true, true, true, Supported},
-		{anchor.InFile, "a.go", [2]int{8, 8}, true, false, true, Supported},
-		{anchor.Relocated, "b.go", [2]int{2, 2}, true, true, true, Supported},
-		{anchor.Unanchored, "a.go", [2]int{}, false, false, true, Unsupported},
-		{anchor.Relocated, "a.go", [2]int{8, 8}, true, false, true, Supported},
-		{anchor.Unanchored, "c.go", [2]int{}, false, false, false, Unsupported},
+		{anchor.ExactNew, "a.go", [2]int{2, 3}, Yes, Yes, Yes, Supported},
+		{anchor.ExactNew, "a.go", [2]int{4, 5}, Yes, No, Yes, Supported},
+		{anchor.ExactOld, "a.go", [2]int{2, 2}, Yes, Yes, Yes, Supported},
+		{anchor.InFile, "a.go", [2]int{8, 8}, Yes, No, Yes, Supported},
+		{anchor.Relocated, "b.go", [2]int{2, 2}, Yes, Yes, Yes, Supported},
+		{anchor.Unanchored, "a.go", [2]int{}, No, No, Yes, Unsupported},
+		{anchor.Relocated, "a.go", [2]int{8, 8}, Yes, No, Yes, Supported},
+		{anchor.Unanchored, "c.go", [2]int{}, No, No, No, Unsupported},
 	}
 	for i, r := range got {
 		g := row{r.Anchor.Status, r.Anchor.Path, [2]int{r.Anchor.StartLine, r.Anchor.EndLine}, r.Checks.CodePresent,
@@ -203,7 +214,7 @@ func TestAnchorChecksEveryFinding(t *testing.T) {
 		if g != want[i] {
 			t.Errorf("finding %d: got %+v, want %+v (%+v)", i, g, want[i], r.Anchor)
 		}
-		if r.Checks.SymbolResolved != "unknown" {
+		if r.Checks.SymbolResolved != Unknown {
 			t.Errorf("finding %d: symbol_resolved = %q", i, r.Checks.SymbolResolved)
 		}
 	}
@@ -213,7 +224,7 @@ func TestAnchorChecksEveryFinding(t *testing.T) {
 	if !slices.Contains(got[0].Normalized, "the producer's lines 1-1 were replaced by the anchor") {
 		t.Errorf("claimed lines: %q", got[0].Normalized)
 	}
-	wantCounts := Counts{Findings: 8, Supported: 6, Unsupported: 2, InChangedHunk: 3,
+	wantCounts := Counts{Findings: 8, BySupport: map[string]int{Supported: 6, Unsupported: 2}, InChangedHunk: 3,
 		ByStatus: map[anchor.Status]int{anchor.ExactNew: 2, anchor.ExactOld: 1, anchor.InFile: 1, anchor.Relocated: 2, anchor.Unanchored: 2}}
 	if fmt.Sprint(counts) != fmt.Sprint(wantCounts) {
 		t.Errorf("counts = %+v, want %+v", counts, wantCounts)
@@ -221,5 +232,28 @@ func TestAnchorChecksEveryFinding(t *testing.T) {
 	out, err := json.Marshal(got[4])
 	if err != nil || !strings.Contains(string(out), `"anchor":{"path":"b.go","start_line":2,"end_line":2,"side":"new","anchor_status":"relocated","refiled_from":"a.go"}`) {
 		t.Fatalf("JSON: %s %v", out, err)
+	}
+}
+
+// A head the caller did not read was never searched: a finding whose code is in no hunk
+// there is unchecked, with code_present and in_changed_hunk unknown, never unsupported;
+// a finding a hunk holds is checked as usual.
+func TestAnchorLeavesAnUnreadHeadUnknown(t *testing.T) {
+	diff := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1,2 +1,3 @@\n func A() {\n+\tlog()\n }\n"
+	set := change(diff, map[string]string{"a.go": unread})
+	b, err := Decode([]byte(`[{"path":"a.go","content":"c","existing_code":"func helper() {}"},{"path":"a.go","content":"c","existing_code":"log()"}]`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, counts := Anchor(b.Findings, set)
+	if a, c := got[0].Anchor, got[0].Checks; a.Reason != anchor.ReasonHeadUnread || got[0].Support != Unchecked ||
+		c != (Checks{CodePresent: Unknown, InChangedHunk: Unknown, InScope: Yes, SymbolResolved: Unknown}) {
+		t.Errorf("outside the hunk: %+v %+v %s", a, c, got[0].Support)
+	}
+	if got[1].Anchor.Status != anchor.ExactNew || got[1].Support != Supported || got[1].Checks.InChangedHunk != Yes {
+		t.Errorf("in the hunk: %+v %+v %s", got[1].Anchor, got[1].Checks, got[1].Support)
+	}
+	if counts.BySupport[Unchecked] != 1 || counts.BySupport[Supported] != 1 || counts.BySupport[Unsupported] != 0 {
+		t.Errorf("counts = %+v", counts)
 	}
 }

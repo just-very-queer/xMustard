@@ -10,9 +10,13 @@
 //     lines, so a snippet spanning a blank line anchors inside its hunk;
 //   - each tier counts its matches: one match anchors, several are ambiguous and anchor
 //     nothing (upstream takes the first), and a tier with no match falls through;
+//   - matching is Knuth-Morris-Pratt over lines (upstream compares the snippet at every
+//     line), so a search is linear in the lines searched whatever the snippet repeats;
 //   - the result is an Anchor with a status, a side and a reason instead of line
 //     numbers written into a comment, an old-side anchor names a renamed file's old
-//     path, and head content is loaded only when needed.
+//     path, and head content is loaded only when needed;
+//   - a head the caller did not read (over a bound, binary) was never searched, so a
+//     snippet no hunk holds is head_unread there, not not_found.
 
 package anchor
 
@@ -49,6 +53,7 @@ const (
 	ReasonNotFound             = "not_found"
 	ReasonAmbiguous            = "ambiguous"              // more than once in the file itself
 	ReasonAmbiguousAcrossFiles = "ambiguous_across_files" // not in the file, in several others
+	ReasonHeadUnread           = "head_unread"            // in no hunk, and a head that could hold it was not read
 )
 
 // Anchor is where a snippet sits. StartLine and EndLine are 1-based and inclusive and
@@ -68,8 +73,12 @@ type Anchor struct {
 }
 
 // Present reports whether the snippet is in the anchor's file: anchored there, or found
-// there more than once.
+// there more than once. It is false as well when that is not known (Unchecked).
 func (a Anchor) Present() bool { return a.Status != Unanchored || a.Reason == ReasonAmbiguous }
+
+// Unchecked reports whether the search could not finish: no hunk holds the snippet and a
+// file's head that could hold it was not read, so it is neither found nor absent.
+func (a Anchor) Unchecked() bool { return a.Reason == ReasonHeadUnread }
 
 // Unplaced is an unanchored anchor on path.
 func Unplaced(path, reason string) Anchor {
@@ -89,7 +98,10 @@ var (
 
 // Snippet is quoted code, normalized: each line trimmed and stripped of one leading +
 // and one leading - diff marker, blank lines dropped.
-type Snippet struct{ lines []string }
+type Snippet struct {
+	lines []string
+	fail  []int // the lines' Knuth-Morris-Pratt table (failure)
+}
 
 // NewSnippet normalizes code, refusing more than MaxSnippetLines lines or
 // MaxSnippetBytes bytes and code with no non-blank line.
@@ -106,8 +118,10 @@ func NewSnippet(code string) (Snippet, error) {
 	if len(lines) == 0 {
 		return Snippet{}, ErrNoSnippet
 	}
-	return Snippet{lines}, nil
+	return snippetOf(lines), nil
 }
+
+func snippetOf(lines []string) Snippet { return Snippet{lines, failure(lines)} }
 
 // Oversized reports whether code is over MaxSnippetBytes bytes or MaxSnippetLines lines
 // (trailing line breaks do not count).
@@ -145,9 +159,9 @@ func appendLine(ls []line, num int, text string) []line {
 	return append(ls, line{num, text})
 }
 
-// contentLines is a whole file's normalized, non-blank lines.
+// contentLines is a whole file's normalized, non-blank lines, allocated once.
 func contentLines(content string) []line {
-	var out []line
+	out := make([]line, 0, strings.Count(content, "\n")+1)
 	for num := 1; content != ""; num++ {
 		var l string
 		l, content, _ = strings.Cut(content, "\n")
@@ -163,22 +177,26 @@ type File struct {
 	OldPath string // "" for an added file
 	deleted bool   // no version at head
 
-	newSide, oldSide [][]line       // per hunk
-	changed          map[Side][]int // added (new) and deleted (old) line numbers, ascending
-	head             func() string  // the file at head; nil when there is none
+	newSide, oldSide [][]line              // per hunk
+	changed          map[Side][]int        // added (new) and deleted (old) line numbers, ascending
+	head             func() (string, bool) // the file at head; nil when there is none
 	headOnce         sync.Once
 	headLines        []line
+	headUnread       bool // head reported that it did not read the file
 }
 
 // NewFile parses one file's unified diff. oldPath is "" for an added file and newPath
-// "" for a deleted one; head returns the file at head ("" when unknown) and may be nil.
-func NewFile(oldPath, newPath, diff string, head func() string) *File {
+// "" for a deleted one. head returns the file at head, and false when the caller did not
+// read it (over a bound, binary): a snippet no hunk holds is then head_unread, not
+// not_found. A nil head means there is no content to search.
+func NewFile(oldPath, newPath, diff string, head func() (string, bool)) *File {
 	f := &File{Path: newPath, OldPath: oldPath, head: head, changed: map[Side][]int{}}
 	if f.Path == "" {
 		f.Path, f.head, f.deleted = oldPath, nil, true
 	}
 	for _, h := range ParseHunks(diff) {
-		var nw, od []line
+		// Sized by the header's counts, capped by the lines the hunk holds.
+		nw, od := make([]line, 0, min(h.NewCount, len(h.Lines))), make([]line, 0, min(h.OldCount, len(h.Lines)))
 		o, n := h.OldStart, h.NewStart
 		for _, hl := range h.Lines {
 			text := normalizeLine(hl.Content)
@@ -201,9 +219,11 @@ func NewFile(oldPath, newPath, diff string, head func() string) *File {
 
 func (f *File) headSegments() [][]line {
 	f.headOnce.Do(func() {
-		if f.head != nil {
-			f.headLines = contentLines(f.head())
+		if f.head == nil {
+			return
 		}
+		content, ok := f.head()
+		f.headLines, f.headUnread = contentLines(content), !ok
 	})
 	if len(f.headLines) == 0 {
 		return nil
@@ -229,16 +249,19 @@ var tiers = [...]tier{
 var wholeFile = tier{InFile, New, (*File).headSegments}
 
 // Resolve anchors a snippet in this file. The first tier holding it decides: one match
-// anchors, several are ambiguous; a snippet no tier holds is not found.
+// anchors, several are ambiguous; a snippet no tier holds is not found, or head_unread
+// when the head was not read.
 func (f *File) Resolve(s Snippet) Anchor {
 	if len(s.lines) == 0 {
 		return Unplaced(f.Path, ReasonNoSnippet)
 	}
 	for _, t := range tiers {
-		first, _, n := find(t.segments(f), s.lines, 0)
-		if n > 0 {
+		if first, _, n := find(t.segments(f), s, 0); n > 0 {
 			return decide(f.pathOn(t.side), t, first, n)
 		}
+	}
+	if f.headUnread {
+		return Unplaced(f.Path, ReasonHeadUnread)
 	}
 	return Unplaced(f.Path, ReasonNotFound)
 }
@@ -261,15 +284,28 @@ func decide(path string, t tier, first span, n int) Anchor {
 
 type span struct{ start, end int }
 
-// find slides want over each segment (a match never spans two) and returns the first
-// match, the match starting at line prefer (zero when none does), and the match count.
-func find(segs [][]line, want []string, prefer int) (first, preferred span, n int) {
+// find slides the snippet over each segment (a match never spans two) and returns the
+// first match, the match starting at line prefer (zero when none does), and the match
+// count, overlapping matches included. It is Knuth-Morris-Pratt over lines: a segment
+// costs at most two line comparisons per line, however much of the snippet it repeats.
+func find(segs [][]line, s Snippet, prefer int) (first, preferred span, n int) {
+	want := s.lines
+	if len(want) == 0 {
+		return first, preferred, 0
+	}
 	for _, seg := range segs {
-		for i := 0; i+len(want) <= len(seg); i++ {
-			if !matchAt(seg[i:], want) {
+		j := 0 // snippet lines matched so far
+		for i, l := range seg {
+			for j > 0 && l.text != want[j] {
+				j = s.fail[j-1]
+			}
+			if l.text == want[j] {
+				j++
+			}
+			if j < len(want) {
 				continue
 			}
-			sp := span{seg[i].num, seg[i+len(want)-1].num}
+			sp := span{seg[i+1-len(want)].num, l.num}
 			if n == 0 {
 				first = sp
 			}
@@ -277,16 +313,24 @@ func find(segs [][]line, want []string, prefer int) (first, preferred span, n in
 				preferred = sp
 			}
 			n++
+			j = s.fail[j-1]
 		}
 	}
 	return first, preferred, n
 }
 
-func matchAt(seg []line, want []string) bool {
-	for j, w := range want {
-		if seg[j].text != w {
-			return false
+// failure is want's Knuth-Morris-Pratt table: fail[k] is the length of the longest
+// proper prefix of want[:k+1] that is also its suffix.
+func failure(want []string) []int {
+	fail := make([]int, len(want))
+	for k, j := 1, 0; k < len(want); k++ {
+		for j > 0 && want[k] != want[j] {
+			j = fail[j-1]
 		}
+		if want[k] == want[j] {
+			j++
+		}
+		fail[k] = j
 	}
-	return true
+	return fail
 }
