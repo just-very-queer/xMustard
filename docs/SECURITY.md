@@ -274,7 +274,7 @@ gate and registers any directory.
 | Host allowlist | `XMUSTARD_ALLOWED_HOSTS=name,...` | On a loopback bind only `localhost` and loopback IPs are accepted as `Host`, plus listed names. This blocks DNS rebinding. On other binds the list applies when it is set. A refusal answers `403 host_not_allowed`. |
 | Origin check | `XMUSTARD_ALLOWED_ORIGINS=https://ui.example,...` | A request that carries `Origin` must come from a loopback origin (loopback bind), the same origin (other binds), or a listed origin. `Origin: null` is refused. A refusal answers `403 origin_not_allowed`. |
 | No keys in URLs | none | `token`, `access_token`, `api_key`, `key`, `password` and similar query parameters answer `400 query_credentials`, even when an `Authorization` header is also present. Send `Authorization: Bearer <token>`. |
-| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Three kinds of non-GET route stay available: capture and revocation of the caller's own tool output, policy evaluation, and token revoke and rotate, so an admin can cut off a leaked token without leaving read-only mode. Minting and the workspace-wide evidence purge are refused. |
+| Read-only mode | `XMUSTARD_READ_ONLY=1` | Mutating routes answer `403 read_only`, and `remember`/`verify` disappear from `tools/list`. Three kinds of non-GET route stay available: capture and revocation of the caller's own tool output, policy evaluation, and token revoke and rotate, so an admin can cut off a leaked token without leaving read-only mode. The client hook routes stay served too, and write no shared state there: a capture records no run outcome, and the session ledger records nothing (no row, snapshot, capsule or mined candidate). Minting and the workspace-wide evidence purge are refused. |
 | Tool disable | `XMUSTARD_DISABLED_TOOLS=impact,why_failed` | The tool's route answers `403 tool_disabled` and the tool leaves `tools/list`. Unknown names stop startup. |
 | Workspace allowlist | `XMUSTARD_WORKSPACE_ALLOWLIST=ws-a,ws-b` | Other workspace ids answer `403 workspace_not_allowed`. The same rule filters `GET /api/workspaces` and checks `POST /api/workspaces/load` (by the id the root would get) and the terminal routes. |
 | Remote execution | profile | Terminals exist only in the platform profile and need `admin`. |
@@ -548,7 +548,8 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
 
 - **Authentication and roles.** Every hook route has a row in the route gate table
   below: core, the proposer role, served in read-only mode (a hook stores only the
-  caller's own tool output, and read-only mode records no outcome). A reader-only
+  caller's own tool output; read-only mode records no outcome and no session ledger
+  row, so no snapshot, capsule or mined candidate either). A reader-only
   token drives no hook. The plugin sends `Authorization: Bearer ${XMUSTARD_API_TOKEN}`
   (an http hook's `allowedEnvVars`); the client sends the same variable.
 - **Workspace.** A hook acts on the workspace the `X-Xmustard-Workspace` header names,
@@ -609,11 +610,13 @@ Hooks record what a session does in the session ledger (govstore `sessions` and
   excerpts: redacted with the shared secret rules, whitespace folded, cut to 240 bytes.
   No tool output is kept beyond the evidence handle, whose original stays under the
   evidence store's owner and scope checks.
-- **Attribution, not authorization.** A session row is an execution key
+- **Attribution, not authorization.** A session row is a workspace's execution key
   (`<client>:<session>[:agent:<agent>]`, a component that is not a plain id becomes a
-  digest) bound to the principal that started it. Rows, capsules and the end of a
-  session from another principal are refused as conflicts (`AppendSessionEvent`,
-  `EndSession`). The key and the principal are audit metadata; they grant nothing.
+  digest; the row id is a digest of the workspace and the key), bound to the principal
+  that started it. A session whose events reach two workspaces has a row in each.
+  Rows, capsules and the end of a session from another principal are refused as
+  conflicts (`AppendSessionEvent`, `EndSession`). The key and the principal are audit
+  metadata; they grant nothing.
 - **Visibility.** ground returns the session state of the workspace to any caller in
   the workspace's scope, reader included: the prior session's snapshot (its goal is the
   first prompt's redacted excerpt), its open failures and files, handles, proposals
@@ -623,14 +626,23 @@ Hooks record what a session does in the session ledger (govstore `sessions` and
 - **Injection.** A snapshot and a capsule are data an agent or a tool produced. The
   SessionStart context scans each (WS-56) and frames it in `<xmustard-data>` with its
   trust label (`derived` for the ledger's, `unverified` for an agent's capsule); a
-  flagged one is withheld with a note, never injected. ground returns a capsule with
-  its `injection_flags`. Neither is ever memory: a capsule is not proposed, verified or
-  pushed as memory, and the snapshot is a derived row.
+  flagged one is withheld with a note, never injected. The capsule's changed paths are
+  part of its framed, scanned text, never of the header outside the frame. ground
+  returns a capsule with its `injection_flags` (its text and paths scanned). Neither is
+  ever memory: a capsule is not proposed, verified or pushed as memory, and the
+  snapshot is a derived row.
+- **Whose handoff.** A new session takes over the caller's own ended session first,
+  then its own session not ended, then another principal's (ended first); ground and
+  the SessionStart header name the last two with a `caveat`. Visibility is unchanged:
+  another principal's session state is still readable in the workspace (above).
 - **Handoff capsules.** `remember(kind=handoff)` is schema-checked (closed members, at
   most 500 words, 20 items per list, 1000 bytes per text; every violation is named in
   the 400), redacted like any remember write, and its paths are confined to the
-  workspace root before they are hashed. It goes into the caller's own session: a
-  `session_id` naming another principal's session is refused.
+  workspace root before they are hashed (a path with a control character, a newline
+  say, is refused, as it is for every memory anchor). It goes into the caller's own
+  session: a `session_id` naming another principal's session is refused, and without
+  one the capsule goes under the MCP session, else the principal's own
+  `mcp:adhoc-<principal>`.
 - **Candidate mining.** A Stop or SessionEnd proposes what the session completed (a
   failure fixed by edits and a passing run; a workflow command that passed twice) as a
   `kind=candidate` memory authored by the session's principal and asking for peer

@@ -53,10 +53,11 @@ func coreGate(role, tool, note string) routeGate {
 
 func platformGate(role, note string) routeGate { return routeGate{Role: role, Note: note} }
 
-// hookGate is a hook route's row: core, and served in read-only mode, because a hook
-// changes no shared state beyond the caller's own capture (the outcome a capture would
-// record is skipped in read-only mode). A hook runs on behalf of an agent session, so
-// every hook route needs the proposer role: a reader-only token drives no hook, and no
+// hookGate is a hook route's row: core, and served in read-only mode, because there a
+// hook changes no shared state beyond the caller's own capture: the outcome a capture
+// would record is skipped, and so is the session ledger (no row, snapshot, capsule or
+// mined candidate; ledgerBase). A hook runs on behalf of an agent session, so every
+// hook route needs the proposer role: a reader-only token drives no hook, and no
 // non-GET route grants reader (TestNoWriteRouteGrantsReader).
 func hookGate(note string) routeGate {
 	return routeGate{Core: true, Role: roleProposer, ReadSafe: true, Note: "hook: " + note}

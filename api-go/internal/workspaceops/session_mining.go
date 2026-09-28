@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -49,9 +50,18 @@ type minedFix struct {
 
 func (f minedFix) fix() string { return "passed after editing " + strings.Join(f.paths, ", ") }
 
-// callOf identifies a call across runs: its tool and argument digest (for a shell call,
-// the command's).
-func callOf(ev govstore.SessionEvent) string { return ev.Tool + "\x00" + ev.ArgsDigest }
+// callOf identifies a call across runs: a file tool's call by its tool and file (a
+// failed Edit is retried with other arguments), any other by its tool and argument
+// digest (for a shell call, the command's). Only a file tool's row carries a path.
+func callOf(ev govstore.SessionEvent) string {
+	return ev.Tool + "\x00" + cmp.Or(ev.Path, ev.ArgsDigest)
+}
+
+// passed reports a call that succeeded: an ok tool call, or a file tool's read or
+// change (a failed one is a tool_call row with status error).
+func passed(ev govstore.SessionEvent) bool {
+	return ev.Kind == LedgerToolCall && ev.Status == LedgerOK || ev.Kind == LedgerFileRead || ev.Kind == LedgerFileModified
+}
 
 // fixes finds each failure followed by file edits and a passing run of the same call. A
 // failure again after the edits starts over: those edits did not fix it.
@@ -79,7 +89,7 @@ func fixes(evs []govstore.SessionEvent) []minedFix {
 		case ev.Kind == LedgerToolCall && ev.Status == LedgerOK:
 			if o := pending[callOf(ev)]; o != nil && len(o.edited) > 0 {
 				f := rowText(o.fail)
-				out = append(out, minedFix{tool: ev.Tool, command: rowText(ev).Text, failure: fallbackString(f.Signature, f.Text),
+				out = append(out, minedFix{tool: ev.Tool, command: rowText(ev).Text, failure: cmp.Or(f.Signature, f.Text),
 					paths: o.edited, handles: nonEmpty(o.fail.Handle, ev.Handle)})
 			}
 			delete(pending, callOf(ev))
@@ -102,14 +112,14 @@ func nonEmpty(vals ...string) []string {
 func mineFixes(_ string, evs []govstore.SessionEvent, _ time.Time) []minedCandidate {
 	var out []minedCandidate
 	for _, f := range fixes(evs) {
-		what := fallbackString(f.command, f.tool)
+		what := cmp.Or(f.command, f.tool)
 		paths := slices.Clone(f.paths)
 		slices.Sort(paths)
 		out = append(out, minedCandidate{
 			sig:   "fix\x00" + what + "\x00" + f.failure + "\x00" + strings.Join(paths, ","),
 			title: cutBytes("Fix: `"+what+"` failure", snapTitleMax),
 			content: fmt.Sprintf("`%s` failed (%s); after editing %s it passed.", what,
-				fallbackString(f.failure, "non-zero exit"), strings.Join(paths, ", ")),
+				cmp.Or(f.failure, "non-zero exit"), strings.Join(paths, ", ")),
 			paths: paths, handles: f.handles,
 		})
 	}
@@ -195,7 +205,9 @@ func mineSession(ctx context.Context, dataDir string, ev LedgerEvent) (int, erro
 		proposed++
 		row := ev
 		row.Kind, row.Tool, row.EntryID, row.Status, row.Text = LedgerMemoryProposed, "xmustard-miner", e.ID, "", ""
-		RecordSession(dataDir, row)
+		if err := recordFromJob(dataDir, row); err != nil {
+			return proposed, err
+		}
 	}
 	return proposed, nil
 }

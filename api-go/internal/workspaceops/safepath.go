@@ -6,6 +6,7 @@ import (
 	"io"
 	"path/filepath"
 	"strings"
+	"unicode"
 )
 
 // Workspace path confinement. Several surfaces accept caller-controlled relative
@@ -127,13 +128,15 @@ var ErrPathEscapesWorkspace = errors.New("path escapes workspace")
 // and ".." escapes are rejected lexically whether or not root is known; with a root,
 // resolveWorkspacePath also rejects a path that leaves the root through a symlink
 // (EvalSymlinks on the target or its nearest existing ancestor). The file need not
-// exist. Errors wrap both ErrPathEscapesWorkspace and ErrInvalidInput.
+// exist. A path holding a control character (NUL, a newline) is rejected: anchors and
+// capsule paths are shown to agents, and a newline would start a line of its own.
+// Errors wrap both ErrPathEscapesWorkspace and ErrInvalidInput.
 func ConfineWorkspacePath(root, rel string) (string, error) {
 	cleaned := strings.TrimPrefix(strings.TrimSpace(rel), "./")
 	escape := func() (string, error) {
 		return "", fmt.Errorf("%w: %q: %w", ErrPathEscapesWorkspace, rel, ErrInvalidInput)
 	}
-	if cleaned == "" || strings.ContainsRune(cleaned, 0) {
+	if cleaned == "" || strings.ContainsFunc(cleaned, unicode.IsControl) {
 		return "", fmt.Errorf("empty or invalid path %q: %w", rel, ErrInvalidInput)
 	}
 	if filepath.IsAbs(cleaned) || strings.HasPrefix(cleaned, "/") || strings.HasPrefix(cleaned, `\`) || filepath.VolumeName(cleaned) != "" {

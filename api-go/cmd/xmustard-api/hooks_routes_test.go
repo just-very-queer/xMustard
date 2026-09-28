@@ -720,7 +720,7 @@ func TestHookWorkspaceScopeAndRoles(t *testing.T) {
 func TestHookTablesAndPluginConfigAgree(t *testing.T) {
 	for _, e := range hooks.Events {
 		_, answers := hookHandlers[e.Name]
-		_, queued := hookQueueEffects[e.Name]
+		_, queued := hookEnqueued[e.Name]
 		if answers == queued || queued != (e.Mode == hooks.Enqueue) {
 			t.Errorf("%s: handler %v, queue effect %v, mode %v", e.Name, answers, queued, e.Mode)
 		}

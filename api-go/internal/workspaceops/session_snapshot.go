@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -285,7 +286,7 @@ func buildSnapshot(ctx context.Context, r govstore.Reader, workspaceID, key stri
 		}
 	}
 	if s.Goal == "" { // the session's first prompt may be older than the tail
-		first, err := r.ListSessionEvents(ctx, govstore.SessionEventFilter{SessionID: key, Kinds: []string{LedgerPrompt}, Limit: 1})
+		first, err := r.ListSessionEvents(ctx, govstore.SessionEventFilter{SessionID: sess.ID, Kinds: []string{LedgerPrompt}, Limit: 1})
 		if err != nil {
 			return nil, err
 		}
@@ -295,8 +296,10 @@ func buildSnapshot(ctx context.Context, r govstore.Reader, workspaceID, key stri
 	}
 	s.OpenFailures = openFailures(evs, now)
 	s.ActiveFiles = activeFiles(evs)
-	if c, _, ok := latestCapsule(ctx, r, workspaceID, key); ok {
-		s.Goal = fallbackString(cutBytes(firstOf(c.Goals), snapGoalMax), s.Goal)
+	// the goal and next step an agent wrote in its own capsule; a derived capsule only
+	// restates the ledger, and its next step is no plan of the agent's
+	if c, _, ok := sessionCapsule(ctx, r, workspaceID, key, true); ok {
+		s.Goal = cmp.Or(cutBytes(firstOf(c.Goals), snapGoalMax), s.Goal)
 		s.NextStep = cutBytes(c.NextStep, snapGoalMax)
 	}
 	s.PendingProposals, s.Decisions, err = proposalState(ctx, r, workspaceID, proposed)
@@ -314,22 +317,20 @@ func firstOf(list []string) string {
 	return list[0]
 }
 
-// openFailures are the failed calls not followed by a passing call of the same tool and
-// arguments, newest first; an expired handle is dropped (its original is gone).
+// openFailures are the failed calls not followed by a passing call of the same call
+// (callOf: a failed Edit is closed by a later Edit of its file), newest first; an
+// expired handle is dropped (its original is gone).
 func openFailures(evs []govstore.SessionEvent, now time.Time) []SnapshotFailure {
 	fixed := map[string]bool{}
 	var out []SnapshotFailure
 	for i := len(evs) - 1; i >= 0; i-- {
 		ev := evs[i]
-		if ev.Kind != LedgerToolCall {
-			continue
-		}
-		call := ev.Tool + "\x00" + ev.ArgsDigest
-		if ev.Status == LedgerOK {
+		call := callOf(ev)
+		if passed(ev) {
 			fixed[call] = true
 			continue
 		}
-		if ev.Status != LedgerError || fixed[call] {
+		if ev.Kind != LedgerToolCall || ev.Status != LedgerError || fixed[call] {
 			continue
 		}
 		fixed[call] = true // one entry per call
@@ -424,13 +425,14 @@ func pendingByID(view []govstore.RankEntry) map[string]SnapshotProposal {
 // storeSnapshot builds a session's snapshot and appends it as a derived ledger row. It
 // is a ledger job (PreCompact, SessionEnd): it runs after the rows queued before it.
 func storeSnapshot(ctx context.Context, dataDir, workspaceID, key, principal string) error {
-	defer touched(dataDir, key)
+	row := sessionRow(workspaceID, key)
+	defer touched(dataDir, row)
 	return memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		snap, err := buildSnapshot(ctx, tx, workspaceID, key, time.Now().UTC())
 		if err != nil {
 			return err
 		}
-		_, err = tx.AppendSessionEvent(ctx, govstore.SessionEventInput{SessionID: key, Kind: LedgerSnapshot,
+		_, err = tx.AppendSessionEvent(ctx, govstore.SessionEventInput{SessionID: row, Kind: LedgerSnapshot,
 			RecordClass: govstore.RecordDerived, Data: snap}, govstore.Actor{Principal: ledgerPrincipal(principal), SessionID: key})
 		return err
 	})
@@ -454,7 +456,8 @@ func LatestSessionSnapshot(ctx context.Context, dataDir, workspaceID, key string
 }
 
 func latestSnapshot(ctx context.Context, r govstore.Reader, workspaceID, key string, now time.Time) (*SessionSnapshot, error) {
-	stored, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: key,
+	row := sessionRow(workspaceID, key)
+	stored, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: row,
 		Kinds: []string{LedgerSnapshot}, Limit: 1})
 	if err != nil {
 		return nil, err
@@ -462,7 +465,7 @@ func latestSnapshot(ctx context.Context, r govstore.Reader, workspaceID, key str
 	if len(stored) == 1 {
 		var s SessionSnapshot
 		if json.Unmarshal(stored[0].Data, &s) == nil && s.Schema == SnapshotSchema {
-			newer, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: key,
+			newer, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: row,
 				Kinds: slices.DeleteFunc(slices.Clone(activityKinds), isCompactionMarker), Limit: 1})
 			if err != nil {
 				return nil, err

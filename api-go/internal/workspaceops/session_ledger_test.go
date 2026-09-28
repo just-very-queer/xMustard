@@ -4,11 +4,13 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -63,14 +65,20 @@ func flushLedger(t testing.TB, dir string) {
 	}
 }
 
-// ledgerRows reads every row of a session, oldest first.
-func ledgerRows(t *testing.T, dir, key string) []govstore.SessionEvent {
+// ledgerRows reads every row of a session (by execution key) of ledgerWS, oldest first.
+func ledgerRows(t testing.TB, dir, key string) []govstore.SessionEvent {
+	t.Helper()
+	return workspaceRows(t, dir, ledgerWS, key)
+}
+
+// workspaceRows reads every row of a workspace's session, oldest first.
+func workspaceRows(t testing.TB, dir, ws, key string) []govstore.SessionEvent {
 	t.Helper()
 	var out []govstore.SessionEvent
-	err := memoryView(context.Background(), dir, ledgerWS, func(r govstore.Reader) error {
+	err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
 		after := int64(0)
 		for {
-			page, err := r.ListSessionEvents(context.Background(), govstore.SessionEventFilter{SessionID: key, AfterSeq: after, Limit: 1000})
+			page, err := r.ListSessionEvents(context.Background(), govstore.SessionEventFilter{SessionID: sessionRow(ws, key), AfterSeq: after, Limit: 1000})
 			if err != nil {
 				return err
 			}
@@ -85,6 +93,26 @@ func ledgerRows(t *testing.T, dir, key string) []govstore.SessionEvent {
 		t.Fatal(err)
 	}
 	return out
+}
+
+// storedSnapshot is a session's last stored snapshot and the newest activity row a
+// restore compares it with (compaction markers aside): latestSnapshot restores the
+// stored snapshot only when it covers that row, and rebuilds it otherwise.
+func storedSnapshot(tb testing.TB, rows []govstore.SessionEvent) (SessionSnapshot, int64) {
+	tb.Helper()
+	var snap SessionSnapshot
+	newest := int64(0)
+	for _, r := range rows {
+		switch {
+		case r.Kind == LedgerSnapshot:
+			if err := json.Unmarshal(r.Data, &snap); err != nil {
+				tb.Fatal(err)
+			}
+		case slices.Contains(activityKinds, r.Kind) && !isCompactionMarker(r.Kind):
+			newest = max(newest, r.Seq)
+		}
+	}
+	return snap, newest
 }
 
 func countKinds(rows []govstore.SessionEvent, kinds ...string) int {
@@ -300,10 +328,10 @@ func TestHandoffCapsuleIsSchemaCheckedAndFlagsStalePaths(t *testing.T) {
 		t.Fatalf("handoffs %+v", recs)
 	}
 	// a session id that is not an execution key goes under that MCP session
-	if key, err := HandoffSessionKey("", "mcp-7"); err != nil || key != "mcp:mcp-7" {
+	if key, err := HandoffSessionKey("", "mcp-7", "agent-a"); err != nil || key != "mcp:mcp-7" {
 		t.Fatalf("transport session: %q %v", key, err)
 	}
-	if _, err := HandoffSessionKey("claude:../x", ""); !errors.Is(err, ErrInvalidInput) {
+	if _, err := HandoffSessionKey("claude:../x", "", "agent-a"); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("a malformed execution key: %v", err)
 	}
 }
@@ -335,12 +363,12 @@ func TestNewSessionInAnotherClientGetsPriorSnapshotAndProposals(t *testing.T) {
 	flushLedger(t, dir)
 
 	var g SessionGrounding
-	if unknown := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "codex:sess-b", nil); len(unknown) != 0 {
+	if unknown := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "codex:sess-b", nil); len(unknown) != 0 {
 		t.Fatalf("unknown %+v", unknown)
 	}
 	h := g.SessionHandoff
 	if h == nil || h.FromSession != "claude:sess-a" || h.Restore || h.Client != "claude" || h.Label != SessionHandoffLabel ||
-		len(h.InjectionFlags) != 0 {
+		len(h.InjectionFlags) != 0 || h.Caveat != "not ended" {
 		t.Fatalf("handoff %+v", h)
 	}
 	if s := h.Snapshot; s == nil || s.Goal != "fix the rounding bug" || len(s.OpenFailures) != 1 || s.OpenFailures[0].Handle != handle ||
@@ -370,16 +398,16 @@ func TestNewSessionInAnotherClientGetsPriorSnapshotAndProposals(t *testing.T) {
 		t.Fatalf("%d snapshots stored, through %d", stored, h.Snapshot.ThroughSeq)
 	}
 	// the SessionStart hook's view is the same, and a session's own id restores it
-	hook, err := HookSessionHandoff(ctx, dir, ledgerWS, "codex:sess-b", false, true)
+	hook, err := HookSessionHandoff(ctx, dir, ledgerWS, "agent-a", "codex:sess-b", false, true)
 	if err != nil || hook == nil || hook.FromSession != "claude:sess-a" {
 		t.Fatalf("hook handoff %+v %v", hook, err)
 	}
 	var own SessionGrounding
-	own.groundingSession.buildSessions(ctx, dir, ledgerWS, "claude:sess-a", nil)
+	own.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "claude:sess-a", nil)
 	if own.SessionHandoff == nil || !own.SessionHandoff.Restore || own.SessionHandoff.FromSession != "claude:sess-a" {
 		t.Fatalf("restore %+v", own.SessionHandoff)
 	}
-	if none, err := HookSessionHandoff(ctx, dir, ledgerWS, "claude:sess-z", true, false); err != nil || none != nil {
+	if none, err := HookSessionHandoff(ctx, dir, ledgerWS, "agent-a", "claude:sess-z", true, false); err != nil || none != nil {
 		t.Fatalf("a session with no ledger restored %+v %v", none, err)
 	}
 }
@@ -434,7 +462,8 @@ func TestCandidateMiningProposesPendingCandidatesOnly(t *testing.T) {
 
 // SessionEnd ends the session with its summary, stores its final snapshot and an
 // automatic capsule (derived), and hashes the client's transcript as an upstream
-// reference.
+// reference. The rows its jobs append (the mined candidate, the transcript reference)
+// land before the snapshot, so the snapshot stored is the one a later start restores.
 func TestSessionEndClosesTheSession(t *testing.T) {
 	dir, root := newLedgerFixture(t, true)
 	home := t.TempDir()
@@ -451,14 +480,20 @@ func TestSessionEndClosesTheSession(t *testing.T) {
 	recordAll(t, dir, s,
 		LedgerEvent{Kind: LedgerPrompt, Text: "fix the rounding bug"},
 		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "t", Status: LedgerError, Text: "go test ./...", Signature: "--- FAIL: TestRound"},
-		LedgerEvent{Kind: LedgerFileModified, Tool: "Edit", Path: "src/a.go"})
+		LedgerEvent{Kind: LedgerFileModified, Tool: "Edit", Path: "src/a.go"},
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "m", Status: LedgerOK, Text: "make build"},
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "m", Status: LedgerOK, Text: "make build"})
 	RecordBoundary(dir, BoundarySessionEnd, LedgerEvent{LedgerSession: s, Text: "logout"})
 	flushLedger(t, dir)
-	h, err := HookSessionHandoff(context.Background(), dir, ledgerWS, "claude:s1", true, false)
+	h, err := HookSessionHandoff(context.Background(), dir, ledgerWS, "agent-a", "claude:s1", true, false)
 	if err != nil || h == nil || h.Status != govstore.SessionEnded || h.Capsule == nil || h.Capsule.RecordClass != govstore.RecordDerived ||
 		!h.Capsule.Auto || !strings.Contains(h.Capsule.Capsule.CurrentState, "ended (logout) with 1 open failure") ||
 		!slices.Equal(h.Capsule.Capsule.Identifiers, []string{"src/a.go"}) || h.Capsule.Trust() != "derived" {
 		t.Fatalf("handoff %+v %v", h, err)
+	}
+	// the snapshot takes no next step from a derived capsule: it is no plan of the agent's
+	if h.Snapshot.NextStep != "" {
+		t.Fatalf("snapshot next step %q from the automatic capsule", h.Snapshot.NextStep)
 	}
 	rows := ledgerRows(t, dir, "claude:s1")
 	sum := sha256.Sum256(body)
@@ -468,15 +503,23 @@ func TestSessionEndClosesTheSession(t *testing.T) {
 			ref = &rows[i]
 		}
 	}
-	if countKinds(rows, LedgerSnapshot) != 1 || ref == nil || ref.ArgsDigest != "sha256:"+hex.EncodeToString(sum[:]) || ref.Path != transcript {
+	if countKinds(rows, LedgerSnapshot) != 1 || countKinds(rows, LedgerMemoryProposed) != 1 || ref == nil ||
+		ref.ArgsDigest != "sha256:"+hex.EncodeToString(sum[:]) || ref.Path != transcript {
 		t.Fatalf("rows %+v", rows)
+	}
+	stored, newest := storedSnapshot(t, rows)
+	if newest > stored.ThroughSeq {
+		t.Fatalf("row #%d landed after the SessionEnd snapshot (through #%d): a restore rebuilds it", newest, stored.ThroughSeq)
+	}
+	if h.Snapshot.ThroughSeq != stored.ThroughSeq || h.Snapshot.At != stored.At {
+		t.Fatalf("restored snapshot through #%d at %s, stored through #%d at %s", h.Snapshot.ThroughSeq, h.Snapshot.At, stored.ThroughSeq, stored.At)
 	}
 	var sess govstore.Session
 	_ = memoryView(context.Background(), dir, ledgerWS, func(r govstore.Reader) error {
-		sess, err = r.GetSession(context.Background(), "claude:s1")
+		sess, err = workspaceSession(context.Background(), r, ledgerWS, "claude:s1")
 		return err
 	})
-	if !strings.Contains(sess.Summary, "1 tool call(s) (1 failed), 1 file(s) modified") || sess.ExecutionKey != "claude:s1" {
+	if !strings.Contains(sess.Summary, "3 tool call(s) (1 failed), 1 file(s) modified, 1 memory proposal(s)") || sess.ExecutionKey != "claude:s1" {
 		t.Fatalf("session %+v", sess)
 	}
 }
@@ -547,9 +590,179 @@ func TestLedgerBoundsHold(t *testing.T) {
 	}
 }
 
+// One client session whose events reach two workspaces (a cd into another repository,
+// nested roots) keeps its rows in each; a capsule written without a session goes under
+// the principal's own ad hoc session of its workspace, so no principal or workspace
+// meets another's session row.
+func TestLedgerSessionIsPerWorkspace(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	other := canonicalRoot(t.TempDir())
+	registerRoots(t, dir, map[string]string{ledgerWS: root, "wsOther": other})
+	ctx := context.Background()
+	failed := ledgerStats.failed.Load()
+	for _, ws := range []struct{ id, root string }{{ledgerWS, root}, {"wsOther", other}} {
+		recordAll(t, dir, LedgerSession{WorkspaceID: ws.id, Root: ws.root, Client: "claude", Session: "s1", Principal: "agent-a"},
+			LedgerEvent{Kind: LedgerPrompt, Text: "fix it in " + ws.id}, LedgerEvent{Kind: LedgerFileRead, Tool: "Read", Path: "x.go"})
+	}
+	if n := ledgerStats.failed.Load() - failed; n != 0 {
+		t.Fatalf("%d ledger rows failed", n)
+	}
+	for _, ws := range []string{ledgerWS, "wsOther"} {
+		if rows := workspaceRows(t, dir, ws, "claude:s1"); len(rows) != 2 || rows[0].WorkspaceID != ws {
+			t.Fatalf("%s rows %+v", ws, rows)
+		}
+		snap, err := BuildSessionSnapshot(ctx, dir, ws, "claude:s1")
+		if err != nil || snap.Goal != "fix it in "+ws || snap.SessionID != "claude:s1" {
+			t.Fatalf("%s snapshot %+v %v", ws, snap, err)
+		}
+	}
+	for _, c := range []struct{ ws, principal string }{{ledgerWS, "agent-a"}, {ledgerWS, "agent-b"}, {"wsOther", "agent-a"}} {
+		rec, err := RememberHandoff(dir, c.ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: validCapsule("")}},
+			"", ContextActor{ID: c.principal})
+		if err != nil || rec.SessionID != "mcp:adhoc-"+c.principal {
+			t.Fatalf("%s by %s without a session: %+v %v", c.ws, c.principal, rec, err)
+		}
+	}
+}
+
+// The capsule an agent writes is what its session hands over: SessionEnd builds no
+// automatic capsule beside it, and a new session in another client gets the agent's
+// goals and next step, in the capsule and in the snapshot. A derived capsule never
+// hides a raw one.
+func TestAgentCapsuleIsWhatSessionEndHandsOver(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	ctx := context.Background()
+	s := ledgerSession(root, "claude", "s1", "agent-a")
+	recordAll(t, dir, s, LedgerEvent{Kind: LedgerPrompt, Text: "fix the rounding bug"},
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "t", Status: LedgerError, Text: "go test ./...", Signature: "--- FAIL: TestRound"},
+		LedgerEvent{Kind: LedgerFileModified, Tool: "Edit", Path: "src/a.go"})
+	const next = "run the migration 0042 then deploy"
+	capsule := `{"goals":["ship rounding fix"],"current_state":"fix written, not deployed","next_step":"` + next + `"}`
+	if _, err := RememberHandoff(dir, ledgerWS, RememberRequest{ProposeContextRequest: ProposeContextRequest{Content: capsule}},
+		"claude:s1", ContextActor{ID: "agent-a"}); err != nil {
+		t.Fatal(err)
+	}
+	// the remember call's own PostToolUse row, then the end
+	recordAll(t, dir, s, LedgerEvent{Kind: LedgerToolCall, Tool: "mcp__xmustard__remember", Args: "r", Status: LedgerOK})
+	RecordBoundary(dir, BoundarySessionEnd, LedgerEvent{LedgerSession: s, Text: "logout"})
+	flushLedger(t, dir)
+	if n := countKinds(ledgerRows(t, dir, "claude:s1"), LedgerHandoff); n != 1 {
+		t.Fatalf("%d capsules stored: an automatic one beside the agent's", n)
+	}
+	check := func(when string) {
+		t.Helper()
+		h, err := HookSessionHandoff(ctx, dir, ledgerWS, "agent-a", "codex:s2", false, true)
+		if err != nil || h == nil || h.FromSession != "claude:s1" || h.Caveat != "" || h.Capsule == nil || h.Capsule.Auto ||
+			h.Capsule.RecordClass != govstore.RecordRaw || h.Capsule.Capsule.NextStep != next ||
+			!slices.Equal(h.Capsule.Capsule.Goals, []string{"ship rounding fix"}) {
+			t.Fatalf("%s: handoff %+v %v", when, h, err)
+		}
+		if h.Snapshot.Goal != "ship rounding fix" || h.Snapshot.NextStep != next || !strings.Contains(h.SnapshotText(), "next: "+next) {
+			t.Fatalf("%s: snapshot %+v", when, h.Snapshot)
+		}
+		var g SessionGrounding
+		g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "codex:s2", nil)
+		if g.SessionHandoff == nil || g.SessionHandoff.Capsule == nil || g.SessionHandoff.Capsule.Capsule.NextStep != next ||
+			g.Continuity == nil || !slices.ContainsFunc(g.Continuity.OpenItems, func(i ContinuityItem) bool { return i.Text == next }) {
+			t.Fatalf("%s: ground %+v", when, g.groundingSession)
+		}
+	}
+	check("after SessionEnd")
+	derived := HandoffCapsule{Schema: HandoffSchema, Goals: []string{"(no prompt recorded)"}, CurrentState: "ended", NextStep: "none recorded"}
+	if _, err := storeHandoff(ctx, dir, ledgerWS, "claude:s1", "agent-a", derived, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	check("after a newer derived capsule")
+}
+
+// A failed Edit changed nothing: it is a failed call, not a file change, open until an
+// Edit of its file succeeds, and a passing run after it is no mined fix.
+func TestFailedEditIsNoChange(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	ctx := context.Background()
+	s := ledgerSession(root, "claude", "s1", "agent-a")
+	recordAll(t, dir, s,
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "t", Status: LedgerError, Text: "go test ./..."},
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Edit", Args: "e1", Status: LedgerError, Path: "src/a.go", Signature: "String to replace not found"},
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "t", Status: LedgerOK, Text: "go test ./..."})
+	snap, err := BuildSessionSnapshot(ctx, dir, ledgerWS, "claude:s1")
+	if err != nil || len(snap.ActiveFiles) != 0 || len(snap.OpenFailures) != 1 || snap.OpenFailures[0].Tool != "Edit" {
+		t.Fatalf("snapshot %+v %v", snap, err)
+	}
+	if found := fixes(ledgerRows(t, dir, "claude:s1")); len(found) != 0 {
+		t.Fatalf("mined a fix from a failed edit: %+v", found)
+	}
+	recordAll(t, dir, s, LedgerEvent{Kind: LedgerFileModified, Tool: "Edit", Args: "e2", Status: LedgerOK, Path: "src/a.go"})
+	snap, err = BuildSessionSnapshot(ctx, dir, ledgerWS, "claude:s1")
+	if err != nil || len(snap.OpenFailures) != 0 || !slices.Equal(snap.ActiveFiles, []SnapshotFile{{Path: "src/a.go", Modified: true}}) {
+		t.Fatalf("after the edit succeeded: %+v %v", snap, err)
+	}
+}
+
+// A new session takes over the caller's own ended session first, then its own session
+// not ended, then another principal's (ended first), and says so when it is not the
+// first kind.
+func TestPriorSessionPrefersTheCallersEndedSession(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	ctx := context.Background()
+	for _, c := range []struct {
+		session, principal string
+		end                bool
+	}{{"mine-ended", "agent-a", true}, {"theirs-ended", "agent-b", true}, {"mine-live", "agent-a", false}, {"d-live", "agent-d", false}} {
+		s := ledgerSession(root, "claude", c.session, c.principal)
+		recordAll(t, dir, s, LedgerEvent{Kind: LedgerPrompt, Text: "work of " + c.session})
+		if c.end {
+			RecordBoundary(dir, BoundarySessionEnd, LedgerEvent{LedgerSession: s, Text: "exit"})
+			flushLedger(t, dir)
+		}
+	}
+	for _, c := range []struct{ principal, from, caveat string }{
+		{"agent-a", "claude:mine-ended", ""},
+		{"agent-d", "claude:d-live", "not ended"},
+		{"agent-c", "claude:theirs-ended", "another principal's"},
+	} {
+		h, err := HookSessionHandoff(ctx, dir, ledgerWS, c.principal, "claude:new", false, true)
+		if err != nil || h == nil || h.FromSession != c.from || h.Caveat != c.caveat {
+			t.Errorf("%s: handoff from %+v (%v), want %s %q", c.principal, h, err, c.from, c.caveat)
+		}
+	}
+}
+
+// The snapshot a hook injects, with the proposals awaiting a distinct verifier, stays
+// within SnapshotMaxBytes: the proposals that fit are listed and the rest counted.
+func TestHandoffSnapshotTextStaysWithinTheBound(t *testing.T) {
+	for _, full := range []bool{false, true} {
+		for _, n := range []int{0, 1, 3, 40} {
+			snap := &SessionSnapshot{Schema: SnapshotSchema, SessionID: "claude:s1", At: time.Now().UTC().Format(time.RFC3339),
+				WorkspaceID: ledgerWS, Goal: "fix the rounding bug"}
+			for i := 0; full && i < 30; i++ {
+				snap.ActiveFiles = append(snap.ActiveFiles, SnapshotFile{Path: fmt.Sprintf("src/%s%02d.go", strings.Repeat("p", 60), i)})
+			}
+			snap.fit(SnapshotMaxBytes)
+			h := &SessionHandoff{Snapshot: snap}
+			for i := range n {
+				h.PendingProposals = append(h.PendingProposals, SnapshotProposal{ID: fmt.Sprintf("ctx_%012d", i),
+					Title: strings.Repeat("t", snapTitleMax), VotesNeeded: 2})
+			}
+			text := h.SnapshotText()
+			listed := strings.Count(text, "awaiting a distinct verifier: ctx_")
+			counted := 0
+			if i := strings.Index(text, " more proposal(s) await"); i >= 0 {
+				counted, _ = strconv.Atoi(text[strings.LastIndex(text[:i], "\n")+1 : i])
+			}
+			if len(text) > SnapshotMaxBytes || listed+counted != n && !(full && counted == 0) || !full && n <= 3 && listed != n {
+				t.Fatalf("full=%v n=%d: %d bytes, %d listed, %d counted:\n%s", full, n, len(text), listed, counted, text)
+			}
+		}
+	}
+}
+
 // BenchmarkSessionHandoff measures what a session start and ground pay for the session
 // section: a prior session with a full ledger tail (512 rows), a stored snapshot, a
-// capsule naming two paths, and two pending proposals.
+// capsule naming two paths, and two pending proposals. session-end-then-startup is the
+// path a new Claude Code session takes: the caller's prior session ended through
+// SessionEnd (mining, a transcript reference, the automatic capsule and the snapshot),
+// and its stored snapshot is restored, not rebuilt.
 func BenchmarkSessionHandoff(b *testing.B) {
 	dir, root := newLedgerFixture(b, true)
 	handle := retainedEvidence(b, dir, ledgerWS, "agent-a")
@@ -578,7 +791,7 @@ func BenchmarkSessionHandoff(b *testing.B) {
 	ctx := context.Background()
 	b.Run("hook-handoff", func(b *testing.B) {
 		for b.Loop() {
-			if h, err := HookSessionHandoff(ctx, dir, ledgerWS, "claude:next", false, true); err != nil || h == nil {
+			if h, err := HookSessionHandoff(ctx, dir, ledgerWS, "agent-b", "claude:next", false, true); err != nil || h == nil {
 				b.Fatal(err)
 			}
 		}
@@ -586,7 +799,7 @@ func BenchmarkSessionHandoff(b *testing.B) {
 	b.Run("ground-session-section", func(b *testing.B) {
 		for b.Loop() {
 			var g SessionGrounding
-			if u := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "", nil); u != nil || g.SessionHandoff == nil {
+			if u := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-b", "", nil); u != nil || g.SessionHandoff == nil {
 				b.Fatal(u)
 			}
 		}
@@ -594,6 +807,35 @@ func BenchmarkSessionHandoff(b *testing.B) {
 	b.Run("build-snapshot", func(b *testing.B) {
 		for b.Loop() {
 			if _, err := BuildSessionSnapshot(ctx, dir, ledgerWS, "claude:prior"); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
+	home := b.TempDir()
+	b.Setenv("HOME", home)
+	b.Setenv("CLAUDE_CONFIG_DIR", "")
+	ended := ledgerSession(root, "claude", "ended", "agent-a")
+	ended.Transcript = filepath.Join(home, ".claude", "projects", "-repo", "ended.jsonl")
+	_ = os.MkdirAll(filepath.Dir(ended.Transcript), 0o700)
+	if err := os.WriteFile(ended.Transcript, []byte(strings.Repeat(`{"type":"user"}`+"\n", 1000)), 0o600); err != nil {
+		b.Fatal(err)
+	}
+	evs = append(evs, LedgerEvent{Kind: LedgerFileModified, Tool: "Edit", Path: "src/a.go"},
+		LedgerEvent{Kind: LedgerToolCall, Tool: "Bash", Args: "d1", Status: LedgerOK, Text: "go test ./pkg01/..."})
+	for i := 0; i < len(evs); i += 500 {
+		recordAll(b, dir, ended, evs[i:min(i+500, len(evs))]...)
+	}
+	RecordBoundary(dir, BoundarySessionEnd, LedgerEvent{LedgerSession: ended, Text: "logout"})
+	flushLedger(b, dir)
+	if h, err := HookSessionHandoff(ctx, dir, ledgerWS, "agent-a", "claude:next", false, true); err != nil || h == nil || h.FromSession != "claude:ended" {
+		b.Fatalf("handoff %+v %v", h, err)
+	}
+	if stored, newest := storedSnapshot(b, ledgerRows(b, dir, "claude:ended")); newest > stored.ThroughSeq || stored.ThroughSeq == 0 {
+		b.Fatalf("the stored snapshot (through #%d) is older than the ledger (#%d): it is rebuilt", stored.ThroughSeq, newest)
+	}
+	b.Run("session-end-then-startup", func(b *testing.B) {
+		for b.Loop() {
+			if h, err := HookSessionHandoff(ctx, dir, ledgerWS, "agent-a", "claude:next", false, true); err != nil || h == nil {
 				b.Fatal(err)
 			}
 		}

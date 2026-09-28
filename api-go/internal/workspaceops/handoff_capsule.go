@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -221,8 +222,10 @@ func handoffID(seq int64) string { return "handoff:" + strconv.FormatInt(seq, 10
 
 // HandoffSessionKey is the session a capsule is stored under: sessionID when it is an
 // execution key (<client>:<session>...), else the MCP session of that id (the
-// transport's X-Xmustard-Session-Id when sessionID is ""), else "mcp:adhoc".
-func HandoffSessionKey(sessionID, transportSession string) (string, error) {
+// transport's X-Xmustard-Session-Id when sessionID is ""), else the principal's own
+// ad hoc session "mcp:adhoc-<principal>" (a session row is per workspace, so no other
+// principal or workspace shares it).
+func HandoffSessionKey(sessionID, transportSession, principal string) (string, error) {
 	sessionID = strings.TrimSpace(sessionID)
 	if strings.Contains(sessionID, ":") {
 		if !executionKeyPattern.MatchString(sessionID) || strings.Contains(sessionID, "..") {
@@ -230,7 +233,7 @@ func HandoffSessionKey(sessionID, transportSession string) (string, error) {
 		}
 		return sessionID, nil
 	}
-	return ExecutionKey("mcp", fallbackString(fallbackString(sessionID, transportSession), "adhoc"), ""), nil
+	return ExecutionKey("mcp", cmp.Or(sessionID, transportSession, "adhoc-"+ledgerPrincipal(principal)), ""), nil
 }
 
 // RememberHandoff stores an agent's capsule (remember kind=handoff): schema-checked,
@@ -248,7 +251,7 @@ func RememberHandoff(dataDir, workspaceID string, req RememberRequest, sessionID
 	if err != nil {
 		return nil, err
 	}
-	key, err := HandoffSessionKey(sessionID, actor.SessionID)
+	key, err := HandoffSessionKey(sessionID, actor.SessionID, actor.ID)
 	if err != nil {
 		return nil, err
 	}
@@ -283,24 +286,25 @@ func storeHandoff(ctx context.Context, dataDir, workspaceID, key, principal stri
 		class = govstore.RecordDerived
 	}
 	actor := govstore.Actor{Principal: ledgerPrincipal(principal), SessionID: key}
+	sessRow := sessionRow(workspaceID, key)
 	var row govstore.SessionEvent
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
-		if _, err := tx.UpsertSession(ctx, govstore.SessionInput{ID: key, WorkspaceID: workspaceID, Client: client,
+		if _, err := tx.UpsertSession(ctx, govstore.SessionInput{ID: sessRow, WorkspaceID: workspaceID, Client: client,
 			ExecutionKey: key}, actor); err != nil {
 			return err
 		}
 		var err error
-		row, err = tx.AppendSessionEvent(ctx, govstore.SessionEventInput{SessionID: key, Kind: LedgerHandoff,
+		row, err = tx.AppendSessionEvent(ctx, govstore.SessionEventInput{SessionID: sessRow, Kind: LedgerHandoff,
 			RecordClass: class, Body: c.Render(), Data: data}, actor)
 		return err
 	})
 	if err != nil {
 		return nil, err
 	}
-	touched(dataDir, key)
-	rec := handoffRecord(workspaceID, client, actor.Principal, row, data, paths)
+	touched(dataDir, sessRow)
+	rec := handoffRecord(workspaceID, key, client, actor.Principal, row, data, paths)
 	rec.Status = "stored"
-	if rep := injection.Scan(c.Render()); !rep.Clean() {
+	if rep := injection.Scan(c.Render(), strings.Join(paths, "\n")); !rep.Clean() {
 		rec.InjectionFlags = rep.Flags
 		rec.Warnings = append(rec.Warnings, "the capsule matches instruction patterns ("+strings.Join(rep.Flags, ", ")+
 			"): it is returned labeled and never pushed into a session")
@@ -308,33 +312,64 @@ func storeHandoff(ctx context.Context, dataDir, workspaceID, key, principal stri
 	return rec, nil
 }
 
-// capsuleTrust labels a capsule by record class: an agent wrote a raw one, the ledger
-// built a derived one; neither is verified.
-var capsuleTrust = map[string]string{govstore.RecordRaw: "unverified", govstore.RecordDerived: "derived"}
-
-// Trust is the capsule's trust label for a data frame.
+// Trust is the capsule's trust label for a data frame: the ledger built a derived one,
+// an agent wrote any other; neither is verified.
 func (r *HandoffRecord) Trust() string {
-	return fallbackString(capsuleTrust[r.RecordClass], "unverified")
+	if r.RecordClass == govstore.RecordDerived {
+		return "derived"
+	}
+	return "unverified"
 }
 
-func handoffRecord(workspaceID, client, principal string, row govstore.SessionEvent, d handoffData, paths []string) *HandoffRecord {
-	return &HandoffRecord{ID: handoffID(row.Seq), WorkspaceID: workspaceID, Kind: LedgerHandoff, SessionID: row.SessionID,
+// Gist is the part of a capsule a SessionStart hook injects: its first goals, its state
+// and next step (each cut as ground's handoffs list cuts them), and the named paths
+// that changed since it was stored. It is text of the capsule's frame, so the injection
+// scan covers the paths too; the whole capsule is session_handoff.capsule.
+func (r *HandoffRecord) Gist() string {
+	v := handoffView(*r)
+	text := fmt.Sprintf("goals: %s\ncurrent state: %s\nnext step: %s", strings.Join(v.Goals, "; "), v.State, v.NextStep)
+	if n := len(r.StalePaths); n > 0 {
+		paths := r.StalePaths[:min(n, groundViewPaths)]
+		text += "\nchanged since it was stored: " + cutBytes(strings.Join(paths, ", "), groundViewTextMax)
+		if n > len(paths) {
+			text += fmt.Sprintf(" (and %d more)", n-len(paths))
+		}
+	}
+	return text + "\nthe whole capsule: ground session_id=" + r.SessionID + " (session_handoff.capsule)"
+}
+
+func handoffRecord(workspaceID, key, client, principal string, row govstore.SessionEvent, d handoffData, paths []string) *HandoffRecord {
+	return &HandoffRecord{ID: handoffID(row.Seq), WorkspaceID: workspaceID, Kind: LedgerHandoff, SessionID: key,
 		Client: client, Principal: principal, RecordClass: row.RecordClass, Auto: d.Auto, At: row.At, Words: d.Words,
 		Capsule: d.Capsule, Paths: paths}
 }
 
-// latestCapsule is the newest capsule of one session.
-func latestCapsule(ctx context.Context, r govstore.Reader, workspaceID, key string) (HandoffCapsule, govstore.SessionEvent, bool) {
-	rows, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: key,
-		Kinds: []string{LedgerHandoff}, Limit: 1})
-	if err != nil || len(rows) == 0 {
+// sessionCapsule is the capsule a session hands over: its newest raw capsule, the one
+// its agent wrote (PAR-PROV-08), else, unless rawOnly, its newest derived one.
+func sessionCapsule(ctx context.Context, r govstore.Reader, workspaceID, key string, rawOnly bool) (HandoffCapsule, govstore.SessionEvent, bool) {
+	rows, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: sessionRow(workspaceID, key),
+		Kinds: []string{LedgerHandoff}, Limit: handoffKeep})
+	if err != nil {
+		return HandoffCapsule{}, govstore.SessionEvent{}, false
+	}
+	pick := -1
+	for i, row := range rows { // newest first
+		if row.RecordClass == govstore.RecordRaw {
+			pick = i
+			break
+		}
+		if pick < 0 && !rawOnly {
+			pick = i
+		}
+	}
+	if pick < 0 {
 		return HandoffCapsule{}, govstore.SessionEvent{}, false
 	}
 	var d handoffData
-	if json.Unmarshal(rows[0].Data, &d) != nil || d.Schema != HandoffSchema {
+	if json.Unmarshal(rows[pick].Data, &d) != nil || d.Schema != HandoffSchema {
 		return HandoffCapsule{}, govstore.SessionEvent{}, false
 	}
-	return d.Capsule, rows[0], true
+	return d.Capsule, rows[pick], true
 }
 
 // latestHandoffs reads the workspace's newest capsules (across its most recently seen
@@ -368,11 +403,11 @@ func capsuleRecord(ctx context.Context, r govstore.Reader, root, workspaceID str
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
-	rec := handoffRecord(workspaceID, sess.Client, sess.Principal, row, d, paths)
+	rec := handoffRecord(workspaceID, sess.ExecutionKey, sess.Client, sess.Principal, row, d, paths)
 	check := ContextEntry{PathHashes: d.PathHashes}
 	computeStaleness(root, &check)
 	rec.StalePaths = check.StalePaths
-	if rep := injection.Scan(d.Capsule.Render()); !rep.Clean() {
+	if rep := injection.Scan(d.Capsule.Render(), strings.Join(paths, "\n")); !rep.Clean() {
 		rec.InjectionFlags = rep.Flags
 	}
 	return rec, true
@@ -389,7 +424,7 @@ func autoCapsule(sess govstore.Session, evs []govstore.SessionEvent, reason stri
 	for _, ev := range evs {
 		switch ev.Kind {
 		case LedgerPrompt:
-			goal = fallbackString(goal, rowText(ev).Text)
+			goal = cmp.Or(goal, rowText(ev).Text)
 		case LedgerToolCall:
 			calls++
 			if ev.Status == LedgerError {
@@ -409,7 +444,7 @@ func autoCapsule(sess govstore.Session, evs []govstore.SessionEvent, reason stri
 	if calls == 0 && goal == "" && len(modified) == 0 {
 		return HandoffCapsule{}, nil, false
 	}
-	c := HandoffCapsule{Schema: HandoffSchema, Goals: []string{fallbackString(goal, "(no prompt recorded)")}}
+	c := HandoffCapsule{Schema: HandoffSchema, Goals: []string{cmp.Or(goal, "(no prompt recorded)")}}
 	c.WhatHappened = []string{fmt.Sprintf("%d tool call(s), %d failed; %d file(s) modified; %d memory proposal(s)",
 		calls, failed, len(modified), proposed)}
 	c.Identifiers = modified
@@ -424,12 +459,12 @@ func autoCapsule(sess govstore.Session, evs []govstore.SessionEvent, reason stri
 			c.ErrorsAndFixes = append(c.ErrorsAndFixes, HandoffErrorFix{Error: f.text()})
 		}
 	}
-	c.CurrentState = fmt.Sprintf("session %s ended (%s) with %d open failure(s)", sess.ID, fallbackString(reason, "unknown"), len(open))
+	c.CurrentState = fmt.Sprintf("session %s ended (%s) with %d open failure(s)", sess.ExecutionKey, cmp.Or(reason, "unknown"), len(open))
 	c.NextStep = "none recorded"
 	if len(open) > 0 {
 		c.NextStep = "resolve the open failure: " + open[0].text()
 	}
-	c.LookupHints = []string{"ground session_id=" + sess.ID}
+	c.LookupHints = []string{"ground session_id=" + sess.ExecutionKey}
 	for _, t := range c.texts() {
 		*t = cutBytes(*t, handoffItemMax)
 	}
@@ -446,12 +481,18 @@ func capsuleViolations(c *HandoffCapsule) []string {
 	return out
 }
 
-// storeAutoCapsule builds and stores a session's automatic capsule (a SessionEnd job).
+// storeAutoCapsule builds and stores a session's automatic capsule (a SessionEnd job),
+// unless its agent wrote one: the agent's capsule is what the session hands over
+// (sessionCapsule), and the snapshot beside it carries the ledger's view, work done
+// after the capsule included.
 func storeAutoCapsule(ctx context.Context, dataDir, workspaceID, key, principal, reason string) error {
 	var c HandoffCapsule
 	var paths []string
 	var ok bool
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		if _, _, wrote := sessionCapsule(ctx, r, workspaceID, key, true); wrote {
+			return nil
+		}
 		sess, evs, err := sessionTail(ctx, r, workspaceID, key)
 		if err != nil {
 			return err

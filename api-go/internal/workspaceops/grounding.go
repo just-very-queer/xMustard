@@ -128,7 +128,7 @@ func BuildSessionGroundingWith(ctx context.Context, dataDir, workspaceID string,
 	}
 	g.stampGenerated()
 	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller)...)
-	g.Unknown = append(g.Unknown, g.groundingSession.buildSessions(ctx, dataDir, workspaceID, opts.SessionID, driftStaleFlag(g.Drift))...)
+	g.Unknown = append(g.Unknown, g.groundingSession.buildSessions(ctx, dataDir, workspaceID, caller, opts.SessionID, driftStaleFlag(g.Drift))...)
 	g.summarize()
 	return g, nil
 }

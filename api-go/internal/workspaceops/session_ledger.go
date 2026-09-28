@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,9 +27,11 @@ import (
 // session and principal of what a session did: tool calls (tool, arguments digest,
 // evidence handle, status), files read and modified, prompts, compactions, and the
 // memories it proposed and verified. The rows live in govstore's session_events, one
-// session row per execution key (<client>:<session>[:agent:<agent>]). Raw
-// observations, derived records (a compaction snapshot, an automatic handoff capsule)
-// and verified records keep their record class.
+// session row per workspace and execution key (<client>:<session>[:agent:<agent>]):
+// the row id derives from both (sessionRow), and the key is kept as the row's
+// execution_key, so a session whose events reach two workspaces has a row in each.
+// Raw observations, derived records (a compaction snapshot, an automatic handoff
+// capsule) and verified records keep their record class.
 //
 // One coordinated writer per data dir appends the rows: callers queue an event
 // (RecordSession) or a derived job (RunSessionJob) and return at once, so a hook never
@@ -72,6 +75,9 @@ var activityKinds = []string{LedgerSessionStart, LedgerSessionEnd, LedgerSubagen
 	LedgerToolCall, LedgerFileRead, LedgerFileModified, LedgerMemoryProposed, LedgerMemoryVerified, LedgerCompaction,
 	LedgerTurnEnd, LedgerTranscript}
 
+// handoffKeep is how many capsules a session keeps.
+const handoffKeep = 8
+
 // ledgerBounds bound one session's rows by kind: the newest keep of each group stay.
 // Age retention (govstore's retention classes) removes the rest over time.
 var ledgerBounds = []struct {
@@ -80,7 +86,7 @@ var ledgerBounds = []struct {
 }{
 	{activityKinds, 2048},
 	{[]string{LedgerSnapshot}, 4},
-	{[]string{LedgerHandoff}, 8},
+	{[]string{LedgerHandoff}, handoffKeep},
 }
 
 // LedgerSession is whose session a row belongs to, in client-neutral terms: the hook
@@ -94,8 +100,9 @@ type LedgerSession struct {
 	// the main thread. Principal is the authenticated caller ("" in open mode). They are
 	// audit metadata, never authorization.
 	Client, Session, Agent, Principal string
-	// Transcript is the client's own transcript file (Claude Code's transcript_path),
-	// hashed as an upstream reference at SessionEnd; it is not stored as given.
+	// Transcript is the client's own transcript file (Claude Code's transcript_path).
+	// At SessionEnd a transcript_ref row keeps its path and the digest of its content
+	// (transcriptJob); no other row keeps it.
 	Transcript string
 }
 
@@ -119,8 +126,17 @@ type LedgerEvent struct {
 	ExpiresAt string
 }
 
-// key is the session's row.
+// key is the session's execution key.
 func (ls LedgerSession) key() string { return ExecutionKey(ls.Client, ls.Session, ls.Agent) }
+
+// sessionRow is the govstore id of a session's row in a workspace: a digest of the
+// workspace and the execution key, so one client session seen in two workspaces (a cd
+// into another repository, nested roots) keeps a row, and its rows, in each. It is
+// always a valid id, whatever the lengths of its parts.
+func sessionRow(workspaceID, key string) string {
+	sum := sha256.Sum256([]byte(workspaceID + "\x00" + key))
+	return "s-" + hex.EncodeToString(sum[:16])
+}
 
 // ledgerData is the JSON a row keeps besides its columns.
 type ledgerData struct {
@@ -159,7 +175,7 @@ func keyPart(s string) string {
 
 // ledgerPrincipal is the principal a row is written as: the open-mode identity when
 // the API runs without credentials.
-func ledgerPrincipal(p string) string { return fallbackString(strings.TrimSpace(p), OpenModeIdentity) }
+func ledgerPrincipal(p string) string { return cmp.Or(strings.TrimSpace(p), OpenModeIdentity) }
 
 // LedgerExcerpt is text as a row keeps it: secrets redacted, then cut to ledgerTextMax
 // bytes on a character boundary, whitespace runs folded.
@@ -202,7 +218,7 @@ type ledgerWriter struct {
 	running bool
 	// appended counts appends per session row since its last bound check; a row leaves
 	// it when it is checked, so it holds only sessions active since the last idle.
-	appended map[string]int
+	appended map[string]int // by session row
 }
 
 // ledgerStats counts ledger work since start (the hook service's operator view).
@@ -364,15 +380,15 @@ func (w *ledgerWriter) append(evs []*LedgerEvent) error {
 	err := memoryUpdate(ctx, w.dataDir, evs[0].WorkspaceID, func(tx govstore.Tx) error {
 		clear(counts)
 		for _, ev := range evs {
-			key := ev.key()
+			key, row := ev.key(), sessionRow(ev.WorkspaceID, ev.key())
 			actor := govstore.Actor{Principal: ledgerPrincipal(ev.Principal), SessionID: key, AgentID: ev.Agent}
-			if counts[key] == 0 {
-				if err := upsertLedgerSession(ctx, tx, ev, key, actor); err != nil {
+			if counts[row] == 0 {
+				if err := upsertLedgerSession(ctx, tx, ev, actor); err != nil {
 					return err
 				}
 			}
-			counts[key]++
-			if _, err := tx.AppendSessionEvent(ctx, ledgerRow(ev, key), actor); err != nil {
+			counts[row]++
+			if _, err := tx.AppendSessionEvent(ctx, ledgerRow(ev, row), actor); err != nil {
 				return err
 			}
 		}
@@ -387,29 +403,38 @@ func (w *ledgerWriter) append(evs []*LedgerEvent) error {
 	ledgerStats.recorded.Add(int64(len(evs)))
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	for key, n := range counts {
-		w.appended[key] += n
+	for row, n := range counts {
+		w.appended[row] += n
 	}
 	return nil
 }
 
-// touched marks a session a job appended to, so the writer's next idle check bounds it.
-func touched(dataDir, key string) {
+// recordFromJob appends one row at once. A job runs on the writer, so a row it queued
+// with RecordSession would land behind the jobs queued after it: a snapshot taken
+// next would then look older than the session.
+func recordFromJob(dataDir string, ev LedgerEvent) error {
+	return sessionLedger(dataDir).append([]*LedgerEvent{&ev})
+}
+
+// touched marks a session row a job appended to, so the writer's next idle check
+// bounds it.
+func touched(dataDir, row string) {
 	w := sessionLedger(dataDir)
 	w.mu.Lock()
 	defer w.mu.Unlock()
-	w.appended[key]++
+	w.appended[row]++
 }
 
 // upsertLedgerSession starts the session row, or touches it, with its branch and HEAD
-// read from the repository files. A subagent's row names its parent session; a session
-// on a branch joins the branch's thread.
-func upsertLedgerSession(ctx context.Context, tx govstore.Tx, ev *LedgerEvent, key string, actor govstore.Actor) error {
+// read from the repository files. A subagent's row names its parent session's row; a
+// session on a branch joins the branch's thread.
+func upsertLedgerSession(ctx context.Context, tx govstore.Tx, ev *LedgerEvent, actor govstore.Actor) error {
 	sha, branch := gitHead(ev.Root)
-	in := govstore.SessionInput{ID: key, WorkspaceID: ev.WorkspaceID, Client: ev.Client, AgentID: ev.Agent,
-		ExecutionKey: key, Branch: branch, HeadSHA: sha, Worktree: ev.Root}
+	key := ev.key()
+	in := govstore.SessionInput{ID: sessionRow(ev.WorkspaceID, key), WorkspaceID: ev.WorkspaceID, Client: ev.Client,
+		AgentID: ev.Agent, ExecutionKey: key, Branch: branch, HeadSHA: sha, Worktree: ev.Root}
 	if ev.Agent != "" {
-		in.ParentID = ExecutionKey(ev.Client, ev.Session, "")
+		in.ParentID = sessionRow(ev.WorkspaceID, ExecutionKey(ev.Client, ev.Session, ""))
 	}
 	if branch != "" {
 		in.ThreadID = "branch:" + branch
@@ -418,9 +443,9 @@ func upsertLedgerSession(ctx context.Context, tx govstore.Tx, ev *LedgerEvent, k
 	return err
 }
 
-// ledgerRow is the row an event appends.
-func ledgerRow(ev *LedgerEvent, key string) govstore.SessionEventInput {
-	in := govstore.SessionEventInput{SessionID: key, Kind: ev.Kind, Tool: ev.Tool, ArgsDigest: ev.Args,
+// ledgerRow is the row an event appends to the session row.
+func ledgerRow(ev *LedgerEvent, row string) govstore.SessionEventInput {
+	in := govstore.SessionEventInput{SessionID: row, Kind: ev.Kind, Tool: ev.Tool, ArgsDigest: ev.Args,
 		Handle: ev.Handle, Status: ev.Status, Path: ev.Path, EntryID: ev.EntryID}
 	if d := (ledgerData{Text: LedgerExcerpt(ev.Text), Signature: LedgerExcerpt(ev.Signature), ExpiresAt: ev.ExpiresAt}); d != (ledgerData{}) {
 		in.Data = d
@@ -433,24 +458,24 @@ func ledgerRow(ev *LedgerEvent, key string) govstore.SessionEventInput {
 // a session overshoots its bound by less than ledgerTrimEvery rows while it is busy.
 func (w *ledgerWriter) trimTouched(all bool) {
 	w.mu.Lock()
-	var keys []string
-	for key, n := range w.appended {
+	var rows []string
+	for row, n := range w.appended {
 		if all || n >= ledgerTrimEvery {
-			keys = append(keys, key)
-			delete(w.appended, key)
+			rows = append(rows, row)
+			delete(w.appended, row)
 		}
 	}
 	w.mu.Unlock()
-	for _, key := range keys {
-		if err := trimLedger(w.dataDir, key); err != nil && !errors.Is(err, context.Canceled) {
-			log.Printf("session ledger: trim %s: %v", key, err)
+	for _, row := range rows {
+		if err := trimLedger(w.dataDir, row); err != nil && !errors.Is(err, context.Canceled) {
+			log.Printf("session ledger: trim %s: %v", row, err)
 		}
 	}
 }
 
-// trimLedger applies ledgerBounds to one session row (the bounds are per session, so no
-// workspace is needed).
-func trimLedger(dataDir, key string) error {
+// trimLedger applies ledgerBounds to one session row (the bounds are per session row,
+// so no workspace is needed).
+func trimLedger(dataDir, row string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), ledgerJobTimeout)
 	defer cancel()
 	s, release, err := acquireMemoryStore(ctx, dataDir)
@@ -460,7 +485,7 @@ func trimLedger(dataDir, key string) error {
 	defer release()
 	return s.Update(ctx, func(tx govstore.Tx) error {
 		for _, b := range ledgerBounds {
-			n, err := tx.TrimSessionEvents(ctx, key, b.kinds, b.keep)
+			n, err := tx.TrimSessionEvents(ctx, row, b.kinds, b.keep)
 			if err != nil {
 				return err
 			}
@@ -476,16 +501,14 @@ func trimLedger(dataDir, key string) error {
 // miner reads.
 const ledgerTail = 512
 
-// sessionTail reads a session row and its newest rows in order (oldest first).
+// sessionTail reads a session (by execution key) of a workspace and its newest rows in
+// order (oldest first).
 func sessionTail(ctx context.Context, r govstore.Reader, workspaceID, key string) (govstore.Session, []govstore.SessionEvent, error) {
-	s, err := r.GetSession(ctx, key)
+	s, err := workspaceSession(ctx, r, workspaceID, key)
 	if err != nil {
 		return govstore.Session{}, nil, err
 	}
-	if s.WorkspaceID != workspaceID {
-		return govstore.Session{}, nil, fmt.Errorf("session %s: %w", key, govstore.ErrNotFound)
-	}
-	evs, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: key,
+	evs, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: s.ID,
 		Kinds: activityKinds, Limit: ledgerTail})
 	if err != nil {
 		return govstore.Session{}, nil, err
@@ -494,6 +517,15 @@ func sessionTail(ctx context.Context, r govstore.Reader, workspaceID, key string
 		evs[i], evs[j] = evs[j], evs[i]
 	}
 	return s, evs, nil
+}
+
+// workspaceSession reads a workspace's session row by execution key.
+func workspaceSession(ctx context.Context, r govstore.Reader, workspaceID, key string) (govstore.Session, error) {
+	s, err := r.GetSession(ctx, sessionRow(workspaceID, key))
+	if err == nil && s.WorkspaceID != workspaceID { // a digest collision: never another workspace's
+		err = fmt.Errorf("session %s: %w", key, govstore.ErrNotFound)
+	}
+	return s, err
 }
 
 // rowText is a row's kept excerpt.
@@ -525,6 +557,9 @@ type ledgerJob func(ctx context.Context, dataDir string, ev LedgerEvent) error
 
 // ledgerBoundaries: the row each boundary appends and the jobs it queues, in order. A
 // subagent's boundary needs its agent id: without one it would end the main thread.
+// The jobs that append rows (mining, the transcript reference) run before the end row's
+// summary and the snapshot, so the stored snapshot covers the whole session and is the
+// one a later start restores (latestSnapshot), not rebuilt.
 var ledgerBoundaries = map[string]struct {
 	kind, status string
 	needsAgent   bool
@@ -535,7 +570,7 @@ var ledgerBoundaries = map[string]struct {
 	BoundaryTurnEnd:      {kind: LedgerTurnEnd, jobs: []ledgerJob{mineJob}},
 	BoundarySubagentStop: {kind: LedgerSubagentStop, needsAgent: true, jobs: []ledgerJob{endRowJob}},
 	BoundarySessionEnd: {kind: LedgerSessionEnd,
-		jobs: []ledgerJob{endRowJob, snapshotJob, autoCapsuleJob, mineJob, transcriptJob}},
+		jobs: []ledgerJob{mineJob, transcriptJob, endRowJob, autoCapsuleJob, snapshotJob}},
 }
 
 // RecordBoundary records a boundary (ev.Text: the compaction trigger or end reason) and
@@ -581,7 +616,7 @@ func endRowJob(ctx context.Context, dataDir string, ev LedgerEvent) error {
 		if err != nil || sess.Status != govstore.SessionActive {
 			return err
 		}
-		_, err = tx.EndSession(ctx, key, govstore.SessionEnded, sessionSummary(evs, time.Now().UTC()),
+		_, err = tx.EndSession(ctx, sess.ID, govstore.SessionEnded, sessionSummary(evs, time.Now().UTC()),
 			govstore.Actor{Principal: ledgerPrincipal(ev.Principal), SessionID: key})
 		return err
 	})
@@ -606,7 +641,8 @@ func sessionSummary(evs []govstore.SessionEvent, now time.Time) string {
 		n[LedgerPrompt], n[LedgerToolCall], n["failed"], modified, n[LedgerMemoryProposed], len(openFailures(evs, now)))
 }
 
-// transcriptJob records the client's transcript as a hashed upstream reference (PAR-HAR-05).
+// transcriptJob records the client's transcript as an upstream reference (PAR-HAR-05):
+// a transcript_ref row keeps its path and the digest of its content.
 func transcriptJob(_ context.Context, dataDir string, ev LedgerEvent) error {
 	if ev.Transcript == "" {
 		return nil
@@ -621,23 +657,23 @@ func transcriptJob(_ context.Context, dataDir string, ev LedgerEvent) error {
 	if truncated {
 		row.Text += fmt.Sprintf(" (the first %d; the file is larger)", transcriptHashCap)
 	}
-	RecordSession(dataDir, row)
-	return nil
+	return recordFromJob(dataDir, row)
 }
 
 // transcriptRoots are where a client keeps its transcripts; a transcript is hashed only
-// under one of them.
-var transcriptRoots = map[string]func(getenv func(string) string) []string{
-	"claude": func(getenv func(string) string) []string {
-		var roots []string
-		if d := getenv("CLAUDE_CONFIG_DIR"); d != "" {
-			roots = append(roots, filepath.Join(d, "projects"))
-		}
-		if h := getenv("HOME"); h != "" {
-			roots = append(roots, filepath.Join(h, ".claude", "projects"))
-		}
-		return roots
-	},
+// under one of them. Claude Code is the one client whose hooks name a transcript.
+func transcriptRoots(client string, getenv func(string) string) []string {
+	if client != "claude" {
+		return nil
+	}
+	var roots []string
+	if d := getenv("CLAUDE_CONFIG_DIR"); d != "" {
+		roots = append(roots, filepath.Join(d, "projects"))
+	}
+	if h := getenv("HOME"); h != "" {
+		roots = append(roots, filepath.Join(h, ".claude", "projects"))
+	}
+	return roots
 }
 
 // transcriptHashCap bounds the bytes of a transcript that are hashed.
@@ -650,8 +686,8 @@ var errNotTranscript = errors.New("not a transcript of this client")
 // (symlinks followed) inside one of the client's transcript roots, opened as the same
 // regular file that was resolved.
 func transcriptRef(client, path string) (digest string, hashed int64, truncated bool, err error) {
-	roots := transcriptRoots[client]
-	if roots == nil || !filepath.IsAbs(path) || filepath.Ext(path) != ".jsonl" {
+	roots := transcriptRoots(client, os.Getenv)
+	if len(roots) == 0 || !filepath.IsAbs(path) || filepath.Ext(path) != ".jsonl" {
 		return "", 0, false, errNotTranscript
 	}
 	resolved, err := filepath.EvalSymlinks(path)
@@ -659,7 +695,7 @@ func transcriptRef(client, path string) (digest string, hashed int64, truncated 
 		return "", 0, false, errNotTranscript
 	}
 	inRoot := false
-	for _, root := range roots(os.Getenv) {
+	for _, root := range roots {
 		if r, err := filepath.EvalSymlinks(root); err == nil && pathWithin(resolved, r) {
 			inRoot = true
 			break

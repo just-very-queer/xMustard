@@ -79,7 +79,7 @@ func registerGroundRoutes(mux routeRegistrar) {
 	})
 }
 
-// maxGroundSessionID bounds ground's session_id (a session row id is at most 200 bytes).
+// maxGroundSessionID bounds ground's session_id (an execution key is at most 200 bytes).
 const maxGroundSessionID = 200
 
 func printable(s string) bool {
