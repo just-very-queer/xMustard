@@ -72,7 +72,7 @@ func TestCodexRecordedShellShapesWithinTheSpillLimit(t *testing.T) {
 	}
 	reason := codexReason(t, res.Shape.Payload)
 	lines := strings.Split(reason, "\n")
-	if len(reason) > codexHookTextBytes || !strings.HasPrefix(lines[len(lines)-1], "[xmustard evidence] ") ||
+	if len(reason) > CodexHookTextBytes || !strings.HasPrefix(lines[len(lines)-1], "[xmustard evidence] ") ||
 		!strings.Contains(reason, "FAIL\texample.com/pkg") || len(res.Projection) > PolicyFor("codex").Target {
 		t.Fatalf("reason %d bytes, projection %d, last line %q", len(reason), len(res.Projection), lines[len(lines)-1])
 	}
@@ -89,7 +89,9 @@ func TestCodexRecordedShellShapesWithinTheSpillLimit(t *testing.T) {
 func TestCodexShellReasonStatesTheExitStatus(t *testing.T) {
 	s, _ := testStore(t, func(l *Limits) { *l = DefaultLimits() })
 	res := observe(t, s, FormatCodex, codexFixture(t, "0.156.1/post_tool_use_bash_large.json"), CaptureMeta{Client: "codex"})
-	if reason := codexReason(t, res.Shape.Payload); !strings.HasPrefix(reason, "[xmustard] exit status unknown: Codex does not pass it to hooks.") {
+	// the handle keeps Codex's own preview of the output, so the line promises no more
+	if reason := codexReason(t, res.Shape.Payload); !strings.HasPrefix(reason, "[xmustard] exit status unknown: Codex does not pass it to hooks.") ||
+		!strings.Contains(reason, "the captured output (Codex's preview)") || strings.Contains(reason, "full original") {
 		t.Fatalf("shell reason starts %q", reason[:min(len(reason), 160)])
 	}
 	log := jsonString(strings.Repeat("ci log line with nothing wrong in it\n", 3000))
@@ -138,7 +140,7 @@ func TestCodexReasonKeepsTheHandleLastWithTheInjectionNote(t *testing.T) {
 	reason := codexReason(t, res.Shape.Payload)
 	note := injection.Note("Bash", res.InjectionFlags)
 	t.Logf("reason %d bytes: projection %d, footer %d", len(reason), len(res.Projection), len(res.Footer))
-	if len(reason) > codexHookTextBytes || !strings.HasSuffix(reason, "\n"+note+"\n"+strings.Split(res.Footer, "\n")[0]) {
+	if len(reason) > CodexHookTextBytes || !strings.HasSuffix(reason, "\n"+note+"\n"+strings.Split(res.Footer, "\n")[0]) {
 		t.Fatalf("reason (%d bytes) does not end with the note, then the recovery line:\n%s", len(reason), reason[max(0, len(reason)-800):])
 	}
 	// every other client keeps the recovery line first, then the note
@@ -270,10 +272,10 @@ func TestShaperRegistry(t *testing.T) {
 	if checkSize(cx, wide) == nil || checkSize(PolicyFor("claude"), wide) != nil {
 		t.Fatal("codex must measure its cap in bytes, claude in characters")
 	}
-	if got := capBytes("aé"+strings.Repeat("x", 20), 6); got != "aé…" || len(got) > 6 {
-		t.Fatalf("capBytes: %q", got)
+	if got := CapBytes("aé"+strings.Repeat("x", 20), 6); got != "aé…" || len(got) > 6 {
+		t.Fatalf("CapBytes: %q", got)
 	}
-	if got := capBytes("aé"+strings.Repeat("x", 20), 5); got != "a…" {
-		t.Fatalf("capBytes on a rune boundary: %q", got)
+	if got := CapBytes("aé"+strings.Repeat("x", 20), 5); got != "a…" {
+		t.Fatalf("CapBytes on a rune boundary: %q", got)
 	}
 }

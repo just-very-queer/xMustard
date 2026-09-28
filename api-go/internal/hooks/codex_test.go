@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"unicode/utf8"
+
+	"xmustard/api-go/internal/evidence"
 )
 
 // Every Codex answer decodes into the output wire of its event with unknown fields
@@ -90,17 +92,21 @@ func TestValidateCodexAnswerRefusesWhatCodexRefuses(t *testing.T) {
 // boundary, and prefers a paragraph break.
 func TestCodexContextIsCappedInBytes(t *testing.T) {
 	s := strings.Repeat("é", 6000) // 12,000 bytes, 6,000 characters: under Claude's cap
-	got := CapContextBytes(s, CodexHookTextBytes)
-	if len(got) > CodexHookTextBytes || !utf8.ValidString(got) || !strings.HasSuffix(got, "…") {
+	limit := evidence.CodexHookTextBytes
+	got := capContext(s, limit)
+	if len(got) > limit || !utf8.ValidString(got) || !strings.HasSuffix(got, "…") {
 		t.Fatalf("capped to %d bytes, valid %v", len(got), utf8.ValidString(got))
 	}
 	para := strings.Repeat("a", 7000) + "\n\n" + strings.Repeat("b", 5000)
-	if got := CapContextBytes(para, CodexHookTextBytes); got != strings.Repeat("a", 7000)+"…" {
+	if got := capContext(para, limit); got != strings.Repeat("a", 7000)+"…" {
 		t.Fatalf("paragraph cut: %d bytes", len(got))
+	}
+	if early := strings.Repeat("a", 100) + "\n\n" + strings.Repeat("b", 12000); capContext(early, limit) != evidence.CapBytes(early, limit) {
+		t.Fatal("a paragraph break in the first half cut the context")
 	}
 	pre, _ := Codex.Event("PreToolUse")
 	reply := Codex.Reply(pre, Result{Context: s})
-	if reply == nil || len(reply.Context) > CodexHookTextBytes || ValidateCodexAnswer("PreToolUse", reply.Body) != nil {
+	if reply == nil || len(reply.Context) > limit || ValidateCodexAnswer("PreToolUse", reply.Body) != nil {
 		t.Fatalf("reply context %d bytes", len(reply.Context))
 	}
 }
@@ -111,6 +117,17 @@ func TestPatchPathsListsEveryChangedFileOnce(t *testing.T) {
 	want := []string{"/r/sub/src/new.go", "/r/sub/src/billing.go", "/r/sub/src/ledger.go", "/abs/old.go"}
 	if got := PatchPaths(patch, "/r/sub"); !reflect.DeepEqual(got, want) {
 		t.Fatalf("paths %v", got)
+	}
+	// a Move to renames the Update File before it, and nothing else
+	moves := PatchMoves(patch+"*** Add File: a.go\n*** Move to: b.go\n", "/r/sub")
+	if want := map[string]string{"/r/sub/src/ledger.go": "/r/sub/src/billing.go"}; !reflect.DeepEqual(moves, want) {
+		t.Fatalf("moves %v", moves)
+	}
+	if got := (Input{ToolName: "apply_patch", Cwd: "/r/sub", ToolInput: ToolInput{Command: patch}}).Moves(); !reflect.DeepEqual(got, moves) {
+		t.Fatalf("apply_patch moves %v", got)
+	}
+	if got := (Input{ToolName: "Bash", ToolInput: ToolInput{Command: patch}}).Moves(); got != nil {
+		t.Fatalf("a Bash command moved %v", got)
 	}
 	in := Input{ToolName: "apply_patch", Cwd: "/r", ToolInput: ToolInput{Command: "*** Update File: a.go\n"}}
 	if got := in.Targets(); !reflect.DeepEqual(got, []string{"/r/a.go"}) || ClassOf("apply_patch") != ToolEdit {
@@ -128,8 +145,10 @@ func TestPatchPathsListsEveryChangedFileOnce(t *testing.T) {
 	}
 }
 
-// The commands hooks.json runs parse back to their event and pin, whatever the client
-// path; nothing else is taken for xMustard's (trust is offered only for these).
+// The commands hooks.json runs parse back to their event and pin, for the client on
+// PATH or at an absolute path; nothing else is taken for xMustard's (trust is offered
+// only for these). A relative client, an assignment prefix, a non-printing character
+// or a pin the client would not send is refused.
 func TestCodexCommandsRoundTrip(t *testing.T) {
 	for _, c := range []struct{ bin, ws string }{
 		{"xmustard-hook", ""}, {"/opt/xm/bin/xmustard-hook", "xmustard-3f2a"}, {"/Users/a b/it's/xmustard-hook", "ws.1_x"},
@@ -147,9 +166,21 @@ func TestCodexCommandsRoundTrip(t *testing.T) {
 		"xmustard-hook claude PostToolUse", "xmustard-hook codex Stop", "xmustard-hook codex PostToolUse --workspace",
 		"xmustard-hook codex PostToolUse --other ws", "xmustard-hook codex PostToolUse --workspace ws extra",
 		"'xmustard-hook codex PostToolUse", "$(which xmustard-hook) codex PostToolUse", "xmustard-hook codex $EVENT",
+		"bin/xmustard-hook codex PostToolUse", "./xmustard-hook codex SessionStart", "PATH=bin/xmustard-hook codex SessionStart",
+		"PATH=/opt/xm/xmustard-hook codex SessionStart", "'x\x1b[2K\r/opt/xm/xmustard-hook' codex PostToolUse",
+		"'/opt/\x1b[2K\r/xm/xmustard-hook' codex PostToolUse", "'/opt/\u202egol/xmustard-hook' codex PostToolUse",
+		"'/opt/\xff/xmustard-hook' codex PostToolUse", "/opt/xm/xmustard-hook.sh codex PostToolUse",
+		"xmustard-hook codex PostToolUse --workspace 'my ws'", "xmustard-hook codex PostToolUse --workspace ../up",
+		"xmustard-hook codex PostToolUse --workspace a=b",
 	} {
 		if _, _, _, ok := ParseCodexCommand(cmd); ok {
 			t.Errorf("%q taken for xMustard's", cmd)
+		}
+	}
+	for bin, want := range map[string]bool{"xmustard-hook": true, "/opt/xm/xmustard-hook": true, "/Users/a b/xmustard-hook": true,
+		"bin/xmustard-hook": false, "~/bin/xmustard-hook": false, "/opt/xm/xmustard-hook\n": false, "/opt/xm/other": false, "": false} {
+		if ValidCodexClient(bin) != want {
+			t.Errorf("ValidCodexClient(%q) = %v", bin, !want)
 		}
 	}
 }

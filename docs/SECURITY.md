@@ -612,13 +612,29 @@ clients' routes share the handlers and every rule below.
   xMustard never writes that on its own. `xmustard-ops codex-hooks trust` asks
   `codex app-server` for the hooks Codex would run (`hooks/list`). It offers only
   xMustard's own untrusted or modified hooks: synchronous command hooks whose command
-  parses as exactly `xmustard-hook codex <Event> [--workspace <id>]` for the event it
-  is registered on. It shows each command and its source file, and it records their
-  hashes (`config/batchWrite`, `hooks.state`) only after the user types `trust` at the
-  controlling terminal. No flag skips the prompt, and without a terminal it refuses.
-  A hook changed afterwards has a new hash, and Codex stops running it until it is
-  trusted again. The hooks.json `--workspace` pin is a workspace id, checked by the
-  daemon like the header it becomes.
+  parses as exactly `<client> codex <Event> [--workspace <id>]` for the event it is
+  registered on, where `<client>` is the one `--hook-bin` names (default
+  `xmustard-hook`, found on Codex's `PATH`).
+  - The client must be `xmustard-hook` itself or an absolute path to a file of that
+    name, every character printable (`hooks.ValidCodexClient`). A relative path or a
+    `NAME=value` prefix would run what the repository holds, since Codex runs the
+    command in the session's cwd. `config` refuses such a `--hook-bin` too.
+  - A hook for another `xmustard-hook`, say one a repository's `.codex/hooks.json`
+    points at, is not offered. The report counts these and names their clients.
+  - The pin must be a safe id (`transport.ValidWorkspaceID`, the client's own check);
+    `config --workspace-id` refuses anything else. The daemon checks the header it
+    becomes like any other.
+  - Every command, source path and Codex message is printed quoted, with control
+    characters escaped, so a file cannot repaint the listing.
+  - The hashes are recorded (`config/batchWrite`, `hooks.state`) only after the user
+    types `trust` at the controlling terminal. No flag skips the prompt, and without a
+    terminal it refuses. A terminal proves less than a secret: Codex can run a command
+    on a pty that becomes its controlling terminal and type into it. So `trust` also
+    refuses when the environment shows an agent's shell (`CODEX_THREAD_ID`,
+    `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED` or `CLAUDECODE`). An agent with
+    full access could still edit config.toml directly, which no prompt prevents.
+  - A hook changed afterwards has a new hash, and Codex stops running it until it is
+    trusted again.
 
 ## Evidence capture redaction (WS-FIX-03)
 

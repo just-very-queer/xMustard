@@ -83,8 +83,11 @@ MCP call, and a command still running when the call returns, reach no hook at al
    xmustard-ops codex-hooks config --root "$PWD" --hook-bin ~/.local/bin/xmustard-hook > .codex/hooks.json
    ```
 
-   Merge by hand if the file already has hooks. `hooks.json` in this directory is the
-   default output (client on `PATH`, no pin).
+   `--hook-bin` must be `xmustard-hook` (found on Codex's `PATH`) or an absolute path
+   to it; a relative path would run whatever the repository holds at that path. A
+   `--workspace-id` must be a safe id (letters, digits, `_`, `.`, `-`). Merge by hand
+   if the file already has hooks. `hooks.json` in this directory is the default output
+   (client on `PATH`, no pin).
 
 4. Trust them. Codex runs a user or project hook only while the hash of its definition
    is trusted, and it records that in `config.toml` under `hooks.state`. Nothing in
@@ -92,17 +95,23 @@ MCP call, and a command still running when the call returns, reach no hook at al
    run:
 
    ```sh
-   xmustard-ops codex-hooks trust --cwd "$PWD"
+   xmustard-ops codex-hooks trust --cwd "$PWD" --hook-bin ~/.local/bin/xmustard-hook
    ```
 
+   Pass the same `--hook-bin` as to `config` (leave it out for a client on `PATH`).
    This asks `codex app-server` which hooks Codex would run from that directory
    (`hooks/list`). It shows xMustard's untrusted or modified hooks: only commands
-   exactly of the form `xmustard-hook codex <Event> [--workspace <id>]`. It records
-   their current hashes (`config/batchWrite` on `hooks.state`) only after you type
-   `trust` at the terminal. No flag skips that prompt, and it refuses without a
-   terminal. If you edit a hook later (a new path or pin), its hash changes, and Codex
-   stops running it until you trust it again. `xmustard-ops codex-hooks status` lists
-   the hooks and their trust, and exits 3 when an event is unregistered or untrusted.
+   exactly of the form `<hook-bin> codex <Event> [--workspace <id>]`, printed quoted.
+   A hook that runs another `xmustard-hook`, such as one a repository's
+   `.codex/hooks.json` points at, is not offered; the report counts these and names
+   their clients. It records the hooks' current hashes (`config/batchWrite` on
+   `hooks.state`) only after you type `trust` at the terminal. No flag skips that
+   prompt. It refuses without a terminal, and inside an agent's shell (when
+   `CODEX_THREAD_ID`, `CODEX_SANDBOX`, `CODEX_SANDBOX_NETWORK_DISABLED` or
+   `CLAUDECODE` is set), where the agent could answer the prompt itself. If you edit a
+   hook later (a new path or pin), its hash changes, and Codex stops running it until
+   you trust it again. `xmustard-ops codex-hooks status --hook-bin <path>` lists the
+   hooks and their trust, and exits 3 when an event is unregistered or untrusted.
 
 ## Configuration
 
@@ -154,18 +163,30 @@ token, it prints nothing and exits 0, so Codex keeps its own output.
 - SubagentStart and SubagentStop need a real subagent. The mock cannot start one:
   0.156.1 refuses its `spawn_agent` call as unsupported, with or without
   `--enable multi_agent`. Recording them takes model calls, so it is an operator step.
-  In a scratch repository, with codex-cli 0.156.1 signed in and a hooks.json that runs
-  `node <repo>/api-go/internal/evidence/testdata/codex/record/hook.mjs /tmp/subagent.jsonl`
-  on SubagentStart and SubagentStop, run:
+  With codex-cli 0.156.1 signed in (credentials in `~/.codex/auth.json`, the default
+  store), run this from the repository root. It uses a scratch `CODEX_HOME`, so your
+  own hooks and config are not touched:
 
   ```sh
-  codex exec --json --skip-git-repo-check --dangerously-bypass-hook-trust -s read-only \
-    "Spawn one explorer subagent to list the files here, wait for it, then answer done."
+  repo=$PWD scratch=$(mktemp -d)
+  export CODEX_HOME="$scratch/home"
+  mkdir -p "$CODEX_HOME" "$scratch/app" && cp ~/.codex/auth.json "$CODEX_HOME/"
+  hook="node $repo/api-go/internal/evidence/testdata/codex/record/hook.mjs $scratch/subagent.jsonl"
+  cat > "$CODEX_HOME/hooks.json" <<EOF
+  {"hooks": {
+    "SubagentStart": [{"hooks": [{"type": "command", "command": "$hook"}]}],
+    "SubagentStop": [{"hooks": [{"type": "command", "command": "$hook"}]}]
+  }}
+  EOF
+  (cd "$scratch/app" && codex exec --json --skip-git-repo-check --dangerously-bypass-hook-trust -s read-only \
+    "Spawn one explorer subagent to list the files here, wait for it, then answer done.")
+  unset CODEX_HOME
   ```
 
-  Then copy each event's first line of `/tmp/subagent.jsonl` into
-  `testdata/recorded/0.156.1/<Event>.json`, with local paths replaced as the
-  recorder does.
+  Then copy each event's first line of `$scratch/subagent.jsonl` into
+  `testdata/recorded/0.156.1/<Event>.json`, with `$scratch/home` replaced by
+  `/Users/dev/.codex` and `$scratch/app` by `/Users/dev/src/app`, as the recorder
+  does.
 - `TestCodexHooksEndToEnd` runs the installed codex-cli with `hooks.json` from
   `CodexHooksJSON`, a freshly built client and a test daemon against the mock model,
   and checks what the model is sent. It needs `XMUSTARD_CODEX_BIN` set to the codex

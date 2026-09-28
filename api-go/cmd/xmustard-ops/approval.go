@@ -36,7 +36,7 @@ type opsEnv struct {
 	// confirm reads a line typed at the controlling terminal (echo on).
 	confirm func(label string) (string, error)
 	// codex starts `codex app-server` (codex_hooks.go).
-	codex func(ctx context.Context, bin string) (*appServer, func(), error)
+	codex func(bin string) (*appServer, func(), error)
 }
 
 func defaultOpsEnv() opsEnv {

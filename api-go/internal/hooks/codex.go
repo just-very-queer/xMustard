@@ -7,6 +7,11 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"unicode"
+	"unicode/utf8"
+
+	"xmustard/api-go/internal/evidence"
+	"xmustard/api-go/internal/hooks/transport"
 )
 
 // Codex's hook protocol (WS-40a; PAR-ADP-07), from codex-rs at 44fe510 and checked
@@ -45,13 +50,6 @@ var CodexEvents = []Event{
 // Codex is Codex's hook protocol.
 var Codex = Client{Name: "codex", Format: "codex", Events: CodexEvents, reply: codexReply}
 
-// CodexHookTextBytes is the most hook text Codex passes on whole: past 2,500
-// approximate tokens of 4 bytes it writes the text to a file and gives the model a
-// head-and-tail preview (output_spill.rs DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT;
-// utils/string approx_token_count). It bounds a block reason and each
-// additionalContext alike.
-const CodexHookTextBytes = 2500 * 4
-
 // codexOutput is every output key xMustard writes. A PostToolUse block's reason
 // replaces the tool output the model sees (Codex hands it over as a failed call's
 // output); hookSpecificOutput carries additionalContext, which every Context event's
@@ -75,7 +73,7 @@ func codexReply(ev Event, r Result) *Reply {
 	}
 	context := ""
 	if ev.Context {
-		context = CapContextBytes(r.Context, CodexHookTextBytes)
+		context = capContext(r.Context, evidence.CodexHookTextBytes)
 	}
 	if context != "" {
 		out.HookSpecificOutput = &codexSpecific{HookEventName: ev.Name, AdditionalContext: context}
@@ -106,31 +104,40 @@ func codexBlock(payload json.RawMessage) (decision, reason string) {
 	return p.Decision, p.Reason
 }
 
-// CapContextBytes keeps a context within n bytes, cutting at a paragraph when it can
-// and on a rune boundary otherwise.
-func CapContextBytes(s string, n int) string {
-	const ellipsis = "…"
+// capContext keeps a context within n bytes (evidence.CapBytes: on a rune boundary,
+// an ellipsis last), cut at its last paragraph break past the half when it has one.
+func capContext(s string, n int) string {
 	if len(s) <= n {
 		return s
 	}
-	cut := strings.ToValidUTF8(s[:n-len(ellipsis)], "")
+	capped := evidence.CapBytes(s, n)
+	cut := strings.TrimSuffix(capped, "…")
 	if i := strings.LastIndex(cut, "\n\n"); i > n/2 {
-		cut = cut[:i]
+		return cut[:i] + "…"
 	}
-	return cut + ellipsis
+	return capped
 }
 
-// patchHeaders open the apply_patch hunks that name a changed file (codex-rs
-// apply-patch/src/parser.rs).
-var patchHeaders = []string{"*** Add File: ", "*** Update File: ", "*** Delete File: ", "*** Move to: "}
+// The apply_patch hunk headers that name a changed file (codex-rs
+// apply-patch/src/parser.rs). A Move to line follows its Update File line and names
+// the file the update is written to.
+const (
+	patchUpdate = "*** Update File: "
+	patchMoveTo = "*** Move to: "
+)
+
+var patchHeaders = []string{"*** Add File: ", patchUpdate, "*** Delete File: ", patchMoveTo}
 
 // maxPatchPaths bounds the files taken from one patch.
 const maxPatchPaths = 16
 
-// PatchPaths lists the files an apply_patch patch changes, in patch order and each
-// once; a relative path is joined to cwd, the directory Codex resolves it against.
-func PatchPaths(patch, cwd string) []string {
-	var out []string
+// patchLine is one header line of a patch and the file it names, joined to the cwd.
+type patchLine struct{ header, path string }
+
+// patchLines reads a patch's file headers in order; a relative path is joined to cwd,
+// the directory Codex resolves it against.
+func patchLines(patch, cwd string) []patchLine {
+	var out []patchLine
 	for _, line := range strings.Split(patch, "\n") {
 		for _, h := range patchHeaders {
 			p, ok := strings.CutPrefix(strings.TrimRight(line, "\r"), h)
@@ -140,12 +147,35 @@ func PatchPaths(patch, cwd string) []string {
 			if !filepath.IsAbs(p) && cwd != "" {
 				p = filepath.Join(cwd, p)
 			}
-			if len(out) < maxPatchPaths && !slices.Contains(out, p) {
-				out = append(out, p)
-			}
+			out = append(out, patchLine{h, p})
 		}
 	}
 	return out
+}
+
+// PatchPaths lists the files an apply_patch patch changes, in patch order and each
+// once, at most maxPatchPaths.
+func PatchPaths(patch, cwd string) []string {
+	var out []string
+	for _, l := range patchLines(patch, cwd) {
+		if len(out) < maxPatchPaths && !slices.Contains(out, l.path) {
+			out = append(out, l.path)
+		}
+	}
+	return out
+}
+
+// PatchMoves maps each file an apply_patch renames a file to onto the file it renames:
+// a Move to line and the Update File line before it.
+func PatchMoves(patch, cwd string) map[string]string {
+	moves := map[string]string{}
+	lines := patchLines(patch, cwd)
+	for i := 1; i < len(lines); i++ {
+		if lines[i].header == patchMoveTo && lines[i-1].header == patchUpdate {
+			moves[lines[i].path] = lines[i-1].path
+		}
+	}
+	return moves
 }
 
 // --- hooks.json ---
@@ -180,7 +210,7 @@ type codexHandler struct {
 }
 
 // CodexHooksJSON is the hooks.json that registers every Codex event with a route: bin
-// is the client (a path or a name on PATH), workspace an optional pin.
+// is the client (ValidCodexClient), workspace an optional pin (transport.ValidWorkspaceID).
 func CodexHooksJSON(bin, workspace string) []byte {
 	file := codexHooksFile{Description: "xMustard hook client (xmustard-ops codex-hooks config)", Hooks: map[string][]codexMatcherGroup{}}
 	for _, ev := range CodexEvents {
@@ -204,12 +234,35 @@ func CodexCommand(bin, event, workspace string) string {
 	return cmd
 }
 
-// ParseCodexCommand recognizes a command CodexCommand wrote: a client binary named
-// xmustard-hook, "codex", a routed event and an optional workspace pin. Any other
-// command, or any other shell syntax, is not xMustard's.
+// CodexClient is the static client's name; hooks.json runs it from Codex's PATH unless
+// it names an absolute path to it.
+const CodexClient = "xmustard-hook"
+
+// ValidCodexClient reports a client a Codex hooks.json may run: CodexClient itself, or
+// an absolute path whose last element is CodexClient and whose every character is
+// printable. A relative path (bin/xmustard-hook) or a NAME=value word would run what
+// the hook's cwd, the repository, holds; a control character could repaint the line
+// that shows the command.
+func ValidCodexClient(bin string) bool {
+	if bin == CodexClient {
+		return true
+	}
+	return path.IsAbs(bin) && path.Base(bin) == CodexClient && printable(bin)
+}
+
+// printable reports valid UTF-8 with no control, format or other non-printing rune
+// (the ASCII space is printable).
+func printable(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsFunc(s, func(r rune) bool { return !unicode.IsPrint(r) })
+}
+
+// ParseCodexCommand recognizes a command CodexCommand writes: a valid client
+// (ValidCodexClient), "codex", a routed event and an optional valid workspace pin
+// (transport.ValidWorkspaceID). Any other command, or any other shell syntax, is not
+// xMustard's.
 func ParseCodexCommand(cmd string) (bin, event, workspace string, ok bool) {
 	w, ok := shellWords(cmd)
-	if !ok || len(w) < 3 || path.Base(w[0]) != "xmustard-hook" || w[1] != "codex" {
+	if !ok || len(w) < 3 || !ValidCodexClient(w[0]) || w[1] != "codex" {
 		return "", "", "", false
 	}
 	if _, routed := Codex.Event(w[2]); !routed {
@@ -218,7 +271,7 @@ func ParseCodexCommand(cmd string) (bin, event, workspace string, ok bool) {
 	switch rest := w[3:]; {
 	case len(rest) == 0:
 		return w[0], w[2], "", true
-	case len(rest) == 2 && rest[0] == "--workspace" && rest[1] != "":
+	case len(rest) == 2 && rest[0] == "--workspace" && transport.ValidWorkspaceID(rest[1]):
 		return w[0], w[2], rest[1], true
 	}
 	return "", "", "", false

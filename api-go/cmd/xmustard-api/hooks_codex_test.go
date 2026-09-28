@@ -15,12 +15,14 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/hooks"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // Codex hook service (WS-40a). integrations/codex/testdata/*.in.json are hook bodies
@@ -85,7 +87,7 @@ func TestCodexHookGoldenSession(t *testing.T) {
 		var out struct{ Decision, Reason string }
 		_ = json.Unmarshal(answers[name], &out)
 		lines := strings.Split(out.Reason, "\n")
-		if out.Decision != "block" || len(out.Reason) > hooks.CodexHookTextBytes || !strings.HasPrefix(lines[len(lines)-1], "[xmustard evidence] ") ||
+		if out.Decision != "block" || len(out.Reason) > evidence.CodexHookTextBytes || !strings.HasPrefix(lines[len(lines)-1], "[xmustard evidence] ") ||
 			!strings.Contains(out.Reason, "--- FAIL: TestParse") {
 			t.Errorf("%s: decision %q, %d-byte reason ending %q", name, out.Decision, len(out.Reason), lines[len(lines)-1])
 		}
@@ -154,14 +156,9 @@ func TestCodexFixturesMatchTheRecordedPayloads(t *testing.T) {
 	}
 }
 
-// Every Codex event has exactly one way to be answered and a gate row, the context cap
-// is the reason cap (both are Codex's spill limit), and the shipped hooks.json is what
-// `xmustard-ops codex-hooks config` writes by default.
+// Every Codex event has exactly one way to be answered and a gate row, and the shipped
+// hooks.json is what `xmustard-ops codex-hooks config` writes by default.
 func TestCodexHookTablesAndConfigAgree(t *testing.T) {
-	if hooks.CodexHookTextBytes != evidence.PolicyFor("codex").MaxChars {
-		t.Fatalf("the hook context cap (%d) and the codex reason cap (%d) are both Codex's spill limit", hooks.CodexHookTextBytes,
-			evidence.PolicyFor("codex").MaxChars)
-	}
 	for _, e := range hooks.CodexEvents {
 		_, answers := hookHandlers[e.Name]
 		_, queued := hookQueueEffects[e.Name]
@@ -220,12 +217,57 @@ func TestCodexHookScopeAndRoles(t *testing.T) {
 	}
 }
 
+// A patch that renames a file (Update File, then Move to) checks the destination
+// against the source's baseline: an error the file had before the move is not new.
+func TestCodexPatchRenameKeepsTheBaseline(t *testing.T) {
+	f := newHookFixture(t)
+	const had = `{"line":4,"column":24,"kind":"missing","node":")","line_hash":"9f2c"}`
+	const added = `{"line":9,"column":2,"kind":"error","node":"}","line_hash":"77aa"}`
+	var patched atomic.Bool
+	hookSyntax = func(_ context.Context, _ workspaceops.ResolvedWorkspace, rels []string) (json.RawMessage, error) {
+		files := make([]string, len(rels))
+		for i, rel := range rels {
+			switch {
+			case rel == "src/billing.go" && !patched.Load():
+				files[i] = fmt.Sprintf(`{"path":%q,"status":"checked","errors":[%s]}`, rel, had)
+			case rel == "src/invoice.go" && patched.Load():
+				files[i] = fmt.Sprintf(`{"path":%q,"status":"checked","errors":[%s,%s]}`, rel, had, added)
+			default: // the destination before the patch, the source after it
+				files[i] = fmt.Sprintf(`{"path":%q,"status":"unreadable","errors":[]}`, rel)
+			}
+		}
+		return json.RawMessage(`{"files":[` + strings.Join(files, ",") + `]}`), nil
+	}
+	body := func(event string, extra map[string]any) string {
+		m := map[string]any{"session_id": "s-move", "turn_id": "t", "transcript_path": nil, "cwd": f.root, "hook_event_name": event,
+			"model": "m", "permission_mode": "default", "tool_name": "apply_patch", "tool_use_id": "call-move",
+			"tool_input": map[string]string{"command": "*** Begin Patch\n*** Update File: src/billing.go\n*** Move to: src/invoice.go\n@@\n-\treturn x\n+\treturn round(x\n*** End Patch\n"}}
+		maps.Copy(m, extra)
+		b, _ := json.Marshal(m)
+		return string(b)
+	}
+	if code, out := f.postTo(t, f.agent, "codex", "PreToolUse", body("PreToolUse", nil)); code != http.StatusOK {
+		t.Fatalf("PreToolUse %d %s", code, out)
+	}
+	patched.Store(true)
+	code, answer := f.postTo(t, f.agent, "codex", "PostToolUse", body("PostToolUse", map[string]any{"tool_response": "Success."}))
+	var out struct {
+		HookSpecificOutput struct{ AdditionalContext string } `json:"hookSpecificOutput"`
+	}
+	_ = json.Unmarshal(answer, &out)
+	if note := out.HookSpecificOutput.AdditionalContext; code != http.StatusOK || !strings.Contains(note, "src/invoice.go: 1 new syntax error(s) after this edit") ||
+		!strings.Contains(note, `cannot parse near "}"`) || strings.Contains(note, `missing ")"`) {
+		t.Fatalf("rename answer %d: %s", code, answer)
+	}
+}
+
 // TestCodexHooksEndToEnd runs the installed codex-cli with hooks.json from
 // CodexHooksJSON, a freshly built xmustard-hook and this API, against the mock
-// Responses API of the Codex recorder (no model call). It checks what the model is sent:
-// the SessionStart and UserPromptSubmit context, and the Bash output replaced by the
-// block reason whole (not spilled), handle last. Set XMUSTARD_CODEX_BIN to a codex
-// binary and have node on PATH to run it.
+// Responses API of the Codex recorder (no model call), at the production budgets (the
+// daemon's 180 ms, the client's 200 ms). It checks what the model is sent: the
+// SessionStart and UserPromptSubmit context, and the Bash output replaced by the block
+// reason whole (not spilled), handle last. Set XMUSTARD_CODEX_BIN to a codex binary and
+// have node on PATH to run it.
 func TestCodexHooksEndToEnd(t *testing.T) {
 	codex := os.Getenv("XMUSTARD_CODEX_BIN")
 	if codex == "" {
@@ -236,7 +278,7 @@ func TestCodexHooksEndToEnd(t *testing.T) {
 		t.Skip("node is not on PATH")
 	}
 	f := newHookFixture(t)
-	t.Setenv("XMUSTARD_HOOK_BUDGET_MS", "3000")
+	t.Setenv("XMUSTARD_HOOK_BUDGET_MS", "") // the fixture's 3 s; unset is the default
 	tmp := t.TempDir()
 	bin := filepath.Join(tmp, "xmustard-hook")
 	build := exec.Command("go", "build", "-o", bin, ".")
@@ -273,7 +315,7 @@ func TestCodexHooksEndToEnd(t *testing.T) {
 		"deploy check: run the SHELL step")
 	run.Dir = f.root
 	run.Env = append(os.Environ(), "CODEX_HOME="+home, "CODEX_SQLITE_HOME="+home, "XMUSTARD_API_BASE="+f.srv.URL,
-		"XMUSTARD_API_TOKEN="+f.agent, "XMUSTARD_HOOK_SOCKET=off", "XMUSTARD_HOOK_TIMEOUT_MS=4000")
+		"XMUSTARD_API_TOKEN="+f.agent, "XMUSTARD_HOOK_SOCKET=off", "XMUSTARD_HOOK_TIMEOUT_MS=")
 	events, err := run.CombinedOutput()
 	if err != nil {
 		t.Fatalf("codex exec: %v\n%s", err, events)
@@ -306,7 +348,7 @@ func TestCodexHooksEndToEnd(t *testing.T) {
 	}
 	lines := strings.Split(reason, "\n")
 	t.Logf("the model got a %d-byte reason in place of the Bash output", len(reason))
-	if !strings.HasPrefix(reason, "[xmustard] exit status unknown") || len(reason) > hooks.CodexHookTextBytes ||
+	if !strings.HasPrefix(reason, "[xmustard] exit status unknown") || len(reason) > evidence.CodexHookTextBytes ||
 		strings.Contains(reason, "Full hook output saved to") || !strings.HasPrefix(lines[len(lines)-1], "[xmustard evidence] ") ||
 		!strings.Contains(reason, "--- FAIL: TestParseValue") {
 		t.Fatalf("the model did not get the whole block reason (%d bytes):\n%s\ncodex events:\n%s", len(reason), reason, events)
@@ -314,24 +356,38 @@ func TestCodexHooksEndToEnd(t *testing.T) {
 	if len(capturedObservations(t, f.dir, f.ws)) != 1 {
 		t.Fatal("the Bash output was not captured once")
 	}
-	// what each hook costs Codex beyond its login shell: the client's start, one post
-	// and the daemon's answer (a PreToolUse search with memory and index hits)
-	pre := fmt.Sprintf(`{"session_id":"t","turn_id":"u","transcript_path":null,"cwd":%q,"hook_event_name":"PreToolUse","model":"m",`+
-		`"permission_mode":"default","tool_name":"Bash","tool_input":{"command":"rg -n roundHalfEven src"},"tool_use_id":"c"}`, f.root)
-	var took []time.Duration
-	for range 20 {
-		hook := exec.Command(bin, "codex", "PreToolUse", "--workspace", f.ws)
-		hook.Stdin = strings.NewReader(pre)
-		hook.Env = []string{"XMUSTARD_API_BASE=" + f.srv.URL, "XMUSTARD_API_TOKEN=" + f.agent, "XMUSTARD_HOOK_SOCKET=off"}
-		start := time.Now()
-		out, err := hook.Output()
-		took = append(took, time.Since(start))
-		if err != nil || !bytes.Contains(out, []byte("roundHalfEven")) {
-			t.Fatalf("client run: %v %s", err, out)
+	// what each hook costs Codex beyond its login shell, at the default budgets: the
+	// client's start, one post and the daemon's answer. The PreToolUse is a search with
+	// memory and index hits. The PostToolUse captures a 40 KB test log, about the
+	// preview Codex hands a hook, and must come back as a block: past the budget the
+	// client fails open and the model gets Codex's unreduced preview.
+	timed := func(event, want string, body func(i int) string) {
+		var took []time.Duration
+		for i := range 20 {
+			hook := exec.Command(bin, "codex", event, "--workspace", f.ws)
+			hook.Stdin = strings.NewReader(body(i))
+			hook.Env = []string{"XMUSTARD_API_BASE=" + f.srv.URL, "XMUSTARD_API_TOKEN=" + f.agent, "XMUSTARD_HOOK_SOCKET=off"}
+			start := time.Now()
+			out, err := hook.Output()
+			took = append(took, time.Since(start))
+			if err != nil || !bytes.Contains(out, []byte(want)) {
+				t.Fatalf("%s run %d: %v %.300s", event, i, err, out)
+			}
 		}
+		slices.Sort(took)
+		t.Logf("xmustard-hook codex %s over 20 runs: p50 %v, max %v", event, took[len(took)/2], took[len(took)-1])
 	}
-	sort.Slice(took, func(i, j int) bool { return took[i] < took[j] })
-	t.Logf("xmustard-hook codex PreToolUse over 20 runs: p50 %v, max %v", took[len(took)/2], took[len(took)-1])
+	timed("PreToolUse", "roundHalfEven", func(int) string {
+		return fmt.Sprintf(`{"session_id":"t","turn_id":"u","transcript_path":null,"cwd":%q,"hook_event_name":"PreToolUse","model":"m",`+
+			`"permission_mode":"default","tool_name":"Bash","tool_input":{"command":"rg -n roundHalfEven src"},"tool_use_id":"c"}`, f.root)
+	})
+	timed("PostToolUse", `{"decision":"block","reason":"[xmustard] exit status unknown`, func(i int) string {
+		b, _ := json.Marshal(map[string]any{"session_id": "t", "turn_id": "u", "transcript_path": nil, "cwd": f.root,
+			"hook_event_name": "PostToolUse", "model": "m", "permission_mode": "default", "tool_name": "Bash",
+			"tool_input": map[string]string{"command": "go test ./..."}, "tool_response": fmt.Sprintf("run %d\n", i) + goTestLog(740),
+			"tool_use_id": fmt.Sprintf("call-%d", i)})
+		return string(b)
+	})
 }
 
 func waitListening(t *testing.T, port int) {

@@ -526,6 +526,18 @@ func (c *hookCall) targets() []string {
 	return rels
 }
 
+// moves maps each file the call renames a file to onto that file, both inside the
+// workspace root and relative to it.
+func (c *hookCall) moves() map[string]string {
+	out := map[string]string{}
+	for to, from := range c.in.Moves() {
+		if rt, rf := workspaceops.RelativeToRoot(c.ws, to), workspaceops.RelativeToRoot(c.ws, from); rt != "" && rf != "" {
+			out[rt] = rf
+		}
+	}
+	return out
+}
+
 // memoryContext pushes the served memories recall ranks for a pattern or a path; they
 // come first in a pre-hook's context.
 func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query string, paths []string) (string, map[string]string) {
@@ -608,20 +620,30 @@ func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Su
 
 // baseline keeps the files' syntax errors before an edit (one worker read for all of
 // them). A file that does not exist yet has an empty baseline: every error of the new
-// file is new.
+// file is new. A file an apply_patch renames keeps its errors: the destination, which
+// does not exist yet, takes its source's baseline.
 func (s *hookServer) baseline(ctx context.Context, c *hookCall, rels []string) {
 	raw, err := hookSyntax(ctx, c.ws, rels)
 	files, perr := hooks.ParseSyntax(raw)
 	if err != nil || perr != nil {
 		return
 	}
+	before := map[string][]string{}
 	for _, f := range files {
 		switch f.Status {
 		case "checked":
-			s.sessions.SetBaseline(c.key, f.Path, f.Keys())
+			before[f.Path] = f.Keys()
 		case "unreadable":
-			s.sessions.SetBaseline(c.key, f.Path, nil)
+			before[f.Path] = nil
 		}
+	}
+	for to, from := range c.moves() {
+		if errs, ok := before[from]; ok {
+			before[to] = errs
+		}
+	}
+	for rel, errs := range before {
+		s.sessions.SetBaseline(c.key, rel, errs)
 	}
 }
 

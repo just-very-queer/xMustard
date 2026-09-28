@@ -47,14 +47,15 @@ type ClientPolicy struct {
 // UnitBytes is the MaxUnit of a client that measures replacement text in bytes.
 const UnitBytes = "bytes"
 
-// Codex spills hook text past 2,500 approximate tokens of 4 bytes each: the reason is
-// written to a temp file and the model gets a head-and-tail preview plus the file's
-// path (codex-rs hooks/src/output_spill.rs DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT;
-// utils/string/src/truncate.rs approx_token_count). A whole block reason must fit in
-// codexHookTextBytes; the projection leaves codexFooterReserve of it for the recovery
-// line and the data-framing note.
+// CodexHookTextBytes is the most hook text Codex passes on whole: past 2,500
+// approximate tokens of 4 bytes each it writes the text to a temp file and gives the
+// model a head-and-tail preview plus the file's path (codex-rs
+// hooks/src/output_spill.rs DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT; utils/string/src/truncate.rs
+// approx_token_count). It bounds a whole block reason and, in the hook service, each
+// additionalContext. The projection leaves codexFooterReserve of a reason for the
+// recovery line and the data-framing note.
 const (
-	codexHookTextBytes = 2500 * 4
+	CodexHookTextBytes = 2500 * 4
 	codexFooterReserve = 1536
 )
 
@@ -69,7 +70,7 @@ var clientPolicies = map[string]ClientPolicy{
 		Replacement: "PostToolUse hookSpecificOutput.updatedToolOutput (schema-matched for built-ins)", shaper: claudeShaper{}},
 	// Codex: PostToolUse decision "block" substitutes the reason as the result;
 	// additionalContextLimit defaults to 2,500 tokens and never raises the spill limit
-	"codex": {Client: "codex", Target: codexHookTextBytes - codexFooterReserve, MaxChars: codexHookTextBytes, MaxUnit: UnitBytes,
+	"codex": {Client: "codex", Target: CodexHookTextBytes - codexFooterReserve, MaxChars: CodexHookTextBytes, MaxUnit: UnitBytes,
 		ContextTokens: 2500, Replacement: "PostToolUse decision=block reason", shaper: codexShaper{}},
 	// Cursor replaces MCP results only (updated_mcp_tool_output); built-ins are observe-only
 	"cursor": {Client: "cursor", Target: 16 << 10, MaxChars: 30000, Replacement: "postToolUse updated_mcp_tool_output (MCP tools only)",
@@ -146,7 +147,7 @@ func (p ClientPolicy) capContext(s string) string {
 		n = p.ContextTokens * 3
 	}
 	if p.MaxUnit == UnitBytes {
-		return capBytes(s, n)
+		return CapBytes(s, n)
 	}
 	return capChars(s, n)
 }
@@ -272,8 +273,8 @@ func capChars(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// capBytes cuts s to at most n bytes on a rune boundary, the last three an ellipsis.
-func capBytes(s string, n int) string {
+// CapBytes cuts s to at most n bytes on a rune boundary, the last three an ellipsis.
+func CapBytes(s string, n int) string {
 	const ellipsis = "…"
 	if n <= len(ellipsis) || len(s) <= n {
 		return s
@@ -371,7 +372,9 @@ const codexShell = "Bash"
 // code N" is the only place Codex puts the exit status: the payload has the output
 // text alone (core/src/tools/context.rs, ExecCommandToolOutput). So the reason gives
 // the status when the body carries one and otherwise says it is unknown, rather than
-// let a reduced output read as a finished success.
+// let a reduced output read as a finished success. It does not promise the full
+// output: the handle keeps what Codex handed the hook, its own preview of a long
+// output with the middle already cut.
 func codexStatus(in ShapeInput) string {
 	switch {
 	case in.Tool != codexShell || in.Body == nil:
@@ -379,7 +382,7 @@ func codexStatus(in ShapeInput) string {
 	case in.Body.ExitCode != nil:
 		return fmt.Sprintf("[xmustard] %s exited with code %d. Its output, reduced:", in.Tool, *in.Body.ExitCode)
 	}
-	return "[xmustard] exit status unknown: Codex does not pass it to hooks. The " + in.Tool + " output below is reduced; the last line names the full original."
+	return "[xmustard] exit status unknown: Codex does not pass it to hooks. The " + in.Tool + " output below is reduced; the last line names the captured output (Codex's preview)."
 }
 
 func (codexShaper) validate(_ string, v any) error {

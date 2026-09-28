@@ -83,7 +83,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer, getenv func(string) s
 // workspace to pin (the flag's, else envWorkspace); false for anything else.
 func parseArgs(args []string, envWorkspace string) (route, workspace string, ok bool) {
 	switch {
-	case len(args) == 4 && args[2] == "--workspace" && workspaceID(args[3]):
+	case len(args) == 4 && args[2] == "--workspace" && transport.ValidWorkspaceID(args[3]):
 		envWorkspace = args[3]
 	case len(args) != 2:
 		return "", "", false
@@ -95,24 +95,7 @@ func parseArgs(args []string, envWorkspace string) (route, workspace string, ok 
 }
 
 // segment accepts a path segment of letters, digits, '_' and '-'.
-func segment(s string) bool { return charset(s, 64, "_-") }
-
-// workspaceID accepts an id of the daemon's safe-id characters (letters, digits, '_',
-// '.' and '-'), not "..".
-func workspaceID(s string) bool { return charset(s, 128, "_.-") && !strings.Contains(s, "..") }
-
-// charset reports a non-empty s of at most max letters, digits and extra bytes.
-func charset(s string, max int, extra string) bool {
-	if s == "" || len(s) > max {
-		return false
-	}
-	for _, r := range s {
-		if !('0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || strings.ContainsRune(extra, r)) {
-			return false
-		}
-	}
-	return true
-}
+func segment(s string) bool { return transport.SafeChars(s, 64, "_-") }
 
 func timeout(getenv func(string) string) time.Duration {
 	if ms, err := strconv.Atoi(strings.TrimSpace(getenv("XMUSTARD_HOOK_TIMEOUT_MS"))); err == nil && ms > 0 && ms <= 60000 {

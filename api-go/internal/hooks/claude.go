@@ -136,6 +136,15 @@ func (in Input) Targets() []string {
 	return nil
 }
 
+// Moves maps each file a Codex apply_patch renames a file to onto the file it renames
+// (PatchMoves); no other tool renames.
+func (in Input) Moves() map[string]string {
+	if in.ToolName != "apply_patch" {
+		return nil
+	}
+	return PatchMoves(in.ToolInput.Command, in.Cwd)
+}
+
 // BatchCall is one call of a PostToolBatch.
 type BatchCall struct {
 	ToolName  string    `json:"tool_name"`
