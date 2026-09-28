@@ -55,6 +55,9 @@ type Spec struct {
 	// (the tool computes the whole list). Otherwise the tool pages (search's own
 	// cursor) or does not page (impact: WS-35 owns its paging).
 	Paged bool
+	// Unpaged names the query arguments that select a result with no paged list: limit
+	// and cursor are rejected with them rather than ignored.
+	Unpaged []string
 	// Ladders by result shape, tried in order: the first whose Match member the result
 	// has applies. Every tool ends with a signals-only ladder (Match "").
 	Ladders []*Ladder
@@ -71,7 +74,7 @@ func (s *Spec) Owns() []string {
 // specs is every budgeted tool.
 var specs = map[string]*Spec{
 	"search":  {Tool: "search", DefaultMaxChars: 8000, Ladders: searchLadders},
-	"explain": {Tool: "explain", DefaultMaxChars: 6000, Paged: true, Ladders: explainLadders},
+	"explain": {Tool: "explain", DefaultMaxChars: 6000, Paged: true, Unpaged: []string{"symbol", "uid"}, Ladders: explainLadders},
 	"impact":  {Tool: "impact", DefaultMaxChars: 8000, Ladders: impactLadders},
 }
 
@@ -117,6 +120,19 @@ func (s *Spec) ParseRequest(q url.Values) (Request, *ArgError) {
 		return Request{}, aerr
 	}
 	req.Cursor = strings.TrimSpace(q.Get("cursor"))
+	for _, u := range s.Unpaged {
+		if q.Get(u) == "" {
+			continue
+		}
+		for _, a := range []struct {
+			name string
+			set  bool
+		}{{"limit", req.Limit > 0}, {"cursor", req.Cursor != ""}} {
+			if a.set {
+				return Request{}, &ArgError{Argument: a.name, Reason: fmt.Sprintf("pages a list; a %s= result has none", u)}
+			}
+		}
+	}
 	return req, nil
 }
 

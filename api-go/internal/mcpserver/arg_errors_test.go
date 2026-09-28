@@ -31,12 +31,12 @@ func TestArgumentErrorsAreToolResultsTheAgentCanRead(t *testing.T) {
 			[]string{`unknown argument "bogus" for tool impact.`, "Arguments of impact: workspace_id, symbol, path, from, to, max_depth (1-4)."}},
 		{"impact", map[string]any{"workspace_id": "ws", "symbol": 3}, "must be a string", []string{`"symbol"`, "must be a string"}},
 		{"search", map[string]any{"workspace_id": "ws", "q": "x", "mode": "regex"}, "must be one of: hybrid, pattern",
-			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|pattern), lang, seed, limit (1-50).",
-				"Also accepted (see " + DocsURI + "): cursor, path_glob."}},
+			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|pattern|symbol), lang, seed, limit (1-50).",
+				"Also accepted (see " + DocsURI + "): cursor, path_glob, kinds, depth, include_body, include_info, substring, max_chars."}},
 		{"recall", map[string]any{"workspace_id": "ws", "limit": 0}, "must be between", []string{"must be between 1 and 50 (got 0)"}},
 		{"search", map[string]any{"workspace_id": "ws"}, "required", []string{`missing required argument "q" for search.`, "q (required)"}},
-		{"explain", map[string]any{"workspace_id": "ws", "symbol": "Add"}, "unknown",
-			[]string{"Hint: explain takes a file or directory path; for a symbol, search(q=...) finds it and impact(symbol=...) gives its blast radius."}},
+		{"explain", map[string]any{"workspace_id": "ws", "name": "Add"}, "unknown",
+			[]string{"Hint: explain takes path= (a file or directory), symbol= (a name path such as Store/Capture) or uid=; search(q=...) finds a name."}},
 	} {
 		msg, d := argErr(t, s, c.tool, c.args)
 		if !strings.HasPrefix(d["reason"].(string), c.reason) || d["tool"] != c.tool {
@@ -94,10 +94,10 @@ func TestImpactTakesAFilePath(t *testing.T) {
 		want string
 	}{
 		{map[string]any{"workspace_id": "ws", "path": "api-go/internal/govstore/entries.go"},
-			"/api/workspaces/ws/changes/since-index?path=api-go%2Finternal%2Fgovstore%2Fentries.go"},
-		{map[string]any{"workspace_id": "ws", "path": "a.go", "max_depth": 2}, "/api/workspaces/ws/changes/since-index?path=a.go&depth=2"},
-		{map[string]any{"workspace_id": "ws", "path": "a.go", "symbol": "Add"}, "/api/workspaces/ws/changes/since-index?path=a.go&symbol=Add"},
-		{map[string]any{"path": filepath.Join(root, "pkg", "a.go")}, "/api/workspaces/repo-ws/changes/since-index?path=pkg%2Fa.go"},
+			"/api/workspaces/ws/changes/since-index?path=api-go%2Finternal%2Fgovstore%2Fentries.go&max_chars=8000"},
+		{map[string]any{"workspace_id": "ws", "path": "a.go", "max_depth": 2}, "/api/workspaces/ws/changes/since-index?path=a.go&depth=2&max_chars=8000"},
+		{map[string]any{"workspace_id": "ws", "path": "a.go", "symbol": "Add"}, "/api/workspaces/ws/changes/since-index?path=a.go&symbol=Add&max_chars=8000"},
+		{map[string]any{"path": filepath.Join(root, "pkg", "a.go")}, "/api/workspaces/repo-ws/changes/since-index?path=pkg%2Fa.go&max_chars=8000"},
 	} {
 		res, rerr := call(t, s, "impact", c.args)
 		if rerr != nil || res["isError"] != false {
@@ -109,7 +109,7 @@ func TestImpactTakesAFilePath(t *testing.T) {
 	}
 	// file_path, the spelling agents also try, is repaired onto path
 	res, _ := call(t, s, "impact", map[string]any{"workspace_id": "ws", "file_path": "a.go"})
-	if p := api.lastTool(t).Path; res["isError"] != false || p != "/api/workspaces/ws/changes/since-index?path=a.go" {
+	if p := api.lastTool(t).Path; res["isError"] != false || p != "/api/workspaces/ws/changes/since-index?path=a.go&max_chars=8000" {
 		t.Fatalf("file_path: %v %s", res, p)
 	}
 }

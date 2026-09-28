@@ -15,6 +15,10 @@ var impactTool = &Tool{
 		{Name: "to", Type: typeString, Desc: "trace path to this symbol"},
 		{Name: "max_depth", Type: typeInteger, Min: 1, Max: maxImpactDepth, Desc: "max hops for symbol=/path= (default 4)"},
 	},
+	// The output budget (WS-36): accepted everywhere, listed only in the full schema
+	// profile, documented at DocsURI. WS-35 owns impact's paging.
+	Advanced:    budgetArgs("impact"),
+	Doc:         budgetSpec("impact").Markdown(),
 	Aliases:     map[string]string{"depth": "max_depth"}, // the API's query name
 	PathArg:     "path",
 	Annotations: Annotations{Title: "Estimate change impact", ReadOnly: true},
@@ -41,6 +45,6 @@ var impactTool = &Tool{
 		case a["symbol"] != "":
 			p = query(p, "symbol", a["symbol"], "depth", a["max_depth"])
 		}
-		return "GET", p, ""
+		return "GET", query(p, budgetQuery("impact", a)...), ""
 	},
 }

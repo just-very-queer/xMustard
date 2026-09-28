@@ -239,7 +239,7 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep query (e.g. `$A \u0026\u0026 $A()`; optional lang).",
+      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep (`$A \u0026\u0026 $A()`); mode=symbol: name path A/b.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -248,16 +248,17 @@
             "type": "string"
           },
           "limit": {
-            "description": "max hits (default 25)",
+            "description": "max hits (default 10)",
             "maximum": 50,
             "minimum": 1,
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default) or pattern (ast-grep)",
+            "description": "hybrid (default), pattern (ast-grep) or symbol",
             "enum": [
               "hybrid",
-              "pattern"
+              "pattern",
+              "symbol"
             ],
             "type": "string"
           },
@@ -339,9 +340,6 @@
             "type": "string"
           }
         },
-        "required": [
-          "path"
-        ],
         "type": "object"
       },
       "name": "explain",

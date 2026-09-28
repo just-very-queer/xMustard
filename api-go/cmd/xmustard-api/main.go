@@ -2707,45 +2707,24 @@ func registerRoutes(mux routeRegistrar) {
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/explain-path", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ExplainPathCtx(
-			r.Context(),
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-			r.URL.Query().Get("path"),
-		)
+		// explain (WS-36): ?path= a file (its explanation, outline and cluster) or a
+		// directory (its outline); ?symbol= a name path or ?uid= a symbol's context.
+		// The output budget and paging (max_chars, limit, cursor) are the tool budget
+		// middleware's (tool_budget_routes.go).
+		req, err := workspaceops.ParseExplain(r.URL.Query(), callerOf(r).ID)
 		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace or path not found",
-				})
-				return
-			}
-			// A path that escapes the workspace (or other bad input) is a 400, not a 500.
-			if workspaceops.IsInvalidInput(err) {
-				writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
-				return
-			}
 			respondError(w, err)
 			return
 		}
-		// enrich with the file's community cluster (its functional neighbourhood),
-		// so explain answers "where does this file sit in the repo", and with the
-		// freshness and coverage of the code graph behind it — best-effort.
-		path := r.URL.Query().Get("path")
-		graph, gerr := workspaceops.PathGraphCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), workspaceID, path)
-		if gerr != nil {
-			writeJSON(w, http.StatusOK, result)
+		result, err := workspaceops.ExplainCtx(r.Context(), envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), req)
+		if errors.Is(err, os.ErrNotExist) {
+			writeJSON(w, http.StatusNotFound, map[string]any{"error": "Workspace or path not found"})
 			return
 		}
-		if graph.Cluster != nil {
-			writeJSON(w, http.StatusOK, map[string]any{
-				"explanation": result, "cluster": graph.Cluster,
-				"freshness": graph.Freshness, "coverage": graph.Coverage,
-			})
+		if err != nil {
+			respondError(w, err)
 			return
 		}
-		result.Freshness, result.Coverage = graph.Freshness, graph.Coverage
 		writeJSON(w, http.StatusOK, result)
 	})
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/clusters", func(w http.ResponseWriter, r *http.Request) {
@@ -4002,7 +3981,7 @@ func registerRoutes(mux routeRegistrar) {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "q query param required"})
 			return
 		}
-		limit := 25
+		limit := workspaceops.DefaultSearchLimit
 		if v := r.URL.Query().Get("limit"); v != "" {
 			if n, err := strconv.Atoi(v); err == nil {
 				limit = n
@@ -4012,6 +3991,12 @@ func registerRoutes(mux routeRegistrar) {
 		var result json.RawMessage
 		var err error
 		switch {
+		case r.URL.Query().Get("mode") == "symbol":
+			// name-path lookup over the code index (WS-36): q is a name path
+			var req workspaceops.SymbolSearchRequest
+			if req, err = workspaceops.ParseSymbolSearch(r.URL.Query(), limit); err == nil {
+				result, err = workspaceops.SymbolSearchCtx(r.Context(), dd, r.PathValue("workspace_id"), req)
+			}
 		case r.URL.Query().Get("mode") == "pattern":
 			// structural AST search: the query is an ast-grep pattern (e.g. `$A && $A()`).
 			pat, perr := workspaceops.SearchSemanticPatternCtx(r.Context(), dd, r.PathValue("workspace_id"), query, r.URL.Query().Get("lang"), r.URL.Query().Get("path"), limit)

@@ -469,6 +469,8 @@ func TestParseRequestRejectsNeverClamps(t *testing.T) {
 		{explain, "limit=0", "limit"},
 		{explain, "limit=501", "limit"},
 		{explain, "cursor=a&cursor=b", "cursor"},
+		{explain, "symbol=Store/Capture&limit=5", "limit"},
+		{explain, "uid=Function:a.go:F%230&cursor=x", "cursor"},
 	}
 	for _, c := range cases {
 		q, _ := url.ParseQuery(c.q)

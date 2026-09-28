@@ -135,14 +135,14 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep query (e.g. `$A && $A()`; optional lang).",
+			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path A/b.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the search query" },
-			{ name: "mode", type: "string", enum: ["hybrid", "pattern"], desc: "hybrid (default) or pattern (ast-grep)" },
+			{ name: "mode", type: "string", enum: ["hybrid", "pattern", "symbol"], desc: "hybrid (default), pattern (ast-grep) or symbol" },
 			{ name: "lang", type: "string", desc: "language hint for pattern mode" },
 			{ name: "seed", type: "string", desc: "symbol to anchor the graph-proximity lane" },
-			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 25)" },
+			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 10)" },
 		],
 		build: (a) => ({
 			method: "GET",
@@ -157,7 +157,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "explain",
 		description: "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.",
-		args: [workspaceArg, { name: "path", type: "string", required: true, maxLength: 4096, desc: "a repo-relative file or directory path" }],
+		// symbol=, uid=, depth and the output budget are MCP advanced arguments this closed
+		// schema does not carry; path answers a file or a directory.
+		args: [workspaceArg, { name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file or directory path" }],
 		build: (a) => ({ method: "GET", path: query(ws(a, "/explain-path"), "path", str(a, "path")) }),
 	},
 	{

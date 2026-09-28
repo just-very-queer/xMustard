@@ -40,6 +40,7 @@
 
 pub mod chunks;
 pub mod config;
+pub mod context;
 pub mod csr;
 pub mod docs;
 pub mod edges;
@@ -52,7 +53,9 @@ pub mod impact;
 pub mod lang;
 pub mod lexical;
 pub mod meta;
+pub mod namepath;
 pub mod names;
+pub mod overview;
 pub mod reader;
 pub mod refresh_queue;
 pub mod rerank;
