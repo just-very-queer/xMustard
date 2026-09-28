@@ -1,8 +1,10 @@
 package main
 
 import (
+	"bytes"
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -149,10 +151,13 @@ func isExecutableFile(p string) bool {
 	return err == nil && fi.Mode().IsRegular() && fi.Mode().Perm()&0o111 != 0
 }
 
-// setupReport is what setup prints: the install, plus the MCP binding for --root.
+// setupReport is what setup prints: the install, plus root's client binding for
+// --root as `mcp-config` prints it. MCP is the mcpServers form; a client with its own
+// config syntax (Codex's config.toml table) gets that text in MCPConfig instead.
 type setupReport struct {
 	daemon.InstallReport
-	MCP map[string]any `json:"mcp,omitempty"`
+	MCP       json.RawMessage `json:"mcp,omitempty"`
+	MCPConfig string          `json:"mcp_config,omitempty"`
 }
 
 // runSetup installs (or upgrades) the daemon and waits until it answers.
@@ -193,33 +198,31 @@ func runSetup(e lifecycleEnv, args []string) int {
 	if !isExecutableFile(spec.APIBin) {
 		return e.fail(fmt.Errorf("%s is not an executable file", spec.APIBin))
 	}
-	binding, err := clientBinding(*root, *client, spec.BaseURL())
+	out, err := clientBinding(*root, *client, spec.BaseURL())
 	if err != nil {
 		return e.fail(err)
 	}
-	report, err := e.installer(p, f.wait).Install(context.Background(), spec)
-	if err != nil {
+	if out.InstallReport, err = e.installer(p, f.wait).Install(context.Background(), spec); err != nil {
 		return e.fail(err)
 	}
-	return e.emit(setupReport{InstallReport: report, MCP: binding})
+	return e.emit(out)
 }
 
-// clientBinding is the mcpServers entry binding root's workspace to the daemon's
-// Streamable HTTP endpoint (the mcp-config shape); nil without --root.
-func clientBinding(root, client, api string) (map[string]any, error) {
+// clientBinding renders what `mcp-config --root --api --client` prints, binding root's
+// workspace to the daemon's Streamable HTTP endpoint; nothing without --root.
+func clientBinding(root, client, api string) (setupReport, error) {
 	if root == "" {
-		return nil, nil
+		return setupReport{}, nil
 	}
-	if !filepath.IsAbs(root) {
-		return nil, errors.New("--root must be absolute")
+	var b bytes.Buffer
+	if err := writeMCPConfig(&b, []string{"--root", root, "--api", api, "--client", client}); err != nil {
+		return setupReport{}, err
 	}
-	if client != "" {
-		if _, err := mcpserver.ParseClientProfile(client); err != nil {
-			return nil, err
-		}
+	profile, _ := mcpserver.ParseClientProfile(client) // writeMCPConfig accepted it
+	if _, own := mcpConfigWriters[profile]; own {
+		return setupReport{MCPConfig: b.String()}, nil
 	}
-	entry, _ := mcpEntry("http", api, mcpserver.WorkspaceIDForPath(filepath.Clean(root)), client, "")
-	return map[string]any{"mcpServers": map[string]any{"xmustard": entry}}, nil
+	return setupReport{MCP: b.Bytes()}, nil
 }
 
 func parseEnvFlags(kvs []string) (map[string]string, error) {

@@ -291,3 +291,33 @@ func TestSetupBinaryPrefersAStableLinkToTheSibling(t *testing.T) {
 		}
 	}
 }
+
+// setup --root prints the binding exactly as mcp-config does: the mcpServers JSON, or,
+// for a client with its own config syntax (Codex), that text in mcp_config.
+func TestSetupClientBindingFollowsMcpConfig(t *testing.T) {
+	root, api := t.TempDir(), "http://127.0.0.1:8042"
+	for _, c := range []struct {
+		client string
+		field  func(setupReport) string
+		prefix string
+	}{
+		{"claude-code", func(r setupReport) string { return string(r.MCP) }, `{`},
+		{"", func(r setupReport) string { return string(r.MCP) }, `{`},
+		{"codex", func(r setupReport) string { return r.MCPConfig }, "[mcp_servers.xmustard]\n"},
+	} {
+		r, err := clientBinding(root, c.client, api)
+		if err != nil {
+			t.Fatalf("%q: %v", c.client, err)
+		}
+		var want bytes.Buffer
+		if err := writeMCPConfig(&want, []string{"--root", root, "--api", api, "--client", c.client}); err != nil {
+			t.Fatal(err)
+		}
+		if got := c.field(r); got != want.String() || !strings.HasPrefix(got, c.prefix) || (len(r.MCP) > 0) == (r.MCPConfig != "") {
+			t.Errorf("%q: binding %+v, want mcp-config's output:\n%s", c.client, r, want.String())
+		}
+	}
+	if r, err := clientBinding("", "codex", api); err != nil || r.MCP != nil || r.MCPConfig != "" {
+		t.Fatalf("no --root: %+v %v", r, err)
+	}
+}

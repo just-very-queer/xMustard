@@ -29,31 +29,53 @@ func TestParseOpencodeModelsOutputAcceptsJSONArray(t *testing.T) {
 	}
 }
 
-func TestSanitizeCodexArgsMatchesPythonExpectations(t *testing.T) {
-	sanitized, err := sanitizeCodexArgs("--approval-mode full-auto -m gpt-5.2 --sandbox-mode read-only --profile bugfix --json")
+func TestSanitizeCodexArgsDropsPinnedAndPassesAllowedFlags(t *testing.T) {
+	sanitized, err := sanitizeCodexArgs(`--approval-mode full-auto -m gpt-5.2 --sandbox-mode read-only --json --ephemeral --color "never" --model=gpt-5.2 --cwd=/tmp/repo --sandbox read-only --local-provider=ollama exec`)
 	if err != nil {
 		t.Fatalf("sanitize codex args: %v", err)
 	}
-	expected := []string{"--profile", "bugfix"}
+	expected := []string{"--ephemeral", "--color=never", "--local-provider=ollama"}
 	if !slices.Equal(sanitized, expected) {
 		t.Fatalf("unexpected sanitized args: %#v", sanitized)
 	}
 }
 
-func TestSanitizeCodexArgsPreservesQuotedValuesAndBlocksEqualsFlags(t *testing.T) {
-	sanitized, err := sanitizeCodexArgs(`--profile "bug fix" --model=gpt-5.2 --cwd=/tmp/repo --approval-mode=full-auto --sandbox read-only --config=fast`)
-	if err != nil {
-		t.Fatalf("sanitize codex args with quotes: %v", err)
-	}
-	expected := []string{"--profile", "bug fix", "--config=fast"}
-	if !slices.Equal(sanitized, expected) {
-		t.Fatalf("unexpected sanitized args with quotes: %#v", sanitized)
+// Every flag that widens what a codex run may touch is refused, not dropped: codex_args
+// is an allow-list (C11 of the 2026-09-28 integrations comparison).
+func TestSanitizeCodexArgsRefusesUnlistedFlags(t *testing.T) {
+	for _, raw := range []string{
+		"--dangerously-bypass-approvals-and-sandbox", "--yolo", "--dangerously-bypass-hook-trust",
+		"--approve-for-me", "--not-so-yolo", "--add-dir /etc", "--add-dir=/etc",
+		"-c sandbox_mode=danger-full-access", `--config=sandbox_mode="danger-full-access"`, "--config=fast",
+		"-p bugfix", "--profile bugfix", "--ignore-rules", "-o /tmp/out", "--output-last-message=/tmp/out", "--worktree",
+		"-i a.png", "resume", "--", "-mgpt-5.2", "-sdanger-full-access",
+		"--color purple", "--color", "--ephemeral=yes", "--local-provider --yolo",
+	} {
+		_, err := sanitizeCodexArgs(raw)
+		if !IsInvalidInput(err) {
+			t.Errorf("%q: got %v, want an invalid-input refusal", raw, err)
+		}
 	}
 }
 
 func TestSanitizeCodexArgsRejectsUnclosedQuotes(t *testing.T) {
-	if _, err := sanitizeCodexArgs(`--profile "bug fix`); err == nil {
-		t.Fatalf("expected unclosed quote error")
+	if _, err := sanitizeCodexArgs(`--color "never`); !IsInvalidInput(err) {
+		t.Fatalf("expected an unclosed quote refusal, got %v", err)
+	}
+}
+
+func TestUpdateSettingsRefusesUnsafeCodexArgs(t *testing.T) {
+	dir := t.TempDir()
+	bad := "--yolo"
+	if _, err := UpdateSettings(dir, AppSettings{CodexArgs: &bad}); !IsInvalidInput(err) {
+		t.Fatalf("--yolo saved: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "settings.json")); !os.IsNotExist(err) {
+		t.Fatalf("refused settings were written: %v", err)
+	}
+	ok := "--ephemeral"
+	if got, err := UpdateSettings(dir, AppSettings{CodexArgs: &ok}); err != nil || got.CodexArgs == nil || *got.CodexArgs != ok {
+		t.Fatalf("allowed codex_args: %+v %v", got, err)
 	}
 }
 

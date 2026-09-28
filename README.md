@@ -95,6 +95,10 @@ the project's workspace, because HTTP has no working directory to resolve it fro
 xmustard-ops mcp-config --root "$PWD" [--client claude-code] [--mode readonly] [--transport relay]
 ```
 
+It prints the form the client's config file takes: a `[mcp_servers.xmustard]` table
+for Codex's `~/.codex/config.toml` with `--client codex`, the JSON `mcpServers` entry
+otherwise.
+
 ```jsonc
 // .mcp.json / client config: URL-capable client
 {
@@ -116,6 +120,15 @@ xmustard-ops mcp-config --root "$PWD" [--client claude-code] [--mode readonly] [
     }
   }
 }
+```
+
+```toml
+# ~/.codex/config.toml (--client codex). Codex sends no MCP roots, so the workspace
+# header is what binds the project; the token is read from the named variable.
+[mcp_servers.xmustard]
+url = "http://127.0.0.1:8042/mcp?client=codex&workspace=<id>"
+bearer_token_env_var = "XMUSTARD_API_TOKEN"
+http_headers = { "X-Xmustard-Workspace" = "<id>" }
 ```
 
 Query parameters on `/mcp` (the relay's flags of the same names): `workspace=<id>`
@@ -268,3 +281,10 @@ and the [evidence-gated backlog](docs/ROADMAP.md).
   stdio server; calls the Rust core for the heavy work.
 - **Postgres** — durable semantic and operational index (JSON files remain the
   source of truth; Postgres is the queryable materialization).
+
+## License
+
+MIT (see [LICENSE](LICENSE)), except files whose header names another licence:
+the finding-anchoring files in `api-go/internal/anchor/` are Apache-2.0
+translations of [open-code-review](https://github.com/alibaba/open-code-review).
+See [NOTICE](NOTICE).

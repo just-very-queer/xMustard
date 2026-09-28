@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -836,34 +837,63 @@ func parseOpencodeModelsOutput(output string) []string {
 	return normalized
 }
 
+// codexPinnedArgs are the flags buildRuntimeCommand sets itself (model, working root,
+// sandbox, approval, JSON output): an admin's copy is dropped, with its value when
+// the flag takes one (true).
+var codexPinnedArgs = map[string]bool{
+	"exec": false, "--json": false, "--experimental-json": false, "--skip-git-repo-check": false,
+	"-m": true, "--model": true, "-C": true, "--cd": true, "--cwd": true,
+	"-s": true, "--sandbox": true, "--sandbox-mode": true, "-a": true, "--ask-for-approval": true, "--approval-mode": true,
+}
+
+// codexAllowedArgs are the other flags codex_args may pass, each with the values it
+// may take (nil: a switch). Anything else is refused.
+var codexAllowedArgs = map[string][]string{
+	"--ephemeral": nil, "--strict-config": nil, "--oss": nil,
+	"--color": {"always", "never", "auto"}, "--local-provider": {"lmstudio", "ollama"},
+}
+
+// sanitizeCodexArgs checks the admin-set codex_args (POST /api/settings), which
+// reach `codex exec` on the platform profile only. It is an allow-list: codex flags
+// can widen what a run may touch (--dangerously-bypass-approvals-and-sandbox/--yolo,
+// --dangerously-bypass-hook-trust, --approve-for-me/--not-so-yolo, --add-dir,
+// -c/--config overrides such as sandbox_mode, -p/--profile config layers,
+// --ignore-rules, -o/--output-last-message writing a file anywhere, --worktree), so
+// a flag that is neither pinned nor allowed is refused, never passed (codex-rs
+// utils/cli/src/shared_options.rs, exec/src/cli.rs).
 func sanitizeCodexArgs(raw string) ([]string, error) {
 	fields, err := splitShellArgs(raw)
 	if err != nil {
-		return nil, fmt.Errorf("codex args: %w", err)
+		return nil, Invalid("codex_args: " + err.Error())
 	}
-	blockedWithValue := map[string]struct{}{
-		"-m": {}, "--model": {}, "-C": {}, "--cd": {}, "--cwd": {}, "-s": {}, "--sandbox": {}, "--sandbox-mode": {},
-		"-a": {}, "--ask-for-approval": {}, "--approval-mode": {},
-	}
-	blockedExact := map[string]struct{}{"exec": {}, "--json": {}, "--skip-git-repo-check": {}}
 	result := []string{}
-	skipNext := false
-	for _, field := range fields {
-		if skipNext {
-			skipNext = false
+	for i := 0; i < len(fields); i++ {
+		name, value, inline := strings.Cut(fields[i], "=")
+		if takesValue, pinned := codexPinnedArgs[name]; pinned {
+			if takesValue && !inline {
+				i++ // its value is dropped with it
+			}
 			continue
 		}
-		if _, blocked := blockedWithValue[field]; blocked {
-			skipNext = true
+		allowed, ok := codexAllowedArgs[name]
+		switch {
+		case !ok:
+			return nil, Invalid(fmt.Sprintf("codex_args: %q is not an allowed codex exec flag (allowed: %s)", name, strings.Join(slices.Sorted(maps.Keys(codexAllowedArgs)), ", ")))
+		case allowed == nil && inline:
+			return nil, Invalid(fmt.Sprintf("codex_args: %s takes no value", name))
+		case allowed == nil:
+			result = append(result, name)
 			continue
+		case !inline && i+1 == len(fields):
+			return nil, Invalid(fmt.Sprintf("codex_args: %s needs a value", name))
+		case !inline:
+			i++
+			value = fields[i]
 		}
-		if _, blocked := blockedExact[field]; blocked {
-			continue
+		if !slices.Contains(allowed, value) {
+			return nil, Invalid(fmt.Sprintf("codex_args: %s takes one of %s, not %q", name, strings.Join(allowed, ", "), value))
 		}
-		if hasBlockedFlagValue(field, blockedWithValue) {
-			continue
-		}
-		result = append(result, field)
+		result = append(result, name+"="+value)
 	}
 	return result, nil
 }
@@ -1076,15 +1106,6 @@ func splitShellArgs(raw string) ([]string, error) {
 	}
 	flush()
 	return args, nil
-}
-
-func hasBlockedFlagValue(arg string, blockedWithValue map[string]struct{}) bool {
-	for flag := range blockedWithValue {
-		if strings.HasPrefix(arg, flag+"=") {
-			return true
-		}
-	}
-	return false
 }
 
 func parsePlanJSON(text string) (*planCommandResult, bool) {
