@@ -137,6 +137,7 @@ func TestWorkerWatcherHandsOutBatchesWithTheRealCore(t *testing.T) {
 	t.Setenv("XMUSTARD_CORE_WORKER", "1")
 	resetWorker()
 	t.Cleanup(resetWorker)
+	t.Cleanup(forgetWatched)
 	prev := refreshDue.Load()
 	t.Cleanup(func() { refreshDue.Store(prev) })
 	due := make(chan string, 16)
@@ -184,4 +185,47 @@ func TestWorkerWatcherHandsOutBatchesWithTheRealCore(t *testing.T) {
 	if forced := TakeRefresh(ctx, root, true); forced == nil || !forced.Empty() {
 		t.Fatalf("a forced take with nothing pending is an empty batch: %+v", forced)
 	}
+}
+
+// A replacement worker (the governor recycles the worker, and its watchers go with it)
+// registers the roots its predecessor watched before it takes a call, so a read that
+// lands on it still finds its root watched.
+func TestANewWorkerWatchesTheRootsItsPredecessorWatched(t *testing.T) {
+	core := realCore(t)
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	resetWorker()
+	t.Cleanup(resetWorker)
+	t.Cleanup(forgetWatched)
+	root, err := filepath.EvalSymlinks(gitFixture(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	WatchRoot(ctx, root)
+	first := coreWorker.runningPID()
+	if first == 0 || !Watched(root) {
+		t.Fatal("the root was not registered with the first worker")
+	}
+	resetWorker() // the worker exits, as a recycle ends it
+	out, err := runCoreCtx(ctx, watchSub, "status", root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st struct {
+		State string `json:"watcher_state"`
+	}
+	if err := json.Unmarshal(out, &st); err != nil {
+		t.Fatal(err)
+	}
+	if second := coreWorker.runningPID(); second == first || second == 0 || !Watched(root) || st.State == "absent" || st.State == "" {
+		t.Fatalf("the new worker (pid %d after %d) does not watch the root: registered %v, state %q", second, first, Watched(root), st.State)
+	}
+}
+
+// forgetWatched drops every root registration (the registry outlives a test's worker).
+func forgetWatched() {
+	watchedRoots.Lock()
+	defer watchedRoots.Unlock()
+	clear(watchedRoots.roots)
 }

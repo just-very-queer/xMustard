@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"maps"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
+
+	"xmustard/api-go/internal/budget"
 )
 
 // The watcher's refresh loop, orchestrator side (WS-15, PAR-FRESH-03). The resident
@@ -21,9 +25,9 @@ import (
 //
 // A watcher lives in the worker process, so everything here needs the live worker:
 // with it off (XMUSTARD_CORE_WORKER unset) or unavailable nothing is watched, and reads
-// refresh the index on their own. A worker that exits takes its watchers with it; the
-// next read registers the root with the new worker, whose start-up batch refreshes the
-// whole tree.
+// refresh the index on their own. A worker that exits takes its watchers with it; its
+// replacement registers the same roots before it takes a call (rewatch), and their
+// start-up batches refresh the whole tree.
 
 // RefreshBatch is a batch taken from a root's watcher.
 type RefreshBatch struct {
@@ -107,6 +111,23 @@ func unwatched(root string, pid int) {
 	defer watchedRoots.Unlock()
 	if watchedRoots.roots[root] == pid {
 		delete(watchedRoots.roots, root)
+	}
+}
+
+// rewatch registers with the new worker p, before it takes any call, the roots earlier
+// workers watched: the governor recycles the worker, and its watchers go with it. A
+// read that lands on p then still finds its root watched, and the root's start-up batch
+// checks the whole tree for what changed while nobody watched.
+func (p *workerProc) rewatch(ctx context.Context) {
+	watchedRoots.Lock()
+	roots := slices.Collect(maps.Keys(watchedRoots.roots))
+	watchedRoots.Unlock()
+	scope := budget.NewScope(nil)
+	defer scope.Close()
+	for _, root := range roots {
+		if r := p.call(ctx, scope, nil, 0, watchSub, []string{"start", root}); r.err == nil && r.rpcErr == nil {
+			setWatched(root, p.pid)
+		}
 	}
 }
 

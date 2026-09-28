@@ -693,6 +693,7 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 		}
 	}
 	p.started.Store(true)
+	p.rewatch(hctx)
 	return p, nil
 }
 
