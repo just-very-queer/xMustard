@@ -138,9 +138,13 @@ func DescribeRemember(dataDir, workspaceID string, req RememberRequest) (HumanCo
 		if err := validateSafeID("entry", req.EntryID); err != nil {
 			return HumanConfirmation{}, err
 		}
+		load := loadEntryTx // edit and retire need an active entry; restore brings one back
+		if op == "restore" {
+			load = loadAnyEntryTx
+		}
 		ctx := context.Background()
 		err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-			e, _, err := loadAnyEntryTx(ctx, r, workspaceID, req.EntryID)
+			e, _, err := load(ctx, r, workspaceID, req.EntryID)
 			if err == nil {
 				lines = append(lines, fmt.Sprintf("memory: %s, served revision %d, %s, %s, title %s", e.ID, e.Revision,
 					e.Status, e.Lifecycle, shownText(e.Title)))

@@ -79,14 +79,23 @@ func TestHumanConfirmationShowsTheWriteAndPinsTheRevision(t *testing.T) {
 		t.Fatalf("propose confirmation: %v\n%s", err, prop.Text)
 	}
 
-	// a write that cannot run fails as it would
+	// a write that cannot run fails as it would; only restore reads a retracted entry
+	gone := promoted(t, dir, ws, "author", "tests need docker")
+	if _, err := RetractContext(dir, ws, gone.ID, "wrong", ContextActor{ID: "root", Admin: true}); err != nil {
+		t.Fatal(err)
+	}
+	if back, err := DescribeRemember(dir, ws, RememberRequest{Op: "restore", EntryID: gone.ID, Reason: "right after all"}); err != nil ||
+		!strings.Contains(back.Text, "retracted") {
+		t.Fatalf("restore of a retracted entry: %v\n%s", err, back.Text)
+	}
 	for name, tc := range map[string]struct {
 		req  RememberRequest
 		want error
 	}{
-		"unknown op":    {RememberRequest{Op: "bless"}, ErrInvalidInput},
-		"unsafe entry":  {RememberRequest{Op: "retire", EntryID: "../x"}, ErrInvalidInput},
-		"missing entry": {RememberRequest{Op: "retire", EntryID: "ctx_missing"}, os.ErrNotExist},
+		"unknown op":        {RememberRequest{Op: "bless"}, ErrInvalidInput},
+		"unsafe entry":      {RememberRequest{Op: "retire", EntryID: "../x"}, ErrInvalidInput},
+		"missing entry":     {RememberRequest{Op: "retire", EntryID: "ctx_missing"}, os.ErrNotExist},
+		"edit of a retired": {RememberRequest{Op: "edit", EntryID: gone.ID, NewString: "x"}, os.ErrNotExist},
 	} {
 		if _, err := DescribeRemember(dir, ws, tc.req); !errors.Is(err, tc.want) {
 			t.Fatalf("%s: want %v, got %v", name, tc.want, err)
