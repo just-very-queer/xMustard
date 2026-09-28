@@ -530,7 +530,7 @@ func (s *hookServer) afterEdit(ctx context.Context, c *hookCall) hookResult {
 	if rel == "" {
 		return hookResult{}
 	}
-	workspaceops.NoteDirtyPaths(c.ws.Scope, []string{rel})
+	workspaceops.NoteChangedPaths(ctx, c.ws.Scope, []string{rel})
 	before, had := s.sessions.TakeBaseline(c.key, rel)
 	raw, err := hookSyntax(ctx, c.ws, []string{rel})
 	files, perr := hooks.ParseSyntax(raw)
@@ -557,7 +557,7 @@ func (s *hookServer) afterCapture(ctx context.Context, c *hookCall) hookResult {
 		res.after = func(r *http.Request) { recordCaptureOutcome(r, s.store, c.ws.WorkspaceID, false, obs) }
 	}
 	if hooks.ClassOf(c.in.ToolName) == hooks.ToolShell {
-		parts = append(parts, s.afterShell(c))
+		parts = append(parts, s.afterShell(ctx, c))
 	}
 	res.context = hooks.Compose(parts...)
 	return res
@@ -565,7 +565,7 @@ func (s *hookServer) afterCapture(ctx context.Context, c *hookCall) hookResult {
 
 // afterShell feeds the dirty set from the command's changed files (Claude Code's
 // bashEditDiff) and gives the post-git notice when the command moved HEAD.
-func (s *hookServer) afterShell(c *hookCall) string {
+func (s *hookServer) afterShell(ctx context.Context, c *hookCall) string {
 	var diff struct {
 		ToolResponse struct {
 			BashEditDiff struct {
@@ -580,7 +580,7 @@ func (s *hookServer) afterShell(c *hookCall) string {
 				rels = append(rels, rel)
 			}
 		}
-		workspaceops.NoteDirtyPaths(c.ws.Scope, rels)
+		workspaceops.NoteChangedPaths(ctx, c.ws.Scope, rels)
 	}
 	verb := hooks.GitHeadMove(c.in.ToolInput.Command)
 	if verb == "" {
@@ -670,18 +670,18 @@ func (s *hookServer) cwdChanged(ctx context.Context, c *hookCall) hookResult {
 	return hookResult{watch: watchPaths(c.ws, idx.Anchors)}
 }
 
-// fileChanged feeds the dirty set.
-func (s *hookServer) fileChanged(_ context.Context, c *hookCall) hookResult {
+// fileChanged feeds the dirty set: the watcher's pending batch (NoteChangedPaths).
+func (s *hookServer) fileChanged(ctx context.Context, c *hookCall) hookResult {
 	if !c.bound {
 		return hookResult{}
 	}
 	if rel := workspaceops.RelativeToRoot(c.ws, c.in.FilePath); rel != "" {
-		workspaceops.NoteDirtyPaths(c.ws.Scope, []string{rel})
+		workspaceops.NoteChangedPaths(ctx, c.ws.Scope, []string{rel})
 	}
 	return hookResult{}
 }
 
-// worktreeRemove forgets a removed worktree's cached identity and dirty set.
+// worktreeRemove forgets a removed worktree's cached identity.
 func (s *hookServer) worktreeRemove(_ context.Context, c *hookCall) hookResult {
 	if p := c.in.WorktreePath; filepath.IsAbs(p) {
 		workspaceops.ForgetRoot(filepath.Clean(p))

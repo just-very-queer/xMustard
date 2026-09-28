@@ -23,11 +23,11 @@ rewrites a tool call.
 | `UserPromptSubmit` | http | Pushes the memories that a keyword in the prompt triggers. A memory tagged `trigger-deploy` is pushed when the prompt says "deploy". |
 | `PreToolUse` (Grep, Glob, Bash, Read, Edit, Write, NotebookEdit) | http | For Grep, Glob and a Bash `rg`/`grep`: the index hits (BM25, names, graph proximity) and memories for the pattern. For Read and Edit: the memories bound to the file, stale ones labeled. Before an edit, it records the file's syntax errors. A burst of searches earns one nudge toward `search`/`impact` (2-minute cooldown). |
 | `PostToolUse` (Bash, Read, Grep, Glob, WebFetch, other servers' MCP tools) | http | Captures the output (redacted, retained behind a handle for about a day) and, when it was reduced, returns a shape-matched `updatedToolOutput` whose last line names the handle. A test, build or lint output is recorded as a run outcome. A git commit, merge, rebase, cherry-pick or pull adds a freshness notice. |
-| `PostToolUse` (Edit, Write, NotebookEdit) | http | Adds the file to the dirty set and reports the syntax errors the edit introduced (tree-sitter). |
+| `PostToolUse` (Edit, Write, NotebookEdit) | http | Adds the file to the index watcher's pending batch and reports the syntax errors the edit introduced (tree-sitter). |
 | `PostToolUseFailure` (Bash) | http | Records the failure as a run outcome and names the failing tests it parsed. |
 | `PostToolBatch` | http | Nudges once when one parallel batch ran several searches. |
 | `CwdChanged` | http | Returns the `watchPaths` of the new directory's workspace. |
-| `FileChanged` | http | Adds the file to the dirty set. The next read re-samples the repository identity. |
+| `FileChanged` | http | Adds the file to the index watcher's pending batch (when a watcher runs). The next read re-samples the repository identity. |
 | `WorktreeRemove` | command | Forgets the worktree's cached identity. It is a command hook because the client always exits 0, and a failing WorktreeRemove hook blocks the removal. |
 | `PreCompact`, `PostCompact`, `Stop`, `SubagentStop`, `SessionEnd` | http | Queued and answered at once (SessionEnd hooks share a 1.5 s budget). After compaction, memories may be pushed again. |
 

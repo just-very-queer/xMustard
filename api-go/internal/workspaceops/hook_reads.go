@@ -11,8 +11,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/rustcore"
@@ -240,86 +238,25 @@ func ReadHookMemoryIndex(ctx context.Context, dataDir, workspaceID string) (Hook
 	return idx, nil
 }
 
-// The dirty set (PAR-FRESH-07): paths the client reported changing (FileChanged, the
-// edit tools, a Bash command's changed files) since the refresh loop last took them.
-// Noting a path also drops the root's cached repository identity, so the next read
-// samples it instead of trusting the cache for up to its TTL (PAR-RT-12). The set is
-// bounded: past maxDirtyPaths a root is marked overflowed, which tells the consumer
-// (WS-15's refresh loop) to run a full check.
-const (
-	maxDirtyPaths = 4096
-	maxDirtyRoots = 64
-)
-
-type dirtyRoot struct {
-	paths    map[string]time.Time
-	overflow bool
-	used     time.Time
-}
-
-var dirtySet = struct {
-	sync.Mutex
-	roots map[string]*dirtyRoot
-}{roots: map[string]*dirtyRoot{}}
-
-// NoteDirtyPaths records root-relative paths as changed and invalidates the root's
-// cached identity. It returns how many paths the root now holds.
-func NoteDirtyPaths(root string, rels []string) int {
+// NoteChangedPaths records root-relative paths a client reported changed
+// (PAR-FRESH-07: a hook's FileChanged, an edit, a Bash command's changed files). When
+// the resident worker's watcher watches root they join its pending batch, the dirty
+// set the refresh loop takes (WS-15, `watch note`); with no watcher, reads refresh the
+// whole tree as before. Either way the root's cached repository identity is dropped,
+// so the next read samples it instead of trusting the cache for up to its TTL
+// (PAR-RT-12). It starts no process, and reports whether a watcher took the paths.
+func NoteChangedPaths(ctx context.Context, root string, rels []string) bool {
 	if root == "" || len(rels) == 0 {
-		return 0
+		return false
 	}
 	InvalidateRepoIdentity(root)
-	now := time.Now()
-	dirtySet.Lock()
-	defer dirtySet.Unlock()
-	d := dirtySet.roots[root]
-	if d == nil {
-		if len(dirtySet.roots) >= maxDirtyRoots {
-			evictDirtyRoot()
-		}
-		d = &dirtyRoot{paths: map[string]time.Time{}}
-		dirtySet.roots[root] = d
-	}
-	d.used = now
-	for _, p := range rels {
-		if len(d.paths) >= maxDirtyPaths {
-			d.overflow = true
-			break
-		}
-		d.paths[p] = now
-	}
-	return len(d.paths)
+	return rustcore.NoteChanged(ctx, root, rels)
 }
 
-// TakeDirtyPaths returns and clears root's dirty set, sorted, and whether it overflowed.
-func TakeDirtyPaths(root string) (paths []string, overflow bool) {
-	dirtySet.Lock()
-	defer dirtySet.Unlock()
-	d := dirtySet.roots[root]
-	if d == nil {
-		return nil, false
-	}
-	delete(dirtySet.roots, root)
-	return slices.Sorted(maps.Keys(d.paths)), d.overflow
-}
-
-// ForgetRoot drops what the identity cache and the dirty set hold for root, as given
-// and as resolved (a removed worktree).
+// ForgetRoot drops the cached identity of root, as given and as resolved (a removed
+// worktree).
 func ForgetRoot(root string) {
 	for _, r := range slices.Compact([]string{root, canonicalRoot(root)}) {
 		InvalidateRepoIdentity(r)
-		dirtySet.Lock()
-		delete(dirtySet.roots, r)
-		dirtySet.Unlock()
 	}
-}
-
-func evictDirtyRoot() {
-	var oldest string
-	for r, d := range dirtySet.roots {
-		if oldest == "" || d.used.Before(dirtySet.roots[oldest].used) {
-			oldest = r
-		}
-	}
-	delete(dirtySet.roots, oldest)
 }

@@ -607,7 +607,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/auth/whoami` | core | reader | served |  | caller principal, roles and usable tools |
 | `ANY /api/health` | core | reader | served |  | public liveness and limits; the budget block needs an operator token while auth is enforced |
 | `POST /api/hooks/claude/CwdChanged` | core | proposer | served |  | hook: watchPaths of the new directory's workspace |
-| `POST /api/hooks/claude/FileChanged` | core | proposer | served |  | hook: dirty set; drops the cached repository identity |
+| `POST /api/hooks/claude/FileChanged` | core | proposer | served |  | hook: feeds the watcher's pending batch; drops the cached repository identity |
 | `POST /api/hooks/claude/PostCompact` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/claude/PostToolBatch` | core | proposer | served |  | hook: batch search nudge |
 | `POST /api/hooks/claude/PostToolUse` | core | proposer | served |  | hook: captures the caller's own tool output; shape-matched updatedToolOutput |
@@ -620,7 +620,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/hooks/claude/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent; records its id for attribution |
 | `POST /api/hooks/claude/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/claude/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
-| `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity and dirty set |
+| `POST /api/hooks/claude/WorktreeRemove` | core | proposer | served |  | hook: forgets the worktree's cached identity |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |

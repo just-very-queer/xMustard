@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"reflect"
 	"slices"
-	"strconv"
 	"testing"
 
 	"xmustard/api-go/internal/budget"
@@ -183,42 +182,30 @@ func TestHookGroundingSpawnsNothingAndListsWhatItSkipped(t *testing.T) {
 	}
 }
 
-func TestDirtySetIsBoundedAndDropsTheCachedIdentity(t *testing.T) {
+// A client-reported change drops the cached identity; without a watcher on the root
+// nothing takes the paths, and nothing is started to find one.
+func TestNoteChangedPathsDropsTheCachedIdentity(t *testing.T) {
 	root := canonicalRoot(t.TempDir())
-	identityCache.mu.Lock()
-	epoch := identityCache.state(root).epoch
-	identityCache.mu.Unlock()
-	if n := NoteDirtyPaths(root, []string{"b.go", "a.go"}); n != 2 {
-		t.Fatalf("held %d", n)
+	t.Setenv("XMUSTARD_CORE_WORKER", "1")
+	epochOf := func() uint64 {
+		identityCache.mu.Lock()
+		defer identityCache.mu.Unlock()
+		return identityCache.state(root).epoch
 	}
-	identityCache.mu.Lock()
-	moved := identityCache.state(root).epoch > epoch
-	identityCache.mu.Unlock()
-	if !moved {
-		t.Fatal("noting a dirty path kept the cached identity")
+	before, spawns := epochOf(), budget.Counters().SpawnsTotal
+	if NoteChangedPaths(context.Background(), root, []string{"b.go", "a.go"}) {
+		t.Fatal("no watcher watches the root, yet the paths were taken")
 	}
-	paths, overflow := TakeDirtyPaths(root)
-	if !reflect.DeepEqual(paths, []string{"a.go", "b.go"}) || overflow {
-		t.Fatalf("took %v %v", paths, overflow)
+	if epochOf() == before {
+		t.Fatal("noting a change kept the cached identity")
 	}
-	if paths, _ := TakeDirtyPaths(root); paths != nil {
-		t.Fatal("take did not clear the set")
+	if budget.Counters().SpawnsTotal != spawns {
+		t.Fatal("noting a change started a process")
 	}
-	many := make([]string, maxDirtyPaths+10)
-	for i := range many {
-		many[i] = "f/" + strconv.Itoa(i) + ".go"
+	if NoteChangedPaths(context.Background(), root, nil) || NoteChangedPaths(context.Background(), "", []string{"a"}) {
+		t.Fatal("nothing to note")
 	}
-	if n := NoteDirtyPaths(root, many); n != maxDirtyPaths {
-		t.Fatalf("held %d past the bound", n)
-	}
-	if _, overflow := TakeDirtyPaths(root); !overflow {
-		t.Fatal("an overflowed set does not say so")
-	}
-	NoteDirtyPaths(root, []string{"x"})
-	ForgetRoot(root)
-	if paths, _ := TakeDirtyPaths(root); paths != nil {
-		t.Fatal("ForgetRoot kept the dirty set")
-	}
+	ForgetRoot(root) // never fails, watched or not
 }
 
 // A hook's search needs the index this process brought up and a running worker; it
