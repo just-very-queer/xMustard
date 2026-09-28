@@ -10,6 +10,8 @@ use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
 
+mod memprobe;
+
 const BIN: &str = env!("CARGO_BIN_EXE_xmustard-core");
 
 fn git(root: &Path, args: &[&str]) {
@@ -1167,77 +1169,6 @@ fn ignore_files_and_non_git_mode() {
     assert_eq!(rep["coverage"]["indexed_files"], 1);
 }
 
-/// Peak RSS of the child process itself, sampled while it runs (macOS: the resident
-/// size from proc_pid_rusage; Linux: VmHWM), and the wait4(2) peak, which also covers
-/// the child's own children (the `git ls-files` it streams from).
-fn child_self_peak_rss(cmd: &mut Command) -> (u64, u64, std::process::ExitStatus) {
-    let child = cmd.spawn().unwrap();
-    let pid = child.id() as libc::pid_t;
-    let mut own = 0u64;
-    let mut status: libc::c_int = 0;
-    // SAFETY: zeroed rusage/rusage_info are valid out-parameters; `pid` is our unreaped
-    // child until wait4 returns it.
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    loop {
-        #[cfg(target_os = "macos")]
-        {
-            let mut info: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::proc_pid_rusage(
-                    pid,
-                    libc::RUSAGE_INFO_V2,
-                    &mut info as *mut _ as *mut libc::rusage_info_t,
-                )
-            };
-            if rc == 0 {
-                own = own.max(info.ri_resident_size);
-            }
-        }
-        #[cfg(target_os = "linux")]
-        if let Ok(s) = fs::read_to_string(format!("/proc/{pid}/status"))
-            && let Some(kb) = s
-                .lines()
-                .find_map(|l| l.strip_prefix("VmHWM:"))
-                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        {
-            own = own.max(kb * 1024);
-        }
-        let rc = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
-        if rc == pid {
-            break;
-        }
-        assert_eq!(rc, 0, "wait4 failed");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    std::mem::forget(child);
-    let tree = if cfg!(target_os = "macos") {
-        ru.ru_maxrss as u64
-    } else {
-        ru.ru_maxrss as u64 * 1024
-    };
-    use std::os::unix::process::ExitStatusExt;
-    (own, tree, std::process::ExitStatus::from_raw(status))
-}
-
-/// Peak RSS of one child run, from wait4(2).
-fn child_peak_rss(cmd: &mut Command) -> (u64, std::process::ExitStatus) {
-    let child = cmd.spawn().unwrap();
-    let pid = child.id() as libc::pid_t;
-    let mut status: libc::c_int = 0;
-    // SAFETY: a zeroed rusage is a valid out-parameter; `pid` is our unreaped child.
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    let rc = unsafe { libc::wait4(pid, &mut status, 0, &mut ru) };
-    assert_eq!(rc, pid);
-    std::mem::forget(child);
-    let bytes = if cfg!(target_os = "macos") {
-        ru.ru_maxrss as u64
-    } else {
-        ru.ru_maxrss as u64 * 1024
-    };
-    use std::os::unix::process::ExitStatusExt;
-    (bytes, std::process::ExitStatus::from_raw(status))
-}
-
 fn synthetic_file(i: usize) -> (String, String) {
     let dir = format!("mod{:02}", i % 50);
     match i % 5 {
@@ -1276,6 +1207,27 @@ fn synthetic_file(i: usize) -> (String, String) {
     }
 }
 
+/// Memory bounds of the 5,000-file build, in MiB (see `memprobe`). On the Linux build
+/// box (WS-FIX-06, load average 5-12) the build's own anonymous memory peaked at 4.3 MiB
+/// with the debug binary and 3.9 MiB with the release one, and RSS at 23.6-24.9 MiB and
+/// 15.8-17.0 MiB.
+///
+/// - Dirty peak (Linux `RssAnon + RssShmem`), the strict bound: 6 MiB. macOS has no
+///   measurement of this fixture, and its footprint also counts allocator state that
+///   RssAnon leaves out, so there the footprint is printed, not asserted.
+/// - RSS peak: 25 MiB, the heavy slot's line, in a release build (`cargo test
+///   --release`); 32 MiB in a debug build, whose code pages count in RSS.
+///
+/// The heavy slot's 25 MiB is a line for the release binary: the Go side declares it
+/// when `index build` takes the slot (`rustcore/heavy.go`), and budget gate v2 (WS-10)
+/// measures the release core, index builds included, in the process tree it gates.
+const BUILD_5000_DIRTY_MIB: Option<f64> = if cfg!(target_os = "linux") {
+    Some(6.0)
+} else {
+    None
+};
+const BUILD_5000_DEBUG_RSS_MIB: f64 = 32.0;
+
 #[test]
 fn build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib() {
     let dir = TempDir::new().unwrap();
@@ -1289,27 +1241,37 @@ fn build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib() {
     git(dir.path(), &["add", "-A"]);
     git(dir.path(), &["commit", "-qm", "c"]);
     let out_path = dir.path().join("report.json");
-    let (peak, status) = child_peak_rss(
+    let peaks = memprobe::child_peaks(
         Command::new(BIN)
             .args(["index", "build", dir.path().to_str().unwrap(), "--no-cache"])
             .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
             .stderr(Stdio::inherit()),
     );
-    assert!(status.success());
+    assert!(peaks.status.success());
     let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
     let cov = &rep["coverage"];
     assert_eq!(cov["eligible_files"], 5000);
     assert_eq!(cov["indexed_files"], 5000, "no file cap: {cov:#}");
     assert_eq!(cov["complete"], true, "{cov:#}");
     assert!(cov["symbols"].as_u64().unwrap() > 20_000);
-    let mib = peak as f64 / (1u64 << 20) as f64;
+    let (dirty, rss) = (memprobe::mib(peaks.dirty), memprobe::mib(peaks.tree_rss));
     eprintln!(
-        "index build of 5,000 files: peak RSS {mib:.1} MiB, report {:?}",
+        "index build of 5,000 files: dirty peak {dirty:.1} MiB, RSS peak {rss:.1} MiB \
+         (own {:.1}), report {:?}",
+        memprobe::mib(peaks.rss),
         rep["timing"]
     );
+    if let Some(line) = BUILD_5000_DIRTY_MIB {
+        assert!(peaks.dirty > 0, "no dirty-memory sample");
+        assert!(
+            dirty <= line,
+            "dirty peak {dirty:.1} MiB exceeds the {line} MiB bound"
+        );
+    }
+    let line = memprobe::rss_line(25.0, BUILD_5000_DEBUG_RSS_MIB);
     assert!(
-        mib <= 25.0,
-        "peak RSS {mib:.1} MiB exceeds the 25 MiB heavy-slot line"
+        rss <= line,
+        "peak RSS {rss:.1} MiB exceeds the {line} MiB bound"
     );
 }
 
@@ -1832,13 +1794,13 @@ fn deep_nesting_is_bounded_and_reported() {
     files.extend(shapes.iter().map(|(p, c)| (*p, c.as_str())));
     let dir = repo(&files);
     let out_path = dir.path().join("report.json");
-    let (peak, status) = child_peak_rss(
+    let peaks = memprobe::child_peaks(
         Command::new(BIN)
             .args(["index", "build", dir.path().to_str().unwrap(), "--no-cache"])
             .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
             .stderr(Stdio::inherit()),
     );
-    assert!(status.success());
+    assert!(peaks.status.success());
     let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
     let losses = &rep["coverage"]["loss_counts"];
     // deep.ts and named.ts, plus the six unbracketed deep shapes
@@ -1868,8 +1830,11 @@ fn deep_nesting_is_bounded_and_reported() {
         )
         .unwrap();
     assert_eq!(engine, "tree_sitter");
-    let mib = peak as f64 / (1u64 << 20) as f64;
-    eprintln!("deeply nested and dense build: peak RSS {mib:.1} MiB");
+    let mib = memprobe::mib(peaks.tree_rss);
+    eprintln!(
+        "deeply nested and dense build: peak RSS {mib:.1} MiB, dirty peak {:.1} MiB",
+        memprobe::mib(peaks.dirty)
+    );
     assert!(mib <= 25.0, "peak RSS {mib:.1} MiB for nested 64 KB files");
 }
 
@@ -1918,7 +1883,7 @@ fn tracked_sets_far_past_the_envelope_keep_the_worker_bounded() {
     assert!(child.wait().unwrap().success());
     drop(info);
     let out_path = dir.path().join("report.json");
-    let (peak, tree_peak, status) = child_self_peak_rss(
+    let peaks = memprobe::child_peaks(
         Command::new(BIN)
             .args([
                 "index",
@@ -1931,7 +1896,7 @@ fn tracked_sets_far_past_the_envelope_keep_the_worker_bounded() {
             .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
             .stderr(Stdio::inherit()),
     );
-    assert!(status.success());
+    assert!(peaks.status.success());
     let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
     let cov = &rep["coverage"];
     assert_eq!(cov["indexed_files"], 2000, "{cov:#}");
@@ -1944,14 +1909,15 @@ fn tracked_sets_far_past_the_envelope_keep_the_worker_bounded() {
         .query_row("SELECT count(*) FROM files", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 2000, "files past the envelope have no rows");
-    let mib = peak as f64 / (1u64 << 20) as f64;
+    let mib = memprobe::mib(peaks.rss);
     // `git ls-files` itself holds the whole Git index (about 28 MiB for 120k entries,
     // measured alone); it is an external child and runs while the worker is at its
     // scan-time low, so the worker's own peak is the bound asserted here.
     eprintln!(
         "120,000 tracked entries past the envelope: worker peak RSS {mib:.1} MiB (sampled), \
-         with children {:.1} MiB",
-        tree_peak as f64 / (1u64 << 20) as f64
+         with children {:.1} MiB, dirty peak {:.1} MiB",
+        memprobe::mib(peaks.tree_rss),
+        memprobe::mib(peaks.dirty)
     );
     assert!(mib <= 25.0, "worker peak RSS {mib:.1} MiB");
     let up = index("update", dir.path(), &["--max-files", "2000"]);
@@ -2080,14 +2046,14 @@ fn max_size_ignore_files_keep_the_worker_bounded() {
     git(dir.path(), &["commit", "-qm", "c"]);
     let out_path = dir.path().join("report.json");
     let t = std::time::Instant::now();
-    let (peak, _, status) = child_self_peak_rss(
+    let peaks = memprobe::child_peaks(
         Command::new(BIN)
             .args(["index", "build", dir.path().to_str().unwrap(), "--no-cache"])
             .stdout(Stdio::from(fs::File::create(&out_path).unwrap()))
             .stderr(Stdio::inherit()),
     );
     let elapsed = t.elapsed();
-    assert!(status.success());
+    assert!(peaks.status.success());
     let rep: Value = serde_json::from_slice(&fs::read(&out_path).unwrap()).unwrap();
     let cov = &rep["coverage"];
     assert_eq!(cov["indexed_files"], 20, "{cov:#}");
@@ -2097,8 +2063,11 @@ fn max_size_ignore_files_keep_the_worker_bounded() {
         cov["ignore_rules_dropped"].as_u64().unwrap() > 900,
         "{cov:#}"
     );
-    let mib = peak as f64 / (1u64 << 20) as f64;
-    eprintln!("max-size ignore files: worker peak RSS {mib:.1} MiB in {elapsed:?}");
+    let mib = memprobe::mib(peaks.rss);
+    eprintln!(
+        "max-size ignore files: worker peak RSS {mib:.1} MiB, dirty peak {:.1} MiB in {elapsed:?}",
+        memprobe::mib(peaks.dirty)
+    );
     assert!(mib <= 25.0, "worker peak RSS {mib:.1} MiB");
     assert!(
         elapsed < std::time::Duration::from_secs(60),
