@@ -73,11 +73,14 @@ type AnchorRef struct {
 	Value string `json:"value"`
 }
 
-// AnchorQuery looks memories up through the anchor inverted index.
+// AnchorQuery looks memories up through the anchor inverted index. ActiveOnly keeps
+// active entries, pending ones included; ServedOnly keeps promoted, active, unexpired
+// ones (it implies ActiveOnly). With neither, entries of every lifecycle count.
 type AnchorQuery struct {
 	WorkspaceID string
 	Kind        string
 	Values      []string
+	ActiveOnly  bool
 	ServedOnly  bool
 	// NewestFirst orders hits by the newest entry instead of by value.
 	NewestFirst bool
@@ -102,9 +105,9 @@ type AnchorReader interface {
 	// AnchorsFor returns ListAnchors for many entries at once, keyed by entry id.
 	AnchorsFor(ctx context.Context, ids []string) (map[string][]Anchor, error)
 	EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHit, error)
-	// AnchorFanout counts, per value of one anchor kind, the workspace's active entries
-	// holding it.
-	AnchorFanout(ctx context.Context, workspaceID, kind string, values []string) (map[string]int, error)
+	// AnchorFanout counts, per value of q.Values, the workspace's entries holding it as
+	// an anchor of q.Kind, under q's lifecycle flags (Limit and NewestFirst are unused).
+	AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]int, error)
 }
 
 // AnchorWriter writes anchors, baselines and drift observations.
@@ -258,13 +261,8 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 	for _, v := range q.Values {
 		args = append(args, v)
 	}
-	args = append(args, q.WorkspaceID)
-	served := ""
-	if q.ServedOnly {
-		served = " AND e.promoted = 1 AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?)"
-		args = append(args, r.nowText())
-	}
-	args = append(args, clampLimit(q.Limit))
+	lifecycle, lifecycleArgs := r.anchorLifecycle(q)
+	args = append(append(append(args, q.WorkspaceID), lifecycleArgs...), clampLimit(q.Limit))
 	order := "a.value, e.pk"
 	if q.NewestFirst {
 		order = "e.pk DESC, a.value"
@@ -272,7 +270,7 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 	rows, err := r.query(ctx, `SELECT a.entry_id, a.kind, a.value, a.declared, a.baseline_state, coalesce(a.stale_since, ''),
 		count(*) OVER (PARTITION BY a.kind, a.value)
 		FROM anchors a JOIN entries e ON e.id = a.entry_id
-		WHERE a.kind = ? AND a.value IN (`+placeholders(len(q.Values))+`) AND e.workspace_id = ?`+served+`
+		WHERE a.kind = ? AND a.value IN (`+placeholders(len(q.Values))+`) AND e.workspace_id = ?`+lifecycle+`
 		ORDER BY `+order+` LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
@@ -289,21 +287,34 @@ func (r *reader) EntriesByAnchor(ctx context.Context, q AnchorQuery) ([]AnchorHi
 	return out, rows.Err()
 }
 
-// AnchorFanout counts the active entries holding each value.
-func (r *reader) AnchorFanout(ctx context.Context, workspaceID, kind string, values []string) (map[string]int, error) {
-	if err := validID("workspace", workspaceID); err != nil {
+// anchorLifecycle is the condition on the joined entries e that q's lifecycle flags ask
+// for, with its arguments.
+func (r *reader) anchorLifecycle(q AnchorQuery) (string, []any) {
+	switch {
+	case q.ServedOnly:
+		return " AND e.promoted = 1 AND e.lifecycle = 'active' AND (e.expires_at IS NULL OR e.expires_at > ?)", []any{r.nowText()}
+	case q.ActiveOnly:
+		return " AND e.lifecycle = 'active'", nil
+	}
+	return "", nil
+}
+
+// AnchorFanout counts the entries holding each value under q's lifecycle flags.
+func (r *reader) AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]int, error) {
+	if err := validID("workspace", q.WorkspaceID); err != nil {
 		return nil, err
 	}
+	lifecycle, lifecycleArgs := r.anchorLifecycle(q)
 	out := map[string]int{}
-	for start := 0; start < len(values); start += maxInArgs {
-		chunk := values[start:min(start+maxInArgs, len(values))]
-		args := []any{kind}
+	for start := 0; start < len(q.Values); start += maxInArgs {
+		chunk := q.Values[start:min(start+maxInArgs, len(q.Values))]
+		args := []any{q.Kind}
 		for _, v := range chunk {
 			args = append(args, v)
 		}
 		rows, err := r.query(ctx, `SELECT a.value, count(*) FROM anchors a JOIN entries e ON e.id = a.entry_id
-			WHERE a.kind = ? AND a.value IN (`+placeholders(len(chunk))+`) AND e.workspace_id = ? AND e.lifecycle = 'active'
-			GROUP BY a.value`, append(args, workspaceID)...)
+			WHERE a.kind = ? AND a.value IN (`+placeholders(len(chunk))+`) AND e.workspace_id = ?`+lifecycle+`
+			GROUP BY a.value`, append(append(args, q.WorkspaceID), lifecycleArgs...)...)
 		if err != nil {
 			return nil, err
 		}

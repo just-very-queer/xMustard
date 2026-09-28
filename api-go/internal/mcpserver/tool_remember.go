@@ -50,18 +50,22 @@ var rememberTool = &Tool{
 		"lower-casing and collapsing whitespace) of a served memory is recorded as a corroboration of it: " +
 		"`outcome` is `corroborated`, `duplicate_of` names it and `corroborations` counts the principals that " +
 		"restated it; nothing new is created. It is created instead, with a warning saying why, when it names " +
-		"`supersedes`, `claims` or `relations`, asks for another kind, topic, tags or expiry, declares other " +
-		"paths, or cites an untrusted capture the memory is clean of (dedupe never launders quarantine). " +
-		"Otherwise `outcome` is `created`. Either way `possible_duplicates` lists active memories it restates: " +
+		"`supersedes`, `claims` or `relations`, asks for another kind, topic, tags or expiry, declares a path " +
+		"the memory does not have, or cites an untrusted capture the memory is clean of (dedupe never launders " +
+		"quarantine). Otherwise `outcome` is `created`. Either way `possible_duplicates` lists active memories " +
+		"it restates: " +
 		"`exact`, `near` (Jaccard of character 3-grams >= 0.9) or `similar` (>= 0.5), with `similarity`; short " +
 		"or low-entropy text only matches exactly. `possible_conflicts` are advisory: tier 1 `claim` (claims " +
 		"on one subject exclude each other), tier 2 `contradiction` (a shared anchor and most words in common, " +
 		"but different numbers, versions or commands, or only one negates or deprecates), tier 3 " +
 		"`path_overlap`. `suggested_supersedes` names served memories it may replace (near duplicates and tier " +
-		"1-2 conflicts): pass them as `supersedes`, or verify one `duplicate_of` the other, which merges it " +
-		"once its gate's number of principals agree. `anchors` are what the text is about: paths, symbols " +
-		"(identifiers resolved against the code index), identifiers, commands, env and config keys, error " +
-		"codes, URLs and quoted code placed on file lines, each with `fanout`, the memories sharing it. " +
+		"1-2 conflicts): pass them as `supersedes`, or verify the other `duplicate_of` the served one (the " +
+		"target must be served), which merges it once its gate's number of principals agree. `anchors` are " +
+		"what the text is about: paths, symbols (identifiers resolved against the code index), identifiers, " +
+		"commands, env and config keys, error " +
+		"codes, URLs and quoted code placed on file lines, each with `fanout`, the memories you may read that " +
+		"share it (served ones, and pending ones for the verifier and human-approver roles). Secrets are " +
+		"redacted from claims as from the text. " +
 		"`claims` states `subject|predicate|object` statements separated by `;`, the predicate one of " +
 		"requires, forbids, runs_with, configured_as, pinned_to, deprecated_by, owned_by, replaces; subjects " +
 		"compare case-insensitively, and recall filters on them with `subject` and `predicate`. `relations` " +

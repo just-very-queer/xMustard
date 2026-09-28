@@ -7,12 +7,14 @@ import (
 	"maps"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strings"
 	"time"
 
 	"xmustard/api-go/internal/anchor"
+	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/rustcore"
 )
@@ -27,20 +29,34 @@ import (
 // how many memories share the anchor. Extracted anchors are not the entry's declared
 // paths: drift baselines stay on what the author declared.
 
-// Extraction bounds: anchors kept per memory, names sent for resolution, quoted blocks
-// and the files each is looked for in, and how long resolution may take.
+// Extraction bounds: anchors kept per memory, the text read for them and the
+// filesystem checks its path candidates may cost, names sent for resolution, quoted
+// blocks and the files each is looked for in, and how long resolution may take.
 const (
 	maxExtractedAnchors = 32
 	maxAnchorValue      = 256
+	maxAnchorText       = 64 << 10
+	maxPathProbes       = 64
 	maxResolveNames     = 16
 	maxQuotedBlocks     = 4
 	maxQuoteFiles       = 4
 	resolveTimeout      = 3 * time.Second
 )
 
+// Quote placement bounds: a file quoted code is looked for in has at most
+// maxQuoteFileBytes and maxQuoteFileLines. The placement holds one file at a time with
+// the line index anchor.Locate builds over it (lineIndexBytes a line: a number and a
+// string header), and reserves that much in the transient pool before reading any.
+const (
+	maxQuoteFileBytes   = 1 << 20
+	maxQuoteFileLines   = 32 << 10
+	lineIndexBytes      = 24
+	quotePlacementBytes = maxQuoteFileBytes + maxQuoteFileLines*lineIndexBytes
+)
+
 // MemoryAnchor is one anchor as remember reports it. SymbolUID is "path#name" for a
-// symbol resolved to one declaration; Fanout is how many active memories of the
-// workspace share the anchor (the new one included).
+// symbol resolved to one declaration; Fanout is how many memories of the workspace that
+// the proposer may read share the anchor (readableAnchors), the new one included.
 type MemoryAnchor struct {
 	Kind      string `json:"kind"`
 	Value     string `json:"value"`
@@ -102,26 +118,41 @@ var anchorExtractors = []anchorExtractor{
 }
 
 // anchorExtraction is one memory's extraction: the files it may name are checked
-// against the workspace root.
+// against the workspace root, at most maxPathProbes times (probes counts them).
 type anchorExtraction struct {
 	root    string
 	anchors []govstore.AnchorInput
 	seen    map[govstore.AnchorRef]bool
+	probes  int
 }
 
 // extractAnchors reads text for anchors, in anchorExtractors order, and returns them
 // with the quoted code blocks it found. root, when known, confirms path anchors.
 func extractAnchors(root, text string) ([]govstore.AnchorInput, []string) {
 	x := &anchorExtraction{root: root, seen: map[govstore.AnchorRef]bool{}}
+	quotes := x.run(text)
+	return x.anchors, quotes
+}
+
+// run reads the first maxAnchorText bytes of text for anchors and returns its quoted
+// code blocks. Once the extraction is full no match is looked at again, so a long text
+// costs no filesystem checks past its first 32 anchors.
+func (x *anchorExtraction) run(text string) []string {
 	var quotes []string
-	masked := fencedCode.ReplaceAllStringFunc(text, func(block string) string {
+	masked := fencedCode.ReplaceAllStringFunc(anchorText(text), func(block string) string {
 		if m := fencedCode.FindStringSubmatch(block); len(quotes) < maxQuotedBlocks && strings.TrimSpace(m[1]) != "" {
 			quotes = append(quotes, m[1])
 		}
 		return blank(block)
 	})
 	for _, ex := range anchorExtractors {
+		if x.full() {
+			break
+		}
 		masked = ex.find.ReplaceAllStringFunc(masked, func(match string) string {
+			if x.full() {
+				return match
+			}
 			sub := match
 			if m := ex.find.FindStringSubmatch(match); len(m) > 1 {
 				sub = m[1]
@@ -132,8 +163,23 @@ func extractAnchors(root, text string) ([]govstore.AnchorInput, []string) {
 			return match
 		})
 	}
-	return x.anchors, quotes
+	return quotes
 }
+
+// anchorText is the part of text anchors are read from: its first maxAnchorText bytes,
+// cut back to the last line or word break so no token is read in part.
+func anchorText(text string) string {
+	if len(text) <= maxAnchorText {
+		return text
+	}
+	text = text[:maxAnchorText]
+	if i := strings.LastIndexAny(text, " \t\n"); i > 0 {
+		return text[:i]
+	}
+	return text
+}
+
+func (x *anchorExtraction) full() bool { return len(x.anchors) >= maxExtractedAnchors }
 
 // add records an anchor once and reports whether its span is claimed: false when the
 // value is not storable or the extraction is full.
@@ -144,7 +190,7 @@ func (x *anchorExtraction) add(kind, value string) bool {
 		return false
 	case x.seen[ref]:
 		return true
-	case len(x.anchors) >= maxExtractedAnchors:
+	case x.full():
 		return false
 	}
 	x.seen[ref] = true
@@ -176,17 +222,20 @@ func keepEnv(_ *anchorExtraction, m string) (string, bool) {
 
 // keepPath keeps a repository path: confined to the workspace root and naming an
 // existing file or directory there, so without a root no path is kept. A trailing
-// ":line" is dropped.
+// ":line" is dropped. Each candidate costs a filesystem check, and past maxPathProbes
+// of them none is kept.
 func keepPath(x *anchorExtraction, m string) (string, bool) {
 	v := strings.TrimRight(m, ".,;:!?")
-	if x.root == "" || (!strings.Contains(v, "/") && !sourceFile.MatchString(v)) {
+	if x.root == "" || x.probes >= maxPathProbes || (!strings.Contains(v, "/") && !sourceFile.MatchString(v)) {
 		return "", false
 	}
-	clean, err := ConfineWorkspacePath(x.root, v)
+	x.probes++
+	// lexical confinement, then the symlink-resolving one that returns the target
+	clean, err := ConfineWorkspacePath("", v)
 	if err != nil {
 		return "", false
 	}
-	resolved, err := resolveWorkspacePath(x.root, clean)
+	resolved, err := resolveWorkspacePath(x.root, filepath.FromSlash(clean))
 	if err != nil {
 		return "", false
 	}
@@ -303,28 +352,45 @@ func locateQuote(path, content, code string) (start, end int, ok bool) {
 }
 
 // quoteAnchors places each quoted block in the first of files that holds it exactly
-// once, as a code anchor "path#Lstart-Lend".
-func quoteAnchors(root string, quotes, files []string) []govstore.AnchorInput {
-	if root == "" {
-		return nil
+// once, as a code anchor "path#Lstart-Lend". Files are read one at a time, in order,
+// only while a block is unplaced, and only within the quote placement bounds; the
+// placement's bytes are reserved in the transient pool first, and a refusal skips it
+// with a warning.
+func quoteAnchors(root string, quotes, files []string) ([]govstore.AnchorInput, string) {
+	if root == "" || len(quotes) == 0 || len(files) == 0 {
+		return nil, ""
 	}
-	files = files[:min(len(files), maxQuoteFiles)]
-	contents := make([]string, len(files))
-	for i, f := range files {
-		if data, ok := readWorkspaceRegularFile(root, f); ok {
-			contents[i] = string(data)
+	scope := budget.NewScope(nil)
+	defer scope.Close()
+	if err := scope.Acquire(quotePlacementBytes); err != nil {
+		return nil, fmt.Sprintf("quoted code was not placed on file lines: %v", err)
+	}
+	placed := make([]string, len(quotes))
+	unplaced := len(quotes)
+	for _, f := range files[:min(len(files), maxQuoteFiles)] {
+		if unplaced == 0 {
+			break
 		}
-	}
-	var out []govstore.AnchorInput
-	for _, q := range quotes {
-		for i, f := range files {
-			if start, end, ok := locateQuote(f, contents[i], q); ok {
-				out = append(out, govstore.AnchorInput{Kind: govstore.AnchorCode, Value: fmt.Sprintf("%s#L%d-L%d", f, start, end), Extracted: true})
-				break
+		content, ok := readWorkspaceText(root, f, maxQuoteFileBytes)
+		if !ok || strings.Count(content, "\n") >= maxQuoteFileLines {
+			continue
+		}
+		for i, q := range quotes {
+			if placed[i] != "" {
+				continue
+			}
+			if start, end, ok := locateQuote(f, content, q); ok {
+				placed[i], unplaced = fmt.Sprintf("%s#L%d-L%d", f, start, end), unplaced-1
 			}
 		}
 	}
-	return out
+	var out []govstore.AnchorInput
+	for _, v := range placed {
+		if v != "" {
+			out = append(out, govstore.AnchorInput{Kind: govstore.AnchorCode, Value: v, Extracted: true})
+		}
+	}
+	return out, ""
 }
 
 // proposalAnchors extracts, resolves and places the anchors of a proposal. declared
@@ -346,8 +412,11 @@ func proposalAnchors(ctx context.Context, root, workspaceID, text string, declar
 			files = append(files, a.Value)
 		}
 	}
-	extracted = append(extracted, quoteAnchors(root, quotes, files)...)
-	return extracted, warnings
+	placed, warn := quoteAnchors(root, quotes, files)
+	if warn != "" {
+		warnings = append(warnings, warn)
+	}
+	return append(extracted, placed...), warnings
 }
 
 // Recall's anchor signal (PAR-RCL-02): a memory sharing an anchor with the query gains
@@ -366,11 +435,55 @@ func anchorBoost(sim float64, fanout int) float64 {
 // maxQueryAnchorHits bounds the index rows one recall reads per anchor kind.
 const maxQueryAnchorHits = 500
 
-// queryAnchorBoosts reads the inverted index for the anchors a recall names (in its
-// query text, and its focus paths) and returns each memory's damped boost with the
-// anchors behind it. A memory's own declared paths already score as paths, so a focus
-// path boosts only the memories that merely mention it.
-func queryAnchorBoosts(ctx context.Context, r govstore.Reader, workspaceID, query string, focus []string) (map[string]float64, map[string][]string, error) {
+// readableAnchors scopes an anchor lookup to the memories a principal may read: the
+// active ones, pending included, for a reviewer (the verifier or human-approver role),
+// and the served ones otherwise. remember's fan-out, the review's neighbours and
+// recall's damping all count through it, so they count the same memories and none
+// reveals pending memory to a principal that may not read it.
+func readableAnchors(workspaceID string, reviewer bool) govstore.AnchorQuery {
+	return govstore.AnchorQuery{WorkspaceID: workspaceID, ActiveOnly: true, ServedOnly: !reviewer}
+}
+
+// anchorsWithFanout renders a new entry's anchors with how many memories its author may
+// read (readableAnchors) share each. The author always reads its own entry, so it is
+// counted where the scope leaves it out.
+func anchorsWithFanout(ctx context.Context, r govstore.Reader, e govstore.Entry, anchors []govstore.Anchor,
+	reviewer bool) ([]MemoryAnchor, error) {
+	scope := readableAnchors(e.WorkspaceID, reviewer)
+	self := 0
+	if scope.ServedOnly && !e.Served(time.Now()) {
+		self = 1
+	}
+	byKind := map[string][]string{}
+	for _, a := range anchors {
+		byKind[a.Kind] = append(byKind[a.Kind], a.Value)
+	}
+	fanout := map[govstore.AnchorRef]int{}
+	for _, kind := range slices.Sorted(maps.Keys(byKind)) {
+		q := scope
+		q.Kind, q.Values = kind, byKind[kind]
+		counts, err := r.AnchorFanout(ctx, q)
+		if err != nil {
+			return nil, err
+		}
+		for v, n := range counts {
+			fanout[govstore.AnchorRef{Kind: kind, Value: v}] = n
+		}
+	}
+	out := make([]MemoryAnchor, len(anchors))
+	for i, a := range anchors {
+		out[i] = MemoryAnchor{Kind: a.Kind, Value: a.Value, SymbolUID: a.SymbolUID, Declared: a.Declared,
+			Fanout: fanout[govstore.AnchorRef{Kind: a.Kind, Value: a.Value}] + self}
+	}
+	return out, nil
+}
+
+// queryAnchorBoosts reads the inverted index, within scope (readableAnchors), for the
+// anchors a recall names (in its query text, and its focus paths) and returns each
+// memory's damped boost with the anchors behind it. A memory's own declared paths
+// already score as paths, so a focus path boosts only the memories that merely mention
+// it.
+func queryAnchorBoosts(ctx context.Context, r govstore.Reader, scope govstore.AnchorQuery, query string, focus []string) (map[string]float64, map[string][]string, error) {
 	extracted, _ := extractAnchors("", query)
 	byKind := map[string][]string{}
 	for _, a := range extracted {
@@ -389,8 +502,9 @@ func queryAnchorBoosts(ctx context.Context, r govstore.Reader, workspaceID, quer
 		if len(values) == 0 {
 			continue
 		}
-		hits, err := r.EntriesByAnchor(ctx, govstore.AnchorQuery{WorkspaceID: workspaceID, Kind: kind,
-			Values: values[:min(len(values), maxResolveNames)], Limit: maxQueryAnchorHits})
+		q := scope
+		q.Kind, q.Values, q.Limit = kind, values[:min(len(values), maxResolveNames)], maxQueryAnchorHits
+		hits, err := r.EntriesByAnchor(ctx, q)
 		if err != nil {
 			return nil, nil, err
 		}

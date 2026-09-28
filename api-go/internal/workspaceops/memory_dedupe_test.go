@@ -143,11 +143,26 @@ func TestIntentOrOtherPathsBlockCorroboration(t *testing.T) {
 		"other paths": func(r *RememberRequest) { r.Paths = []string{"svc/other.go"} },
 	} {
 		got := rememberAs(t, dir, ws, ContextActor{ID: "agent-" + strings.ReplaceAll(name, " ", "-")}, portFact, extra)
-		if got.Outcome != OutcomeCreated || dupIDs(got)[served.ID] != MatchExact ||
-			!slices.ContainsFunc(got.Warnings, func(w string) bool { return strings.Contains(w, "was not corroborated") }) {
+		if got.Outcome != OutcomeCreated || dupIDs(got)[served.ID] != MatchExact || !notCorroborated(got) {
 			t.Fatalf("%s: %+v", name, got)
 		}
 	}
+	if same := rememberAs(t, dir, ws, ContextActor{ID: "agent-same-path"}, portFact, withPaths("svc/config.go")); same.Outcome != OutcomeCorroborated {
+		t.Fatalf("a restatement declaring the memory's own path: %+v", same)
+	}
+	// a corroboration records no paths, so declaring any path a pathless memory lacks
+	// creates the proposal
+	fact := "Nightly exports land in the exports bucket under a date prefix."
+	pathless := promoted(t, dir, ws, "author", fact)
+	got := rememberAs(t, dir, ws, ContextActor{ID: "agent-paths"}, fact, withPaths("jobs/export.go"))
+	if got.Outcome != OutcomeCreated || dupIDs(got)[pathless.ID] != MatchExact || !slices.Equal(got.Paths, []string{"jobs/export.go"}) ||
+		!notCorroborated(got) {
+		t.Fatalf("paths declared against a pathless memory: %+v", got)
+	}
+}
+
+func notCorroborated(e *ContextEntry) bool {
+	return slices.ContainsFunc(e.Warnings, func(w string) bool { return strings.Contains(w, "was not corroborated") })
 }
 
 // Dedupe never launders quarantine: a write citing an untrusted capture is not a
@@ -221,6 +236,24 @@ func TestDuplicateOfQuorumMergesAndCarriesQuarantine(t *testing.T) {
 	if view, _ := entryView(t, dir, ws, survivor.ID, false); view.Quarantine != "untrusted_capture:webfetch" {
 		t.Fatalf("the survivor of a quarantined duplicate is clean: %+v", view)
 	}
+}
+
+// A duplicate_of verdict must name served memory: merging a verified entry into a
+// pending one would leave recall serving neither, so the verdict is refused and nothing
+// moves. The other direction merges.
+func TestDuplicateOfNeedsAServedTarget(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	served := promoted(t, dir, ws, "author", portFact)
+	pending := rememberAs(t, dir, ws, ContextActor{ID: "agent-b"}, "Payments listens on 8081 (the sidecar has 8080).")
+	_, err := VerifyContextOutcome(dir, ws, served.ID, ContextActor{ID: "peer-1", Verifier: true},
+		VerifyRequest{Outcome: OutcomeDuplicateOf, Target: pending.ID})
+	if !errors.Is(err, ErrInvalidInput) || !strings.Contains(err.Error(), "is pending, not served memory") {
+		t.Fatalf("duplicate_of a pending target: %v", err)
+	}
+	if view, _ := entryView(t, dir, ws, served.ID, false); view.Lifecycle != "" || !recalledIDs(t, dir, ws)[served.ID] {
+		t.Fatalf("the refused verdict moved the served entry: %+v", view)
+	}
+	mergeFixture(t, dir, ws, pending.ID, served.ID)
 }
 
 // A core entry may not hold a quarantine, so a quarantined duplicate cannot merge into

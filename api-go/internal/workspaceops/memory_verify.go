@@ -1,10 +1,12 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"xmustard/api-go/internal/govstore"
 )
@@ -243,11 +245,21 @@ func retractOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce
 // mergeOnQuorum merges an entry into the target of its duplicate_of verdicts once as many
 // distinct principals as its gate requires named that target on its served revision
 // (PAR-GOV-03). The merged entry is kept and hidden: recall(include_merged) shows it
-// when it had been promoted, and a restore brings it back unverified. Dedupe never
-// launders quarantine: a quarantined duplicate passes its mark to the survivor, and a
-// core survivor, which may not hold one, refuses the merge.
+// when it had been promoted, and a restore brings it back unverified. The target must
+// be served memory, or the merge would hide the entry behind unverified or retired
+// text, so a verdict naming any other target is refused. Dedupe never launders
+// quarantine: a quarantined duplicate passes its mark to the survivor, and a core
+// survivor, which may not hold one, refuses the merge.
 func mergeOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce ContextEntry, in govstore.VoteInput,
 	actor govstore.Actor) (ContextEntry, bool, error) {
+	target, _, err := loadEntryTx(ctx, tx, workspaceID, in.Target)
+	if err != nil {
+		return ContextEntry{}, false, err
+	}
+	if now := time.Now(); !target.Served(now) {
+		return ContextEntry{}, false, fmt.Errorf("duplicate_of target %s is %s, not served memory: name the served entry "+
+			"as the target and the other as its duplicate: %w", in.Target, entryState(target, now), ErrInvalidInput)
+	}
 	votes, err := tx.ServedVotes(ctx, []string{ce.ID})
 	if err != nil {
 		return ContextEntry{}, false, err
@@ -261,10 +273,6 @@ func mergeOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce C
 	if named < max(ce.RequiredVerifications, 1) {
 		return ce, false, nil
 	}
-	target, _, err := loadEntryTx(ctx, tx, workspaceID, in.Target)
-	if err != nil {
-		return ContextEntry{}, false, err
-	}
 	if err := markQuarantined(ctx, tx, target, ce.Quarantine, actor); err != nil {
 		return ContextEntry{}, false, err
 	}
@@ -274,6 +282,16 @@ func mergeOnQuorum(ctx context.Context, tx govstore.Tx, workspaceID string, ce C
 	}
 	out, err := entryAfter(ctx, tx, workspaceID, ce.ID)
 	return out, false, err
+}
+
+// entryState names e's state in a message: its rank state, else its lifecycle, else the
+// status of an active entry recall never ranks (a rejected one).
+func entryState(e govstore.Entry, now time.Time) string {
+	lifecycle := e.Lifecycle
+	if lifecycle == govstore.LifecycleActive {
+		lifecycle = ""
+	}
+	return cmp.Or(e.RankState(now), lifecycle, e.Status)
 }
 
 // settleEntry re-derives an entry's status and promotion from the votes on its served

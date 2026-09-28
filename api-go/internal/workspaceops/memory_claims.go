@@ -66,6 +66,15 @@ func cleanClaims(in []MemoryClaim) ([]MemoryClaim, error) {
 // "Go" and "go" are one subject.
 func claimSubject(s string) string { return strings.ToLower(strings.TrimSpace(s)) }
 
+// claimTexts are the stored texts of claims, for the instruction-pattern scan.
+func claimTexts(claims []MemoryClaim) []string {
+	out := make([]string, 0, 2*len(claims))
+	for _, c := range claims {
+		out = append(out, c.Subject, c.Object)
+	}
+	return out
+}
+
 // cleanRelations validates relations: a proposal-level kind and a well-formed target.
 func cleanRelations(in []MemoryRelation) ([]MemoryRelation, error) {
 	if len(in) > maxRelations {

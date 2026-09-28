@@ -8,9 +8,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"xmustard/api-go/internal/govstore"
 )
@@ -95,12 +97,91 @@ func TestQuotedCodeIsAnchoredOnFileLines(t *testing.T) {
 	if len(quotes) != 2 {
 		t.Fatalf("quotes %q", quotes)
 	}
-	got := quoteAnchors(root, quotes, []string{"server/timeouts.go"})
-	if len(got) != 1 || got[0].Kind != govstore.AnchorCode || got[0].Value != "server/timeouts.go#L4-L6" {
+	got, warn := quoteAnchors(root, quotes, []string{"server/timeouts.go"})
+	if warn != "" || len(got) != 1 || got[0].Kind != govstore.AnchorCode || got[0].Value != "server/timeouts.go#L4-L6" {
 		t.Fatalf("quoted code anchors %+v", got)
 	}
 	if _, ok := anchorSet(extracted)["ReadTimeout"]; ok {
 		t.Fatal("identifiers inside a quoted block were extracted as well")
+	}
+}
+
+// Extraction does bounded filesystem work: at most maxPathProbes path candidates are
+// checked, only the first maxAnchorText bytes are read, and a full extraction checks
+// nothing more, so a megabyte of slashed tokens costs at most maxPathProbes checks.
+func TestExtractAnchorsBoundsFilesystemProbes(t *testing.T) {
+	root := t.TempDir()
+	var b strings.Builder
+	for i := 0; b.Len() < 1<<20; i++ {
+		fmt.Fprintf(&b, "d%d/f%d ", i, i)
+	}
+	x := &anchorExtraction{root: root, seen: map[govstore.AnchorRef]bool{}}
+	start := time.Now()
+	x.run(b.String())
+	if x.probes != maxPathProbes || len(x.anchors) != 0 {
+		t.Fatalf("%d probes and %d anchors, want %d probes and none", x.probes, len(x.anchors), maxPathProbes)
+	}
+	if took := time.Since(start); took > 2*time.Second {
+		t.Fatalf("extracting from 1 MiB of path-like tokens took %v", took)
+	}
+	var names []string
+	for i := range maxExtractedAnchors + 8 {
+		names = append(names, fmt.Sprintf("pkg/f%d.go", i))
+		writeRepoFile(t, root, names[i], "package pkg\n")
+	}
+	x = &anchorExtraction{root: root, seen: map[govstore.AnchorRef]bool{}}
+	x.run(strings.Join(names, " ") + " " + b.String())
+	if len(x.anchors) != maxExtractedAnchors || x.probes != maxExtractedAnchors {
+		t.Fatalf("%d anchors after %d probes; a full extraction must stop checking at %d", len(x.anchors), x.probes,
+			maxExtractedAnchors)
+	}
+}
+
+// allocated reports the bytes fn allocates.
+func allocated(fn func()) uint64 {
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	fn()
+	runtime.ReadMemStats(&after)
+	return after.TotalAlloc - before.TotalAlloc
+}
+
+// Quote placement reads nothing when the proposal quotes no code, never reads a file
+// over its cap, and reads the rest one at a time only until each block is placed.
+func TestQuoteAnchorsReadLazilyWithinBounds(t *testing.T) {
+	root := t.TempDir()
+	var big []string
+	for i := range maxQuoteFiles {
+		rel := fmt.Sprintf("big/f%d.go", i)
+		writeRepoFile(t, root, rel, "")
+		if err := os.Truncate(filepath.Join(root, rel), 7<<20); err != nil {
+			t.Fatal(err)
+		}
+		big = append(big, rel)
+	}
+	var anchors []govstore.AnchorInput
+	if n := allocated(func() {
+		anchors, _ = proposalAnchors(context.Background(), root, "ws", "The timeouts live in the big files.", big)
+	}); n > 256<<10 || slices.ContainsFunc(anchors, func(a govstore.AnchorInput) bool { return a.Kind == govstore.AnchorCode }) {
+		t.Fatalf("a proposal naming four 7 MiB files and quoting no code allocated %d bytes (anchors %+v)", n, anchors)
+	}
+	if n := allocated(func() { anchors, _ = quoteAnchors(root, []string{"const ReadTimeout = 5\n"}, big) }); n > 256<<10 || len(anchors) != 0 {
+		t.Fatalf("placement over files past the cap allocated %d bytes (anchors %+v)", n, anchors)
+	}
+	body := "package server\n\nconst ReadTimeout = 5\n" + strings.Repeat("// padding line\n", 20_000)
+	writeRepoFile(t, root, "server/a.go", body)
+	writeRepoFile(t, root, "server/b.go", body)
+	n := allocated(func() {
+		anchors, _ = quoteAnchors(root, []string{"const ReadTimeout = 5\n"}, []string{"server/a.go", "server/b.go"})
+	})
+	if len(anchors) != 1 || anchors[0].Value != "server/a.go#L3-L3" {
+		t.Fatalf("quoted code anchors %+v", anchors)
+	}
+	// one file's text (1x) and the line index Locate builds over it (about 1.5x); reading
+	// the second file as well would double it
+	if limit := uint64(len(body)) * 7 / 2; n > limit {
+		t.Fatalf("placing one block allocated %d bytes, over %d: a second file was read", n, limit)
 	}
 }
 
@@ -171,6 +252,64 @@ func TestAnchorsResolveSymbolsThroughTheWorker(t *testing.T) {
 	}
 	if a := byValue["server/config.go"]; a.Kind != govstore.AnchorPath || a.Declared {
 		t.Fatalf("the extracted path %+v", a)
+	}
+}
+
+// remember's fan-out counts only memory the proposer may read: a pending entry sharing
+// the anchor counts for a reviewer and for no one else, and the new entry always counts
+// itself.
+func TestAnchorFanoutCountsReadableMemoryOnly(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	const url = "https://wiki.example.com/runbooks/rotate-keys"
+	promoted(t, dir, ws, "author", "Signing keys rotate every quarter; the steps are at "+url)
+	rememberAs(t, dir, ws, ContextActor{ID: "author"}, "Rotating the webhook secret follows "+url+" as well.")
+	fanout := func(who ContextActor, text string) int {
+		t.Helper()
+		e := rememberAs(t, dir, ws, who, text)
+		i := slices.IndexFunc(e.Anchors, func(a MemoryAnchor) bool { return a.Value == url })
+		if i < 0 {
+			t.Fatalf("no anchor for the URL: %+v", e.Anchors)
+		}
+		return e.Anchors[i].Fanout
+	}
+	if n := fanout(ContextActor{ID: "agent-b"}, "Our key rotation runbook is "+url); n != 2 {
+		t.Fatalf("a proposer without the verifier role sees fan-out %d, want 2 (the served entry and its own)", n)
+	}
+	if n := fanout(ContextActor{ID: "agent-c", Verifier: true}, "The runbook for rotating deploy keys: "+url); n != 4 {
+		t.Fatalf("a reviewer sees fan-out %d, want 4 (served, two pending and its own)", n)
+	}
+}
+
+// Anchor lookups read active memory only: retired entries neither damp recall's anchor
+// boost nor take the review's neighbour slots from a live overlap.
+func TestAnchorLookupsIgnoreRetiredMemory(t *testing.T) {
+	dir, ws := t.TempDir(), "ws"
+	off := false
+	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: &off})
+	author := ContextActor{ID: "author"}
+	live := rememberAs(t, dir, ws, author, "The payments service reads PAYMENTS_PORT at start.", withPaths("server/config.go"))
+	for i := range maxConflictSides + 4 {
+		e := rememberAs(t, dir, ws, author, fmt.Sprintf("Retired note %d: the old gateway also read PAYMENTS_PORT.", i),
+			withPaths("server/config.go"))
+		storeUpdate(t, dir, ws, func(tx govstore.Tx) error {
+			_, err := tx.Transition(context.Background(), e.ID, govstore.TransitionInput{To: govstore.LifecycleRetracted}, govstore.Actor{Principal: "admin"})
+			return err
+		})
+	}
+	res, err := RecallWith(context.Background(), dir, ws, RecallRequest{Query: "PAYMENTS_PORT", Explain: true, Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := res["entries"].([]ContextEntry)
+	if len(entries) != 1 || entries[0].ID != live.ID || entries[0].ScoreDetails.Anchor != 0.5 {
+		t.Fatalf("recall damped the live memory by retired ones: %+v", entries)
+	}
+	for _, who := range []ContextActor{{ID: "agent-b"}, {ID: "agent-c", Verifier: true}} {
+		other := rememberAs(t, dir, ws, who, "Lint settings for the "+who.ID+" build are unrelated to ports.",
+			withPaths("server/config.go"))
+		if c, ok := conflictWith(other, live.ID); !ok || c.Kind != ConflictPathOverlap {
+			t.Fatalf("%s: retired entries hid the live path overlap: %+v", who.ID, other.PossibleConflicts)
+		}
 	}
 }
 

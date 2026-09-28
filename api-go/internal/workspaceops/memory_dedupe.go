@@ -82,6 +82,8 @@ type reviewCandidate struct {
 
 // proposalReview is a proposal checked against the workspace before it is written.
 type proposalReview struct {
+	// reviewer: the proposer may read unverified memory (reviewInput.reviewer)
+	reviewer   bool
 	candidates []*reviewCandidate
 	duplicates []PossibleDuplicate
 	// corroborate is a served entry the proposal restates exactly, or "".
@@ -132,9 +134,9 @@ var corroborationBlocks = []corroborationBlock{
 		func(in reviewInput, _ *reviewCandidate) bool { return in.intent }},
 	{"the proposal asks for another kind, topic, tags or expiry",
 		func(in reviewInput, c *reviewCandidate) bool { return in.classifiedOtherwise(c.entry) }},
-	{"its declared paths differ", func(in reviewInput, c *reviewCandidate) bool {
-		return len(in.declared) > 0 && len(c.view.Paths) > 0 &&
-			!slices.ContainsFunc(in.declared, func(p string) bool { return slices.Contains(c.view.Paths, p) })
+	// a corroboration records no paths, so a declared path the memory lacks would be lost
+	{"it declares paths the memory does not have", func(in reviewInput, c *reviewCandidate) bool {
+		return slices.ContainsFunc(in.declared, func(p string) bool { return !slices.Contains(c.view.Paths, p) })
 	}},
 }
 
@@ -166,7 +168,7 @@ func reviewProposal(ctx context.Context, tx govstore.Tx, in reviewInput) (propos
 			ids = append(ids, id)
 		}
 	}
-	var rv proposalReview
+	rv := proposalReview{reviewer: in.reviewer}
 	if rv.candidates, err = loadReviewCandidates(ctx, tx, in, ids); err != nil {
 		return proposalReview{}, err
 	}
@@ -246,7 +248,9 @@ func (rv *proposalReview) candidate(id string) *reviewCandidate {
 	return nil
 }
 
-// anchorNeighbours are the newest active entries sharing one of the proposal's anchors.
+// anchorNeighbours are the newest entries the proposer may read (readableAnchors) that
+// share one of the proposal's anchors, so no retired or unreadable entry takes the slot
+// of a live neighbour.
 func anchorNeighbours(ctx context.Context, r govstore.Reader, in reviewInput) ([]string, error) {
 	byKind := map[string][]string{}
 	for _, p := range in.declared {
@@ -259,8 +263,9 @@ func anchorNeighbours(ctx context.Context, r govstore.Reader, in reviewInput) ([
 	}
 	var ids []string
 	for _, kind := range slices.Sorted(maps.Keys(byKind)) {
-		hits, err := r.EntriesByAnchor(ctx, govstore.AnchorQuery{WorkspaceID: in.workspaceID, Kind: kind,
-			Values: byKind[kind], Limit: maxConflictSides, NewestFirst: true})
+		q := readableAnchors(in.workspaceID, in.reviewer)
+		q.Kind, q.Values, q.Limit, q.NewestFirst = kind, byKind[kind], maxConflictSides, true
+		hits, err := r.EntriesByAnchor(ctx, q)
 		if err != nil {
 			return nil, err
 		}

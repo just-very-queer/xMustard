@@ -421,7 +421,11 @@ func (rv *proposalReview) report(ctx context.Context, r govstore.Reader, out *Co
 	if err != nil {
 		return err
 	}
-	if out.Anchors, err = anchorsWithFanout(ctx, r, out.WorkspaceID, anchors[out.ID]); err != nil {
+	e, err := r.GetEntry(ctx, out.ID)
+	if err != nil {
+		return err
+	}
+	if out.Anchors, err = anchorsWithFanout(ctx, r, e, anchors[out.ID], rv.reviewer); err != nil {
 		return err
 	}
 	view := *out
@@ -453,30 +457,6 @@ func corroborateEntry(ctx context.Context, tx govstore.Tx, workspaceID, id strin
 	}
 	out := withContent[0]
 	out.Outcome, out.DuplicateOf, out.Corroborations = OutcomeCorroborated, id, len(all)
-	return out, nil
-}
-
-// anchorsWithFanout renders an entry's anchors with how many active memories share each.
-func anchorsWithFanout(ctx context.Context, r govstore.Reader, workspaceID string, anchors []govstore.Anchor) ([]MemoryAnchor, error) {
-	byKind := map[string][]string{}
-	for _, a := range anchors {
-		byKind[a.Kind] = append(byKind[a.Kind], a.Value)
-	}
-	fanout := map[govstore.AnchorRef]int{}
-	for _, kind := range slices.Sorted(maps.Keys(byKind)) {
-		counts, err := r.AnchorFanout(ctx, workspaceID, kind, byKind[kind])
-		if err != nil {
-			return nil, err
-		}
-		for v, n := range counts {
-			fanout[govstore.AnchorRef{Kind: kind, Value: v}] = n
-		}
-	}
-	out := make([]MemoryAnchor, len(anchors))
-	for i, a := range anchors {
-		out[i] = MemoryAnchor{Kind: a.Kind, Value: a.Value, SymbolUID: a.SymbolUID, Declared: a.Declared,
-			Fanout: fanout[govstore.AnchorRef{Kind: a.Kind, Value: a.Value}]}
-	}
 	return out, nil
 }
 
@@ -718,13 +698,18 @@ func Remember(dataDir, workspaceID string, req RememberRequest, actor ContextAct
 	var red ingestRedaction
 	red.scrub(&req.Title, &req.Content, &req.NewString, &req.Reason)
 	req.Description = red.scrubOptional(req.Description)
+	// claims are stored, and quoted in conflict reasons other principals read
+	req.Claims = slices.Clone(req.Claims)
+	for i := range req.Claims {
+		red.scrub(&req.Claims[i].Subject, &req.Claims[i].Object)
+	}
 	req.Source, req.OpenMode, req.Caller = actor.ID, actor.OpenMode, actor
 	out, err := run(dataDir, workspaceID, req, actor)
 	if err != nil {
 		return nil, err
 	}
 	red.annotate(out)
-	flagInstructions(out, req.Title, req.Content, req.NewString)
+	flagInstructions(out, append([]string{req.Title, req.Content, req.NewString}, claimTexts(req.Claims)...)...)
 	return out, nil
 }
 

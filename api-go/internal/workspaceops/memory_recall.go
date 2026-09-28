@@ -499,7 +499,7 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 				return err
 			}
 		}
-		if boosts, boostWhy, err = queryAnchorBoosts(ctx, r, workspaceID, req.Query, focus); err != nil {
+		if boosts, boostWhy, err = queryAnchorBoosts(ctx, r, readableAnchors(workspaceID, req.ReadsUnverified()), req.Query, focus); err != nil {
 			return err
 		}
 		if req.Subject != "" {
