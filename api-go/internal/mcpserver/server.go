@@ -203,6 +203,7 @@ type Session struct {
 	mu          sync.Mutex
 	version     string // "" until initialize
 	rootsCap    bool   // the client declared the roots capability
+	elicitCap   bool   // the client declared the elicitation capability (elicitation.go)
 	initialized bool   // notifications/initialized received: server requests allowed
 	roots       *rootsState
 	rootsGen    uint64 // bumped by roots/list_changed and initialize; guards s.roots
@@ -273,7 +274,8 @@ func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		Capabilities    struct {
-			Roots *json.RawMessage `json:"roots"`
+			Roots       *json.RawMessage `json:"roots"`
+			Elicitation *json.RawMessage `json:"elicitation"`
 		} `json:"capabilities"`
 	}
 	if len(params) > 0 && strings.TrimSpace(string(params)) != "null" {
@@ -285,6 +287,7 @@ func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
 	s.mu.Lock()
 	s.version = v
 	s.rootsCap = p.Capabilities.Roots != nil
+	s.elicitCap = p.Capabilities.Elicitation != nil
 	s.roots = nil
 	s.rootsGen++
 	s.mu.Unlock()

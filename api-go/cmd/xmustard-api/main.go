@@ -285,6 +285,8 @@ type memoryCaller struct {
 	// session and callID are the transport's provenance of the write (the MCP bridge
 	// sends its session and the JSON-RPC id of the tool call).
 	session, callID string
+	// approval labels a human approver's write (human_presence.go); "" for anyone else.
+	approval string
 }
 
 // id is the identity recorded as author/verifier. It is never caller-asserted.
@@ -305,7 +307,7 @@ func (c memoryCaller) actor() workspaceops.ContextActor {
 		Admin:     c.openMode || c.principal.Has(workspaceops.RoleAdmin),
 		Approver:  c.openMode || c.principal.Has(workspaceops.RoleHumanApprover),
 		Verifier:  c.openMode || c.principal.Has(workspaceops.RoleVerifier),
-		SessionID: c.session, CallID: c.callID,
+		SessionID: c.session, CallID: c.callID, Approval: c.approval,
 	}
 	if c.principal != nil {
 		a.Owner, a.Kind = c.principal.Owner, c.principal.Kind
@@ -343,7 +345,7 @@ func requireMemoryCaller(w http.ResponseWriter, r *http.Request, role string) (m
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
 		return memoryCaller{}, false
 	}
-	return memoryCaller{principal: p, openMode: p == nil, session: session, callID: callID}, true
+	return memoryCaller{principal: p, openMode: p == nil, session: session, callID: callID, approval: approvalLabel(r, p)}, true
 }
 
 // requireWellFormedJSON decodes a body that may be absent or blank (the handler then
@@ -521,6 +523,17 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 				RemoteAddr: r.RemoteAddr,
 			})
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
+			return
+		}
+		// A presence-only token is typed at the xmustard-ops prompt, never sent as a
+		// bearer token (WS-57): one that arrives here was read from somewhere else.
+		if principal != nil && principal.PresenceOnly {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action: "denied", Actor: principal.ID, Detail: "presence-only token presented as a bearer token",
+				Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"reason": "presence_only_token",
+				"error": "this token is presence-only: it is accepted only when typed at the xmustard-ops prompt, never as a bearer token"})
 			return
 		}
 		// A reader-only principal's writes are refused by the route gate, which

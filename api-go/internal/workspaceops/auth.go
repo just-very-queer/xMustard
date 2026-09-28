@@ -53,6 +53,11 @@ type Principal struct {
 	// owners instead of token ids.
 	Owner string `json:"owner,omitempty"`
 	Kind  string `json:"kind,omitempty"`
+	// PresenceOnly marks a human's token that is accepted only when typed at the
+	// xmustard-ops terminal prompt (WS-57): the API refuses it as a bearer token and the
+	// ops CLI refuses it from a file or the environment, so no configuration an agent
+	// process reads has to hold it.
+	PresenceOnly bool `json:"presence_only,omitempty"`
 }
 
 // AllowsWorkspace reports whether the principal may act on workspaceID. An empty
@@ -82,10 +87,12 @@ type tokenRecord struct {
 	TokenIdentity
 }
 
-// TokenIdentity is who operates a token (see Principal.Owner and Principal.Kind).
+// TokenIdentity is who operates a token (see Principal.Owner, Principal.Kind and
+// Principal.PresenceOnly).
 type TokenIdentity struct {
-	Owner string `json:"owner,omitempty"`
-	Kind  string `json:"kind,omitempty"`
+	Owner        string `json:"owner,omitempty"`
+	Kind         string `json:"kind,omitempty"`
+	PresenceOnly bool   `json:"presence_only,omitempty"`
 }
 
 // Principal kinds.
@@ -104,6 +111,9 @@ func (ti TokenIdentity) normalize(id string) (TokenIdentity, error) {
 	if ti.Kind != PrincipalAgent && ti.Kind != PrincipalHuman {
 		return TokenIdentity{}, fmt.Errorf("kind %q is not agent or human: %w", ti.Kind, ErrInvalidInput)
 	}
+	if ti.PresenceOnly && ti.Kind != PrincipalHuman {
+		return TokenIdentity{}, fmt.Errorf("a presence-only token is typed by a human, so its kind is human: %w", ErrInvalidInput)
+	}
 	return ti, nil
 }
 
@@ -113,6 +123,7 @@ func (r tokenRecord) principal() Principal {
 	p := newPrincipal(r.ID, fallbackString(r.Role, roleAgent), slices.Clone(r.Workspaces))
 	p.Owner = fallbackString(r.Owner, p.Owner)
 	p.Kind = fallbackString(r.Kind, p.Kind)
+	p.PresenceOnly = r.PresenceOnly
 	return p
 }
 
@@ -448,7 +459,8 @@ func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []stri
 		Workspaces:  workspaces,
 		// Only an owner other than the id itself is written, so stored records stay
 		// as they were for tokens that never set one.
-		TokenIdentity: TokenIdentity{Owner: stripDefault(ident.Owner, id), Kind: stripDefault(ident.Kind, PrincipalAgent)},
+		TokenIdentity: TokenIdentity{Owner: stripDefault(ident.Owner, id), Kind: stripDefault(ident.Kind, PrincipalAgent),
+			PresenceOnly: ident.PresenceOnly},
 	})
 	if err := writeJSON(tokensPath(dataDir), next); err != nil {
 		return "", err
@@ -481,7 +493,8 @@ func RotateToken(dataDir, id string, ttlSeconds int) (string, error) {
 		if r.ID == id {
 			// preserve the role, workspace scope and identity across rotation
 			p := r.principal()
-			return mintTokenLocked(dataDir, id, p.Role, ttlSeconds, r.Workspaces, TokenIdentity{Owner: p.Owner, Kind: p.Kind})
+			return mintTokenLocked(dataDir, id, p.Role, ttlSeconds, r.Workspaces,
+				TokenIdentity{Owner: p.Owner, Kind: p.Kind, PresenceOnly: p.PresenceOnly})
 		}
 	}
 	return "", os.ErrNotExist

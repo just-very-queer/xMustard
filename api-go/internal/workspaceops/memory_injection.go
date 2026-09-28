@@ -167,9 +167,9 @@ func humanApproved(e govstore.Entry, revisionAuthor string, votes []govstore.Vot
 }
 
 // humanApprovers are the principals that are human approvers of workspaceID now (WS-09
-// roles, WS-19B kinds): a file-backed token (environment tokens are agents) of kind
-// human that holds the human-approver role (admin holds it too), is scoped to the
-// workspace, has not expired and is not the open-mode identity. A revoked token is gone
+// roles, WS-19B kinds, WS-57 IsHumanApprover): a file-backed token (environment tokens
+// are agents) of kind human that holds the human-approver role (admin holds it too), is
+// scoped to the workspace, has not expired and is not the open-mode identity. A revoked token is gone
 // from the store, so its approvals stop counting. An unreadable token store is an
 // error: nothing counts as approved.
 func humanApprovers(dataDir, workspaceID string) (map[string]bool, error) {
@@ -180,8 +180,7 @@ func humanApprovers(dataDir, workspaceID string) (map[string]bool, error) {
 	out := map[string]bool{}
 	for _, r := range store.recs {
 		p := r.principal()
-		if tokenExpired(r.ExpiresAt) || IsOpenModeIdentity(p.ID) || p.Kind != PrincipalHuman ||
-			!p.Has(RoleHumanApprover) || !p.AllowsWorkspace(workspaceID) {
+		if tokenExpired(r.ExpiresAt) || IsOpenModeIdentity(p.ID) || !IsHumanApprover(&p) || !p.AllowsWorkspace(workspaceID) {
 			continue
 		}
 		out[p.ID] = true

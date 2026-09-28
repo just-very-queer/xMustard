@@ -111,6 +111,37 @@ func TestAdmitMemoryNeedsHumanApproval(t *testing.T) {
 	}
 }
 
+// An approval cast through the human-approval surface (WS-57: xmustard-ops approve)
+// is a human approval: the memory is admitted to a pushed surface.
+func TestOpsHumanVerdictAdmits(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	raw, err := MintIdentityToken(dir, "alice", "human-approver", 0, nil, TokenIdentity{Kind: PrincipalHuman})
+	if err != nil {
+		t.Fatal(err)
+	}
+	h, err := AuthorizeHumanApprover(dir, ws, raw, TokenFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t", Content: "tags come from main"}},
+		ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := VerifyContext(dir, ws, e.ID, "peer-1", true, ""); err != nil {
+		t.Fatal(err)
+	}
+	if res := admit(t, dir, ws, injection.SurfaceHook, e.ID); len(res.Admitted) != 0 {
+		t.Fatalf("admitted before the human approved: %+v", res)
+	}
+	if _, err := HumanVerdict(dir, ws, e.ID, h, OutcomeApprove, 0, "checked the release script"); err != nil {
+		t.Fatal(err)
+	}
+	if res := admit(t, dir, ws, injection.SurfaceHook, e.ID); len(res.Admitted) != 1 || res.Admitted[0].Basis != "human_approved" {
+		t.Fatalf("a human verdict did not admit the memory: %+v", res)
+	}
+}
+
 // A vote counts as a human approval only from a principal that is a human approver of
 // the workspace now, cast as kind human, and not by the memory's author.
 func TestHumanApprovalFailsClosed(t *testing.T) {
