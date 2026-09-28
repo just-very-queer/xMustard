@@ -36,7 +36,9 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		if len(req.Paths) == 0 && q.Get("paths") != "" {
 			req.Paths = strings.Split(q.Get("paths"), ",")
 		}
-		if !requireHumanPresence(w, r, caller, rememberAction(r.PathValue("workspace_id"), req)) {
+		if _, ok := holdForHuman(w, r, caller, func() (workspaceops.HumanConfirmation, error) {
+			return workspaceops.DescribeRemember(dataDir(), r.PathValue("workspace_id"), req)
+		}); !ok {
 			return
 		}
 		result, err := workspaceops.Remember(dataDir(), r.PathValue("workspace_id"), req, caller.actor())
@@ -80,15 +82,22 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		if req.Outcome == "" && !req.Approve {
 			req.Outcome = workspaceops.OutcomeReject
 		}
-		if !requireHumanPresence(w, r, caller, verifyAction(r.PathValue("workspace_id"), r.PathValue("entry_id"), req.Outcome, req.Revision)) {
+		verify := workspaceops.VerifyRequest{Outcome: req.Outcome, Revision: req.Revision, Note: req.Note,
+			Target: req.Target, EvidenceHandle: req.EvidenceHandle}
+		confirmed, ok := holdForHuman(w, r, caller, func() (workspaceops.HumanConfirmation, error) {
+			return workspaceops.DescribeVerify(dataDir(), r.PathValue("workspace_id"), r.PathValue("entry_id"), verify)
+		})
+		if !ok {
 			return
+		}
+		if confirmed != nil && confirmed.Revision > 0 {
+			verify.Revision = confirmed.Revision // the revision the human was shown
 		}
 		// The verifier is the AUTHENTICATED principal; a body "agent" is ignored. In
 		// open mode all unauthenticated callers collapse to a single identity, so N
 		// fabricated agent names cannot satisfy the multi-agent gate.
 		result, err := workspaceops.VerifyContextOutcome(dataDir(), r.PathValue("workspace_id"), r.PathValue("entry_id"),
-			caller.actor(), workspaceops.VerifyRequest{Outcome: req.Outcome, Revision: req.Revision, Note: req.Note,
-				Target: req.Target, EvidenceHandle: req.EvidenceHandle})
+			caller.actor(), verify)
 		respondMemoryWrite(w, r, caller, result, err)
 	})
 	mux.HandleFunc("PUT /api/workspaces/{workspace_id}/context/{entry_id}", func(w http.ResponseWriter, r *http.Request) {

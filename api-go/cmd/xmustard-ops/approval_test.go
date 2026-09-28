@@ -34,8 +34,12 @@ func runOps(e opsEnv, args ...string) int { return approvalCommands[args[0]](e, 
 
 func mintApprover(t *testing.T, dir, id, kind string) string {
 	t.Helper()
-	raw, err := workspaceops.MintIdentityToken(dir, id, workspaceops.RoleHumanApprover, 0, nil,
-		workspaceops.TokenIdentity{Owner: id, Kind: kind})
+	return mintIdentity(t, dir, id, workspaceops.TokenIdentity{Owner: id, Kind: kind})
+}
+
+func mintIdentity(t *testing.T, dir, id string, ident workspaceops.TokenIdentity) string {
+	t.Helper()
+	raw, err := workspaceops.MintIdentityToken(dir, id, workspaceops.RoleHumanApprover, 0, nil, ident)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -56,8 +60,9 @@ func TestApproveRejectAndQueueNeedAHumanApprover(t *testing.T) {
 	dir, ws := t.TempDir(), "ws"
 	token := mintApprover(t, dir, "alice", workspaceops.PrincipalHuman)
 	agentToken := mintApprover(t, dir, "bot", workspaceops.PrincipalAgent)
+	presence := mintIdentity(t, dir, "erin", workspaceops.TokenIdentity{Kind: workspaceops.PrincipalHuman, PresenceOnly: true})
 	var ids []string
-	for _, content := range []string{"the build uses make", "tests need docker", "lint with golangci"} {
+	for _, content := range []string{"the build uses make", "tests need docker", "lint with golangci", "ci runs on linux"} {
 		e, err := workspaceops.Remember(dir, ws, workspaceops.RememberRequest{ProposeContextRequest: workspaceops.ProposeContextRequest{
 			Title: "t", Content: content}}, workspaceops.ContextActor{ID: "author"})
 		if err != nil {
@@ -70,16 +75,30 @@ func TestApproveRejectAndQueueNeedAHumanApprover(t *testing.T) {
 	if code := runOps(typed, "queue", ws, "--data-dir", dir); code != 0 {
 		t.Fatalf("queue exit %d", code)
 	}
-	if q := decodeOut(t, out); q["total"] != float64(3) || q["approver"] != "alice" {
+	if q := decodeOut(t, out); q["total"] != float64(4) || q["approver"] != "alice" {
 		t.Fatalf("queue: %v", q)
 	}
 
-	// a typed token is user presence; the environment and a file are advisory
+	// the assurance belongs to the token: an ordinary token is advisory even when typed,
+	// since it also works from places agents read; a presence-only one typed is user
+	// presence, and refused from the environment or a file
 	if code := runOps(typed, "approve", ws, ids[0], "--note", "read it", "--data-dir", dir); code != 0 {
 		t.Fatalf("approve exit %d", code)
 	}
-	if res := decodeOut(t, out); res["approval"] != "ops/user_presence" || res["verdict"] != "approve" {
+	if res := decodeOut(t, out); res["approval"] != "ops/advisory" || res["verdict"] != "approve" {
 		t.Fatalf("approve: %v", res)
+	}
+	present, out, _ := testEnv(nil, presence)
+	if code := runOps(present, "approve", ws, ids[3], "--data-dir", dir); code != 0 {
+		t.Fatalf("presence-only approve exit %d", code)
+	}
+	if res := decodeOut(t, out); res["approval"] != "ops/user_presence" {
+		t.Fatalf("presence-only typed: %v", res)
+	}
+	leaked, out, errOut := testEnv(map[string]string{"XMUSTARD_APPROVER_TOKEN": presence}, "")
+	if code := runOps(leaked, "reject", ws, ids[3], "--data-dir", dir); code != exitError || out.Len() != 0 ||
+		!strings.Contains(errOut.String(), "presence-only token") {
+		t.Fatalf("a presence-only token from the environment was accepted: exit %d %s %s", code, out, errOut)
 	}
 	fromEnv, out, _ := testEnv(map[string]string{"XMUSTARD_APPROVER_TOKEN": token}, "")
 	if code := runOps(fromEnv, "reject", ws, ids[1], "--data-dir", dir); code != 0 {
@@ -161,7 +180,7 @@ func TestReviewApproveRevokeAndGate(t *testing.T) {
 	e, out, _ := testEnv(map[string]string{"XMUSTARD_APPROVER_TOKEN": token}, "")
 	gate := func(want int) map[string]any {
 		t.Helper()
-		if code := runOps(e, "review", "gate", ws, "--data-dir", dataDir); code != want {
+		if code := runOps(e, "review", "gate", ws, "--base", "main", "--data-dir", dataDir); code != want {
 			t.Fatalf("gate exit %d, want %d: %s", code, want, out)
 		}
 		return decodeOut(t, out)
@@ -199,6 +218,7 @@ func TestReviewApproveRevokeAndGate(t *testing.T) {
 		{"review", "revoke", ws, "--approval", "1", "--data-dir", dataDir}, // no reason
 		{"review", "merge", ws},                                            // unknown subcommand
 		{"review", "gate"},                                                 // no workspace
+		{"review", "gate", ws, "--data-dir", dataDir},                      // no --base
 	} {
 		if code := runOps(e, args...); code != exitUsage {
 			t.Fatalf("%v: want usage exit, got %d", args, code)

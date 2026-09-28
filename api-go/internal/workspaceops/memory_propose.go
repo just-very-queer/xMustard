@@ -454,20 +454,30 @@ var rememberOps = map[string]func(dataDir, workspaceID string, req RememberReque
 	},
 }
 
+// NormalizeRememberOp is the op Remember runs for raw: trimmed, lower case, propose
+// when blank. An unknown op is invalid input.
+func NormalizeRememberOp(raw string) (string, error) {
+	op := fallbackString(strings.ToLower(strings.TrimSpace(raw)), "propose")
+	if _, ok := rememberOps[op]; !ok {
+		return "", fmt.Errorf("op %q is not propose, supersede, edit, retire or restore: %w", raw, ErrInvalidInput)
+	}
+	return op, nil
+}
+
 // Remember runs one remember write as actor, who is always the author: a proposal is
 // attributed to actor, never to a Source in the request. The evidence and run the write
 // cites are checked and bound to it first, and secrets are redacted from every text
 // field that is stored (old_string only locates stored text and is never stored).
 func Remember(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error) {
-	op := fallbackString(strings.ToLower(strings.TrimSpace(req.Op)), "propose")
-	run, ok := rememberOps[op]
-	if !ok {
-		return nil, fmt.Errorf("op %q is not propose, supersede, edit, retire or restore: %w", req.Op, ErrInvalidInput)
+	op, err := NormalizeRememberOp(req.Op)
+	if err != nil {
+		return nil, err
 	}
+	run := rememberOps[op]
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
-	actor, err := bindProvenance(dataDir, workspaceID, actor, req.Evidence, req.RunID)
+	actor, err = bindProvenance(dataDir, workspaceID, actor, req.Evidence, req.RunID)
 	if err != nil {
 		return nil, err
 	}

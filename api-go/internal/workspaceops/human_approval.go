@@ -1,11 +1,14 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"xmustard/api-go/internal/govstore"
@@ -16,11 +19,20 @@ import (
 // is present: `xmustard-ops approve|reject|queue|review`, with the token typed at the
 // terminal or read from a file or the environment, and over MCP only through a client
 // that asks the human to confirm each write (elicitation). Every write it makes carries
-// an approval label, "<surface>/<assurance>". The assurance is user_presence only when
-// the token was typed at the terminal, so no agent process could read it; anything else
-// is advisory, because an agent process of the same user could have used the token.
-// Neither is an enforcement: the store is a file the user's processes can write, so an
-// approval records a human's decision, and enforcement stays with the branch
+// an approval label, "<surface>/<assurance>".
+//
+// The assurance belongs to the token, not to the channel it arrived on. It is
+// user_presence only for a presence-only token (TokenIdentity.PresenceOnly) typed at the
+// terminal prompt: the API refuses such a token as a bearer token and the ops CLI
+// refuses it from a file or the environment, both audited, so no configuration an agent
+// process reads has to hold it. Every other token is advisory wherever it is used,
+// because the same token is accepted from files, the environment, HTTP and MCP client
+// configurations that agent processes of the same user can read, and a process that
+// reads it can also type it into a pseudo-terminal. user_presence is not proof either:
+// a process that learns a presence-only token can type it through a pseudo-terminal
+// too; the label says the token is never accepted where agents are expected to read
+// it. Neither is an enforcement: the store is a file the user's processes can write,
+// so an approval records a human's decision, and enforcement stays with the branch
 // protection or policy that consumes it.
 
 // Where a human approver's write was made.
@@ -30,13 +42,23 @@ const (
 	ApprovalSurfaceHTTP = "http"            // a direct API call
 )
 
-// Whether an agent process could have read the token that made the write.
+// How far the token that made the write is kept from agent processes.
 const (
-	AssuranceUserPresence = "user_presence" // typed at the terminal and never stored
-	AssuranceAdvisory     = "advisory"      // from a file, the environment or a client config
+	// AssuranceUserPresence: a presence-only token typed at the terminal prompt.
+	AssuranceUserPresence = "user_presence"
+	// AssuranceAdvisory: a token also accepted from files, the environment, HTTP or an
+	// MCP client configuration, which agent processes can read.
+	AssuranceAdvisory = "advisory"
 )
 
-var assurances = map[string]bool{AssuranceUserPresence: true, AssuranceAdvisory: true}
+// Where the ops CLI read a human approver's token.
+const (
+	TokenTyped   = "terminal"    // typed at the controlling terminal with echo off
+	TokenFile    = "file"        // --token-file
+	TokenEnviron = "environment" // XMUSTARD_APPROVER_TOKEN
+)
+
+var tokenSources = map[string]bool{TokenTyped: true, TokenFile: true, TokenEnviron: true}
 
 // HumanApprovalLabel is the label a human approver's write records under
 // provenance.approval.
@@ -60,16 +82,19 @@ type HumanApprover struct {
 	Assurance string
 }
 
-// AuthorizeHumanApprover resolves raw to a human approver acting on workspaceID. The
-// checks run in order and fail closed: a token is given, it resolves (known, not
-// revoked, not expired), it is not the open-mode identity, it is of kind human, it holds
-// the human-approver role, and it is scoped to the workspace. A refusal is audited.
-func AuthorizeHumanApprover(dataDir, workspaceID, raw, assurance string) (HumanApprover, error) {
+// AuthorizeHumanApprover resolves raw, read from source (TokenTyped, TokenFile or
+// TokenEnviron), to a human approver acting on workspaceID. The checks run in order and
+// fail closed: a token is given, it resolves (known, not revoked, not expired), it is
+// not the open-mode identity, it is of kind human, it holds the human-approver role, it
+// is scoped to the workspace, and a presence-only token was typed at the terminal. A
+// refusal is audited. The assurance is user_presence for a presence-only token and
+// advisory for any other.
+func AuthorizeHumanApprover(dataDir, workspaceID, raw, source string) (HumanApprover, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return HumanApprover{}, err
 	}
-	if !assurances[assurance] {
-		return HumanApprover{}, fmt.Errorf("assurance %q is not user_presence or advisory: %w", assurance, ErrInvalidInput)
+	if !tokenSources[source] {
+		return HumanApprover{}, fmt.Errorf("token source %q is not terminal, file or environment: %w", source, ErrInvalidInput)
 	}
 	deny := func(actor, why string) (HumanApprover, error) {
 		RecordAuthAudit(dataDir, AuthAuditEvent{Action: "denied", Actor: actor, Detail: "human approval: " + why,
@@ -90,6 +115,13 @@ func AuthorizeHumanApprover(dataDir, workspaceID, raw, assurance string) (HumanA
 		return deny(p.ID, fmt.Sprintf("principal %q lacks the human-approver role (has %s)", p.ID, strings.Join(p.RoleSet(), ", ")))
 	case !p.AllowsWorkspace(workspaceID):
 		return deny(p.ID, fmt.Sprintf("principal %q is not scoped to workspace %s", p.ID, workspaceID))
+	case p.PresenceOnly && source != TokenTyped:
+		return deny(p.ID, fmt.Sprintf("principal %q has a presence-only token, accepted only when typed at the terminal prompt, "+
+			"and it was read from the %s", p.ID, source))
+	}
+	assurance := AssuranceAdvisory
+	if p.PresenceOnly {
+		assurance = AssuranceUserPresence
 	}
 	return HumanApprover{Principal: *p, Assurance: assurance}, nil
 }
@@ -191,8 +223,8 @@ type IndexBaselineRecord struct {
 // ApprovalQueue is what awaits one human approver in a workspace: the memory writes
 // the approver may vote on (awaiting_me: not written by them, not already voted on by
 // them, and not blocked by the owner-distinct policy; Skipped counts the rest), oldest
-// first, at most limit of them with Total counting all, and the recent index baseline
-// builds.
+// pending revision first, at most limit of them with Total counting all, and the recent
+// index baseline builds.
 type ApprovalQueue struct {
 	WorkspaceID    string                `json:"workspace_id"`
 	Approver       string                `json:"approver"`
@@ -209,22 +241,28 @@ const (
 	skipSameOwner = "same_owner"
 )
 
-// queueCandidate is one pending revision of an entry.
+// queueCandidate is one pending revision of an entry; rv and votes are filled once it
+// is found eligible.
 type queueCandidate struct {
 	entry    govstore.Entry
 	revision int64
 	kind     string
+	rv       govstore.Revision
+	votes    []govstore.Vote
+	at       time.Time // rv.CreatedAt, the age the queue sorts by
 }
 
 // HumanApprovalQueue lists what awaits h in workspaceID (see ApprovalQueue). limit
 // bounds the items rendered (default 50) and baselines the index baseline builds listed
-// (default 10), newest last.
+// (default 10), newest last. Items are ordered by when their pending revision was
+// written, so a recent edit of an old entry sorts after older proposals.
 func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, baselines int) (*ApprovalQueue, error) {
 	limit, baselines = positiveOr(limit, 50), positiveOr(baselines, 10)
 	ctx := context.Background()
 	q := &ApprovalQueue{WorkspaceID: workspaceID, Approver: h.Principal.ID, Items: []ApprovalItem{},
 		Skipped: map[string]int{skipOwn: 0, skipVoted: 0, skipSameOwner: 0}, IndexBaselines: []IndexBaselineRecord{}}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		var eligible []queueCandidate
 		f := govstore.EntryFilter{WorkspaceID: workspaceID, Limit: storeListPage}
 		for {
 			page, err := r.ListEntries(ctx, f)
@@ -233,8 +271,12 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 			}
 			for _, e := range page {
 				for _, c := range pendingRevisions(e) {
-					if err := q.consider(ctx, r, dataDir, h, c, limit); err != nil {
+					ok, err := q.consider(ctx, r, dataDir, h, &c)
+					if err != nil {
 						return err
+					}
+					if ok {
+						eligible = append(eligible, c)
 					}
 				}
 			}
@@ -242,6 +284,17 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 				break
 			}
 			f.AfterCursor = page[len(page)-1].Cursor
+		}
+		slices.SortStableFunc(eligible, func(a, b queueCandidate) int {
+			return cmp.Or(a.at.Compare(b.at), cmp.Compare(a.entry.ID, b.entry.ID), cmp.Compare(a.revision, b.revision))
+		})
+		q.Total = len(eligible)
+		for _, c := range eligible[:min(limit, len(eligible))] {
+			item, err := queueItem(ctx, r, c)
+			if err != nil {
+				return err
+			}
+			q.Items = append(q.Items, item)
 		}
 		var err error
 		q.IndexBaselines, err = recentIndexBaselines(ctx, r, workspaceID, baselines)
@@ -266,16 +319,17 @@ func pendingRevisions(e govstore.Entry) []queueCandidate {
 	return out
 }
 
-// consider adds c to the queue when h may vote on it, or counts why not.
-func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir string, h HumanApprover, c queueCandidate, limit int) error {
+// consider reports whether h may vote on c, filling its revision and votes, or counts
+// why not.
+func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir string, h HumanApprover, c *queueCandidate) (bool, error) {
 	e, me := c.entry, h.Principal.ID
 	rv, err := r.GetRevision(ctx, e.ID, c.revision)
 	if err != nil {
-		return err
+		return false, err
 	}
 	votes, err := r.ListVotes(ctx, e.ID, c.revision)
 	if err != nil {
-		return err
+		return false, err
 	}
 	skip := ""
 	switch {
@@ -289,23 +343,17 @@ func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir
 		if errors.Is(err, ErrSameOwner) {
 			skip = skipSameOwner
 		} else if err != nil {
-			return err
+			return false, err
 		}
 	}
 	if skip != "" {
 		q.Skipped[skip]++
-		return nil
+		return false, nil
 	}
-	q.Total++
-	if len(q.Items) >= limit {
-		return nil
-	}
-	item, err := queueItem(ctx, r, c, rv, votes)
-	if err != nil {
-		return err
-	}
-	q.Items = append(q.Items, item)
-	return nil
+	// an unparseable time sorts first: the oldest is shown rather than hidden
+	c.at, _ = time.Parse(time.RFC3339Nano, rv.CreatedAt)
+	c.rv, c.votes = rv, votes
+	return true, nil
 }
 
 // votedBy reports whether principal has a counting verdict among votes.
@@ -320,8 +368,8 @@ func votedBy(votes []govstore.Vote, principal string) bool {
 
 // queueItem renders one candidate: a proposal with its text (bound to its digest), an
 // edit with its reason and diff, and the verdicts cast so far.
-func queueItem(ctx context.Context, r govstore.Reader, c queueCandidate, rv govstore.Revision, votes []govstore.Vote) (ApprovalItem, error) {
-	e := c.entry
+func queueItem(ctx context.Context, r govstore.Reader, c queueCandidate) (ApprovalItem, error) {
+	e, rv, votes := c.entry, c.rv, c.votes
 	tally, err := r.Tally(ctx, e.ID, c.revision)
 	if err != nil {
 		return ApprovalItem{}, err

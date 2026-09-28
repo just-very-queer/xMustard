@@ -21,13 +21,15 @@ import (
 // approver attests that they reviewed one change: the repository, the merge base of a
 // base ref and a head, the head commit and the SHA-256 of the diff between them, and
 // the review records they read. The attestation is stale as soon as the head, the merge
-// base or the diff differs, and a human approver can revoke it. It is an attestation
+// base or the diff differs (a gate asked about another base sees another merge base), a
+// human approver can revoke it, and it stops counting when its approver's token is
+// revoked. It is an attestation
 // only: xMustard never runs git merge, never changes branch protection and never posts
 // to a pull request, and it is created only here, from `xmustard-ops review approve`,
 // never over MCP or HTTP. `review gate` reports the state through its exit code for the
 // human's own pre-push hook; there is no signed export, so it is not a CI control. The
-// record is as strong as its token (see HumanApprover): advisory unless the token was
-// typed at the terminal.
+// record is as strong as its token (see HumanApprover): advisory unless a presence-only
+// token was typed at the terminal.
 
 // MergeApprovalEnforcement is the label every attestation and every status carries.
 const MergeApprovalEnforcement = "attestation only: xMustard never merges, never changes branch protection " +
@@ -88,17 +90,23 @@ type MergeRevocation struct {
 	At     string `json:"at"`
 }
 
-// MergeApprovalStatus is the human approval state of the change at a head: current
-// when an unrevoked attestation binds exactly this change, stale when attestations
-// exist but none does (Approval is then the newest one), none when there is none.
+// MergeApprovalStatus is the human approval state of merging a head into a base:
+// current when a trusted, unrevoked attestation binds exactly the change from their
+// merge base to the head, stale when trusted attestations exist but none does (Approval
+// is then the newest one), none when there is none. Revoked counts revoked attestations
+// and Untrusted those whose approver is not, or no longer, a human approver of the
+// workspace; neither is ever current.
 type MergeApprovalStatus struct {
 	WorkspaceID string         `json:"workspace_id"`
 	Status      string         `json:"status"`
+	BaseRef     string         `json:"base_ref"`
 	Head        string         `json:"head"`
 	Approval    *MergeApproval `json:"approval,omitempty"`
-	// Current is the change as it is now, for the base ref of Approval.
+	// Current is the change as it is now, from the merge base of BaseRef and Head; it is
+	// observed only when an attestation names this head.
 	Current     *ReviewedChange `json:"current,omitempty"`
 	Revoked     int             `json:"revoked"`
+	Untrusted   int             `json:"untrusted"`
 	Enforcement string          `json:"enforcement"`
 }
 
@@ -129,15 +137,16 @@ func DiffReviewedChange(ctx context.Context, dataDir, workspaceID, baseRef, head
 	if err != nil {
 		return ReviewedChange{}, err
 	}
-	return diffAt(ctx, workspaceID, root, baseRef, head)
-}
-
-// diffAt observes the change from the merge base of baseRef and the resolved head.
-func diffAt(ctx context.Context, workspaceID, root, baseRef, head string) (ReviewedChange, error) {
 	base, err := resolveCommit(ctx, root, baseRef)
 	if err != nil {
 		return ReviewedChange{}, err
 	}
+	return diffAt(ctx, workspaceID, root, baseRef, base, head)
+}
+
+// diffAt observes the change from the merge base of base (resolved from baseRef) and
+// head, both resolved commits.
+func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string) (ReviewedChange, error) {
 	var mb bytes.Buffer
 	if err := reviewGit(ctx, root, &mb, "merge-base", base, head); err != nil {
 		return ReviewedChange{}, fmt.Errorf("merge base of %s and %s: %w", baseRef, head, err)
@@ -313,10 +322,15 @@ func RevokeMergeApproval(ctx context.Context, dataDir, workspaceID string, h Hum
 	return out, err
 }
 
-// MergeApprovalState reports the human approval state of the change at headRef (see
-// MergeApprovalStatus). Only attestations whose head is the resolved head are diffed
-// again; any other one is stale without running git.
-func MergeApprovalState(ctx context.Context, dataDir, workspaceID, headRef string) (*MergeApprovalStatus, error) {
+// MergeApprovalState reports the human approval state of merging headRef into baseRef
+// (see MergeApprovalStatus). An attestation counts only when it is unrevoked, its
+// recorded approver kind is human and its approver is still a human approver scoped to
+// the workspace (a revoked token distrusts what it attested), and it is current only
+// when it binds the change from the merge base of baseRef and the head: the same
+// repository, merge base, head and diff digest. An attestation of a narrower change (made
+// against another base) is therefore stale. The change is diffed at most once, and only
+// when an attestation names the resolved head.
+func MergeApprovalState(ctx context.Context, dataDir, workspaceID, baseRef, headRef string) (*MergeApprovalStatus, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
@@ -329,7 +343,8 @@ func MergeApprovalState(ctx context.Context, dataDir, workspaceID, headRef strin
 	if err != nil {
 		return nil, err
 	}
-	st := &MergeApprovalStatus{WorkspaceID: workspaceID, Status: MergeApprovalNone, Enforcement: MergeApprovalEnforcement}
+	st := &MergeApprovalStatus{WorkspaceID: workspaceID, Status: MergeApprovalNone, BaseRef: baseRef,
+		Enforcement: MergeApprovalEnforcement}
 	root := WorkspaceRepoScope(dataDir, workspaceID)
 	if root == "" {
 		return nil, fmt.Errorf("workspace %s has no repository root: %w", workspaceID, os.ErrNotExist)
@@ -337,11 +352,19 @@ func MergeApprovalState(ctx context.Context, dataDir, workspaceID, headRef strin
 	if st.Head, err = resolveCommit(ctx, root, headRef); err != nil {
 		return nil, err
 	}
-	observed := map[string]ReviewedChange{} // by base ref
+	base, err := resolveCommit(ctx, root, baseRef) // an unknown base is an error, never "none"
+	if err != nil {
+		return nil, err
+	}
+	approvers := humanApproversOf(dataDir, workspaceID)
 	for i := len(approvals) - 1; i >= 0; i-- {
 		a := approvals[i]
-		if a.Revoked != nil {
+		switch {
+		case a.Revoked != nil:
 			st.Revoked++
+			continue
+		case a.ApproverKind != PrincipalHuman || !approvers[a.Approver]:
+			st.Untrusted++
 			continue
 		}
 		if st.Approval == nil {
@@ -350,24 +373,32 @@ func MergeApprovalState(ctx context.Context, dataDir, workspaceID, headRef strin
 		if a.Head != st.Head || a.Repository != root {
 			continue
 		}
-		now, ok := observed[a.BaseRef]
-		if !ok {
-			if now, err = diffAt(ctx, workspaceID, root, a.BaseRef, st.Head); err != nil {
+		if st.Current == nil {
+			now, err := diffAt(ctx, workspaceID, root, baseRef, base, st.Head)
+			if err != nil {
 				return nil, err
 			}
-			observed[a.BaseRef] = now
+			st.Current = &now
 		}
-		if a.same(now) {
-			st.Status, st.Approval, st.Current = MergeApprovalCurrent, &approvals[i], &now
+		if a.same(*st.Current) {
+			st.Status, st.Approval = MergeApprovalCurrent, &approvals[i]
 			return st, nil
 		}
 	}
-	if st.Approval != nil {
-		if now, ok := observed[st.Approval.BaseRef]; ok {
-			st.Current = &now
+	return st, nil
+}
+
+// humanApproversOf is the ids of the principals that are human approvers scoped to
+// workspaceID now: of kind human, holding the human-approver role, with a token that
+// was not revoked.
+func humanApproversOf(dataDir, workspaceID string) map[string]bool {
+	out := map[string]bool{}
+	for _, p := range ListPrincipals(dataDir) {
+		if IsHumanApprover(&p) && p.AllowsWorkspace(workspaceID) {
+			out[p.ID] = true
 		}
 	}
-	return st, nil
+	return out
 }
 
 // listMergeApprovals reads every attestation of the workspace, oldest first, with the

@@ -77,34 +77,57 @@ func TestAuthorizeHumanApproverFailsClosed(t *testing.T) {
 	if err := RevokeToken(dir, "dave"); err != nil {
 		t.Fatal(err)
 	}
+	presence, err := MintIdentityToken(dir, "erin", RoleHumanApprover, 0, nil,
+		TokenIdentity{Owner: "erin", Kind: PrincipalHuman, PresenceOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	deniedThrottleMu.Lock() // the process-global denied-event throttle: order-independent
 	lastDeniedWrite, deniedSuppressed = time.Time{}, 0
 	deniedThrottleMu.Unlock()
-	for _, raw := range []string{good, admin} {
-		h, err := AuthorizeHumanApprover(dir, ws, raw, AssuranceAdvisory)
-		if err != nil || h.Label() != "ops/advisory" {
-			t.Fatalf("a human approver was refused: %v %+v", err, h)
+	// the assurance belongs to the token: an ordinary token is advisory even when typed,
+	// a presence-only one is user presence and only when typed
+	for _, tc := range []struct{ raw, source, label string }{
+		{good, TokenTyped, "ops/advisory"}, {good, TokenFile, "ops/advisory"}, {admin, TokenEnviron, "ops/advisory"},
+		{presence, TokenTyped, "ops/user_presence"},
+	} {
+		h, err := AuthorizeHumanApprover(dir, ws, tc.raw, tc.source)
+		if err != nil || h.Label() != tc.label {
+			t.Fatalf("%s from the %s: want %s, got %v %+v", h.Principal.ID, tc.source, tc.label, err, h)
 		}
 	}
-	for name, tc := range map[string]struct{ raw, why string }{
-		"no token":        {"", "no token was given"},
-		"unknown token":   {"xmt_not-a-token", "unknown, revoked or expired"},
-		"revoked token":   {revoked, "unknown, revoked or expired"},
-		"agent kind":      {agentApprover, "of kind agent, not human"},
-		"missing role":    {humanVerifier, "lacks the human-approver role"},
-		"other workspace": {otherScope, "not scoped to workspace ws"},
+	for name, tc := range map[string]struct{ raw, source, why string }{
+		"no token":               {"", TokenTyped, "no token was given"},
+		"unknown token":          {"xmt_not-a-token", TokenTyped, "unknown, revoked or expired"},
+		"revoked token":          {revoked, TokenTyped, "unknown, revoked or expired"},
+		"agent kind":             {agentApprover, TokenTyped, "of kind agent, not human"},
+		"missing role":           {humanVerifier, TokenTyped, "lacks the human-approver role"},
+		"other workspace":        {otherScope, TokenTyped, "not scoped to workspace ws"},
+		"presence-only in env":   {presence, TokenEnviron, "presence-only token, accepted only when typed"},
+		"presence-only in files": {presence, TokenFile, "read from the file"},
 	} {
-		_, err := AuthorizeHumanApprover(dir, ws, tc.raw, AssuranceUserPresence)
+		_, err := AuthorizeHumanApprover(dir, ws, tc.raw, tc.source)
 		if !errors.Is(err, ErrHumanApproverRequired) || !strings.Contains(err.Error(), tc.why) {
 			t.Fatalf("%s: want a refusal naming %q, got %v", name, tc.why, err)
 		}
 	}
-	if _, err := AuthorizeHumanApprover(dir, ws, good, "trusted"); !errors.Is(err, ErrInvalidInput) {
-		t.Fatalf("an unknown assurance was accepted: %v", err)
+	if _, err := AuthorizeHumanApprover(dir, ws, good, "clipboard"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("an unknown token source was accepted: %v", err)
 	}
-	if _, err := AuthorizeHumanApprover(dir, "../x", good, AssuranceAdvisory); !errors.Is(err, ErrInvalidInput) {
+	if _, err := AuthorizeHumanApprover(dir, "../x", good, TokenTyped); !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("an unsafe workspace id was accepted: %v", err)
+	}
+	// only a human's token is presence-only, and rotation keeps it presence-only
+	if _, err := MintIdentityToken(dir, "bot2", RoleHumanApprover, 0, nil, TokenIdentity{PresenceOnly: true}); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("an agent's token was minted presence-only: %v", err)
+	}
+	rotated, err := RotateToken(dir, "erin", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if p := ResolveToken(dir, rotated); p == nil || !p.PresenceOnly {
+		t.Fatalf("rotation dropped presence-only: %+v", p)
 	}
 	denied := 0
 	for _, ev := range ListAuthAudit(dir, 0) {
@@ -231,6 +254,31 @@ func TestHumanApprovalQueueListsWhatAwaitsTheApprover(t *testing.T) {
 	// the limit bounds the items rendered, not the total
 	if q, err = HumanApprovalQueue(dir, ws, h, 1, 0); err != nil || q.Total != 2 || len(q.Items) != 1 || len(q.IndexBaselines) != 3 {
 		t.Fatalf("limit: %v %+v", err, q)
+	}
+}
+
+// The queue is ordered by when the pending revision was written, not by entry: a
+// recent edit of an old entry comes after an older proposal, and the limit keeps the
+// oldest.
+func TestHumanApprovalQueueIsOldestPendingRevisionFirst(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	h := humanApprover("alice", "alice")
+	old := promoted(t, dir, ws, "author", "the build uses make")
+	waiting := propose(t, dir, ws, ContextActor{ID: "author"}, "tests need docker")
+	time.Sleep(2 * time.Millisecond) // the edit is strictly younger than the proposal
+	if _, err := EditContext(dir, ws, old.ID, EditRequest{BaseRevision: 1, Reason: "add go", NewString: " and go"},
+		ContextActor{ID: "author"}); err != nil {
+		t.Fatal(err)
+	}
+	q, err := HumanApprovalQueue(dir, ws, h, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if q.Total != 2 || q.Items[0].EntryID != waiting.ID || q.Items[1].EntryID != old.ID || q.Items[1].Kind != "edit" {
+		t.Fatalf("want the older proposal before the newer edit: %+v", q.Items)
+	}
+	if q, err = HumanApprovalQueue(dir, ws, h, 1, 0); err != nil || q.Total != 2 || len(q.Items) != 1 || q.Items[0].EntryID != waiting.ID {
+		t.Fatalf("the limit must keep the oldest: %v %+v", err, q)
 	}
 }
 

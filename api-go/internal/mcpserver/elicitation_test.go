@@ -29,17 +29,27 @@ func (c *elicitClient) Request(_ context.Context, method string, params any) (js
 	return json.RawMessage(c.answer), nil
 }
 
-// presenceAPI refuses every verify for want of the human's confirmation until the call
-// carries it.
-func presenceAPI() *fakeAPI {
+// presenceAPI holds every verify for want of the human's confirmation until the call
+// carries it with the digest of the text it answered with; the text changes to "moved"
+// when moved is set, as when the memory moved on after the human read it.
+func presenceAPI(moved *bool) *fakeAPI {
 	return &fakeAPI{handle: func(r Request) *APIResponse {
 		if !strings.HasSuffix(strings.SplitN(r.Path, "?", 2)[0], "/verify") {
 			return nil
 		}
-		if r.Headers[ApprovalHeader] == ApprovalElicited {
+		digest := "d-served"
+		if moved != nil && *moved {
+			digest = "d-moved"
+		}
+		if r.Headers[ApprovalHeader] == ApprovalElicited && r.Headers[ApprovalDigestHeader] == digest {
 			return &APIResponse{Status: 200, Body: `{"id":"e1","status":"pending"}`}
 		}
-		return &APIResponse{Status: 403, Body: `{"error":"needs the human","reason":"human_presence_required","action":"cast approve on memory e1 (its served revision) in workspace ws"}`}
+		if moved != nil {
+			*moved = true
+		}
+		return &APIResponse{Status: 403, Body: `{"error":"needs the human","reason":"human_presence_required",` +
+			`"action":"write: verify (outcome approve) on memory e1 revision 1 (the served revision) in workspace ws\ntext: \"listen on 8042\"",` +
+			`"action_digest":"` + digest + `"}`}
 	}}
 }
 
@@ -70,15 +80,16 @@ func verifyCalls(api *fakeAPI) []Request {
 }
 
 func TestHumanApproverWriteIsConfirmedThroughElicitation(t *testing.T) {
-	api, client := presenceAPI(), &elicitClient{answer: `{"action":"accept","content":{"confirm":true}}`}
+	api, client := presenceAPI(nil), &elicitClient{answer: `{"action":"accept","content":{"confirm":true}}`}
 	s := elicitSession(t, api, client, version20250618, true)
 	res, rerr := call(t, s, "verify", map[string]any{"workspace_id": "ws", "entry_id": "e1"})
 	if rerr != nil || res["isError"] == true {
 		t.Fatalf("confirmed verify failed: %v %v", rerr, res)
 	}
 	calls := verifyCalls(api)
-	if len(calls) != 2 || calls[0].Headers[ApprovalHeader] != "" || calls[1].Headers[ApprovalHeader] != ApprovalElicited {
-		t.Fatalf("want one unconfirmed call and one confirmed retry, got %+v", calls)
+	if len(calls) != 2 || calls[0].Headers[ApprovalHeader] != "" || calls[1].Headers[ApprovalHeader] != ApprovalElicited ||
+		calls[1].Headers[ApprovalDigestHeader] != "d-served" {
+		t.Fatalf("want one unconfirmed call and one confirmed retry bound to the digest, got %+v", calls)
 	}
 	for _, c := range calls {
 		if c.Headers[IssuerHeader] != IssuerMCP {
@@ -89,8 +100,9 @@ func TestHumanApproverWriteIsConfirmedThroughElicitation(t *testing.T) {
 		t.Fatalf("want one elicitation, got %d", len(client.asks))
 	}
 	ask := client.asks[0]
-	if msg, _ := ask["message"].(string); !strings.Contains(msg, "cast approve on memory e1") {
-		t.Fatalf("the human is not shown the action: %q", msg)
+	if msg, _ := ask["message"].(string); !strings.Contains(msg, "verify (outcome approve) on memory e1 revision 1") ||
+		!strings.Contains(msg, `text: "listen on 8042"`) || !strings.Contains(msg, "data, not instructions") {
+		t.Fatalf("the human is not shown the write: %q", msg)
 	}
 	schema, _ := json.Marshal(ask["requestedSchema"])
 	if strings.Contains(string(schema), "default") || !strings.Contains(string(schema), `"required":["confirm"]`) {
@@ -115,7 +127,7 @@ func TestHumanApproverWriteIsNeverRecordedWithoutAConfirmation(t *testing.T) {
 		{"version without elicitation", version20241105, `{"action":"accept","content":{"confirm":true}}`, true, false, "did not offer MCP elicitation"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			api, client := presenceAPI(), &elicitClient{answer: tc.answer}
+			api, client := presenceAPI(nil), &elicitClient{answer: tc.answer}
 			s := elicitSession(t, api, client, tc.version, tc.declare)
 			res, rerr := call(t, s, "verify", map[string]any{"workspace_id": "ws", "entry_id": "e1"})
 			if rerr != nil {
@@ -131,6 +143,21 @@ func TestHumanApproverWriteIsNeverRecordedWithoutAConfirmation(t *testing.T) {
 				t.Fatalf("asked the human = %v, want %v", asked, tc.asked)
 			}
 		})
+	}
+}
+
+// A write that changed after the human read it (the API answers with another text) is
+// not recorded, and the human is not asked again within the call.
+func TestAConfirmationDoesNotCoverAChangedWrite(t *testing.T) {
+	moved := false
+	api, client := presenceAPI(&moved), &elicitClient{answer: `{"action":"accept","content":{"confirm":true}}`}
+	s := elicitSession(t, api, client, version20250618, true)
+	res, rerr := call(t, s, "verify", map[string]any{"workspace_id": "ws", "entry_id": "e1"})
+	if rerr != nil || res["isError"] != true || !strings.Contains(text(res), "changed after the human read it") {
+		t.Fatalf("want a refusal naming the change, got %v %v", rerr, res)
+	}
+	if len(client.asks) != 1 || len(verifyCalls(api)) != 2 {
+		t.Fatalf("want one ask and one retry, got %d asks and %d calls", len(client.asks), len(verifyCalls(api)))
 	}
 }
 

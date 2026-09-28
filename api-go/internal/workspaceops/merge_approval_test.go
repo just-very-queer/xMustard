@@ -57,19 +57,30 @@ func reviewRepo(t testing.TB) (dataDir, ws, root string, git func(args ...string
 	return dataDir, ws, root, git
 }
 
+// mergeState is the approval state of merging HEAD into main.
 func mergeState(t *testing.T, dir, ws string) *MergeApprovalStatus {
 	t.Helper()
-	st, err := MergeApprovalState(context.Background(), dir, ws, "HEAD")
+	st, err := MergeApprovalState(context.Background(), dir, ws, "main", "HEAD")
 	if err != nil {
 		t.Fatal(err)
 	}
 	return st
 }
 
+// trustedApprover is a human approver whose token is in the store, so the gate trusts
+// what it attests.
+func trustedApprover(t testing.TB, dir, id, owner string) HumanApprover {
+	t.Helper()
+	if _, err := MintIdentityToken(dir, id, RoleHumanApprover, 0, nil, TokenIdentity{Owner: owner, Kind: PrincipalHuman}); err != nil {
+		t.Fatal(err)
+	}
+	return humanApprover(id, owner)
+}
+
 func TestMergeApprovalBindsTheReviewedDiff(t *testing.T) {
 	ctx := context.Background()
 	dir, ws, _, git := reviewRepo(t)
-	h := humanApprover("alice", "alice-team")
+	h := trustedApprover(t, dir, "alice", "alice-team")
 	if st := mergeState(t, dir, ws); st.Status != MergeApprovalNone || st.Enforcement != MergeApprovalEnforcement {
 		t.Fatalf("no attestation yet: %+v", st)
 	}
@@ -140,6 +151,75 @@ func TestMergeApprovalBindsTheReviewedDiff(t *testing.T) {
 	}
 }
 
+// The gate binds the merge it is asked about: an attestation of the change against dev
+// does not cover merging the same head into main, which also brings dev's unreviewed
+// commits (review finding: a narrower attestation used to report current).
+func TestMergeGateBindsTheRequestedBase(t *testing.T) {
+	ctx := context.Background()
+	dir, ws, root, git := reviewRepo(t)
+	commit := func(name, body string) {
+		t.Helper()
+		if err := os.WriteFile(filepath.Join(root, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		git("add", ".")
+		git("commit", "-q", "-m", name)
+	}
+	git("checkout", "-q", "-b", "dev", "main")
+	commit("x.go", "package a\n\nfunc Unreviewed() {}\n")
+	git("checkout", "-q", "-b", "feature2")
+	commit("y.go", "package a\n\nfunc Reviewed() {}\n")
+	a, err := ApproveMerge(ctx, dir, ws, trustedApprover(t, dir, "alice", "alice"), "dev", "HEAD", nil, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	onDev, err := MergeApprovalState(ctx, dir, ws, "dev", "HEAD")
+	if err != nil || onDev.Status != MergeApprovalCurrent || onDev.BaseRef != "dev" {
+		t.Fatalf("merging into dev is what was reviewed: %v %+v", err, onDev)
+	}
+	onMain, err := MergeApprovalState(ctx, dir, ws, "main", "HEAD")
+	if err != nil || onMain.Status != MergeApprovalStale || onMain.Current == nil ||
+		onMain.Current.DiffBytes <= a.DiffBytes || onMain.Current.MergeBase != git("rev-parse", "main") {
+		t.Fatalf("merging into main brings unreviewed commits and must be stale: %v %+v", err, onMain)
+	}
+	if _, err := MergeApprovalState(ctx, dir, ws, "no-such-base", "HEAD"); !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("an unknown base must be an error, not a state: %v", err)
+	}
+}
+
+// Only an attestation by a principal that is still a human approver counts: one whose
+// token was revoked, or whose recorded kind is not human, is never current.
+func TestMergeGateDistrustsUntrustedApprovers(t *testing.T) {
+	ctx := context.Background()
+	dir, ws, _, _ := reviewRepo(t)
+	if _, err := ApproveMerge(ctx, dir, ws, trustedApprover(t, dir, "alice", "alice"), "main", "HEAD", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := mergeState(t, dir, ws); st.Status != MergeApprovalCurrent {
+		t.Fatalf("want current: %+v", st)
+	}
+	if err := RevokeToken(dir, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if st := mergeState(t, dir, ws); st.Status != MergeApprovalNone || st.Untrusted != 1 || st.Approval != nil {
+		t.Fatalf("a revoked approver's attestation still counts: %+v", st)
+	}
+	agent := trustedApprover(t, dir, "bob", "bob")
+	agent.Principal.Kind = PrincipalAgent // recorded with kind agent
+	if _, err := ApproveMerge(ctx, dir, ws, agent, "main", "HEAD", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := mergeState(t, dir, ws); st.Status != MergeApprovalNone || st.Untrusted != 2 {
+		t.Fatalf("an attestation recorded with kind agent counts: %+v", st)
+	}
+	if _, err := ApproveMerge(ctx, dir, ws, trustedApprover(t, dir, "carol", "carol"), "main", "HEAD", nil, ""); err != nil {
+		t.Fatal(err)
+	}
+	if st := mergeState(t, dir, ws); st.Status != MergeApprovalCurrent || st.Approval.Approver != "carol" || st.Untrusted != 0 {
+		t.Fatalf("a trusted attestation is current and stops the walk: %+v", st)
+	}
+}
+
 func TestReviewDiffIgnoresRepositoryAndEnvironmentConfig(t *testing.T) {
 	ctx := context.Background()
 	dir, ws, root, git := reviewRepo(t)
@@ -175,7 +255,7 @@ func TestReviewDiffIgnoresRepositoryAndEnvironmentConfig(t *testing.T) {
 func TestMergeApprovalRefusesBadInput(t *testing.T) {
 	ctx := context.Background()
 	dir, ws, _, _ := reviewRepo(t)
-	h := humanApprover("alice", "alice")
+	h := trustedApprover(t, dir, "alice", "alice")
 	for name, tc := range map[string]struct {
 		base, head string
 		reviews    []string
@@ -213,14 +293,14 @@ func BenchmarkMergeApprovalStateLargeDiff(b *testing.B) {
 	}
 	git("add", ".")
 	git("commit", "-q", "-m", "large")
-	a, err := ApproveMerge(context.Background(), dir, ws, humanApprover("alice", "alice"), "main", "HEAD", nil, "")
+	a, err := ApproveMerge(context.Background(), dir, ws, trustedApprover(b, dir, "alice", "alice"), "main", "HEAD", nil, "")
 	if err != nil {
 		b.Fatal(err)
 	}
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		st, err := MergeApprovalState(context.Background(), dir, ws, "HEAD")
+		st, err := MergeApprovalState(context.Background(), dir, ws, "main", "HEAD")
 		if err != nil || st.Status != MergeApprovalCurrent {
 			b.Fatalf("%v %+v", err, st)
 		}

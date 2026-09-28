@@ -54,10 +54,12 @@ func renderToolsDoc(tools []*Tool) string {
 	}
 	b.WriteString("\n## Human approvers\n\nA remember or verify call made with a human approver's token (kind human, " +
 		"human-approver role) is held until the human confirms it. When the client declared the elicitation capability " +
-		"(protocol 2025-06-18) the server asks with elicitation/create and records the call only on an explicit accept " +
-		"with confirm=true; otherwise nothing is recorded, and the human can act from a terminal with `xmustard-ops " +
+		"(protocol 2025-06-18) the server shows the write with elicitation/create (its op or outcome, ids, revision and " +
+		"quoted text) and records it only on an explicit accept with confirm=true, and only while the write still matches " +
+		"what was shown; otherwise nothing is recorded, and the human can act from a terminal with `xmustard-ops " +
 		"approve|reject|queue`. Such a record is labelled advisory: the client configuration holding the token is " +
-		"readable by agent processes. Merge approvals are never made over MCP (`xmustard-ops review approve|revoke|gate`).\n")
+		"readable by agent processes. A presence-only token is refused here. Merge approvals are never made over MCP " +
+		"(`xmustard-ops review approve|revoke|gate`).\n")
 	b.WriteString("\n## Hidden aliases\n\nAccepted on tools/call and never listed; each folds onto its canonical argument " +
 		"and the call's _meta[\"xmustard/normalized\"] records it. Claude Code drops an argument named exactly `query`, " +
 		"so the listed name is `q`.\n\n")

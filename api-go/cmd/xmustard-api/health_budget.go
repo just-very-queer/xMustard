@@ -82,6 +82,8 @@ func healthBudgetView(r *http.Request) (full bool, detail string) {
 		return false, "authentication is enforced: send an operator bearer token (admin, or another non-reader role with no workspace scope) for the full budget block"
 	case principal == nil:
 		return true, "" // auto mode with no credentials: the open loopback default
+	case principal.PresenceOnly:
+		return false, "a presence-only token is accepted only at the xmustard-ops prompt, never as a bearer token"
 	case len(principal.Workspaces) > 0:
 		return false, "the full budget block shows host-wide activity, so a workspace-scoped token sees only the limits"
 	case principal.ReadOnly():

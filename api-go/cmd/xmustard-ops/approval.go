@@ -18,9 +18,11 @@ import (
 // human approver's token: a principal of kind human with the human-approver role,
 // scoped to the workspace. The token is read from --token-file, then from
 // XMUSTARD_APPROVER_TOKEN, and otherwise typed at the controlling terminal with echo
-// off. Only a typed token records user_presence; a file or the environment is
-// readable by agent processes of this user, so what it records is labelled advisory.
-// Nothing here merges, changes branch protection or posts anywhere.
+// off. The assurance comes from the token (workspaceops.AuthorizeHumanApprover): a
+// presence-only token is accepted only when typed and records user_presence; any other
+// token records advisory wherever it is read, since the same token also works from
+// places agent processes of this user can read. Nothing here merges, changes branch
+// protection or posts anywhere.
 
 // opsEnv is what the approval commands read and write, so tests can drive them.
 type opsEnv struct {
@@ -67,23 +69,23 @@ func (e opsEnv) approverFlagSet(name string) (*flag.FlagSet, approverFlags) {
 	fs.SetOutput(e.stderr)
 	return fs, approverFlags{
 		dataDir:   fs.String("data-dir", envOr(e.getenv, "XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory"),
-		tokenFile: fs.String("token-file", "", "file holding the human approver's token (advisory: agent processes can read it)"),
+		tokenFile: fs.String("token-file", "", "file holding the human approver's token (advisory: agent processes can read it; a presence-only token is refused)"),
 	}
 }
 
 // approver authenticates the human approver for workspaceID (fail closed; see
 // workspaceops.AuthorizeHumanApprover).
 func (e opsEnv) approver(f approverFlags, workspaceID string) (workspaceops.HumanApprover, error) {
-	raw, assurance, err := e.approverToken(*f.tokenFile)
+	raw, source, err := e.approverToken(*f.tokenFile)
 	if err != nil {
 		return workspaceops.HumanApprover{}, err
 	}
-	return workspaceops.AuthorizeHumanApprover(*f.dataDir, workspaceID, raw, assurance)
+	return workspaceops.AuthorizeHumanApprover(*f.dataDir, workspaceID, raw, source)
 }
 
-// approverToken reads the token and how sure it is that no agent process could read
-// it: typed at the terminal is user_presence, a file or the environment advisory.
-func (e opsEnv) approverToken(tokenFile string) (raw, assurance string, err error) {
+// approverToken reads the token and where it came from: a file, the environment, or
+// typed at the terminal.
+func (e opsEnv) approverToken(tokenFile string) (raw, source string, err error) {
 	switch {
 	case tokenFile != "":
 		f, err := os.Open(tokenFile)
@@ -92,12 +94,12 @@ func (e opsEnv) approverToken(tokenFile string) (raw, assurance string, err erro
 		}
 		defer f.Close()
 		b, err := io.ReadAll(io.LimitReader(f, maxTokenFileBytes))
-		return strings.TrimSpace(string(b)), workspaceops.AssuranceAdvisory, err
+		return strings.TrimSpace(string(b)), workspaceops.TokenFile, err
 	case strings.TrimSpace(e.getenv("XMUSTARD_APPROVER_TOKEN")) != "":
-		return strings.TrimSpace(e.getenv("XMUSTARD_APPROVER_TOKEN")), workspaceops.AssuranceAdvisory, nil
+		return strings.TrimSpace(e.getenv("XMUSTARD_APPROVER_TOKEN")), workspaceops.TokenEnviron, nil
 	}
 	raw, err = e.prompt("xmustard human approver token: ")
-	return strings.TrimSpace(raw), workspaceops.AssuranceUserPresence, err
+	return strings.TrimSpace(raw), workspaceops.TokenTyped, err
 }
 
 // runHumanVerdict is `approve|reject <workspace_id> <entry_id> [--revision N] [--note TEXT]`.
@@ -208,17 +210,20 @@ func runReviewRevoke(e opsEnv, workspaceID string, args []string) int {
 	return e.emit(a)
 }
 
-// runReviewGate prints the approval state of --head and exits 0 only when a current
-// attestation binds it (3: none, 4: stale). It reads only, so it takes no token.
+// runReviewGate prints the approval state of merging --head into --base and exits 0
+// only when a current attestation binds that change (3: none, 4: stale). --base is
+// required: an attestation made against another base covers another diff. It reads
+// only, so it takes no token.
 func runReviewGate(e opsEnv, workspaceID string, args []string) int {
 	fs := flag.NewFlagSet("xmustard-ops review gate", flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
 	dataDir := fs.String("data-dir", envOr(e.getenv, "XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+	base := fs.String("base", "", "the ref the head merges into, such as the remote branch a push updates (required)")
 	head := fs.String("head", "HEAD", "the head to check")
-	if fs.Parse(args) != nil || fs.NArg() > 0 {
-		return e.usage("usage: xmustard-ops review gate <workspace_id> [--head REF] [--data-dir DIR]")
+	if fs.Parse(args) != nil || fs.NArg() > 0 || strings.TrimSpace(*base) == "" {
+		return e.usage("usage: xmustard-ops review gate <workspace_id> --base REF [--head REF] [--data-dir DIR]")
 	}
-	st, err := workspaceops.MergeApprovalState(context.Background(), *dataDir, workspaceID, *head)
+	st, err := workspaceops.MergeApprovalState(context.Background(), *dataDir, workspaceID, *base, *head)
 	if err != nil {
 		return e.fail(err)
 	}

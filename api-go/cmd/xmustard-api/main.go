@@ -525,6 +525,17 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
 			return
 		}
+		// A presence-only token is typed at the xmustard-ops prompt, never sent as a
+		// bearer token (WS-57): one that arrives here was read from somewhere else.
+		if principal != nil && principal.PresenceOnly {
+			workspaceops.RecordAuthAudit(dataDir, workspaceops.AuthAuditEvent{
+				Action: "denied", Actor: principal.ID, Detail: "presence-only token presented as a bearer token",
+				Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+			})
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"reason": "presence_only_token",
+				"error": "this token is presence-only: it is accepted only when typed at the xmustard-ops prompt, never as a bearer token"})
+			return
+		}
 		// A reader-only principal's writes are refused by the route gate, which
 		// names the missing role; every non-GET route needs more than reader
 		// (TestNoWriteRouteGrantsReader).
