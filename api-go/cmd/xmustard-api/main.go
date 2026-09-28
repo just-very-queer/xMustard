@@ -44,8 +44,19 @@ func main() {
 		return
 	}
 
+	if err := prepareDaemon(); err != nil { // log file, env hygiene (daemon_lifecycle.go)
+		log.Fatal(err)
+	}
 	cfg := loadServerConfig(dataDir())
+	activated, err := adoptActivatedSocket(&cfg)
+	if err != nil {
+		log.Fatal(err)
+	}
 	if err := validateStartup(cfg); err != nil {
+		log.Fatal(err)
+	}
+	ln, err := listen(cfg, activated)
+	if err != nil {
 		log.Fatal(err)
 	}
 	applyRuntimeHygiene()
@@ -105,11 +116,12 @@ func main() {
 		log.Printf("shutdown: services closed")
 	}()
 	log.Printf("xmustard api-go listening on %s (tls=%v)", cfg.addr(), cfg.hasTLS())
+	go checkStoreAtStart(baseCtx)
 	var serveErr error
 	if cfg.hasTLS() {
-		serveErr = srv.ListenAndServeTLS(cfg.tlsCert, cfg.tlsKey)
+		serveErr = srv.ServeTLS(ln, cfg.tlsCert, cfg.tlsKey)
 	} else {
-		serveErr = srv.ListenAndServe()
+		serveErr = srv.Serve(ln)
 	}
 	if serveErr != nil && serveErr != http.ErrServerClosed {
 		log.Fatal(serveErr)
