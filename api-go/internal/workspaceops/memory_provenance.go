@@ -41,7 +41,7 @@ func (a ContextActor) storeActor(root string) govstore.Actor {
 	id := fallbackString(strings.TrimSpace(a.ID), adminEditor)
 	return govstore.Actor{
 		Principal: id, Owner: fallbackString(a.Owner, id), Kind: a.Kind, SessionID: a.SessionID,
-		CallID: a.CallID, RunID: a.RunID, Evidence: a.Evidence, HeadSHA: sha, Branch: branch,
+		CallID: a.CallID, RunID: a.RunID, Evidence: a.Evidence, HeadSHA: sha, Branch: branch, Approval: a.Approval,
 	}
 }
 

@@ -97,6 +97,16 @@ type VerifyRequest struct {
 	EvidenceHandle string
 }
 
+// NormalizeVerifyOutcome is the outcome VerifyContextOutcome applies for raw: trimmed,
+// lower case, approve when blank. An unknown outcome is invalid input.
+func NormalizeVerifyOutcome(raw string) (string, error) {
+	outcome := fallbackString(strings.ToLower(strings.TrimSpace(raw)), OutcomeApprove)
+	if _, ok := verifyOutcomes[outcome]; !ok {
+		return "", fmt.Errorf("outcome %q is not %s: %w", raw, verifyOutcomeNames, ErrInvalidInput)
+	}
+	return outcome, nil
+}
+
 // VerifyContextOutcome records voter's verdict and settles what it decides. Distinct
 // principals only: a principal's new verdict on a revision replaces its earlier one, so
 // one agent cannot satisfy a multi-agent gate by voting twice, and under the
@@ -120,11 +130,11 @@ func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextAct
 	if agent == "" {
 		return nil, fmt.Errorf("agent is required")
 	}
-	req.Outcome = fallbackString(strings.ToLower(strings.TrimSpace(req.Outcome)), OutcomeApprove)
-	apply, ok := verifyOutcomes[req.Outcome]
-	if !ok {
-		return nil, fmt.Errorf("outcome %q is not %s: %w", req.Outcome, verifyOutcomeNames, ErrInvalidInput)
+	var err error
+	if req.Outcome, err = NormalizeVerifyOutcome(req.Outcome); err != nil {
+		return nil, err
 	}
+	apply := verifyOutcomes[req.Outcome]
 	if req.Revision < 0 {
 		return nil, fmt.Errorf("revision must be positive: %w", ErrInvalidInput)
 	}
@@ -133,7 +143,7 @@ func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextAct
 			return nil, err
 		}
 	}
-	voter, err := bindProvenance(dataDir, workspaceID, voter, []string{req.EvidenceHandle}, "")
+	voter, err = bindProvenance(dataDir, workspaceID, voter, []string{req.EvidenceHandle}, "")
 	if err != nil {
 		return nil, err
 	}

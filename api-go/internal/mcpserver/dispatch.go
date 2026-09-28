@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"net/http"
 	"strings"
 	"time"
@@ -124,16 +125,24 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 		scope.Close() // no request ledger (direct callers/tests): nothing to hold
 	}
 	method, path, body := t.Build(args)
-	var headers map[string]string
+	// every call names its issuer, so the API can hold a human approver's write for
+	// confirmation (elicitation.go) with or without evidence delivery
+	headers := map[string]string{IssuerHeader: IssuerMCP}
 	if d := s.srv.opts.Delivery; d != nil {
-		headers = d.Headers(ctx)
+		maps.Copy(headers, d.Headers(ctx))
 	}
-	resp, err := s.srv.opts.Backend.Do(ctx, Request{Method: method, Path: path, Body: body, Headers: headers})
+	resp, refusal, err := s.call(ctx, Request{Method: method, Path: path, Body: body, Headers: headers})
 	if errors.Is(err, budget.ErrOverloaded) {
 		return nil, OverloadError(err)
 	}
 	if err != nil {
 		return TextResult(err.Error(), true), nil
+	}
+	if refusal != nil { // a human approver's write the human did not confirm
+		if err := s.finish(ctx, refusal, ws, norms); err != nil {
+			return ReplyRefused(err)
+		}
+		return refusal, nil
 	}
 	if isOverloadBody(resp.Status, resp.Body) {
 		return nil, OverloadError(budget.ErrOverloaded)
