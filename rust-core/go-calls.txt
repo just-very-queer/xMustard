@@ -52,6 +52,7 @@ called symbolgraph clusters
 called symbolgraph coverage
 called symbolgraph hotspots
 called symbolgraph impact
+called symbolgraph impact-file
 called symbolgraph trace
 called watch done
 called watch start

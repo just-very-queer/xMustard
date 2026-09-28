@@ -3866,8 +3866,16 @@ func registerRoutes(mux routeRegistrar) {
 		ws := r.PathValue("workspace_id")
 		q := r.URL.Query()
 		// impact enriched with the precomputed symbol graph: ?symbol= → blast radius;
-		// ?from=&to= → shortest dependency path; otherwise the dirty-symbols view.
+		// ?path= → the same from one file; ?from=&to= → shortest dependency path;
+		// otherwise the dirty-symbols view. A path mixed with another mode is refused,
+		// not silently outranked.
 		switch {
+		case q.Get("path") != "" && (q.Get("symbol") != "" || q.Get("from") != "" || q.Get("to") != ""):
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "impact takes one of path=, symbol= or from=&to="})
+		case q.Get("path") != "":
+			depth, _ := strconv.Atoi(q.Get("depth"))
+			result, err := workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), depth)
+			issueIntel(w, err, result)
 		case q.Get("from") != "" && q.Get("to") != "":
 			result, err := workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"))
 			issueIntel(w, err, result)

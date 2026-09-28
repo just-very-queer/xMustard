@@ -660,6 +660,17 @@ fn tool_results(root: &str) -> Vec<(&'static str, Value)> {
             run_json(&["symbolgraph", "impact", root, "ws", "computeTotal", "4"]),
         ),
         (
+            "impact-file",
+            run_json(&[
+                "symbolgraph",
+                "impact-file",
+                root,
+                "ws",
+                "web/src/total.ts",
+                "4",
+            ]),
+        ),
+        (
             "trace",
             run_json(&[
                 "symbolgraph",
@@ -760,6 +771,78 @@ fn freshness_envelope_on_search_explain_and_impact_reports_the_commit_relation()
     for (tool, f) in statuses(root) {
         assert_eq!(f["status"], "unknown", "{tool}: {f}");
     }
+}
+
+// impact(path=) walks the reference graph from the file itself, as impact(symbol=)
+// walks it from the symbol's defining files: the same answer from the legacy graph and
+// the index, bounded by max_depth, and found=false (nothing impacted) for a path the
+// graph does not hold.
+#[test]
+fn impact_file_walks_from_the_file_on_both_sources() {
+    let r = fixture();
+    let root = r.path().to_str().unwrap();
+    let file = |path: &str, depth: &str| {
+        run_json(&["symbolgraph", "impact-file", root, "ws", path, depth])
+    };
+    let answers = || {
+        let total = file("web/src/total.ts", "4");
+        let symbol = run_json(&["symbolgraph", "impact", root, "ws", "computeTotal", "4"]);
+        assert_eq!(
+            symbol["defined_in"],
+            json!(["web/src/total.ts"]),
+            "{symbol}"
+        );
+        assert_eq!(total["impacted"], symbol["impacted"], "{total}\n{symbol}");
+        assert_eq!(total["found"], true, "{total}");
+        assert_eq!(total["path"], "web/src/total.ts");
+        let direct: Vec<&str> = total["impacted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|i| i["distance"] == 1)
+            .map(|i| i["path"].as_str().unwrap())
+            .collect();
+        for dep in [
+            "web/src/handler.ts",
+            "web/src/total.test.ts",
+            "web/src/view.ts",
+        ] {
+            assert!(direct.contains(&dep), "{dep} references total.ts: {total}");
+        }
+        // helper.ts is one hop from total.ts, so total's dependents are two hops away
+        let near = file("web/src/helper.ts", "1");
+        let far = file("web/src/helper.ts", "2");
+        assert_eq!(
+            near["impacted"],
+            json!([{"path": "web/src/total.ts", "distance": 1}]),
+            "{near}"
+        );
+        assert!(far["impacted_count"].as_u64().unwrap() > 1, "{far}");
+        assert!(
+            far["impacted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|i| i["distance"].as_u64().unwrap() <= 2)
+        );
+        for missing in ["web/src/nope.ts", "web/src", "../outside.ts"] {
+            let v = file(missing, "4");
+            assert_eq!(v["found"], false, "{v}");
+            assert_eq!(v["impacted_count"], 0, "{v}");
+            assert!(
+                v["freshness"].is_object() && v["coverage"].is_object(),
+                "{v}"
+            );
+        }
+        (total, far)
+    };
+    let (legacy, legacy_far) = answers();
+    assert_eq!(legacy["freshness"]["source"], "legacy_graph", "{legacy}");
+    run_json(&["index", "build", root]);
+    let (indexed, indexed_far) = answers();
+    assert_eq!(indexed["freshness"]["source"], "index", "{indexed}");
+    assert_eq!(legacy["impacted"], indexed["impacted"]);
+    assert_eq!(legacy_far["impacted"], indexed_far["impacted"]);
 }
 
 // A read that observed another repository identity than the index was brought to (its
