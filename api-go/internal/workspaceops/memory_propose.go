@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"regexp"
+	"slices"
 	"strings"
 	"time"
 
@@ -125,6 +126,19 @@ type ContextEntry struct {
 	// Redactions reports the secrets removed from the write before it was stored
 	// (PAR-SEC-04); nothing of a secret value is kept.
 	Redactions *redact.Report `json:"redactions,omitempty"`
+	// Kind, Topic and Tags classify the entry (PAR-GOV-09); recall filters on them.
+	Kind  string   `json:"kind,omitempty"`
+	Topic string   `json:"topic,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
+	// Recall labels (WS-20), set only on recall results: the rank state (served,
+	// pending, superseded, expired), the trust (a verification mode, or unverified),
+	// the peer approvals a pending entry still needs, the ranking signals when
+	// explain=true, and whether the output budget cut the content.
+	State            string        `json:"state,omitempty"`
+	Trust            string        `json:"trust,omitempty"`
+	VotesNeeded      *int          `json:"votes_needed,omitempty"`
+	ScoreDetails     *ScoreDetails `json:"score_details,omitempty"`
+	ContentTruncated bool          `json:"content_truncated,omitempty"`
 }
 
 type ProposeContextRequest struct {
@@ -143,6 +157,10 @@ type ProposeContextRequest struct {
 	// Expires hides the entry after a UTC date (inclusive, YYYY-MM-DD) or an RFC 3339
 	// time (PAR-GOV-12). A malformed value fails open: no expiry, and a warning.
 	Expires string `json:"expires,omitempty"`
+	// Kind (one of MemoryKinds), Topic ("/"-separated) and Tags classify the entry.
+	Kind  string   `json:"kind,omitempty"`
+	Topic string   `json:"topic,omitempty"`
+	Tags  []string `json:"tags,omitempty"`
 	// OpenMode is set by the HTTP layer, never decoded from a client, when the caller
 	// is unauthenticated because no credentials are configured. The proposal is then
 	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
@@ -235,6 +253,9 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if err != nil {
 		return nil, err
 	}
+	if req.Kind != "" && !slices.Contains(MemoryKinds, req.Kind) {
+		return nil, fmt.Errorf("kind %q is not one of %s: %w", req.Kind, strings.Join(MemoryKinds, ", "), ErrInvalidInput)
+	}
 	expiresAt, expiresOK := parseExpiry(req.Expires)
 	permission := strings.ToLower(strings.TrimSpace(req.Permission))
 	if permission != "readwrite" {
@@ -287,6 +308,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			RequiredVerifications: required, RequireVerification: peersOnly,
 			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
 			ExpiresAt: expiresAt, Metadata: supersedesMetadata(supersedes),
+			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags),
 		}, actor)
 		if err != nil {
 			return err
@@ -312,6 +334,10 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	}
 	return &out, nil
 }
+
+// MemoryKinds are the kinds a memory may declare (PAR-GOV-09).
+var MemoryKinds = []string{"project_knowledge", "decision", "constraint", "workflow", "procedure", "gotcha",
+	"measurement", "convention", "handoff", "candidate", "maintenance"}
 
 // selfAssertion is the note of the author's own approval that promotes a write at once,
 // or "" when the write waits for peers. Open mode (no credentials, so a peer quorum can

@@ -268,3 +268,35 @@ func TestParseSchemaProfile(t *testing.T) {
 		t.Fatal("an unknown schema profile must be an error")
 	}
 }
+
+// The promoted-title index the instructions point to is a resource: recall with
+// names_only at the largest page and budget, for the session's workspace; an API
+// failure is a protocol error, not an empty index.
+func TestMemoryIndexResourceReadsNamesOnlyRecall(t *testing.T) {
+	api := &fakeAPI{handle: func(r Request) *APIResponse {
+		if strings.Contains(r.Path, "/context/active") {
+			return &APIResponse{Status: 200, Body: `{"render":"names","entries":[{"id":"e1","title":"t","state":"served"}]}`}
+		}
+		return nil
+	}}
+	s := newSession(t, api, Options{WorkspaceID: "bound"}, nil, LatestProtocolVersion)
+	res, rerr := s.Handle(context.Background(), "resources/list", nil)
+	if rerr != nil || !strings.Contains(mustJSON(res), MemoryIndexURI) || !strings.Contains(Instructions, MemoryIndexURI) {
+		t.Fatalf("index not listed or not in the instructions: %v %v", res, rerr)
+	}
+	res, rerr = s.Handle(context.Background(), "resources/read", json.RawMessage(`{"uri":"`+MemoryIndexURI+`"}`))
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if p := api.lastTool(t).Path; p != "/api/workspaces/bound/context/active?limit=50&names_only=true&max_chars=10000" {
+		t.Fatalf("index read %s", p)
+	}
+	c := res.(map[string]any)["contents"].([]map[string]any)[0]
+	if c["uri"] != MemoryIndexURI || c["mimeType"] != "application/json" || !strings.Contains(c["text"].(string), `"id":"e1"`) {
+		t.Fatalf("index contents: %v", c)
+	}
+	api.handle = func(Request) *APIResponse { return &APIResponse{Status: 403, Body: `{"error":"no"}`} }
+	if _, rerr = s.Handle(context.Background(), "resources/read", json.RawMessage(`{"uri":"`+MemoryIndexURI+`"}`)); rerr == nil || rerr.Code != CodeInternal {
+		t.Fatalf("a failed index read must be an error: %v", rerr)
+	}
+}

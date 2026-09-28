@@ -3931,28 +3931,24 @@ func registerRoutes(mux routeRegistrar) {
 		// unverified text and history=true (revisions and events) need a reviewer: the
 		// verifier or human-approver role (admin holds both; open mode is the operator).
 		if id := q.Get("entry_id"); id != "" {
-			p := principalFromContext(r.Context())
-			reviewer := p == nil || p.Has(workspaceops.RoleVerifier) || p.Has(workspaceops.RoleHumanApprover)
 			history := q.Get("history") == "true"
-			if history && !reviewer {
-				denyMissingRole(w, r, p, workspaceops.RoleVerifier)
+			if history && !requireReviewer(w, r) {
 				return
 			}
-			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, history, reviewer)
+			result, err := workspaceops.GetContextEntry(dd, r.PathValue("workspace_id"), id, history, isReviewer(r))
 			issueIntel(w, err, result)
 			return
 		}
-		var paths []string
-		if q.Get("paths") != "" {
-			paths = strings.Split(q.Get("paths"), ",")
+		req, err := recallRequest(r)
+		if err != nil {
+			respondError(w, err)
+			return
 		}
-		limit := 0
-		if v := q.Get("limit"); v != "" {
-			if n, err := strconv.Atoi(v); err == nil && n > 0 {
-				limit = min(n, maxRecallLimit) // clamp: recall stays bounded
-			}
+		// the verification queue is unverified text: a reviewer's read, like history
+		if req.ReadsUnverified() && !requireReviewer(w, r) {
+			return
 		}
-		result, err := workspaceops.RecallContextCtx(r.Context(), dd, r.PathValue("workspace_id"), q.Get("query"), paths, limit)
+		result, err := workspaceops.RecallWith(r.Context(), dd, r.PathValue("workspace_id"), req)
 		issueIntel(w, err, result)
 	})
 	registerMemoryRoutes(mux)

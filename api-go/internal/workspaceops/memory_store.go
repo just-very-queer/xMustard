@@ -284,6 +284,7 @@ func contextEntryFrom(e govstore.Entry, votes []govstore.Vote, anchors []govstor
 		SearchTokens: e.SearchTokens, ContentDigest: e.ContentDigest,
 		Revision: e.Revision, SupersededBy: e.SupersededBy, InvalidatedAt: e.InvalidatedAt, ExpiresAt: e.ExpiresAt,
 		Supersedes: pendingSupersedes(e),
+		Kind:       e.Kind, Topic: e.Topic, Tags: e.Tags,
 	}
 	if e.HeadRevision > e.Revision {
 		ce.PendingRevision = e.HeadRevision

@@ -92,6 +92,9 @@ var rememberFields = []struct {
 	{"permission", proposeOps, func(q RememberRequest) string { return shownText(q.Permission) }},
 	{"paths", proposeOps, func(q RememberRequest) string { return shownText(strings.Join(q.Paths, ", ")) }},
 	{"supersedes", proposeOps, func(q RememberRequest) string { return shownText(strings.Join(q.Supersedes, ", ")) }},
+	{"kind", proposeOps, func(q RememberRequest) string { return shownText(q.Kind) }},
+	{"topic", proposeOps, func(q RememberRequest) string { return shownText(q.Topic) }},
+	{"tags", proposeOps, func(q RememberRequest) string { return shownText(strings.Join(q.Tags, ", ")) }},
 	{"require_verification", proposeOps, func(q RememberRequest) string {
 		if q.RequireVerification == nil {
 			return ""

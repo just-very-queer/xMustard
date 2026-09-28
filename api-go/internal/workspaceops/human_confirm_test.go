@@ -72,9 +72,10 @@ func TestHumanConfirmationShowsTheWriteAndPinsTheRevision(t *testing.T) {
 	}
 	secret := "ghp_" + strings.Repeat("aB3dE5", 6)
 	prop, err := DescribeRemember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "deploy",
-		Content: "deploy with " + secret, Supersedes: []string{e.ID}}})
+		Content: "deploy with " + secret, Supersedes: []string{e.ID}, Kind: "decision", Tags: []string{"ci", "deploy"}}})
 	if err != nil || strings.Contains(prop.Text, secret) || !strings.Contains(prop.Text, "write: remember (op propose)") ||
-		!strings.Contains(prop.Text, `supersedes: "`+e.ID+`"`) {
+		!strings.Contains(prop.Text, `supersedes: "`+e.ID+`"`) || !strings.Contains(prop.Text, `kind: "decision"`) ||
+		!strings.Contains(prop.Text, `tags: "ci, deploy"`) {
 		t.Fatalf("propose confirmation: %v\n%s", err, prop.Text)
 	}
 

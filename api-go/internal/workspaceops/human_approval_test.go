@@ -22,7 +22,7 @@ func humanApprover(id, owner string) HumanApprover {
 		Roles: ExpandRoles(RoleHumanApprover)}, Assurance: AssuranceUserPresence}
 }
 
-func propose(t *testing.T, dir, ws string, author ContextActor, content string) *ContextEntry {
+func proposeAs(t *testing.T, dir, ws string, author ContextActor, content string) *ContextEntry {
 	t.Helper()
 	e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t",
 		Content: content, Permission: "readwrite"}}, author)
@@ -142,7 +142,7 @@ func TestAuthorizeHumanApproverFailsClosed(t *testing.T) {
 
 func TestHumanVerdictIsOneDistinctLabelledVote(t *testing.T) {
 	dir, ws := multiAgentDir(t), "ws"
-	e := propose(t, dir, ws, ContextActor{ID: "author"}, "the build uses make")
+	e := proposeAs(t, dir, ws, ContextActor{ID: "author"}, "the build uses make")
 	h := humanApprover("alice", "alice")
 	got, err := HumanVerdict(dir, ws, e.ID, h, OutcomeApprove, 0, "read it")
 	if err != nil {
@@ -161,7 +161,7 @@ func TestHumanVerdictIsOneDistinctLabelledVote(t *testing.T) {
 	}
 
 	// a human reject is a reject
-	e2 := propose(t, dir, ws, ContextActor{ID: "author"}, "the build uses bazel")
+	e2 := proposeAs(t, dir, ws, ContextActor{ID: "author"}, "the build uses bazel")
 	h.Assurance = AssuranceAdvisory
 	if _, err := HumanVerdict(dir, ws, e2.ID, h, OutcomeReject, 0, "wrong"); err != nil {
 		t.Fatal(err)
@@ -180,7 +180,7 @@ func TestHumanVerdictIsOneDistinctLabelledVote(t *testing.T) {
 func TestHumanVerdictKeepsPrincipalsDistinct(t *testing.T) {
 	dir, ws := multiAgentDir(t), "ws"
 	h := humanApprover("alice", "alice")
-	own := propose(t, dir, ws, ContextActor{ID: "alice"}, "mine")
+	own := proposeAs(t, dir, ws, ContextActor{ID: "alice"}, "mine")
 	if _, err := HumanVerdict(dir, ws, own.ID, h, OutcomeApprove, 0, ""); !errors.Is(err, ErrSelfApproval) {
 		t.Fatalf("a human approved their own proposal: %v", err)
 	}
@@ -195,7 +195,7 @@ func TestHumanVerdictKeepsPrincipalsDistinct(t *testing.T) {
 	}
 	// under the owner-distinct policy a human cannot approve their own agent's memory
 	dir = ownerPolicyDir(t, DistinctOwner)
-	mine := propose(t, dir, ws, ContextActor{ID: "alice-bot", Owner: "alice"}, "from my agent")
+	mine := proposeAs(t, dir, ws, ContextActor{ID: "alice-bot", Owner: "alice"}, "from my agent")
 	if _, err := HumanVerdict(dir, ws, mine.ID, h, OutcomeApprove, 0, ""); !errors.Is(err, ErrSameOwner) {
 		t.Fatalf("owner policy: %v", err)
 	}
@@ -204,10 +204,10 @@ func TestHumanVerdictKeepsPrincipalsDistinct(t *testing.T) {
 func TestHumanApprovalQueueListsWhatAwaitsTheApprover(t *testing.T) {
 	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
 	h := humanApprover("alice", "alice")
-	waiting := propose(t, dir, ws, ContextActor{ID: "author"}, strings.Repeat("x", maxQueueContent+10))
-	propose(t, dir, ws, ContextActor{ID: "alice"}, "mine")                           // own
-	propose(t, dir, ws, ContextActor{ID: "alice-bot", Owner: "alice"}, "my agent's") // same owner
-	voted := propose(t, dir, ws, ContextActor{ID: "author"}, "already voted")
+	waiting := proposeAs(t, dir, ws, ContextActor{ID: "author"}, strings.Repeat("x", maxQueueContent+10))
+	proposeAs(t, dir, ws, ContextActor{ID: "alice"}, "mine")                           // own
+	proposeAs(t, dir, ws, ContextActor{ID: "alice-bot", Owner: "alice"}, "my agent's") // same owner
+	voted := proposeAs(t, dir, ws, ContextActor{ID: "author"}, "already voted")
 	if _, err := HumanVerdict(dir, ws, voted.ID, h, OutcomeApprove, 0, ""); err != nil {
 		t.Fatal(err)
 	}
@@ -264,7 +264,7 @@ func TestHumanApprovalQueueIsOldestPendingRevisionFirst(t *testing.T) {
 	dir, ws := multiAgentDir(t), "ws"
 	h := humanApprover("alice", "alice")
 	old := promoted(t, dir, ws, "author", "the build uses make")
-	waiting := propose(t, dir, ws, ContextActor{ID: "author"}, "tests need docker")
+	waiting := proposeAs(t, dir, ws, ContextActor{ID: "author"}, "tests need docker")
 	time.Sleep(2 * time.Millisecond) // the edit is strictly younger than the proposal
 	if _, err := EditContext(dir, ws, old.ID, EditRequest{BaseRevision: 1, Reason: "add go", NewString: " and go"},
 		ContextActor{ID: "author"}); err != nil {
