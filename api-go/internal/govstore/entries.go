@@ -117,6 +117,24 @@ func (e Entry) Served(now time.Time) bool {
 	return e.ExpiresAt == "" || e.ExpiresAt > canonTime(now)
 }
 
+// RankState is the rank state the ranking view labels the entry with at time now (the
+// Go twin of rankStateCases), or "" when recall never ranks it.
+func (e Entry) RankState(now time.Time) string {
+	unexpired := e.ExpiresAt == "" || e.ExpiresAt > canonTime(now)
+	active := e.Lifecycle == LifecycleActive
+	switch {
+	case e.Promoted && active && unexpired:
+		return RankServed
+	case e.Promoted && active:
+		return RankExpired
+	case !e.Promoted && active && unexpired && e.Status == StatusPending:
+		return RankPending
+	case e.Promoted && e.Lifecycle == LifecycleSuperseded:
+		return RankSuperseded
+	}
+	return ""
+}
+
 // NewEntry is a proposal. The author is always the writing Actor's principal: scope
 // and author are derived server-side, never taken from the payload (SEC-05).
 type NewEntry struct {
@@ -378,7 +396,14 @@ func (r *reader) ListEntries(ctx context.Context, f EntryFilter) ([]Entry, error
 	return out, rows.Err()
 }
 
+// MaxTags bounds an entry's tags: recall and ground decode every ranked entry's tags,
+// so their count must not grow with what one proposer writes.
+const MaxTags = 32
+
 func validateTags(tags []string) error {
+	if len(tags) > MaxTags {
+		return fmt.Errorf("%w: %d tags, at most %d", ErrInvalid, len(tags), MaxTags)
+	}
 	for _, t := range tags {
 		if !tagPattern.MatchString(t) {
 			return fmt.Errorf("%w: tag %q (letters, digits, '_', '.', '-' only)", ErrInvalid, t)

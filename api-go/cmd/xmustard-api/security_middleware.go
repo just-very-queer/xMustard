@@ -479,6 +479,29 @@ func denyMissingRole(w http.ResponseWriter, r *http.Request, p *workspaceops.Pri
 	})
 }
 
+// isReviewer reports whether the caller may read unverified memory text: the verifier
+// or human-approver role (admin holds both; open mode is the operator). An anonymous
+// caller (XMUSTARD_AUTH=off while tokens exist) is a reader, so it is not.
+func isReviewer(r *http.Request) bool {
+	c := callerOf(r)
+	return c.has(workspaceops.RoleVerifier) || c.has(workspaceops.RoleHumanApprover)
+}
+
+// requireReviewer passes a reviewer and answers anyone else: 401 without a principal,
+// else a 403 naming the verifier role.
+func requireReviewer(w http.ResponseWriter, r *http.Request) bool {
+	if isReviewer(r) {
+		return true
+	}
+	p := principalFromContext(r.Context())
+	if p == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required"})
+		return false
+	}
+	denyMissingRole(w, r, p, workspaceops.RoleVerifier)
+	return false
+}
+
 // --- the caller's view of itself (whoami, ground) ---
 
 // callerView is who the caller is and what it may do.

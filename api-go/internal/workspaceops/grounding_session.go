@@ -41,6 +41,9 @@ func (g *SessionGrounding) summarize() {
 	if n := g.MemoryVerificationModes[VerificationSelfAssertedOpen]; n > 0 {
 		g.Summary += fmt.Sprintf(" %d memory self-asserted in open mode (not peer-verified).", n)
 	}
+	if g.PendingForYou != nil && *g.PendingForYou > 0 {
+		g.Summary += fmt.Sprintf(" %d pending memory await your verification (recall status=awaiting_me).", *g.PendingForYou)
+	}
 	if len(g.Unknown) > 0 {
 		g.Summary += fmt.Sprintf(" %d field(s) unknown (see unknown).", len(g.Unknown))
 	}

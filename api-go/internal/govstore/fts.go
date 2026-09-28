@@ -92,6 +92,9 @@ type TranscriptHit struct {
 // SearchReader runs full-text queries.
 type SearchReader interface {
 	SearchMemories(ctx context.Context, q MemoryQuery) ([]MemoryHit, error)
+	// MemoryScores returns the negated BM25 of every workspace entry matching text,
+	// keyed by entry id, whatever its state: the lexical signal recall fuses.
+	MemoryScores(ctx context.Context, workspaceID, text string) (map[string]float64, error)
 	SearchTranscripts(ctx context.Context, q TranscriptQuery) ([]TranscriptHit, error)
 }
 
@@ -179,6 +182,32 @@ func (r *reader) SearchMemories(ctx context.Context, q MemoryQuery) ([]MemoryHit
 		out = append(out, h)
 	}
 	return out, rows.Err()
+}
+
+// maxScoredMatches bounds how many matches MemoryScores reads; the best-scoring ones
+// are kept.
+const maxScoredMatches = 20_000
+
+// MemoryScores scores every matching entry of a workspace by BM25 over title, body and
+// anchors (porter-stemmed, IDF-weighted).
+func (r *reader) MemoryScores(ctx context.Context, workspaceID, text string) (map[string]float64, error) {
+	if err := validID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	match, _ := ftsQuery(text)
+	if match == "" {
+		return nil, nil
+	}
+	rows, err := r.query(ctx, `SELECT e.id, -`+memoryBM25+` FROM memory_fts JOIN entries e ON e.pk = memory_fts.rowid
+		WHERE memory_fts MATCH ? AND e.workspace_id = ? ORDER BY `+memoryBM25+`, e.pk LIMIT ?`, match, workspaceID, maxScoredMatches)
+	if err != nil {
+		return nil, err
+	}
+	out := map[string]float64{}
+	var id string
+	var score float64
+	err = eachRow(rows, func() { out[id] = score }, func() error { return rows.Scan(&id, &score) })
+	return out, err
 }
 
 // SearchTranscripts ranks session ledger text by BM25, with date and session filters.
