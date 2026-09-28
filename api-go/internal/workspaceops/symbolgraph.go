@@ -3,6 +3,8 @@ package workspaceops
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strconv"
 
 	"xmustard/api-go/internal/rustcore"
@@ -104,6 +106,12 @@ func indexedRead(ctx context.Context, dataDir, workspaceID string, run func(root
 	}
 	read := ensureCodeIndex(ctx, root)
 	out, err := run(root, read)
+	var refusal *rustcore.Refusal
+	if errors.As(err, &refusal) {
+		// the core refused the caller's input (a revision that names no commit, a
+		// worktree that is not a checkout); its refusal names only that input
+		return nil, fmt.Errorf("%s: %w", refusal.Reason, ErrInvalidInput)
+	}
 	if err != nil {
 		return nil, err
 	}

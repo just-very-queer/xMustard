@@ -172,13 +172,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "max hops (default 3)" },
 		],
 		// The impact v2 filters, paging and diff scopes (WS-35) are MCP advanced arguments
-		// this closed schema does not carry; the API refuses from or to alone.
+		// this closed schema does not carry. Every argument goes to the API, as Go's Build
+		// sends it, and the API refuses one of another form (symbol with from and to,
+		// max_depth alone) instead of it being dropped.
 		build: (a) => {
-			let path = ws(a, "/changes/since-index");
-			if (str(a, "from") || str(a, "to"))
-				path = query(path, "from", str(a, "from"), "to", str(a, "to"), "depth", str(a, "max_depth"));
-			else if (str(a, "symbol")) path = query(path, "symbol", str(a, "symbol"), "depth", str(a, "max_depth"));
-			return { method: "GET", path };
+			const args = ["from", str(a, "from"), "to", str(a, "to"), "symbol", str(a, "symbol"), "depth", str(a, "max_depth")];
+			return { method: "GET", path: query(ws(a, "/changes/since-index"), ...args) };
 		},
 	},
 	{

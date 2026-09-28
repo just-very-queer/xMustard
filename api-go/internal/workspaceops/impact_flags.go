@@ -2,6 +2,9 @@ package workspaceops
 
 import (
 	"fmt"
+	"maps"
+	"math"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -31,7 +34,13 @@ const (
 var RelationTypes = []string{"CALLS", "IMPORTS", "EXTENDS", "IMPLEMENTS", "USES", "ACCESSES", "HAS_METHOD", "HAS_PROPERTY"}
 
 // ChangeScopes are the scope names (gitdiff's vocabulary; workspace is all).
-var ChangeScopes = []string{"unstaged", "staged", "all", "workspace", "compare", "commit", "range"}
+var ChangeScopes = func() []string {
+	names := make([]string, len(gitdiff.Scopes))
+	for i, s := range gitdiff.Scopes {
+		names[i] = s.Name
+	}
+	return names
+}()
 
 type impactParam struct {
 	param, flag string
@@ -73,7 +82,7 @@ func listOf(values ...string) func(string) error {
 
 func unitInterval(v string) error {
 	f, err := strconv.ParseFloat(v, 64)
-	if err != nil || f < 0 || f > 1 {
+	if err != nil || math.IsNaN(f) || f < 0 || f > 1 {
 		return fmt.Errorf("must be a number from 0 to 1")
 	}
 	return nil
@@ -81,9 +90,11 @@ func unitInterval(v string) error {
 
 func boolean(v string) error { return oneOf("true", "false")(v) }
 
+// checkoutPath takes an absolute path: a relative one would resolve against the core
+// process's working directory.
 func checkoutPath(v string) error {
-	if len(v) > 4096 || strings.ContainsRune(v, 0) {
-		return fmt.Errorf("is not a path")
+	if len(v) > 4096 || strings.ContainsRune(v, 0) || !filepath.IsAbs(v) {
+		return fmt.Errorf("is not an absolute path")
 	}
 	return nil
 }
@@ -126,6 +137,46 @@ func concat(lists ...[]impactParam) []impactParam {
 	return out
 }
 
+// impactTargets are the arguments that name a form's targets: the core takes them as
+// positional arguments, not flags, so CheckImpactRequest strips them.
+var impactTargets = map[ImpactForm][]string{ImpactBlast: {"symbol"}, ImpactTrace: {"from", "to"}}
+
+// ImpactFormOf picks the impact read params name: from and to together are a trace,
+// symbol a blast radius, scope a diff-to-symbol read, and none of them the changes since
+// the index baseline. from or to alone is refused.
+func ImpactFormOf(params map[string]string) (ImpactForm, error) {
+	from, to := params["from"] != "", params["to"] != ""
+	switch {
+	case from != to:
+		return "", fmt.Errorf("a trace needs both from and to: %w", ErrInvalidInput)
+	case from:
+		return ImpactTrace, nil
+	case params["symbol"] != "":
+		return ImpactBlast, nil
+	case params["scope"] != "":
+		return ImpactChanges, nil
+	}
+	return ImpactSinceIndex, nil
+}
+
+// CheckImpactRequest picks the form of an impact request and checks every parameter
+// against it, so a request is refused whole before any core runs. It returns the form
+// and the parameters less the form's targets (the ImpactFlags input).
+func CheckImpactRequest(params map[string]string) (ImpactForm, map[string]string, error) {
+	form, err := ImpactFormOf(params)
+	if err != nil {
+		return "", nil, err
+	}
+	rest := maps.Clone(params)
+	for _, k := range impactTargets[form] {
+		delete(rest, k)
+	}
+	if _, err := ImpactFlags(form, rest); err != nil {
+		return "", nil, err
+	}
+	return form, rest, nil
+}
+
 // impactParamNames is every parameter any form takes, the forms' own arguments
 // (symbol, from, to) included: a caller strips its form's before ImpactFlags.
 func impactParamNames() map[string]bool {
@@ -165,6 +216,11 @@ func ImpactFlags(form ImpactForm, params map[string]string) ([]string, error) {
 			return nil, fmt.Errorf("%s %q %v: %w", p.param, v, err, ErrInvalidInput)
 		}
 		out = append(out, "--"+p.flag+"="+v)
+	}
+	if form == ImpactChanges {
+		if err := gitdiff.CheckScope(params["scope"], params["base"], params["head"]); err != nil {
+			return nil, fmt.Errorf("%v: %w", err, ErrInvalidInput)
+		}
 	}
 	return out, nil
 }

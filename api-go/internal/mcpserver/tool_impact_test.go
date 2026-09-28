@@ -1,8 +1,13 @@
 package mcpserver
 
 import (
+	"encoding/json"
+	"net/url"
+	"slices"
 	"strings"
 	"testing"
+
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // Impact v2 (WS-35): each form forwards its own filters and paging as query
@@ -33,6 +38,55 @@ func TestImpactForwardsEachFormsArguments(t *testing.T) {
 		}
 		if p := api.lastTool(t).Path; p != c.path {
 			t.Fatalf("%v forwarded\n %q\nwant\n %q", c.args, p, c.path)
+		}
+	}
+}
+
+// An argument of another form reaches the API, which refuses the call, so a caller never
+// gets a different read than it asked for (a staged-scoped or directed read answered
+// as a full blast radius). The fake API applies the route's own check.
+func TestImpactRefusesArgumentsOfAnotherForm(t *testing.T) {
+	api := &fakeAPI{handle: func(r Request) *APIResponse {
+		u, err := url.Parse(r.Path)
+		if err != nil || !strings.HasSuffix(u.Path, "/changes/since-index") {
+			return nil
+		}
+		params := map[string]string{}
+		for k := range u.Query() {
+			params[k] = u.Query().Get(k)
+		}
+		if _, _, err := workspaceops.CheckImpactRequest(params); err != nil {
+			body, _ := json.Marshal(map[string]string{"error": err.Error()})
+			return &APIResponse{Status: 400, Body: string(body)}
+		}
+		return nil
+	}}
+	s := newSession(t, api, Options{}, nil, LatestProtocolVersion)
+	for _, c := range []struct {
+		args map[string]any
+		path string
+	}{
+		{map[string]any{"symbol": "X", "scope": "staged"}, "?symbol=X&scope=staged"},
+		{map[string]any{"from": "a", "to": "b", "direction": "downstream", "limit": 5}, "?from=a&to=b&direction=downstream&limit=5"},
+		{map[string]any{"scope": "all", "direction": "downstream"}, "?direction=downstream&scope=all"},
+		{map[string]any{"direction": "downstream"}, "?direction=downstream"},
+	} {
+		c.args["workspace_id"] = "ws"
+		res, rerr := call(t, s, "impact", c.args)
+		if rerr != nil || res["isError"] != true || !strings.Contains(text(res), "does not apply to impact") {
+			t.Fatalf("%v: want a refusal, got %v %v", c.args, rerr, res)
+		}
+		if p := api.lastTool(t).Path; p != "/api/workspaces/ws/changes/since-index"+c.path {
+			t.Fatalf("%v forwarded %q", c.args, p)
+		}
+	}
+}
+
+// Build forwards every argument the tool declares.
+func TestImpactForwardsEveryDeclaredArgument(t *testing.T) {
+	for _, a := range append(append([]Arg{}, impactTool.Args...), impactTool.Advanced...) {
+		if a.Name != workspaceArg.Name && !slices.Contains(impactQuery, a.Name) {
+			t.Fatalf("Build does not forward %s", a.Name)
 		}
 	}
 }

@@ -3866,24 +3866,23 @@ func registerRoutes(mux routeRegistrar) {
 		ws := r.PathValue("workspace_id")
 		// impact (WS-35): ?from=&to= → shortest path with per-hop edges; ?symbol= →
 		// blast radius by depth tier; ?scope= → the symbols a scoped diff touches;
-		// otherwise the changes since the index baseline. A parameter of another form
-		// is refused (workspaceops.ImpactFlags).
+		// otherwise the changes since the index baseline. A parameter of another form,
+		// or a value out of range, is a 400 before any core runs.
 		q, params := r.URL.Query(), map[string]string{}
 		for name := range r.URL.Query() {
 			params[name] = q.Get(name)
 		}
-		form, err := impactForm(params)
+		form, rest, err := workspaceops.CheckImpactRequest(params)
 		var result json.RawMessage
-		switch form {
-		case "":
-		case workspaceops.ImpactTrace:
-			result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), without(params, "from", "to"))
-		case workspaceops.ImpactBlast:
-			result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), without(params, "symbol"))
-		case workspaceops.ImpactChanges:
-			result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, params)
-		default:
-			if _, err = workspaceops.ImpactFlags(form, params); err == nil {
+		if err == nil {
+			switch form {
+			case workspaceops.ImpactTrace:
+				result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
+			case workspaceops.ImpactBlast:
+				result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+			case workspaceops.ImpactChanges:
+				result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
+			default:
 				result, err = workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
 			}
 		}

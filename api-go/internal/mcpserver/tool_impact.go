@@ -48,29 +48,30 @@ var impactTool = &Tool{
 		"freshness": "object", "coverage": "object",
 	},
 	MaxResultChars: boundedResultChars,
+	// Every argument goes to the API, which picks the form and refuses an argument of
+	// another form (workspaceops.CheckImpactRequest), so no filter is dropped unsaid.
 	Build: func(a map[string]string) (string, string, string) {
-		p := wsPath(a, "/changes/since-index")
-		walk := []string{"relation_types", a["relation_types"], "min_confidence", a["min_confidence"],
-			"include_tests", a["include_tests"], "depth", a["max_depth"]}
-		page := []string{"limit", a["limit"], "offset", a["offset"], "summary_only", a["summary_only"],
-			"timeout_ms", a["timeout_ms"]}
-		switch {
-		case a["from"] != "" || a["to"] != "":
-			p = query(p, append([]string{"from", a["from"], "to", a["to"]}, walk...)...)
-		case a["symbol"] != "":
-			p = query(p, append(append([]string{"symbol", a["symbol"], "direction", a["direction"]}, walk...), page...)...)
-		case a["scope"] != "":
-			p = query(p, append(append([]string{"scope", a["scope"], "base", a["base"], "head", a["head"],
-				"worktree", a["worktree"]}, walk...), page...)...)
+		kv := make([]string, 0, 2*len(impactQuery))
+		for _, name := range impactQuery {
+			param := name
+			if name == "max_depth" {
+				param = "depth" // the API's name
+			}
+			kv = append(kv, param, a[name])
 		}
-		return "GET", p, ""
+		return "GET", query(wsPath(a, "/changes/since-index"), kv...), ""
 	},
 }
+
+// impactQuery is every impact argument in the order the API receives it: the forms'
+// own arguments, then the walk's, then paging.
+var impactQuery = []string{"from", "to", "symbol", "direction", "scope", "base", "head", "worktree",
+	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms"}
 
 // impactDoc is the docs resource's paragraph on impact v2.
 const impactDoc = `symbol= accepts a name, Container.name, a UID or a file path; a class or interface is also seeded with its constructors and its file (upstream) or its members (downstream). Results group by depth: 1 WILL BREAK, 2 LIKELY AFFECTED, 3+ MAY NEED TESTING, each paged by limit and offset. risk (upstream only) is CRITICAL when direct dependents >= 30, modules >= 5 or impacted >= 200; HIGH at 15, 3, 100; MEDIUM at 5 direct or 30 impacted; LOW otherwise; UNKNOWN when no dependent is found. epistemic.completeness is exact only when no resolver drop, lexical edge, coverage loss or cap could hide a dependent; otherwise lower_bound with causes and boundaries. Arguments of another form (for example direction with from=&to=) are refused.
 
-scope= reads a diff (system and global Git configuration ignored, every diff option pinned): unstaged (index to working tree), staged (HEAD to index), all or workspace (HEAD to working tree), compare (base to the working tree, or to head), commit (head's first parent to head, default HEAD), range (merge-base of base and head to head). Working-tree scopes include untracked files. Each changed file is parsed on both sides, so spans are current; changed_symbols are added, modified or removed with contract_break on a signature change or a removed export, and affected is the upstream walk from all of them.
+scope= reads a diff (system and global Git configuration ignored, every diff option pinned): unstaged (index to working tree), staged (HEAD to index), all or workspace (HEAD to working tree), compare (base to the working tree, or to head), commit (head's first parent to head, default HEAD), range (merge-base of base and head to head); a revision the scope does not take is refused. worktree, an absolute path, diffs another checkout of the repository. Working-tree scopes include untracked files. Each changed file is parsed on both sides, so spans are current; changed_symbols are added, modified or removed with contract_break on a signature change or a removed export, and affected is the upstream walk from all of them.
 
 from=&to= searches downstream (from depends on to), then upstream; max_depth defaults to 10 (at most 30), 200 edges per node, 5000 nodes per level, 50000 visited. Without a path it returns the furthest node reached and the caps hit.
 `
