@@ -381,7 +381,7 @@
         "readOnlyHint": true,
         "title": "Estimate change impact"
       },
-      "description": "Blast radius. symbol= (name, Container.name, UID or path) → dependents by depth (d1 will break), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. from=\u0026to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+      "description": "Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=\u0026to= → shortest path, per-hop edges. No args → changes since the index baseline.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -390,10 +390,15 @@
             "type": "string"
           },
           "max_depth": {
-            "description": "max hops (default 3)",
+            "description": "hops (default 3; path= 4)",
             "maximum": 32,
             "minimum": 1,
             "type": "integer"
+          },
+          "path": {
+            "description": "a repo-relative file",
+            "maxLength": 4096,
+            "type": "string"
           },
           "symbol": {
             "description": "symbol to compute blast radius for",

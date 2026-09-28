@@ -22,6 +22,8 @@ type ImpactForm string
 const (
 	// ImpactBlast is symbol= (blast radius by depth tier).
 	ImpactBlast ImpactForm = "symbol"
+	// ImpactFile is path= (WS-FIX-05): the files referencing a file's symbols.
+	ImpactFile ImpactForm = "path"
 	// ImpactTrace is from=&to= (shortest path with per-hop edges).
 	ImpactTrace ImpactForm = "trace"
 	// ImpactChanges is scope= (the symbols a scoped diff touches, and their dependents).
@@ -117,6 +119,8 @@ var (
 			{"direction", "direction", oneOf("upstream", "downstream")},
 		}),
 		ImpactTrace: concat(walkParams, []impactParam{{"depth", "max-depth", intIn(1, 30)}}),
+		// the legacy file-level walk takes no filters; its core takes depth positionally
+		ImpactFile: {{"depth", "max-depth", intIn(1, 4)}},
 		ImpactChanges: concat(walkParams, pageParams, []impactParam{
 			{"depth", "max-depth", intIn(1, 32)},
 			{"scope", "scope", oneOf(ChangeScopes...)},
@@ -139,11 +143,12 @@ func concat(lists ...[]impactParam) []impactParam {
 
 // impactTargets are the arguments that name a form's targets: the core takes them as
 // positional arguments, not flags, so CheckImpactRequest strips them.
-var impactTargets = map[ImpactForm][]string{ImpactBlast: {"symbol"}, ImpactTrace: {"from", "to"}}
+var impactTargets = map[ImpactForm][]string{ImpactBlast: {"symbol"}, ImpactFile: {"path"}, ImpactTrace: {"from", "to"}}
 
 // ImpactFormOf picks the impact read params name: from and to together are a trace,
-// symbol a blast radius, scope a diff-to-symbol read, and none of them the changes since
-// the index baseline. from or to alone is refused.
+// symbol a blast radius, path a file's, scope a diff-to-symbol read, and none of them
+// the changes since the index baseline. from or to alone is refused; two targets are
+// refused by CheckImpactRequest, since each form's table lacks the others'.
 func ImpactFormOf(params map[string]string) (ImpactForm, error) {
 	from, to := params["from"] != "", params["to"] != ""
 	switch {
@@ -153,6 +158,8 @@ func ImpactFormOf(params map[string]string) (ImpactForm, error) {
 		return ImpactTrace, nil
 	case params["symbol"] != "":
 		return ImpactBlast, nil
+	case params["path"] != "":
+		return ImpactFile, nil
 	case params["scope"] != "":
 		return ImpactChanges, nil
 	}
@@ -177,10 +184,15 @@ func CheckImpactRequest(params map[string]string) (ImpactForm, map[string]string
 	return form, rest, nil
 }
 
-// impactParamNames is every parameter any form takes, the forms' own arguments
-// (symbol, from, to) included: a caller strips its form's before ImpactFlags.
+// impactParamNames is every parameter any form takes, the forms' own targets
+// (impactTargets) included: a caller strips its form's before ImpactFlags.
 func impactParamNames() map[string]bool {
-	names := map[string]bool{"symbol": true, "from": true, "to": true}
+	names := map[string]bool{}
+	for _, targets := range impactTargets {
+		for _, t := range targets {
+			names[t] = true
+		}
+	}
 	for _, table := range impactParams {
 		for _, p := range table {
 			names[p.param] = true

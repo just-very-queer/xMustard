@@ -18,6 +18,7 @@ func TestImpactFlagsTable(t *testing.T) {
 			[]string{"--relation-types=calls,ACCESSES", "--min-confidence=0.9", "--include-tests=true", "--limit=10",
 				"--offset=0", "--summary-only=false", "--timeout-ms=500", "--max-depth=5", "--direction=downstream"}},
 		{ImpactTrace, map[string]string{"depth": "30"}, []string{"--max-depth=30"}},
+		{ImpactFile, map[string]string{"depth": "4"}, []string{"--max-depth=4"}},
 		{ImpactChanges, map[string]string{"scope": "compare", "base": "origin/main", "head": "HEAD~1", "worktree": "/tmp/wt", "symbols": "20"},
 			[]string{"--scope=compare", "--base=origin/main", "--head=HEAD~1", "--worktree=/tmp/wt", "--symbols=20"}},
 		{ImpactChanges, map[string]string{"scope": "workspace"}, []string{"--scope=workspace"}},
@@ -48,6 +49,10 @@ func TestImpactFlagsTable(t *testing.T) {
 		{ImpactTrace, map[string]string{"direction": "upstream"}},
 		{ImpactTrace, map[string]string{"limit": "5"}},
 		{ImpactTrace, map[string]string{"symbol": "x"}},
+		{ImpactFile, map[string]string{"depth": "5"}},
+		{ImpactFile, map[string]string{"direction": "upstream"}},
+		{ImpactFile, map[string]string{"symbol": "x"}},
+		{ImpactBlast, map[string]string{"path": "a.go"}},
 		{ImpactChanges, map[string]string{"scope": "sideways"}},
 		{ImpactChanges, map[string]string{"scope": "range", "base": "-x"}},
 		{ImpactChanges, map[string]string{"scope": "range", "base": "a b"}},
@@ -82,6 +87,8 @@ func TestImpactFormOfTable(t *testing.T) {
 		{map[string]string{"from": "a", "to": "b", "symbol": "s"}, ImpactTrace, false},
 		{map[string]string{"symbol": "s", "scope": "all"}, ImpactBlast, false},
 		{map[string]string{"scope": "all"}, ImpactChanges, false},
+		{map[string]string{"path": "a.go", "scope": "all"}, ImpactFile, false},
+		{map[string]string{"symbol": "s", "path": "a.go"}, ImpactBlast, false},
 		{map[string]string{}, ImpactSinceIndex, false},
 		{map[string]string{"from": "a"}, "", true},
 		{map[string]string{"to": "b", "symbol": "s"}, "", true},
@@ -112,6 +119,8 @@ func TestCheckImpactRequestRefusesAnotherFormsParameters(t *testing.T) {
 		{"scope": "all", "direction": "downstream"},
 		{"direction": "downstream"},
 		{"from": "a"},
+		{"symbol": "X", "path": "a.go"},
+		{"path": "a.go", "limit": "5"},
 	} {
 		if _, _, err := CheckImpactRequest(bad); !IsInvalidInput(err) {
 			t.Fatalf("%v: want invalid input, got %v", bad, err)

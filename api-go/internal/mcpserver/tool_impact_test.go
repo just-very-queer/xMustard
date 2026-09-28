@@ -70,6 +70,7 @@ func TestImpactRefusesArgumentsOfAnotherForm(t *testing.T) {
 		{map[string]any{"from": "a", "to": "b", "direction": "downstream", "limit": 5}, "?from=a&to=b&direction=downstream&limit=5"},
 		{map[string]any{"scope": "all", "direction": "downstream"}, "?direction=downstream&scope=all"},
 		{map[string]any{"direction": "downstream"}, "?direction=downstream"},
+		{map[string]any{"path": "a.go", "direction": "upstream"}, "?path=a.go&direction=upstream"},
 	} {
 		c.args["workspace_id"] = "ws"
 		res, rerr := call(t, s, "impact", c.args)
@@ -91,9 +92,11 @@ func TestImpactForwardsEveryDeclaredArgument(t *testing.T) {
 	}
 }
 
-// Values outside their declared ranges are rejected before any call, never clamped.
+// Values outside their declared ranges are rejected before any call, never clamped
+// (an isError argument error since WS-FIX-05).
 func TestImpactRejectsOutOfRangeArguments(t *testing.T) {
-	s := newSession(t, &fakeAPI{}, Options{}, nil, LatestProtocolVersion)
+	api := &fakeAPI{}
+	s := newSession(t, api, Options{}, nil, LatestProtocolVersion)
 	for _, bad := range []map[string]any{
 		{"symbol": "x", "min_confidence": 1.5},
 		{"symbol": "x", "max_depth": 33},
@@ -103,9 +106,10 @@ func TestImpactRejectsOutOfRangeArguments(t *testing.T) {
 		{"symbol": "x", "limit": 0},
 	} {
 		bad["workspace_id"] = "ws"
-		if _, rerr := call(t, s, "impact", bad); rerr == nil || rerr.Code != CodeInvalidParams {
-			t.Fatalf("%v: want invalid params, got %v", bad, rerr)
-		}
+		argErr(t, s, "impact", bad)
+	}
+	if reqs := api.toolRequests(); len(reqs) != 0 {
+		t.Fatalf("a rejected argument reached the API: %v", reqs)
 	}
 }
 

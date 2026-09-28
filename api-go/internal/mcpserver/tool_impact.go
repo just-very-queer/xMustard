@@ -8,13 +8,14 @@ const maxImpactDepth = 32
 
 var impactTool = &Tool{
 	Name:        "impact",
-	Description: "Blast radius. symbol= (name, Container.name, UID or path) → dependents by depth (d1 will break), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+	Description: "Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
 	Args: []Arg{
 		workspaceArg,
 		{Name: "symbol", Type: typeString, Desc: "symbol to compute blast radius for"},
+		{Name: "path", Type: typeString, MaxLen: maxPathArg, Desc: "a repo-relative file"},
 		{Name: "from", Type: typeString, Desc: "trace path from this symbol"},
 		{Name: "to", Type: typeString, Desc: "trace path to this symbol"},
-		{Name: "max_depth", Type: typeInteger, Min: 1, Max: maxImpactDepth, Desc: "max hops (default 3)"},
+		{Name: "max_depth", Type: typeInteger, Min: 1, Max: maxImpactDepth, Desc: "hops (default 3; path= 4)"},
 	},
 	// Impact v2 (WS-35): typed filters, per-depth paging and diff-to-symbol scopes are
 	// accepted everywhere and listed only in the full schema profile; the docs resource
@@ -37,11 +38,13 @@ var impactTool = &Tool{
 	Doc: impactDoc,
 	// depth is the API's query name; a UID goes where a symbol does
 	Aliases:     map[string]string{"depth": "max_depth", "uid": "symbol"},
+	PathArg:     "path",
 	Annotations: Annotations{Title: "Estimate change impact", ReadOnly: true},
-	// symbol=: symbol, impacted_count, by_depth, risk; from=&to=: found, length; scope=
-	// and no args: changed symbols and since. Every graph read carries the graph's
-	// freshness and coverage. Other members (epistemic, counts, hops, affected) are
-	// returned but not listed, to keep tools/list within its cap.
+	// symbol=: symbol, impacted_count, by_depth, risk; path=: found, impacted_count
+	// (and impacted); from=&to=: found, length; scope= and no args: changed symbols and
+	// since. Every graph read carries the graph's freshness and coverage. Other members
+	// (epistemic, counts, hops, affected) are returned but not listed, to keep
+	// tools/list within its cap.
 	Output: map[string]string{
 		"symbol": "string", "impacted_count": "integer", "by_depth": "array", "risk": "string",
 		"found": "boolean", "length": "integer", "since": "string",
@@ -65,11 +68,13 @@ var impactTool = &Tool{
 
 // impactQuery is every impact argument in the order the API receives it: the forms'
 // own arguments, then the walk's, then paging.
-var impactQuery = []string{"from", "to", "symbol", "direction", "scope", "base", "head", "worktree",
+var impactQuery = []string{"path", "symbol", "from", "to", "direction", "scope", "base", "head", "worktree",
 	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms"}
 
 // impactDoc is the docs resource's paragraph on impact v2.
-const impactDoc = `symbol= accepts a name, Container.name, a UID or a file path; a class or interface is also seeded with its constructors and its file (upstream) or its members (downstream). Results group by depth: 1 WILL BREAK, 2 LIKELY AFFECTED, 3+ MAY NEED TESTING, each paged by limit and offset. risk (upstream only) is CRITICAL when direct dependents >= 30, modules >= 5 or impacted >= 200; HIGH at 15, 3, 100; MEDIUM at 5 direct or 30 impacted; LOW otherwise; UNKNOWN when no dependent is found. epistemic.completeness is exact only when no resolver drop, lexical edge, coverage loss or cap could hide a dependent; otherwise lower_bound with causes and boundaries. Arguments of another form (for example direction with from=&to=) are refused.
+const impactDoc = `symbol= accepts a name, Container.name, a UID or a file path; a class or interface is also seeded with its constructors and its file (upstream) or its members (downstream). Results group by depth: 1 WILL BREAK, 2 LIKELY AFFECTED, 3+ MAY NEED TESTING, each paged by limit and offset. risk (upstream only) is CRITICAL when direct dependents >= 30, modules >= 5 or impacted >= 200; HIGH at 15, 3, 100; MEDIUM at 5 direct or 30 impacted; LOW otherwise; UNKNOWN when no dependent is found. epistemic.completeness is exact only when no resolver drop, lexical edge, coverage loss or cap could hide a dependent; otherwise lower_bound with causes and boundaries. Arguments of another form (for example direction with from=&to=, or two of symbol=, path= and from=&to=) are refused.
+
+path= (WS-FIX-05) lists the files that reference a symbol the file defines, with their distance, over the file-level lexical graph: max_depth 1 to 4 (default 4), no filters or paging; found is false when the graph does not hold the file. For resolved tiers and risk from a file, pass it as symbol=.
 
 scope= reads a diff (system and global Git configuration ignored, every diff option pinned): unstaged (index to working tree), staged (HEAD to index), all or workspace (HEAD to working tree), compare (base to the working tree, or to head), commit (head's first parent to head, default HEAD), range (merge-base of base and head to head); a revision the scope does not take is refused. worktree, an absolute path, diffs another checkout of the repository. Working-tree scopes include untracked files. Each changed file is parsed on both sides, so spans are current; changed_symbols are added, modified or removed with contract_break on a signature change or a removed export, and affected is the upstream walk from all of them.
 

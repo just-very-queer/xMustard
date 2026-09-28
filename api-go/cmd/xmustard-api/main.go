@@ -3866,9 +3866,10 @@ func registerRoutes(mux routeRegistrar) {
 		dd := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
 		ws := r.PathValue("workspace_id")
 		// impact (WS-35): ?from=&to= → shortest path with per-hop edges; ?symbol= →
-		// blast radius by depth tier; ?scope= → the symbols a scoped diff touches;
-		// otherwise the changes since the index baseline. A parameter of another form,
-		// or a value out of range, is a 400 before any core runs.
+		// blast radius by depth tier; ?path= → the files referencing one file
+		// (WS-FIX-05); ?scope= → the symbols a scoped diff touches; otherwise the
+		// changes since the index baseline. A parameter of another form (two targets
+		// among them), or a value out of range, is a 400 before any core runs.
 		q, params := r.URL.Query(), map[string]string{}
 		for name := range r.URL.Query() {
 			params[name] = q.Get(name)
@@ -3881,6 +3882,8 @@ func registerRoutes(mux routeRegistrar) {
 				result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
 			case workspaceops.ImpactBlast:
 				result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+			case workspaceops.ImpactFile:
+				result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
 			case workspaceops.ImpactChanges:
 				result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
 			default:

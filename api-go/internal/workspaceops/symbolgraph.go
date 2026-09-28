@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -95,6 +96,35 @@ func DetectChangesCtx(ctx context.Context, dataDir, workspaceID string, params m
 		args = append(append(append(args, read.flags()...), flags...), root, workspaceID)
 		return rustcore.RunSymbolgraph(ctx, args...)
 	})
+}
+
+// FileImpactCtx is impact(path=) (WS-FIX-05): the files that reference a symbol defined
+// in path, up to the depth hops of params (the ImpactFile parameters, default 4), with
+// the graph's freshness and coverage. The walk is the legacy file-level one, started
+// from the file; found is false when the graph does not hold the file. The path is
+// confined to the workspace before it reaches the core, which only looks it up in the
+// graph.
+func FileImpactCtx(ctx context.Context, dataDir, workspaceID, path string, params map[string]string) (json.RawMessage, error) {
+	if _, err := ImpactFlags(ImpactFile, params); err != nil {
+		return nil, err
+	}
+	depth := cmp.Or(params["depth"], "4")
+	root, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID)
+	if err != nil {
+		return nil, err
+	}
+	rel, err := ConfineWorkspacePath(root, path)
+	if err != nil {
+		return nil, err
+	}
+	read := ensureCodeIndex(ctx, root)
+	args := []string{"impact-file"}
+	args = append(append(args, read.flags()...), root, workspaceID, rel, depth)
+	out, err := rustcore.RunSymbolgraph(ctx, args...)
+	if err != nil {
+		return nil, err
+	}
+	return read.annotate(out), nil
 }
 
 // indexedRead brings the workspace's code index to its observed identity, runs one

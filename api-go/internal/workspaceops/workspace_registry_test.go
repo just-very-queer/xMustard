@@ -262,6 +262,9 @@ func TestNineToolPathsNeverParseTheSnapshot(t *testing.T) {
 			if _, err := SymbolImpactCtx(ctx, dataDir, ws, "F", map[string]string{"depth": "2"}); err != nil {
 				return err
 			}
+			if _, err := FileImpactCtx(ctx, dataDir, ws, "f.go", map[string]string{"depth": "2"}); err != nil {
+				return err
+			}
 			_, err := TraceSymbolsCtx(ctx, dataDir, ws, "F", "G", nil)
 			return err
 		},

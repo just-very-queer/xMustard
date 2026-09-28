@@ -163,21 +163,22 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius. symbol= (name, Container.name, UID or path) → dependents by depth (d1 will break), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+			"Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
 		args: [
 			workspaceArg,
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
+			{ name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file" },
 			{ name: "from", type: "string", desc: "trace path from this symbol" },
 			{ name: "to", type: "string", desc: "trace path to this symbol" },
-			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "max hops (default 3)" },
+			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "hops (default 3; path= 4)" },
 		],
 		// The impact v2 filters, paging and diff scopes (WS-35) are MCP advanced arguments
 		// this closed schema does not carry. Every argument goes to the API, as Go's Build
-		// sends it, and the API refuses one of another form (symbol with from and to,
-		// max_depth alone) instead of it being dropped.
+		// sends it, and the API refuses one of another form (two of symbol, path and
+		// from/to; max_depth alone) instead of it being dropped.
 		build: (a) => {
-			const args = ["from", str(a, "from"), "to", str(a, "to"), "symbol", str(a, "symbol"), "depth", str(a, "max_depth")];
-			return { method: "GET", path: query(ws(a, "/changes/since-index"), ...args) };
+			const args = ["path", "symbol", "from", "to"].flatMap((k) => [k, str(a, k)]);
+			return { method: "GET", path: query(ws(a, "/changes/since-index"), ...args, "depth", str(a, "max_depth")) };
 		},
 	},
 	{

@@ -107,7 +107,7 @@ describe("tool specs mirror the MCP server", () => {
 		assert.equal(rem.method, "POST");
 		assert.deepEqual(JSON.parse(rem.body ?? ""), { content: "c", paths: ["a.go", "b.go"] });
 		// every argument reaches the API, which refuses symbol with from and to
-		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", from: "A", to: "B" }).path, "/api/workspaces/w/changes/since-index?from=A&to=B&symbol=S");
+		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", from: "A", to: "B" }).path, "/api/workspaces/w/changes/since-index?symbol=S&from=A&to=B");
 		assert.equal(spec("impact").build({ workspace_id: "w", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?depth=2");
 		// run_id reads (GET); without it the call reaches the recording route, as Go's Build does
 		assert.deepEqual(spec("why_failed").build({ workspace_id: "w", run_id: "oc_1" }), { method: "GET", path: "/api/workspaces/w/runs/oc_1/why-failed" });
@@ -160,6 +160,8 @@ describe("tool specs mirror the MCP server", () => {
 		assert.equal(spec("recall").build({ workspace_id: "w" }).path, "/api/workspaces/w/context/active?max_chars=4000");
 		assert.equal(spec("search").build({ workspace_id: "w", q: "x", limit: 50 }).path, "/api/workspaces/w/search?q=x&limit=50");
 		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?symbol=S&depth=2");
+		assert.equal(spec("impact").build({ workspace_id: "w", path: "a/b.go", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?path=a%2Fb.go&depth=2");
+		assert.equal(spec("impact").build({ workspace_id: "w", path: "a.go", symbol: "S" }).path, "/api/workspaces/w/changes/since-index?path=a.go&symbol=S");
 		const v = spec("verify").build({ workspace_id: "w", entry_id: "e", approve: false, note: "stale: a.go" });
 		assert.equal(v.path, "/api/workspaces/w/context/e/verify?approve=false");
 		assert.equal(v.body, '{"note":"stale: a.go"}');
