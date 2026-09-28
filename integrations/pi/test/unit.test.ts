@@ -31,7 +31,7 @@ import {
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
-import { checkRequired, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
+import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
 
 
 type Handler = (req: http.IncomingMessage, res: http.ServerResponse, body: Buffer) => void;
@@ -144,8 +144,18 @@ describe("tool specs mirror the MCP server", () => {
 			assert.deepEqual(toJsonSchema(spec(g.name)), g.inputSchema, `${g.name} inputSchema`);
 		}
 	});
+	test("recall's default budget is the MCP tool's", (t) => {
+		const src = new URL("../../../api-go/internal/mcpserver/tool_recall.go", import.meta.url);
+		if (!existsSync(src)) return t.skip("api-go not present in this checkout");
+		const m = /recallDefaultMaxChars\s*=\s*(\d+)/.exec(readFileSync(src, "utf8"));
+		assert.equal(Number(m?.[1]), RECALL_DEFAULT_MAX_CHARS);
+	});
 	test("new bounds and the verify note build like Go", () => {
-		assert.equal(spec("recall").build({ workspace_id: "w", q: "auth flow", limit: 5 }).path, "/api/workspaces/w/context/active?query=auth+flow&limit=5");
+		assert.equal(
+			spec("recall").build({ workspace_id: "w", q: "auth flow", limit: 5 }).path,
+			"/api/workspaces/w/context/active?query=auth+flow&limit=5&max_chars=4000",
+		);
+		assert.equal(spec("recall").build({ workspace_id: "w" }).path, "/api/workspaces/w/context/active?max_chars=4000");
 		assert.equal(spec("search").build({ workspace_id: "w", q: "x", limit: 50 }).path, "/api/workspaces/w/search?q=x&limit=50");
 		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?symbol=S&depth=2");
 		const v = spec("verify").build({ workspace_id: "w", entry_id: "e", approve: false, note: "stale: a.go" });
