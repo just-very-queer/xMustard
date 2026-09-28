@@ -1139,21 +1139,16 @@ const BRANCH_KEYWORDS: &[&str] = &["if", "while", "match", "switch", "elif", "wh
 /// (`line_keywords`), found once per line so long lines stay linear.
 fn flow_of(line: &str, keywords: (Option<usize>, Option<usize>), start: usize, end: usize) -> u8 {
     let (first_return, first_branch) = keywords;
-    if first_return.is_some_and(|s| s < start) {
-        return flow::RETURNS;
-    }
-    if first_branch.is_some_and(|s| s < start) {
-        return flow::BRANCHES;
-    }
     let after = line.get(end..).unwrap_or("").trim_start();
-    if (after.starts_with('=') && !after.starts_with("=="))
+    let assigned = (after.starts_with('=') && !after.starts_with("=="))
         || ["+=", "-=", "*=", "/="]
             .iter()
-            .any(|op| after.starts_with(op))
-    {
-        return flow::WRITES;
-    }
-    flow::NONE
+            .any(|op| after.starts_with(op));
+    flow::classify(
+        first_return.is_some_and(|s| s < start),
+        first_branch.is_some_and(|s| s < start),
+        assigned,
+    )
 }
 
 /// Start columns of the first `return` and the first branch keyword on a line.

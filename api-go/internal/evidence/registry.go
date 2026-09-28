@@ -817,11 +817,7 @@ func (structuredReducer) Reduce(ctx context.Context, in *Input) (*Projection, er
 			out.WriteByte('\n')
 		}
 	}
-	for _, s := range in.Sections {
-		if _, ok := parts[s.Name]; !ok {
-			parts[s.Name] = ""
-		}
-	}
+	fillParts(parts, in.Sections)
 	facts := Facts{ExitCode: in.Sel.ExitCode}
 	used := "xm-structured/1"
 	if anyText {

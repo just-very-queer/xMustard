@@ -244,3 +244,36 @@ func TestShimDropsAnOversizedRootsAnswer(t *testing.T) {
 	case <-time.After(300 * time.Millisecond):
 	}
 }
+
+// Every frame shape the read loop tells apart, end to end: malformed JSON is a parse
+// error without an id, a blank line and a notification get no reply, requests are
+// answered by id (an unknown method with an error), and end of input stops the shim.
+func TestShimReadLoopFrameShapes(t *testing.T) {
+	p := startShim(t, "/", "XMUSTARD_API_BASE=http://127.0.0.1:9")
+	p.send(t, `{not json`)
+	m := p.next(t)
+	if _, hasID := m["id"]; hasID || fmt.Sprint(m["error"]) != "map[code:-32700 message:parse error]" {
+		t.Fatalf("malformed frame: %v", m)
+	}
+	p.send(t, `   `)
+	p.send(t, `{"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":99}}`)
+	p.send(t, `{"jsonrpc":"2.0","id":"a","method":"ping"}`)
+	if m = p.next(t); m["id"] != "a" || fmt.Sprint(m["result"]) != "map[]" {
+		t.Fatalf("ping after a blank line and a notification: %v", m)
+	}
+	p.send(t, `{"jsonrpc":"2.0","id":4,"method":"no/such"}`)
+	if m = p.next(t); m["id"] != float64(4) || m["error"].(map[string]any)["code"] != float64(-32601) {
+		t.Fatalf("unknown method: %v", m)
+	}
+	_ = p.stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("shim exit at end of input: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the shim did not stop at end of input")
+	}
+}

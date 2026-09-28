@@ -237,25 +237,7 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 	if cfg.Fake {
 		r.Driver = "fake:" + cfg.Driver
 	}
-	if m.DryRun {
-		r.Warnings = append(r.Warnings, "dry run (fake driver and/or stub stack): these numbers exercise the harness and are not experimental evidence")
-	}
-	if m.Containment == ContainNone {
-		r.Warnings = append(r.Warnings, "containment none: hidden oracle files and other runs' artifacts were readable by the agent")
-	}
-	if m.Interrupted {
-		r.Warnings = append(r.Warnings, "run interrupted: the result set is incomplete")
-	}
-	if m.Aborted != "" {
-		r.Warnings = append(r.Warnings, "ABORTED: "+m.Aborted+"; no run started after it, and results before it may be contaminated")
-	}
-	if cfg.KeepWorktrees {
-		w := "keep_worktrees: every run's worktree was kept for debugging (isolation.kept_at); containment hid them from later runs' agents"
-		if m.Containment == ContainNone {
-			w = "keep_worktrees with containment none: earlier runs' worktrees (solved trees) were readable by later runs' agents"
-		}
-		r.Warnings = append(r.Warnings, w)
-	}
+	r.Warnings = manifestWarnings(m)
 
 	byArm := map[string][]*RunRecord{}
 	for i := range recs {
@@ -266,54 +248,10 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 			continue
 		}
 		byArm[rec.Arm] = append(byArm[rec.Arm], rec)
-		if rec.Arm == ArmBaseline && rec.Transcript != nil {
-			for _, s := range rec.Transcript.MCPServers {
-				if strings.Contains(strings.ToLower(s), "xmustard") {
-					r.Warnings = append(r.Warnings, fmt.Sprintf("baseline run %s had an operator MCP server %q: the baseline is not xMustard-free", pairID(rec), s))
-				}
-			}
-		}
-		if rec.Transcript != nil && !rec.Transcript.FinalEvent {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: no final client event; tokens and cost are incomplete", pairID(rec), rec.Arm))
-		}
-		if rec.ClientError != "" {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: client error (%s), scored as the agent's outcome; exclude_client_errors pre-registers leaving such runs out", pairID(rec), rec.Arm, rec.ClientError))
-		}
-		if iso := rec.Isolation; iso != nil && iso.VerifyChangedTree {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: the visible verify step changed the tree; the oracle judged the agent's final tree after a restore", pairID(rec), rec.Arm))
-		}
-		if rec.Oracle != nil {
-			if w := unrunnableOracle(rec.Oracle.ExitCode); w != "" {
-				r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: %s; the run counts as unresolved", pairID(rec), rec.Arm, w))
-			}
-		}
-		if iso := rec.Isolation; iso != nil && iso.EscapedKilled > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s/%s: %d process(es) outlived the run's process groups and were killed before judging", pairID(rec), rec.Arm, iso.EscapedKilled))
-		}
-		if rec.RSS != nil {
-			if rec.RSS.AgentPeakKiB > r.RSSGate.MaxAgentKiB {
-				r.RSSGate.MaxAgentKiB = rec.RSS.AgentPeakKiB
-			}
-			if len(rec.RSS.XmRolesObserved) > 0 {
-				r.RSSGate.RunsSampled++
-				if rec.RSS.XmPeakKiB > r.RSSGate.MaxXmKiB {
-					r.RSSGate.MaxXmKiB = rec.RSS.XmPeakKiB
-					r.RSSGate.MaxXmRun = pairID(rec) + "/" + rec.Arm
-				}
-				if rec.RSS.XmPeakKiB*1024 > GateBytes {
-					r.RSSGate.OverGate = append(r.RSSGate.OverGate, pairID(rec)+"/"+rec.Arm)
-				}
-			}
-		}
+		r.Warnings = append(r.Warnings, runWarnings(rec)...)
+		r.RSSGate.observe(rec)
 	}
-	switch {
-	case !r.RSSGate.RealStack:
-		r.RSSGate.Note = "no product stack was measured (stub or none); RSS numbers are harness plumbing only"
-	case r.RSSGate.RunsSampled == 0:
-		r.RSSGate.Note = "no xMustard process was sampled"
-	default:
-		r.RSSGate.Note = "sampled ps-RSS peaks (100 ms, v1 method); the parity-scale gate (WS-10/WS-50) is authoritative"
-	}
+	r.RSSGate.Note = r.RSSGate.note()
 	if len(r.NotCompleted) > 0 {
 		r.Warnings = append(r.Warnings, fmt.Sprintf("%d run(s) did not complete; see not_completed", len(r.NotCompleted)))
 	}
@@ -335,27 +273,151 @@ func buildReport(m *Manifest, recs []RunRecord) *Report {
 		}
 		r.Comparisons = append(r.Comparisons, compareArm(cfg.ReferenceArm, arm, ref, byArm[arm], th, harm[arm].value()))
 	}
-	for _, arm := range armNames {
-		if s := r.ArmSummaries[slices.Index(armNames, arm)]; s.UsageUnknown > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %d completed run(s) without session usage from the client's final event; they are left out of token medians and deltas", arm, s.UsageUnknown))
-		}
-		if h := harm[arm]; h.unpaired > 0 {
-			r.Warnings = append(r.Warnings, fmt.Sprintf("%s: %d failing run(s) received a harmful memory but have no completed %s run of the same task and repetition; stale-memory harm cannot attribute them", arm, h.unpaired, ArmXmustardMCP))
-		}
+	for i, arm := range armNames {
+		r.Warnings = append(r.Warnings, armWarnings(arm, r.ArmSummaries[i], harm[arm])...)
 		if ms := summarizeMemory(arm, byArm[arm], harm[arm]); ms != nil {
 			r.Memory = append(r.Memory, *ms)
-			if ms.ScopeLeakage > 0 {
-				r.Warnings = append(r.Warnings, fmt.Sprintf("GOVERNANCE: %s delivered %d foreign-scope memories (scope leakage must be 0)", arm, ms.ScopeLeakage))
-			}
-			if ms.PendingServed > 0 || ms.PendingAsPeerVerified > 0 {
-				r.Warnings = append(r.Warnings, fmt.Sprintf("GOVERNANCE: %s delivered %d unverified memories (%d labelled peer_verified)", arm, ms.PendingServed, ms.PendingAsPeerVerified))
-			}
-			if ms.PromotionErrors > 0 {
-				r.Warnings = append(r.Warnings, fmt.Sprintf("GOVERNANCE: %s promoted %d memories during single-agent runs", arm, ms.PromotionErrors))
-			}
+			r.Warnings = append(r.Warnings, governanceWarnings(arm, ms)...)
 		}
 	}
 	return r
+}
+
+// manifestWarnings are the warnings about the evaluation as a whole, in report order.
+func manifestWarnings(m *Manifest) []string {
+	none := m.Containment == ContainNone
+	keep := m.Config.KeepWorktrees
+	var out []string
+	for _, w := range []struct {
+		when bool
+		text string
+	}{
+		{m.DryRun, "dry run (fake driver and/or stub stack): these numbers exercise the harness and are not experimental evidence"},
+		{none, "containment none: hidden oracle files and other runs' artifacts were readable by the agent"},
+		{m.Interrupted, "run interrupted: the result set is incomplete"},
+		{m.Aborted != "", "ABORTED: " + m.Aborted + "; no run started after it, and results before it may be contaminated"},
+		{keep && !none, "keep_worktrees: every run's worktree was kept for debugging (isolation.kept_at); containment hid them from later runs' agents"},
+		{keep && none, "keep_worktrees with containment none: earlier runs' worktrees (solved trees) were readable by later runs' agents"},
+	} {
+		if w.when {
+			out = append(out, w.text)
+		}
+	}
+	return out
+}
+
+// runWarnings are the warnings one completed run raises, in report order: an
+// operator MCP server named like xMustard in a baseline run, then each of
+// runWarningRules, prefixed with the run.
+func runWarnings(rec *RunRecord) []string {
+	var out []string
+	if rec.Arm == ArmBaseline && rec.Transcript != nil {
+		for _, s := range rec.Transcript.MCPServers {
+			if strings.Contains(strings.ToLower(s), "xmustard") {
+				out = append(out, fmt.Sprintf("baseline run %s had an operator MCP server %q: the baseline is not xMustard-free", pairID(rec), s))
+			}
+		}
+	}
+	for _, rule := range runWarningRules {
+		if w := rule(rec); w != "" {
+			out = append(out, fmt.Sprintf("%s/%s: %s", pairID(rec), rec.Arm, w))
+		}
+	}
+	return out
+}
+
+// runWarningRules each describe one problem a completed run can have, or return "".
+var runWarningRules = []func(rec *RunRecord) string{
+	func(rec *RunRecord) string {
+		if rec.Transcript != nil && !rec.Transcript.FinalEvent {
+			return "no final client event; tokens and cost are incomplete"
+		}
+		return ""
+	},
+	func(rec *RunRecord) string {
+		if rec.ClientError != "" {
+			return "client error (" + rec.ClientError + "), scored as the agent's outcome; exclude_client_errors pre-registers leaving such runs out"
+		}
+		return ""
+	},
+	func(rec *RunRecord) string {
+		if iso := rec.Isolation; iso != nil && iso.VerifyChangedTree {
+			return "the visible verify step changed the tree; the oracle judged the agent's final tree after a restore"
+		}
+		return ""
+	},
+	func(rec *RunRecord) string {
+		if rec.Oracle == nil {
+			return ""
+		}
+		if w := unrunnableOracle(rec.Oracle.ExitCode); w != "" {
+			return w + "; the run counts as unresolved"
+		}
+		return ""
+	},
+	func(rec *RunRecord) string {
+		if iso := rec.Isolation; iso != nil && iso.EscapedKilled > 0 {
+			return fmt.Sprintf("%d process(es) outlived the run's process groups and were killed before judging", iso.EscapedKilled)
+		}
+		return ""
+	},
+}
+
+// observe folds one completed run's sampled peaks into the gate summary.
+func (g *RSSGateSummary) observe(rec *RunRecord) {
+	if rec.RSS == nil {
+		return
+	}
+	g.MaxAgentKiB = max(g.MaxAgentKiB, rec.RSS.AgentPeakKiB)
+	if len(rec.RSS.XmRolesObserved) == 0 {
+		return
+	}
+	g.RunsSampled++
+	run := pairID(rec) + "/" + rec.Arm
+	if rec.RSS.XmPeakKiB > g.MaxXmKiB {
+		g.MaxXmKiB, g.MaxXmRun = rec.RSS.XmPeakKiB, run
+	}
+	if rec.RSS.XmPeakKiB*1024 > GateBytes {
+		g.OverGate = append(g.OverGate, run)
+	}
+}
+
+// note says what the gate's numbers are.
+func (g *RSSGateSummary) note() string {
+	switch {
+	case !g.RealStack:
+		return "no product stack was measured (stub or none); RSS numbers are harness plumbing only"
+	case g.RunsSampled == 0:
+		return "no xMustard process was sampled"
+	}
+	return "sampled ps-RSS peaks (100 ms, v1 method); the parity-scale gate (WS-10/WS-50) is authoritative"
+}
+
+// armWarnings are an arm's warnings about the numbers it reports.
+func armWarnings(arm string, s ArmSummary, h harmCount) []string {
+	var out []string
+	if s.UsageUnknown > 0 {
+		out = append(out, fmt.Sprintf("%s: %d completed run(s) without session usage from the client's final event; they are left out of token medians and deltas", arm, s.UsageUnknown))
+	}
+	if h.unpaired > 0 {
+		out = append(out, fmt.Sprintf("%s: %d failing run(s) received a harmful memory but have no completed %s run of the same task and repetition; stale-memory harm cannot attribute them", arm, h.unpaired, ArmXmustardMCP))
+	}
+	return out
+}
+
+// governanceWarnings are an arm's memory-governance violations.
+func governanceWarnings(arm string, ms *MemorySummary) []string {
+	var out []string
+	if ms.ScopeLeakage > 0 {
+		out = append(out, fmt.Sprintf("GOVERNANCE: %s delivered %d foreign-scope memories (scope leakage must be 0)", arm, ms.ScopeLeakage))
+	}
+	if ms.PendingServed > 0 || ms.PendingAsPeerVerified > 0 {
+		out = append(out, fmt.Sprintf("GOVERNANCE: %s delivered %d unverified memories (%d labelled peer_verified)", arm, ms.PendingServed, ms.PendingAsPeerVerified))
+	}
+	if ms.PromotionErrors > 0 {
+		out = append(out, fmt.Sprintf("GOVERNANCE: %s promoted %d memories during single-agent runs", arm, ms.PromotionErrors))
+	}
+	return out
 }
 
 func summarizeArm(arm string, runs []*RunRecord) ArmSummary {
