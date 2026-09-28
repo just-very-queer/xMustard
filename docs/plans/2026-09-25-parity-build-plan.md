@@ -504,7 +504,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Collision risk.** changetrack.rs and indexcache.rs were changed by w0-drift (WS-00), and WS-22 also edits changetrack.rs; sequence WS-22 first. Cargo.toml is shared with WS-16 and WS-37.
 
-**Implementation record (branch parity/ws-15, 2026-09-28).** These notes record what was built and measured, and where it differs from the text above. Measurements: `docs/benchmarks/2026-09-28-ws15-watcher.md`. The work was finished after the first agent was cut off. It was merged with feat/parity-v2 at 49feb45 (WS-21) and 3ab0b17 (WS-20).
+**Implementation record (branch parity/ws-15, 2026-09-28).** These notes record what was built and measured, and where it differs from the text above. Measurements: `docs/benchmarks/2026-09-28-ws15-watcher.md`. The work was finished after the first agent was cut off. It was merged with feat/parity-v2 at 49feb45 (WS-21), 3ab0b17 (WS-20) and 144123c (WS-57). Final checks on the Linux box after the last merge (`xm-remote-check.sh all -count=1`): every Rust test target and Go package passed (remote_exit=0), with 6 clippy warnings, the base's count.
 - *Watcher (PAR-FRESH-03).* `rust-core/src/index/watch.rs`, inside `serve`, uses notify 8.2. It runs one watcher per registered root, at most 4 roots, least recently used first out. A root that is stopped or evicted is announced `absent`.
   - Backends: macOS uses FSEvents, one recursive stream. Linux uses inotify, with one watch per covered directory (at most 32,768 per root) plus the Git dir, `logs/`, `info/` and every `refs/` directory. Directories that appear later get watches, and the files already in them are queued.
   - Coverage: the whole root except the directories Git ignores as a whole. That list comes from `git status --ignored=matching` at start and again after an ignore file changes; without it, the built-in exclusions apply. Files over 32 MiB are dropped.
@@ -558,7 +558,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
   - `content_hash` is still computed when a baseline is written and by `changetrack fingerprint`. Drift no longer compares it.
   - recall's `drift_checked` stays WS-20's integer count. impact reports `drift_checked` for its changes mode only.
   - The ENOSPC path was tested with an injected `MaxFilesWatch` and a lowered per-root limit; the kernel's `max_user_watches` could not be lowered on the box without root.
-  - The `index_query` resident-RSS test (WS-14, debug build, 15 MiB line) failed once in the full Linux suite while a base build ran beside it. Run alone, it measured +14.5 MiB steady on head and +13.9 on base, both under the line; the test is near its line on Linux in debug builds.
+  - The `index_query` resident-RSS test (WS-14, debug build, 15 MiB line) failed once in a full Linux suite while a base build ran beside it. It passed alone (+14.5 MiB steady on head, +13.9 on base) and in the final suite. It sits near its line on Linux in debug builds.
 - *Files outside the list.*
   - Rust: `index/envelope.rs`, `index/reader.rs`, `index/mod.rs`, `symbolgraph.rs`, `bin/xmustard-core.rs` (the `watch` command, coverage freshness) and `go-calls.txt`.
   - Go: `rustcore/root.go` (`watch` is worker-only), `workspaceops/code_index.go`, `workspaceops/grounding_index.go`, and the tests `rustcore/refresh_test.go`, `workspaceops/code_index_test.go` and `cmd/xmustard-api/worker_process_test.go`.
