@@ -573,11 +573,11 @@ impl<'c> Resolver<'c> {
         local: &str,
     ) -> rusqlite::Result<Found> {
         let Some(target) = imp.resolved else {
-            // a relative specifier naming no indexed file is a broken in-repo binding
-            let cause = if imp.target_key.is_some() {
-                Cause::Unresolved
-            } else {
-                Cause::External
+            // a relative specifier naming no indexed file is a broken in-repo binding; a
+            // non-relative one is a package or a path alias the resolver does not map
+            let cause = match imp.target_key {
+                Some(_) => Cause::Unresolved,
+                None => Cause::UnresolvedModule,
             };
             return Ok(Found::Drop(cause));
         };

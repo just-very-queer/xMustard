@@ -333,6 +333,33 @@ fn a_file_target_is_seeded_with_its_declared_symbols() {
     assert_eq!(v["defined_in"], serde_json::json!(["src/hub.ts"]));
 }
 
+// A path alias the resolver does not map (tsconfig `paths`) hides in-repo dependents:
+// the binding is kept as an `unresolved_module` drop, so the answer is a lower bound
+// that names the importing file, never an exact zero.
+#[test]
+fn an_unmapped_import_alias_makes_the_answer_a_lower_bound() {
+    let r = repo(&files(&[
+        ("src/core/api.ts", "export function buildHandler(): number { return 1; }\n"),
+        (
+            "src/app.ts",
+            "import { buildHandler } from '@core/api';\nexport function start(): number { return buildHandler(); }\n",
+        ),
+    ]));
+    build(r.path());
+    let v = sg("impact", r.path(), &[], &["buildHandler"]);
+    assert_eq!(v["epistemic"]["completeness"], "lower_bound", "{v:#}");
+    assert_eq!(v["epistemic"]["causes"]["unresolved_module"], 1, "{v:#}");
+    assert!(
+        v["epistemic"]["boundaries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["path"] == "src/app.ts" && b["cause"] == "unresolved_module"),
+        "{v:#}"
+    );
+    assert_eq!(v["risk"], "UNKNOWN");
+}
+
 #[test]
 fn zero_upstream_callers_is_unknown_with_a_note() {
     let r = graph_fixture();

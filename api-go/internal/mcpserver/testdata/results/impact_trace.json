@@ -44,10 +44,10 @@
       "dirty_paths_touching_result": [
         "pkg/calc/calc.go"
       ],
-      "head": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+      "head": "52c693ca770f52ffa5cf898ed8fd7afc826d0ba8",
       "identity_age_ms": 0,
       "index_version": "schema-4.csr-2",
-      "indexed_commit": "c33de00d26e604cb1062e0efccb9582bffd2f248",
+      "indexed_commit": "52c693ca770f52ffa5cf898ed8fd7afc826d0ba8",
       "refresh": {
         "escalated": false,
         "reparsed": 2,
@@ -60,7 +60,7 @@
     },
     "from": "main",
     "from_targets": 1,
-    "generated_at": "2026-09-28T11:59:29Z",
+    "generated_at": "2026-09-28T12:29:51Z",
     "hops": [
       {
         "confidence": 0.9,
