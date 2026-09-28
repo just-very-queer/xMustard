@@ -32,6 +32,7 @@ type routeSpec struct {
 func apiRouteAreas() [][]routeSpec {
 	return [][]routeSpec{
 		authRoutes,
+		toolRoutes,
 		operatorRoutes,
 		postgresRoutes,
 		workspaceRoutes,
