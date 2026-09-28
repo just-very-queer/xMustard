@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/hooks"
 )
 
@@ -153,9 +154,14 @@ func TestCodexFixturesMatchTheRecordedPayloads(t *testing.T) {
 	}
 }
 
-// Every Codex event has exactly one way to be answered and a gate row, and the shipped
-// hooks.json is what `xmustard-ops codex-hooks config` writes by default.
+// Every Codex event has exactly one way to be answered and a gate row, the context cap
+// is the reason cap (both are Codex's spill limit), and the shipped hooks.json is what
+// `xmustard-ops codex-hooks config` writes by default.
 func TestCodexHookTablesAndConfigAgree(t *testing.T) {
+	if hooks.CodexHookTextBytes != evidence.PolicyFor("codex").MaxChars {
+		t.Fatalf("the hook context cap (%d) and the codex reason cap (%d) are both Codex's spill limit", hooks.CodexHookTextBytes,
+			evidence.PolicyFor("codex").MaxChars)
+	}
 	for _, e := range hooks.CodexEvents {
 		_, answers := hookHandlers[e.Name]
 		_, queued := hookQueueEffects[e.Name]

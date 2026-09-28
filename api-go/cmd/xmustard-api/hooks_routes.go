@@ -66,9 +66,8 @@ import (
 // reader-only token gets the middleware's 401 or 403, which Claude Code shows as a
 // non-blocking hook error (the static client prints nothing). The service starts no
 // process for a hook (the client starts xmustard-hook for command hooks): Rust work
-// runs only on a resident
-// worker that is already running, and the repository identity is never sampled (a
-// hook-delivered observation is captured_identity=unknown).
+// runs only on a resident worker that is already running, and the repository identity
+// is never sampled (a hook-delivered observation is captured_identity=unknown).
 //
 // Route gates: every event is its own route with a row in routeGateTable (hookGate): core,
 // the proposer role (a hook runs for an agent session; no non-GET route grants reader),

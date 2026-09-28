@@ -39,7 +39,7 @@ The block also replaces Codex's header for the call, and that header's `Process
 exited with code N` is the only place Codex gives a shell command's exit status. The
 hook payload carries only the output text (`core/src/tools/context.rs`). So a replaced
 `Bash` output starts with a line saying the exit status is unknown. The exact status
-exists only in Codex's app-server stream (`item/completed`), which WS-34 imports.
+exists only in Codex's app-server stream (`item/completed`), which WS-34 plans to read.
 
 Codex hands a hook its own preview of a long command output, with the middle already
 cut (about 40 KB). A failure in that middle is gone before xMustard sees it. A failed
