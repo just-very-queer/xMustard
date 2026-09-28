@@ -1,6 +1,7 @@
 package main
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -107,8 +108,39 @@ func (c *RunConfig) peer(name string) (PeerConfig, bool) {
 
 func (c *RunConfig) client() ClientConfig { return c.Clients[c.Driver] }
 
-// prepare validates the configuration and fills defaults.
+// prepare validates the configuration and fills defaults. Every problem found is
+// reported, in a fixed order, not only the first.
 func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
+	errs := c.prepareDriver()
+	errs = append(errs, c.prepareArms()...)
+	c.fillDefaults(corpus)
+	errs = append(errs, c.checkPeers()...)
+	errs = append(errs, c.checkTaskFilter(corpus)...)
+	self, err := os.Executable()
+	if err != nil {
+		errs = append(errs, err)
+	}
+	c.self = self
+	errs = append(errs, c.prepareStack()...)
+	errs = append(errs, c.preparePiAdapter()...)
+	abs, err := filepath.Abs(outDir)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	c.outDir = abs
+	errs = append(errs, c.prepareHidden(corpus)...)
+	c.xmNames = attributedNames(c.Stack)
+	mode, err := resolveContainment(c.Containment)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	c.contain = mode
+	return errors.Join(errs...)
+}
+
+// prepareDriver resolves fake:<driver> and requires a known driver, and a fixed model
+// for a real-model run.
+func (c *RunConfig) prepareDriver() []error {
 	var errs []error
 	if kind, ok := strings.CutPrefix(c.Driver, "fake:"); ok {
 		c.Fake, c.Driver = true, kind
@@ -119,6 +151,13 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 	if !c.Fake && strings.TrimSpace(c.Model) == "" {
 		errs = append(errs, errors.New("a fixed --model is required for real-model runs"))
 	}
+	return errs
+}
+
+// prepareArms parses the arms (DefaultArms when none are named) and picks the
+// reference arm when none is named: the baseline when it runs, else the first arm.
+func (c *RunConfig) prepareArms() []error {
+	var errs []error
 	if len(c.Arms) == 0 {
 		c.Arms = slices.Clone(DefaultArms)
 	}
@@ -140,21 +179,23 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 	if !slices.Contains(c.Arms, c.ReferenceArm) {
 		errs = append(errs, fmt.Errorf("reference_arm %q is not among the arms", c.ReferenceArm))
 	}
+	return errs
+}
+
+// fillDefaults sets the pre-registered defaults of what was left unset.
+func (c *RunConfig) fillDefaults(corpus *Corpus) {
 	if c.Repeats <= 0 {
 		c.Repeats = max(corpus.Defaults.Repeats, 1)
 	}
-	if c.Seed == 0 {
-		c.Seed = 20260925
-	}
-	if c.Thresholds.MaxP == 0 {
-		c.Thresholds.MaxP = 0.05
-	}
-	if c.Thresholds.BootstrapIters == 0 {
-		c.Thresholds.BootstrapIters = 10000
-	}
-	if c.Thresholds.Alpha == 0 {
-		c.Thresholds.Alpha = 0.05
-	}
+	c.Seed = cmp.Or(c.Seed, 20260925)
+	c.Thresholds.MaxP = cmp.Or(c.Thresholds.MaxP, 0.05)
+	c.Thresholds.BootstrapIters = cmp.Or(c.Thresholds.BootstrapIters, 10000)
+	c.Thresholds.Alpha = cmp.Or(c.Thresholds.Alpha, 0.05)
+}
+
+// checkPeers checks every peer and records its owner-decision rule.
+func (c *RunConfig) checkPeers() []error {
+	var errs []error
 	for i := range c.Peers {
 		rule, err := c.Peers[i].check()
 		if err != nil {
@@ -162,16 +203,24 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 		}
 		c.Peers[i].OwnerDecisionRule = rule
 	}
+	return errs
+}
+
+// checkTaskFilter requires every filtered task to exist in the corpus.
+func (c *RunConfig) checkTaskFilter(corpus *Corpus) []error {
+	var errs []error
 	for _, id := range c.Tasks {
 		if !slices.ContainsFunc(corpus.Tasks, func(t Task) bool { return t.ID == id }) {
 			errs = append(errs, fmt.Errorf("task filter names unknown task %q", id))
 		}
 	}
-	self, err := os.Executable()
-	if err != nil {
-		errs = append(errs, err)
-	}
-	c.self = self
+	return errs
+}
+
+// prepareStack defaults the stack kind (real when its binaries are named, stub for a
+// dry run, else none) and checks what that kind needs: the real stack's three
+// binaries exist (absolute paths), and the stub only backs fake-driver runs.
+func (c *RunConfig) prepareStack() []error {
 	if c.Stack.Kind == "" {
 		switch {
 		case c.Stack.APIBin != "" || c.Stack.MCPBin != "":
@@ -182,6 +231,7 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 			c.Stack.Kind = StackNone
 		}
 	}
+	var errs []error
 	switch c.Stack.Kind {
 	case StackReal:
 		if c.Stack.CoreBin == "" {
@@ -209,25 +259,34 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 	default:
 		errs = append(errs, fmt.Errorf("stack.kind must be real, stub or none"))
 	}
-	if c.Driver == "pi" && c.Fake && c.client().Extension == "" {
-		// the fake agent emulates the adapter itself; the flag only marks the wiring
+	return errs
+}
+
+// preparePiAdapter wires the Pi adapter: the fake agent emulates it itself (the flag
+// only marks the wiring), and a real Pi run of an xMustard arm requires it.
+func (c *RunConfig) preparePiAdapter() []error {
+	if c.Driver != "pi" || c.client().Extension != "" {
+		return nil
+	}
+	if c.Fake {
 		if c.Clients == nil {
 			c.Clients = map[string]ClientConfig{}
 		}
 		cc := c.client()
 		cc.Extension = "fake-xmustard-pi-adapter"
 		c.Clients["pi"] = cc
+		return nil
 	}
-	if c.Driver == "pi" && !c.Fake && c.Stack.Kind != StackNone && c.client().Extension == "" {
-		errs = append(errs, errors.New("clients.pi.extension (integrations/pi/src/index.ts) is required for xMustard arms under pi"))
+	if c.Stack.Kind != StackNone {
+		return []error{errors.New("clients.pi.extension (integrations/pi/src/index.ts) is required for xMustard arms under pi")}
 	}
-	abs, err := filepath.Abs(outDir)
-	if err != nil {
-		errs = append(errs, err)
-	}
-	c.outDir = abs
-	// Anything the sandboxed agent or the contained API must execute or load cannot
-	// live in a hidden path.
+	return nil
+}
+
+// prepareHidden fixes the paths the sandboxed agent cannot read (the corpus's hidden
+// files, the repositories they live in, the output directory) and refuses anything
+// the agent or the contained API must execute or load that lives in one of them.
+func (c *RunConfig) prepareHidden(corpus *Corpus) []error {
 	corpusHidden := corpus.hiddenPaths()
 	c.hiddenRepos = repoPaths(corpusHidden)
 	c.hidden = append(append(corpusHidden, c.hiddenRepos...), c.outDir)
@@ -238,14 +297,7 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 	if c.Fake || c.Stack.Kind == StackStub {
 		mustRead = append(mustRead, c.self) // the fake agent and the stub MCP bridge
 	}
-	c.xmNames = slices.Clone(xmustardProcNames)
-	if c.Stack.Kind == StackReal {
-		for _, p := range []string{c.Stack.APIBin, c.Stack.MCPBin, c.Stack.CoreBin} {
-			c.xmNames = append(c.xmNames, filepath.Base(p))
-		}
-	}
-	slices.Sort(c.xmNames)
-	c.xmNames = slices.Compact(c.xmNames)
+	var errs []error
 	for _, p := range mustRead {
 		if p == "" || !filepath.IsAbs(p) {
 			continue
@@ -256,12 +308,20 @@ func (c *RunConfig) prepare(corpus *Corpus, outDir string) error {
 			}
 		}
 	}
-	mode, err := resolveContainment(c.Containment)
-	if err != nil {
-		errs = append(errs, err)
+	return errs
+}
+
+// attributedNames are the process names counted toward the xMustard tree: the fixed
+// names plus the configured real-stack binaries.
+func attributedNames(stack StackConfig) []string {
+	names := slices.Clone(xmustardProcNames)
+	if stack.Kind == StackReal {
+		for _, p := range []string{stack.APIBin, stack.MCPBin, stack.CoreBin} {
+			names = append(names, filepath.Base(p))
+		}
 	}
-	c.contain = mode
-	return errors.Join(errs...)
+	slices.Sort(names)
+	return slices.Compact(names)
 }
 
 // Isolation records what the harness enforced for one run.
