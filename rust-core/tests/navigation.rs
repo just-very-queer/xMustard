@@ -359,4 +359,29 @@ fn context_groups_references_by_relation() {
     assert_eq!(py["epistemic"]["completeness"], "lower_bound");
     assert_eq!(py["epistemic"]["resolved_language"], false);
     assert_eq!(nav("context", root, &[], "Nope")["found"], false);
+    // a type's members are its outgoing HAS_METHOD and HAS_PROPERTY edges
+    let store = nav("context", root, &[], "/Store");
+    let rel = |name: &str| -> Vec<String> {
+        store["outgoing"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["name_path"] == name)
+            .map(|e| e["relation"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(
+        rel("Store/Capture").contains(&"HAS_METHOD".to_string()),
+        "{store}"
+    );
+    assert!(
+        rel("Store/items").contains(&"HAS_PROPERTY".to_string()),
+        "{store}"
+    );
+    assert!(
+        store["outgoing_by_relation"]["HAS_METHOD"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
 }

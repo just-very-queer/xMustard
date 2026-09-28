@@ -234,6 +234,7 @@ fn by_relation(edges: &[Edge]) -> BTreeMap<String, usize> {
 
 /// Breadth-first layers over resolved symbol edges from `start`: layer 1 is direct,
 /// each further layer (to 1 + chain_depth) the edges of the previous layer's symbols.
+/// A symbol sits in the nearest layer that reaches it, with one edge per relation.
 fn layered(
     conn: &Connection,
     start: i64,
@@ -242,13 +243,16 @@ fn layered(
     truncated: &mut bool,
 ) -> rusqlite::Result<Vec<Edge>> {
     let mut out: Vec<Edge> = Vec::new();
-    let mut seen: HashSet<i64> = HashSet::from([start]);
+    let mut visited: HashSet<i64> = HashSet::from([start]);
     let mut frontier = vec![start];
     for layer in 1..=1 + chain_depth {
         let mut next = Vec::new();
+        let mut emitted: HashSet<(i64, String, Option<String>)> = HashSet::new();
         for id in &frontier {
             for l in links(conn, sql, *id)? {
-                if !seen.insert(l.other) {
+                if visited.contains(&l.other)
+                    || !emitted.insert((l.other, l.kind.clone(), l.access.clone()))
+                {
                     continue;
                 }
                 if out.len() >= MAX_EDGES {
@@ -261,10 +265,13 @@ fn layered(
                 else {
                     continue;
                 };
-                next.push(l.other);
+                if !next.contains(&l.other) {
+                    next.push(l.other);
+                }
                 out.push(edge(s, l, layer));
             }
         }
+        visited.extend(next.iter().copied());
         frontier = next;
     }
     Ok(out)
@@ -390,7 +397,7 @@ fn resolve_target(conn: &Connection, target: &str) -> rusqlite::Result<Result<Ta
         Ok(np) => np,
         Err(e) => return Ok(Err(e)),
     };
-    let found = namepath::find(conn, &np, &FindOptions::default())?;
+    let (found, _) = namepath::find(conn, &np, &FindOptions::default())?;
     Ok(Ok(match found.first() {
         None => Target::Missing,
         Some(_) if namepath::ambiguous(&found) => Target::Ambiguous(found),

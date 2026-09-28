@@ -239,29 +239,28 @@ pub struct FindOptions<'a> {
     pub path_glob: Option<&'a str>,
 }
 
-/// Every non-local symbol matching the name path, ranked.
+/// Every non-local symbol matching the name path, ranked, and whether the candidate
+/// cap cut the names read (the first MAX_CANDIDATES in path order are ranked).
 pub fn find(
     conn: &Connection,
     np: &NamePath,
     opts: &FindOptions<'_>,
-) -> rusqlite::Result<Vec<Symbol>> {
+) -> rusqlite::Result<(Vec<Symbol>, bool)> {
     let glob = opts
         .path_glob
         .filter(|g| !g.is_empty())
         .map(|g| Glob::compile(g.as_bytes()));
-    let mut found = if opts.substring {
-        query(
-            conn,
-            "instr(lower(n.name), lower(?1)) > 0 AND s.local = 0 ORDER BY f.path, s.start_line LIMIT ?2",
-            params![np.name(), MAX_CANDIDATES as i64],
-        )?
+    let name = if opts.substring {
+        "instr(lower(n.name), lower(?1)) > 0"
     } else {
-        query(
-            conn,
-            "n.name = ?1 AND s.local = 0 ORDER BY f.path, s.start_line LIMIT ?2",
-            params![np.name(), MAX_CANDIDATES as i64],
-        )?
+        "n.name = ?1"
     };
+    let mut found = query(
+        conn,
+        &format!("{name} AND s.local = 0 ORDER BY f.path, s.start_line LIMIT ?2"),
+        params![np.name(), MAX_CANDIDATES as i64],
+    )?;
+    let capped = found.len() >= MAX_CANDIDATES;
     found.retain(|s| {
         np.containers_match(&s.row.qualified)
             && opts.kinds.admits(&s.kind)
@@ -287,7 +286,7 @@ pub fn find(
             .then_with(|| a.path.cmp(&b.path))
             .then(a.lines[0].cmp(&b.lines[0]))
     });
-    Ok(found)
+    Ok((found, capped))
 }
 
 /// Exact name 1.0, case-folded 0.9, a substring by how much of the name it covers;
@@ -537,7 +536,13 @@ pub fn answer(
         return Ok(out);
     };
     let snap = &opened.snapshot;
-    let found = snap.with_text(|conn| find(conn, &np, &lk.find))?;
+    let (found, capped) = snap.with_text(|conn| find(conn, &np, &lk.find))?;
+    if capped {
+        out["degradations"] = json!([format!(
+            "more than {MAX_CANDIDATES} symbols match; the first {MAX_CANDIDATES} in path order were ranked \
+             (narrow with path_glob or a longer name path)"
+        )]);
+    }
     let max = lk.max_matches.clamp(1, MAX_MATCHES);
     let mut page: Vec<Symbol> = found.iter().skip(lk.offset).take(max).cloned().collect();
     let depth = lk.depth.min(MAX_DEPTH);
