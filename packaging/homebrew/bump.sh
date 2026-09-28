@@ -13,6 +13,7 @@ set -eu
 
 tag=${1:-}
 formula=${2:-$(dirname "$0")/xmustard.rb}
+case $tag in *[!0-9A-Za-z.-]*) tag= ;; esac # grep matches per line, so no newline gets past
 if ! printf '%s\n' "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$'; then
   echo "usage: bump.sh vX.Y.Z[-pre] [formula]" >&2
   exit 2
@@ -30,7 +31,7 @@ source_url="$repo/archive/refs/tags/$tag.tar.gz"
 curl -fsSL -o "$tmp/SHA256SUMS" "$repo/releases/download/$tag/SHA256SUMS"
 curl -fsSL -o "$tmp/source.tar.gz" "$source_url"
 
-# url -> sha256 for every file of the release; rejects a malformed checksum line
+# one `sha256  url` line per release file (bump.awk refuses a malformed line)
 {
   printf '%s  %s\n' "$(shasum -a 256 "$tmp/source.tar.gz" | cut -d ' ' -f 1)" "$source_url"
   sed "s|  \*\{0,1\}|  $repo/releases/download/$tag/|" "$tmp/SHA256SUMS"
@@ -69,11 +70,13 @@ $1 == "url" && index($0, "v" old) {
   if (!(u in sha)) fail("the release has no checksum for " u)
   pending = u
   used[u] = 1
+  moved++
 }
 { print }
 END {
   if (bad) exit 1
   if (pending != "") fail("url " pending " is not followed by its sha256 line")
+  if (!moved) fail("no url names v" old)
   for (u in sha)
     if (!(u in used)) print "note: the formula does not use " u > "/dev/stderr"
 }
