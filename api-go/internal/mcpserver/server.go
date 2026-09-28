@@ -186,7 +186,7 @@ func New(opts Options) *Server {
 		opts.Name = "xmustard"
 	}
 	if opts.Version == "" {
-		opts.Version = "0.1.0"
+		opts.Version = "0.1.1"
 	}
 	if opts.Schema == "" {
 		opts.Schema = SchemaLean

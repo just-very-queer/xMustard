@@ -1,7 +1,7 @@
 {
   "name": "xmustard",
   "displayName": "xMustard",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Shared, verified memory and repository intelligence for Claude Code: the nine xMustard MCP tools, plus hooks that reduce native tool output behind recoverable handles and inject verified memory and index hits.",
   "homepage": "https://github.com/just-very-queer/xMustard",
   "license": "MIT",
