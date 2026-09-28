@@ -32,26 +32,40 @@ relay:
 	cd rust-core && cargo build --release --bin xmustard-relay
 
 # Release archive for this host: `make release VERSION=v0.2.0`. It builds the Rust core
-# and relay with cargo --locked and the Go binaries with -trimpath and CGO off, checks
+# and relay with cargo --locked and the Go binaries with -trimpath and CGO off (static, so
+# the platform profile's PTY terminals, which need cgo, are unavailable in them), checks
 # that the built binaries start, and writes $(DIST)/xmustard-<version>-<os>-<arch>.tar.gz
 # (the five binaries and LICENSE) with its .sha256. The tag workflow
-# (.github/workflows/release.yml) runs it once per platform.
+# (.github/workflows/release.yml) runs it once per platform. RUSTFLAGS and CFLAGS (for the
+# C in tree-sitter and SQLite) are replaced so the binaries hold no build-machine paths
+# (the checkout becomes ., CARGO_HOME /cargo), and every archive entry gets the commit's
+# time, a fixed mode and owner 0, so a rebuild of a commit with the same toolchains gives
+# the same archive bytes.
 DIST ?= dist
 VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+SOURCE_DATE := $(shell TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y%m%d%H%M.%S 2>/dev/null)
 RELEASE_NAME := xmustard-$(VERSION)-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
 RELEASE_DIR := $(abspath $(DIST))/$(RELEASE_NAME)
 RUST_BINS := xmustard-core xmustard-relay
 GO_BINS := xmustard-api xmustard-mcp xmustard-ops
+RELEASE_FILES := $(sort LICENSE $(RUST_BINS) $(GO_BINS))
 
 release:
-	rm -rf "$(RELEASE_DIR)" "$(RELEASE_DIR).tar.gz" "$(RELEASE_DIR).tar.gz.sha256"
+	rm -rf "$(RELEASE_DIR)" "$(RELEASE_DIR).tar" "$(RELEASE_DIR).tar.gz" "$(RELEASE_DIR).tar.gz.sha256"
 	mkdir -p "$(RELEASE_DIR)"
-	cd rust-core && cargo build --release --locked $(RUST_BINS:%=--bin %)
+	cd rust-core && cargo_home=$${CARGO_HOME:-$$HOME/.cargo} && \
+		RUSTFLAGS="--remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$$cargo_home=/cargo" \
+		CFLAGS="-ffile-prefix-map=$(CURDIR)=. -ffile-prefix-map=$$cargo_home=/cargo" \
+		cargo build --release --locked $(RUST_BINS:%=--bin %)
 	cp $(RUST_BINS:%=rust-core/target/release/%) LICENSE "$(RELEASE_DIR)/"
 	cd api-go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$(RELEASE_DIR)/" $(GO_BINS:%=./cmd/%)
 	"$(RELEASE_DIR)/xmustard-core" 2>&1 | grep -q usage
 	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$(RELEASE_DIR)/xmustard-mcp" | grep -q '"remember"'
-	cd "$(DIST)" && COPYFILE_DISABLE=1 tar --owner=0 --group=0 --numeric-owner -czf "$(RELEASE_NAME).tar.gz" "$(RELEASE_NAME)"
+	cd "$(RELEASE_DIR)" && chmod 0755 . $(RUST_BINS) $(GO_BINS) && chmod 0644 LICENSE && \
+		TZ=UTC0 touch -t $(or $(SOURCE_DATE),197001010000.00) . $(RELEASE_FILES)
+	cd "$(DIST)" && COPYFILE_DISABLE=1 tar --no-recursion --no-xattrs --owner=0 --group=0 --numeric-owner \
+		-cf "$(RELEASE_NAME).tar" "$(RELEASE_NAME)" $(RELEASE_FILES:%=$(RELEASE_NAME)/%)
+	cd "$(DIST)" && gzip -n -9 "$(RELEASE_NAME).tar"
 	cd "$(DIST)" && shasum -a 256 "$(RELEASE_NAME).tar.gz" > "$(RELEASE_NAME).tar.gz.sha256"
 	cat "$(RELEASE_DIR).tar.gz.sha256"
 
