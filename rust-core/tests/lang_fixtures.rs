@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use xmustard_core::index::extract::{DEFAULT_MAX_PARSE_BYTES, Lang, extract};
 use xmustard_core::index::facts::{FileFacts, ref_kind};
 
+mod memprobe;
+
 const FIXTURES: &[&str] = &[
     "sample.py",
     "Sample.java",
@@ -262,59 +264,6 @@ fn coverage_reports_every_language_by_support() {
     }
 }
 
-/// Peak memory of one child run: (dirty peak, total RSS peak). The dirty peak is the
-/// process's own writable memory (macOS: lifetime maximum physical footprint; Linux:
-/// RssAnon), sampled while it runs; the RSS peak (wait4) also counts clean, shareable
-/// pages of the binary, such as grammar parse tables.
-fn child_peaks(cmd: &mut std::process::Command) -> (u64, u64, std::process::ExitStatus) {
-    let child = cmd.spawn().unwrap();
-    let pid = child.id() as libc::pid_t;
-    let mut dirty = 0u64;
-    let mut status: libc::c_int = 0;
-    // SAFETY: zeroed rusage/rusage_info are valid out-parameters; `pid` is our unreaped
-    // child until wait4 returns it.
-    let mut ru: libc::rusage = unsafe { std::mem::zeroed() };
-    loop {
-        #[cfg(target_os = "macos")]
-        {
-            let mut info: libc::rusage_info_v4 = unsafe { std::mem::zeroed() };
-            let rc = unsafe {
-                libc::proc_pid_rusage(
-                    pid,
-                    libc::RUSAGE_INFO_V4,
-                    &mut info as *mut _ as *mut libc::rusage_info_t,
-                )
-            };
-            if rc == 0 {
-                dirty = dirty.max(info.ri_lifetime_max_phys_footprint);
-            }
-        }
-        #[cfg(target_os = "linux")]
-        if let Ok(s) = std::fs::read_to_string(format!("/proc/{pid}/status"))
-            && let Some(kb) = s
-                .lines()
-                .find_map(|l| l.strip_prefix("RssAnon:"))
-                .and_then(|v| v.trim().trim_end_matches("kB").trim().parse::<u64>().ok())
-        {
-            dirty = dirty.max(kb * 1024);
-        }
-        let rc = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut ru) };
-        if rc == pid {
-            break;
-        }
-        assert_eq!(rc, 0, "wait4 failed");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-    std::mem::forget(child);
-    let rss = if cfg!(target_os = "macos") {
-        ru.ru_maxrss as u64
-    } else {
-        ru.ru_maxrss as u64 * 1024
-    };
-    use std::os::unix::process::ExitStatusExt;
-    (dirty, rss, std::process::ExitStatus::from_raw(status))
-}
-
 /// Every pack parsed in one worker. Compiling a tag query scans its grammar's whole
 /// parse table (tree-sitter's query analysis), so each language present adds its clean
 /// parse-table pages to RSS (measured: 49-54 MiB RSS with all 15 packs) while the worker's
@@ -337,14 +286,15 @@ fn build_of_5000_files_across_all_packs_stays_under_25_mib_dirty() {
         .collect();
     let dir = repo(&files);
     let out_path = dir.path().join("report.json");
-    let (dirty, rss, status) = child_peaks(
+    let peaks = memprobe::child_peaks(
         std::process::Command::new(BIN)
             .args(["index", "build", dir.path().to_str().unwrap(), "--no-cache"])
             .stdout(std::process::Stdio::from(
                 std::fs::File::create(&out_path).unwrap(),
             )),
     );
-    assert!(status.success());
+    let (dirty, rss) = (peaks.dirty, peaks.tree_rss);
+    assert!(peaks.status.success());
     let rep: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&out_path).unwrap()).unwrap();
     assert_eq!(
@@ -352,7 +302,7 @@ fn build_of_5000_files_across_all_packs_stays_under_25_mib_dirty() {
         "{:#}",
         rep["coverage"]
     );
-    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    let mib = memprobe::mib;
     eprintln!(
         "index build of 5,000 files over every pack: dirty peak {:.1} MiB, RSS peak {:.1} MiB",
         mib(dirty),
