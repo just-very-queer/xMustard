@@ -96,9 +96,11 @@ const COMMANDS: &[Command] = &[
     // Builds or refreshes the durable per-workspace SQLite index: whole-repository
     // work that writes owner-only state, so it keeps the per-call process boundary.
     cmd("index", Residency::OneShot, xmustard_core::index::run),
+    // `changes` parses both sides of every changed file (WS-35): the grammars and parse
+    // transients leave with a one-shot process instead of staying in the service.
     cmd(
         "symbolgraph",
-        Residency::ResidentExcept(&["build", "blast-radius"]),
+        Residency::ResidentExcept(&["build", "blast-radius", "changes"]),
         run_symbolgraph_command,
     ),
     cmd("ownership", Residency::Resident, ownership),
@@ -952,21 +954,37 @@ fn run_changetrack_command(mut args: Args) -> CmdResult {
 /// `symbolgraph <build|hotspots|blast-radius|...> ...` — the semantic symbol graph.
 /// The read-only queries run on the code index's snapshot when the root has an index
 /// (resident when serving) and on the legacy graph otherwise (see
-/// `symbolgraph::query_source`); impact, impact-file, trace and cluster-of carry
-/// freshness and coverage.
+/// `symbolgraph::query_source`); impact, impact-file, trace, changes and cluster-of carry
+/// freshness and coverage. `--name=value` flags lead the positional arguments (after
+/// `--identity-key`), so a symbol that looks like a flag is never read as one.
 fn run_symbolgraph_command(mut args: Args) -> CmdResult {
+    use xmustard_core::index::{detect_changes, impact, trace};
     use xmustard_core::symbolgraph as sg;
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|blast-radius> [--identity-key=K] ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|changes|blast-radius> [--identity-key=K] [--name=value ...] ...",
     )?;
-    let (key, mut args) = identity_flag(args);
+    let (key, args) = identity_flag(args);
+    let mut rest: Vec<String> = args.collect();
+    let lead = rest.iter().take_while(|a| a.starts_with("--")).count();
+    let flags: Vec<String> = rest.drain(..lead).collect();
+    let mut args = rest.into_iter();
     let source = |root: &str, ws: &str| sg::query_source_for(Path::new(root), ws, key.as_deref());
     let usage = |rest: &str| {
-        format!("xmustard-core symbolgraph {sub} [--identity-key=K] <root> <workspace_id>{rest}")
+        format!(
+            "xmustard-core symbolgraph {sub} [--identity-key=K] [--name=value ...] <root> <workspace_id>{rest}"
+        )
     };
     let failed = |e: String| CmdError::failed(format!("symbolgraph {sub}: {e}"));
+    let bad_flag = |e: String| CmdError::new(2, format!("symbolgraph {sub}: {e}"));
+    let takes_flags = matches!(sub.as_str(), "impact" | "trace" | "changes");
+    if !takes_flags && !flags.is_empty() {
+        return Err(bad_flag(format!(
+            "takes no flags (got {})",
+            flags.join(" ")
+        )));
+    }
     match sub.as_str() {
         "build" => {
             let u = usage("");
@@ -982,13 +1000,20 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
             // with the freshness of the source it came from: the snapshot generation,
-            // the watcher state and the last index run's counters (WS-15)
+            // the watcher state and the last index run's counters (WS-15), and the
+            // import-cycle summary (PAR-IMP-08; null on the legacy graph)
             let src = source(&root, &ws);
             let freshness = src.freshness(std::iter::empty());
+            let cycles = match src.import_cycles() {
+                Some(Ok(summary)) => serde_json::to_value(summary).unwrap_or_default(),
+                Some(Err(e)) => serde_json::json!({ "error": e }),
+                None => serde_json::Value::Null,
+            };
             let cov = src.coverage;
             json(&serde_json::json!({
                 "complete": cov.complete,
                 "languages": cov.languages,
+                "import_cycles": cycles,
                 "freshness": freshness,
             }))
         }
@@ -1015,22 +1040,28 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             }))
         }
         "impact" => {
-            let u = usage(" <symbol> [max_depth]");
+            let u = usage(" <symbol|uid|path> [max_depth]");
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
             let symbol = need(&mut args, &u)?;
-            let depth = args
-                .next()
-                .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(4);
+            let mut q = impact::Query::new(&symbol);
+            // the positional depth of earlier callers, then the flags
+            let depth = args.next().map(|d| format!("--max-depth={d}"));
+            q.apply_flags(depth.into_iter().chain(flags))
+                .map_err(bad_flag)?;
             let src = source(&root, &ws);
-            let mut out = src.graph.impact(&symbol, depth).map_err(failed)?;
-            let paths = out
+            let out = src.impact(&q).map_err(failed)?;
+            let paths: Vec<&str> = out
                 .defined_in
                 .iter()
-                .chain(out.impacted.iter().map(|i| &i.path));
-            (out.freshness, out.coverage) = src.annotate(paths.map(String::as_str));
-            json(&out)
+                .map(String::as_str)
+                .chain(
+                    out.by_depth
+                        .iter()
+                        .flat_map(|t| t.items.iter().flatten().map(|i| i.path.as_str())),
+                )
+                .collect();
+            annotated(&out, src.annotate(paths))
         }
         "impact-file" => {
             // impact(path=): the file-level walk; the caller confines the path to the
@@ -1058,10 +1089,50 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let ws = need(&mut args, &u)?;
             let from = need(&mut args, &u)?;
             let to = need(&mut args, &u)?;
+            let mut q = trace::TraceQuery::new(&from, &to);
+            q.apply_flags(flags).map_err(bad_flag)?;
             let src = source(&root, &ws);
-            let mut out = src.graph.trace(&from, &to).map_err(failed)?;
-            (out.freshness, out.coverage) = src.annotate(out.path.iter().map(String::as_str));
-            json(&out)
+            let out = src.trace(&q).map_err(failed)?;
+            let paths = out.path.iter().map(String::as_str);
+            annotated(&out, src.annotate(paths))
+        }
+        "changes" => {
+            let u = usage(" (with --scope=unstaged|staged|all|compare|commit|range)");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let (scope, flags): (Vec<String>, Vec<String>) =
+                flags.into_iter().partition(|f| f.starts_with("--scope="));
+            let scope = scope
+                .last()
+                .and_then(|f| f.strip_prefix("--scope="))
+                .ok_or_else(|| CmdError::usage(&u))?;
+            let scope = xmustard_core::gitdiff::Scope::parse(scope).ok_or_else(|| {
+                bad_flag(format!(
+                    "--scope: use one of {}",
+                    xmustard_core::gitdiff::scope_names()
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            })?;
+            let mut q = detect_changes::ChangesQuery::new(scope);
+            q.apply_flags(flags).map_err(bad_flag)?;
+            let canonical = fs::canonicalize(&root).map_err(|e| failed(format!("{root}: {e}")))?;
+            let cfg = xmustard_core::index::config::IndexConfig::load(&canonical)
+                .map_err(|e| failed(format!("config: {e}")))?;
+            let src = source(&root, &ws);
+            let mut out = Err(detect_changes::DetectError::Failed(
+                "the graph was not walked".into(),
+            ));
+            src.graph.with_walk_graph(&mut |g| {
+                out = detect_changes::detect(&canonical, &cfg, &q, g, &src.coverage.loss_counts);
+            });
+            // a refusal exits 2, which the Go side answers as the caller's error (400)
+            let out = out.map_err(|e| match e {
+                detect_changes::DetectError::Refused(why) => bad_flag(why),
+                detect_changes::DetectError::Failed(why) => failed(why),
+            })?;
+            let paths = out.changed_files.iter().map(|f| f.path.as_str());
+            annotated(&out, src.annotate(paths))
         }
         "hotspots" => {
             let u = usage(" [limit]");
@@ -1086,6 +1157,20 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             format!("unknown symbolgraph subcommand: {other}"),
         )),
     }
+}
+
+/// `out` as JSON with the freshness and coverage of the source that answered.
+fn annotated<T: serde::Serialize>(
+    out: &T,
+    (freshness, coverage): (
+        Option<xmustard_core::index::envelope::Freshness>,
+        Option<xmustard_core::symbolgraph::CoverageSummary>,
+    ),
+) -> CmdResult {
+    let mut v = serde_json::to_value(out).map_err(|e| CmdError::failed(e.to_string()))?;
+    v["freshness"] = serde_json::to_value(freshness).unwrap_or_default();
+    v["coverage"] = serde_json::to_value(coverage).unwrap_or_default();
+    json(&v)
 }
 
 #[cfg(test)]

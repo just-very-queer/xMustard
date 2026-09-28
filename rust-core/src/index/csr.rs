@@ -16,8 +16,14 @@
 //!   each name's symbols in (path, ord) order and `FileSyms` each file's symbols.
 //! - Graph nodes are files `0..F` then symbols `F..F+S`. `Out`/`In` hold every edge of
 //!   `index.db` as a forward and a reverse CSR (u32 offsets per node, 12-byte
-//!   [`Edge`] records). A symbol-level edge (WS-17) sits on its symbol nodes; a
-//!   file-level one (the lexical layer) on its file nodes.
+//!   [`Edge`] records with kind, layer, provenance, confidence, reason and access). A
+//!   symbol-level edge (WS-17) sits on its symbol nodes; a file-level one (the lexical
+//!   layer, and a resolved edge from file-level code) on its file nodes. An edge's
+//!   `via` (the name or module it was bound through) stays in `index.db`.
+//! - `NameDrops` lists, per name, the resolver's drops of references to it (WS-17's
+//!   `resolve_drops`: file, cause, occurrences), and `FileDrops` per file its drops by
+//!   cause, so impact's completeness envelope (PAR-IMP-05) is read from the same
+//!   generation as the graph it describes.
 //! - `FileOut`/`FileIn` are the file projection of the `structure` layer: one 8-byte
 //!   [`FileEdge`] per ordered file pair (self pairs dropped), weights summed. Impact,
 //!   trace, clusters and hotspots walk it.
@@ -51,8 +57,10 @@ use sha2::{Digest, Sha256};
 use super::meta;
 
 const MAGIC: &[u8; 8] = b"XMCSR01\n";
-/// Bump on any layout change; a segment of another version is rebuilt.
-pub const FORMAT_VERSION: u32 = 1;
+/// Bump on any layout change; a segment of another version does not open, and the next
+/// index update rewrites it. Version 2 (WS-35): reason and access in the edge record
+/// (weight narrowed to u16), and the drop sections.
+pub const FORMAT_VERSION: u32 = 2;
 const SEGMENT_PREFIX: &str = "graph.";
 const SEGMENT_SUFFIX: &str = ".csr";
 
@@ -77,8 +85,12 @@ pub(super) enum Sec {
     FileOut,
     FileInOff,
     FileIn,
+    NameDropOff,
+    NameDrops,
+    FileDropOff,
+    FileDrops,
 }
-const SECTIONS: usize = Sec::FileIn as usize + 1;
+const SECTIONS: usize = Sec::FileDrops as usize + 1;
 
 /// One CSR direction: its per-node offsets and its records.
 #[derive(Debug, Clone, Copy)]
@@ -101,6 +113,14 @@ pub const FILE_OUT: Adj = Adj {
 pub const FILE_IN: Adj = Adj {
     off: Sec::FileInOff,
     rec: Sec::FileIn,
+};
+const NAME_DROPS: Adj = Adj {
+    off: Sec::NameDropOff,
+    rec: Sec::NameDrops,
+};
+const FILE_DROPS: Adj = Adj {
+    off: Sec::FileDropOff,
+    rec: Sec::FileDrops,
 };
 
 // ---------------------------------------------------------------------------
@@ -194,12 +214,16 @@ impl Row for SymRow {
     }
 }
 
-/// One edge as seen from a node: the other end, weight, and footer-table indexes of
-/// kind, layer and provenance; confidence is quantized to 0..=255.
+/// One edge as seen from a node: the other end, the weight (occurrences, saturating at
+/// `u16::MAX`), and footer-table indexes of reason, access, kind, layer and provenance;
+/// confidence is quantized to 0..=255.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, PartialOrd, Ord, Hash)]
 pub struct Edge {
     pub node: u32,
-    pub weight: u32,
+    pub weight: u16,
+    pub reason: u8,
+    /// Index into `accesses`; 0 is no access mode (every kind but ACCESSES).
+    pub access: u8,
     pub kind: u8,
     pub layer: u8,
     pub provenance: u8,
@@ -211,7 +235,9 @@ impl Row for Edge {
     fn decode(b: &[u8]) -> Self {
         Edge {
             node: le32(b, 0),
-            weight: le32(b, 4),
+            weight: u16::from_le_bytes([b[4], b[5]]),
+            reason: b[6],
+            access: b[7],
             kind: b[8],
             layer: b[9],
             provenance: b[10],
@@ -221,7 +247,41 @@ impl Row for Edge {
     fn encode(&self, out: &mut Vec<u8>) {
         out.extend_from_slice(&self.node.to_le_bytes());
         out.extend_from_slice(&self.weight.to_le_bytes());
-        out.extend_from_slice(&[self.kind, self.layer, self.provenance, self.confidence]);
+        out.extend_from_slice(&[
+            self.reason,
+            self.access,
+            self.kind,
+            self.layer,
+            self.provenance,
+            self.confidence,
+        ]);
+    }
+}
+
+/// A resolver drop (PAR-IMP-05). In `NameDrops` (grouped by name) `at` is the file of
+/// the dropped references; in `FileDrops` (grouped by file) it is how many distinct
+/// names were dropped for the cause. `count` is occurrences, saturating at `u16::MAX`;
+/// `cause` indexes the footer's `drop_causes`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct DropRow {
+    pub at: u32,
+    pub count: u16,
+    pub cause: u8,
+}
+
+impl Row for DropRow {
+    const SIZE: usize = 8;
+    fn decode(b: &[u8]) -> Self {
+        DropRow {
+            at: le32(b, 0),
+            count: u16::from_le_bytes([b[4], b[5]]),
+            cause: b[6],
+        }
+    }
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.extend_from_slice(&self.at.to_le_bytes());
+        out.extend_from_slice(&self.count.to_le_bytes());
+        out.extend_from_slice(&[self.cause, 0]);
     }
 }
 
@@ -250,6 +310,17 @@ pub fn quantize_confidence(c: f64) -> u8 {
     (c.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// The confidence a quantized value stands for. Edge confidences are two-decimal tier
+/// values (0.95, 0.9, 0.5), and a 1/255 step is below half a hundredth, so rounding to
+/// two decimals gives the stored value back exactly.
+pub fn confidence_of(q: u8) -> f64 {
+    (f64::from(q) / 255.0 * 100.0).round() / 100.0
+}
+
+fn clamp_u16(v: i64) -> u16 {
+    v.clamp(0, u16::MAX as i64) as u16
+}
+
 // ---------------------------------------------------------------------------
 // Footer
 // ---------------------------------------------------------------------------
@@ -263,6 +334,9 @@ pub struct Counts {
     pub names: u32,
     pub edges: u32,
     pub file_edges: u32,
+    /// Rows of `NameDrops`.
+    #[serde(default)]
+    pub drops: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -276,6 +350,13 @@ pub struct Footer {
     pub layers: Vec<String>,
     pub provenances: Vec<String>,
     pub symbol_kinds: Vec<String>,
+    #[serde(default)]
+    pub reasons: Vec<String>,
+    /// Access modes; index 0 is the empty string (no mode).
+    #[serde(default)]
+    pub accesses: Vec<String>,
+    #[serde(default)]
+    pub drop_causes: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -644,6 +725,33 @@ impl Segment {
     pub fn symbol_kind(&self, i: u8) -> &str {
         Self::table(&self.footer.symbol_kinds, i)
     }
+
+    pub fn reason(&self, i: u8) -> &str {
+        Self::table(&self.footer.reasons, i)
+    }
+
+    pub fn access(&self, i: u8) -> &str {
+        Self::table(&self.footer.accesses, i)
+    }
+
+    pub fn drop_cause(&self, i: u8) -> &str {
+        Self::table(&self.footer.drop_causes, i)
+    }
+
+    /// The footer-table index of `name` in a closed set, when the segment has it.
+    pub fn table_index(list: &[String], name: &str) -> Option<u8> {
+        list.iter().position(|s| s == name).map(|i| i as u8)
+    }
+
+    /// Resolver drops of references to name `n`, in (file, cause) order.
+    pub fn name_drops(&self, n: u32) -> Result<Vec<DropRow>, String> {
+        self.neighbours(NAME_DROPS, n)
+    }
+
+    /// Resolver drops in file `f` by cause.
+    pub fn file_drops(&self, f: u32) -> Result<Vec<DropRow>, String> {
+        self.neighbours(FILE_DROPS, f)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -817,7 +925,8 @@ fn edge_query(from: &str, to: &str) -> String {
         format!("CASE WHEN e.{end}_symbol IS NULL THEN {f}.dense - 1 ELSE ?1 + {s}.dense - 1 END")
     };
     format!(
-        "SELECT {a} AS na, {b} AS nb, e.kind, e.layer, e.weight, e.confidence, e.provenance
+        "SELECT {a} AS na, {b} AS nb, e.kind, e.layer, e.weight, e.confidence, e.provenance,
+           e.reason, e.access
          FROM edges e JOIN seg_files fa ON fa.fid = e.{from}_file JOIN seg_files fb ON fb.fid = e.{to}_file
          LEFT JOIN seg_syms sa ON sa.sid = e.{from}_symbol LEFT JOIN seg_syms sb ON sb.sid = e.{to}_symbol
          WHERE (e.{from}_symbol IS NULL OR sa.dense IS NOT NULL)
@@ -1056,19 +1165,29 @@ fn write_body(conn: &Connection, w: &mut SegWriter, generation: i64) -> Result<(
 
     // ---- every edge, forward and reverse ----
     let nodes = files + symbols;
-    let (mut edge_kinds, mut layers, mut provs) =
-        (Table::default(), Table::default(), Table::default());
+    let (mut edge_kinds, mut layers, mut provs, mut reasons, mut accesses) = (
+        Table::default(),
+        Table::default(),
+        Table::default(),
+        Table::default(),
+        Table::default(),
+    );
+    accesses.id("")?; // index 0: no access mode
     let mut edge_dir = |w: &mut SegWriter, adj: Adj, from: &str, to: &str| -> Result<u32, String> {
         w.grouped::<Edge>(adj.off, adj.rec, nodes, |push| {
             each_row(conn, &edge_query(from, to), [files], |r| {
                 let kind: String = r.get(2).map_err(sql)?;
                 let layer: String = r.get(3).map_err(sql)?;
                 let prov: String = r.get(6).map_err(sql)?;
+                let reason: String = r.get(7).map_err(sql)?;
+                let access: Option<String> = r.get(8).map_err(sql)?;
                 push(
                     clamp_u32(r.get(0).map_err(sql)?),
                     Edge {
                         node: clamp_u32(r.get(1).map_err(sql)?),
-                        weight: clamp_u32(r.get(4).map_err(sql)?),
+                        weight: clamp_u16(r.get(4).map_err(sql)?),
+                        reason: reasons.id(&reason)?,
+                        access: accesses.id(access.as_deref().unwrap_or(""))?,
                         kind: edge_kinds.id(&kind)?,
                         layer: layers.id(&layer)?,
                         provenance: provs.id(&prov)?,
@@ -1103,6 +1222,48 @@ fn write_body(conn: &Connection, w: &mut SegWriter, generation: i64) -> Result<(
     let file_edges = file_dir(w, FILE_OUT, "src", "dst")?;
     file_dir(w, FILE_IN, "dst", "src")?;
 
+    // ---- resolver drops, by name and by file ----
+    let mut causes = Table::default();
+    let drops = w.grouped::<DropRow>(NAME_DROPS.off, NAME_DROPS.rec, names, |push| {
+        each_row(
+            conn,
+            "SELECT sn.dense - 1, sf.dense - 1, r.cause, r.count FROM resolve_drops r
+             JOIN temp.seg_names sn ON sn.nid = r.name_id JOIN temp.seg_files sf ON sf.fid = r.file_id
+             ORDER BY 1, 2, 3",
+            [],
+            |r| {
+                let cause: String = r.get(2).map_err(sql)?;
+                push(
+                    clamp_u32(r.get(0).map_err(sql)?),
+                    DropRow {
+                        at: clamp_u32(r.get(1).map_err(sql)?),
+                        count: clamp_u16(r.get(3).map_err(sql)?),
+                        cause: causes.id(&cause)?,
+                    },
+                )
+            },
+        )
+    })?;
+    w.grouped::<DropRow>(FILE_DROPS.off, FILE_DROPS.rec, files, |push| {
+        each_row(
+            conn,
+            "SELECT sf.dense - 1, r.cause, count(*), sum(r.count) FROM resolve_drops r
+             JOIN temp.seg_files sf ON sf.fid = r.file_id GROUP BY 1, 2 ORDER BY 1, 2",
+            [],
+            |r| {
+                let cause: String = r.get(1).map_err(sql)?;
+                push(
+                    clamp_u32(r.get(0).map_err(sql)?),
+                    DropRow {
+                        at: clamp_u32(r.get(2).map_err(sql)?),
+                        count: clamp_u16(r.get(3).map_err(sql)?),
+                        cause: causes.id(&cause)?,
+                    },
+                )
+            },
+        )
+    })?;
+
     let footer = Footer {
         version: FORMAT_VERSION,
         generation,
@@ -1113,12 +1274,16 @@ fn write_body(conn: &Connection, w: &mut SegWriter, generation: i64) -> Result<(
             names,
             edges,
             file_edges,
+            drops,
         },
         sections: w.ranges.to_vec(),
         edge_kinds: edge_kinds.names,
         layers: layers.names,
         provenances: provs.names,
         symbol_kinds: kinds.names,
+        reasons: reasons.names,
+        accesses: accesses.names,
+        drop_causes: causes.names,
     };
     let raw = serde_json::to_vec(&footer).map_err(|e| e.to_string())?;
     w.put(&raw)?;

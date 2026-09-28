@@ -18,15 +18,18 @@ const (
 	typeString  = "string"
 	typeBoolean = "boolean"
 	typeInteger = "integer"
+	// typeNumber is a decimal within the whole-number bounds Min and Max (impact's
+	// min_confidence, 0 to 1).
+	typeNumber = "number"
 )
 
 // Arg is one tool argument.
 type Arg struct {
 	Name     string
-	Type     string // typeString | typeBoolean | typeInteger
+	Type     string // typeString | typeBoolean | typeInteger | typeNumber
 	Required bool
 	Enum     []string
-	Min, Max int // inclusive bounds of an integer argument
+	Min, Max int // inclusive bounds of an integer or number argument
 	MaxLen   int // maximum length of a string argument in characters (0: unbounded)
 	// List marks a comma-separated list (a JSON array of strings is also accepted);
 	// with Enum, every element must be one of it. It travels as one canonical string.
@@ -148,7 +151,7 @@ func (t *Tool) inputSchema(profile SchemaProfile) map[string]any {
 		if len(a.Enum) > 0 && !a.List { // a list's elements are checked on tools/call
 			p["enum"] = a.Enum
 		}
-		if a.Type == typeInteger {
+		if a.Type == typeInteger || a.Type == typeNumber {
 			p["minimum"], p["maximum"] = a.Min, a.Max
 		}
 		if a.MaxLen > 0 {
@@ -288,7 +291,8 @@ func coerce(tool, key string, spec Arg, v any) (string, *ArgError) {
 			return "", argError(tool, key, "must be a boolean", nil)
 		}
 		return strconv.FormatBool(b), nil
-	case typeInteger:
+	case typeInteger, typeNumber:
+		what := map[string]string{typeInteger: "an integer", typeNumber: "a number"}[spec.Type]
 		var f float64
 		switch n := v.(type) {
 		case float64:
@@ -296,19 +300,19 @@ func coerce(tool, key string, spec Arg, v any) (string, *ArgError) {
 		case json.Number:
 			var err error
 			if f, err = n.Float64(); err != nil {
-				return "", argError(tool, key, "must be an integer", nil)
+				return "", argError(tool, key, "must be "+what, nil)
 			}
 		default:
-			return "", argError(tool, key, "must be an integer", nil)
+			return "", argError(tool, key, "must be "+what, nil)
 		}
-		if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) {
-			return "", argError(tool, key, "must be an integer", nil)
+		if math.IsInf(f, 0) || math.IsNaN(f) || (spec.Type == typeInteger && f != math.Trunc(f)) {
+			return "", argError(tool, key, "must be "+what, nil)
 		}
 		if f < float64(spec.Min) || f > float64(spec.Max) {
 			return "", argError(tool, key, fmt.Sprintf("must be between %d and %d (got %s); out-of-range values are rejected, not clamped",
 				spec.Min, spec.Max, strconv.FormatFloat(f, 'f', -1, 64)), map[string]any{"minimum": spec.Min, "maximum": spec.Max})
 		}
-		return strconv.FormatInt(int64(f), 10), nil
+		return strconv.FormatFloat(f, 'f', -1, 64), nil
 	default: // string
 		if spec.List {
 			return coerceList(tool, key, spec, v)

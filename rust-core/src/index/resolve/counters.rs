@@ -2,7 +2,8 @@
 //! (PAR-IMP-05). A reference the resolver cannot bind exactly is recorded per file,
 //! name and cause in `resolve_drops`, so a query about a symbol can say whether its
 //! dependents are exact or a lower bound, and why. External bindings are only counted:
-//! they never name an in-repo symbol.
+//! they never name an in-repo symbol. A binding through an import the resolver cannot
+//! map to a file is kept: its specifier may be a path alias for in-repo code.
 
 use std::collections::BTreeMap;
 
@@ -13,8 +14,13 @@ use serde::Serialize;
 pub enum Cause {
     /// A member access whose receiver's type is unknown (`x.f()` with `x` untyped).
     ReceiverUntyped,
-    /// Bound outside the index: an external module, the standard library, a builtin.
+    /// Bound outside the index: the standard library, a builtin, a Go package outside
+    /// the repository. Counted, never kept.
     External,
+    /// Bound through a TS/JS import whose non-relative specifier the resolver maps to no
+    /// file: a package, or a path alias (tsconfig `paths`, which it does not read). Kept,
+    /// since an alias hides in-repo dependents (WS-35).
+    UnresolvedModule,
     /// A name-only (global tier) match with several definers, or too common to bind.
     Ambiguous,
     /// An in-repo binding whose target was not found (missing member, unnamed default
@@ -33,6 +39,7 @@ impl Cause {
         match self {
             Cause::ReceiverUntyped => "receiver_untyped",
             Cause::External => "external",
+            Cause::UnresolvedModule => "unresolved_module",
             Cause::Ambiguous => "ambiguous",
             Cause::Unresolved => "unresolved",
             Cause::DispatchBoundary => "dispatch_boundary",

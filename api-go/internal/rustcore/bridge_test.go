@@ -40,6 +40,28 @@ func TestRunCoreContextBoundsFloodingChild(t *testing.T) {
 	}
 }
 
+// A core that refuses the request (exit 2) is the caller's error: a *Refusal whose
+// Error() stays sanitized and whose Reason is the first line of the refusal.
+func TestRunCoreContextReportsARefusal(t *testing.T) {
+	fake := filepath.Join(t.TempDir(), "fakecore.sh")
+	script := "#!/bin/sh\necho 'symbolgraph changes: revision \"nope\" does not name a commit' 1>&2\necho second 1>&2\nexit 2\n"
+	if err := os.WriteFile(fake, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", fake)
+	_, err := runCoreCtx(context.Background(), "symbolgraph", "changes", "--scope=range", "root", "ws")
+	var refusal *Refusal
+	if !errors.As(err, &refusal) {
+		t.Fatalf("want a *Refusal, got %v", err)
+	}
+	if refusal.Reason != `symbolgraph changes: revision "nope" does not name a commit` {
+		t.Fatalf("reason %q", refusal.Reason)
+	}
+	if strings.Contains(err.Error(), "nope") {
+		t.Fatalf("Error() must stay sanitized: %q", err.Error())
+	}
+}
+
 // rust-core/go-calls.txt lists every xmustard-core call that code reachable from an
 // api-go main makes (`called`), and the commands kept although nothing reachable
 // calls them (`kept`, with the reason). This test holds the list to the Go sources;

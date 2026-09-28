@@ -2388,6 +2388,9 @@ pub trait QueryGraph: Send + Sync {
     fn indexed_stat(&self, _path: &str) -> Option<(u64, i64)> {
         None
     }
+    /// Call `f` with this source as the graph impact v2, trace and the import-cycle
+    /// check walk (WS-35).
+    fn with_walk_graph(&self, f: &mut dyn FnMut(&dyn crate::index::impact::Graph));
 }
 
 fn inbound_by_path(graph: &SymbolGraph) -> HashMap<&str, usize> {
@@ -2453,6 +2456,10 @@ impl QueryGraph for SymbolGraph {
 
     fn clusters(&self) -> Result<Vec<FileCluster>, String> {
         Ok(compute_clusters(self))
+    }
+
+    fn with_walk_graph(&self, f: &mut dyn FnMut(&dyn crate::index::impact::Graph)) {
+        f(&crate::index::impact::LegacyGraph::new(self));
     }
 }
 
@@ -2580,6 +2587,36 @@ impl QuerySource {
                 None,
             ),
         }
+    }
+
+    /// Impact v2 (WS-35) on this source.
+    pub fn impact(
+        &self,
+        q: &crate::index::impact::Query,
+    ) -> Result<crate::index::impact::Impact, String> {
+        let mut out = Err("the graph was not walked".to_string());
+        self.graph.with_walk_graph(&mut |g| {
+            out = crate::index::impact::run(g, q, &self.coverage.loss_counts);
+        });
+        out
+    }
+
+    /// Trace v2 (WS-35) on this source.
+    pub fn trace(
+        &self,
+        q: &crate::index::trace::TraceQuery,
+    ) -> Result<crate::index::trace::Trace, String> {
+        let mut out = Err("the graph was not walked".to_string());
+        self.graph
+            .with_walk_graph(&mut |g| out = crate::index::trace::run(g, q));
+        out
+    }
+
+    /// The import-cycle summary (PAR-IMP-08) of the code index; None when the legacy
+    /// graph answers (its imports are lexical).
+    pub fn import_cycles(&self) -> Option<Result<crate::index::cycles::CycleSummary, String>> {
+        self.index()
+            .map(|o| o.snapshot.cycles().map(|r| r.summary()))
     }
 
     /// Freshness and coverage summary for a result touching `paths`.

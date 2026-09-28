@@ -30,6 +30,7 @@ use serde_json::{Value, json};
 use super::config::IndexConfig;
 use super::csr::{self, FILE_IN, FILE_OUT, FileEdge, GraphStorage, Segment};
 use super::envelope::{self, Freshness, Relation};
+use super::impact;
 use super::{DB_FILE, meta, scan, schema};
 use crate::symbolgraph::{
     CoverageLoss, FileCluster, FileImpact, FileRef, Hotspot, ImpactedFile, IndexCoverage,
@@ -148,27 +149,41 @@ pub fn load_segment(db: &Path, storage: GraphStorage) -> Result<(Segment, StoreM
 }
 
 /// The per-file table every query touches, resident with its snapshot (about 50 bytes
-/// per file, so at most ~0.5 MiB inside the envelope): paths as one string heap, and
-/// the structure stats of the file rows.
+/// per file, so at most ~0.5 MiB inside the envelope): paths as one string heap, the
+/// structure stats of the file rows, and whether the resolver owns the file's language
+/// and whether it is a test file (impact's layer rule and test filter).
 struct Files {
     heap: String,
     off: Vec<u32>,
     inbound: Vec<u32>,
     dependents: Vec<u32>,
     symbols: Vec<u32>,
+    resolved: Vec<bool>,
+    test: Vec<bool>,
 }
 
 impl Files {
     fn load(seg: &Segment) -> Result<Files, String> {
         let (heap, off) = seg.path_heap()?;
         let rows = seg.file_rows()?;
-        Ok(Files {
+        let mut files = Files {
             heap,
             off,
             inbound: rows.iter().map(|r| r.inbound).collect(),
             dependents: rows.iter().map(|r| r.dependents).collect(),
             symbols: rows.iter().map(|r| r.symbols).collect(),
-        })
+            resolved: Vec::with_capacity(rows.len()),
+            test: Vec::with_capacity(rows.len()),
+        };
+        for f in 0..rows.len() as u32 {
+            let path = files.path(f);
+            let resolved = super::lang::Lang::for_path(path)
+                .is_some_and(|l| super::resolve::resolves(l.name()));
+            let test = super::edges::is_test_file(path);
+            files.resolved.push(resolved);
+            files.test.push(test);
+        }
+        Ok(files)
     }
 
     fn path(&self, f: u32) -> &str {
@@ -186,6 +201,8 @@ pub struct Snapshot {
     files: Files,
     root: PathBuf,
     clusters: OnceLock<Result<Communities, String>>,
+    /// The import-cycle report (PAR-IMP-08), computed on first use.
+    cycles: OnceLock<Result<super::cycles::CycleReport, String>>,
     /// The store this generation was read from.
     db: PathBuf,
     /// The text lanes' read-only connection (`fts`), opened on first use.
@@ -210,6 +227,7 @@ impl Snapshot {
                 root: root.to_path_buf(),
                 seg,
                 clusters: OnceLock::new(),
+                cycles: OnceLock::new(),
                 db: loc.db.clone(),
                 text: Mutex::new(None),
             },
@@ -219,6 +237,14 @@ impl Snapshot {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The import-cycle report of this generation, computed once.
+    pub fn cycles(&self) -> Result<&super::cycles::CycleReport, String> {
+        self.cycles
+            .get_or_init(|| super::cycles::compute(self))
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     /// Run `f` on this snapshot's text connection (the BM25 lanes and chunk rows of
@@ -536,6 +562,240 @@ impl QueryGraph for Snapshot {
         let f = self.seg.file_id(path).ok()??;
         let row = self.seg.file_row(f).ok()?;
         Some((row.size, row.mtime_ns))
+    }
+
+    fn with_walk_graph(&self, f: &mut dyn FnMut(&dyn impact::Graph)) {
+        f(self);
+    }
+}
+
+impl Snapshot {
+    /// The symbols a UID names (`Label:path:Container.name#arity~suffix`).
+    fn lookup_uid(&self, uid: &str) -> Result<Vec<u32>, String> {
+        let Some((label, rest)) = uid.split_once(':') else {
+            return Ok(Vec::new());
+        };
+        let Some((path, qualified)) = rest.rsplit_once(':') else {
+            return Ok(Vec::new());
+        };
+        let Some(f) = self.seg.file_id(path)? else {
+            return Ok(Vec::new());
+        };
+        let qualified = qualified.split(['#', '~']).next().unwrap_or(qualified);
+        let (container, name) = match qualified.rsplit_once('.') {
+            Some((c, n)) => (c.rsplit('.').next(), n),
+            None => (None, qualified),
+        };
+        let mut out = Vec::new();
+        for s in self.seg.file_symbols(f)? {
+            let node = self.seg.symbol_node(s);
+            let row = self.seg.symbol(s)?;
+            if self.seg.symbol_kind(row.kind) == label
+                && self.seg.name(row.name)? == name
+                && self.container_is(node, container)?
+            {
+                out.push(node);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Whether `node`'s container (the type declaring it) is named `want` (None: no
+    /// container is required).
+    fn container_is(&self, node: u32, want: Option<&str>) -> Result<bool, String> {
+        let Some(want) = want else { return Ok(true) };
+        for e in self.seg.neighbours::<csr::Edge>(csr::IN, node)? {
+            let kind = self.seg.edge_kind(e.kind);
+            if matches!(kind, "HAS_METHOD" | "HAS_PROPERTY")
+                && let Some(s) = e.node.checked_sub(self.seg.counts().files)
+                && self.seg.name(self.seg.symbol(s)?.name)? == want
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Non-local symbols named `name` (and declared in `container`, when given).
+    fn lookup_name(&self, name: &str, container: Option<&str>) -> Result<Vec<u32>, String> {
+        let Some(n) = self.seg.name_id(name)? else {
+            return Ok(Vec::new());
+        };
+        let mut out = Vec::new();
+        for s in self.seg.symbols_named(n)? {
+            let node = self.seg.symbol_node(s);
+            if !self.seg.symbol(s)?.local && self.container_is(node, container)? {
+                out.push(node);
+            }
+        }
+        Ok(out)
+    }
+}
+
+impl impact::Graph for Snapshot {
+    fn file_count(&self) -> u32 {
+        self.seg.counts().files
+    }
+
+    fn path(&self, file: u32) -> &str {
+        self.files.path(file)
+    }
+
+    fn file_of(&self, node: u32) -> Result<u32, String> {
+        match node.checked_sub(self.seg.counts().files) {
+            Some(s) => Ok(self.seg.symbol(s)?.file),
+            None => Ok(node),
+        }
+    }
+
+    fn key(&self, node: u32) -> Result<impact::NodeKey, String> {
+        Ok(match node.checked_sub(self.seg.counts().files) {
+            Some(s) => {
+                let row = self.seg.symbol(s)?;
+                impact::NodeKey {
+                    file: row.file,
+                    line: row.line,
+                    name: Some(row.name),
+                }
+            }
+            None => impact::NodeKey {
+                file: node,
+                line: 0,
+                name: None,
+            },
+        })
+    }
+
+    fn symbol(&self, node: u32) -> Result<Option<impact::SymbolFacts>, String> {
+        let Some(s) = node.checked_sub(self.seg.counts().files) else {
+            return Ok(None);
+        };
+        let row = self.seg.symbol(s)?;
+        Ok(Some(impact::SymbolFacts {
+            name: self.seg.name(row.name)?,
+            name_id: row.name,
+            kind: self.seg.symbol_kind(row.kind).to_string(),
+            line: row.line,
+        }))
+    }
+
+    fn edges(&self, node: u32, dir: impact::Direction) -> Result<Vec<csr::Edge>, String> {
+        self.seg.neighbours(dir.adjacency(), node)
+    }
+
+    fn labels(&self, e: &csr::Edge) -> impact::Labels<'_> {
+        impact::Labels {
+            kind: self.seg.edge_kind(e.kind),
+            layer: self.seg.layer(e.layer),
+            provenance: self.seg.provenance(e.provenance),
+            reason: self.seg.reason(e.reason),
+            access: self.seg.access(e.access),
+        }
+    }
+
+    fn resolved(&self, file: u32) -> bool {
+        self.files
+            .resolved
+            .get(file as usize)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    fn is_test(&self, file: u32) -> bool {
+        self.files.test.get(file as usize).copied().unwrap_or(false)
+    }
+
+    /// A UID, a file path, `Container.name`, or a plain name, tried in that order.
+    fn lookup(&self, target: &str) -> Result<impact::Lookup, String> {
+        let qualified = target
+            .rsplit_once('.')
+            .filter(|(c, n)| !c.is_empty() && !n.is_empty());
+        let tries: [(&'static str, Option<Vec<u32>>); 4] = [
+            (
+                "uid",
+                target
+                    .contains(':')
+                    .then(|| self.lookup_uid(target))
+                    .transpose()?,
+            ),
+            ("path", self.seg.file_id(target)?.map(|f| vec![f])),
+            (
+                "qualified",
+                qualified
+                    .map(|(c, n)| self.lookup_name(n, c.rsplit('.').next()))
+                    .transpose()?,
+            ),
+            ("name", Some(self.lookup_name(target, None)?)),
+        ];
+        for (matched, found) in tries {
+            if let Some(mut nodes) = found.filter(|n| !n.is_empty()) {
+                let truncated = nodes.len() > impact::MAX_TARGETS;
+                nodes.truncate(impact::MAX_TARGETS);
+                return Ok(impact::Lookup {
+                    nodes,
+                    matched,
+                    truncated,
+                });
+            }
+        }
+        Ok(impact::Lookup::default())
+    }
+
+    fn file_node(&self, path: &str) -> Result<Option<u32>, String> {
+        self.seg.file_id(path)
+    }
+
+    fn file_symbols(&self, file: u32) -> Result<Vec<u32>, String> {
+        let mut out = Vec::new();
+        for s in self.seg.file_symbols(file)? {
+            if !self.seg.symbol(s)?.local {
+                out.push(self.seg.symbol_node(s));
+            }
+        }
+        Ok(out)
+    }
+
+    fn drops(
+        &self,
+        names: &BTreeSet<u32>,
+        files: &BTreeSet<u32>,
+        dir: impact::Direction,
+    ) -> Result<Vec<impact::Boundary>, String> {
+        let mut out = Vec::new();
+        match dir {
+            impact::Direction::Upstream => {
+                for &n in names {
+                    let name = self.seg.name(n)?;
+                    for d in self.seg.name_drops(n)? {
+                        out.push(impact::Boundary {
+                            cause: self.seg.drop_cause(d.cause).to_string(),
+                            name: name.clone(),
+                            path: self.files.path(d.at).to_string(),
+                            count: u32::from(d.count),
+                        });
+                    }
+                }
+            }
+            impact::Direction::Downstream => {
+                for &f in files {
+                    for d in self.seg.file_drops(f)? {
+                        out.push(impact::Boundary {
+                            cause: self.seg.drop_cause(d.cause).to_string(),
+                            name: String::new(),
+                            path: self.files.path(f).to_string(),
+                            count: u32::from(d.count),
+                        });
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn import_cycles(&self) -> Option<&super::cycles::CycleReport> {
+        self.cycles()
+            .inspect_err(|e| eprintln!("index: import cycles: {e}"))
+            .ok()
     }
 }
 

@@ -4,19 +4,129 @@
     "symbol": "Add"
   },
   "result": {
+    "affected_flows": null,
+    "affected_modules": [
+      {
+        "count": 1,
+        "module": "."
+      },
+      {
+        "count": 1,
+        "module": "pkg/calc"
+      }
+    ],
+    "by_depth": [
+      {
+        "depth": 1,
+        "items": [
+          {
+            "confidence": 0.9,
+            "edge": "CALLS",
+            "kind": "Function",
+            "line": 9,
+            "name": "main",
+            "path": "main.go",
+            "provenance": "scope",
+            "reason": "package",
+            "via": "Add"
+          },
+          {
+            "confidence": 0.95,
+            "edge": "CALLS",
+            "kind": "Function",
+            "line": 7,
+            "name": "Double",
+            "path": "pkg/calc/calc.go",
+            "provenance": "scope",
+            "reason": "same-file",
+            "via": "Add"
+          }
+        ],
+        "label": "WILL BREAK",
+        "offset": 0,
+        "total": 2
+      }
+    ],
+    "counts": {
+      "below_confidence": 0,
+      "by_depth": [
+        2
+      ],
+      "direct": 2,
+      "files": 2,
+      "modules": 2,
+      "tests_excluded": 0,
+      "total": 2
+    },
+    "coverage": {
+      "complete": true,
+      "eligible_files": 2,
+      "envelope": {
+        "exceeded": [],
+        "max_file_size": 1048576,
+        "max_files": 10000,
+        "max_symbols": 100000,
+        "max_total_bytes": 314572800
+      },
+      "indexed_files": 2,
+      "languages": {
+        "go": {
+          "failed": 0,
+          "supported": 2,
+          "unsupported": 0
+        }
+      },
+      "loss_counts": {},
+      "max_files": 10000,
+      "truncated": false
+    },
     "defined_in": [
       "pkg/calc/calc.go"
     ],
-    "generated_at": "2026-09-25T08:23:36Z",
-    "impacted": [
-      {
-        "distance": 1,
-        "path": "main.go"
-      }
-    ],
-    "impacted_count": 1,
+    "direction": "upstream",
+    "epistemic": {
+      "causes": {},
+      "completeness": "exact"
+    },
+    "freshness": {
+      "dirty_paths_touching_result": [
+        "pkg/calc/calc.go"
+      ],
+      "head": "52c693ca770f52ffa5cf898ed8fd7afc826d0ba8",
+      "identity_age_ms": 0,
+      "index_version": "schema-4.csr-2",
+      "indexed_commit": "52c693ca770f52ffa5cf898ed8fd7afc826d0ba8",
+      "refresh": {
+        "escalated": false,
+        "reparsed": 2,
+        "reresolved": 2
+      },
+      "snapshot_generation": 1,
+      "source": "index",
+      "status": "current",
+      "watcher_state": "absent"
+    },
+    "generated_at": "2026-09-28T12:29:51Z",
+    "graph": "resolved",
+    "impacted_count": 2,
+    "include_tests": false,
     "max_depth": 3,
-    "symbol": "Add"
+    "relation_types": [
+      "CALLS",
+      "IMPORTS",
+      "EXTENDS",
+      "IMPLEMENTS"
+    ],
+    "risk": "LOW",
+    "symbol": "Add",
+    "targets": [
+      {
+        "kind": "Function",
+        "line": 4,
+        "name": "Add",
+        "path": "pkg/calc/calc.go"
+      }
+    ]
   },
   "tool": "impact"
 }
