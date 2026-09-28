@@ -199,7 +199,8 @@ refuse text are explicit and fail closed.
 - **Pushed surfaces.** Memory pushed into context unasked, from a hook (WS-23: the
   memories bound to a file a tool reads or edits, those matching a search pattern,
   those a prompt keyword triggers, and the core tier at SessionStart and
-  SubagentStart) or the core tier (WS-31), goes through `workspaceops.AdmitMemory`. The checks run in order:
+  SubagentStart) or the core tier (WS-31: initialize.instructions and SessionStart),
+  goes through `workspaceops.AdmitMemory`. The checks run in order:
   the entry exists in the workspace, it is served, its content matches its digest, it
   is not quarantined, it has a human approval, and it scans clean (a truncated scan
   counts as flagged). What passes is framed in `<xmustard-data>` blocks after a notice.
@@ -235,6 +236,51 @@ refuse text are explicit and fail closed.
   through unchanged, so no injection-check line reaches the agent with it. The
   scan reads the JSON of a projection up to 256 KiB as decoded text; longer JSON is
   scanned raw (and is flagged `scan_truncated` in any case).
+
+### Write policy, tiers and standing memory (WS-31)
+
+- **Write policy.** Every governed-memory write (a proposal, a supersession, an edit,
+  the legacy in-place edit and a tier change) is checked server-side against the
+  workspace's memory policy before anything is stored. The policy is a table of rules:
+  required fields and allowed kinds for a proposal, character caps on the content, the
+  title and the one-line description, the topic depth, and the core budget. A refusal
+  lists every violation as `{field, rule, limit, actual}`: 400 for a cap or a schema
+  rule, 403 (audited) when only a human approver could make the write.
+- **Protected memory.** A write that sets a protected field (`tier` always; the policy
+  may add `permission` readwrite, `supersedes` or `expires`) or whose title, content,
+  topic or paths match a protected pattern (RE2, at most 32 of 256 characters) needs a
+  human-approver principal: kind `human`, the `human-approver` role (admin holds it),
+  and never open mode, which has no human approver. Protection is enforced where the
+  text is written; `verify` stores no memory text and is not policy-checked.
+- **The policy config** is a file under the workspace's data directory, changed only by
+  `xmustard-ops policy set` under an admin's human token (the WS-57 checks, and the
+  admin role on top), recorded as a `memory_policy` event with the old and new digests
+  and the approval label. An unreadable or invalid stored policy refuses every write
+  and every push until it is replaced (fail closed). Like the rest of the store, the
+  file is writable by the user's processes: it records a human's decision and the API
+  enforces it, but it is not tamper-proof.
+- **Tiers.** Served memory is core or deferred (an entry stored with no tier is
+  deferred). Only a human approver moves an entry between tiers (`remember(op=tier)`
+  over the API, or `xmustard-ops memory tier`), only served memory enters the core tier,
+  within the core budget, and govstore refuses a quarantined entry the core tier (on
+  insert, on a tier change, and on a classification that would mark a core entry).
+- **Standing memory** (initialize.instructions, SessionStart, `xmustard://memory/core`,
+  the `orient` prompt, `xmustard-ops guidance write`) is one projection compiled from a
+  single read snapshot: the core tier admitted by the core surface (a human approval of
+  the served revision, not quarantined, no instruction pattern), each entry framed with
+  the revision its approval is on (`rev`), then an index of the other served entries'
+  titles and one-line descriptions (the `index` surface: served, not quarantined, no
+  instruction pattern in the title or description; the content is never pushed). An
+  edit accepted by agents changes the served revision, so the entry is withheld until a
+  human approves that revision. The projection is cached by the memory revision, the
+  budget, the human approvers and the policy digest, until the earliest expiry among the
+  entries it read.
+- **Push approval strength.** The policy sets, per pushed surface (core, hook), whether
+  any human approval counts (`human_approver`, the default) or only one whose vote was
+  recorded as `ops/user_presence` by a principal of kind human (`user_presence`). That
+  label means only that the approver typed a presence-only token at the ops terminal,
+  which the API and the environment refuse; it is not proof a human was present, since a
+  process that learns a presence-only token can type it through a pseudo-terminal.
 
 ### Changes for existing tokens
 

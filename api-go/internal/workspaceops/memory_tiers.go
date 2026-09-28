@@ -242,7 +242,8 @@ type MemoryProjection struct {
 	Deferred  DeferredIndex    `json:"deferred_index"`
 	// Onboarding: no served memory yet; Text carries the onboarding line.
 	Onboarding bool `json:"onboarding,omitempty"`
-	// Scanned is false when the workspace has more served entries than one compile reads.
+	// Complete is false when the workspace has more served entries than one compile
+	// reads (maxProjectionScan, newest first).
 	Complete       bool   `json:"complete"`
 	Text           string `json:"text"`
 	Chars          int    `json:"text_chars"`
