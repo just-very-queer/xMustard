@@ -332,6 +332,11 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			if err != nil {
 				return err
 			}
+			// retiring core memory by replacement is a tier change: a human approver's
+			if old.Tier == govstore.TierCore && !isHumanApproverActor(writer) {
+				return &MemoryPolicyError{Violations: []MemoryPolicyViolation{{Field: "supersedes", Rule: RuleProtectedField,
+					Limit: "human_approver", Actual: "supersedes core entry " + id}}}
+			}
 			supersededGate = max(supersededGate, old.RequiredVerifications)
 		}
 		if tier == govstore.TierCore {

@@ -496,6 +496,15 @@ func TestSetMemoryTierIsGoverned(t *testing.T) {
 	if err != nil || e.Tier != govstore.TierCore {
 		t.Fatalf("human approver: %+v %v", e, err)
 	}
+	// replacing a core entry retires it from the core tier: a human approver's write
+	replace := RememberRequest{Op: "supersede", ProposeContextRequest: ProposeContextRequest{Title: "t", Content: "the new fact",
+		Supersedes: []string{served.ID}}}
+	if _, err := Remember(dir, ws, replace, ContextActor{ID: "author", Kind: PrincipalAgent}); !isPolicyError(err, RuleProtectedField) {
+		t.Fatalf("an agent superseded a core entry: %v", err)
+	}
+	if _, err := Remember(dir, ws, replace, humanActor("hum")); err != nil {
+		t.Fatalf("a human approver's replacement of a core entry: %v", err)
+	}
 	if e, err = Remember(dir, ws, RememberRequest{Op: "tier", EntryID: served.ID, Reason: "demote", ProposeContextRequest: ProposeContextRequest{Tier: "deferred"}},
 		humanActor("hum")); err != nil || e.Tier != "" {
 		t.Fatalf("remember op=tier: %+v %v", e, err)

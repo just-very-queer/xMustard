@@ -240,18 +240,24 @@ func (p MemoryPolicy) check(w memoryWrite, actor ContextActor) []MemoryPolicyVio
 		return out
 	}
 	who := fallbackString(actor.Kind, "unauthenticated")
+	// the config is validated on load; a rule this build cannot evaluate protects the write
 	for _, f := range p.ProtectedFields {
-		if actual, set := protectedFieldRules[f](w); set {
+		rule := protectedFieldRules[f]
+		if rule == nil {
+			add(f, RuleProtectedField, "human_approver", who+" (unknown protected field)")
+			continue
+		}
+		if actual, set := rule(w); set {
 			add(f, RuleProtectedField, "human_approver", who+" set "+f+"="+actual)
 		}
 	}
 	for _, pp := range p.ProtectedPatterns {
 		re, err := compilePattern(pp.Pattern)
-		if err != nil { // validated on load; a pattern that fails here protects the write
-			add(pp.Field, RuleProtectedPattern, "human_approver", who+" (pattern "+pp.Name+" does not compile)")
-			continue
-		}
-		if slices.ContainsFunc(patternFields[pp.Field](w), re.MatchString) {
+		fields := patternFields[pp.Field]
+		switch {
+		case err != nil || fields == nil:
+			add(pp.Field, RuleProtectedPattern, "human_approver", who+" (pattern "+pp.Name+" cannot be evaluated)")
+		case slices.ContainsFunc(fields(w), re.MatchString):
 			add(pp.Field, RuleProtectedPattern, "human_approver", who+" matched "+pp.Name)
 		}
 	}
