@@ -53,6 +53,9 @@ called symbolgraph coverage
 called symbolgraph hotspots
 called symbolgraph impact
 called symbolgraph trace
+called watch done
+called watch start
+called watch take
 called wiki
 
 kept lsp-hover -- rustcore.RunLspHover has no caller; WS-25's spec keeps the command for the LSP lane (PAR-SYM-06)

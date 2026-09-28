@@ -67,7 +67,8 @@ const (
 	workerProtocol = 1
 	// maxWorkerFrame is the largest response body: the one-shot stdout cap.
 	maxWorkerFrame = maxCoreStdout
-	// maxWorkerNotice bounds a frame that carries no request id (never sent today).
+	// maxWorkerNotice bounds a frame that carries no request id: a watcher notification
+	// (refresh.go).
 	maxWorkerNotice    = 64 << 10
 	maxWorkerHeaderLen = 1024
 	maxWorkerHeaders   = 16
@@ -692,6 +693,7 @@ func (s *workerSupervisor) startWorker(ctx context.Context, key workerKey, set w
 		}
 	}
 	p.started.Store(true)
+	p.rewatch(hctx)
 	return p, nil
 }
 
@@ -894,12 +896,15 @@ func (p *workerProc) readFrames(r *bufio.Reader) error {
 			return err
 		}
 		if !hasID {
+			// a notification: the watcher's `$/refresh.due` and `$/watch.state`
 			if n > maxWorkerNotice {
 				return fmt.Errorf("%w: %d-byte frame without a request id", errWorkerProtocol, n)
 			}
-			if _, err := r.Discard(n); err != nil {
+			body := make([]byte, n)
+			if _, err := io.ReadFull(r, body); err != nil {
 				return err
 			}
+			p.workerNotice(body)
 			continue
 		}
 		p.mu.Lock()
