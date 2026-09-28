@@ -27,7 +27,7 @@ xmustard-api (Go; default 127.0.0.1:8042)
   |-- workspaceops  memory, grounding, outcomes, registration, tokens, diagnostics
   |     |-- govstore    governance.db (SQLite WAL): memory, votes, events, outcomes
   |     |-- injection   instruction-pattern scan, data framing, quarantine
-  |     '-- redact      secret redaction on memory ingest and command output
+  |     '-- redact      secret redaction on memory ingest, command output and captures
   |-- evidence      scoped originals, bounded projections, recovery handles; capture
   |                 streams through redact.Writer before the spool
   |-- hooks         Claude Code hook events: capture, pushed memory, index hits

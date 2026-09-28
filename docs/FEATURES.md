@@ -1,11 +1,11 @@
 # Features
 
-What xMustard `v0.1.0` ships, what backs each piece, and what is still planned.
+What xMustard `v0.1.1` ships, what backs each piece, and what is still planned.
 Measured numbers link to their record. Where nothing was measured, this page says so.
 
 xMustard gives the coding agents you already use a shared memory they can check, and
 narrow, current context about your repository. It runs locally, with no Docker, and
-reaches agents through nine MCP tools. Details: [release notes](releases/v0.1.0.md),
+reaches agents through nine MCP tools. Details: [release notes](releases/v0.1.1.md),
 [architecture](ARCHITECTURE.md), [security](SECURITY.md).
 
 ## Nine tools, one small surface
@@ -20,15 +20,17 @@ Agents learn nine tools, not dozens. Modes and arguments do the rest.
 | `verify` | A way to approve or reject a peer's proposal | Identity is the caller's token, never an argument; needs the `verifier` role |
 | `search` | `path:line` hits with snippets and reasons | Up to six lanes fused with RRF (K=60); `mode=pattern` runs an ast-grep query (needs `ast-grep` or `sg` on `PATH`) |
 | `explain` | A file or directory's purpose, role, key symbols, and how to run or verify it | One repo-relative `path` |
-| `impact` | Blast radius of the current changes, a symbol, or the path between two symbols | A lexical reference graph, up to 4 hops; edges at distance 1 or more are leads, not proof |
+| `impact` | Blast radius of the current changes, a symbol, a file (`path=`), or the path between two symbols | A lexical reference graph, up to 4 hops; edges at distance 1 or more are leads, not proof |
 | `diagnostics` | Normalized errors and warnings from the latest stored run | Reads its baseline from Postgres; needs `postgres_dsn` in `settings.json` |
 | `why_failed` | Error lines and implicated files for a run, a pasted log or an evidence handle | Reads a bounded 1 MiB tail and redacts it; a pasted log or an evidence handle records an outcome that `ground` then lists |
 
 The schema stays lean. Advanced arguments are accepted but listed only in the full
 schema profile, and documented at the MCP resource `xmustard://docs/tools`. A test
-caps the `tools/list` result: 8,769 bytes for all nine tools in the lean profile on
+caps the `tools/list` result: 8,888 bytes for all nine tools in the lean profile on
 protocol 2025-06-18 (`api-go/internal/mcpserver/testdata/tools_list_budget.json`).
-`mode=readonly` lists seven tools and hides `remember` and `verify`.
+`mode=readonly` lists seven tools and hides `remember` and `verify`. An argument that
+fails validation comes back as a tool result with `isError`, a did-you-mean hint where
+one applies and the tool's arguments; an unknown tool is a JSON-RPC `-32602`.
 
 ## Shared memory that agents check
 
@@ -40,9 +42,9 @@ protocol 2025-06-18 (`api-go/internal/mcpserver/testdata/tools_list_budget.json`
   every caller is one identity and writes are labelled `self_asserted_open_mode`.
 - **Drift checks on recall.** At verification, a promoted memory snapshots the content
   hashes of its anchored files. Recall compares them and marks the entry stale when a
-  file appears, disappears or changes. Known issue in v0.1.0: some nested anchors,
-  such as `pkg/auth.go`, record a missing baseline and are never flagged stale
-  ([details](ARCHITECTURE.md#known-seams-in-v010)). Top-level paths work.
+  file appears, disappears or changes, at every path depth. In v0.1.0 an anchor at an
+  even depth, such as `pkg/auth.go`, recorded a missing baseline and was never flagged
+  stale ([details](ARCHITECTURE.md#fixed-since-v010)).
 - **A full lifecycle.** Supersede, retire, retract, purge with a digest tombstone,
   expiry, compare-and-swap edits (`base_revision`) and history.
 - **Provenance on every write.** Principal, owner, kind, session and call ids, HEAD
@@ -77,11 +79,18 @@ protocol 2025-06-18 (`api-go/internal/mcpserver/testdata/tools_list_budget.json`
 - **Hybrid search.** BM25 over function bodies, comments, names and paths; BM25 over
   doc sections; identifier match; trigram typo tolerance (not meaning); reference
   degree; and proximity to a seed symbol. Results carry reasons and up to three
-  line-numbered snippets. The retrieval gate passes 21 of 21 checks on the release
-  commit ([release notes](releases/v0.1.0.md)); its gold fixture is a small,
+  line-numbered snippets. The retrieval gate passes 21 of 21 checks on the v0.1.1 release
+  tree ([release notes](releases/v0.1.1.md)); its gold fixture is a small,
   hand-made repository of 14 files, not a real-repository benchmark.
 - **Secret-aware search.** Secret paths such as `.env` and SSH keys are refused before
   their text is read, and snippets mask credential-shaped words.
+- **An index that follows your edits.** With the resident worker on
+  (`XMUSTARD_CORE_WORKER=1`), a watcher (FSEvents on macOS, inotify on Linux) turns
+  edits into incremental index updates. On a 5,000-file tree an edit reached the index
+  in p50 424 ms on Linux and 488 ms on macOS in the in-process loop test, and 497 ms
+  on Linux through the API ([WS-15 record](benchmarks/2026-09-28-ws15-watcher.md)).
+  While the watcher vouches for a repository, queries spawn no Git, and ground's drift
+  check hashes no file on an unchanged tree.
 
 ## Grounding and failures
 
@@ -102,18 +111,18 @@ protocol 2025-06-18 (`api-go/internal/mcpserver/testdata/tools_list_budget.json`
 
 - **Large results stay recoverable.** A projection that omits bytes carries a
   recovery handle, and `resources/read` pages the exact original.
-- **Built, not yet live: reducers for native tool output.** Shell, test, build, lint,
-  log, git, diff, grep, read, list, glob and structured. A golden test keeps one
-  failing assertion among 5,000 passing tests (exit code, counts, failure header,
-  assertion, first and last stack frames) inside 16 KiB and 4 KiB targets
-  (`api-go/internal/evidence/reducers_test.go`). They act only on captured output,
-  and v0.1.0 release builds refuse capture (below).
-- **Limit: capture is refused in release builds.** `POST .../evidence/capture`
-  answers `503 redaction_unavailable`, because no streaming secret redactor is wired
-  into `captureRedactor` yet; only the `-tags xmustard_e2e` test build installs one.
-  It fails closed on purpose, since captured originals are kept and searchable. The
-  nine tools' own results are unaffected. The production redactor is the next fix,
-  planned for v0.1.1.
+- **Reducers for native tool output.** Shell, test, build, lint, log, git, diff,
+  grep, read, list, glob and structured. A golden test keeps one failing assertion
+  among 5,000 passing tests (exit code, counts, failure header, assertion, first and
+  last stack frames) inside 16 KiB and 4 KiB targets
+  (`api-go/internal/evidence/reducers_test.go`). They act on captured output: from
+  the capture route, the Claude Code hooks and the Pi adapter.
+- **Captured output is redacted before it is kept.** Every capture streams through the
+  secret redactor (`redact.Writer`) before a byte reaches the spool; the output of a
+  secret path is refused (`422 secret_path`), and capture fails closed without a
+  working redactor. On 16 MiB of nothing but secrets the redactor's live heap peaked
+  at 0.4 MiB at most (Linux build box). In v0.1.0 no redactor was wired, and every
+  capture was refused ([release notes](releases/v0.1.1.md#capture-redaction)).
 
 ## Transports and clients
 
@@ -124,21 +133,30 @@ protocol 2025-06-18 (`api-go/internal/mcpserver/testdata/tools_list_budget.json`
   deprecated Go shim `xmustard-mcp`
   ([relay record](benchmarks/2026-09-26-ws13-relay-rss.md)).
 - **Config in one command.** `xmustard-ops mcp-config --root /abs/repo` prints an
-  `mcpServers` entry for HTTP or, with `--transport relay`, for the relay. The token is
-  referenced as `${XMUSTARD_API_TOKEN}`, never written in.
+  `mcpServers` entry for HTTP or, with `--transport relay`, for the relay, and with
+  `--client codex` a `[mcp_servers.xmustard]` table for Codex's `config.toml`. The
+  token is referenced as a variable, never written in.
+- **Claude Code plugin with hooks.** `integrations/claude-code` adds the nine tools and
+  15 hook events. PostToolUse replaces a large native output with its redacted
+  reduction behind a recovery handle; pre-tool hooks add index hits and memory a human
+  approved; SessionStart adds ground's summary. No hook allows, denies or rewrites a
+  tool call, an answer past about 200 ms leaves Claude Code's own output, and the API
+  starts no process for a hook. Under 4 concurrent clients on the Linux build box,
+  PreToolUse(Read) answered in p50 4.2 ms and p95 7.5 ms. The static hook client is
+  built from a source checkout
+  ([plugin README](../integrations/claude-code/README.md)).
 - **Documented clients.** Claude Code, Codex, Pi and any client that reads
   `mcpServers` JSON. The labels `claude-code`, `codex`, `cursor`, `opencode`, `pi` and
   `letta` for `?client=` and `--client` only attribute usage.
 - **Pi adapter.** An in-repo extension, pinned to Pi 0.87.1, registers the nine tools
   as direct HTTP calls plus `xmustard_expand` ([Pi README](../integrations/pi/README.md)).
-  Its built-in tool reduction, masking and compaction need evidence capture. In v0.1.0
-  release builds, reduction and compaction fall back to Pi's own behavior, and masking
-  covers only results that already carry a handle.
-- **Codex and OpenCode: MCP configuration only.** There is no Codex hook package or
-  OpenCode plugin yet; `integrations/pi` is the only packaged adapter. The server
-  already decodes Codex, Cursor and OpenCode hook bodies and shapes results for each
-  (`api-go/internal/evidence/`), but that capture route answers 503 in release builds.
-  Adapters for these clients are planned (WS-40).
+  Its built-in tool reduction, masking and compaction go through evidence capture,
+  which works in release builds since v0.1.1; its end-to-end test passes 9 of 18 tests
+  (nine need a large-result fixture, a WS-24 follow-up).
+- **Codex, OpenCode and Cursor: MCP configuration only.** There is no Codex hook
+  package, OpenCode plugin or Cursor hook yet. The server already decodes their hook
+  bodies and shapes results for each through one shaper registry
+  (`api-go/internal/evidence/`). Adapters for these clients are planned (WS-40).
 
 ## Security and governance
 
@@ -147,48 +165,66 @@ protocol 2025-06-18 (`api-go/internal/mcpserver/testdata/tools_list_budget.json`
 - Six roles gate every route: `admin`, `human-approver`, `indexer`, `verifier`,
   `proposer` and `reader`.
 - An instruction-pattern scan labels recalled memory and every evidence projection.
-  Memory that cites an untrusted capture is quarantined; in v0.1.0 release builds no
-  such capture can exist yet, because capture is refused.
+  Memory that cites an untrusted capture (WebFetch, another MCP server) is
+  quarantined, and only human-approved, unquarantined, clean memory is pushed by a
+  hook.
 - Human approvals through `xmustard-ops approve|reject|queue`, and merge attestations
   bound to a reviewed diff and its base through `xmustard-ops review`. xMustard never
-  merges.
+  merges. Review finding anchoring and a findings store exist behind the `review`
+  build tag, off in release builds.
+- The service unit `xmustard-ops setup` writes binds loopback only and carries no
+  token.
 
 The full posture is in [SECURITY](SECURITY.md).
 
 ## Footprint
 
-- **Release gate.** Budget gate v2 (`--suite ci`) passed on the release commit on a
-  Linux x86_64 build box: process-tree peaks of 70.5 MiB for the frozen v1 workload
-  over the stdio shim, and 68.8 MiB for two agents through `xmustard-relay`, against a
-  95.4 MiB line. The [release notes](releases/v0.1.0.md) are the only source for that run. The newest stored
-  report, from 2026-09-27 on Linux, shows 62.0 and 66.0 MiB
-  ([report](benchmarks/evidence/2026-09-28/ws18-gate-v2-ci-head.md)).
+- **Release gate.** Budget gate v2 (`--suite ci`) passed on the v0.1.1 release tree on
+  a Linux x86_64 build box, with the release core and relay: process-tree peaks of
+  66.6 MiB for the frozen v1 workload over the stdio shim and 60.8 MiB for two agents
+  through `xmustard-relay`, against a 95.4 MiB line
+  ([release notes](releases/v0.1.1.md#measured-on-the-release-tree-linux-x86_64-build-box)).
+  v0.1.0's release commit measured 70.5 and 68.8 MiB.
 - **Not yet at parity scale.** The parity-scale suite (4 agents, 2 hot repositories,
-  4 worktrees) has not passed. v0.1.0 is not a parity claim.
+  4 worktrees) has not passed. v0.1.1 is not a parity claim.
 - **Not measured yet.** No token savings or task-success lift on real agent tasks has
   been measured. `xmustard-eval` can run paired arms with real clients, but no
   real-model run is recorded in the repository ([eval tasks](../eval/tasks/README.md)).
 
+## Operations
+
+- **A background service.** `xmustard-ops setup` installs the API as a launchd agent
+  (macOS) or a systemd socket and service (Linux) and waits for `/api/health`;
+  `daemon status|restart|stop` and `uninstall` complete it. The daemon logs to a
+  rotated file, and the relay waits up to 10 s for a restarting API.
+- **Store backup and restore.** `xmustard-ops store backup` writes a verified copy
+  beside a running daemon, `store check` checks one read-only, and `store restore`
+  swaps it in, keeping the old store aside. The API migrates and checks its store at
+  start-up (93 to 108 ms on a 12.4 MiB store, Linux build box) and fails memory calls
+  closed on a damaged one.
+
 ## Install
 
 - **Prebuilt archives** for macOS arm64 and Linux x86_64, each with five binaries and a
-  `.sha256` file. The macOS binaries carry only an ad-hoc signature (no Developer ID).
-  On Linux, `xmustard-core` needs glibc 2.39 or newer (Ubuntu 24.04+ or Debian 13+).
-- **From source** with `make build` (Go 1.26, Rust stable).
-- **Homebrew.** `packaging/homebrew/xmustard.rb` builds the v0.1.0 tag from source.
-  Current Homebrew installs formulae only from a tap, and there is no public tap yet.
+  `.sha256` file, built by the tag-triggered release workflow. The macOS binaries carry
+  only an ad-hoc signature (no Developer ID). The Linux archive is built on Ubuntu
+  22.04, so its Rust binaries need glibc 2.35 at most (the exact floor was not
+  measured); the Go binaries are static.
+- **From source** with `make build` (Go 1.26, Rust stable), or `make release` for the
+  archive.
+- **Homebrew.** `packaging/homebrew/xmustard.rb` installs the v0.1.0 archive on macOS
+  arm64 and builds the v0.1.0 tag from source elsewhere, until
+  `packaging/homebrew/bump.sh` moves it to a newer release. Current Homebrew installs
+  formulae only from a tap, and there is no public tap yet.
 
-## Planned, not in v0.1.0
+## Planned, not in v0.1.1
 
 | Item | Workstream |
 |---|---|
-| File watcher and incremental refresh (merged into `feat/parity-v2` after the tag, not released) | WS-15 |
-| Hook service and Claude Code plugin (on branch `parity/ws-23`, not released) | WS-23 |
-| Tag-triggered release workflow | WS-26 |
-| Daemon lifecycle | WS-58 |
 | `why_failed` command-mode hardening | WS-21B |
-| Streaming redactor wired into evidence capture, which unblocks the native-output reducers and the Pi adapter's built-in reduction, masking and compaction | WS-05 follow-up, planned for v0.1.1 |
-| Tiered memory and memory pushed into context | WS-31 |
+| Dedupe, code anchors, tiered conflicts and structured claims for memory | WS-27 |
+| Tiered memory and its own pushed surface | WS-31 |
+| Impact v2: tiers, risk and typed filters (merged into `feat/parity-v2` after the v0.1.1 cut) | WS-35 |
 | Static-embedding semantic lane | WS-37 |
 | Codex, OpenCode and Cursor adapters | WS-40 |
 | Parity evaluation suite and parity-scale gate | WS-50 |
@@ -200,7 +236,7 @@ gate of each workstream.
 ## Historical: feature specifications, April 2026
 
 Everything below is kept as history. It describes the issue-tracker platform of April
-2026, not the v0.1.0 product. Those routes exist only under
+2026, not the v0.1.x product. Those routes exist only under
 `XMUSTARD_PROFILE=platform`, and the migration in F15 is done: the Python backend was
 retired in June 2026, and Go plus Rust is the architecture.
 

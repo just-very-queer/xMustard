@@ -10,7 +10,7 @@
 > `Makefile`. Tuesday, Codex recalls it before running the tests. Wednesday someone edits the
 > `Makefile`, and the next `recall` flags the memory as stale.
 
-This is Wednesday's `recall` from the v0.1.0 release, trimmed with `jq`. Step 3 of the
+This is Wednesday's `recall` from the v0.1.1 release, trimmed with `jq`. Step 3 of the
 [Quickstart](#quickstart) reproduces it.
 
 ```json
@@ -36,9 +36,11 @@ does this file do, what breaks if I touch it, why did that fail. Memory and code
 same repository, so `ground` reports stale memory next to changed files and signatures. It runs
 as one API on `127.0.0.1`, a Rust core and SQLite. No Docker. MIT licensed.
 
-**v0.1.0 is out.** Prebuilt binaries for macOS arm64 and Linux x86_64 are on the
-[release page](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.0). Read the
-[release notes](docs/releases/v0.1.0.md).
+**v0.1.1 is out.** It adds a Claude Code plugin with hooks, an index watcher, a background
+service with store backup and file-level `impact`, and fixes evidence capture and drift checks.
+Prebuilt binaries for macOS arm64 and Linux x86_64 are on the
+[release page](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.1). Read the
+[release notes](docs/releases/v0.1.1.md).
 
 ## Why xMustard
 
@@ -47,8 +49,7 @@ as one API on `127.0.0.1`, a Rust core and SQLite. No Docker. MIT licensed.
   Every recalled entry carries a [trust label](#one-agent-two-or-a-team).
 - **Memory that notices drift.** Anchor a fact to the files it is about. xMustard hashes them
   when the fact is promoted, and `recall` flags it stale when one of them changes, appears or
-  disappears. In v0.1.0, files at an even path depth, such as `pkg/auth.go`, are recorded as
-  missing, so their changes are never flagged ([known limits](#known-limits-in-v010)).
+  disappears.
 - **Orientation in one call.** `ground` reports what changed, went stale, broke or got blocked
   since the baseline (the state recorded when you registered the repository), including
   contract breaks: changed parameters or return types. Its output fits a budget (6,000
@@ -57,10 +58,14 @@ as one API on `127.0.0.1`, a Rust core and SQLite. No Docker. MIT licensed.
   paths and docs with identifier and typo-tolerant matching. Hits come back as `path:line` with
   snippets and the reasons they ranked. 15 tree-sitter grammars cover Go, Rust, TypeScript, TSX,
   JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash.
-- **Light enough to leave running.** Two agents on the relay peaked at 68.8 MiB for the whole
-  process tree on the release commit (Linux x86_64). The relay itself uses about 2 MiB per agent.
+- **Light enough to leave running.** Two agents on the relay peaked at 60.8 MiB for the whole
+  process tree on the v0.1.1 release tree (Linux x86_64). The relay itself uses about 2 MiB per
+  agent.
 - **Failures explained and remembered.** `why_failed` reads a run, a pasted log or an evidence
   handle, points at the error lines, and records the failure so the next `ground` lists it.
+- **Hooks that shrink what the agent reads.** In Claude Code, the plugin replaces a large Bash,
+  Read or Grep output with a reduction whose last line names a recovery handle, redacted before
+  anything is kept, and adds memory a human approved before the agent reads or edits a file.
 
 ## How it compares
 
@@ -82,14 +87,14 @@ documentation and source only; no tool was installed or benchmarked.
 
 ## Quickstart
 
-You need macOS on Apple silicon, or Linux x86_64 with glibc 2.39+ (Ubuntu 24.04+, Debian 13+).
+You need macOS on Apple silicon, or Linux x86_64 with glibc 2.35+ (Ubuntu 22.04+, Debian 12+).
 Elsewhere, you can try [building from source](#build-from-source). You also need `git` and
 `jq`. Run all four steps in one shell.
 
 **1. Install the binaries.**
 
 ```bash
-V=v0.1.0
+V=v0.1.1
 A=xmustard-$V-darwin-arm64            # Linux: A=xmustard-$V-linux-x86_64
 curl -fsSLO https://github.com/just-very-queer/xMustard/releases/download/$V/$A.tar.gz
 curl -fsSLO https://github.com/just-very-queer/xMustard/releases/download/$V/$A.tar.gz.sha256
@@ -161,7 +166,7 @@ Ask Claude to run `ground` at the start of a task and `recall` before it edits. 
 ## The nine tools
 
 Eight of them work with nothing beyond the Quickstart. `diagnostics` needs a Postgres database in
-v0.1.0.
+v0.1.1.
 
 | Tool | What it answers | Example |
 |---|---|---|
@@ -170,9 +175,9 @@ v0.1.0.
 | `remember` | Propose a fact, decision or gotcha, anchored to the files it is about. | `content="make test needs DB_URL set"` `paths="Makefile"` |
 | `verify` | Approve or reject another agent's proposed memory. | `entry_id="ctx_..."` `approve=true` |
 | `search` | Where is it? `path:line` hits with snippets and reasons. `mode=pattern` runs an ast-grep query (needs `ast-grep` on `PATH`). | `q="session expiry"` |
-| `explain` | What is this file for, what are its key symbols, and how do I run or verify it? Files only in v0.1.0; a directory returns an error. | `path="src/server.ts"` |
+| `explain` | What is this file for, what are its key symbols, and how do I run or verify it? Files only in v0.1.1; a directory returns an error. | `path="src/server.ts"` |
 | `impact` | What might break if I change this? A lexical reference graph up to 4 hops, from the current changes, a symbol, or one file (`path=`), so treat edges as leads, not proof. | `symbol="parseConfig"` or `path="src/config.ts"` |
-| `diagnostics` | Which errors and warnings does the workspace have now? Needs Postgres in v0.1.0. | no arguments |
+| `diagnostics` | Which errors and warnings does the workspace have now? Needs Postgres in v0.1.1. | no arguments |
 | `why_failed` | Why did this fail? Error lines and implicated files from a run, a pasted log or an evidence handle. | `log="<test output>"` |
 
 `workspace_id` is optional everywhere. It resolves from the connection's binding,
@@ -196,9 +201,9 @@ stdio bridge. `xmustard-ops mcp-config --root "$PWD" [--transport http|relay] [-
 checkout's absolute path, so generate an entry per checkout. The examples below use `$WS` from
 step 4 of the Quickstart.
 
-| Client | What v0.1.0 ships |
+| Client | What v0.1.1 ships |
 |---|---|
-| Claude Code | MCP over HTTP or the relay |
+| Claude Code | MCP over HTTP or the relay, and a plugin with hooks (from a source checkout) |
 | Codex | MCP configuration only; no Codex hook package yet |
 | Pi | An in-repo extension that calls the API directly |
 | Cursor, OpenCode, other MCP clients | The generic `mcp-config` entry; no OpenCode plugin yet |
@@ -217,6 +222,34 @@ claude mcp add xmustard -e 'XMUSTARD_API_TOKEN=${XMUSTARD_API_TOKEN}' -- xmustar
 # project scope: Claude asks you to approve it on the next run, and warns if XMUSTARD_API_TOKEN is unset
 xmustard-ops mcp-config --root "$PWD" --client claude-code > .mcp.json
 ```
+
+</details>
+
+<details>
+<summary><b>Claude Code plugin: hooks that reduce output and push approved memory</b></summary>
+
+The plugin in [`integrations/claude-code`](integrations/claude-code/README.md) adds the nine
+tools and posts Claude Code's hook events to the API. `PostToolUse` replaces a large native
+output (Bash, Read, Grep, Glob, WebFetch, other MCP servers) with its reduction, redacted and
+kept behind a recovery handle. Before a search or a file read it adds matching index hits and
+memory a human approved; at session start, ground's summary. No hook allows, denies or rewrites a tool
+call, and a slow answer (past about 200 ms) leaves Claude Code's own output. From a source
+checkout, with Go 1.26:
+
+```bash
+# 1. build the static hook client into the plugin (it is not in the release archive)
+(cd api-go && go build -o ../integrations/claude-code/hooks/bin/xmustard-hook ./cmd/xmustard-hook)
+# 2. run the API with the resident worker, which serves index hits and syntax errors to hooks
+XMUSTARD_CORE_WORKER=1 xmustard-api      # or: xmustard-ops setup --env XMUSTARD_CORE_WORKER=1
+# 3. once tokens are minted, give Claude Code an agent token
+export XMUSTARD_API_TOKEN=<token>        # from: xmustard-api mint-token claude-1 agent
+# 4. load the plugin
+claude --plugin-dir integrations/claude-code
+```
+
+Register the repository first (`workspace load`, step 4 of the Quickstart). The hook URLs name
+`127.0.0.1:8042`; edit `hooks/hooks.json` if the API listens elsewhere. A hook pushes only
+memory that a human approver approved, that is not quarantined and that scans clean.
 
 </details>
 
@@ -254,9 +287,8 @@ XMUSTARD_API_BASE=http://127.0.0.1:8042 XMUSTARD_TOKEN=<token> ./node_modules/.b
 ```
 
 Pi reads `XMUSTARD_TOKEN`, not `XMUSTARD_API_TOKEN`, and needs it only once auth is on. It never
-registers a repository, so run `workspace load` first. The nine tools work in release builds;
-the extension's built-in tool reduction, masking and compaction are limited there
-([known limits](#known-limits-in-v010)). See [integrations/pi](integrations/pi/README.md).
+registers a repository, so run `workspace load` first. Its built-in tool reduction, masking and
+compaction go through the API's redacting capture. See [integrations/pi](integrations/pi/README.md).
 
 </details>
 
@@ -326,30 +358,31 @@ When `alice` proposes a memory, it becomes `peer_verified` after `bob` and `caro
 The roles are `admin`, `human-approver`, `indexer`, `verifier`, `proposer` and `reader`; `agent`
 means proposer plus verifier.
 
-## Known limits in v0.1.0
+## Known limits in v0.1.1
 
-- **Drift is never flagged for files at an even path depth.** When a memory is promoted, an
-  anchor with an even number of path components, such as `pkg/auth.go`, is recorded as missing,
-  so later edits to that file never mark the memory stale. Odd depths such as `main.go` and
-  `src/api/auth.go` are checked. To spot an affected memory, look at `path_hashes` in `recall`
-  output: an existing file recorded as `"\u0000missing"` is not being checked. A fix is written
-  and not yet merged.
-- **Evidence capture is refused in release builds.** `POST .../evidence/capture` answers
-  `503 redaction_unavailable`. Capture keeps originals, so it stays closed until a streaming
-  secret redactor is wired in, and v0.1.0 release builds have none. The nine tools are
-  unaffected. Pi's built-in tool reduction and compaction fall back to Pi's own behavior,
-  masking covers only results that already carry a handle, and no hook client can post tool
-  output yet. The redactor is planned for v0.1.1.
 - **`diagnostics` needs Postgres.** Without `postgres_dsn` in `<data dir>/settings.json` it
   returns "Postgres DSN is required to read diagnostics". The `XMUSTARD_PG_DSN` environment
   variable does not supply it.
 - **`explain` takes files only.** A directory path returns an error, although the tool
   description mentions directories.
-- **Platforms.** Prebuilt archives cover macOS arm64 and Linux x86_64 with glibc 2.39+. Neither
-  CI nor the release covers any other system, so elsewhere a source build is the only option,
-  and it is untested. There is no public Homebrew tap yet.
+- **The Claude Code plugin needs a source checkout.** Its static hook client is not in the
+  release archive, so building it needs Go. Index hits and syntax reports in hooks, and the
+  file watcher, need the opt-in resident worker (`XMUSTARD_CORE_WORKER=1`). Codex, Cursor and
+  OpenCode get MCP configuration only; their hook adapters are planned.
+- **Redaction is pattern-based.** Captured output is redacted before it is kept, but a secret
+  no rule recognizes is kept as written, and a secret file read through a shell (`cat .env`)
+  is matched by content only. Revoke an original with `DELETE .../evidence/{handle}`.
+- **Platforms.** Prebuilt archives cover macOS arm64 and Linux x86_64. The Linux archive is
+  built on Ubuntu 22.04, so it needs glibc 2.35 at most; the exact floor was not measured.
+  Neither CI nor the release covers any other system, so elsewhere a source build is the only
+  option, and it is untested. There is no public Homebrew tap yet.
 - **Heavier workloads.** A larger benchmark suite (4 agents, 2 repositories, 4 worktrees) has
   not passed its 95.4 MiB line yet.
+- **Upgrading from v0.1.0.** The memory database moves to a new schema that v0.1.0 cannot
+  open, so run `xmustard-ops store backup` before any other v0.1.1 command if you may go back.
+  Memories promoted under v0.1.0 and anchored at an even path depth, such as `pkg/auth.go`,
+  recorded that file as missing, so `recall` now flags them stale; check them and supersede
+  or retire them. The [release notes](docs/releases/v0.1.1.md#upgrading) have the steps.
 
 ## How it works
 
@@ -358,6 +391,7 @@ flowchart LR
   A["Claude Code, Codex, Cursor, ..."] -- "MCP over HTTP" --> API
   S["stdio-only client"] -- stdio --> R["xmustard-relay"] -- "HTTP /mcp" --> API
   P["Pi extension"] -- HTTP --> API
+  H["Claude Code plugin hooks"] -- "HTTP /api/hooks" --> API
   API["xmustard-api (Go)<br/>127.0.0.1:8042<br/>nine tools, auth, roles"] --> G[("memory database (SQLite)<br/>memory, votes, outcomes")]
   API -- "per call, or resident worker" --> C["xmustard-core (Rust)<br/>index, search, impact, drift"]
   C --> I[("code index<br/>.git/xmustard-cache")]
@@ -366,7 +400,8 @@ flowchart LR
 The Go API (`api-go`) owns MCP, auth, roles and the memory database, a SQLite file in your data
 directory. The Rust core (`rust-core`) owns the tree-sitter index, hybrid search, impact and
 change tracking. The API starts it per call; `XMUSTARD_CORE_WORKER=1` keeps a resident worker
-(opt-in). [Architecture](docs/ARCHITECTURE.md) has the full picture.
+(opt-in) that also watches the repository and refreshes the index as files change.
+[Architecture](docs/ARCHITECTURE.md) has the full picture.
 
 ## By the numbers
 
@@ -375,10 +410,12 @@ Measured, with the conditions that matter. Each source has the details, and
 
 | Result | What was measured | Conditions |
 |---|---|---|
-| 68.8 MiB | Peak RSS of the whole process tree with 2 agents on the relay (budget gate line: 95.4 MiB) | Release commit, Linux x86_64 ([release notes](docs/releases/v0.1.0.md)) |
+| 60.8 MiB | Peak RSS of the whole process tree with 2 agents on the relay (budget gate line: 95.4 MiB) | v0.1.1 release tree, Linux x86_64, 6 cores, resident worker off ([release notes](docs/releases/v0.1.1.md#measured-on-the-release-tree-linux-x86_64-build-box)) |
 | 2.1–2.2 MiB vs 13.5 MiB | RSS per stdio agent: relay vs the older Go `xmustard-mcp` shim | macOS arm64, 3 runs ([relay RSS](docs/benchmarks/2026-09-26-ws13-relay-rss.md)) |
 | 25.0 MiB | Peak RSS to index all 2,660 files (51,263 symbols) of the cline repo with no file cap, segment write included | Apple M1 ([index RSS](docs/benchmarks/2026-09-25-ws07-index-rss.md), [resident index](docs/benchmarks/2026-09-26-ws14-resident-index.md)) |
 | 28.5 ms / 31.0 ms | `recall` p50 / p95 over 1,000 memories, through the API | Linux, 6 cores ([status](docs/STATUS.md#measured)) |
+| 424 ms / 488 ms | p50 from a file edit to the index that holds it, with the watcher | 5,000-file tree, in-process loop; Linux (inotify) / Apple M1 (FSEvents) ([watcher](docs/benchmarks/2026-09-28-ws15-watcher.md)) |
+| 4.2 ms / 7.5 ms | p50 / p95 of a Claude Code `PreToolUse` hook on a file read, answered by the running API | Linux, 6 cores, 600 calls from 4 concurrent clients ([release notes](docs/releases/v0.1.1.md#claude-code-plugin-and-hook-service-ws-23)) |
 | 19,544 B → 4,550 B | `ground` output with the default budget, all 200 contract breaks still counted | pi-mono clone, 1,929 files, 60 files with a changed signature ([status](docs/STATUS.md#measured)) |
 
 **Not measured yet:** token savings or task success on real agent tasks. The evaluation harness
@@ -393,9 +430,12 @@ compares xMustard with another tool.
   caller only its tools. `why_failed` runs no commands unless you set
   `XMUSTARD_WHY_FAILED_COMMANDS=1` and call it with an admin token; command mode is host-code
   execution, not a sandbox.
-- **Secrets stay out.** Memory is redacted on ingest. Search refuses secret paths and masks
-  credential-shaped words in snippets. Capture fails closed without a secret redactor. By
-  default, the relay sends the token only to loopback hosts.
+- **Secrets stay out.** Memory is redacted on ingest, and captured tool output before a byte is
+  kept. Search and capture refuse secret paths such as `.env`, and snippets mask
+  credential-shaped words. Capture fails closed without a working redactor. By default, the
+  relay sends the token only to loopback hosts.
+- **Hooks never decide.** A hook adds context or a reduced output, or says nothing; it never
+  allows, denies or rewrites a tool call, and the API starts no process for one.
 - **Memory is data, not instructions.** Recalled memory carries `injection_flags` from an
   instruction-pattern scan (a pattern check, not a classifier), and content from untrusted
   captures is quarantined.
@@ -404,14 +444,15 @@ The full model is in [docs/SECURITY.md](docs/SECURITY.md).
 
 ## Roadmap
 
-- **v0.1.1:** the streaming secret redactor, so that evidence capture, and with it Pi's built-in
-  tool reduction, masking and compaction, work in release builds.
-- **Next:** a file watcher that keeps the resident index fresh, a Claude Code plugin with hooks,
-  a background service (launchd or systemd) with store backup and restore, and a tag-triggered
-  release workflow with a Homebrew formula that installs the prebuilt archives.
-- **Later:** Codex hooks, an OpenCode plugin and Cursor hooks, a static-embedding search lane,
-  impact analysis with risk tiers, symbol resolvers for Rust, Python and Java, session handoff
-  between clients, and an evaluation suite for memory and context reduction.
+- **Shipped in v0.1.1:** the streaming secret redactor (evidence capture, and with it Pi's
+  built-in tool reduction, masking and compaction), a Claude Code plugin with hooks, a file
+  watcher that keeps the resident index fresh, a background service (launchd or systemd) with
+  store backup and restore, file-level `impact`, and a tag-triggered release workflow.
+- **Next:** Codex hooks, an OpenCode plugin and Cursor hooks; the hook client in the release
+  archive; a Homebrew formula on the prebuilt Linux archive.
+- **Later:** a static-embedding search lane, impact analysis with risk tiers, symbol resolvers
+  for Rust, Python and Java, session handoff between clients, and an evaluation suite for memory
+  and context reduction.
 
 What is under way now is in [status](docs/STATUS.md#in-progress). The roadmap's working plan, by
 workstream: [build plan](docs/plans/2026-09-25-parity-build-plan.md).
@@ -420,17 +461,19 @@ workstream: [build plan](docs/plans/2026-09-25-parity-build-plan.md).
 
 With Go 1.26 and Rust 1.89 or newer, `make build` builds all five binaries. `make install`
 copies them into `$PREFIX/bin`; the default `PREFIX=/usr/local` usually needs `sudo`, and
-`make install PREFIX=$HOME/.local` does not. The Homebrew formula in
-[`packaging/homebrew/xmustard.rb`](packaging/homebrew/xmustard.rb) builds the v0.1.0 tag from
-source; Homebrew installs formulae only from a tap, so copy it into a local one (`brew tap-new`)
-until a public tap exists.
+`make install PREFIX=$HOME/.local` does not. `make release VERSION=v0.1.1` builds the release
+archive for your platform. The Homebrew formula in
+[`packaging/homebrew/xmustard.rb`](packaging/homebrew/xmustard.rb) installs the v0.1.0 archive on
+macOS arm64 and builds the v0.1.0 tag from source elsewhere until it is moved to v0.1.1
+(`packaging/homebrew/bump.sh`); Homebrew installs formulae only from a tap, so copy it into a
+local one (`brew tap-new`) until a public tap exists.
 
 ## Learn more
 
 - [Documentation map](docs/README.md), [vision](docs/VISION.md), [architecture](docs/ARCHITECTURE.md) and [status](docs/STATUS.md)
-- [Security model](docs/SECURITY.md) and [v0.1.0 release notes](docs/releases/v0.1.0.md)
+- [Security model](docs/SECURITY.md), [v0.1.1 release notes](docs/releases/v0.1.1.md) and [v0.1.0 release notes](docs/releases/v0.1.0.md)
 - [Benchmarks and gates](scripts/bench/README.md) and the [measurement records](docs/benchmarks/)
-- [Pi extension](integrations/pi/README.md)
+- [Claude Code plugin](integrations/claude-code/README.md) and [Pi extension](integrations/pi/README.md)
 
 **Contributing.** Start with [AGENTS.md](AGENTS.md). Run `make check-backend` (Go tests and build,
 Rust tests and Clippy) before you open a pull request.

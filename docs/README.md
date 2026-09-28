@@ -1,7 +1,7 @@
 # Documentation map
 
 xMustard's docs fall into three groups. **Start here** explains what the product is
-and what v0.1.0 ships. **Reference** holds the details you look up while working.
+and what v0.1.1 ships. **Reference** holds the details you look up while working.
 **History** keeps earlier reviews, plans and research; each one describes the project
 when it was written, not today's behavior.
 
@@ -12,7 +12,8 @@ Read these in order.
 | Read | For |
 | --- | --- |
 | [README](../README.md) | What xMustard is, how to install it, and how to connect an MCP client |
-| [v0.1.0 release notes](releases/v0.1.0.md) | What the first tagged release contains, how to install it, and its known limits |
+| [v0.1.1 release notes](releases/v0.1.1.md) | What the current release fixes and adds, how to install and upgrade, and its known limits |
+| [v0.1.0 release notes](releases/v0.1.0.md) | What the first tagged release contained, and its limits at the time |
 | [Status](STATUS.md) | What ships, measured numbers, known limits, and work in progress |
 | [Vision](VISION.md) | Product scope, constraints, and open choices |
 | [Architecture](ARCHITECTURE.md) | Which module owns a behavior |
@@ -22,15 +23,16 @@ Read these in order.
 
 | Topic | Read |
 | --- | --- |
-| What v0.1.0 ships per feature, what backs it, and what is still planned | [Features](FEATURES.md) |
-| Roles, route gates, exposure posture, registration, `why_failed` command mode, injection safety | [Security](SECURITY.md) |
+| What v0.1.1 ships per feature, what backs it, and what is still planned | [Features](FEATURES.md) |
+| Roles, route gates, exposure posture, registration, `why_failed` command mode, injection safety, capture redaction, client hooks, the service unit | [Security](SECURITY.md) |
 | Advanced tool arguments and hidden aliases | The MCP resource `xmustard://docs/tools`, generated from `api-go/internal/mcpserver` |
+| Claude Code plugin and hook events | [integrations/claude-code](../integrations/claude-code/README.md) |
 | Pi extension | [integrations/pi](../integrations/pi/README.md) |
 | Retrieval gate and budget gate v2 | [scripts/bench](../scripts/bench/README.md) |
 | Evaluation corpus and the `xmustard-eval` executor | [eval/tasks](../eval/tasks/README.md) |
 | Active execution plan, with implementation records per workstream | [Parity build plan](plans/2026-09-25-parity-build-plan.md) |
 | Requirements behind that plan | [Parity requirements](research/PARITY_REQUIREMENTS_2026-09-25.md) |
-| Measurements by workstream | [WS-07 index RSS](benchmarks/2026-09-25-ws07-index-rss.md), [D-02 FTS5 vs tantivy](benchmarks/2026-09-25-d02-fts5-vs-tantivy.md), [WS-13 relay RSS](benchmarks/2026-09-26-ws13-relay-rss.md), [WS-14 resident index](benchmarks/2026-09-26-ws14-resident-index.md), [WS-16 language packs](benchmarks/2026-09-26-ws16-language-packs.md), [WS-17 resolver](benchmarks/2026-09-26-ws17-resolver.md), [WS-18 hybrid search](benchmarks/2026-09-28-ws18-hybrid-search.md) |
+| Measurements by workstream | [WS-07 index RSS](benchmarks/2026-09-25-ws07-index-rss.md), [D-02 FTS5 vs tantivy](benchmarks/2026-09-25-d02-fts5-vs-tantivy.md), [WS-13 relay RSS](benchmarks/2026-09-26-ws13-relay-rss.md), [WS-14 resident index](benchmarks/2026-09-26-ws14-resident-index.md), [WS-16 language packs](benchmarks/2026-09-26-ws16-language-packs.md), [WS-17 resolver](benchmarks/2026-09-26-ws17-resolver.md), [WS-18 hybrid search](benchmarks/2026-09-28-ws18-hybrid-search.md), [WS-15 watcher](benchmarks/2026-09-28-ws15-watcher.md) |
 | Release history | [Changelog](CHANGELOG.md) |
 | Tool-output reduction and assurance design, dated 2026-09-24; its status lines predate the release | [Context layer](CONTEXT_LAYER.md) |
 | Competitor comparison, dated 2026-09-24 | [Competitor parity](research/COMPETITOR_PARITY_2026-09-24.md); refresh first-party evidence before relying on it |
