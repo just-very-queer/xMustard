@@ -44,7 +44,8 @@ import (
 //     cooldown).
 //   - SessionStart and SubagentStart inject ground's spawn-free part and the core-tier
 //     memories; UserPromptSubmit the memories a prompt keyword triggers.
-//   - FileChanged feeds the dirty set; CwdChanged and SessionStart return watchPaths.
+//   - FileChanged feeds the dirty set (the resident watcher's pending batch, WS-15);
+//     CwdChanged and SessionStart return watchPaths.
 //   - Stop, SubagentStop, SessionEnd, PreCompact and PostCompact are recorded on a
 //     queue and answered at once (SessionEnd hooks share a 1.5 s budget).
 //
@@ -56,11 +57,12 @@ import (
 // repository identity is never sampled (a hook-delivered observation is
 // captured_identity=unknown).
 //
-// Route gates: every event is its own route with a row in routeGateTable. Capture events
-// need the proposer role, the others the reader role; all are served in read-only mode
-// (a capture stores only the caller's own output). The workspace comes from the
-// X-Xmustard-Workspace header or the registered root holding the event's cwd, and is
-// then checked like a workspace path: served by this deployment and in the token's scope.
+// Route gates: every event is its own route with a row in routeGateTable (hookGate): core,
+// the proposer role (a hook runs for an agent session; no non-GET route grants reader),
+// served in read-only mode (a capture stores only the caller's own output). The workspace
+// comes from the X-Xmustard-Workspace header or the registered root holding the event's
+// cwd, and is then checked like a workspace path: served by this deployment and in the
+// token's scope.
 
 // defaultHookBudget is how long a hook answer may take; past it the route answers empty.
 const defaultHookBudget = 180 * time.Millisecond
@@ -71,6 +73,9 @@ const (
 	hookWatchPaths   = 128 // watchPaths an answer carries
 	hookTriggerLimit = 16  // memories one prompt may trigger
 	hookQueueDepth   = 256 // queued enqueue-mode events before new ones are dropped
+	// hookMaxCandidates is AdmitMemory's bound on one admission; later candidates wait
+	// for a later push.
+	hookMaxCandidates = 64
 )
 
 // hookBudget is XMUSTARD_HOOK_BUDGET_MS, from 20 to 5,000 ms (default 180).
@@ -474,10 +479,11 @@ func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query strin
 // admission error pushes nothing (fail closed).
 func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Surface, ids []string, stale map[string][]string, recall string) []string {
 	ids = s.sessions.Unseen(c.key, ids)
+	ids = ids[:min(len(ids), hookMaxCandidates)]
 	if len(ids) == 0 {
 		return nil
 	}
-	m, err := workspaceops.AdmitMemory(ctx, dataDir(), c.ws.WorkspaceID, surface, ids[:min(len(ids), 64)])
+	m, err := workspaceops.AdmitMemory(ctx, dataDir(), c.ws.WorkspaceID, surface, ids)
 	if err != nil {
 		return nil
 	}
