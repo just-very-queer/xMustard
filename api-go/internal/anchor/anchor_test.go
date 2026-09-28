@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -155,6 +156,36 @@ func TestTouches(t *testing.T) {
 		if set.Touches(a) {
 			t.Errorf("Touches(%+v) = true", a)
 		}
+	}
+}
+
+// A finding filed against a file outside the change is looked for in that file at head
+// (Outside) before it is re-filed; without Outside it is only re-filed.
+func TestPlaceTriesAFileOutsideTheChangeFirst(t *testing.T) {
+	changed := NewFile("a.go", "a.go", "@@ -1 +1,2 @@\n x\n+shared()\n", nil)
+	heads := map[string]string{"out.go": "package p\n\nfunc F() {\n\tshared()\n}\n", "twice.go": "shared()\nshared()\n"}
+	var asked []string
+	set := NewSet([]*File{changed})
+	set.Outside = func(p string) string { asked = append(asked, p); return heads[p] }
+	for _, tc := range []struct {
+		path, code string
+		want       Anchor
+	}{
+		{"out.go", "shared()", Anchor{Path: "out.go", StartLine: 4, EndLine: 4, Side: New, Status: InFile}},
+		{"twice.go", "shared()", Anchor{Path: "twice.go", Status: Unanchored, Reason: ReasonAmbiguous, Candidates: 2}},
+		{"missing.go", "shared()", Anchor{Path: "a.go", StartLine: 2, EndLine: 2, Side: New, Status: Relocated, RefiledFrom: "missing.go"}},
+		{"a.go", "x", Anchor{Path: "a.go", StartLine: 1, EndLine: 1, Side: New, Status: ExactNew}},
+	} {
+		if got := place(set, tc.path, tc.code); got != tc.want {
+			t.Errorf("%s: got %+v, want %+v", tc.path, got, tc.want)
+		}
+	}
+	if want := []string{"out.go", "twice.go", "missing.go"}; !slices.Equal(asked, want) {
+		t.Errorf("Outside asked for %q, want %q (a changed file never goes through it)", asked, want)
+	}
+	set.Outside = nil
+	if got := place(set, "out.go", "shared()"); got.Status != Relocated || got.Path != "a.go" {
+		t.Errorf("without Outside: %+v", got)
 	}
 }
 

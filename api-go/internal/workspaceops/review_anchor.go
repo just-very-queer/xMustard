@@ -22,8 +22,9 @@ import (
 // evidence original, decoded by the review package) is anchored against the sealed
 // change a merge attestation binds: the hardened diff from the merge base of a base ref
 // to a head (observeChange, the same bytes merge approval digests), plus the files at
-// that head for snippets outside the hunks. Nothing is stored; WS-66 owns the findings
-// store and WS-67 the verify transport.
+// that head for snippets outside the hunks and for findings filed against a file the
+// change does not touch. Nothing is stored; WS-66 owns the findings store and WS-67 the
+// verify transport.
 
 // ReviewEvidenceLabel is the label every anchoring carries.
 const ReviewEvidenceLabel = "evidence only: anchors and checks are deterministic facts about the quoted code, " +
@@ -37,6 +38,7 @@ var (
 	headFileLimit     = int64(1 << 20)
 	headTotalLimit    = int64(16 << 20)
 	errAnchorTooLarge = errors.New("the change is too large to anchor findings in")
+	errNotAtHead      = errors.New("not at head")
 )
 
 // maxSkippedPaths bounds the skipped paths an anchoring lists.
@@ -55,14 +57,15 @@ type ReviewAnchoring struct {
 	Label      string            `json:"label"`
 }
 
-// HeadReads accounts for the files read at head: read in full, or skipped (over a bound,
+// HeadReads accounts for the files read at head: read in full, skipped (over a bound,
 // binary, not a blob, or a name the batch reader cannot pass) and searched in their
-// hunks only.
+// hunks only, or missing (a path a finding names that head does not hold).
 type HeadReads struct {
 	Files        int      `json:"files"`
 	Bytes        int64    `json:"bytes"`
 	Skipped      int      `json:"skipped"`
 	SkippedPaths []string `json:"skipped_paths,omitempty"`
+	Missing      int      `json:"missing"`
 }
 
 // AnchorReviewFindings anchors batch against the change from the merge base of baseRef
@@ -90,7 +93,9 @@ func AnchorReviewFindings(ctx context.Context, dataDir, workspaceID, baseRef, he
 		}
 		files = append(files, anchor.NewFile(s.OldPath, s.NewPath, s.Diff, head))
 	}
-	found, counts := review.Anchor(batch.Findings, anchor.NewSet(files))
+	set := anchor.NewSet(files)
+	set.Outside = blobs.read
+	found, counts := review.Anchor(batch.Findings, set)
 	if blobs.err != nil { // a head read failed: anchors that needed it would be wrong
 		return nil, blobs.err
 	}
@@ -129,7 +134,8 @@ type headBlobs struct {
 }
 
 // read returns the file at head, or "" when it is skipped, missing or a read failed
-// (err records a failure).
+// (err records a failure). It is also Set.Outside, so path may be any path a finding
+// names; the batch reader resolves it in head's tree and never on disk.
 func (h *headBlobs) read(path string) string {
 	if h.err != nil {
 		return ""
@@ -144,6 +150,9 @@ func (h *headBlobs) read(path string) string {
 	}
 	content, ok, err := h.next(path)
 	switch {
+	case errors.Is(err, errNotAtHead):
+		h.reads.Missing++
+		return ""
 	case err != nil:
 		h.err = fmt.Errorf("read %s at %s: %w", path, h.head, err)
 		return ""
@@ -185,8 +194,8 @@ func (h *headBlobs) start() error {
 }
 
 // next asks for head:path and reads the answer: "<oid> <type> <size>" and the object,
-// or "<name> missing". ok is false for a missing object, a non-blob, a blob over a
-// bound, and a binary blob; the object's bytes are consumed either way.
+// or "<name> missing". A missing object is errNotAtHead; ok is false for a non-blob, a
+// blob over a bound and a binary blob. The object's bytes are consumed either way.
 func (h *headBlobs) next(path string) (content string, ok bool, err error) {
 	if _, err := fmt.Fprintf(h.in, "%s:%s\n", h.head, path); err != nil {
 		return "", false, err
@@ -197,7 +206,7 @@ func (h *headBlobs) next(path string) (content string, ok bool, err error) {
 	}
 	header = strings.TrimSuffix(header, "\n")
 	if strings.HasSuffix(header, " missing") || strings.HasSuffix(header, " ambiguous") {
-		return "", false, nil
+		return "", false, errNotAtHead
 	}
 	fields := strings.Fields(header)
 	if len(fields) != 3 {

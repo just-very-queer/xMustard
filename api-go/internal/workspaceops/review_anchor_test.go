@@ -18,8 +18,8 @@ import (
 )
 
 // anchorRepo is reviewRepo with more files on main (a 40-line file, a name with a space,
-// a non-ASCII name and a file the feature deletes) and a feature commit that edits and
-// deletes them, rebased so main is the merge base.
+// a non-ASCII name, a file the feature deletes and one it leaves alone) and a feature
+// commit that edits and deletes them, rebased so main is the merge base.
 func anchorRepo(t testing.TB) (dataDir, ws string) {
 	t.Helper()
 	dataDir, ws, root, git := reviewRepo(t)
@@ -38,6 +38,7 @@ func anchorRepo(t testing.TB) (dataDir, ws string) {
 	write("my file.go", "package a\n\nvar spaced = 1\n")
 	write("café.go", "package a\n\nvar accent = 1\n")
 	write("gone.go", "package a\n\nfunc Gone() {}\n")
+	write("keep.go", "package a\n\nvar kept = 1\n")
 	git("add", ".")
 	git("commit", "-q", "-m", "more")
 	git("checkout", "-q", "feature")
@@ -75,6 +76,8 @@ func TestReviewAnchorBindsTheSealedChange(t *testing.T) {
 		[2]string{"gone.go", "func Gone() {}"},
 		[2]string{"b.go", "v20 := step(20) + drift"},
 		[2]string{"a.go", "not in this change"},
+		[2]string{"keep.go", "var kept = 1"},    // a file outside the change, read at head
+		[2]string{"nowhere.go", "var kept = 1"}, // a path head does not hold
 	)
 	got, err := AnchorReviewFindings(context.Background(), dir, ws, "main", "HEAD", batch)
 	if err != nil {
@@ -88,31 +91,38 @@ func TestReviewAnchorBindsTheSealedChange(t *testing.T) {
 		t.Fatalf("anchored against %+v, the attested change is %+v", got.Change, want)
 	}
 	type row struct {
-		path   string
-		status anchor.Status
-		lines  [2]int
-		inHunk bool
+		path            string
+		status          anchor.Status
+		lines           [2]int
+		inHunk, inScope bool
 	}
 	wantRows := []row{
-		{"a.go", anchor.ExactNew, [2]int{3, 3}, true},
-		{"big.go", anchor.InFile, [2]int{5, 6}, false},
-		{"my file.go", anchor.ExactNew, [2]int{3, 3}, true},
-		{"café.go", anchor.ExactNew, [2]int{3, 3}, true},
-		{"gone.go", anchor.ExactOld, [2]int{3, 3}, true},
-		{"big.go", anchor.Relocated, [2]int{20, 20}, true},
-		{"a.go", anchor.Unanchored, [2]int{}, false},
+		{"a.go", anchor.ExactNew, [2]int{3, 3}, true, true},
+		{"big.go", anchor.InFile, [2]int{5, 6}, false, true},
+		{"my file.go", anchor.ExactNew, [2]int{3, 3}, true, true},
+		{"café.go", anchor.ExactNew, [2]int{3, 3}, true, true},
+		{"gone.go", anchor.ExactOld, [2]int{3, 3}, true, true},
+		{"big.go", anchor.Relocated, [2]int{20, 20}, true, true},
+		{"a.go", anchor.Unanchored, [2]int{}, false, true},
+		{"keep.go", anchor.InFile, [2]int{3, 3}, false, false},
+		{"nowhere.go", anchor.Unanchored, [2]int{}, false, false},
+	}
+	if len(got.Findings) != len(wantRows) {
+		t.Fatalf("%d findings, want %d", len(got.Findings), len(wantRows))
 	}
 	for i, f := range got.Findings {
-		g := row{f.Anchor.Path, f.Anchor.Status, [2]int{f.Anchor.StartLine, f.Anchor.EndLine}, f.Checks.InChangedHunk}
+		g := row{f.Anchor.Path, f.Anchor.Status, [2]int{f.Anchor.StartLine, f.Anchor.EndLine}, f.Checks.InChangedHunk, f.Checks.InScope}
 		if g != wantRows[i] {
 			t.Errorf("finding %d: got %+v, want %+v (%+v)", i, g, wantRows[i], f.Anchor)
 		}
 	}
-	if got.Counts.Supported != 6 || got.Counts.Unsupported != 1 || got.Findings[6].Support != review.Unsupported {
+	if got.Counts.Supported != 7 || got.Counts.Unsupported != 2 || got.Findings[6].Support != review.Unsupported ||
+		got.Findings[7].Support != review.Supported || got.Findings[8].Support != review.Unsupported {
 		t.Errorf("counts = %+v", got.Counts)
 	}
-	// Only big.go needed its head (a.go's miss reads a.go and b.go too, found nowhere).
-	if got.HeadReads.Files < 1 || got.HeadReads.Skipped != 0 || got.Files != 6 || got.Label != ReviewEvidenceLabel {
+	// big.go and keep.go needed their heads (a.go's miss reads a.go and b.go too, found
+	// nowhere); nowhere.go is not at head.
+	if got.HeadReads.Files < 2 || got.HeadReads.Skipped != 0 || got.HeadReads.Missing != 1 || got.Files != 6 || got.Label != ReviewEvidenceLabel {
 		t.Errorf("files %d, head reads %+v", got.Files, got.HeadReads)
 	}
 }
