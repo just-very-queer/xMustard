@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"xmustard/api-go/internal/evidence"
+	"xmustard/api-go/internal/redact"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -136,24 +137,32 @@ func TestCaptureRouteRefusesWhenTheRedactorFails(t *testing.T) {
 }
 
 // The output of a secret path (WS-72 denylist) is refused with 422 secret_path and
-// never retained, wherever the body names the path; templates stay capturable.
+// never retained, wherever the body names the path, and whichever path the reducer
+// would select: a harmless caller path does not hide a secret one in the body, nor
+// the tool input's path one in the response. Templates stay capturable.
 func TestCaptureRouteRefusesSecretPaths(t *testing.T) {
 	f := newEvidenceFixture(t, true)
 	alice, _ := workspaceops.MintToken(f.dir, "alice", "agent")
 	content, _ := json.Marshal(strings.Repeat("API_URL=https://internal.example.test\nFEATURE=on\n", 1000))
-	read := func(path string, inputFirst bool) string {
-		input := `"tool_input":{"file_path":"` + path + `"}`
-		response := `"tool_response":{"type":"text","file":{"filePath":"` + path + `","content":` + string(content) + `}}`
+	// read is a Claude Read body naming inputPath in its tool input and responsePath
+	// in its response
+	read := func(inputPath, responsePath string, inputFirst bool) string {
+		input := `"tool_input":{"file_path":"` + inputPath + `"}`
+		response := `"tool_response":{"type":"text","file":{"filePath":"` + responsePath + `","content":` + string(content) + `}}`
 		if !inputFirst {
 			input, response = response, input
 		}
 		return `{"session_id":"s","hook_event_name":"PostToolUse","tool_name":"Read",` + input + `,` + response + `,"tool_use_id":"t1"}`
 	}
+	const env, readme = "/home/dev/app/.env", "/home/dev/app/README.md"
 	refused := []struct{ query, body string }{
-		{"format=claude&client=claude", read("/home/dev/app/.env", true)},
-		{"format=claude&client=claude", read("/home/dev/app/.env.production", false)},
-		{"format=claude&client=claude", read("/home/dev/.ssh/config", true)},
+		{"format=claude&client=claude", read(env, env, true)},
+		{"format=claude&client=claude", read("/home/dev/app/.env.production", "/home/dev/app/.env.production", false)},
+		{"format=claude&client=claude", read("/home/dev/.ssh/config", "/home/dev/.ssh/config", true)},
 		{"client=pi&tool=read&path=deploy/.npmrc&target=1024", string(content)},
+		{"format=claude&client=claude&path=README.md", read(env, env, true)},
+		{"format=claude&client=claude", read(readme, env, true)},
+		{"format=claude&client=claude&path=deploy/.npmrc", read(readme, readme, false)},
 	}
 	for _, tc := range refused {
 		code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?"+tc.query, alice, strings.NewReader(tc.body), nil)
@@ -164,42 +173,71 @@ func TestCaptureRouteRefusesSecretPaths(t *testing.T) {
 	if n := retainedOriginals(f); n != 0 {
 		t.Fatalf("%d originals of secret paths retained", n)
 	}
-	code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=claude", alice,
-		strings.NewReader(read("/home/dev/app/.env.example", true)), nil)
-	if code != 200 {
-		t.Fatalf(".env.example: %d %s", code, b[:min(len(b), 300)])
+	for _, body := range []string{read("/home/dev/app/.env.example", "/home/dev/app/.env.example", true), read(readme, readme, true)} {
+		code, b, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence/capture?format=claude&client=claude", alice, strings.NewReader(body), nil)
+		if code != 200 {
+			t.Fatalf("%.80s: %d %s", body, code, b[:min(len(b), 300)])
+		}
 	}
 }
 
-// The production redactor fits the capture window: 16 MiB of nothing but secrets, in
-// the decoder's 32 KiB writes, grows the live heap by less than captureWindowBytes.
+// The production redactor fits the capture window with room for the decoder: 16 MiB
+// of nothing but secrets, in the decoder's 32 KiB writes, grows the live heap by
+// less than a quarter of captureWindowBytes. The units are the densest secrets each kind
+// of rule finds, each replaced by a longer marker; the literal value of a secret
+// environment variable (8 bytes, the shortest one kept) is redacted by a redactor
+// built as workspaceops.OutputRedactor builds it, from an environment that holds it.
 func TestCaptureRedactorFitsTheCaptureWindow(t *testing.T) {
 	if testing.Short() {
-		t.Skip("streams 16 MiB")
+		t.Skip("streams 16 MiB per unit")
 	}
-	chunk := bytes.Repeat([]byte("password=Zx9!Zx9!\n"), (32<<10)/18)
-	var ms runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&ms)
-	base, peak := ms.HeapAlloc, uint64(0)
-	red := captureRedactor(io.Discard)
-	for written := 0; written < 16<<20; written += len(chunk) {
-		if _, err := red.Write(chunk); err != nil {
+	withEnv := func(w io.Writer) evidence.StreamRedactor {
+		return redact.New(redact.WithEnv(redact.SecretEnv([]string{"DB_PASSWORD=hunter22"})...)).NewWriter(w)
+	}
+	units := []struct {
+		redactor func(io.Writer) evidence.StreamRedactor
+		unit     string
+	}{
+		{captureRedactor, "password=Zx9!Zx9!\n"}, {captureRedactor, "secret=x\n"}, {captureRedactor, `"secret":"x"`},
+		{withEnv, "hunter22"}, {withEnv, "hunter22\n"},
+	}
+	for _, u := range units {
+		chunk := bytes.Repeat([]byte(u.unit), (32<<10)/len(u.unit))
+		var ms runtime.MemStats
+		runtime.GC()
+		runtime.ReadMemStats(&ms)
+		base, peak := ms.HeapAlloc, uint64(0)
+		var out countingWriter
+		red := &failClosed{next: u.redactor(&out)}
+		for written := 0; written < 16<<20; written += len(chunk) {
+			if _, err := red.Write(chunk); err != nil {
+				t.Fatal(err)
+			}
+			if written%(1<<20) < len(chunk) {
+				runtime.GC()
+				runtime.ReadMemStats(&ms)
+				peak = max(peak, ms.HeapAlloc)
+			}
+		}
+		if err := red.Flush(); err != nil {
 			t.Fatal(err)
 		}
-		if written%(1<<20) < len(chunk) {
-			runtime.GC()
-			runtime.ReadMemStats(&ms)
-			peak = max(peak, ms.HeapAlloc)
+		runtime.KeepAlive(red)
+		growth := int64(peak) - int64(base)
+		t.Logf("%-14.14q x16 MiB: %d MiB out, live heap growth peak %d KiB (capture window %d KiB)", u.unit, out.n>>20, growth>>10, captureWindowBytes>>10)
+		if out.n <= 16<<20 {
+			t.Fatalf("%q: %d bytes out for 16 MiB in; every unit is a secret, and its marker is longer", u.unit, out.n)
+		}
+		if growth >= captureWindowBytes/4 {
+			t.Fatalf("%q: the capture redactor holds %d KiB, beyond a quarter of the %d KiB capture window", u.unit, growth>>10, captureWindowBytes>>10)
 		}
 	}
-	if err := red.Flush(); err != nil {
-		t.Fatal(err)
-	}
-	runtime.KeepAlive(red)
-	growth := int64(peak) - int64(base)
-	t.Logf("16 MiB of secrets: live heap growth peak %d KiB (capture window %d KiB)", growth>>10, captureWindowBytes>>10)
-	if growth >= captureWindowBytes {
-		t.Fatalf("the capture redactor holds %d KiB, beyond the %d KiB capture window", growth>>10, captureWindowBytes>>10)
-	}
+}
+
+// countingWriter counts the bytes written to it.
+type countingWriter struct{ n int }
+
+func (c *countingWriter) Write(p []byte) (int, error) {
+	c.n += len(p)
+	return len(p), nil
 }

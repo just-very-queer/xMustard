@@ -16,12 +16,16 @@ import (
 // form. The rules are the ones why_failed applies to command output
 // (workspaceops.OutputRedactor): the default secret patterns, the key-aware detector
 // and the literal values of this daemon's secret environment variables. The Writer
-// holds one 128 KiB window and its lookahead, never the stream: it retains about
-// 0.3 MiB, and 1.2 MiB on input that is nothing but secrets
-// (redact.TestWriterMemoryIsBounded), inside captureWindowBytes. The decoder flushes
-// it at every section boundary, so each output string is redacted as one input. The
-// secret-path denylist applies once the body names its path (evidence.ErrSecretPath,
-// 422 secret_path).
+// buffers 128 KiB and decides it 8 KiB at a time, each window read with the 33 KiB
+// lookahead after it, so it never holds the stream, and a window's scratch and output
+// do not grow with the density of secrets. On 16 MiB of the densest secret units, in
+// the decoder's 32 KiB writes, its live heap peaks at 0.4 MiB at most (an 8-byte
+// secret environment value repeated; redact.TestWriterMemoryIsBounded and
+// TestCaptureRedactorFitsTheCaptureWindow), under a quarter of captureWindowBytes.
+// The decoder flushes it at every section boundary, so each output string is
+// redacted as one input. Every path the capture names is checked against the
+// secret-path denylist once the body is read (evidence.ErrSecretPath, 422
+// secret_path).
 
 // captureRedactor wraps the capture spool writer with the streaming secret redactor.
 // Every build sets it (the xmustard_e2e build chains a test marker in front, see

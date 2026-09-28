@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -85,7 +86,7 @@ type ObservationResult struct {
 }
 
 // Observe captures one tool output. The output of a secret path is refused
-// (ErrSecretPath) once the body has named its path; the spool is discarded.
+// (ErrSecretPath) once the body has named its paths; the spool is discarded.
 func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput) (*ObservationResult, error) {
 	if reg == nil {
 		reg = DefaultRegistry()
@@ -158,10 +159,10 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	if in.Format == FormatRaw || in.Format == "" {
 		meta.BodySHA256, meta.BodyBytes = body.BodySHA256, body.BodyBytes
 	}
-	sel := selectorFor(meta, body, in.Sel)
-	if pattern, secret := redact.MatchSecretPath(sel.Path); secret {
-		return nil, fmt.Errorf("%w (%q matches %s)", ErrSecretPath, sel.Path, pattern)
+	if path, pattern := secretPath(body, in.Sel); pattern != "" {
+		return nil, fmt.Errorf("%w (%q matches %s)", ErrSecretPath, path, pattern)
 	}
+	sel := selectorFor(meta, body, in.Sel)
 	red, argv0 := reg.Select(sel)
 	pol := PolicyFor(meta.Client)
 	target := pol.Target
@@ -247,6 +248,46 @@ func spoolRaw(r io.Reader, dst io.Writer, redact func(io.Writer) StreamRedactor)
 		BodySHA256: hex.EncodeToString(h.Sum(nil)), BodyBytes: n}, nil
 }
 
+// pathKeys are the tool-input fields that name the file or directory a tool read,
+// in the order selectorFor prefers them.
+var pathKeys = []string{"file_path", "filePath", "path", "target_file", "notebook_path", "directory", "dir_path"}
+
+// secretPath returns a path the capture names that is a secret path (WS-72) and
+// the pattern it matches, or "", "". It checks every path, not only the one the
+// reducer selects: the caller's path, each path field of the tool input, and each
+// path field of the response (a Claude Read names its file in both), so that no
+// path can hide another.
+func secretPath(body *HookBody, over Selector) (path, pattern string) {
+	paths := responsePaths(body.Response, []string{over.Path})
+	for _, k := range pathKeys {
+		paths = append(paths, body.Input[k])
+	}
+	for _, p := range paths {
+		if pattern, ok := redact.MatchSecretPath(p); ok {
+			return p, pattern
+		}
+	}
+	return "", ""
+}
+
+// responsePaths appends the string values of the path fields in a response
+// skeleton (Claude Read's file.filePath) to out.
+func responsePaths(n *Node, out []string) []string {
+	if n == nil {
+		return out
+	}
+	if n.Kind == 'v' && slices.Contains(pathKeys, n.Key) {
+		var s string
+		if json.Unmarshal(n.Raw, &s) == nil {
+			out = append(out, s)
+		}
+	}
+	for _, kid := range n.Kids {
+		out = responsePaths(kid, out)
+	}
+	return out
+}
+
 // selectorFor derives the reducer selector from the capture metadata, the decoded
 // tool input and the caller's overrides.
 func selectorFor(meta CaptureMeta, body *HookBody, over Selector) Selector {
@@ -259,7 +300,7 @@ func selectorFor(meta CaptureMeta, body *HookBody, over Selector) Selector {
 		return ""
 	}
 	sel := Selector{Client: meta.Client, Tool: meta.Tool, ExitCode: meta.ExitCode, Family: over.Family,
-		Command: first("command", "cmd"), Path: first("file_path", "filePath", "path", "target_file", "notebook_path", "directory", "dir_path")}
+		Command: first("command", "cmd"), Path: first(pathKeys...)}
 	if over.Command != "" {
 		sel.Command = over.Command
 	}
