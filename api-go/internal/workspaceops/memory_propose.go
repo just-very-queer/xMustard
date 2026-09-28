@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/govstore"
+	"xmustard/api-go/internal/injection"
 	"xmustard/api-go/internal/redact"
 )
 
@@ -130,6 +131,13 @@ type ContextEntry struct {
 	Kind  string   `json:"kind,omitempty"`
 	Topic string   `json:"topic,omitempty"`
 	Tags  []string `json:"tags,omitempty"`
+	// Quarantine says why the entry is quarantined (WS-56): it derives from an untrusted
+	// capture or a foreign import. A quarantined entry is served labeled and never pushed
+	// into context unasked, and it cannot enter the core tier.
+	Quarantine string `json:"quarantine,omitempty"`
+	// InjectionFlags are the instruction patterns its title and content match
+	// (injection.Scan), set wherever its text is returned.
+	InjectionFlags []string `json:"injection_flags,omitempty"`
 	// Recall labels (WS-20), set only on recall results: the rank state (served,
 	// pending, superseded, expired), the trust (a verification mode, or unverified),
 	// the peer approvals a pending entry still needs, the ranking signals when
@@ -194,6 +202,10 @@ type ContextActor struct {
 	CallID    string
 	RunID     string
 	Evidence  []string
+	// Quarantine says why what this actor writes is quarantined (WS-56): it cites an
+	// untrusted capture (bindProvenance), or an importer brings it in from outside the
+	// workspace's store (injection.QuarantineForeignImport). "" when it is not.
+	Quarantine string
 }
 
 // safeIDPattern rejects anything that could escape the data dir or be a path
@@ -304,7 +316,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			WorkspaceID: workspaceID, Title: title, Content: req.Content, Permission: permission,
 			RequiredVerifications: required, RequireVerification: peersOnly,
 			Paths: cleanPaths(anchors), SearchTokens: memoryTokenList(title + " " + req.Content),
-			ExpiresAt: expiresAt, Metadata: supersedesMetadata(supersedes),
+			ExpiresAt: expiresAt, Metadata: proposalMetadata(supersedes, caller.Quarantine),
 			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags),
 		}, actor)
 		if err != nil {
@@ -372,11 +384,32 @@ func cleanSupersedes(ids []string) ([]string, error) {
 	return out, nil
 }
 
-func supersedesMetadata(ids []string) map[string]string {
-	if len(ids) == 0 {
+// proposalMetadata is a proposal's entry metadata: its pending supersession and its
+// quarantine, when it has them.
+func proposalMetadata(supersedes []string, quarantine string) map[string]string {
+	meta := map[string]string{}
+	if len(supersedes) > 0 {
+		meta[supersedesKey] = strings.Join(supersedes, ",")
+	}
+	if quarantine != "" {
+		meta[govstore.MetaQuarantine] = quarantine
+	}
+	return meta
+}
+
+// markQuarantined marks e quarantined for why, keeping its classification. An entry
+// already quarantined keeps its first reason; an empty why changes nothing.
+func markQuarantined(ctx context.Context, tx govstore.Tx, e govstore.Entry, why string, actor govstore.Actor) error {
+	if why == "" || e.Metadata[govstore.MetaQuarantine] != "" {
 		return nil
 	}
-	return map[string]string{supersedesKey: strings.Join(ids, ",")}
+	meta := maps.Clone(e.Metadata)
+	if meta == nil {
+		meta = map[string]string{}
+	}
+	meta[govstore.MetaQuarantine] = why
+	_, err := tx.SetClassification(ctx, e.ID, govstore.Classification{Kind: e.Kind, Topic: e.Topic, Tags: e.Tags, Metadata: meta}, actor)
+	return err
 }
 
 // pendingSupersedes is the supersession a proposal still waits to apply.
@@ -503,5 +536,19 @@ func Remember(dataDir, workspaceID string, req RememberRequest, actor ContextAct
 		return nil, err
 	}
 	red.annotate(out)
+	flagInstructions(out, req.Title, req.Content, req.NewString)
 	return out, nil
+}
+
+// flagInstructions reports on a written entry the instruction patterns the text it
+// stored matches (WS-56). The write is kept: the text is served labeled on recall and
+// is never pushed into context unasked.
+func flagInstructions(e *ContextEntry, text ...string) {
+	rep := injection.Scan(text...)
+	if e == nil || rep.Clean() {
+		return
+	}
+	e.InjectionFlags = rep.Flags
+	e.Warnings = append(e.Warnings, fmt.Sprintf("the text matches instruction patterns (%s): recall serves it labeled "+
+		"with injection_flags, and hooks and the core tier never inject it", strings.Join(rep.Flags, ", ")))
 }

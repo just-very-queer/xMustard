@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/injection"
 )
 
 // Default limits. Configuration may LOWER them (XMUSTARD_EVIDENCE_*); an increase needs
@@ -205,6 +206,9 @@ type Delivery struct {
 	// CapturedIdentity is "bound" when complete identities before and after execution
 	// agree, otherwise "unknown".
 	CapturedIdentity string `json:"captured_identity"`
+	// InjectionFlags are the instruction patterns the projection matches (WS-56): tool
+	// output is data, and a client should present flagged output as such.
+	InjectionFlags []string `json:"injection_flags,omitempty"`
 }
 
 // Page is one authorized byte range of a retained original, base64-encoded (standard
@@ -472,6 +476,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		}
 	}
 	d.Projection, d.ProjectedBytes, d.Omissions, d.Reduced, d.ProjectionMode = proj, len(proj), rec.Omissions, rec.Reduced, rec.Mode
+	d.InjectionFlags = injection.Scan(proj).Flags
 	if !rec.Reduced && !req.Retain {
 		// nothing omitted: nothing retained, no handle, identity not sampled
 		d.CapturedIdentity = "unknown"

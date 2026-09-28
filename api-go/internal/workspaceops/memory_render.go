@@ -9,6 +9,7 @@ import (
 	"unicode/utf8"
 
 	"xmustard/api-go/internal/govstore"
+	"xmustard/api-go/internal/injection"
 )
 
 // Recall disclosure and budgets (PAR-RCL-04/05/06): a page of the ranked candidates,
@@ -27,25 +28,29 @@ type recallPage struct {
 // RecallLine is the compact render of an entry: one line of its text; fetch the full
 // entry with recall(entry_id).
 type RecallLine struct {
-	ID           string        `json:"id"`
-	Title        string        `json:"title"`
-	Trust        string        `json:"trust"`
-	State        string        `json:"state"`
-	Stale        bool          `json:"stale,omitempty"`
-	Paths        []string      `json:"paths,omitempty"`
-	VotesNeeded  *int          `json:"votes_needed,omitempty"`
-	Text         string        `json:"text"`
-	ScoreDetails *ScoreDetails `json:"score_details,omitempty"`
+	ID             string        `json:"id"`
+	Title          string        `json:"title"`
+	Trust          string        `json:"trust"`
+	State          string        `json:"state"`
+	Stale          bool          `json:"stale,omitempty"`
+	Paths          []string      `json:"paths,omitempty"`
+	VotesNeeded    *int          `json:"votes_needed,omitempty"`
+	Quarantine     string        `json:"quarantine,omitempty"`
+	InjectionFlags []string      `json:"injection_flags,omitempty"`
+	Text           string        `json:"text"`
+	ScoreDetails   *ScoreDetails `json:"score_details,omitempty"`
 }
 
 // RecallName is the names_only render: enough to choose what to fetch.
 type RecallName struct {
-	ID    string   `json:"id"`
-	Title string   `json:"title"`
-	Topic string   `json:"topic,omitempty"`
-	State string   `json:"state"`
-	Stale bool     `json:"stale,omitempty"`
-	Paths []string `json:"paths,omitempty"`
+	ID             string   `json:"id"`
+	Title          string   `json:"title"`
+	Topic          string   `json:"topic,omitempty"`
+	State          string   `json:"state"`
+	Stale          bool     `json:"stale,omitempty"`
+	Paths          []string `json:"paths,omitempty"`
+	Quarantine     string   `json:"quarantine,omitempty"`
+	InjectionFlags []string `json:"injection_flags,omitempty"`
 }
 
 // compactTextChars bounds a compact line's text.
@@ -93,11 +98,13 @@ func mapRows[T any](es []ContextEntry, f func(ContextEntry) T) []T {
 
 func compactRow(e ContextEntry) RecallLine {
 	return RecallLine{ID: e.ID, Title: e.Title, Trust: e.Trust, State: e.State, Stale: e.Stale, Paths: e.Paths,
-		VotesNeeded: e.VotesNeeded, Text: oneLine(e.Content, compactTextChars), ScoreDetails: e.ScoreDetails}
+		VotesNeeded: e.VotesNeeded, Quarantine: e.Quarantine, InjectionFlags: e.InjectionFlags,
+		Text: oneLine(e.Content, compactTextChars), ScoreDetails: e.ScoreDetails}
 }
 
 func nameRow(e ContextEntry) RecallName {
-	return RecallName{ID: e.ID, Title: e.Title, Topic: e.Topic, State: e.State, Stale: e.Stale, Paths: e.Paths}
+	return RecallName{ID: e.ID, Title: e.Title, Topic: e.Topic, State: e.State, Stale: e.Stale, Paths: e.Paths,
+		Quarantine: e.Quarantine, InjectionFlags: e.InjectionFlags}
 }
 
 // oneLine folds text onto one line of at most n bytes, cut on a rune boundary.
@@ -117,9 +124,11 @@ func cutRunes(s string, n int) string {
 	return s[:n]
 }
 
-// label fills the recall-only fields of a returned entry.
+// label fills the recall-only fields of a returned entry, and the instruction patterns
+// its text matches (WS-56).
 func (c scoredEntry) label(explain bool) ContextEntry {
 	e := c.entry
+	e.InjectionFlags = injection.Scan(e.Title, e.Content).Flags
 	e.State, e.Trust = c.rank.State, trustLabel(c.rank)
 	if c.rank.State == govstore.RankPending {
 		need := max(c.rank.RequiredVerifications-c.rank.PeerApprovals, 0)
@@ -160,6 +169,7 @@ func finishRecall(workspaceID string, req RecallRequest, res map[string]any, pag
 	render := recallRenders[req.renderName()]
 	res["render"] = req.renderName()
 	res["already_shown"] = alreadyShown
+	res["data_notice"] = injection.DataNotice // memory is data, not instructions (WS-56)
 	// build renders the first n picked entries as kept, and returns the result's size.
 	build := func(kept []ContextEntry, n int) int {
 		resume := next

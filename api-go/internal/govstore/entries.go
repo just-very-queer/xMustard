@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"regexp"
 	"strconv"
 	"strings"
@@ -34,9 +35,18 @@ const (
 	ModeSingleAgent          = "single_agent"
 )
 
+// Tiers (PAR-GOV-08). The core tier is pushed into every session.
+const TierCore = "core"
+
+// MetaQuarantine is the metadata key that marks an entry quarantined (WS-56): content
+// derived from an untrusted capture or a foreign import. Its value says why. The mark
+// is sticky: a classification change keeps it, and a quarantined entry never enters
+// the core tier.
+const MetaQuarantine = "quarantine"
+
 var (
 	validScopes      = set("workspace", "dir", "private", "session", "run", "global", "shared")
-	validTiers       = set("", "core", "deferred")
+	validTiers       = set("", TierCore, "deferred")
 	validPermissions = set("readonly", "readwrite")
 	validStatuses    = set(StatusPending, StatusVerified, StatusRejected)
 	validModes       = set(ModePeerVerified, ModeSelfAssertedOpenMode, ModeSingleAgent)
@@ -462,6 +472,8 @@ func (t *txn) insertEntry(ctx context.Context, in NewEntry, o entryOrigin, actor
 		return Entry{}, fmt.Errorf("%w: scope %q", ErrInvalid, scope)
 	case !validTiers[in.Tier]:
 		return Entry{}, fmt.Errorf("%w: tier %q", ErrInvalid, in.Tier)
+	case in.Tier == TierCore && in.Metadata[MetaQuarantine] != "":
+		return Entry{}, quarantinedCore(in.ID, in.Metadata[MetaQuarantine])
 	case !validPermissions[permission]:
 		return Entry{}, fmt.Errorf("%w: permission %q", ErrInvalid, permission)
 	case strings.TrimSpace(in.Content) == "":
@@ -794,7 +806,21 @@ func (t *txn) SetTier(ctx context.Context, id, tier string, actor Actor) (Entry,
 	if !validTiers[tier] {
 		return Entry{}, fmt.Errorf("%w: tier %q", ErrInvalid, tier)
 	}
+	if tier == TierCore {
+		cur, err := t.GetEntry(ctx, id)
+		if err != nil {
+			return Entry{}, err
+		}
+		if q := cur.Metadata[MetaQuarantine]; q != "" {
+			return Entry{}, quarantinedCore(id, q)
+		}
+	}
 	return t.updateField(ctx, id, actor, EventTierChange, "tier", tier, func(e Entry) string { return e.Tier }, tier)
+}
+
+// quarantinedCore refuses a quarantined entry the core tier.
+func quarantinedCore(id, why string) error {
+	return fmt.Errorf("%w: entry %s is quarantined (%s) and cannot enter the core tier", ErrInvalid, id, why)
 }
 
 // SetRequiredVerifications changes the entry's gate. The peer_verified invariant is
@@ -858,6 +884,13 @@ func (t *txn) SetClassification(ctx context.Context, id string, c Classification
 	}
 	if cur.Lifecycle == LifecyclePurged {
 		return Entry{}, fmt.Errorf("%w: entry %s is purged", ErrInvalid, id)
+	}
+	if q := cur.Metadata[MetaQuarantine]; q != "" && c.Metadata[MetaQuarantine] == "" {
+		c.Metadata = maps.Clone(c.Metadata) // the quarantine mark is sticky
+		if c.Metadata == nil {
+			c.Metadata = map[string]string{}
+		}
+		c.Metadata[MetaQuarantine] = q
 	}
 	tags, err := encodeStrings(c.Tags)
 	if err != nil {

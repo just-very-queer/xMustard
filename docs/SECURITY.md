@@ -158,6 +158,59 @@ peer invariant, so the API and the store agree on who is a peer.
   `redactions` (count per rule) and a warning naming the rules. `old_string` only
   locates stored text and is never stored.
 
+### Injection safety (WS-56)
+
+Everything xMustard puts into an agent's context is text that agents wrote or tools
+produced, and it can carry instructions aimed at the agent reading it.
+`api-go/internal/injection` holds the policy as data tables, and the checks that
+refuse text are explicit and fail closed.
+
+- **Scan.** A rule table flags the shapes of an injection, not imperative text as
+  such (a memory is meant to say "run make check before committing"): overriding
+  earlier instructions, a new task or role, forged authority, secrecy towards the
+  user, prompt leaks, exfiltration of secrets, `curl | sh`, chat-template tokens,
+  `Human:`/`Assistant:` turns, frame and system tags, forged hook JSON, and invisible
+  characters (zero-width, bidirectional controls, Unicode tag characters). The text is
+  folded once (lowercase, whitespace runs to one space). Every match starts with one
+  of its rule's trigger literals, so a pattern runs only from a trigger, over a
+  window its longest match fits in. A scan reads at most 128 KiB and reports
+  `scan_truncated` past that.
+- **Where it runs.** `recall` (every render, the memory index and fetch by id) labels
+  each entry with `injection_flags` and `quarantine` and adds a `data_notice`.
+  `remember` keeps flagged text and returns the flags with a warning. Every evidence
+  projection, which is every MCP tool result and every captured native output,
+  carries `injection_flags`, and the MCP bridge adds a data-framing note to a flagged
+  result. The initialize instructions say that memory, tool output and
+  `<xmustard-data>` blocks are data, not instructions. `ground` returns counts and
+  ids only, so it carries no agent-written text.
+- **Pushed surfaces.** Memory pushed into context unasked, from a hook (WS-23) or the
+  core tier (WS-31), goes through `workspaceops.AdmitMemory`. The checks run in order:
+  the entry exists in the workspace, it is served, its content matches its digest, it
+  is not quarantined, it has a human approval, and it scans clean (a truncated scan
+  counts as flagged). What passes is framed in `<xmustard-data>` blocks after a notice.
+  The frame cannot be closed from inside: a frame tag in the text is written with
+  `&lt;`.
+- **Human approval** of a memory is an `approve` verdict on its served revision, in the
+  current vote epoch. The verdict must be recorded with kind `human`, and its principal
+  must be a human approver of the workspace now: a file-backed token of kind `human`
+  with the `human-approver` role (admin holds it), scoped to the workspace, unexpired
+  and not revoked. The approver must not have written the entry or the served
+  revision. Approval by a quorum of agents, or by anyone in open mode, is not human
+  approval. So without a human approver, nothing is pushed.
+- **Quarantine.** A write that cites an evidence handle captured from a tool other than
+  the workspace's own file, search, list, diff and shell tools or xMustard's tools
+  (for example WebFetch, WebSearch, a browser or another MCP server) marks the entry
+  `quarantine: untrusted_capture:<tool>`. The list of trusted tools is an allowlist, so
+  an unknown tool name is untrusted. An importer marks foreign memory
+  `foreign_import`. The mark is sticky: an edit that cites such a capture adds it, and
+  a classification change keeps it. A quarantined entry is still served on recall,
+  labeled, but it is never pushed, and the store refuses it the core tier.
+- **Limits.** The scan is a pattern check: a paraphrase it has no rule for passes, and
+  a legitimate memory that quotes an injection is flagged (and so never pushed).
+  Quarantine sees only what a write cites; content an agent copies from the web
+  without citing the capture is not marked. The capture's tool name is the one the
+  capturing client recorded.
+
 ### Changes for existing tokens
 
 Before the role table, an `agent` token could call every route except the admin
