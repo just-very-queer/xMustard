@@ -203,14 +203,39 @@ func (t *Tool) listEntry(version string, profile SchemaProfile) map[string]any {
 	return e
 }
 
-// invalidParams is the JSON-RPC -32602 error for a rejected argument; data names the
-// tool and argument so a client can point at the offending field.
-func invalidParams(tool, arg, reason string, extra map[string]any) *RPCError {
-	data := map[string]any{"tool": tool, "argument": arg, "reason": reason}
-	for k, v := range extra {
-		data[k] = v
+// ArgError is a tools/call argument the tool does not take as given: unknown, of the
+// wrong type, outside its enum, bounds or length, missing when required, or given
+// under two names with different values. MCP 2025-11-25 makes input validation a tool
+// execution error, so dispatch answers it as a result with isError (argErrorResult)
+// that a client hands to the model, never as a JSON-RPC error, which clients may show
+// as an empty response.
+type ArgError struct {
+	Tool     string
+	Argument string
+	// Reason is what was wrong: "unknown", "required", a toolcompat code, or the rule
+	// the value broke ("must be an integer").
+	Reason string
+	// Detail carries the rule's bounds (minimum and maximum, enum, maxLength) or
+	// toolcompat's expected spelling and signature.
+	Detail  map[string]any
+	Message string
+}
+
+func (e *ArgError) Error() string { return e.Message }
+
+// argError rejects arg for the reason a rule gives; extra holds the rule's bounds.
+func argError(tool, arg, reason string, extra map[string]any) *ArgError {
+	return &ArgError{Tool: tool, Argument: arg, Reason: reason, Detail: extra,
+		Message: fmt.Sprintf("argument %q for tool %s %s", arg, tool, reason)}
+}
+
+// data is the error as _meta["xmustard/argument_error"] carries it.
+func (e *ArgError) data() map[string]any {
+	d := map[string]any{"tool": e.Tool, "argument": e.Argument, "reason": e.Reason}
+	for k, v := range e.Detail {
+		d[k] = v
 	}
-	return &RPCError{Code: CodeInvalidParams, Message: fmt.Sprintf("argument %q for tool %s %s", arg, tool, reason), Data: data}
+	return d
 }
 
 // BuildArgs strictly validates raw tools/call arguments against the tool's declared
@@ -218,7 +243,7 @@ func invalidParams(tool, arg, reason string, extra map[string]any) *RPCError {
 // wrong types, non-scalar values, out-of-enum values, strings over their length cap
 // and integers outside their bounds (never clamping), and folds hidden aliases onto
 // their canonical names. The returned map records each alias that was used.
-func BuildArgs(t *Tool, raw map[string]any) (args map[string]string, aliased map[string]string, rerr *RPCError) {
+func BuildArgs(t *Tool, raw map[string]any) (args map[string]string, aliased map[string]string, aerr *ArgError) {
 	args = map[string]string{}
 	from := map[string]string{} // canonical name -> the key that supplied it
 	for k, v := range raw {
@@ -227,19 +252,19 @@ func BuildArgs(t *Tool, raw map[string]any) (args map[string]string, aliased map
 		if !ok {
 			canon, isAlias := t.Aliases[k]
 			if !isAlias {
-				return nil, nil, &RPCError{Code: CodeInvalidParams, Message: fmt.Sprintf("unknown argument %q for tool %s", k, t.Name),
-					Data: map[string]any{"tool": t.Name, "argument": k, "reason": "unknown"}}
+				return nil, nil, &ArgError{Tool: t.Name, Argument: k, Reason: "unknown",
+					Message: fmt.Sprintf("unknown argument %q for tool %s", k, t.Name)}
 			}
 			name = canon
 			spec, _ = t.arg(canon)
 		}
-		val, rerr := coerce(t.Name, k, spec, v)
-		if rerr != nil {
-			return nil, nil, rerr
+		val, aerr := coerce(t.Name, k, spec, v)
+		if aerr != nil {
+			return nil, nil, aerr
 		}
 		if prev, dup := from[name]; dup {
 			if args[name] != val {
-				return nil, nil, invalidParams(t.Name, k, fmt.Sprintf("conflicts with %q", prev), nil)
+				return nil, nil, argError(t.Name, k, fmt.Sprintf("conflicts with %q", prev), nil)
 			}
 		} else {
 			from[name] = k
@@ -255,12 +280,12 @@ func BuildArgs(t *Tool, raw map[string]any) (args map[string]string, aliased map
 	return args, aliased, nil
 }
 
-func coerce(tool, key string, spec Arg, v any) (string, *RPCError) {
+func coerce(tool, key string, spec Arg, v any) (string, *ArgError) {
 	switch spec.Type {
 	case typeBoolean:
 		b, ok := v.(bool)
 		if !ok {
-			return "", invalidParams(tool, key, "must be a boolean", nil)
+			return "", argError(tool, key, "must be a boolean", nil)
 		}
 		return strconv.FormatBool(b), nil
 	case typeInteger:
@@ -271,16 +296,16 @@ func coerce(tool, key string, spec Arg, v any) (string, *RPCError) {
 		case json.Number:
 			var err error
 			if f, err = n.Float64(); err != nil {
-				return "", invalidParams(tool, key, "must be an integer", nil)
+				return "", argError(tool, key, "must be an integer", nil)
 			}
 		default:
-			return "", invalidParams(tool, key, "must be an integer", nil)
+			return "", argError(tool, key, "must be an integer", nil)
 		}
 		if f != math.Trunc(f) || math.IsInf(f, 0) || math.IsNaN(f) {
-			return "", invalidParams(tool, key, "must be an integer", nil)
+			return "", argError(tool, key, "must be an integer", nil)
 		}
 		if f < float64(spec.Min) || f > float64(spec.Max) {
-			return "", invalidParams(tool, key, fmt.Sprintf("must be between %d and %d (got %s); out-of-range values are rejected, not clamped",
+			return "", argError(tool, key, fmt.Sprintf("must be between %d and %d (got %s); out-of-range values are rejected, not clamped",
 				spec.Min, spec.Max, strconv.FormatFloat(f, 'f', -1, 64)), map[string]any{"minimum": spec.Min, "maximum": spec.Max})
 		}
 		return strconv.FormatInt(int64(f), 10), nil
@@ -290,13 +315,13 @@ func coerce(tool, key string, spec Arg, v any) (string, *RPCError) {
 		}
 		s, ok := v.(string)
 		if !ok {
-			return "", invalidParams(tool, key, "must be a string", nil)
+			return "", argError(tool, key, "must be a string", nil)
 		}
 		if len(spec.Enum) > 0 && !contains(spec.Enum, s) {
-			return "", invalidParams(tool, key, "must be one of: "+strings.Join(spec.Enum, ", "), map[string]any{"enum": spec.Enum})
+			return "", argError(tool, key, "must be one of: "+strings.Join(spec.Enum, ", "), map[string]any{"enum": spec.Enum})
 		}
 		if spec.MaxLen > 0 && utf8.RuneCountInString(s) > spec.MaxLen {
-			return "", invalidParams(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
+			return "", argError(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
 		}
 		return s, nil
 	}
@@ -304,24 +329,24 @@ func coerce(tool, key string, spec Arg, v any) (string, *RPCError) {
 
 // coerceList validates a comma-separated list, or a JSON array of strings, and
 // returns its elements trimmed and comma-joined.
-func coerceList(tool, key string, spec Arg, v any) (string, *RPCError) {
+func coerceList(tool, key string, spec Arg, v any) (string, *ArgError) {
 	var elems []string
 	switch x := v.(type) {
 	case string:
 		if spec.MaxLen > 0 && utf8.RuneCountInString(x) > spec.MaxLen {
-			return "", invalidParams(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
+			return "", argError(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
 		}
 		elems = strings.Split(x, ",")
 	case []any:
 		for _, e := range x {
 			s, ok := e.(string)
 			if !ok {
-				return "", invalidParams(tool, key, "must be a comma-separated string or an array of strings", nil)
+				return "", argError(tool, key, "must be a comma-separated string or an array of strings", nil)
 			}
 			elems = append(elems, s)
 		}
 	default:
-		return "", invalidParams(tool, key, "must be a comma-separated string or an array of strings", nil)
+		return "", argError(tool, key, "must be a comma-separated string or an array of strings", nil)
 	}
 	out := make([]string, 0, len(elems))
 	for _, e := range elems {
@@ -329,14 +354,14 @@ func coerceList(tool, key string, spec Arg, v any) (string, *RPCError) {
 			continue
 		}
 		if len(spec.Enum) > 0 && !contains(spec.Enum, e) {
-			return "", invalidParams(tool, key, fmt.Sprintf("names %q; each element must be one of: %s", e, strings.Join(spec.Enum, ", ")),
+			return "", argError(tool, key, fmt.Sprintf("names %q; each element must be one of: %s", e, strings.Join(spec.Enum, ", ")),
 				map[string]any{"enum": spec.Enum})
 		}
 		out = append(out, e)
 	}
 	joined := strings.Join(out, ",")
 	if spec.MaxLen > 0 && utf8.RuneCountInString(joined) > spec.MaxLen {
-		return "", invalidParams(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
+		return "", argError(tool, key, fmt.Sprintf("must be at most %d characters", spec.MaxLen), map[string]any{"maxLength": spec.MaxLen})
 	}
 	return joined, nil
 }

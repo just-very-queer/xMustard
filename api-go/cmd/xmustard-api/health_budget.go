@@ -49,11 +49,19 @@ type publicBudget struct {
 func healthResponse(r *http.Request) map[string]any {
 	full, detail := healthBudgetView(r)
 	body := map[string]any{"status": "ok", "service": "api-go"}
+	// the governance store's startup check (WS-58), once the daemon ran it
+	store := workspaceops.MemoryStoreHealth(dataDir())
 	if !full {
 		body["transient_pool"] = map[string]any{"max": budget.TransientBytes.Max()}
 		body["children"] = map[string]any{"cap": budget.Children.Cap()}
 		body["budget"] = publicBudget{Version: 1, GateBytes: budget.GateBytes, SoftCeilingBytes: budget.Gov.SoftCeiling(), Detail: detail}
+		if store.Status != "" {
+			body["store"] = store.Public()
+		}
 		return body
+	}
+	if store.Status != "" {
+		body["store"] = store
 	}
 	// admission counters (bench/diagnostics): bytes xMustard reserved, not RSS
 	body["transient_pool"] = map[string]any{"max": budget.TransientBytes.Max(), "in_use": budget.TransientBytes.InUse(), "peak": budget.TransientBytes.Peak()}

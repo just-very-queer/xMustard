@@ -32,8 +32,9 @@ use super::csr::{self, FILE_IN, FILE_OUT, FileEdge, GraphStorage, Segment};
 use super::envelope::{self, Freshness, Relation};
 use super::{DB_FILE, meta, scan, schema};
 use crate::symbolgraph::{
-    CoverageLoss, FileCluster, FileRef, Hotspot, ImpactedFile, IndexCoverage, IndexWork,
-    QueryGraph, SourceIdentitySummary, SymbolImpact, SymbolRef, SymbolTrace, dominant_directory,
+    CoverageLoss, FileCluster, FileImpact, FileRef, Hotspot, ImpactedFile, IndexCoverage,
+    IndexWork, QueryGraph, SourceIdentitySummary, SymbolImpact, SymbolRef, SymbolTrace,
+    dominant_directory,
 };
 
 fn sql(e: rusqlite::Error) -> String {
@@ -265,6 +266,39 @@ impl Snapshot {
         Ok(out)
     }
 
+    /// The files that reference `start`, transitively up to `max_depth` hops, each with
+    /// its distance, nearest first and in path order within a distance (the legacy
+    /// graph's `dependents` over the file projection).
+    fn dependents(
+        &self,
+        start: impl IntoIterator<Item = u32>,
+        max_depth: usize,
+    ) -> Result<Vec<ImpactedFile>, String> {
+        let mut frontier: Vec<u32> = start.into_iter().collect();
+        let mut visited: HashSet<u32> = frontier.iter().copied().collect();
+        let mut impacted = Vec::new();
+        let mut depth = 1;
+        while !frontier.is_empty() && depth <= max_depth {
+            let mut next = BTreeSet::new();
+            for f in &frontier {
+                for e in self.seg.neighbours::<FileEdge>(FILE_IN, *f)? {
+                    if visited.insert(e.file) {
+                        next.insert(e.file);
+                    }
+                }
+            }
+            for f in &next {
+                impacted.push(ImpactedFile {
+                    path: self.files.path(*f).to_string(),
+                    distance: depth,
+                });
+            }
+            frontier = next.into_iter().collect();
+            depth += 1;
+        }
+        Ok(impacted)
+    }
+
     fn paths(&self, ids: impl IntoIterator<Item = u32>) -> Vec<String> {
         ids.into_iter()
             .map(|f| self.files.path(f).to_string())
@@ -429,28 +463,7 @@ impl QueryGraph for Snapshot {
 
     fn impact(&self, symbol: &str, max_depth: usize) -> Result<SymbolImpact, String> {
         let defined = self.defining_files(symbol)?;
-        let mut visited: HashSet<u32> = defined.iter().copied().collect();
-        let mut frontier: Vec<u32> = defined.iter().copied().collect();
-        let mut impacted = Vec::new();
-        let mut depth = 1;
-        while !frontier.is_empty() && depth <= max_depth {
-            let mut next = BTreeSet::new();
-            for f in &frontier {
-                for e in self.seg.neighbours::<FileEdge>(FILE_IN, *f)? {
-                    if visited.insert(e.file) {
-                        next.insert(e.file);
-                    }
-                }
-            }
-            for f in &next {
-                impacted.push(ImpactedFile {
-                    path: self.files.path(*f).to_string(),
-                    distance: depth,
-                });
-            }
-            frontier = next.into_iter().collect();
-            depth += 1;
-        }
+        let impacted = self.dependents(defined.iter().copied(), max_depth)?;
         Ok(SymbolImpact {
             symbol: symbol.to_string(),
             defined_in: self.paths(defined),
@@ -460,6 +473,12 @@ impl QueryGraph for Snapshot {
             generated_at: now(),
             ..Default::default()
         })
+    }
+
+    fn file_impact(&self, path: &str, max_depth: usize) -> Result<FileImpact, String> {
+        let start = self.seg.file_id(path)?;
+        let impacted = self.dependents(start, max_depth)?;
+        Ok(FileImpact::new(path, start.is_some(), impacted, max_depth))
     }
 
     fn trace(&self, from: &str, to: &str) -> Result<SymbolTrace, String> {

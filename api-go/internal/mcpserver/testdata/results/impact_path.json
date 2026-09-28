@@ -1,0 +1,49 @@
+{
+  "arguments": {
+    "max_depth": 3,
+    "path": "pkg/calc/calc.go"
+  },
+  "result": {
+    "coverage": {
+      "complete": true,
+      "eligible_files": 3,
+      "indexed_files": 3,
+      "languages": {
+        "go": {
+          "failed": 0,
+          "supported": 3,
+          "unsupported": 0
+        }
+      },
+      "loss_counts": {},
+      "max_files": 10000,
+      "truncated": false
+    },
+    "found": true,
+    "freshness": {
+      "dirty_paths_touching_result": [],
+      "head": "7eb1d9b44b30a89da2484c06bcfa30cd4345c4d0",
+      "identity_age_ms": 0,
+      "index_version": "xm-index-2",
+      "indexed_commit": "7eb1d9b44b30a89da2484c06bcfa30cd4345c4d0",
+      "source": "legacy_graph",
+      "status": "current",
+      "watcher_state": "absent"
+    },
+    "generated_at": "2026-09-28T11:21:05Z",
+    "impacted": [
+      {
+        "distance": 1,
+        "path": "pkg/report/report.go"
+      },
+      {
+        "distance": 2,
+        "path": "main.go"
+      }
+    ],
+    "impacted_count": 2,
+    "max_depth": 3,
+    "path": "pkg/calc/calc.go"
+  },
+  "tool": "impact"
+}

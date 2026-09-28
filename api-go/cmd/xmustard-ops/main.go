@@ -31,6 +31,9 @@ func main() {
 	if run, ok := approvalCommands[args[0]]; ok { // the human-approval surface (approval.go)
 		os.Exit(run(defaultOpsEnv(), args[1:]))
 	}
+	if run, ok := lifecycleCommands[args[0]]; ok { // daemon lifecycle and store backup (setup.go)
+		os.Exit(run(defaultLifecycleEnv(), args[1:]))
+	}
 	switch args[0] {
 	case "diagnostics":
 		runDiagnostics(args[1:])

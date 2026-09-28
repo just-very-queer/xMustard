@@ -30,16 +30,16 @@ func TestToolcompatRepairsAndRecordsNormalizations(t *testing.T) {
 func TestToolcompatNeverRewritesWriteTools(t *testing.T) {
 	api := &fakeAPI{}
 	s := newSession(t, api, Options{}, nil, LatestProtocolVersion)
-	_, rerr := call(t, s, "remember", map[string]any{"workspace_id": "ws", "text": "a fact"})
-	if rerr == nil || rerr.Code != CodeInvalidParams || !strings.Contains(rerr.Message, `"content"`) {
-		t.Fatalf("want -32602 naming content, got %+v", rerr)
+	msg, d := argErr(t, s, "remember", map[string]any{"workspace_id": "ws", "text": "a fact"})
+	if !strings.Contains(msg, `"content"`) || d["reason"] != "needs_repair" || d["argument"] != "content" {
+		t.Fatalf("want an argument error naming content, got %q %v", msg, d)
 	}
 	if n := len(api.toolRequests()); n != 0 {
 		t.Fatalf("a refused write reached the API %d times", n)
 	}
 	// a number spelled as a string stays a strict rejection (no coercion)
-	if _, rerr := call(t, s, "recall", map[string]any{"workspace_id": "ws", "limit": "5"}); rerr == nil {
-		t.Fatal("a string integer was coerced")
+	if _, d := argErr(t, s, "recall", map[string]any{"workspace_id": "ws", "limit": "5"}); d["argument"] != "limit" {
+		t.Fatalf("a string integer was coerced: %v", d)
 	}
 }
 

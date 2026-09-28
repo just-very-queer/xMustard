@@ -615,10 +615,18 @@ func (s *SQLStore) View(ctx context.Context, fn func(Reader) error) error {
 // exist. It runs on a dedicated connection so writers are never blocked. The copy holds
 // all governance text, so it is created 0600 like the store; a backup taken before a
 // purge still holds the purged text.
-func (s *SQLStore) Backup(ctx context.Context, dest string) (err error) {
+func (s *SQLStore) Backup(ctx context.Context, dest string) error {
 	if s.closed.Load() {
 		return ErrClosed
 	}
+	return vacuumInto(ctx, s.path+"?_pragma=busy_timeout("+
+		strconv.FormatInt(s.opts.BusyTimeout.Milliseconds(), 10)+")&_pragma=mmap_size(0)&_pragma=cache_size(-"+
+		strconv.Itoa(s.opts.ReaderCacheKiB)+")", dest)
+}
+
+// vacuumInto writes a consistent, compacted copy of the database dsn opens to dest,
+// which must not exist, and removes dest when that fails.
+func vacuumInto(ctx context.Context, dsn, dest string) (err error) {
 	// Create dest first, exclusively and private: this refuses an existing file without
 	// a stat-then-create race, and VACUUM INTO accepts an empty existing file.
 	f, err := os.OpenFile(dest, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
@@ -634,9 +642,7 @@ func (s *SQLStore) Backup(ctx context.Context, dest string) (err error) {
 			_ = os.Remove(dest)
 		}
 	}()
-	db, err := sql.Open("sqlite", s.path+"?_pragma=busy_timeout("+
-		strconv.FormatInt(s.opts.BusyTimeout.Milliseconds(), 10)+")&_pragma=mmap_size(0)&_pragma=cache_size(-"+
-		strconv.Itoa(s.opts.ReaderCacheKiB)+")")
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return err
 	}

@@ -5,14 +5,17 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/injection"
+	"xmustard/api-go/internal/redact"
 )
 
 // Universal observation capture (PAR-CTX-01): the output of ANY tool — a client's
@@ -26,6 +29,12 @@ import (
 
 // FormatRaw is a body that is the tool output itself.
 const FormatRaw HookFormat = "raw"
+
+// ErrSecretPath refuses the capture of a tool output whose path is a secret file or
+// directory (redact.MatchSecretPath: SSH keys, netrc, registry tokens, .env files).
+// Such content is a credential store whatever the redactor finds in it, so it is
+// neither retained nor projected; the client keeps its own result.
+var ErrSecretPath = errors.New("the captured output comes from a secret path and is not retained")
 
 // ObservationInput is one capture request.
 type ObservationInput struct {
@@ -76,7 +85,8 @@ type ObservationResult struct {
 	Command string `json:"-"`
 }
 
-// Observe captures one tool output.
+// Observe captures one tool output. The output of a secret path is refused
+// (ErrSecretPath) once the body has named its paths; the spool is discarded.
 func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput) (*ObservationResult, error) {
 	if reg == nil {
 		reg = DefaultRegistry()
@@ -148,6 +158,9 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	meta.CapturedIdentity = "unknown"
 	if in.Format == FormatRaw || in.Format == "" {
 		meta.BodySHA256, meta.BodyBytes = body.BodySHA256, body.BodyBytes
+	}
+	if path, pattern := secretPath(body, in.Sel); pattern != "" {
+		return nil, fmt.Errorf("%w (%q matches %s)", ErrSecretPath, path, pattern)
 	}
 	sel := selectorFor(meta, body, in.Sel)
 	red, argv0 := reg.Select(sel)
@@ -235,6 +248,46 @@ func spoolRaw(r io.Reader, dst io.Writer, redact func(io.Writer) StreamRedactor)
 		BodySHA256: hex.EncodeToString(h.Sum(nil)), BodyBytes: n}, nil
 }
 
+// pathKeys are the tool-input fields that name the file or directory a tool read,
+// in the order selectorFor prefers them.
+var pathKeys = []string{"file_path", "filePath", "path", "target_file", "notebook_path", "directory", "dir_path"}
+
+// secretPath returns a path the capture names that is a secret path (WS-72) and
+// the pattern it matches, or "", "". It checks every path, not only the one the
+// reducer selects: the caller's path, each path field of the tool input, and each
+// path field of the response (a Claude Read names its file in both), so that no
+// path can hide another.
+func secretPath(body *HookBody, over Selector) (path, pattern string) {
+	paths := responsePaths(body.Response, []string{over.Path})
+	for _, k := range pathKeys {
+		paths = append(paths, body.Input[k])
+	}
+	for _, p := range paths {
+		if pattern, ok := redact.MatchSecretPath(p); ok {
+			return p, pattern
+		}
+	}
+	return "", ""
+}
+
+// responsePaths appends the string values of the path fields in a response
+// skeleton (Claude Read's file.filePath) to out.
+func responsePaths(n *Node, out []string) []string {
+	if n == nil {
+		return out
+	}
+	if n.Kind == 'v' && slices.Contains(pathKeys, n.Key) {
+		var s string
+		if json.Unmarshal(n.Raw, &s) == nil {
+			out = append(out, s)
+		}
+	}
+	for _, kid := range n.Kids {
+		out = responsePaths(kid, out)
+	}
+	return out
+}
+
 // selectorFor derives the reducer selector from the capture metadata, the decoded
 // tool input and the caller's overrides.
 func selectorFor(meta CaptureMeta, body *HookBody, over Selector) Selector {
@@ -247,7 +300,7 @@ func selectorFor(meta CaptureMeta, body *HookBody, over Selector) Selector {
 		return ""
 	}
 	sel := Selector{Client: meta.Client, Tool: meta.Tool, ExitCode: meta.ExitCode, Family: over.Family,
-		Command: first("command", "cmd"), Path: first("file_path", "filePath", "path", "target_file", "notebook_path", "directory", "dir_path")}
+		Command: first("command", "cmd"), Path: first(pathKeys...)}
 	if over.Command != "" {
 		sel.Command = over.Command
 	}
