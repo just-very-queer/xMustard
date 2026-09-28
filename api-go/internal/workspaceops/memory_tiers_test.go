@@ -688,3 +688,21 @@ func projectionBenchSingle(b *testing.B, dir, ws string, n int) {
 		}
 	}
 }
+
+// A tier is never dropped by dedupe: restating served memory with a tier it does not
+// hold creates the entry (a governed core proposal) instead of corroborating.
+func TestTierRequestIsNotCorroborated(t *testing.T) {
+	dir, ws := tiersDir(t), "ws"
+	const text = "releases are cut from main after the full check passes"
+	served := promoted(t, dir, ws, "author", text)
+	same := RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t", Content: text}}
+	e, err := Remember(dir, ws, same, humanActor("hum"))
+	if err != nil || e.Outcome != OutcomeCorroborated || e.DuplicateOf != served.ID {
+		t.Fatalf("a plain restatement corroborates: %+v %v", e, err)
+	}
+	same.Tier = "core"
+	e, err = Remember(dir, ws, same, humanActor("hum"))
+	if err != nil || e.Outcome == OutcomeCorroborated || e.Tier != govstore.TierCore || e.ID == served.ID {
+		t.Fatalf("a core restatement must be created with its tier: %+v %v", e, err)
+	}
+}
