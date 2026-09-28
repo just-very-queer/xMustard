@@ -1,0 +1,90 @@
+{
+ "warnings": [
+  "dry run (fake driver and/or stub stack): these numbers exercise the harness and are not experimental evidence",
+  "containment none: hidden oracle files and other runs' artifacts were readable by the agent",
+  "run interrupted: the result set is incomplete",
+  "ABORTED: corpus_changed: t9 oracle; no run started after it, and results before it may be contaminated",
+  "keep_worktrees with containment none: earlier runs' worktrees (solved trees) were readable by later runs' agents",
+  "baseline run t1#r0 had an operator MCP server \"XMustard-shadow\": the baseline is not xMustard-free",
+  "t2#r0/xmustard_mcp: no final client event; tokens and cost are incomplete",
+  "t3#r0/xmustard_mcp: client error (exit 1; error event: rate limited), scored as the agent's outcome; exclude_client_errors pre-registers leaving such runs out",
+  "t4#r0/baseline: the visible verify step changed the tree; the oracle judged the agent's final tree after a restore",
+  "t4#r0/baseline: 2 process(es) outlived the run's process groups and were killed before judging",
+  "t5#r0/baseline: the oracle exited 127: a command it ran was not found; the run counts as unresolved",
+  "t6#r0/xmustard_mcp: the oracle exited 126: a command it ran could not be executed or was denied (is what setup installed reachable from the judged tree?); the run counts as unresolved",
+  "3 run(s) did not complete; see not_completed",
+  "xmustard_mcp: 1 completed run(s) without session usage from the client's final event; they are left out of token medians and deltas",
+  "xmustard_memory: 1 failing run(s) received a harmful memory but have no completed xmustard_mcp run of the same task and repetition; stale-memory harm cannot attribute them",
+  "GOVERNANCE: xmustard_memory delivered 2 foreign-scope memories (scope leakage must be 0)",
+  "GOVERNANCE: xmustard_memory delivered 1 unverified memories (1 labelled peer_verified)",
+  "GOVERNANCE: xmustard_memory promoted 1 memories during single-agent runs"
+ ],
+ "rss_gate": {
+  "gate_bytes": 100000000,
+  "runs_with_xmustard_samples": 2,
+  "max_xmustard_peak_kib": 150000,
+  "max_xmustard_peak_run": "t6#r0/xmustard_mcp",
+  "runs_over_gate": [
+   "t6#r0/xmustard_mcp"
+  ],
+  "max_agent_peak_kib": 500000,
+  "executor_max_rss_bytes": 44040192,
+  "note": "sampled ps-RSS peaks (100 ms, v1 method); the parity-scale gate (WS-10/WS-50) is authoritative",
+  "real_stack": true
+ },
+ "counts": {
+  "completed": 33,
+  "error": 1,
+  "interrupted": 1,
+  "skipped": 1
+ },
+ "not_completed": [
+  {
+   "task_id": "t0",
+   "arm": "xmustard_mcp_hooks",
+   "rep": 0,
+   "status": "skipped",
+   "reason": "placeholder: no hooks"
+  },
+  {
+   "task_id": "t10",
+   "arm": "baseline",
+   "rep": 0,
+   "status": "interrupted",
+   "reason": "interrupted during the agent run"
+  },
+  {
+   "task_id": "t9",
+   "arm": "xmustard_mcp",
+   "rep": 0,
+   "status": "error",
+   "reason": "setup step 0 failed (exit 2)"
+  }
+ ],
+ "memory": [
+  {
+   "arm": "xmustard_memory",
+   "runs": 12,
+   "current_fact_recall": 1,
+   "scope_leakage": 2,
+   "pending_served": 1,
+   "pending_as_peer_verified": 1,
+   "promotion_errors": 1,
+   "harm_unpaired_runs": 1
+  }
+ ],
+ "driver": "claude"
+}
+{
+ "warnings": [
+  "1 run(s) did not complete; see not_completed"
+ ],
+ "rss_gate": {
+  "gate_bytes": 100000000,
+  "runs_with_xmustard_samples": 0,
+  "max_xmustard_peak_kib": 0,
+  "max_agent_peak_kib": 0,
+  "note": "no xMustard process was sampled",
+  "real_stack": true
+ }
+}

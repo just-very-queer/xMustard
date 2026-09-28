@@ -207,13 +207,7 @@ pub fn rebuild_file_edges(
                 _ => {}
             }
             words.insert(name.clone(), id);
-            let label = match fl {
-                flow::RETURNS => Some("returns"),
-                flow::BRANCHES => Some("branches"),
-                flow::WRITES => Some("writes"),
-                _ => None,
-            };
-            if let Some(label) = label {
+            if let Some(label) = flow::label(fl) {
                 let e = flow_counts.entry((name, label)).or_insert((id, 0));
                 e.1 += n;
             }

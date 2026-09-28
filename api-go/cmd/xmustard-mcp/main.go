@@ -399,6 +399,130 @@ func cancelledRequestID(params json.RawMessage) (string, bool) {
 	return string(p.RequestID), true
 }
 
+// msgKind is the closed set of shapes a decoded frame takes.
+type msgKind uint8
+
+const (
+	msgMalformed    msgKind = iota // not JSON: a parse error without an id
+	msgResponse                    // the client answering a server request (roots/list)
+	msgNotification                // no id: never answered
+	msgRequest                     // anything else is dispatched as a request
+)
+
+// decodeFrame decodes one frame and classifies it.
+func decodeFrame(line []byte) (rpcMessage, msgKind) {
+	var m rpcMessage
+	switch {
+	case json.Unmarshal(line, &m) != nil:
+		return m, msgMalformed
+	case m.isResponse():
+		return m, msgResponse
+	case len(m.ID) == 0 && strings.HasPrefix(m.Method, "notifications/"):
+		return m, msgNotification
+	}
+	return m, msgRequest
+}
+
+// reply is the response to a dispatched request.
+func reply(id json.RawMessage, result any, rerr *rpcError) rpcResponse {
+	if rerr != nil {
+		return rpcResponse{JSONRPC: "2.0", ID: id, Error: rerr}
+	}
+	return rpcResponse{JSONRPC: "2.0", ID: id, Result: result}
+}
+
+// stdioServer is the read loop's state: the serialized writer, the in-flight registry
+// a cancellation reaches, and the bounded worker slots.
+type stdioServer struct {
+	send     func(rpcResponse)
+	inflight *inflightRegistry
+	slots    chan struct{}
+	workers  sync.WaitGroup
+}
+
+// serve handles one frame read under admission; scope holds its reservation until the
+// frame is answered.
+func (s *stdioServer) serve(f *frame, scope *budget.Scope) {
+	switch {
+	case f.truncated:
+		// permanent (past the size cap or the whole pool): a request is answered with
+		// the id from a top-level parse of the bounded prefix, else null; a response to
+		// a server request is dropped, never answered.
+		scope.Close()
+		s.refuseUndecoded(f.probe, &rpcError{Code: tooLargeCode, Message: "request exceeds max message size"})
+	case f.headroom:
+		// served from the fixed control headroom: only control frames proceed
+		scope.Close()
+		s.serveControl(bytes.TrimSpace(f.line), f.neverFits)
+	default:
+		s.serveAdmitted(f, scope)
+	}
+}
+
+// serveControl answers a frame read from the control headroom: responses,
+// notifications and ping are served; any other request is refused with its id,
+// permanently when it can never fit the pool.
+func (s *stdioServer) serveControl(line []byte, neverFits bool) {
+	m, kind := decodeFrame(line)
+	switch {
+	case kind != msgRequest:
+		s.serveNonRequest(m, kind)
+	case m.Method == "ping":
+		s.send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Result: map[string]any{}})
+	case neverFits:
+		s.send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: admissionError(budget.ErrNeverFits)})
+	default:
+		s.send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: overloadError(budget.ErrOverloaded)})
+	}
+}
+
+// serveAdmitted decodes a frame the pool admitted and dispatches it by shape.
+func (s *stdioServer) serveAdmitted(f *frame, scope *budget.Scope) {
+	rawBytes := int64(len(f.line)) // reserved while reading
+	line := bytes.TrimSpace(f.line)
+	if aerr := admitDecode(scope, f.refused, line); aerr != nil {
+		scope.Close()
+		s.refuseUndecoded(f.probe, aerr)
+		return
+	}
+	if len(line) == 0 {
+		scope.Close()
+		return
+	}
+	m, kind := decodeFrame(line)
+	f.line = nil            // the raw frame is no longer referenced
+	scope.Release(rawBytes) // ...so its reservation ends; the decoded copy stays held
+	switch {
+	case kind != msgRequest:
+		scope.Close()
+		s.serveNonRequest(m, kind)
+	case m.Method == "initialize":
+		// Negotiation is answered before the next frame is read, so requests the
+		// client pipelines behind it see the negotiated version. It does no I/O.
+		result, rerr := dispatchCtx(budget.WithScope(context.Background(), scope), m.Method, m.Params)
+		scope.Close()
+		s.send(reply(m.ID, result, rerr))
+	default:
+		s.startWorker(m, scope)
+	}
+}
+
+// serveNonRequest handles the shapes that are never dispatched: a malformed frame gets
+// a structured parse error rather than a silent drop, a client response goes to the
+// server request waiting for it (never answered back), and a notification expects no
+// response (a cancellation aborts the matching in-flight request here, so the loop
+// stays responsive to it).
+func (s *stdioServer) serveNonRequest(m rpcMessage, kind msgKind) {
+	switch kind {
+	case msgMalformed:
+		s.send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: mcpserver.CodeParseError, Message: "parse error"}})
+	case msgResponse:
+		client.deliver(m)
+	case msgNotification:
+		notify(s.inflight, m)
+	}
+}
+
 // notify handles a notification: cancellation here (this loop owns the in-flight
 // registry), everything else in the session.
 func notify(inflight *inflightRegistry, m rpcMessage) {
@@ -409,6 +533,43 @@ func notify(inflight *inflightRegistry, m rpcMessage) {
 		return
 	}
 	session.Notify(m.Method, m.Params)
+}
+
+// startWorker runs an id-bearing request on its own goroutine with a cancelable
+// context registered by id, so the read loop keeps reading (and can service a
+// cancellation or a roots/list answer) while the tool call is outstanding. JSON-RPC
+// permits out-of-order responses; the client matches by id. Past the in-flight limit
+// the request is refused at once. The worker owns the frame's ledger (ingress, decode,
+// argument and response bytes) until its reply is sent.
+func (s *stdioServer) startWorker(m rpcMessage, scope *budget.Scope) {
+	select {
+	case s.slots <- struct{}{}:
+	default:
+		scope.Close()
+		s.send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: overloadCode,
+			Message: fmt.Sprintf("xmustard overloaded: %d requests already in flight; retry shortly", cap(s.slots))}})
+		return
+	}
+	ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), m.ID))
+	idKey := string(m.ID)
+	s.inflight.add(idKey, cancel)
+	s.workers.Add(1)
+	go func() {
+		defer s.workers.Done()
+		defer func() { <-s.slots }()
+		defer scope.Close()
+		defer s.inflight.done(idKey)
+		defer cancel()
+		result, rerr := dispatchCtx(ctx, m.Method, m.Params)
+		s.send(reply(m.ID, result, rerr))
+	}()
+}
+
+// refuseUndecoded answers a frame that was not decoded, when a reply is owed.
+func (s *stdioServer) refuseUndecoded(probe []byte, rerr *rpcError) {
+	if resp := client.answerUndecoded(probe, rerr); resp != nil {
+		s.send(*resp)
+	}
 }
 
 func main() {
@@ -428,14 +589,11 @@ func main() {
 		_ = writer.Flush()
 		sendMu.Unlock()
 	}
-	send := func(resp rpcResponse) { write(resp) }
 	client.mu.Lock()
 	client.send = write
 	client.mu.Unlock()
-	inflight := newInflight()
-	slots := make(chan struct{}, maxInflight())
-	var workers sync.WaitGroup
-	defer workers.Wait()
+	s := &stdioServer{send: func(resp rpcResponse) { write(resp) }, inflight: newInflight(), slots: make(chan struct{}, maxInflight())}
+	defer s.workers.Wait()
 
 	for {
 		// Every frame is admitted against the shim's transient pool before it is
@@ -443,107 +601,8 @@ func main() {
 		// and the reservation is held by the worker until its reply is written.
 		scope := budget.NewScope(nil)
 		f := readAdmittedLine(reader, scope)
-		err := f.err
-		rawBytes := int64(len(f.line)) // reserved while reading
-		line := bytes.TrimSpace(f.line)
-		if f.truncated {
-			scope.Close()
-			// permanent (past the size cap or the whole pool): a request is answered with
-			// the id from a top-level parse of the bounded prefix, else null; a response to
-			// a server request is dropped, never answered.
-			if resp := client.answerUndecoded(f.probe, &rpcError{Code: tooLargeCode, Message: "request exceeds max message size"}); resp != nil {
-				send(*resp)
-			}
-		} else if f.headroom {
-			// served from the fixed control headroom: only control frames proceed
-			scope.Close()
-			var m rpcMessage
-			if json.Unmarshal(line, &m) != nil {
-				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: mcpserver.CodeParseError, Message: "parse error"}})
-			} else if m.isResponse() {
-				client.deliver(m)
-			} else if len(m.ID) == 0 && strings.HasPrefix(m.Method, "notifications/") {
-				notify(inflight, m)
-			} else if m.Method == "ping" {
-				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Result: map[string]any{}})
-			} else if f.neverFits {
-				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: admissionError(budget.ErrNeverFits)})
-			} else {
-				send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: overloadError(budget.ErrOverloaded)})
-			}
-		} else if aerr := admitDecode(scope, f.refused, line); aerr != nil {
-			scope.Close()
-			if resp := client.answerUndecoded(f.probe, aerr); resp != nil {
-				send(*resp)
-			}
-		} else if len(line) == 0 {
-			scope.Close()
-		} else {
-			var m rpcMessage
-			jsonErr := json.Unmarshal(line, &m)
-			f.line, line = nil, nil // the raw frame is no longer referenced
-			scope.Release(rawBytes) // ...so its reservation ends; the decoded copy stays held
-			if jsonErr != nil {
-				scope.Close()
-				// malformed JSON → structured parse error rather than a silent drop.
-				send(rpcResponse{JSONRPC: "2.0", Error: &rpcError{Code: mcpserver.CodeParseError, Message: "parse error"}})
-			} else if m.isResponse() {
-				scope.Close()
-				// the client answering a server request (roots/list): never answered back
-				client.deliver(m)
-			} else if len(m.ID) == 0 && strings.HasPrefix(m.Method, "notifications/") {
-				scope.Close()
-				// notifications have no id and expect no response. A cancellation aborts
-				// the matching in-flight request so the loop stays responsive to it.
-				notify(inflight, m)
-			} else if m.Method == "initialize" {
-				// Negotiation is answered before the next frame is read, so requests the
-				// client pipelines behind it see the negotiated version. It does no I/O.
-				result, rerr := dispatchCtx(budget.WithScope(context.Background(), scope), m.Method, m.Params)
-				scope.Close()
-				resp := rpcResponse{JSONRPC: "2.0", ID: m.ID, Result: result}
-				if rerr != nil {
-					resp.Result, resp.Error = nil, rerr
-				}
-				send(resp)
-			} else {
-				// Run each id-bearing request on its own goroutine with a cancelable
-				// context registered by id, so the read loop keeps reading (and can
-				// service a cancellation or a roots/list answer) while the tool call is
-				// outstanding. JSON-RPC permits out-of-order responses; the client
-				// matches by id.
-				select {
-				case slots <- struct{}{}:
-				default:
-					scope.Close()
-					send(rpcResponse{JSONRPC: "2.0", ID: m.ID, Error: &rpcError{Code: overloadCode,
-						Message: fmt.Sprintf("xmustard overloaded: %d requests already in flight; retry shortly", cap(slots))}})
-					continue // a final frame at EOF is followed by an empty EOF read
-				}
-				// The worker owns the frame's ledger (ingress, decode, argument and
-				// response bytes) until its reply is sent.
-				ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), m.ID))
-				idKey := string(m.ID)
-				inflight.add(idKey, cancel)
-				workers.Add(1)
-				go func(m rpcMessage) {
-					defer workers.Done()
-					defer func() { <-slots }()
-					defer scope.Close()
-					defer inflight.done(idKey)
-					defer cancel()
-					result, rerr := dispatchCtx(ctx, m.Method, m.Params)
-					resp := rpcResponse{JSONRPC: "2.0", ID: m.ID}
-					if rerr != nil {
-						resp.Error = rerr
-					} else {
-						resp.Result = result
-					}
-					send(resp)
-				}(m)
-			}
-		}
-		if err != nil { // io.EOF or a read error: stop
+		s.serve(&f, scope)
+		if f.err != nil { // io.EOF or a read error: stop
 			break
 		}
 	}
