@@ -572,7 +572,8 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   recorded `captured_identity=unknown` (the producing repository state was not
   observed). The session and subagent ids are recorded for attribution only.
 - **What a hook may do.** An answer adds context, replaces a native output with its
-  shape-matched reduction, sets the FileChanged watch list, or says nothing. It never
+  shape-matched reduction (PostToolUse only), sets the FileChanged watch list
+  (SessionStart and CwdChanged), or says nothing. It never
   allows, denies or rewrites a tool call. A timeout past the ~200 ms budget, a body the
   service cannot read and a workspace out of scope are empty 200s, so Claude Code's own
   behavior is unchanged. Authentication stays fail-closed: a missing, expired, revoked
@@ -587,8 +588,11 @@ through the static client `xmustard-hook` over a Unix socket (a command hook).
   `agent_id`) gets a memory at most once until compaction, and a memory counts as
   given only when the answer that carries its frame, or the note that withheld it, was
   written. A memory that does not fit in the ~10,000-character context left is counted
-  in the withheld note as `too_large`, with the `recall` call that shows it. No hook starts a process: Rust work runs only on a resident worker
-  that is already running.
+  in the withheld note as `too_large`, with the `recall` call that shows it.
+- **Processes.** The daemon starts no process for a hook: Rust work runs only on a
+  resident worker that is already running. Claude Code itself starts the static client
+  once per event for the two command hooks, SessionStart and WorktreeRemove; every
+  other event is an http hook to the running daemon.
 
 ## Health endpoint
 

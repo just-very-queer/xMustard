@@ -17,22 +17,33 @@ Authentication is not relaxed: a missing, expired, rotated or reader-only token 
 401 or 403, which Claude Code shows as a non-blocking hook error on every matched call
 (the static client stays silent). No hook allows, denies or rewrites a tool call.
 
+Only `PostToolUse` can replace what the model sees: it returns a reduced
+`updatedToolOutput` in place of a native tool's output. Every other event adds
+context, sets the watch list, or answers with nothing. Most events are http hooks,
+so Claude Code posts them to the running daemon and no process starts. `SessionStart`
+and `WorktreeRemove` are command hooks: Claude Code starts the static client
+`hooks/bin/xmustard-hook` once for each of these events. Measured on Linux, the
+client is a 3.5 MB binary that peaks under 5 MiB and runs under 10 ms; it gives up
+at its 200 ms budget. The daemon itself starts no process for any hook.
+
 ## What each event does
 
-| Event | Hook type | What xMustard does |
-| --- | --- | --- |
-| `SessionStart` | command (`hooks/bin/xmustard-hook`) | Adds ground's spawn-free summary (failed runs, stale and pending memory) and the core-tier memories as context. Returns `watchPaths`: the files memory is anchored to. |
-| `SubagentStart` | http | The same context for the subagent. A subagent has steering state of its own (keyed by its `agent_id`), so a memory pushed into the main thread is pushed into the subagent too, and the reverse. |
-| `UserPromptSubmit` | http | Pushes the memories that a keyword in the prompt triggers. A memory tagged `trigger-deploy` is pushed when the prompt says "deploy". |
-| `PreToolUse` (Grep, Glob, Bash, Read, Edit, Write, NotebookEdit) | http | For Grep, Glob and a Bash `rg`/`grep`: the index hits (BM25, names, graph proximity) and memories for the pattern. For Read and Edit: the memories bound to the file, stale ones labeled. Before an edit, it records the file's syntax errors. A burst of searches earns one nudge toward `search`/`impact` (2-minute cooldown). |
-| `PostToolUse` (Bash, Read, Grep, Glob, WebFetch, other servers' MCP tools) | http | Captures the output (redacted, retained behind a handle for about a day) and, when it was reduced, returns a shape-matched `updatedToolOutput` whose last line names the handle. A test, build or lint output is recorded as a run outcome. A git commit, merge, rebase, cherry-pick or pull adds a freshness notice. |
-| `PostToolUse` (Edit, Write, NotebookEdit) | http | Adds the file to the index watcher's pending batch and reports the syntax errors the edit introduced (tree-sitter). |
-| `PostToolUseFailure` (Bash) | http | Records the failure as a run outcome and names the failing tests it parsed. |
-| `PostToolBatch` | http | Nudges once when one parallel batch ran several searches. |
-| `CwdChanged` | http | Returns the `watchPaths` of the new directory's workspace; `[]`, which clears the list, when the directory is in none. |
-| `FileChanged` | http | Adds the file to the index watcher's pending batch (when a watcher runs). The next read re-samples the repository identity. |
-| `WorktreeRemove` | command | Forgets the worktree's cached identity. It is a command hook because the client always exits 0, and a failing WorktreeRemove hook blocks the removal. |
-| `PreCompact`, `PostCompact`, `Stop`, `SubagentStop`, `SessionEnd` | http | Queued and answered at once (SessionEnd hooks share a 1.5 s budget). After compaction, memories may be pushed again. SubagentStop drops the subagent's steering state, SessionEnd the session's. |
+The Answer column lists what an answer can carry. "Nothing" means an empty 200.
+
+| Event | Hook type | Answer | What xMustard does |
+| --- | --- | --- | --- |
+| `SessionStart` | command: starts `hooks/bin/xmustard-hook` | `additionalContext`, `watchPaths` | Adds ground's spawn-free summary (failed runs, stale and pending memory) and the core-tier memories as context. Returns `watchPaths`: the files memory is anchored to. |
+| `SubagentStart` | http | `additionalContext` | The same context for the subagent. A subagent has steering state of its own (keyed by its `agent_id`), so a memory pushed into the main thread is pushed into the subagent too, and the reverse. |
+| `UserPromptSubmit` | http | `additionalContext` | Pushes the memories that a keyword in the prompt triggers. A memory tagged `trigger-deploy` is pushed when the prompt says "deploy". |
+| `PreToolUse` (Grep, Glob, Bash, Read, Edit, Write, NotebookEdit) | http | `additionalContext` | For Grep, Glob and a Bash `rg`/`grep`: the index hits (BM25, names, graph proximity) and memories for the pattern. For Read and Edit: the memories bound to the file, stale ones labeled. Before an edit, it records the file's syntax errors. A burst of searches earns one nudge toward `search`/`impact` (2-minute cooldown). The tool call itself is never changed. |
+| `PostToolUse` (Bash, Read, Grep, Glob, WebFetch, other servers' MCP tools) | http | `updatedToolOutput`, `additionalContext` | Captures the output (redacted, retained behind a handle for about a day). When it was reduced and the reduction matches the tool's output shape, returns it as `updatedToolOutput`, whose last line names the handle; otherwise the original stays and a notice says why. A test, build or lint output is recorded as a run outcome. A git command that moves HEAD (commit, merge, rebase, pull, checkout and the like) adds a freshness notice. |
+| `PostToolUse` (Edit, Write, NotebookEdit) | http | `additionalContext` | Adds the file to the index watcher's pending batch and reports the syntax errors the edit introduced (tree-sitter). |
+| `PostToolUseFailure` (Bash) | http | `additionalContext` | Records the failure as a run outcome and names the failing tests it parsed. |
+| `PostToolBatch` | http | `additionalContext` | Nudges once when one parallel batch ran several searches. |
+| `CwdChanged` | http | `watchPaths` | Returns the `watchPaths` of the new directory's workspace; `[]`, which clears the list, when the directory is in none. |
+| `FileChanged` | http | nothing | Adds the file to the index watcher's pending batch (when a watcher runs). The next read re-samples the repository identity. |
+| `WorktreeRemove` | command: starts `hooks/bin/xmustard-hook` | nothing | Forgets the cached identity of a worktree at or under the workspace root. It is a command hook because the client always exits 0, and a failing WorktreeRemove hook blocks the removal. |
+| `PreCompact`, `PostCompact`, `Stop`, `SubagentStop`, `SessionEnd` | http | nothing | Queued and answered at once (SessionEnd hooks share a 1.5 s budget). After compaction, memories may be pushed again. SubagentStop drops the subagent's steering state, SessionEnd the session's. |
 
 `WorktreeCreate` is not hooked: a WorktreeCreate hook replaces Claude Code's own git
 worktree creation.
@@ -60,9 +71,10 @@ it.
    XMUSTARD_CORE_WORKER=1 xmustard-api
    ```
 
-   Hooks never start a process. Until a resident worker runs and this daemon has built
-   the repository's code index (any `search`, `explain` or `impact` call does it), hooks
-   add no index hits and no syntax report. Memory, capture and ground work without it.
+   The daemon starts no process for a hook. Until a resident worker runs and this
+   daemon has built the repository's code index (any `search`, `explain` or `impact`
+   call does it), hooks add no index hits and no syntax report. Memory, capture and
+   ground work without it.
 
 3. Register the repository with the daemon (the MCP tools register the client's root
    on first use; `POST /api/workspaces/load` does it directly), and give Claude Code

@@ -1,5 +1,5 @@
 {
-  "description": "xMustard: shape-matched reductions of native tool output with recoverable handles, verified memory and index hits before searches and file reads, ground at session start, and the dirty set from edits. Every hook fails open: a missing or slow daemon leaves Claude Code's own behavior unchanged.",
+  "description": "xMustard: shape-matched reductions of native tool output with recoverable handles, verified memory and index hits before searches and file reads, ground at session start, and the dirty set from edits. A slow daemon, an unreadable event or a directory outside the token's workspaces gets an empty answer, so Claude Code keeps its own output; a stopped daemon or a refused token (401/403) shows a non-blocking hook error. Only PostToolUse replaces an output; SessionStart and WorktreeRemove start the static client hooks/bin/xmustard-hook.",
   "hooks": {
     "SessionStart": [
       {

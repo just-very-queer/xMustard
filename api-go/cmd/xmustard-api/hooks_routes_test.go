@@ -507,6 +507,53 @@ func TestHookCwdChangedClearsTheWatchList(t *testing.T) {
 	}
 }
 
+// WorktreeRemove forgets a worktree's cached identity only inside the workspace that
+// passed the scope checks: the root or a path under it, never a relative path, a path
+// that climbs out, another directory, or any path from a cwd in no workspace.
+func TestHookWorktreeRemoveStaysInTheWorkspace(t *testing.T) {
+	f := newHookFixture(t)
+	var mu sync.Mutex
+	var forgot []string
+	prev := hookForgetRoot
+	t.Cleanup(func() { hookForgetRoot = prev })
+	hookForgetRoot = func(root string) {
+		mu.Lock()
+		defer mu.Unlock()
+		forgot = append(forgot, root)
+	}
+	under := filepath.Join(f.root, ".claude", "worktrees", "feature")
+	elsewhere := t.TempDir()
+	for _, c := range []struct {
+		cwd, path string
+		forgets   bool
+	}{
+		{f.root, under, true},
+		{f.root, f.root, true},
+		{f.root, elsewhere, false},
+		{f.root, f.root + "/../other", false},
+		{f.root, ".claude/worktrees/feature", false},
+		{elsewhere, under, false}, // unbound: the cwd is in no workspace
+	} {
+		mu.Lock()
+		forgot = nil
+		mu.Unlock()
+		if code, body := f.post(t, f.agent, "WorktreeRemove", hookEvent(map[string]any{"session_id": "wt", "cwd": c.cwd,
+			"hook_event_name": "WorktreeRemove", "worktree_path": c.path})); code != 200 || len(body) != 0 {
+			t.Fatalf("%s: %d %s", c.path, code, body)
+		}
+		mu.Lock()
+		got := slices.Clone(forgot)
+		mu.Unlock()
+		var want []string
+		if c.forgets {
+			want = []string{filepath.Clean(c.path)}
+		}
+		if !slices.Equal(got, want) {
+			t.Fatalf("cwd %s, worktree %s: forgot %v, want %v", c.cwd, c.path, got, want)
+		}
+	}
+}
+
 // The withheld note of a keyword push names the trigger tag recall filters on.
 func TestHookTriggerNoteNamesTheTag(t *testing.T) {
 	f := newHookFixture(t)

@@ -61,7 +61,8 @@ import (
 // empty 200, and so is a body it cannot read or a workspace out of scope, so the client
 // keeps its original output. Authentication stays fail-closed: a missing, expired or
 // reader-only token gets the middleware's 401 or 403, which Claude Code shows as a
-// non-blocking hook error. No hook starts a process: Rust work runs only on a resident
+// non-blocking hook error. The service starts no process for a hook (Claude Code starts
+// the static client for the command-hook events): Rust work runs only on a resident
 // worker that is already running, and the repository identity is never sampled (a
 // hook-delivered observation is captured_identity=unknown).
 //
@@ -94,10 +95,12 @@ func hookBudget() time.Duration {
 	return defaultHookBudget
 }
 
-// The resident-worker reads a hook makes; tests replace them.
+// The resident-worker reads a hook makes, and the identity drop of a removed worktree;
+// tests replace them.
 var (
-	hookSearch = workspaceops.HookSearch
-	hookSyntax = workspaceops.HookSyntaxCheck
+	hookSearch     = workspaceops.HookSearch
+	hookSyntax     = workspaceops.HookSyntaxCheck
+	hookForgetRoot = workspaceops.ForgetRoot
 )
 
 // hookStats counts hook answers since start (hookUsage, /api/health).
@@ -780,7 +783,7 @@ func (s *hookServer) worktreeRemove(_ context.Context, c *hookCall) hookResult {
 		return hookResult{}
 	}
 	if p == filepath.Clean(c.ws.Root) || workspaceops.RelativeToRoot(c.ws, p) != "" {
-		workspaceops.ForgetRoot(p)
+		hookForgetRoot(p)
 	}
 	return hookResult{}
 }
