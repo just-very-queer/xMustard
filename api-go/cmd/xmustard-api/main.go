@@ -737,169 +737,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
-	mux.HandleFunc("GET /api/workspaces", func(w http.ResponseWriter, r *http.Request) {
-		// Filter the list by the caller's token scope so a workspace-scoped (per-worker)
-		// token can't enumerate other tenants' repo roots. Unscoped tokens see all.
-		result, err := workspaceops.ListWorkspacesScoped(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			principalFromContext(r.Context()),
-		)
-		if err != nil {
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		n := 0 // and by the deployment's workspace allowlist
-		for _, it := range result {
-			if postureFrom(r).allowsWorkspace(it.WorkspaceID) {
-				result[n] = it
-				n++
-			}
-		}
-		writeJSON(w, http.StatusOK, result[:n])
-	})
-	mux.HandleFunc("POST /api/workspaces/load", func(w http.ResponseWriter, r *http.Request) {
-		var request workspaceops.WorkspaceLoadRequest
-		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]any{
-				"error": "invalid JSON body",
-			})
-			return
-		}
-		admitted, ok := admitWorkspaceLoad(w, r, &request)
-		if !ok {
-			return
-		}
-		dataDir := envDefault("XMUSTARD_DATA_DIR", "../backend/data")
-		result, err := workspaceops.LoadWorkspace(dataDir, request)
-		if !admitted.finish(w, r, request.RootPath, err) {
-			return
-		}
-		// the automatic index baseline (PAR-FRESH-06), built after this answer
-		workspaceops.StartRegistrationBaseline(dataDir, result.Workspace.WorkspaceID)
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/snapshot", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadWorkspaceSnapshot(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Snapshot not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/worktree", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadWorktreeStatus(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-state", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadRepoToolState(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/ingestion-plan", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadIngestionPlan(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/run-targets", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadRunTargets(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/verify-targets", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadVerifyTargets(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/runs", func(w http.ResponseWriter, r *http.Request) {
 		if !requireRole(w, r, "agent") { // launching a run is an agent action, not readonly
 			return
@@ -941,84 +778,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 		)
 		if err != nil {
 			respondError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/scan", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ScanWorkspace(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/activity", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		issueID := r.URL.Query().Get("issue_id")
-		runID := r.URL.Query().Get("run_id")
-		limit := 100
-		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
-			if parsed, err := strconv.Atoi(rawLimit); err == nil {
-				limit = parsed
-			}
-		}
-		result, err := workspaceops.ListWorkspaceActivity(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-			issueID,
-			runID,
-			limit,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/activity/overview", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		limit := 200
-		if rawLimit := r.URL.Query().Get("limit"); rawLimit != "" {
-			if parsed, err := strconv.Atoi(rawLimit); err == nil {
-				limit = parsed
-			}
-		}
-		result, err := workspaceops.ReadActivityOverview(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-			limit,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
 			return
 		}
 		writeJSON(w, http.StatusOK, result)
@@ -1777,68 +1536,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 		}
 		writeJSON(w, http.StatusOK, result)
 	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/sources", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadSources(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Snapshot not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/drift", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadDriftSummary(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Snapshot not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/tree", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		relativePath := r.URL.Query().Get("relative_path")
-		result, err := workspaceops.ListWorkspaceTree(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-			relativePath,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/issues/{issue_id}/fixes", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		issueID := r.PathValue("issue_id")
@@ -1883,26 +1580,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 			if errors.Is(err, os.ErrNotExist) {
 				writeJSON(w, http.StatusNotFound, map[string]any{
 					"error": "Missing resource",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/guidance", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ListWorkspaceGuidanceRecords(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
 				})
 				return
 			}
@@ -2031,47 +1708,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 			if errors.Is(err, workspaceops.ErrInvalidDiagnosticsRequest) {
 				writeJSON(w, http.StatusBadRequest, map[string]any{
 					"error": err.Error(),
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-context", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadRepoContext(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-			r.URL.Query().Get("base_ref"),
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/project-info", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ReadProjectInfo(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
 				})
 				return
 			}
@@ -2486,26 +2122,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /api/workspaces/{workspace_id}/repo-map", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID := r.PathValue("workspace_id")
 		result, err := workspaceops.ReadWorkspaceRepoMap(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			workspaceID,
-		)
-		if err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				writeJSON(w, http.StatusNotFound, map[string]any{
-					"error": "Workspace not found",
-				})
-				return
-			}
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
-	})
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/export", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID := r.PathValue("workspace_id")
-		result, err := workspaceops.ExportWorkspace(
 			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
 			workspaceID,
 		)
@@ -3519,16 +3135,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 		result, err := workspaceops.BuildSecurityReviewPacket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
 		issueIntel(w, err, result)
 	})
-	// --- operational dashboard ---
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/dashboard", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.BuildWorkspaceDashboard(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
-	// --- change state (gitnexus-style change tracking) ---
-	mux.HandleFunc("GET /api/workspaces/{workspace_id}/fingerprint", func(w http.ResponseWriter, r *http.Request) {
-		result, err := workspaceops.WorkspaceFingerprint(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"))
-		issueIntel(w, err, result)
-	})
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/index", func(w http.ResponseWriter, r *http.Request) {
 		// the route gate admits only the indexer and admin roles; the history records who
 		who := memoryCaller{principal: principalFromContext(r.Context())}.id()
@@ -3762,34 +3368,6 @@ func registerInlineRoutes(mux routeRegistrar) {
 		}
 		result, err := workspaceops.IngestTicket(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), r.PathValue("issue_id"), req)
 		issueIntel(w, err, result)
-	})
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/guidance/customize", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			Kind string `json:"kind"`
-		}
-		_ = json.NewDecoder(r.Body).Decode(&body)
-		result, err := workspaceops.BuildGuidanceCustomization(envDefault("XMUSTARD_DATA_DIR", "../backend/data"), r.PathValue("workspace_id"), body.Kind)
-		issueIntel(w, err, result)
-	})
-	// Generate a deterministic starter guidance file (the frontend previously POSTed here
-	// to a non-existent route — a dead path; now implemented with confined no-follow writes).
-	mux.HandleFunc("POST /api/workspaces/{workspace_id}/guidance/starters", func(w http.ResponseWriter, r *http.Request) {
-		var body struct {
-			TemplateID string `json:"template_id"`
-			Overwrite  bool   `json:"overwrite"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			respondError(w, workspaceops.Invalid("invalid JSON body"))
-			return
-		}
-		result, err := workspaceops.GenerateGuidanceStarter(
-			envDefault("XMUSTARD_DATA_DIR", "../backend/data"),
-			r.PathValue("workspace_id"), body.TemplateID, body.Overwrite)
-		if err != nil {
-			respondError(w, err)
-			return
-		}
-		writeJSON(w, http.StatusOK, result)
 	})
 	// One versioned issue handoff merging review (verification+risk), security, and the
 	// latest run insight (acceptance+policy) — consumable by PR/Linear/Jira sync.
