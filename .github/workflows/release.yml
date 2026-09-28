@@ -5,10 +5,9 @@
 # from SHA256SUMS. A manual run builds and uploads the archives as workflow artifacts
 # without creating a release (a dry run).
 #
-# Reproducibility: Go comes from api-go/go.mod (the toolchain check.yml tests with), Rust
-# is pinned below, dependencies are locked, and no build cache is restored, so a release
-# never consumes a cache written by a pull-request run. Actions are pinned to commit SHAs;
-# the tag is in the comment.
+# Reproducibility: both toolchains are pinned below, dependencies are locked, and no build
+# cache is restored, so a release never consumes a cache written by a pull-request run.
+# Actions are pinned to commit SHAs; the tag is in the comment.
 name: release
 
 on:
@@ -25,7 +24,10 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: never
-  # The Rust toolchain the build box validates every workstream with (it built v0.1.0).
+  # The toolchains the build box validates every workstream with; they built v0.1.0. The
+  # Go and Rust standard libraries ship inside the binaries, so raise both to their latest
+  # patch release before tagging.
+  GO_VERSION: "1.26.1"
   RUST_TOOLCHAIN: "1.93.1"
 
 jobs:
@@ -48,7 +50,7 @@ jobs:
           persist-credentials: false
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: api-go/go.mod
+          go-version: ${{ env.GO_VERSION }}
           cache: false
       - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87 # stable branch
         with:
