@@ -44,7 +44,7 @@ func (s *Spec) Markdown() string {
 		"clients that expand by handle; `recover_unavailable` says why there is none.\n\n")
 	fmt.Fprintf(&b, "A budgeted result ends with `%s`: `max_chars`, `used_chars` (the result's own size), `degraded_stage` (the "+
 		"last rung applied, `full` when none), `stages`, `over_budget` (only when true), `lists` (per reduced list: `state`, "+
-		"`kept`, `total`, `by` group counts), `omitted`, `signals`, `more`, `recover_uri`, `recover_handle`, "+
+		"`kept`, `total`, `each_kept` for tiers, `by` group counts), `omitted`, `signals`, `more`, `recover_uri`, `recover_handle`, "+
 		"`recover_unavailable` and `docs`.\n", ReportMember)
 	return b.String()
 }

@@ -426,6 +426,9 @@ func TestByDepthTiersKeepTheirFirstItems(t *testing.T) {
 	if kept[0] == 0 || kept[0] >= 40 || kept[0] != kept[1] || kept[1] != kept[2] {
 		t.Fatalf("tiers kept %v", kept)
 	}
+	if lr := a.rep.Lists["by_depth"]; lr.EachKept != kept[0] || lr.Total != 3 {
+		t.Fatalf("list report %+v, want each_kept %d", lr, kept[0])
+	}
 	if a.out["risk"] != "HIGH" {
 		t.Fatal("risk dropped")
 	}

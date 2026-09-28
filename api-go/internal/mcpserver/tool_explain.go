@@ -51,7 +51,8 @@ const explainDoc = "### Outline and symbol context\n\nexplain takes one of `path
 	"explanation, its community cluster and its outline: top-level symbols (locals excluded) with line ranges and " +
 	"children to `depth` (default 1, at most 3), `symbols_total` and `symbols_by_kind`. A directory answers its " +
 	"outline: `summary`, `files_total`, `languages`, `symbols_by_kind`, its immediate `dirs`, and `files`, each " +
-	"with its own outline (default depth 0). `symbol` (a name path, as search mode=symbol takes it) or `uid` " +
+	"with its own outline (default depth 0; at most 2,000 files, `files_truncated` past that, and 50 top-level " +
+	"symbols per file, `symbols_total` counting them all). `symbol` (a name path, as search mode=symbol takes it) or `uid` " +
 	"answers the symbol's context: `symbol` with its signature and doc comment (`include_content` adds the body), " +
 	"`incoming` and `outgoing` edges grouped by `relation` (CALLS, USES, ACCESSES with access, EXTENDS, " +
 	"IMPLEMENTS, HAS_METHOD, HAS_PROPERTY) with `layer`, `confidence` and `provenance`, `chain_depth` (0 to 3) " +

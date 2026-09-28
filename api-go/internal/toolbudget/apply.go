@@ -180,6 +180,7 @@ type listState struct {
 	objs  [][]kv // parsed items, filled on first use
 	drop  map[string]bool
 	clip  map[string]int
+	each  string   // the item member list opFitEach cut, if any
 	cache [][]byte // rendered items under drop and clip; nil when stale
 	k     int      // items kept in modeItems
 	mode  int
@@ -190,7 +191,7 @@ type listState struct {
 
 func (l *listState) reset() {
 	l.drop, l.clip, l.cache = map[string]bool{}, map[string]int{}, nil
-	l.k, l.mode, l.state = len(l.items), modeItems, ""
+	l.k, l.mode, l.state, l.each = len(l.items), modeItems, "", ""
 }
 
 func (l *listState) obj(i int) []kv {
@@ -292,27 +293,24 @@ func writeWithout(w *bytes.Buffer, raw []byte, drop map[string]bool) {
 }
 
 // writeObject writes the members keep admits, each through val when set.
-func writeObject(w *bytes.Buffer, o []kv, keep func(kv) bool, val func(*bytes.Buffer, kv) bool) {
+func writeObject(w *bytes.Buffer, o []kv, keep func(kv) bool, val func(*bytes.Buffer, kv)) {
 	w.WriteByte('{')
 	n := 0
 	for _, m := range o {
 		if !keep(m) {
 			continue
 		}
-		mark := w.Len()
 		if n > 0 {
 			w.WriteByte(',')
 		}
+		n++
 		w.Write(quote(m.key))
 		w.WriteByte(':')
-		if val != nil && !val(w, m) {
-			w.Truncate(mark)
-			continue
-		}
-		if val == nil {
+		if val != nil {
+			val(w, m)
+		} else {
 			w.Write(m.raw)
 		}
-		n++
 	}
 	w.WriteByte('}')
 }
@@ -627,6 +625,7 @@ func (b *budgeter) stepList(l *listState, r Rung) bool {
 	case opFit:
 		return l.mode == modeItems && b.fitItems(l)
 	case opFitEach:
+		l.each = r.Each
 		return l.mode == modeItems && b.fitEach(l, r.Each)
 	case opCount:
 		// a nested list cannot be renamed inside its object: it goes to the total
@@ -851,16 +850,14 @@ func (b *budgeter) writeMember(w *bytes.Buffer, m *member) {
 		}
 		return true
 	}
-	writeObject(w, m.sub, keep, func(w *bytes.Buffer, s kv) bool {
-		l := m.nested[s.key]
-		if l == nil {
-			w.Write(s.raw)
-			return true
+	writeObject(w, m.sub, keep, func(w *bytes.Buffer, s kv) {
+		// a nested list keeps its key (a counts rename is not possible inside the
+		// parent's object, so nested lists only trim or go)
+		if l := m.nested[s.key]; l != nil {
+			b.writeListValue(w, l)
+			return
 		}
-		// the nested list's key is already written; a counts rename is not possible
-		// inside the parent's object, so nested lists only trim or go
-		b.writeListValue(w, l)
-		return true
+		w.Write(s.raw)
 	})
 }
 
@@ -940,6 +937,8 @@ type listReport struct {
 	State string `json:"state"`
 	Kept  int    `json:"kept"`
 	Total int    `json:"total"`
+	// EachKept is how many elements of each item's own list stayed (tiers_trimmed).
+	EachKept int `json:"each_kept,omitempty"`
 	// By counts the page's items by the list's GroupBy member when items were cut.
 	By map[string]int `json:"by,omitempty"`
 }
@@ -978,7 +977,7 @@ func (b *budgeter) report(used int) []byte {
 		if l.state == "" {
 			continue
 		}
-		lr := listReport{State: l.state, Kept: l.kept(), Total: len(l.items)}
+		lr := listReport{State: l.state, Kept: l.kept(), Total: len(l.items), EachKept: l.clip[l.each]}
 		if l.spec.GroupBy != "" && l.mode == modeItems && l.cut() {
 			lr.By = largest(l.groups(), maxReportGroups)
 		}
