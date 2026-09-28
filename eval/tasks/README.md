@@ -158,18 +158,21 @@ which authors the lifecycle fixtures, has to edit `corpus.go` for it.
 the injection-safety policy (`api-go/internal/injection`). They run as unit tests, with
 no client and no model: `cd api-go && go test ./internal/injection/` runs
 `TestEval02InjectionFixtures` and `TestRuleTriggersStartEveryMatch` over them. The file
-has four sections:
+has five sections:
 
 | Section | Each case gives | The test checks |
 | --- | --- | --- |
 | `scan` | a text and the rule ids it must be flagged with (`[]` for a benign near miss) | the flags, in rule-table order |
+| `tool_result` | a tool result as xMustard delivers it (JSON with escaped newlines and `\u003c`, a stream, or plain text) and its rule ids | the flags `ScanText` reports |
 | `policy` | a surface, a basis, an optional quarantine, a text (`repeat` makes it long) | admit or withhold, the reason and the flags |
 | `frame` | a text (and an id attribute) that tries to close or forge a frame | exactly one opening and one closing frame tag, and attributes that stay quoted |
 | `capture` | a capture's tool name | the quarantine content derived from it gets (`""` is trusted) |
 
 The end-to-end cases, which cover a WebFetch citation that quarantines a proposal and
-an edit, human approval failing closed, and flagged memory served on recall but never
-pushed, are the `workspaceops` tests in `memory_injection_test.go`.
+an edit, a recall result that carries a quarantined memory into a proposal, a core
+entry refusing an untrusted edit, human approval failing closed, and flagged memory
+served on recall but never pushed, are the `workspaceops` tests in
+`memory_injection_test.go`.
 
 ## Arms
 
