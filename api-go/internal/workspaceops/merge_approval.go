@@ -135,6 +135,12 @@ type mergeRevocationData struct {
 // DiffReviewedChange observes the change between the merge base of baseRef and headRef
 // in the workspace's repository.
 func DiffReviewedChange(ctx context.Context, dataDir, workspaceID, baseRef, headRef string) (ReviewedChange, error) {
+	return observeChange(ctx, dataDir, workspaceID, baseRef, headRef, nil)
+}
+
+// observeChange is DiffReviewedChange that also writes the diff text to text when it is
+// not nil, so what a caller reads is exactly what was digested.
+func observeChange(ctx context.Context, dataDir, workspaceID, baseRef, headRef string, text io.Writer) (ReviewedChange, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return ReviewedChange{}, err
 	}
@@ -150,19 +156,23 @@ func DiffReviewedChange(ctx context.Context, dataDir, workspaceID, baseRef, head
 	if err != nil {
 		return ReviewedChange{}, err
 	}
-	return diffAt(ctx, workspaceID, root, baseRef, base, head)
+	return diffAt(ctx, workspaceID, root, baseRef, base, head, text)
 }
 
 // diffAt observes the change from the merge base of base (resolved from baseRef) and
-// head, both resolved commits.
-func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string) (ReviewedChange, error) {
+// head, both resolved commits. The diff text also goes to text when it is not nil.
+func diffAt(ctx context.Context, workspaceID, root, baseRef, base, head string, text io.Writer) (ReviewedChange, error) {
 	var mb bytes.Buffer
 	if err := reviewGit(ctx, root, &mb, "merge-base", base, head); err != nil {
 		return ReviewedChange{}, fmt.Errorf("merge base of %s and %s: %w", baseRef, head, err)
 	}
 	c := ReviewedChange{WorkspaceID: workspaceID, Repository: root, BaseRef: baseRef, MergeBase: strings.TrimSpace(mb.String()), Head: head}
 	h := sha256.New()
-	counted := &countingWriter{w: h}
+	var sink io.Writer = h
+	if text != nil {
+		sink = io.MultiWriter(h, text)
+	}
+	counted := &countingWriter{w: sink}
 	if err := reviewGit(ctx, root, counted, reviewDiffArgs(c.MergeBase, head)...); err != nil {
 		return ReviewedChange{}, fmt.Errorf("diff %s..%s: %w", c.MergeBase, head, err)
 	}
@@ -195,23 +205,31 @@ func resolveCommit(ctx context.Context, root, ref string) (string, error) {
 	return strings.TrimSpace(out.String()), nil
 }
 
-// reviewGit runs git in root with the system and global configuration ignored, hooks
-// and the fsmonitor off, and every GIT_* and XMUSTARD_* variable removed from its
-// environment (the approver's token never reaches it), writing stdout to w.
+// reviewGit runs reviewGitCommand to completion within reviewDiffTimeout, writing
+// stdout to w.
 func reviewGit(ctx context.Context, root string, w io.Writer, args ...string) error {
 	ctx, cancel := context.WithTimeout(ctx, reviewDiffTimeout)
 	defer cancel()
-	full := append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "core.fsmonitor=false", "-c", "core.quotePath=true"}, args...)
-	cmd := exec.CommandContext(ctx, "git", full...)
-	cmd.Dir, cmd.Stdout, cmd.WaitDelay = root, w, time.Second
+	cmd := reviewGitCommand(ctx, root, args...)
+	cmd.Stdout = w
 	var stderr bytes.Buffer
 	cmd.Stderr = &limitedBuffer{buf: &stderr, max: 4 << 10}
-	cmd.Env = append(scrubbedGitEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
-		"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("git %s: %w: %s", args[0], err, strings.TrimSpace(stderr.String()))
 	}
 	return nil
+}
+
+// reviewGitCommand is git in root with the system and global configuration ignored,
+// hooks and the fsmonitor off, and every GIT_* and XMUSTARD_* variable removed from its
+// environment (the approver's token never reaches it).
+func reviewGitCommand(ctx context.Context, root string, args ...string) *exec.Cmd {
+	full := append([]string{"-c", "core.hooksPath=" + os.DevNull, "-c", "core.fsmonitor=false", "-c", "core.quotePath=true"}, args...)
+	cmd := exec.CommandContext(ctx, "git", full...)
+	cmd.Dir, cmd.WaitDelay = root, time.Second
+	cmd.Env = append(scrubbedGitEnv(), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL="+os.DevNull,
+		"GIT_TERMINAL_PROMPT=0", "GIT_OPTIONAL_LOCKS=0", "LC_ALL=C")
+	return cmd
 }
 
 func scrubbedGitEnv() []string {
@@ -415,7 +433,7 @@ func MergeApprovalState(ctx context.Context, dataDir, workspaceID, baseRef, head
 			continue
 		}
 		if st.Current == nil {
-			now, err := diffAt(ctx, workspaceID, root, baseRef, base, st.Head)
+			now, err := diffAt(ctx, workspaceID, root, baseRef, base, st.Head, nil)
 			if err != nil {
 				return nil, err
 			}

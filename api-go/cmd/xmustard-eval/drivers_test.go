@@ -118,6 +118,36 @@ func TestParseCodexFinalEvent(t *testing.T) {
 	}
 }
 
+// codex emits {"type":"error"} for retryable errors too (codex-rs
+// event_processor_with_jsonl_output.rs): a run that completes after one is not an
+// error; one that ends on it is.
+func TestParseCodexErrorEventIsFatalOnlyWithoutCompletion(t *testing.T) {
+	retried := `{"type":"turn.started"}
+{"type":"error","message":"Reconnecting... 1/5 (stream disconnected before completion)"}
+{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":50,"output_tokens":10,"reasoning_output_tokens":2}}
+`
+	tr := codexDriver{}.Parse(strings.NewReader(retried), "xmustard")
+	if tr.IsError || tr.ErrorText != "" || !tr.FinalEvent || !tr.UsageReported {
+		t.Fatalf("a retried error marked the run failed: %+v", tr)
+	}
+	// cache writes are part of input_tokens, like cached reads
+	if want := (Usage{Input: 10, CacheRead: 40, CacheWrite: 50, Output: 10, Reasoning: 2, Total: 110}); tr.Usage != want {
+		t.Fatalf("usage %+v, want %+v", tr.Usage, want)
+	}
+	// an unset cache-write price bills cache writes at the input rate
+	priceUsage(&tr, "gpt-x", map[string]Price{"gpt-x": {InputPerMTok: 1, CachedInputPerMTok: 0.1, OutputPerMTok: 10}})
+	if tr.CostUSD == nil || *tr.CostUSD != 0.000164 { // (10 + 40*0.1 + 50 + 10*10) / 1e6
+		t.Fatalf("priced cost %v", tr.CostUSD)
+	}
+	fatal := retried + `{"type":"turn.started"}
+{"type":"error","message":"unexpected status 401 Unauthorized"}
+`
+	tr = codexDriver{}.Parse(strings.NewReader(fatal), "xmustard")
+	if !tr.IsError || tr.ErrorText != "unexpected status 401 Unauthorized" {
+		t.Fatalf("an error with no completion after it: %+v", tr)
+	}
+}
+
 const piStream = `{"id":"xm-eval-prompt","type":"response","command":"prompt","success":true}
 {"type":"agent_start"}
 {"type":"tool_execution_end","toolCallId":"c1","toolName":"recall","isError":false,"result":{"content":[{"type":"text","text":"mem"}]}}
