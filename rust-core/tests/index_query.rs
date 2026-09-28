@@ -791,10 +791,10 @@ fn freshness_envelope_on_search_explain_and_impact_reports_the_commit_relation()
     }
 }
 
-// impact(path=) walks the reference graph from the file itself, as impact(symbol=)
-// walks it from the symbol's defining files: the same answer from the legacy graph and
-// the index, bounded by max_depth, and found=false (nothing impacted) for a path the
-// graph does not hold.
+// impact(path=) walks the file-level reference graph from the file itself (the walk
+// impact(symbol=) made from a symbol's defining files before impact v2, WS-35): the same
+// answer from the legacy graph and the index, bounded by max_depth, and found=false
+// (nothing impacted) for a path the graph does not hold.
 #[test]
 fn impact_file_walks_from_the_file_on_both_sources() {
     let r = fixture();
@@ -804,13 +804,14 @@ fn impact_file_walks_from_the_file_on_both_sources() {
     };
     let answers = || {
         let total = file("web/src/total.ts", "4");
+        // the file the symbol form resolves computeTotal to; its answer is impact v2's
+        // (depth tiers over typed edges), no longer this file walk
         let symbol = run_json(&["symbolgraph", "impact", root, "ws", "computeTotal", "4"]);
         assert_eq!(
             symbol["defined_in"],
             json!(["web/src/total.ts"]),
             "{symbol}"
         );
-        assert_eq!(total["impacted"], symbol["impacted"], "{total}\n{symbol}");
         assert_eq!(total["found"], true, "{total}");
         assert_eq!(total["path"], "web/src/total.ts");
         let direct: Vec<&str> = total["impacted"]
