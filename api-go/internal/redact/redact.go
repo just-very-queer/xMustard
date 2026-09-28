@@ -17,10 +17,10 @@
 // *RejectError.
 //
 // The same engine serves strings (String, Bytes, Check, Findings) and streams
-// (NewReader, Copy, WriteFile). Input is processed in fixed 128 KiB windows,
-// about 33 KiB of which are held back as lookahead, which covers everything a
-// detector reads past where it matched. A window emits text in clear only
-// before the positions it has decided; a secret it found that starts later
+// (NewReader, NewWriter, Copy, WriteFile). Input is processed in fixed 128 KiB
+// windows, about 33 KiB of which are held back as lookahead, which covers
+// everything a detector reads past where it matched. A window emits text in
+// clear only before the positions it has decided; a secret it found that starts later
 // (the password of a URL whose scheme it saw) is merged with the next
 // window's findings. So a secret split across read or window boundaries is
 // still found, the output is what one pass over the whole input produces
@@ -65,8 +65,8 @@
 //
 //   - Memory ingest (remember): Check to refuse content with a secret, or
 //     String to store it redacted; surface the Report as `redacted`.
-//   - Evidence capture: hash the original while storing redacted bytes with
-//     r.NewReader(io.TeeReader(src, sha256.New())).
+//   - Evidence capture: NewWriter over the spool writer, flushed at every
+//     section boundary (the capture route wires it; see evidence.StreamRedactor).
 //   - Transcript and session imports: NewReader per file, or Value per decoded
 //     JSON record.
 //   - Fixtures, overflow and handoff files: WriteFile (mode 0600, atomic).
