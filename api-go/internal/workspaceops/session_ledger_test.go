@@ -339,7 +339,8 @@ func TestNewSessionInAnotherClientGetsPriorSnapshotAndProposals(t *testing.T) {
 		t.Fatalf("unknown %+v", unknown)
 	}
 	h := g.SessionHandoff
-	if h == nil || h.FromSession != "claude:sess-a" || h.Restore || h.Client != "claude" || h.Label != SessionHandoffLabel {
+	if h == nil || h.FromSession != "claude:sess-a" || h.Restore || h.Client != "claude" || h.Label != SessionHandoffLabel ||
+		len(h.InjectionFlags) != 0 {
 		t.Fatalf("handoff %+v", h)
 	}
 	if s := h.Snapshot; s == nil || s.Goal != "fix the rounding bug" || len(s.OpenFailures) != 1 || s.OpenFailures[0].Handle != handle ||

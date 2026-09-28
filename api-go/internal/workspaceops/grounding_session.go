@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/govstore"
+	"xmustard/api-go/internal/injection"
 )
 
 // groundingSession is the session section of `ground`: the one-line summary an
@@ -56,8 +57,12 @@ type SessionHandoff struct {
 	// the paths changed since.
 	Capsule *HandoffRecord `json:"capsule,omitempty"`
 	// DriftStale is the drift section's stale flag (null when drift is unknown).
-	DriftStale *bool  `json:"drift_stale"`
-	Label      string `json:"label"`
+	DriftStale *bool `json:"drift_stale"`
+	// InjectionFlags are the instruction patterns the snapshot's text matches (WS-56):
+	// it carries prompt, command and error excerpts; a SessionStart hook withholds a
+	// flagged one.
+	InjectionFlags []string `json:"injection_flags,omitempty"`
+	Label          string   `json:"label"`
 }
 
 // HandoffHandle is an evidence handle a session's tool call left, unexpired.
@@ -228,7 +233,8 @@ func handoffFrom(ctx context.Context, r govstore.Reader, root, workspaceID, sess
 		return nil, err
 	}
 	h := &SessionHandoff{FromSession: from.ID, Client: from.Client, Principal: from.Principal, Status: from.Status,
-		LastSeenAt: from.LastSeenAt, Restore: restore, Snapshot: snap, Label: SessionHandoffLabel}
+		LastSeenAt: from.LastSeenAt, Restore: restore, Snapshot: snap, Label: SessionHandoffLabel,
+		InjectionFlags: injection.Scan(snap.Render()).Flags}
 	if h.Handles, err = recentHandles(ctx, r, workspaceID, from.ID, now); err != nil {
 		return nil, err
 	}
@@ -283,6 +289,7 @@ func containsProposal(list []SnapshotProposal, id string) bool {
 func continuity(ctx context.Context, r govstore.Reader, workspaceID string, main []govstore.Session, pending map[string]SnapshotProposal,
 	now time.Time) (*Continuity, error) {
 	c := &Continuity{RecentActionable: []ContinuityItem{}, OpenItems: []ContinuityItem{}}
+	listed := map[string]bool{} // a proposal edited in a session is recorded again
 	for _, sess := range main[:min(len(main), groundRecentWindow)] {
 		rows, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, SessionID: sess.ID,
 			Kinds: []string{LedgerToolCall, LedgerMemoryProposed}, Limit: groundRecentCalls / groundRecentWindow})
@@ -303,7 +310,8 @@ func continuity(ctx context.Context, r govstore.Reader, workspaceID string, main
 				Text: cutBytes(capsule.NextStep, groundViewTextMax)})
 		}
 		for _, ev := range rows {
-			if p, ok := pending[ev.EntryID]; ok && ev.Kind == LedgerMemoryProposed && len(c.OpenItems) < groundContinuity {
+			if p, ok := pending[ev.EntryID]; ok && ev.Kind == LedgerMemoryProposed && !listed[p.ID] && len(c.OpenItems) < groundContinuity {
+				listed[p.ID] = true
 				c.OpenItems = append(c.OpenItems, ContinuityItem{Session: sess.ID, Kind: "proposal",
 					Text: fmt.Sprintf("%q needs %d more vote(s)", p.Title, p.VotesNeeded), EntryID: p.ID})
 			}

@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"log"
+	"time"
 )
 
 // ShutdownInFlight performs a workload-aware drain AFTER HTTP admissions have stopped
@@ -15,14 +16,20 @@ import (
 //     to or double-launches an orphaned worker.
 //  2. each terminal: mark closed, end every process in the shell's session, close the PTY.
 //  3. merge the coalesced search-retrieval feedback into each workspace's store.
-//  4. flush the inline PG mirror workers so the interrupted run snapshots are mirrored.
+//  4. let the session ledger write what hooks queued (its snapshots and capsules too),
+//     for at most ledgerShutdownWait.
+//  5. flush the inline PG mirror workers so the interrupted run snapshots are mirrored.
 func ShutdownInFlight(dataDir string) {
 	interruptInFlightRuns(dataDir)
 	closeAllTerminals()
 	feedbackRec.flush()
+	FlushSessionLedger(dataDir, ledgerShutdownWait)
 	PgInlineFlush()
 	CloseMemoryStores()
 }
+
+// ledgerShutdownWait bounds how long shutdown waits for the session ledger.
+const ledgerShutdownWait = 5 * time.Second
 
 func interruptInFlightRuns(dataDir string) {
 	type live struct {

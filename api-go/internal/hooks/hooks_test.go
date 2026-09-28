@@ -365,3 +365,45 @@ func TestDecodeSkipsFieldsOfAnotherType(t *testing.T) {
 		t.Fatal("malformed JSON decoded")
 	}
 }
+
+// A call's argument digest identifies it across runs (WS-33): a shell call by its
+// command alone, any other tool by its input as sent, whatever the spacing.
+func TestArgsDigestIdentifiesACallAcrossRuns(t *testing.T) {
+	digest := func(body string) string {
+		t.Helper()
+		in, err := Decode([]byte(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ArgsDigest(in, []byte(body))
+	}
+	run := digest(`{"tool_name":"Bash","tool_input":{"command":"go test ./...","description":"run the tests"}}`)
+	rerun := digest(`{"tool_name":"Bash","tool_input":{"command":" go test ./... ","description":"re-run"}}`)
+	read := digest(`{"tool_name":"Read","tool_input":{"file_path":"/r/a.go","limit":20}}`)
+	spaced := digest(`{"tool_name":"Read","tool_input": { "file_path" : "/r/a.go", "limit" : 20 }}`)
+	other := digest(`{"tool_name":"Read","tool_input":{"file_path":"/r/b.go","limit":20}}`)
+	if run == "" || run != rerun || read != spaced || read == other || !strings.HasPrefix(run, "sha256:") {
+		t.Fatalf("digests: run %s rerun %s read %s spaced %s other %s", run, rerun, read, spaced, other)
+	}
+}
+
+// xMustard's own remember and verify calls are memory actions with the memory they
+// name; anything else, and a remember that stored no memory, is not.
+func TestOwnMemoryCall(t *testing.T) {
+	for _, c := range []struct {
+		tool, body, kind, id string
+		ok                   bool
+	}{
+		{"mcp__xmustard__verify", `{"tool_input":{"entry_id":"ctx_0123456789ab","approve":true}}`, "memory_verified", "ctx_0123456789ab", true},
+		{"mcp__plugin_xmustard_xmustard__remember", `{"tool_input":{"content":"x"},"tool_response":[{"type":"text","text":"{\"id\":\"ctx_ba9876543210\",\"status\":\"pending\"}"}]}`,
+			"memory_proposed", "ctx_ba9876543210", true},
+		{"mcp__xmustard__remember", `{"tool_input":{"kind":"handoff"},"tool_response":{"id":"handoff:3"}}`, "", "", false},
+		{"mcp__other__remember", `{"tool_input":{"entry_id":"ctx_0123456789ab"}}`, "", "", false},
+		{"mcp__xmustard__recall", `{"tool_input":{"entry_id":"ctx_0123456789ab"}}`, "", "", false},
+	} {
+		kind, id, ok := OwnMemoryCall(c.tool, []byte(c.body))
+		if ok != c.ok || ok && (kind != c.kind || id != c.id) {
+			t.Errorf("%s: %q %q %v, want %q %q %v", c.tool, kind, id, ok, c.kind, c.id, c.ok)
+		}
+	}
+}
