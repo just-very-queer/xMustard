@@ -40,6 +40,7 @@ func apiRouteAreas() [][]routeSpec {
 		verificationRoutes,
 		goalRoutes,
 		governanceRoutes,
+		codeIntelRoutes,
 		routesOf(registerInlineRoutes),
 	}
 }
@@ -173,6 +174,19 @@ func itemCall[T any](item string, op func(dataDir, workspaceID, id string) (T, e
 func queryCall[T any](key string, op func(dataDir, workspaceID, value string) (T, error), fail failure) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		result, err := op(dataDir(), r.PathValue("workspace_id"), r.URL.Query().Get(key))
+		reply(w, result, err, fail)
+	}
+}
+
+// requiredQueryCall is queryCall for a parameter the route cannot run without: a
+// missing one is a 400 that names it, before the call.
+func requiredQueryCall[T any](key string, op func(dataDir, workspaceID, value string) (T, error), fail failure) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		value, ok := requireQuery(w, r, key)
+		if !ok {
+			return
+		}
+		result, err := op(dataDir(), r.PathValue("workspace_id"), value)
 		reply(w, result, err, fail)
 	}
 }
