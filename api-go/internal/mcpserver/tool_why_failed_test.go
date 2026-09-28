@@ -81,8 +81,8 @@ func TestReadOnlyConnectionServesWhyFailedReadsOnly(t *testing.T) {
 // is rejected, not clamped.
 func TestWhyFailedTimeoutStaysUnderTheClientCallTimeout(t *testing.T) {
 	s := newSession(t, &fakeAPI{}, Options{}, nil, LatestProtocolVersion)
-	if _, rerr := call(t, s, "why_failed", map[string]any{"workspace_id": "ws", "command": "go test", "timeout_seconds": 55}); rerr == nil {
-		t.Fatal("a timeout past the client's call timeout must be rejected")
+	if _, d := argErr(t, s, "why_failed", map[string]any{"workspace_id": "ws", "command": "go test", "timeout_seconds": 55}); d["argument"] != "timeout_seconds" {
+		t.Fatalf("a timeout past the client's call timeout must be rejected: %v", d)
 	}
 	if maxWhyFailedTimeout >= 60 {
 		t.Fatalf("maxWhyFailedTimeout %d must stay below the 60 s client call timeout", maxWhyFailedTimeout)

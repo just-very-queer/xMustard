@@ -24,8 +24,9 @@ func TestToolDescriptionsStateImplementationLimits(t *testing.T) {
 		// bodies are searched by BM25 over chunks (WS-18); the trigram lane is typo
 		// tolerance, not meaning.
 		"search": {"bm25", "function bodies", "doc sections", "typo tolerance (not meaning)", "rrf (k=60)", "ast-grep"},
-		// symbol= is a file-level walk from the defining files; from=&to= ignores direction.
-		"impact": {"lexical reference graph", "import lines", "leads to confirm, not proof", "defining files", "undirected"},
+		// symbol= is a file-level walk from the defining files, path= the same walk from
+		// one file; from=&to= ignores direction.
+		"impact": {"lexical reference graph", "import lines", "leads to confirm, not proof", "defining files", "path= → the same from one file", "undirected"},
 		// paths alone gate results; no args ranks by working-tree overlap.
 		"recall": {"conflicts", "path overlap, not contradiction", "non-matches dropped", "working-tree overlap"},
 	}

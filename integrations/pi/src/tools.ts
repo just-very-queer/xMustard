@@ -157,17 +157,22 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=&to= → shortest undirected file path.",
+			"Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops; path= → the same from one file. from=&to= → shortest undirected file path.",
 		args: [
 			workspaceArg,
 			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
+			{ name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file" },
 			{ name: "from", type: "string", desc: "trace path from this symbol" },
 			{ name: "to", type: "string", desc: "trace path to this symbol" },
-			{ name: "max_depth", type: "integer", minimum: 1, maximum: 4, desc: "max hops for symbol= (default 4)" },
+			{ name: "max_depth", type: "integer", minimum: 1, maximum: 4, desc: "max hops for symbol=/path= (default 4)" },
 		],
+		// path= forwards every mode argument, so the API refuses path mixed with symbol or
+		// from/to (Go's Build does the same).
 		build: (a) => {
 			let path = ws(a, "/changes/since-index");
-			if (str(a, "from") && str(a, "to")) path = query(path, "from", str(a, "from"), "to", str(a, "to"));
+			if (str(a, "path"))
+				path = query(path, ...["path", "symbol", "from", "to"].flatMap((k) => [k, str(a, k)]), "depth", str(a, "max_depth"));
+			else if (str(a, "from") && str(a, "to")) path = query(path, "from", str(a, "from"), "to", str(a, "to"));
 			else if (str(a, "symbol")) path = query(path, "symbol", str(a, "symbol"), "depth", str(a, "max_depth"));
 			return { method: "GET", path };
 		},

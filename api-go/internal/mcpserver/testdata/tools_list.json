@@ -381,7 +381,7 @@
         "readOnlyHint": true,
         "title": "Estimate change impact"
       },
-      "description": "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops. from=\u0026to= → shortest undirected file path.",
+      "description": "Blast radius over a LEXICAL reference graph (name matches + import lines, not resolved calls): distance≥1 edges are leads to confirm, not proof. No args → current changes (dirty symbols, contract_break). symbol= → files referencing its defining files, ≤4 hops; path= → the same from one file. from=\u0026to= → shortest undirected file path.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -390,10 +390,15 @@
             "type": "string"
           },
           "max_depth": {
-            "description": "max hops for symbol= (default 4)",
+            "description": "max hops for symbol=/path= (default 4)",
             "maximum": 4,
             "minimum": 1,
             "type": "integer"
+          },
+          "path": {
+            "description": "a repo-relative file",
+            "maxLength": 4096,
+            "type": "string"
           },
           "symbol": {
             "description": "symbol to compute blast radius for",

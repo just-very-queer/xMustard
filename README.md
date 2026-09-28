@@ -40,9 +40,11 @@ gives agents such as Claude Code, Codex, and OpenCode two related capabilities:
 
 The agent-facing surface has **nine tools**. They use modes/params (e.g.
 `search?mode=pattern`, `impact
-symbol=/from=/to=`, `recall query=`) rather than split into more tools, and
+symbol=/path=/from=/to=`, `recall query=`) rather than split into more tools, and
 `tools/call` strictly validates arguments — unknown/wrong-typed/non-scalar/
-out-of-enum args are rejected with a JSON-RPC `-32602`, never silently coerced.
+out-of-enum args are rejected, never silently coerced, with a tool error
+(`isError`) that says what was wrong and lists the tool's arguments; an unknown
+tool or a malformed request is a JSON-RPC `-32602`.
 The historical narrowing decision is recorded in [`docs/RETHINK.md`](docs/RETHINK.md).
 
 The candidate also advertises MCP `resources` for authorized original-evidence
@@ -144,7 +146,7 @@ access logs.
 | `verify` | `entry_id`, `approve?` | Approve (or reject) a peer's proposed memory; it promotes once enough distinct principals approve. |
 | `search` | `query`, `mode?` (`hybrid`\|`pattern`), `lang?`, `seed?` | Code search returning `path:line` slices, not a dump. Default `hybrid` ranks symbol names, file paths and doc chunks, not function bodies: RRF over lexical IDF, char-trigram fuzzy matching (typo tolerance; conceptual matching only when built with the optional `semantic-onnx` feature and `XMUSTARD_EMBED_MODEL` names a local ONNX model directory), inbound-reference degree, and graph proximity to `seed=<symbol>`. `mode=pattern` runs an ast-grep structural query over code. |
 | `explain` | `path` | Explain a file or directory: purpose, key symbols, how to run/verify it. |
-| `impact` | `symbol?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → files that reference the file(s) defining that name, up to 4 hops (file-level, so a hit may use a different symbol from the same file); `from=`&`to=` → shortest undirected path between the files defining the two names. |
+| `impact` | `symbol?`, `path?`, `from?`, `to?` | Blast radius over a lexical reference graph (symbol-name matches across files plus import-line heuristics, not resolved calls), so distance ≥ 1 edges are leads to confirm, not proof. No args → current changes (with `contract_break` flags); `symbol=` → files that reference the file(s) defining that name, up to 4 hops (file-level, so a hit may use a different symbol from the same file); `path=` → the same walk from one file (`found: false` when the graph does not hold it); `from=`&`to=` → shortest undirected path between the files defining the two names. |
 | `diagnostics` | — | Current normalized errors/warnings for the workspace. |
 | `why_failed` | `run_id?`; advanced: `command`, `cwd`, `timeout_seconds`, `evidence_handle`, `log` | Explain a failure without a platform run: failure signals, salient error lines from the output's last MiB, the changed files it implicates and the promoted memories on them. `run_id` reads a platform run or a recorded outcome. `command` runs a test, build or lint command from a closed table (argv, no shell, inside the workspace root, without the daemon's secrets, one at a time, its process group killed at the timeout; on a loopback bind, or anywhere with `XMUSTARD_WHY_FAILED_COMMANDS=1`); `evidence_handle` and `log` explain a captured or pasted output. Each records a run-independent outcome that `ground` lists in `recent_failed_runs` until a later run of the same command resolves it. Captured failing test/build/lint outputs are recorded the same way. |
 

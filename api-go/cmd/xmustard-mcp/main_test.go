@@ -67,14 +67,19 @@ func TestDispatchToolsCallMalformedParams(t *testing.T) {
 	}
 }
 
-func TestDispatchToolsCallUnknownToolIsResult(t *testing.T) {
-	// Unknown tool is a recoverable tool result (isError), not a protocol error.
-	res, rerr := dispatch("tools/call", json.RawMessage(`{"name":"nope","arguments":{}}`))
+// MCP 2025-11-25: an unknown tool is a protocol error (-32602), while an argument
+// the tool rejects is a tool result (isError) the model can correct.
+func TestDispatchToolsCallUnknownToolIsProtocolError(t *testing.T) {
+	_, rerr := dispatch("tools/call", json.RawMessage(`{"name":"nope","arguments":{}}`))
+	if rerr == nil || rerr.Code != -32602 || !strings.Contains(rerr.Message, "Unknown tool: nope") {
+		t.Fatalf("expected -32602 for an unknown tool, got %v", rerr)
+	}
+	res, rerr := dispatch("tools/call", json.RawMessage(`{"name":"impact","arguments":{"bogus":"x"}}`))
 	if rerr != nil {
-		t.Fatalf("unknown tool should not be a JSON-RPC error, got %v", rerr)
+		t.Fatalf("an unknown argument must be a tool result, got JSON-RPC error %v", rerr)
 	}
 	if m, _ := res.(map[string]any); m["isError"] != true {
-		t.Fatalf("expected isError tool result for unknown tool, got %v", res)
+		t.Fatalf("expected an isError tool result for an unknown argument, got %v", res)
 	}
 }
 
