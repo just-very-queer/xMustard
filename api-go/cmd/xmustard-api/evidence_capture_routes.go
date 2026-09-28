@@ -34,9 +34,9 @@ import (
 //
 // Redaction (PAR-CTX-01 "Redaction applies") is fail-closed: an original is retained
 // for the whole retention window and is searchable, so capture refuses with 503
-// redaction_unavailable until a streaming redactor is wired (captureRedactor; the
-// WS-05 redact.Stream plugs in there). Search stays available for originals that
-// were captured redacted.
+// redaction_unavailable when no streaming redactor is wired (captureRedactor).
+// Production builds wire WS-05's redact.Writer (capture_redactor.go, WS-23). Search
+// stays available for originals that were captured redacted.
 //
 // target lowers the client's projection target for one capture (1 KiB..1 MiB; a value
 // above the client policy's target changes nothing). The Pi adapter uses it to retain
@@ -50,8 +50,9 @@ import (
 // A captured test, build or lint output also becomes a run-independent outcome that
 // ground lists (WS-21, outcome_routes.go), except in read-only mode.
 
-// captureRedactor wraps the capture spool writer with the streaming secret redactor.
-// While it is nil, POST .../evidence/capture refuses (503 redaction_unavailable).
+// captureRedactor wraps the capture spool writer with the streaming secret redactor
+// (set by capture_redactor.go). While it is nil, POST .../evidence/capture refuses
+// (503 redaction_unavailable) and the hook routes capture nothing.
 var captureRedactor func(io.Writer) evidence.StreamRedactor
 
 // captureWindowBytes is the transient memory one capture holds while it decodes and
