@@ -5,6 +5,10 @@ import (
 	"strconv"
 )
 
+// memoryKinds mirrors workspaceops.MemoryKinds (a test keeps them equal).
+var memoryKinds = []string{"project_knowledge", "decision", "constraint", "workflow", "procedure", "gotcha",
+	"measurement", "convention", "handoff", "candidate", "maintenance"}
+
 // maxRevision bounds revision arguments; real revisions are small counters.
 const maxRevision = 1 << 30
 
@@ -33,6 +37,10 @@ var rememberTool = &Tool{
 		// Provenance (WS-19B): checked before the write.
 		{Name: "evidence", Type: typeString, List: true, MaxLen: 1024, Desc: "evidence handles it rests on"},
 		{Name: "run_id", Type: typeString, Desc: "run it came from"},
+		// Classification (WS-20): what recall's kind, topic and tags filters match.
+		{Name: "kind", Type: typeString, Enum: memoryKinds},
+		{Name: "topic", Type: typeString, Desc: "a/b/c"},
+		{Name: "tags", Type: typeString, List: true, MaxLen: 1024},
 	},
 	// Proposing is additive (never destroys state) and not idempotent: each call is a
 	// new proposal.
@@ -45,12 +53,12 @@ var rememberTool = &Tool{
 		// content goes in the JSON BODY, not the URL, so durable memory text is not
 		// exposed in access logs / error strings (XM-NEW-018).
 		payload := map[string]any{}
-		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id"} {
+		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id", "kind", "topic"} {
 			if a[k] != "" {
 				payload[k] = a[k]
 			}
 		}
-		for _, k := range []string{"paths", "supersedes", "evidence"} {
+		for _, k := range []string{"paths", "supersedes", "evidence", "tags"} {
 			if a[k] != "" {
 				payload[k] = splitCSV(a[k])
 			}

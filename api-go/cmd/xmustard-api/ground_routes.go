@@ -35,7 +35,7 @@ func registerGroundRoutes(mux routeRegistrar) {
 			writeJSON(w, http.StatusBadRequest, body)
 			return
 		}
-		result, err := workspaceops.BuildSessionGroundingCtx(r.Context(), dataDir(), r.PathValue("workspace_id"))
+		result, err := workspaceops.BuildSessionGroundingFor(r.Context(), dataDir(), r.PathValue("workspace_id"), callerOf(r).ID)
 		if err != nil {
 			respondError(w, err)
 			return

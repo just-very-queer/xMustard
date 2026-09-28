@@ -105,13 +105,14 @@ var sections = []Section{
 		Doc:     "working-tree changes against the indexed baseline, changed signatures in the order the index lists them, and per-language symbol coverage",
 	},
 	{
-		Name: "memory", Cap: 768,
+		Name: "memory", Cap: 1024,
 		Members: []Member{
 			{Name: "stale_memory", Signal: true}, {Name: "stale_memory_checked"}, {Name: "stale_memory_total"},
 			{Name: "stale_memory_complete", Signal: true}, {Name: "memory_verification_modes", Signal: true},
+			{Name: "pending_for_you", Signal: true}, {Name: "memory_pressure", Signal: true},
 		},
-		Recover: "ground sections=memory; recall flags each stale memory",
-		Doc:     "promoted memory whose files drifted, and promoted memory by verification mode",
+		Recover: "ground sections=memory; recall flags each stale memory; recall status=awaiting_me lists pending_for_you",
+		Doc:     "promoted memory whose files drifted, promoted memory by verification mode, the pending memory awaiting your verification, and memory pressure (core_pct, pending_count)",
 	},
 	{
 		Name: "drift", Cap: 1536,

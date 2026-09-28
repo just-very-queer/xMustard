@@ -90,6 +90,8 @@ func TestSearchPagesCarryABoundCursor(t *testing.T) {
 		"past window":   encodeSearchCursor(searchWindow+50, req.rankingKey(ws)),
 		"unsigned":      b64("s1.3." + parts[2][:12]),
 		"recall cursor": b64("r2.3.1." + parts[2]),
+		// signed over this very search, but a recall cursor
+		"recall-signed": recallCursors.encode(req.rankingKey(ws), 3, 16),
 		"garbage":       "not-a-cursor",
 		"over-long":     strings.Repeat("A", maxSearchCursorLen+1),
 	} {
