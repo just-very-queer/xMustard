@@ -52,8 +52,11 @@ impl Cause {
 /// Resolver totals for one build or update, reported under `counters.resolve`.
 #[derive(Debug, Clone, Serialize, Default)]
 pub struct ResolveCounters {
-    /// Go and TS/JS files whose symbol edges were (re)computed.
+    /// Files of the resolver's languages whose symbol edges were (re)computed.
     pub files: usize,
+    /// The same by language family (`go`, `ts`, `rust`, `python`, `java`): coverage of
+    /// the resolver, with the edges each family produced and the drops it recorded.
+    pub languages: BTreeMap<&'static str, LanguageCounters>,
     /// Symbol-layer edges written.
     pub edges: usize,
     /// Edges by confidence tier: `same_file`, `import_scoped`, `global`.
@@ -61,6 +64,15 @@ pub struct ResolveCounters {
     /// References bound to a local binding (never an edge, never a drop).
     pub locals: usize,
     /// Drops and boundaries by cause (occurrences).
+    pub drops: BTreeMap<&'static str, usize>,
+}
+
+/// Resolver coverage of one language family.
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct LanguageCounters {
+    pub files: usize,
+    pub edges: usize,
+    /// Drops and boundaries by cause (occurrences), external bindings included.
     pub drops: BTreeMap<&'static str, usize>,
 }
 
@@ -78,11 +90,14 @@ impl FileDrops {
         conn: &Connection,
         fid: i64,
         totals: &mut ResolveCounters,
+        family: &'static str,
     ) -> rusqlite::Result<()> {
         let mut ins = conn.prepare_cached(
             "INSERT INTO resolve_drops(file_id, name_id, cause, count) VALUES (?1, ?2, ?3, ?4)",
         )?;
+        let by_language = totals.languages.entry(family).or_default();
         for ((name_id, cause), n) in self.0 {
+            *by_language.drops.entry(cause.as_str()).or_default() += n as usize;
             *totals.drops.entry(cause.as_str()).or_default() += n as usize;
             // an external binding never hides an in-repo dependent: counted, not kept.
             if cause != Cause::External {

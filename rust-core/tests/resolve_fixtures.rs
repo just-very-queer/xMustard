@@ -516,8 +516,8 @@ fn impact_returns_resolved_edges_with_confidence_provenance_and_completeness() {
 
     // a language the resolver does not own falls back to lexical file edges
     let rr = repo(&[
-        ("core.rs", "pub fn compute_widget() -> i32 { 1 }\n"),
-        ("app.rs", "fn run() -> i32 { compute_widget() }\n"),
+        ("core.rb", "def compute_widget\n  1\nend\n"),
+        ("app.rb", "def run\n  compute_widget()\nend\n"),
     ]);
     index("build", rr.path(), &[]);
     let lex = index("impact", rr.path(), &["--symbol", "compute_widget"]);
@@ -525,7 +525,7 @@ fn impact_returns_resolved_edges_with_confidence_provenance_and_completeness() {
     assert_eq!(lex["epistemic"]["completeness"], "lower_bound");
     assert_eq!(lex["epistemic"]["causes"]["lexical_graph"], 1);
     let (_, app) = impact_items(&lex)[0];
-    assert_eq!(app["path"], "app.rs");
+    assert_eq!(app["path"], "app.rb");
     assert_eq!(app["kind"], "File");
     assert_eq!(app["provenance"], "lexical");
 }

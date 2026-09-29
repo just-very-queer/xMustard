@@ -75,3 +75,10 @@
 (import_from_statement
   module_name: (_) @module
   (wildcard_import)) @import.wildcard
+
+(function_definition
+  body: (block
+    (expression_statement
+      (assignment
+        left: (identifier) @reference.bind
+        right: (call)))))
