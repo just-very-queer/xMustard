@@ -71,6 +71,12 @@ retrieval-ledger seed writing to an `agent_feedback` segment.
   `impact?symbol=` BFS blast radius + `impact?from=&to=` trace over precomputed
   adjacency, ast-grep `search?mode=pattern`, communities/clusters.
 
+- **Phase 4 — symbol navigation:** *(done, WS-36)* name-path lookup
+  (`search?mode=symbol`), file and directory outlines and a symbol's context
+  (`explain?path=`, `explain?symbol=`) read the code index
+  (`rust-core/src/index/{namepath,overview,context}.rs`); search, explain and impact
+  results fit an output budget (`api-go/internal/toolbudget/`).
+
 See `docs/plans/2026-06-20-deep-graph-loop.md` (S1–S6, all complete).
 
 ## What NOT to do

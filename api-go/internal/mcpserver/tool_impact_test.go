@@ -22,13 +22,13 @@ func TestImpactForwardsEachFormsArguments(t *testing.T) {
 		{map[string]any{"symbol": "Store.Put", "direction": "downstream", "max_depth": 5, "relation_types": []any{"CALLS", "ACCESSES"},
 			"min_confidence": 0.9, "include_tests": true, "limit": 10, "offset": 20, "summary_only": true, "timeout_ms": 500},
 			"/api/workspaces/ws/changes/since-index?symbol=Store.Put&direction=downstream&relation_types=CALLS%2CACCESSES" +
-				"&min_confidence=0.9&include_tests=true&depth=5&limit=10&offset=20&summary_only=true&timeout_ms=500"},
-		{map[string]any{"uid": "Method:a.ts:A.b#0"}, "/api/workspaces/ws/changes/since-index?symbol=Method%3Aa.ts%3AA.b%230"},
+				"&min_confidence=0.9&include_tests=true&depth=5&limit=10&offset=20&summary_only=true&timeout_ms=500&max_chars=8000"},
+		{map[string]any{"uid": "Method:a.ts:A.b#0"}, "/api/workspaces/ws/changes/since-index?symbol=Method%3Aa.ts%3AA.b%230&max_chars=8000"},
 		{map[string]any{"from": "a", "to": "b", "depth": 12, "min_confidence": 0.5},
-			"/api/workspaces/ws/changes/since-index?from=a&to=b&min_confidence=0.5&depth=12"},
+			"/api/workspaces/ws/changes/since-index?from=a&to=b&min_confidence=0.5&depth=12&max_chars=8000"},
 		{map[string]any{"scope": "range", "base": "main", "head": "HEAD", "limit": 5},
-			"/api/workspaces/ws/changes/since-index?scope=range&base=main&head=HEAD&limit=5"},
-		{map[string]any{}, "/api/workspaces/ws/changes/since-index"},
+			"/api/workspaces/ws/changes/since-index?scope=range&base=main&head=HEAD&limit=5&max_chars=8000"},
+		{map[string]any{}, "/api/workspaces/ws/changes/since-index?max_chars=8000"},
 	}
 	for _, c := range cases {
 		c.args["workspace_id"] = "ws"
@@ -77,16 +77,21 @@ func TestImpactRefusesArgumentsOfAnotherForm(t *testing.T) {
 		if rerr != nil || res["isError"] != true || !strings.Contains(text(res), "does not apply to impact") {
 			t.Fatalf("%v: want a refusal, got %v %v", c.args, rerr, res)
 		}
-		if p := api.lastTool(t).Path; p != "/api/workspaces/ws/changes/since-index"+c.path {
+		// the output budget (WS-36) follows the tool's own arguments
+		if p := api.lastTool(t).Path; p != "/api/workspaces/ws/changes/since-index"+c.path+"&max_chars=8000" {
 			t.Fatalf("%v forwarded %q", c.args, p)
 		}
 	}
 }
 
-// Build forwards every argument the tool declares.
+// Build forwards every argument the tool declares: its own (impactQuery) and the
+// output budget's (budgetQuery, WS-36).
 func TestImpactForwardsEveryDeclaredArgument(t *testing.T) {
+	budgeted := func(name string) bool {
+		return slices.ContainsFunc(budgetArgs("impact"), func(b Arg) bool { return b.Name == name })
+	}
 	for _, a := range append(append([]Arg{}, impactTool.Args...), impactTool.Advanced...) {
-		if a.Name != workspaceArg.Name && !slices.Contains(impactQuery, a.Name) {
+		if a.Name != workspaceArg.Name && !slices.Contains(impactQuery, a.Name) && !budgeted(a.Name) {
 			t.Fatalf("Build does not forward %s", a.Name)
 		}
 	}

@@ -213,7 +213,10 @@ fn syntax_check(mut args: Args) -> CmdResult {
     if paths.is_empty() {
         return Err(CmdError::usage(usage));
     }
-    json(&xmustard_core::syntaxcheck::check(&PathBuf::from(root), &paths))
+    json(&xmustard_core::syntaxcheck::check(
+        &PathBuf::from(root),
+        &paths,
+    ))
 }
 
 fn explain_path(mut args: Args) -> CmdResult {
@@ -963,7 +966,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|changes|resolve|blast-radius> [--identity-key=K] [--name=value ...] ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|changes|resolve|blast-radius|find-symbol|overview|context> [--identity-key=K] [--name=value ...] ...",
     )?;
     let (key, args) = identity_flag(args);
     let mut rest: Vec<String> = args.collect();
@@ -978,7 +981,10 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
     };
     let failed = |e: String| CmdError::failed(format!("symbolgraph {sub}: {e}"));
     let bad_flag = |e: String| CmdError::new(2, format!("symbolgraph {sub}: {e}"));
-    let takes_flags = matches!(sub.as_str(), "impact" | "trace" | "changes");
+    let takes_flags = matches!(
+        sub.as_str(),
+        "impact" | "trace" | "changes" | "find-symbol" | "overview" | "context"
+    );
     if !takes_flags && !flags.is_empty() {
         return Err(bad_flag(format!(
             "takes no flags (got {})",
@@ -1145,6 +1151,60 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             let src = source(&root, &ws);
             json(&src.graph.hotspots(limit).map_err(failed)?)
         }
+        "find-symbol" => {
+            // search mode=symbol (WS-36): a name path, paged and ranked
+            let u = usage(&format!(" <name_path> (flags: {})", FIND_FLAGS.join(", ")));
+            let flags = NavFlags::parse(&flags, FIND_FLAGS, &u)?;
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let query = need(&mut args, &u)?;
+            use xmustard_core::index::namepath::{self as np, FindOptions, Kinds, Lookup};
+            let lookup = Lookup {
+                find: FindOptions {
+                    substring: flags.on("substring"),
+                    kinds: Kinds::parse(flags.get("kinds")),
+                    path_glob: Some(flags.get("path-glob")),
+                },
+                depth: flags.num("depth", 0, &u)?,
+                include_body: flags.on("include-body"),
+                include_info: flags.on("include-info"),
+                max_matches: flags.num("max-matches", np::DEFAULT_MAX_MATCHES as u32, &u)? as usize,
+                offset: flags.num("offset", 0, &u)? as usize,
+            };
+            let src = source(&root, &ws);
+            json(&np::answer(&src, &ws, &query, &lookup).map_err(|e| CmdError::new(2, e))?)
+        }
+        "overview" => {
+            // explain path= (WS-36): a file's or directory's outline
+            let u = usage(" <path> (flags: depth)");
+            let flags = NavFlags::parse(&flags, &["depth"], &u)?;
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let path = need(&mut args, &u)?;
+            let src = source(&root, &ws);
+            let depth = flags.num("depth", 1, &u)?;
+            json(&xmustard_core::index::overview::answer(&src, &ws, &path, depth).map_err(failed)?)
+        }
+        "context" => {
+            // explain symbol= (WS-36): a symbol's references in both directions
+            let u = usage(" <name_path|uid> (flags: chain-depth, include-content)");
+            let flags = NavFlags::parse(&flags, &["chain-depth", "include-content"], &u)?;
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let target = need(&mut args, &u)?;
+            let src = source(&root, &ws);
+            let chain_depth = flags.num("chain-depth", 0, &u)?;
+            json(
+                &xmustard_core::index::context::answer(
+                    &src,
+                    &ws,
+                    &target,
+                    chain_depth,
+                    flags.on("include-content"),
+                )
+                .map_err(|e| CmdError::new(2, e))?,
+            )
+        }
         "resolve" => {
             // memory anchors (WS-27): the declarations of the names a memory mentions,
             // from the source search and impact read
@@ -1169,6 +1229,55 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
             2,
             format!("unknown symbolgraph subcommand: {other}"),
         )),
+    }
+}
+
+/// The flags `symbolgraph find-symbol` takes.
+const FIND_FLAGS: &[&str] = &[
+    "offset",
+    "max-matches",
+    "path-glob",
+    "kinds",
+    "depth",
+    "substring",
+    "include-body",
+    "include-info",
+];
+
+/// The leading `--name[=value]` flags of a navigation subcommand (the symbolgraph
+/// command splits them off before the positionals); a flag the subcommand does not take
+/// is a usage error.
+struct NavFlags(std::collections::HashMap<String, String>);
+
+impl NavFlags {
+    fn parse(flags: &[String], known: &[&str], usage: &str) -> Result<NavFlags, CmdError> {
+        let mut out = std::collections::HashMap::new();
+        for f in flags {
+            let f = f.trim_start_matches("--");
+            let (name, value) = f.split_once('=').unwrap_or((f, "true"));
+            if !known.contains(&name) {
+                return Err(CmdError::usage(format!("{usage} (unknown flag --{name})")));
+            }
+            out.insert(name.to_string(), value.to_string());
+        }
+        Ok(NavFlags(out))
+    }
+
+    fn get(&self, name: &str) -> &str {
+        self.0.get(name).map_or("", String::as_str)
+    }
+
+    fn on(&self, name: &str) -> bool {
+        self.get(name) == "true"
+    }
+
+    fn num(&self, name: &str, default: u32, usage: &str) -> Result<u32, CmdError> {
+        match self.0.get(name) {
+            None => Ok(default),
+            Some(v) => v
+                .parse()
+                .map_err(|_| CmdError::usage(format!("{usage} (--{name} must be a number)"))),
+        }
     }
 }
 
@@ -1218,6 +1327,9 @@ mod tests {
         ("symbolgraph", &["clusters"]),
         ("symbolgraph", &["cluster-of"]),
         ("symbolgraph", &["coverage"]),
+        ("symbolgraph", &["find-symbol"]),
+        ("symbolgraph", &["overview"]),
+        ("symbolgraph", &["context"]),
         ("symbolgraph", &["resolve"]),
         ("changetrack", &["fingerprint"]),
         ("changetrack", &["drift"]),

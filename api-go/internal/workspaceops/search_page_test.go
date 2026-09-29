@@ -165,7 +165,7 @@ func TestSearchCursorStopsAtTheEndAndTheWindow(t *testing.T) {
 		{0, 0, 0, false},
 	} {
 		var res map[string]any
-		_ = json.Unmarshal(withSearchCursor(body(c.total, c.hits), c.offset, ranking), &res)
+		_ = json.Unmarshal(withListCursor(body(c.total, c.hits), "hits", c.offset, ranking), &res)
 		_, got := res["next_cursor"]
 		if got != c.want {
 			t.Errorf("offset %d total %d hits %d: next_cursor %v, want %v", c.offset, c.total, c.hits, got, c.want)

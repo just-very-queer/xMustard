@@ -95,13 +95,23 @@ func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) 
 // BuildSessionGroundingFor grounds a session for caller: pending_for_you counts the
 // pending memory caller neither authored nor voted on.
 func BuildSessionGroundingFor(ctx context.Context, dataDir, workspaceID, caller string) (*SessionGrounding, error) {
-	return BuildSessionGroundingSince(ctx, dataDir, workspaceID, caller, noSince)
+	return BuildSessionGroundingWith(ctx, dataDir, workspaceID, GroundOptions{Caller: caller, Since: noSince})
 }
 
-// BuildSessionGroundingSince is BuildSessionGroundingFor that also reports what changed
-// in served memory after the memory revision since (memory_delta); a negative since
-// asks for no delta.
-func BuildSessionGroundingSince(ctx context.Context, dataDir, workspaceID, caller string, since int64) (*SessionGrounding, error) {
+// GroundOptions are who asks ground and from which session.
+type GroundOptions struct {
+	Caller string
+	// SessionID is the caller's execution key (ground session_id): session_handoff then
+	// restores that session's snapshot when it has a ledger, and otherwise hands over
+	// the most recent other session.
+	SessionID string
+	// Since asks for memory_delta after this memory revision (WS-31); negative asks for none.
+	Since int64
+}
+
+// BuildSessionGroundingWith grounds a session with its options.
+func BuildSessionGroundingWith(ctx context.Context, dataDir, workspaceID string, opts GroundOptions) (*SessionGrounding, error) {
+	caller := opts.Caller
 	g := &SessionGrounding{WorkspaceID: workspaceID}
 	unknown, err := g.groundingIndex.build(ctx, dataDir, workspaceID)
 	if err != nil {
@@ -120,7 +130,8 @@ func BuildSessionGroundingSince(ctx context.Context, dataDir, workspaceID, calle
 	}
 	g.stampGenerated()
 	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller,
-		groundMemoryOptions{since: max(since, noSince), budget: true})...)
+		groundMemoryOptions{since: max(opts.Since, noSince), budget: true})...)
+	g.Unknown = append(g.Unknown, g.groundingSession.buildSessions(ctx, dataDir, workspaceID, caller, opts.SessionID, driftStaleFlag(g.Drift))...)
 	g.summarize()
 	return g, nil
 }

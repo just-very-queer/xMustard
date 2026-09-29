@@ -14,7 +14,7 @@ func TestSearchForwardsCursorAndPathGlob(t *testing.T) {
 	if rerr != nil || res["isError"] == true {
 		t.Fatalf("search refused: %v %v", rerr, res)
 	}
-	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/search?q=retry&cursor=czEuMy5hYmM&path_glob=%2A%2A%2F%2A.go" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/search?q=retry&cursor=czEuMy5hYmM&path_glob=%2A%2A%2F%2A.go&max_chars=8000" {
 		t.Fatalf("search forwarded %q", p)
 	}
 	if msg, _ := argErr(t, s, "search", map[string]any{"workspace_id": "ws", "q": "retry", "cursor": strings.Repeat("A", 65)}); !strings.Contains(msg, "at most 64") {

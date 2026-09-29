@@ -570,7 +570,7 @@ func TestHiddenQueryAliasAcceptedButNotAdvertised(t *testing.T) {
 	if rerr != nil || res["isError"] != false {
 		t.Fatalf("query alias rejected: %v %v", rerr, res)
 	}
-	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/search?q=Handler" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/search?q=Handler&max_chars=8000" {
 		t.Fatalf("alias not folded onto q: %s", p)
 	}
 	norms := res["_meta"].(map[string]any)["xmustard/normalized"].([]Normalization)
@@ -594,7 +594,7 @@ func TestHiddenQueryAliasAcceptedButNotAdvertised(t *testing.T) {
 	if _, rerr := call(t, s, "impact", map[string]any{"workspace_id": "ws", "symbol": "S", "depth": 2}); rerr != nil {
 		t.Fatal(rerr)
 	}
-	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/changes/since-index?symbol=S&depth=2" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/ws/changes/since-index?symbol=S&depth=2&max_chars=8000" {
 		t.Fatalf("depth alias: %s", p)
 	}
 }
@@ -632,7 +632,7 @@ func TestToolURLBuilding(t *testing.T) {
 		t.Fatal("explain missing")
 	}
 	method, path, body := tl.Build(map[string]string{"workspace_id": "ws1", "path": "src/a.go"})
-	if method != "GET" || path != "/api/workspaces/ws1/explain-path?path=src%2Fa.go" || body != "" {
+	if method != "GET" || path != "/api/workspaces/ws1/explain-path?path=src%2Fa.go&max_chars=6000" || body != "" {
 		t.Fatalf("bad url: %s %s %q", method, path, body)
 	}
 }
@@ -689,7 +689,7 @@ func TestVerifyNoteTravelsInBody(t *testing.T) {
 
 func TestCallToolMissingArg(t *testing.T) {
 	s := newSession(t, &fakeAPI{}, Options{}, nil, "2025-06-18")
-	res, rerr := call(t, s, "explain", map[string]any{"workspace_id": "ws"}) // missing path
+	res, rerr := call(t, s, "search", map[string]any{"workspace_id": "ws"}) // missing q
 	if rerr != nil || res["isError"] != true {
 		t.Fatalf("expected isError for missing arg, got %v %v", res, rerr)
 	}
@@ -1143,7 +1143,7 @@ func TestAbsolutePathArgumentResolvesAndIsRelativized(t *testing.T) {
 	if rerr != nil || res["isError"] != false {
 		t.Fatalf("%v %v", rerr, res)
 	}
-	if p := api.lastTool(t).Path; p != "/api/workspaces/repo-ws/explain-path?path=src%2Fpkg%2Fa.go" {
+	if p := api.lastTool(t).Path; p != "/api/workspaces/repo-ws/explain-path?path=src%2Fpkg%2Fa.go&max_chars=6000" {
 		t.Fatalf("path not relativized: %s", p)
 	}
 	norms := res["_meta"].(map[string]any)["xmustard/normalized"].([]Normalization)
@@ -1152,7 +1152,7 @@ func TestAbsolutePathArgumentResolvesAndIsRelativized(t *testing.T) {
 	}
 	// with an explicit workspace the absolute path is still made relative to its root
 	_, _ = call(t, s, "explain", map[string]any{"workspace_id": "repo-ws", "path": abs})
-	if p := api.lastTool(t).Path; !strings.HasSuffix(p, "path=src%2Fpkg%2Fa.go") {
+	if p := api.lastTool(t).Path; !strings.Contains(p, "path=src%2Fpkg%2Fa.go&") {
 		t.Fatalf("explicit workspace + absolute path: %s", p)
 	}
 }

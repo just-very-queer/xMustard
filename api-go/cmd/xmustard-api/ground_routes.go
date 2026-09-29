@@ -2,9 +2,11 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
+	"unicode"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/groundbudget"
@@ -46,7 +48,16 @@ func registerGroundRoutes(mux routeRegistrar) {
 			}
 			since = n
 		}
-		result, err := workspaceops.BuildSessionGroundingSince(r.Context(), dataDir(), r.PathValue("workspace_id"), callerOf(r).ID, since)
+		// session_id names the caller's session (an execution key): its own snapshot is
+		// restored when it has one, else the prior session is handed over (WS-33)
+		session := strings.TrimSpace(q.Get("session_id"))
+		if len(session) > maxGroundSessionID || !printable(session) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("session_id must be printable and at most %d bytes", maxGroundSessionID),
+				"argument": "session_id"})
+			return
+		}
+		result, err := workspaceops.BuildSessionGroundingWith(r.Context(), dataDir(), r.PathValue("workspace_id"),
+			workspaceops.GroundOptions{Caller: callerOf(r).ID, SessionID: session, Since: since})
 		if err != nil {
 			respondError(w, err)
 			return
@@ -79,18 +90,16 @@ func registerGroundRoutes(mux routeRegistrar) {
 	})
 }
 
+// maxGroundSessionID bounds ground's session_id (an execution key is at most 200 bytes).
+const maxGroundSessionID = 200
+
+func printable(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0
+}
+
 // retainGround keeps the unbudgeted ground result as evidence on a delivered call, so
 // the budgeted reply can name its recovery handle; a plain HTTP call is told how to
 // get the unbudgeted result instead.
 func retainGround(r *http.Request, raw []byte) groundbudget.Recovery {
-	keep := retainOriginalFrom(r.Context())
-	if keep == nil {
-		return groundbudget.Recovery{Unavailable: "not a delivered call: omit sections and max_chars for the unbudgeted result"}
-	}
-	d, err := keep(raw)
-	if err != nil {
-		_, reason := evidenceErrorStatus(err)
-		return groundbudget.Recovery{Unavailable: "evidence " + reason}
-	}
-	return groundbudget.Recovery{Handle: d.Handle, URI: d.ResourceURI}
+	return retainBudgeted(r, raw, "omit sections and max_chars for the unbudgeted result")
 }

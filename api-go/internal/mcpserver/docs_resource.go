@@ -108,7 +108,7 @@ const MemoryIndexURI = "xmustard://memory/index"
 func docsList() []map[string]any {
 	return []map[string]any{{
 		"uri": DocsURI, "name": "xMustard tool arguments not in tools/list", "mimeType": "text/markdown",
-		"description": "Arguments tools/call accepts beyond the listed schema (ground sections and max_chars), ground's output-budget contract, and hidden aliases.",
+		"description": "Arguments tools/call accepts beyond the listed schema, the output-budget contracts of ground, search, explain and impact, search mode=symbol, explain's outline and symbol context, and hidden aliases.",
 	}, {
 		"uri": MemoryCoreURI, "name": "xMustard standing memory", "mimeType": "application/json",
 		"description": "The standing-memory projection of the session's workspace: the human-approved core tier, each entry " +

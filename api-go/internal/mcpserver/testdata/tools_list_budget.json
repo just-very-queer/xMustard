@@ -1,19 +1,75 @@
 {
-  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day, and the WS-20 recall filters, disclosure and budget arguments and remember's kind, topic and tags the same day (full caps grew by exactly their cost each time; the WS-20 argument descriptions live at xmustard://docs/tools, not in the schema). WS-18 (2026-09-28): the search description now names BM25 over bodies and lost 59 bytes, search's outputSchema gained omitted and next_cursor (58 bytes, 2025-06-18 only), and the Advanced cursor and path_glob arguments cost 198 bytes in the full profile; lean caps were lowered to the measured sizes. WS-21 (2026-09-28): why_failed run_id became optional and the tool non-read-only (command mode runs commands); its lean entry shrank by 9 bytes at 2025-06-18 (command, off by default, left the description) and by 53 bytes at 2024-11-05 (caps lowered), and the full caps grew by exactly the cost of its five advanced source arguments (621 bytes at 2025-06-18, 577 at 2024-11-05). WS-20 review round 2 (2026-09-28): recall's Advanced session_id gained maxLength 128, 16 bytes in the full profile only. WS-35 (2026-09-28): impact's description now names the resolved Go/TS graph and its completeness (32 bytes shorter), max_depth allows 32 with a shorter description, and its outputSchema lists by_depth for impacted and risk (25 bytes, 2025-06-18 only): lean caps were lowered by the measured 18 bytes (2025-06-18) and 43 (2024-11-05). impact's twelve Advanced v2 arguments (direction, relation_types, min_confidence, include_tests, limit, offset, summary_only, timeout_ms, scope, base, head, worktree) cost the full profile 1,292 bytes at 2025-06-18 and 1,292 at 2024-11-05 over the lowered lean sizes; the full caps grew by exactly that (+1,274 and +1,249 over their old caps). WS-27 (2026-09-28): the recall description names the conflict tiers in 3 fewer bytes (lean caps lowered), and the full caps grew by exactly the cost of recall's Advanced include_merged, subject and predicate (161 bytes) and remember's Advanced claims and relations (125 bytes), described at xmustard://docs/tools. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates. WS-FIX-05 (2026-09-28): impact gained path= (file-level blast radius), listed in the lean schema by owner decision; every cap rose by exactly its measured 119 bytes (the path property 79, the description's path= clause 34, max_depth's description naming path= 6), for every profile, role and protocol version. WS-35 merged with WS-FIX-05 (2026-09-28): path= keeps its lean property, the description's clause became \"path= → a file's lexical referrers\" and max_depth's description \"hops (default 3; path= 4)\", and the caps are the measured sizes, 116 bytes above WS-35's lowered caps and below WS-FIX-05's (lean) in every profile, role and version. WS-27 merged after WS-35 and WS-FIX-05 (2026-09-28): WS-27's deltas applied to those caps (lean -3 everywhere; full +158 reader and verifier, +283 proposer and agent), and every cap equals its measured size. WS-31 (2026-09-28): ground's Advanced since_revision and recall's Advanced tier cost 200 bytes in the full profile for every role; remember's Advanced tier, op=tier and the reworded description argument cost 124 more for the roles that list remember; every full cap rose by exactly that measured cost, and no lean cap changed.",
+  "about": "Byte caps on the tools/list result (compact JSON, as the stdio shim writes it) per schema profile, protocol version and role profile. Measured 2026-09-25 (WS-54); remember content made optional and the WS-19A lifecycle arguments added as Advanced 2026-09-26, and the WS-19B provenance and evidence-bound vote arguments the same day, and the WS-20 recall filters, disclosure and budget arguments and remember's kind, topic and tags the same day (full caps grew by exactly their cost each time; the WS-20 argument descriptions live at xmustard://docs/tools, not in the schema). WS-18 (2026-09-28): the search description now names BM25 over bodies and lost 59 bytes, search's outputSchema gained omitted and next_cursor (58 bytes, 2025-06-18 only), and the Advanced cursor and path_glob arguments cost 198 bytes in the full profile; lean caps were lowered to the measured sizes. WS-21 (2026-09-28): why_failed run_id became optional and the tool non-read-only (command mode runs commands); its lean entry shrank by 9 bytes at 2025-06-18 (command, off by default, left the description) and by 53 bytes at 2024-11-05 (caps lowered), and the full caps grew by exactly the cost of its five advanced source arguments (621 bytes at 2025-06-18, 577 at 2024-11-05). WS-20 review round 2 (2026-09-28): recall's Advanced session_id gained maxLength 128, 16 bytes in the full profile only. WS-35 (2026-09-28): impact's description now names the resolved Go/TS graph and its completeness (32 bytes shorter), max_depth allows 32 with a shorter description, and its outputSchema lists by_depth for impacted and risk (25 bytes, 2025-06-18 only): lean caps were lowered by the measured 18 bytes (2025-06-18) and 43 (2024-11-05). impact's twelve Advanced v2 arguments (direction, relation_types, min_confidence, include_tests, limit, offset, summary_only, timeout_ms, scope, base, head, worktree) cost the full profile 1,292 bytes at 2025-06-18 and 1,292 at 2024-11-05 over the lowered lean sizes; the full caps grew by exactly that (+1,274 and +1,249 over their old caps). WS-27 (2026-09-28): the recall description names the conflict tiers in 3 fewer bytes (lean caps lowered), and the full caps grew by exactly the cost of recall's Advanced include_merged, subject and predicate (161 bytes) and remember's Advanced claims and relations (125 bytes), described at xmustard://docs/tools. Lower a cap when the list shrinks; never raise one to fit an addition: advertise less (declare the argument Advanced, documented at xmustard://docs/tools) or trim a description. cmd/xmustard-api checks role_profiles against the route gates. WS-FIX-05 (2026-09-28): impact gained path= (file-level blast radius), listed in the lean schema by owner decision; every cap rose by exactly its measured 119 bytes (the path property 79, the description's path= clause 34, max_depth's description naming path= 6), for every profile, role and protocol version. WS-35 merged with WS-FIX-05 (2026-09-28): path= keeps its lean property, the description's clause became \"path= → a file's lexical referrers\" and max_depth's description \"hops (default 3; path= 4)\", and the caps are the measured sizes, 116 bytes above WS-35's lowered caps and below WS-FIX-05's (lean) in every profile, role and version. WS-33 merged with WS-35 (2026-09-28): ground's Advanced session_id and its new sections value session, and remember's Advanced session_id (handoff capsules), 64 bytes each in the full profile only (reader and verifier +64, proposer and agent +128 over WS-35's full caps); lean caps unchanged. WS-27 merged after WS-35 and WS-FIX-05 (2026-09-28), independently of WS-33 (lean -3 everywhere; full +158 reader and verifier, +283 proposer and agent over the WS-35+WS-FIX-05 base). WS-33 merged with WS-27 (this branch, 2026-09-29): both deltas are additive over the same WS-35+WS-FIX-05 base (WS-33 touches ground and remember's session_id; WS-27 touches recall and remember's claims/relations), so the full caps are the sum of both deltas over that base; lean caps take WS-27's lowered values (WS-33 left lean unchanged). Caps below are provisional sums pending a remote re-measurement; xm-remote-check.sh's TestToolsListStaysWithinByteCaps failure, if any, states the exact measured size to substitute. WS-36 (2026-09-28): search gained mode=symbol (an enum value, its mode description, and a description clause that replaced pattern mode's example, 4 bytes shorter) and explain's path stopped being required (explain also takes symbol= and uid=); together every lean cap fell by 5 bytes, and the full caps grew by exactly the 1,349 bytes of the new Advanced arguments over the lowered lean sizes (search max_chars, kinds, depth, include_body, include_info, substring; explain symbol, uid, depth, chain_depth, include_content, max_chars, limit, cursor; impact max_chars). WS-36 merged with WS-33 (2026-09-29): both deltas are additive, so the full caps are WS-36's plus WS-33's session_id cost (reader and verifier +64, proposer and agent +128); lean caps are WS-36's. Provisional pending remote re-measurement. WS-31 merged with WS-33 (2026-09-29): the Advanced ground since_revision argument (200 bytes) and remember tier (124 bytes, remember-capable profiles) were added on top of session_id; full caps rose by exactly that.",
   "role_profiles": {
-    "reader": ["ground", "recall", "search", "explain", "impact", "diagnostics", "why_failed"],
-    "proposer": ["ground", "recall", "remember", "search", "explain", "impact", "diagnostics", "why_failed"],
-    "verifier": ["ground", "recall", "verify", "search", "explain", "impact", "diagnostics", "why_failed"],
-    "agent": ["ground", "recall", "remember", "verify", "search", "explain", "impact", "diagnostics", "why_failed"]
+    "reader": [
+      "ground",
+      "recall",
+      "search",
+      "explain",
+      "impact",
+      "diagnostics",
+      "why_failed"
+    ],
+    "proposer": [
+      "ground",
+      "recall",
+      "remember",
+      "search",
+      "explain",
+      "impact",
+      "diagnostics",
+      "why_failed"
+    ],
+    "verifier": [
+      "ground",
+      "recall",
+      "verify",
+      "search",
+      "explain",
+      "impact",
+      "diagnostics",
+      "why_failed"
+    ],
+    "agent": [
+      "ground",
+      "recall",
+      "remember",
+      "verify",
+      "search",
+      "explain",
+      "impact",
+      "diagnostics",
+      "why_failed"
+    ]
   },
   "caps": {
     "lean": {
-      "2024-11-05": {"reader": 3957, "proposer": 4650, "verifier": 4588, "agent": 5281},
-      "2025-06-18": {"reader": 6731, "proposer": 7830, "verifier": 7765, "agent": 8864}
+      "2024-11-05": {
+        "reader": 3952,
+        "proposer": 4645,
+        "verifier": 4583,
+        "agent": 5276
+      },
+      "2025-06-18": {
+        "reader": 6726,
+        "proposer": 7825,
+        "verifier": 7760,
+        "agent": 8859
+      }
     },
     "full": {
-      "2024-11-05": {"reader": 7767, "proposer": 9926, "verifier": 8806, "agent": 10965},
-      "2025-06-18": {"reader": 10541, "proposer": 13106, "verifier": 11983, "agent": 14548}
+      "2024-11-05": {
+        "reader": 9180,
+        "proposer": 11403,
+        "verifier": 10219,
+        "agent": 12442
+      },
+      "2025-06-18": {
+        "reader": 11954,
+        "proposer": 14583,
+        "verifier": 13396,
+        "agent": 16025
+      }
     }
   }
 }

@@ -119,10 +119,10 @@ describe("tool specs mirror the MCP server", () => {
 			properties: {
 				workspace_id: { type: "string", description: "workspace id; auto-resolved if omitted" },
 				q: { type: "string", description: "the search query" },
-				mode: { type: "string", description: "hybrid (default) or pattern (ast-grep)", enum: ["hybrid", "pattern"] },
+				mode: { type: "string", description: "hybrid (default), pattern (ast-grep) or symbol", enum: ["hybrid", "pattern", "symbol"] },
 				lang: { type: "string", description: "language hint for pattern mode" },
 				seed: { type: "string", description: "symbol to anchor the graph-proximity lane" },
-				limit: { type: "integer", description: "max hits (default 25)", minimum: 1, maximum: 50 },
+				limit: { type: "integer", description: "max hits (default 10)", minimum: 1, maximum: 50 },
 			},
 			required: ["q"],
 			additionalProperties: false,

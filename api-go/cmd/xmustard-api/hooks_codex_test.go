@@ -161,7 +161,7 @@ func TestCodexFixturesMatchTheRecordedPayloads(t *testing.T) {
 func TestCodexHookTablesAndConfigAgree(t *testing.T) {
 	for _, e := range hooks.CodexEvents {
 		_, answers := hookHandlers[e.Name]
-		_, queued := hookQueueEffects[e.Name]
+		_, queued := hookEnqueued[e.Name]
 		if answers == queued || queued != (e.Mode == hooks.Enqueue) {
 			t.Errorf("%s: handler %v, queue effect %v, mode %v", e.Name, answers, queued, e.Mode)
 		}

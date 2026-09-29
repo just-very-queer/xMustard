@@ -680,6 +680,9 @@ type RememberRequest struct {
 	// derived from (PAR-PROV-04); both are checked before anything is written.
 	Evidence []string `json:"evidence,omitempty"`
 	RunID    string   `json:"run_id,omitempty"`
+	// SessionID is the session a handoff capsule (kind handoff) is stored under: an
+	// execution key, or the id of an MCP session (HandoffSessionKey).
+	SessionID string `json:"session_id,omitempty"`
 }
 
 var rememberOps = map[string]func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error){
