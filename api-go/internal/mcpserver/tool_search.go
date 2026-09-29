@@ -1,10 +1,9 @@
 package mcpserver
 
+import "xmustard/api-go/internal/workspaceops"
+
 // maxSearchLimit bounds the hits one search returns.
 const maxSearchLimit = 50
-
-// maxNavDepth bounds depth= of symbol children (workspaceops.NavMaxDepth).
-const maxNavDepth = 3
 
 // searchQueryArgs are the search arguments that travel as query parameters under
 // their own names.
@@ -28,7 +27,7 @@ var searchTool = &Tool{
 		{Name: "cursor", Type: typeString, MaxLen: maxSearchCursorLen, Desc: "next_cursor of the previous page"},
 		{Name: "path_glob", Type: typeString, MaxLen: 256, Desc: "only paths matching this glob (** crosses /)"},
 		{Name: "kinds", Type: typeString, MaxLen: 256, Desc: "mode=symbol: Function,Method or -Variable"},
-		{Name: "depth", Type: typeInteger, Min: 0, Max: maxNavDepth, Desc: "mode=symbol: child levels"},
+		{Name: "depth", Type: typeInteger, Min: 0, Max: workspaceops.NavMaxDepth, Desc: "mode=symbol: child levels"},
 		{Name: "include_body", Type: typeBoolean, Desc: "mode=symbol: add bodies"},
 		{Name: "include_info", Type: typeBoolean, Desc: "mode=symbol: add signatures, docs"},
 		{Name: "substring", Type: typeBoolean, Desc: "mode=symbol: substring match"},

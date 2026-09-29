@@ -362,9 +362,12 @@ func SearchCursor(workspaceID string, q url.Values) func(offset int) string {
 	}
 }
 
-// symbolSearchRequest reads search mode=symbol's arguments from a query.
+// symbolSearchRequest reads search mode=symbol's arguments from a query. Substring
+// parses the same way ParseSymbolSearch does (strconv.ParseBool), so a cursor signed
+// here matches the ranking key the handler builds from a validated request.
 func symbolSearchRequest(q url.Values) SymbolSearchRequest {
-	return SymbolSearchRequest{Query: q.Get("q"), PathGlob: q.Get("path_glob"), Kinds: q.Get("kinds"), Substring: q.Get("substring") == "true"}
+	substring, _ := boolParam(q, "substring")
+	return SymbolSearchRequest{Query: q.Get("q"), PathGlob: q.Get("path_glob"), Kinds: q.Get("kinds"), Substring: substring}
 }
 
 // ParseSymbolSearch reads search mode=symbol's arguments, rejecting malformed ones.

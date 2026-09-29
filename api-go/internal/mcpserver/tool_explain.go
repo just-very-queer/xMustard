@@ -1,11 +1,10 @@
 package mcpserver
 
+import "xmustard/api-go/internal/workspaceops"
+
 // maxPathArg bounds the path argument (PATH_MAX on Linux): it is model-supplied and
 // matched against the registered roots on every call.
 const maxPathArg = 4096
-
-// maxChainDepth bounds chain_depth= (workspaceops.NavMaxChainDepth).
-const maxChainDepth = 3
 
 // explainQueryArgs are the explain arguments that travel as query parameters under
 // their own names.
@@ -23,8 +22,8 @@ var explainTool = &Tool{
 	Advanced: append([]Arg{
 		{Name: "symbol", Type: typeString, MaxLen: maxPathArg, Desc: "a name path: its context"},
 		{Name: "uid", Type: typeString, MaxLen: maxPathArg, Desc: "a symbol UID: its context"},
-		{Name: "depth", Type: typeInteger, Min: 0, Max: maxNavDepth, Desc: "outline child levels"},
-		{Name: "chain_depth", Type: typeInteger, Min: 0, Max: maxChainDepth, Desc: "symbol=: extra edge layers"},
+		{Name: "depth", Type: typeInteger, Min: 0, Max: workspaceops.NavMaxDepth, Desc: "outline child levels"},
+		{Name: "chain_depth", Type: typeInteger, Min: 0, Max: workspaceops.NavMaxChainDepth, Desc: "symbol=: extra edge layers"},
 		{Name: "include_content", Type: typeBoolean, Desc: "symbol=: add its body"},
 	}, budgetArgs("explain")...),
 	Doc:         explainDoc + "\n" + budgetSpec("explain").Markdown(),

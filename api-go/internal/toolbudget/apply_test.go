@@ -7,6 +7,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // envelopeMembers are coverage and freshness shaped like the core's, with lists the
@@ -235,8 +237,10 @@ func TestCountsRungGroupsByPath(t *testing.T) {
 		if total != 10 || len(by) != 4 {
 			t.Fatalf("hits_by_path %v", by)
 		}
-		if a.out["next_cursor"] != cursorAt(0) {
-			t.Fatalf("counts continues at the page start: %v", a.out["next_cursor"])
+		if a.out["next_cursor"] != nil {
+			// offset 0 with nothing kept: no item was ever returned, so there is no
+			// valid next offset to sign (has_more/recover_uri still report the cut).
+			t.Fatalf("counts at the first page issues no cursor: %v", a.out["next_cursor"])
 		}
 		return
 	}
@@ -495,6 +499,38 @@ func TestImpactChangesListsBreaksLast(t *testing.T) {
 	for i := range 5 {
 		if ds[i].(map[string]any)["contract_break"] != true {
 			t.Fatal("contract breaks are listed first and kept")
+		}
+	}
+}
+
+// TestExplainFirstPageCursorIsFollowable regression-tests the real ExplainCursor and
+// DecodeExplainCursor (not the test's cursorAt stub) through Apply. When the first
+// page (offset 0) is reduced past the "symbols" list to counts/total, no item was
+// ever returned, so a next_cursor must not be signed: DecodeExplainCursor rejects any
+// offset <= 0, and previously nextCursor still called Cursor(0) at that rung.
+func TestExplainFirstPageCursorIsFollowable(t *testing.T) {
+	q := url.Values{"path": {"pkg/a.go"}}
+	cursor := workspaceops.ExplainCursor("ws", q)
+	long := strings.Repeat("n", 1800)
+	syms := make([]map[string]any, 5)
+	for i := range syms {
+		syms[i] = map[string]any{"name_path": fmt.Sprintf("Type%02d%s", i, long), "kind": "Struct", "lines": []int{i, i + 1}}
+	}
+	res := map[string]any{"path": "pkg/a.go", "explanation": strings.Repeat("x", 1200), "symbols": syms, "symbols_total": 5}
+	var a applied
+	for mc := 2000; mc >= MinMaxChars; mc -= 20 {
+		a = run(t, "explain", res, Request{MaxChars: mc}, Page{Slice: true, Offset: 0, Cursor: cursor}, nil)
+		if a.rep.DegradedStage == "counts" {
+			break
+		}
+	}
+	if a.rep.DegradedStage != "counts" {
+		t.Fatalf("want the counts rung, got %q", a.rep.DegradedStage)
+	}
+	nc, _ := a.out["next_cursor"].(string)
+	if nc != "" {
+		if _, err := workspaceops.DecodeExplainCursor("ws", q, nc); err != nil {
+			t.Fatalf("next_cursor %q is not a next_cursor of this explain call: %v", nc, err)
 		}
 	}
 }

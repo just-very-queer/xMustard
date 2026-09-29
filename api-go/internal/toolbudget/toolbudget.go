@@ -124,13 +124,11 @@ func (s *Spec) ParseRequest(q url.Values) (Request, *ArgError) {
 		if q.Get(u) == "" {
 			continue
 		}
-		for _, a := range []struct {
-			name string
-			set  bool
-		}{{"limit", req.Limit > 0}, {"cursor", req.Cursor != ""}} {
-			if a.set {
-				return Request{}, &ArgError{Argument: a.name, Reason: fmt.Sprintf("pages a list; a %s= result has none", u)}
-			}
+		if req.Limit > 0 {
+			return Request{}, &ArgError{Argument: "limit", Reason: fmt.Sprintf("pages a list; a %s= result has none", u)}
+		}
+		if req.Cursor != "" {
+			return Request{}, &ArgError{Argument: "cursor", Reason: fmt.Sprintf("pages a list; a %s= result has none", u)}
 		}
 	}
 	return req, nil

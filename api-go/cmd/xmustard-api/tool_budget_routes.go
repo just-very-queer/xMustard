@@ -99,6 +99,11 @@ func budgetPage(spec *toolbudget.Spec, ws string, q url.Values, req toolbudget.R
 		offset, err := workspaceops.DecodeExplainCursor(ws, q, req.Cursor)
 		return toolbudget.Page{Slice: true, Offset: offset, Limit: req.Limit, Cursor: workspaceops.ExplainCursor(ws, q)}, err
 	case "search":
+		if q.Get("rerank") != "" {
+			// the rerank lane never reads cursor=, so a signed cursor here would not
+			// advance the next page: issue none (has_more/recover_uri still report the cut).
+			return toolbudget.Page{}, nil
+		}
 		return toolbudget.Page{Cursor: workspaceops.SearchCursor(ws, q)}, nil
 	}
 	return toolbudget.Page{}, nil

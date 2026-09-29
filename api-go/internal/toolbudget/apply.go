@@ -895,6 +895,11 @@ func (b *budgeter) nextCursor(more bool) string {
 		return ""
 	case !b.paged.cut():
 		return b.page.Cursor(b.page.Offset + len(b.paged.items))
+	case b.page.Offset+b.paged.kept() <= 0:
+		// the list was reduced below its items (e.g. to counts/total) at the very
+		// first page: no item was ever returned, so there is no valid next offset
+		// to sign. has_more and recover_uri still report the cut.
+		return ""
 	}
 	return b.page.Cursor(b.page.Offset + b.paged.kept())
 }
