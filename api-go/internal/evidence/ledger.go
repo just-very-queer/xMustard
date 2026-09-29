@@ -145,7 +145,8 @@ type Delivered struct {
 // Decision is the ledger's answer for one delivered result.
 type Decision struct {
 	// Exempt is set when the ledger did not consider the call; Reason says why
-	// (side_effecting, identity_incomplete, revision_missing, args_invalid).
+	// (side_effecting, identity_incomplete, revision_missing, args_invalid,
+	// digest_missing).
 	Exempt bool
 	Reason string
 	// Unchanged means the result repeats an earlier one: deliver Notice instead.
@@ -328,6 +329,13 @@ func (l *Ledger) Observe(o Delivered) Decision {
 	if err != nil {
 		return Decision{Exempt: true, Reason: keyErrorReason(err)}
 	}
+	if o.Digest == ([32]byte{}) {
+		// A consumer that left the content digest unset would otherwise compare equal
+		// to every other keyless observation, and a changed result at the same
+		// revision would be reported unchanged. The guard is keyed on the raw sha, so
+		// it refuses to trust a zero digest rather than guess it is a real one.
+		return Decision{Exempt: true, Reason: "digest_missing"}
+	}
 	class := ClassifyError(o.IsError, o.Status, o.ErrorText)
 	var key, digest [16]byte
 	kd := k.Digest()
@@ -343,7 +351,7 @@ func (l *Ledger) Observe(o Delivered) Decision {
 	d := Decision{Class: class}
 	e := s.entries[key]
 	switch {
-	case e != nil && e.digest == digest && e.expires-now.Unix() >= noticeMinTTL && o.Bytes >= l.limits.MinBytes:
+	case e != nil && class == ClassSuccess && e.digest == digest && e.expires-now.Unix() >= noticeMinTTL && o.Bytes >= l.limits.MinBytes:
 		e.repeats++
 		d.Unchanged, d.SinceCall, d.SinceSeq, d.Repeats = true, e.callID, e.seq, int(e.repeats)
 		d.Handle, d.ExpiresAt = encodeHandle(e.handle), time.Unix(e.expires, 0)

@@ -31,9 +31,22 @@ type Original struct {
 type Ref struct {
 	Handle string
 	// ResourceURI reads exactly the original (the handle's URI with offset and length).
-	ResourceURI    string
+	ResourceURI string
+	// BaseURI is the handle's resource URI with no offset or length, for building a
+	// paged read when Length exceeds what resources/read serves in one call.
+	BaseURI        string
 	Offset, Length int64
 	ExpiresAt      time.Time
+}
+
+// pagedURI is BaseURI with offset and a length capped at pageBytes, for an original
+// whose full range is larger than resources/read allows in one call.
+func (r Ref) pagedURI(pageBytes int64) string {
+	length := r.Length
+	if length > pageBytes {
+		length = pageBytes
+	}
+	return r.BaseURI + "&offset=" + strconv.FormatInt(r.Offset, 10) + "&length=" + strconv.FormatInt(length, 10)
 }
 
 // Retainer retains originals and returns one Ref per original, in order.
@@ -98,7 +111,7 @@ func (r StoreRetainer) Retain(ctx context.Context, originals []Original) ([]Ref,
 	exp, _ := time.Parse(time.RFC3339Nano, d.ExpiresAt)
 	refs := make([]Ref, len(originals))
 	for i, rg := range ranges {
-		refs[i] = Ref{Handle: d.Handle, Offset: rg[0], Length: rg[1], ExpiresAt: exp,
+		refs[i] = Ref{Handle: d.Handle, Offset: rg[0], Length: rg[1], ExpiresAt: exp, BaseURI: d.ResourceURI,
 			ResourceURI: d.ResourceURI + "&offset=" + strconv.FormatInt(rg[0], 10) + "&length=" + strconv.FormatInt(rg[1], 10)}
 	}
 	return refs, nil
@@ -108,12 +121,15 @@ func (r StoreRetainer) Retain(ctx context.Context, originals []Original) ([]Ref,
 // use id and content digest, and returns it again while it lives. A context hook that
 // compacts the client's raw history on every turn then writes the same stub bytes each
 // turn, so the compacted prefix stays byte-stable for the provider's prompt cache and
-// no original is retained twice. It keeps at most Max refs (the oldest go first).
+// no original is retained twice. It keeps at most max refs (the oldest go first).
+//
+// A MemoRetainer must come from NewMemoRetainer: its fields are unexported so a zero
+// or struct-literal value (nil clock, nil map) can never be constructed and used.
 type MemoRetainer struct {
-	Next Retainer
-	Max  int
-	// MinTTL is the least life a remembered handle must have left to be reused.
-	MinTTL time.Duration
+	next Retainer
+	max  int
+	// minTTL is the least life a remembered handle must have left to be reused.
+	minTTL time.Duration
 	now    func() time.Time
 
 	mu    sync.Mutex
@@ -121,7 +137,7 @@ type MemoRetainer struct {
 	order [][32]byte
 }
 
-// DefaultMemo is the number of refs a MemoRetainer keeps when Max is 0.
+// DefaultMemo is the number of refs a MemoRetainer keeps when max is 0.
 const DefaultMemo = 512
 
 // NewMemoRetainer wraps next.
@@ -129,7 +145,7 @@ func NewMemoRetainer(next Retainer, max int) *MemoRetainer {
 	if max <= 0 {
 		max = DefaultMemo
 	}
-	return &MemoRetainer{Next: next, Max: max, MinTTL: time.Hour, now: time.Now, memo: map[[32]byte]Ref{}}
+	return &MemoRetainer{next: next, max: max, minTTL: time.Hour, now: time.Now, memo: map[[32]byte]Ref{}}
 }
 
 // SetClock replaces the clock (tests).
@@ -145,7 +161,7 @@ func (m *MemoRetainer) Retain(ctx context.Context, originals []Original) ([]Ref,
 	now := m.now()
 	for i, o := range originals {
 		keys[i] = memoKey(o)
-		if ref, ok := m.memo[keys[i]]; ok && ref.ExpiresAt.Sub(now) >= m.MinTTL {
+		if ref, ok := m.memo[keys[i]]; ok && ref.ExpiresAt.Sub(now) >= m.minTTL {
 			refs[i] = ref
 			continue
 		}
@@ -159,7 +175,7 @@ func (m *MemoRetainer) Retain(ctx context.Context, originals []Original) ([]Ref,
 	for j, i := range missing {
 		batch[j] = originals[i]
 	}
-	got, err := m.Next.Retain(ctx, batch)
+	got, err := m.next.Retain(ctx, batch)
 	if err != nil {
 		return nil, err
 	}
@@ -175,7 +191,7 @@ func (m *MemoRetainer) Retain(ctx context.Context, originals []Original) ([]Ref,
 		}
 		m.memo[keys[i]] = got[j]
 	}
-	for len(m.order) > m.Max {
+	for len(m.order) > m.max {
 		delete(m.memo, m.order[0])
 		m.order = m.order[1:]
 	}

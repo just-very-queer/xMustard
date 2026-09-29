@@ -298,8 +298,9 @@ func choose(xs []*exchange, opts Options) []*candidate {
 // sizingRef is a ref as long as a real one, to size a stub before retention.
 func sizingRef(workspace string) Ref {
 	h := evidence.HandlePrefix + strings.Repeat("x", 43)
-	return Ref{Handle: h, Offset: 1 << 24, Length: 1 << 24,
-		ResourceURI: evidence.ResourceURI(h, workspace) + "&offset=16777216&length=16777216"}
+	base := evidence.ResourceURI(h, workspace)
+	return Ref{Handle: h, Offset: 1 << 24, Length: 1 << 24, BaseURI: base,
+		ResourceURI: base + "&offset=16777216&length=16777216"}
 }
 
 // windowBoundary is the index of the first exchange kept whole: KeepRecent from the
@@ -346,8 +347,13 @@ func (c *candidate) stub(ref Ref) string {
 	if len(c.evidence) > 0 {
 		b.WriteString(". It named evidence " + strings.Join(c.evidence, ", "))
 	}
-	fmt.Fprintf(&b, ". Original (%d bytes) retained: handle %s, offset %d, length %d; read it with resources/read uri=%s",
-		len(c.x.result.content), ref.Handle, ref.Offset, ref.Length, ref.ResourceURI)
+	if ref.Length > evidence.DefaultPageSize {
+		fmt.Fprintf(&b, ". Original (%d bytes) retained: handle %s, offset %d; read it in pages of at most %d bytes starting at offset %d, with resources/read uri=%s",
+			len(c.x.result.content), ref.Handle, ref.Offset, evidence.DefaultPageSize, ref.Offset, ref.pagedURI(evidence.DefaultPageSize))
+	} else {
+		fmt.Fprintf(&b, ". Original (%d bytes) retained: handle %s, offset %d, length %d; read it with resources/read uri=%s",
+			len(c.x.result.content), ref.Handle, ref.Offset, ref.Length, ref.ResourceURI)
+	}
 	return b.String()
 }
 

@@ -163,14 +163,20 @@ func (c *ResultCache) Get(scope CacheScope, k Key) (CachedResult, CacheInfo, boo
 // expire. The cache keeps its own copy of the body.
 func (c *ResultCache) Put(scope CacheScope, k Key, r CachedResult) bool {
 	cost := int64(len(r.Body)+len(r.Handle)+len(r.ContentType)+len(r.RawSHA256)+len(scope.Workspace)) + cacheEntryOverhead
-	if !cacheable(k) || r.IsError || cost > c.limits.MaxEntryBytes {
+	if !cacheable(k) || r.IsError {
 		c.refuse()
 		return false
 	}
 	// the copy's capacity is its allocation (rounded up to a size class or to pages),
-	// which is what the entry holds
+	// which is what the entry holds; MaxEntryBytes is checked against that accounted
+	// cost, not the pre-copy estimate, so a stored entry never exceeds the limit it was
+	// admitted under.
 	r.Body = append([]byte(nil), r.Body...)
 	cost += int64(cap(r.Body) - len(r.Body))
+	if cost > c.limits.MaxEntryBytes {
+		c.refuse()
+		return false
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if !handleLive(r, c.now()) {

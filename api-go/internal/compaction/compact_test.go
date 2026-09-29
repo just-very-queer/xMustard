@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -33,11 +34,12 @@ func (m *memRetainer) Retain(_ context.Context, originals []Original) ([]Ref, er
 	h := fmt.Sprintf("%s%043d", evidence.HandlePrefix, m.calls)
 	var buf []byte
 	refs := make([]Ref, len(originals))
+	base := evidence.ResourceURI(h, "ws")
 	for i, o := range originals {
 		off := int64(len(buf))
 		buf = append(append(buf, o.Content...), '\n')
-		refs[i] = Ref{Handle: h, Offset: off, Length: int64(len(o.Content)), ExpiresAt: time.Now().Add(24 * time.Hour),
-			ResourceURI: evidence.ResourceURI(h, "ws") + "&offset=" + strconv.FormatInt(off, 10) + "&length=" + strconv.Itoa(len(o.Content))}
+		refs[i] = Ref{Handle: h, Offset: off, Length: int64(len(o.Content)), ExpiresAt: time.Now().Add(24 * time.Hour), BaseURI: base,
+			ResourceURI: base + "&offset=" + strconv.FormatInt(off, 10) + "&length=" + strconv.Itoa(len(o.Content))}
 	}
 	m.bundles[h] = buf
 	return refs, nil
@@ -335,6 +337,92 @@ func TestCompactOriginalsRecoverThroughTheEvidenceStore(t *testing.T) {
 		Actor: "agent-b", AuthEnforced: true}); !errors.Is(err, evidence.ErrDenied) {
 		t.Fatalf("foreign principal read: %v", err)
 	}
+}
+
+// TestCompactStubURIStaysWithinOnePageForLargeOriginals covers the MCP resources/read
+// route directly: its length param must never exceed evidence.DefaultPageSize (64 KiB),
+// which is the largest length that route accepts (mcpserver.PageBytes), even though the
+// HTTP store.Read route clamps a too-large length silently. A stub for an original over
+// one page must instead describe reading it in pages, starting at the same offset.
+func TestCompactStubURIStaysWithinOnePageForLargeOriginals(t *testing.T) {
+	store := evidence.NewStore(t.TempDir(), evidence.DefaultLimits())
+	rt := StoreRetainer{Store: store, WorkspaceID: "ws", RepoScope: "/repo", Actor: "agent-a", AuthEnforced: true, Issuer: "http"}
+	big := strings.Repeat("x", int(evidence.DefaultPageSize)+4096)
+	in := anthropicSession(t,
+		user(toolUse("call-1", "search", map[string]any{"q": "a"})),
+		assistant(toolResult("call-1", big, false)),
+		user(toolUse("call-2", "search", map[string]any{"q": "b"})),
+		assistant(toolResult("call-2", "small"+padding, false)),
+		user(toolUse("call-3", "search", map[string]any{"q": "c"})),
+		assistant(toolResult("call-3", "small"+padding, false)),
+		user(toolUse("call-4", "search", map[string]any{"q": "d"})),
+		assistant(toolResult("call-4", "small"+padding, false)),
+	)
+	res, err := Compact(context.Background(), Formats["anthropic"], in, rt, Options{Workspace: "ws", KeepRecent: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep *Replacement
+	for i := range res.Replacements {
+		if res.Replacements[i].ToolUseID == "call-1" {
+			rep = &res.Replacements[i]
+		}
+	}
+	if rep == nil {
+		t.Fatal("the large original was not replaced")
+	}
+	if rep.Ref.Length <= evidence.DefaultPageSize {
+		t.Fatalf("test setup: original not larger than one page (%d bytes)", rep.Ref.Length)
+	}
+	stubText := stubOf(t, Formats["anthropic"], res.Messages, "call-1")
+	uri := uriFromStub(t, stubText)
+	u, err := url.Parse(uri)
+	if err != nil {
+		t.Fatalf("stub URI does not parse: %v (%q)", err, uri)
+	}
+	length, err := strconv.Atoi(u.Query().Get("length"))
+	if err != nil || length <= 0 || length > int(evidence.DefaultPageSize) {
+		t.Fatalf("stub URI length=%q exceeds resources/read's %d-byte limit: %s", u.Query().Get("length"), evidence.DefaultPageSize, uri)
+	}
+	offset, err := strconv.ParseInt(u.Query().Get("offset"), 10, 64)
+	if err != nil || offset != rep.Ref.Offset {
+		t.Fatalf("stub URI offset=%q, want %d", u.Query().Get("offset"), rep.Ref.Offset)
+	}
+	// confirm the page it names actually reads through the real store
+	page, err := store.Read(context.Background(), evidence.ReadRequest{WorkspaceID: "ws", Handle: rep.Ref.Handle,
+		Actor: "agent-a", AuthEnforced: true, Offset: offset, Length: length})
+	if err != nil {
+		t.Fatalf("store.Read on the stub's own paged uri: %v", err)
+	}
+	if page.Length <= 0 {
+		t.Fatal("paged read returned nothing")
+	}
+}
+
+// stubOf finds the stub text of the tool result with the given id.
+func stubOf(t *testing.T, f Format, msgs []json.RawMessage, id string) string {
+	t.Helper()
+	for _, r := range scanAll(t, f, msgs).results {
+		if r.id == id {
+			var s string
+			if json.Unmarshal(r.content, &s) == nil {
+				return s
+			}
+		}
+	}
+	t.Fatalf("no result found for %s", id)
+	return ""
+}
+
+// uriFromStub extracts the resources/read uri=... the stub tells the agent to use.
+func uriFromStub(t *testing.T, stub string) string {
+	t.Helper()
+	const marker = "resources/read uri="
+	i := strings.Index(stub, marker)
+	if i < 0 {
+		t.Fatalf("stub carries no resources/read uri: %q", stub)
+	}
+	return stub[i+len(marker):]
 }
 
 // anthropicSession builds Anthropic messages from (role, blocks) pairs.

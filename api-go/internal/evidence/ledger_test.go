@@ -126,6 +126,29 @@ func TestLedgerNeedsALiveHandleAndACompleteIdentity(t *testing.T) {
 	if d := l.Observe(badArgs); !d.Exempt || d.Reason != "args_invalid" {
 		t.Fatalf("invalid args: %+v", d)
 	}
+	noDigest := delivered(t, "toolu_01")
+	noDigest.Digest = [32]byte{}
+	if d := l.Observe(noDigest); !d.Exempt || d.Reason != "digest_missing" {
+		t.Fatalf("zero digest: %+v", d)
+	}
+}
+
+// TestLedgerRefusesAZeroDigestRatherThanTreatItAsAKey guards against a consumer that
+// leaves Delivered.Digest unset: every repeat at the same key would otherwise compare
+// equal by the zero digest, so a changed result at the same revision would be reported
+// unchanged instead of delivered whole.
+func TestLedgerRefusesAZeroDigestRatherThanTreatItAsAKey(t *testing.T) {
+	l := newTestLedger(LedgerLimits{})
+	first := delivered(t, "toolu_01")
+	first.Digest = [32]byte{}
+	if d := l.Observe(first); !d.Exempt || d.Reason != "digest_missing" {
+		t.Fatalf("first call: %+v", d)
+	}
+	changed := delivered(t, "toolu_02")
+	changed.Digest = [32]byte{}
+	if d := l.Observe(changed); d.Unchanged {
+		t.Fatal("a changed result at a zero digest was reported unchanged")
+	}
 }
 
 func TestLedgerNeverDedupesSideEffectingCalls(t *testing.T) {
@@ -246,6 +269,26 @@ func TestLedgerAnnotatesRepeatedFailuresByClass(t *testing.T) {
 		o.Rev.Source = "diag-1"
 		if d := l.Observe(o); d.Failing != nil {
 			t.Fatalf("%s: coarse count survived a success: %+v", c.tool, d.Failing)
+		}
+	}
+}
+
+// TestLedgerNeverTurnsARepeatedFailureIntoAnUnchangedNotice guards the ledger's own
+// contract ("a repeated failure is annotated, never suppressed"): a failure large
+// enough and with a live enough handle to otherwise qualify for a notice must still be
+// delivered whole, with its class attached, not reported as Unchanged.
+func TestLedgerNeverTurnsARepeatedFailureIntoAnUnchangedNotice(t *testing.T) {
+	l := newTestLedger(LedgerLimits{})
+	o := failing(t, "explain", `{"path":"missing.go"}`, "path not found")
+	o.Bytes = 4096
+	o.Handle, o.ExpiresAt = testHandle(t), ledgerNow.Add(24*time.Hour)
+	for i := 1; i <= 3; i++ {
+		d := l.Observe(o)
+		if d.Unchanged {
+			t.Fatalf("call %d: a repeated failure with Bytes=%d and a live handle was reported Unchanged: %+v", i, o.Bytes, d)
+		}
+		if d.Class != ClassNotFound {
+			t.Fatalf("call %d: class = %v, want ClassNotFound", i, d.Class)
 		}
 	}
 }

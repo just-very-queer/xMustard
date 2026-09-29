@@ -121,6 +121,29 @@ func TestResultCacheRefusesWhatItMustNotKeep(t *testing.T) {
 	}
 }
 
+// TestResultCachePutAccountsForCopyCapacitySlackAgainstMaxEntryBytes covers a body
+// sized so its pre-copy byte count fits under MaxEntryBytes but the stored copy's
+// allocated capacity (rounded up to a Go size class) does not: with MaxEntryBytes set
+// equal to MaxBytes, admitting it would let the eviction loop evict the entry Put just
+// inserted, while Put itself still reported it Stored.
+func TestResultCachePutAccountsForCopyCapacitySlackAgainstMaxEntryBytes(t *testing.T) {
+	rev := completeRev()
+	k := mustKey(t, "explain", `{"path":"a.go"}`, rev)
+	// a body length not on a size class boundary, so append's growth leaves slack
+	body := string(bytes.Repeat([]byte("z"), 1001))
+	preSlackCost := int64(len(body)+len(testHandle(t))+len("application/json")+len("ab")+len(alice.Workspace)) + cacheEntryOverhead
+	c := newTestCache(CacheLimits{MaxBytes: preSlackCost, MaxEntryBytes: preSlackCost})
+	if c.Put(alice, k, cached(t, body)) {
+		t.Fatal("an entry whose copy capacity pushes its cost over MaxEntryBytes was cached")
+	}
+	if _, _, ok := c.Get(alice, k); ok {
+		t.Fatal("the refused entry was still served")
+	}
+	if s := c.Stats(); s.Stored != 0 || s.Entries != 0 {
+		t.Fatalf("refused entry counted as stored: %+v", s)
+	}
+}
+
 func TestResultCacheIsCappedByBytesWithLRUEviction(t *testing.T) {
 	c := newTestCache(CacheLimits{MaxBytes: 40 << 10, MaxEntryBytes: 16 << 10})
 	rev := completeRev()
@@ -176,7 +199,9 @@ func TestEvidenceCachesStayWithinTheirBudgetLine(t *testing.T) {
 			o := Delivered{Scope: Scope{Workspace: "workspace-0123456789", Principal: "agent-principal-0001", Session: fmt.Sprintf("mcp-%032x", s)},
 				Tool: "search", Args: []byte(fmt.Sprintf(`{"q":"symbol-%d","limit":25}`, i)), Rev: completeRev(),
 				CallID: fmt.Sprintf("toolu_01%022d", s*1000+i), Bytes: 8192, Handle: handles[i%64], ExpiresAt: now.Add(time.Hour)}
-			o.Digest[0], o.Digest[1] = byte(i), byte(s)
+			// never all-zero (s=0, i=0 would otherwise collide with the ledger's own
+			// digest_missing exemption and be skipped, filling one entry short)
+			o.Digest[0], o.Digest[1], o.Digest[31] = byte(i), byte(s), 1
 			l.Observe(o)
 		}
 	}
