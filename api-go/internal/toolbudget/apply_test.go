@@ -24,7 +24,8 @@ func envelopeMembers(losses, dirty int) map[string]any {
 		"coverage": map[string]any{"complete": false, "truncated": false, "indexed_files": 568,
 			"loss_counts": map[string]any{"lexical_fallback": losses}, "losses": lossList,
 			"languages": map[string]any{"go": map[string]int{"supported": 590, "failed": 6}, "rust": map[string]int{"supported": 77, "failed": 5},
-				"python": map[string]int{"supported": 8, "failed": 2}}},
+				"python": map[string]int{"supported": 8, "failed": 2}},
+			"work": map[string]any{"graph_cache": "hit", "files_parsed": 0, "files_reused": 568}},
 		"freshness": map[string]any{"source": "index", "status": "current", "dirty_paths_touching_result": dirtyList,
 			"refresh": map[string]any{"reparsed": 568, "reresolved": 568, "escalated": false}},
 	}
@@ -275,7 +276,8 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 		if _, ok := cov["languages"]; ok {
 			t.Fatal("signal_flags keeps coverage.languages")
 		}
-		if cov["loss_counts"] == nil || cov["complete"] != false || cov["indexed_files"] != float64(568) {
+		if cov["loss_counts"] == nil || cov["complete"] != false || cov["indexed_files"] != float64(568) ||
+			cov["work"].(map[string]any)["graph_cache"] != "hit" {
 			t.Fatalf("signal_flags dropped a kept member: %v", cov)
 		}
 		fr := a.out["freshness"].(map[string]any)
@@ -285,7 +287,7 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 		if a.rep.Signals["coverage.languages"] != 3 || a.rep.Signals["freshness.refresh"] != 3 || a.rep.Signals["coverage.losses"] != 6 {
 			t.Fatalf("signals %v", a.rep.Signals)
 		}
-		if _, ok := a.rep.Signals["coverage.loss_counts"]; ok {
+		if _, ok := a.rep.Signals["coverage.loss_counts"]; ok || a.rep.Signals["coverage.work"] != 0 {
 			t.Fatal("a kept member is not reported as removed")
 		}
 		return

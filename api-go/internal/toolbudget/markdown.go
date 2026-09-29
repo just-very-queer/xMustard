@@ -37,7 +37,8 @@ func (s *Spec) Markdown() string {
 	}
 	b.WriteString("\nA list that returns fewer items than its page holds sets `has_more`; a paged list's `next_cursor` continues " +
 		"at the first item not returned, so fewer items loses nothing. Signals are never dropped silently: `signal_counts` " +
-		"and `signal_flags` keep every flag, count and short text of coverage and freshness (and coverage.loss_counts) and " +
+		"and `signal_flags` keep every flag, count and text of coverage and freshness (and coverage's loss_counts, work and " +
+		"source_identity) and " +
 		"move the lengths of the lists and the sizes of the nested objects they remove to `output_budget.signals`; any " +
 		"member no rung names is returned as is. When anything was reduced on an MCP call, the unbudgeted result is " +
 		"retained as evidence: `recover_uri` pages or searches it with resources/read and `recover_handle` names it for " +

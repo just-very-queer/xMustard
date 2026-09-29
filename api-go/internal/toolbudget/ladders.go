@@ -81,11 +81,14 @@ var signalCounts = Rung{Name: "signal_counts", Op: opSignals,
 
 // signalFlags is the shared rung that reduces signal objects to their scalars.
 var signalFlags = Rung{Name: "signal_flags", Op: opFlags,
-	Doc: "coverage and freshness keep every flag, count and short text and coverage.loss_counts; their other nested objects (per-language coverage, refresh counters) go, sized in output_budget.signals"}
+	Doc: "coverage and freshness keep every flag, count and text and coverage's loss_counts, work (the index work this read did) and source_identity; their other nested objects (per-language coverage, extraction, envelope, refresh counters) go, sized in output_budget.signals"}
 
 var (
-	envelope     = []string{"coverage", "freshness"}
-	envelopeKeep = []string{"coverage.loss_counts"}
+	envelope = []string{"coverage", "freshness"}
+	// envelopeKeep are the nested envelope objects that are signals themselves: the
+	// exact loss counts, the index work this read did (cache hit or miss, files
+	// parsed) and whether the source identity was stable
+	envelopeKeep = []string{"coverage.loss_counts", "coverage.work", "coverage.source_identity"}
 )
 
 // fallback applies when no other ladder of a tool matches: only the signals shrink.
