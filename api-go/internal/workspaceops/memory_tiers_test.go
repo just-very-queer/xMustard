@@ -271,6 +271,60 @@ func TestSinceRevisionReturnsOnlyChangedEntries(t *testing.T) {
 	}
 }
 
+// An entry proposed after since and promoted inside the window is "added" even when an
+// edit-type event (here a tier_change to deferred, allowed on a pending entry) touched it
+// first: the served-at-since state is decided from serve/remove transitions only, not
+// from which folded event came first.
+func TestSinceRevisionAddedSurvivesAnEarlierEditOnAPendingEntry(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	since := memoryRevision(t, dir, ws)
+	p, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "p", Content: "pending fact"}},
+		ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := SetMemoryTier(dir, ws, p.ID, "deferred", "keep it out of core once live", humanActor("hum")); err != nil {
+		t.Fatal(err)
+	}
+	for _, peer := range []string{"peer-1", "peer-2"} {
+		if _, err := VerifyContextOutcome(dir, ws, p.ID, ContextActor{ID: peer, Verifier: true},
+			VerifyRequest{Outcome: OutcomeApprove, Revision: 1}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var g groundingMemory
+	if unknown := g.build(dir, ws, "me", groundMemoryOptions{since: since}); len(unknown) != 0 {
+		t.Fatal(unknown)
+	}
+	d := g.MemoryDelta
+	if !slices.Contains(d.Added, p.ID) || slices.Contains(d.Changed, p.ID) {
+		t.Fatalf("a pending entry touched then promoted must be added, not changed: %+v", d)
+	}
+}
+
+// A pending proposal that never became served memory, and is then retracted, classified
+// or tier-changed, is served at neither since nor now: it must not appear in Removed.
+func TestSinceRevisionOmitsARetractedPendingProposal(t *testing.T) {
+	dir, ws := multiAgentDir(t), "ws"
+	since := memoryRevision(t, dir, ws)
+	p, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "p", Content: "pending fact"}},
+		ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := RetractContext(dir, ws, p.ID, "no longer needed", ContextActor{ID: "hum", Approver: true}); err != nil {
+		t.Fatal(err)
+	}
+	var g groundingMemory
+	if unknown := g.build(dir, ws, "me", groundMemoryOptions{since: since}); len(unknown) != 0 {
+		t.Fatal(unknown)
+	}
+	d := g.MemoryDelta
+	if slices.Contains(d.Removed, p.ID) || len(d.Added)+len(d.Changed)+len(d.Superseded)+len(d.Removed) != 0 {
+		t.Fatalf("a never-served pending entry must not be listed: %+v", d)
+	}
+}
+
 // adminHuman authenticates an admin who is a human approver, from a token file.
 func adminHuman(t *testing.T, dir, ws, id string) HumanApprover {
 	t.Helper()

@@ -211,21 +211,38 @@ func guidanceSpan(lines []string) (begin, end int, err error) {
 // the human's prose. It returns the new document and the action; unchanged when the
 // existing block's body is already body.
 func spliceGuidance(doc, body, block string) (string, string, error) {
-	lines := strings.Split(doc, "\n")
+	// A CRLF document's lines still carry a trailing "\r" after splitting on "\n"; fold
+	// to LF for the span search and the body comparison, then restore CRLF on write so
+	// the result stays idempotent and single-line-ending instead of mixing the two.
+	crlf := strings.Contains(doc, "\r\n")
+	norm := doc
+	if crlf {
+		norm = strings.ReplaceAll(doc, "\r\n", "\n")
+	}
+	lines := strings.Split(norm, "\n")
 	begin, end, err := guidanceSpan(lines)
 	switch {
 	case err != nil:
 		return "", "", err
-	case begin < 0 && strings.TrimSpace(doc) == "":
-		return block + "\n", guidanceAppended, nil
+	case begin < 0 && strings.TrimSpace(norm) == "":
+		return restoreEOL(block+"\n", crlf), guidanceAppended, nil
 	case begin < 0:
-		return strings.TrimRight(doc, "\n") + "\n\n" + block + "\n", guidanceAppended, nil
+		return restoreEOL(strings.TrimRight(norm, "\n")+"\n\n"+block+"\n", crlf), guidanceAppended, nil
 	}
 	if old := strings.Join(lines[begin+1:end], "\n") + "\n"; old == body {
 		return doc, guidanceUnchanged, nil
 	}
 	out := append(slices.Clone(lines[:begin]), strings.Split(block, "\n")...)
-	return strings.Join(append(out, lines[end+1:]...), "\n"), guidanceReplaced, nil
+	return restoreEOL(strings.Join(append(out, lines[end+1:]...), "\n"), crlf), guidanceReplaced, nil
+}
+
+// restoreEOL puts s back into CRLF when the source document used it; s is otherwise
+// always LF-only (guidanceSpan and the block text never emit "\r").
+func restoreEOL(s string, crlf bool) string {
+	if crlf {
+		return strings.ReplaceAll(s, "\n", "\r\n")
+	}
+	return s
 }
 
 // errGuidanceSymlink: the writer never writes through a symlink (CLAUDE.md is often one

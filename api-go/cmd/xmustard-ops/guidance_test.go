@@ -59,6 +59,28 @@ func TestGuidanceBlockIsIdempotentWithLineAnchoredMarkers(t *testing.T) {
 	}
 }
 
+// A CRLF document keeps its line ending and the writer is idempotent on it: splicing the
+// same body twice reports unchanged, and the block itself never mixes bare "\n" into a
+// CRLF file.
+func TestGuidanceBlockIsIdempotentOnCRLF(t *testing.T) {
+	prose := "# Project\r\n\r\nOur own conventions stay ours.\r\n"
+	p := testProjection(5, workspaceops.ProjectedMemory{ID: "ctx_a", Revision: 2, Title: "Release rule", Content: "Tag from main only."})
+	body := guidanceBody("ws", p)
+	block := guidanceBlock(p.Revision, body)
+
+	doc, action, err := spliceGuidance(prose, body, block)
+	if err != nil || action != guidanceAppended {
+		t.Fatalf("first write: %s %v", action, err)
+	}
+	if strings.Contains(doc, "\n") && strings.Count(doc, "\r\n") != strings.Count(doc, "\n") {
+		t.Fatalf("mixed line endings after first write:\n%q", doc)
+	}
+	again, action, err := spliceGuidance(doc, body, block)
+	if err != nil || action != guidanceUnchanged || again != doc {
+		t.Fatalf("second write should be a no-op: %s %v\n%q", action, err, again)
+	}
+}
+
 // Memory text cannot break the block: a marker-like line is indented and a fence it
 // opens is closed, so the block still parses back as one.
 func TestGuidanceTextCannotBreakTheBlock(t *testing.T) {

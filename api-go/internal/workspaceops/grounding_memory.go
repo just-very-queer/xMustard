@@ -248,21 +248,57 @@ type SupersededMemory struct {
 type deltaChange struct {
 	seq     int64 // the newest event, for ordering
 	touched bool  // an event was folded
-	// firstAdded: the first event promoted or restored the entry, so it was not served
-	// at since.
-	firstAdded bool
-	removed    bool   // an event took it out of served memory
-	stale      bool   // the newest drift signal flags it stale
-	by         string // the entry that superseded it
+	// firstTransition is what the first serve/remove-type event folded for this entry
+	// did to served memory ("serve" or "remove"); edit-type events (tier_change,
+	// classify, revision_accepted, expiry) never set it, so they cannot hide whether
+	// the entry was served at since. Empty means no serve/remove event fell in the
+	// window, so the served-at-since state equals the served-now state.
+	firstTransition string
+	// bornInWindow: the entry's own propose or import event (its first event, ever) fell
+	// inside the window, so it cannot have been served at since regardless of what a
+	// later serve/remove-type event in the window looks like.
+	bornInWindow bool
+	stale        bool   // the newest drift signal flags it stale
+	by           string // the entry that superseded it
+}
+
+// servedAtSince reports whether the entry was part of served memory immediately after
+// since, before any event in the window: an entry created inside the window was not
+// served at since; otherwise a serve-type event first means it was not served yet; a
+// remove-type event first means it still was; with neither, the served-at-since state
+// matches whether it is served now.
+func (c *deltaChange) servedAtSince(servedNow bool) bool {
+	if c.bornInWindow {
+		return false
+	}
+	switch c.firstTransition {
+	case "serve":
+		return false
+	case "remove":
+		return true
+	default:
+		return servedNow
+	}
 }
 
 // Effects of the history's event types on served memory. A type missing here (a vote,
 // a feedback outcome, an anchor edit) changes nothing an agent was served.
 var (
-	deltaServe   = func(c *deltaChange, _ govstore.Event) { c.firstAdded = c.firstAdded || !c.touched }
-	deltaEdit    = func(*deltaChange, govstore.Event) {}
-	deltaRemove  = func(c *deltaChange, _ govstore.Event) { c.removed = true }
+	deltaServe = func(c *deltaChange, _ govstore.Event) {
+		if c.firstTransition == "" {
+			c.firstTransition = "serve"
+		}
+	}
+	deltaEdit   = func(*deltaChange, govstore.Event) {}
+	deltaRemove = func(c *deltaChange, _ govstore.Event) {
+		if c.firstTransition == "" {
+			c.firstTransition = "remove"
+		}
+	}
+	deltaBorn    = func(c *deltaChange, _ govstore.Event) { c.bornInWindow = true }
 	deltaEffects = map[string]func(*deltaChange, govstore.Event){
+		govstore.EventPropose:          deltaBorn,
+		govstore.EventImport:           deltaBorn,
 		govstore.EventPromote:          deltaServe,
 		govstore.EventRestore:          deltaServe, // from archived; a restore that demotes is followed by a demote
 		govstore.EventRevisionAccepted: deltaEdit,
@@ -283,7 +319,10 @@ var (
 			// the replacing entry's own supersede event names what it replaced; its
 			// promotion already says it was added
 			if json.Unmarshal(ev.Data, &data) == nil && data.SupersededBy != "" {
-				c.removed, c.by = true, data.SupersededBy
+				c.by = data.SupersededBy
+				if c.firstTransition == "" {
+					c.firstTransition = "remove"
+				}
 			}
 		},
 	}
@@ -358,14 +397,15 @@ func (d deltaEvents) delta(since, revision int64, served map[string]bool, staleN
 	}
 	for _, id := range ids {
 		c := d.byEntry[id]
+		sas := c.servedAtSince(served[id]) // served immediately after since
 		switch {
-		case !served[id] && c.firstAdded:
+		case !served[id] && !sas:
 			// served neither at since nor now: nothing an agent saw changed
 		case !served[id] && c.by != "":
 			out.Superseded = append(out.Superseded, SupersededMemory{ID: id, By: c.by})
 		case !served[id]:
 			out.Removed = append(out.Removed, id)
-		case c.firstAdded:
+		case !sas:
 			out.Added = append(out.Added, id)
 		case c.stale || driftNow[id]:
 			out.Stale = append(out.Stale, id)
