@@ -108,6 +108,13 @@ type AnchorReader interface {
 	// AnchorFanout counts, per value of q.Values, the workspace's entries holding it as
 	// an anchor of q.Kind, under q's lifecycle flags (Limit and NewestFirst are unused).
 	AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]int, error)
+	// AnchorsInPaths returns the anchors of the workspace's served entries that lie in
+	// one of paths (PAR-PROV-03): a path anchor on it, a symbol anchor whose uid is
+	// "path#name" or a code anchor "path#Lstart-Lend" in it. At most limit rows in all
+	// (up to MaxAnchorRows), taken chunk by chunk in the order of paths, so a caller that
+	// sorts paths nearest first keeps the nearest anchors; a caller reading limit+1 rows
+	// learns that rows were dropped.
+	AnchorsInPaths(ctx context.Context, workspaceID string, paths []string, limit int) ([]Anchor, error)
 }
 
 // AnchorWriter writes anchors, baselines and drift observations.
@@ -327,6 +334,64 @@ func (r *reader) AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]in
 	return out, nil
 }
 
+// MaxAnchorRows bounds the rows one AnchorsInPaths call returns.
+const MaxAnchorRows = 5000
+
+// anchorColsA is anchorCols on the alias a.
+const anchorColsA = `a.entry_id, a.ordinal, a.kind, a.value, a.declared, a.symbol_uid, a.baseline_state, a.baseline_hash,
+	a.baseline_kind, a.baseline_commit, coalesce(a.baseline_at, ''), coalesce(a.stale_since, ''), a.stale_commit`
+
+// anchorFileExpr is the file an anchor lies in: its value for a path anchor, else the
+// part of its uid (symbol) or value (code) before "#".
+const anchorFileExpr = `CASE a.kind WHEN 'path' THEN a.value
+	WHEN 'symbol' THEN substr(a.symbol_uid, 1, instr(a.symbol_uid, '#') - 1)
+	ELSE substr(a.value, 1, instr(a.value, '#') - 1) END`
+
+// AnchorsInPaths finds the served entries' anchors that lie in paths. Path anchors use
+// the (kind, value) index; symbol and code anchors are scanned by kind.
+func (r *reader) AnchorsInPaths(ctx context.Context, workspaceID string, paths []string, limit int) ([]Anchor, error) {
+	if err := validID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	limit = min(max(limit, 1), MaxAnchorRows)
+	var out []Anchor
+	for start := 0; start < len(paths) && len(out) < limit; start += maxInArgs {
+		chunk := paths[start:min(start+maxInArgs, len(paths))]
+		in := placeholders(len(chunk))
+		args := make([]any, 0, 2*len(chunk)+4)
+		for range 2 {
+			for _, p := range chunk {
+				args = append(args, p)
+			}
+		}
+		lifecycle, lifecycleArgs := r.anchorLifecycle(AnchorQuery{ServedOnly: true})
+		args = append(append(append(args, workspaceID), lifecycleArgs...), limit-len(out))
+		rows, err := r.query(ctx, "SELECT "+anchorColsA+` FROM anchors a JOIN entries e ON e.id = a.entry_id
+			WHERE (a.kind = 'path' AND a.value IN (`+in+`)
+			   OR a.kind IN ('symbol', 'code') AND (`+anchorFileExpr+`) IN (`+in+`))
+			AND e.workspace_id = ?`+lifecycle+` ORDER BY e.pk, a.ordinal LIMIT ?`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			a, err := scanAnchor(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, a)
+		}
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
 func (t *txn) liveEntry(ctx context.Context, id string) (Entry, error) {
 	e, err := t.GetEntry(ctx, id)
 	if err != nil {
@@ -418,7 +483,8 @@ func (t *txn) setBaselines(ctx context.Context, e Entry, baselines []Baseline, c
 	})
 }
 
-// MarkStale flags drifted anchors and the entry, once per anchor.
+// MarkStale flags drifted anchors and the entry, once per anchor. It leaves updated_at
+// alone: stale_since records the event, and a drift is not a content change.
 func (t *txn) MarkStale(ctx context.Context, entryID string, refs []AnchorRef, commit string, actor Actor) (int, error) {
 	if err := actor.validate(); err != nil {
 		return 0, err
@@ -442,8 +508,8 @@ func (t *txn) MarkStale(ctx context.Context, entryID string, refs []AnchorRef, c
 	if len(fresh) == 0 {
 		return 0, nil
 	}
-	if _, err := t.exec(ctx, "UPDATE entries SET needs_reverify = 1, stale_since = coalesce(stale_since, ?), updated_at = ? WHERE id = ?",
-		now, now, entryID); err != nil {
+	if _, err := t.exec(ctx, "UPDATE entries SET needs_reverify = 1, stale_since = coalesce(stale_since, ?) WHERE id = ?",
+		now, entryID); err != nil {
 		return 0, err
 	}
 	if err := t.appendEvent(ctx, actor, eventRow{
@@ -468,8 +534,7 @@ func (t *txn) ClearDrift(ctx context.Context, entryID string, actor Actor) error
 	if err != nil {
 		return err
 	}
-	res2, err := t.exec(ctx, "UPDATE entries SET needs_reverify = 0, stale_since = NULL, updated_at = ? WHERE id = ? AND needs_reverify = 1",
-		t.nowText(), entryID)
+	res2, err := t.exec(ctx, "UPDATE entries SET needs_reverify = 0, stale_since = NULL WHERE id = ? AND needs_reverify = 1", entryID)
 	if err != nil {
 		return err
 	}

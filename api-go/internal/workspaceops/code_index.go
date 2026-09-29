@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log"
+	"slices"
 	"sync"
 	"time"
 
@@ -314,6 +315,10 @@ func runCodeIndexRefresh(root string, f *refreshFlight) {
 		return
 	}
 	f.report, outcome = &r, refreshDone
+	// the batch's paths are what changed: memory anchored there is looked at (WS-28)
+	if observe := indexedPathsObserver; observe != nil && batch != nil && !batch.Whole() && len(batch.Paths) > 0 {
+		go observe(root, slices.Clone(batch.Paths))
+	}
 }
 
 // withRefreshWork reports a refresh this read waited for as the read's own index

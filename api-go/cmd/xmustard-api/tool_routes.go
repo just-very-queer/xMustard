@@ -112,8 +112,14 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 		result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
 	case workspaceops.ImpactBlast:
 		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+		if err == nil {
+			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+		}
 	case workspaceops.ImpactFile:
 		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
+		if err == nil {
+			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, "", []string{q.Get("path")}, result)
+		}
 	case workspaceops.ImpactChanges:
 		result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
 	default:

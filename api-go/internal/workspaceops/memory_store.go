@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"bufio"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -301,7 +302,8 @@ func contextEntryFrom(e govstore.Entry, votes []govstore.Vote, anchors []govstor
 		Revision: e.Revision, SupersededBy: e.SupersededBy, InvalidatedAt: e.InvalidatedAt, ExpiresAt: e.ExpiresAt,
 		Supersedes: pendingSupersedes(e),
 		Kind:       e.Kind, Topic: e.Topic, Tags: e.Tags, Quarantine: e.Metadata[govstore.MetaQuarantine],
-		Description: e.Description,
+		Description: e.Description, ValidFrom: e.ValidFrom, ValidFromCommit: e.ValidFromCommit,
+		InvalidatedCommit: e.InvalidatedCommit, NeedsReverify: e.NeedsReverify, StaleSince: e.StaleSince,
 	}
 	if e.Tier == govstore.TierCore {
 		ce.Tier = govstore.TierCore
@@ -320,6 +322,10 @@ func contextEntryFrom(e govstore.Entry, votes []govstore.Vote, anchors []govstor
 		}
 	}
 	for _, a := range anchors {
+		if a.StaleSince != "" {
+			ce.StaleAnchors = append(ce.StaleAnchors, a.Kind+":"+a.Value)
+			ce.StaleCommit = cmp.Or(ce.StaleCommit, a.StaleCommit)
+		}
 		if a.Kind != govstore.AnchorPath {
 			continue
 		}

@@ -80,6 +80,11 @@ type RankEntry struct {
 	Paths []string
 	// Baselined: at least one path anchor carries a drift baseline.
 	Baselined bool
+	// The bi-temporal interval (PAR-PROV-02: valid_from to invalidated_at, each with the
+	// commit HEAD was at, "" when unknown) and the persisted drift flag (PAR-PROV-03).
+	ValidFrom, ValidFromCommit, InvalidatedAt, InvalidatedCommit, ExpiresAt string
+	NeedsReverify                                                           bool
+	StaleSince                                                              string
 }
 
 // RankQuery selects a ranking view: the rank states to read and the caller the
@@ -130,7 +135,9 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 	args := []any{r.nowText(), q.WorkspaceID, principalKey(q.Caller), OpenModeIdentity}
 	rows, err := r.query(ctx, `SELECT e.id, e.title, e.verification_mode, e.updated_at, e.content_digest,
 		`+rankStateExpr+`, e.status, e.kind, e.topic, e.tier, e.tags, e.source, e.source_owner, e.required_verifications,
-		coalesce(e.superseded_by, ''), e.source_key = ?3 AND ?3 <> ''
+		coalesce(e.superseded_by, ''), e.source_key = ?3 AND ?3 <> '',
+		coalesce(e.valid_from, ''), e.valid_from_commit, coalesce(e.invalidated_at, ''), e.invalidated_commit,
+		e.needs_reverify, coalesce(e.stale_since, ''), coalesce(e.expires_at, '')
 		FROM entries e WHERE `+where+` ORDER BY e.pk`, args[:3]...)
 	if err != nil {
 		return nil, err
@@ -145,7 +152,8 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 	}, func() error {
 		e = RankEntry{}
 		if err := rows.Scan(&e.ID, &e.Title, &e.VerificationMode, &e.UpdatedAt, &e.ContentDigest, &e.State,
-			&e.Status, &e.Kind, &e.Topic, &e.Tier, &tags, &e.Author, &e.AuthorOwner, &e.RequiredVerifications, &e.SupersededBy, &e.ByCaller); err != nil {
+			&e.Status, &e.Kind, &e.Topic, &e.Tier, &tags, &e.Author, &e.AuthorOwner, &e.RequiredVerifications, &e.SupersededBy, &e.ByCaller,
+			&e.ValidFrom, &e.ValidFromCommit, &e.InvalidatedAt, &e.InvalidatedCommit, &e.NeedsReverify, &e.StaleSince, &e.ExpiresAt); err != nil {
 			return err
 		}
 		return decodeJSONColumn(tags, &e.Tags)
