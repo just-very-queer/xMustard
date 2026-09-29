@@ -15,7 +15,7 @@ import (
 )
 
 // registerRoots writes workspaces.json and a snapshot for each id -> root.
-func registerRoots(t *testing.T, dir string, roots map[string]string) {
+func registerRoots(t testing.TB, dir string, roots map[string]string) {
 	t.Helper()
 	var recs []workspaceRecord
 	for _, id := range slices.Sorted(maps.Keys(roots)) {

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -71,10 +72,11 @@ import (
 //
 // Route gates: every event is its own route with a row in routeGateTable (hookGate): core,
 // the proposer role (a hook runs for an agent session; no non-GET route grants reader),
-// served in read-only mode (a capture stores only the caller's own output). The workspace
-// comes from the X-Xmustard-Workspace header or the registered root holding the event's
-// cwd, and is then checked like a workspace path: served by this deployment and in the
-// token's scope.
+// served in read-only mode (a capture stores only the caller's own output; the session
+// ledger records nothing, so no boundary work runs: no snapshot, capsule or mined
+// candidate). The workspace comes from the X-Xmustard-Workspace header or the
+// registered root holding the event's cwd, and is then checked like a workspace path:
+// served by this deployment and in the token's scope.
 
 // defaultHookBudget is how long a hook answer may take; past it the route answers empty.
 const defaultHookBudget = 180 * time.Millisecond
@@ -106,17 +108,22 @@ var (
 	hookForgetRoot = workspaceops.ForgetRoot
 )
 
-// hookStats counts hook answers since start (hookUsage, /api/health).
+// hookStats counts hook answers since start (hookUsage, /api/health); drained counts
+// the queued events the consumer has handled.
 var hookStats struct {
-	answered, timedOut, failOpen, enqueued, dropped atomic.Int64
+	answered, timedOut, failOpen, enqueued, dropped, drained atomic.Int64
 }
 
 // hookUsage is the operator's view of the hook service in /api/health: answers given,
 // answers the budget cut to empty, bodies it could not read (empty answers too), and
 // the queued events and those dropped because the queue was full.
 func hookUsage() map[string]int64 {
-	return map[string]int64{"answered": hookStats.answered.Load(), "timed_out": hookStats.timedOut.Load(),
+	usage := map[string]int64{"answered": hookStats.answered.Load(), "timed_out": hookStats.timedOut.Load(),
 		"fail_open": hookStats.failOpen.Load(), "enqueued": hookStats.enqueued.Load(), "dropped": hookStats.dropped.Load()}
+	for k, v := range workspaceops.LedgerUsage() {
+		usage["ledger_"+k] = v
+	}
+	return usage
 }
 
 type hookServer struct {
@@ -170,22 +177,31 @@ var hookHandlers = map[string]func(*hookServer, context.Context, *hookCall) hook
 	"WorktreeRemove":     (*hookServer).worktreeRemove,
 }
 
-// hookQueued is an Enqueue-mode event waiting for the consumer.
+// hookQueued is an Enqueue-mode event waiting for the consumer. ledger is its session in
+// the ledger's terms and text its trigger or reason; ledger is nil when the event names
+// no session or no workspace in scope, and in read-only mode (ledgerBase).
 type hookQueued struct {
-	event string
-	key   hooks.SessionKey
+	event, text string
+	key         hooks.SessionKey
+	ledger      *workspaceops.LedgerSession
 }
 
-// hookQueueEffects is what the consumer does with each Enqueue-mode event: SessionEnd
-// drops the session's contexts, SubagentStop the subagent's, PostCompact forgets what
-// was pushed into the compacted context. Stop and PreCompact only mark the queue
-// contract today: WS-33 adds the session ledger and the compaction snapshot behind them.
-var hookQueueEffects = map[string]func(*hooks.Sessions, hooks.SessionKey){
-	"SessionEnd":   (*hooks.Sessions).End,
-	"SubagentStop": endSubagent,
-	"PostCompact":  (*hooks.Sessions).Compacted,
-	"PreCompact":   func(*hooks.Sessions, hooks.SessionKey) {},
-	"Stop":         func(*hooks.Sessions, hooks.SessionKey) {},
+// hookEnqueued is what the consumer does with each Enqueue-mode event: its effect on the
+// steering state (SessionEnd drops the session's contexts, SubagentStop the
+// subagent's, PostCompact forgets what was pushed into the compacted context), and the
+// session-ledger boundary it records (WS-33: PreCompact takes the compaction snapshot,
+// Stop mines candidates, SessionEnd ends the session with its mining, transcript
+// reference, automatic capsule and snapshot). The ledger writer does the boundary's
+// work after the answer (Claude Code gives SessionEnd hooks a shared 1.5 s budget).
+var hookEnqueued = map[string]struct {
+	effect   func(*hooks.Sessions, hooks.SessionKey)
+	boundary string
+}{
+	"PreCompact":   {boundary: workspaceops.BoundaryPreCompact},
+	"PostCompact":  {(*hooks.Sessions).Compacted, workspaceops.BoundaryPostCompact},
+	"Stop":         {boundary: workspaceops.BoundaryTurnEnd},
+	"SubagentStop": {endSubagent, workspaceops.BoundarySubagentStop},
+	"SessionEnd":   {(*hooks.Sessions).End, workspaceops.BoundarySessionEnd},
 }
 
 // endSubagent drops a subagent's context. Claude Code also fires SubagentStop for its
@@ -363,33 +379,102 @@ func (s *hookServer) sessionStart(ctx context.Context, c *hookCall) hookResult {
 	if c.in.Source == "clear" || c.in.Source == "compact" {
 		s.sessions.Compacted(c.key) // what was pushed is gone from the context
 	}
-	return s.grounding(ctx, c, c.ev.WatchPaths)
+	s.record(c, workspaceops.LedgerEvent{Kind: workspaceops.LedgerSessionStart, Text: c.in.Source})
+	return s.grounding(ctx, c, c.ev.WatchPaths, s.sessionContext(ctx, c)...)
 }
 
 // subagentStart grounds a subagent: its hooks carry its agent_id, so it gets a
 // context of its own (hooks.SessionKey) and the core tier is pushed into it too.
 func (s *hookServer) subagentStart(ctx context.Context, c *hookCall) hookResult {
+	s.record(c, workspaceops.LedgerEvent{Kind: workspaceops.LedgerSubagentStart, Text: c.in.AgentType})
 	return s.grounding(ctx, c, false)
 }
 
-// grounding is SessionStart's and SubagentStart's context: ground's spawn-free part
-// and the core-tier memories, and (SessionStart) the files memory is anchored to as
-// watchPaths, so FileChanged reports their edits.
-func (s *hookServer) grounding(ctx context.Context, c *hookCall, watch bool) hookResult {
+// grounding is SessionStart's and SubagentStart's context: ground's spawn-free part,
+// the session parts (SessionStart: the snapshot or handoff, sessionContext), and the
+// core-tier memories in the room left, and (SessionStart) the files memory is anchored
+// to as watchPaths, so FileChanged reports their edits.
+func (s *hookServer) grounding(ctx context.Context, c *hookCall, watch bool, session ...string) hookResult {
 	if !c.bound {
 		return hookResult{}
 	}
 	g := workspaceops.HookGrounding(ctx, dataDir(), c.ws.WorkspaceID, c.caller)
-	res := hookResult{context: groundLine(c.ws, g)}
+	res := hookResult{context: hooks.Compose(append([]string{groundLine(c.ws, g)}, session...)...)}
 	if idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID); err == nil {
 		var memory string
 		memory, res.offered = s.push(ctx, c, injection.SurfaceCore, idx.Core, nil, "recall", hooks.Room(res.context))
-		res.context = hooks.Compose(res.context, memory)
+		res.context = oneNotice(hooks.Compose(res.context, memory))
 		if watch {
 			res.watch = watchPaths(c.ws, idx.Anchors)
 		}
 	}
 	return res
+}
+
+// hookHandoffs are the session states SessionStart restores, by source: after a
+// compaction the session's own snapshot (PAR-HAR-04), at a new session the prior
+// session's handoff, from any client (PAR-HAR-05). resume and clear restore nothing:
+// a resumed session has its history, and clear asked for a fresh context.
+var hookHandoffs = map[string]struct {
+	own, prior bool
+	header     string
+}{
+	"compact": {own: true, header: "[xmustard] restored after compaction: this session's state at the compaction boundary"},
+	"startup": {prior: true, header: "[xmustard] handoff from the prior session"},
+}
+
+// sessionContext is SessionStart's session parts: the line naming this session's
+// execution key, and the restored snapshot or the prior session's handoff with its
+// capsule, each scanned for instruction patterns and framed as data (WS-56). A flagged
+// part is withheld with a note naming the ground call that returns it labeled.
+func (s *hookServer) sessionContext(ctx context.Context, c *hookCall) []string {
+	if !c.bound || c.in.SessionID == "" || c.in.AgentID != "" {
+		return nil
+	}
+	key := workspaceops.ExecutionKey(c.client.Name, c.in.SessionID, "")
+	parts := []string{fmt.Sprintf("[xmustard session] this session is %s. Before it ends, remember(kind=\"handoff\", session_id=%q, "+
+		"content=<capsule JSON>, paths=...) leaves a handoff for the next session; ground session_id=%s restores its state.", key, key, key)}
+	mode, ok := hookHandoffs[c.in.Source]
+	if !ok {
+		return parts
+	}
+	h, err := workspaceops.HookSessionHandoff(ctx, dataDir(), c.ws.WorkspaceID, c.caller, key, mode.own, mode.prior)
+	if err != nil || h == nil {
+		return parts
+	}
+	caveat := ""
+	if h.Caveat != "" {
+		caveat = "; " + h.Caveat
+	}
+	header := fmt.Sprintf("%s (%s from %s, %s, last seen %s%s): derived from the session ledger, not verified memory.",
+		mode.header, h.FromSession, cmp.Or(h.Client, "an unknown client"), h.Status, h.LastSeenAt, caveat)
+	parts = append(parts, framedPart(header, "snapshot", h.FromSession, "derived", h.SnapshotText()))
+	if c := h.Capsule; c != nil {
+		parts = append(parts, framedPart("[xmustard] its handoff capsule "+c.ID+":", "handoff", c.ID, c.Trust(), c.Gist()))
+	}
+	return parts
+}
+
+// framedPart frames text as data under a header, or withholds it when the scan flags it
+// (the ground call that returns it labeled is session_handoff's).
+func framedPart(header, kind, id, trust, text string) string {
+	if rep := injection.Scan(text); !rep.Clean() {
+		return fmt.Sprintf("%s withheld: it holds instruction-like text (%s); ground returns it labeled.",
+			strings.TrimSuffix(header, ":"), strings.Join(rep.Flags, ", "))
+	}
+	return header + "\n" + injection.Notice + "\n" + injection.Frame(injection.Block{Kind: kind, ID: id, Trust: trust, Text: text})
+}
+
+// oneNotice keeps the first injection notice of a composed context: each framed part
+// carries one so that it stands alone, and a context needs it once.
+func oneNotice(s string) string {
+	first := strings.Index(s, injection.Notice)
+	if first < 0 {
+		return s
+	}
+	end := first + len(injection.Notice)
+	rest := strings.ReplaceAll(s[end:], "\n\n"+injection.Notice+"\n\n", "\n\n")
+	return s[:end] + strings.ReplaceAll(rest, "\n"+injection.Notice+"\n", "\n")
 }
 
 // groundLine is ground's summary as far as a hook computes it.
@@ -418,6 +503,7 @@ func (s *hookServer) userPrompt(ctx context.Context, c *hookCall) hookResult {
 	if !c.bound || strings.TrimSpace(c.in.Prompt) == "" {
 		return hookResult{}
 	}
+	s.record(c, workspaceops.LedgerEvent{Kind: workspaceops.LedgerPrompt, Text: c.in.Prompt})
 	idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID)
 	if err != nil || len(idx.Triggers) == 0 {
 		return hookResult{}
@@ -653,11 +739,89 @@ func (s *hookServer) postToolUse(ctx context.Context, c *hookCall) hookResult {
 	}
 	switch tool := c.in.ToolName; {
 	case hooks.ClassOf(tool) == hooks.ToolEdit:
+		s.recordCall(c, workspaceops.LedgerOK, nil)
 		return s.afterEdit(ctx, c)
 	case hooks.Captured(tool):
 		return s.afterCapture(ctx, c)
 	}
+	s.recordCall(c, workspaceops.LedgerOK, nil)
 	return hookResult{}
+}
+
+// --- the session ledger ---
+
+// ledgerFileKinds are the rows of the file tools' calls that succeeded (WS-33); a failed
+// one, like any other call, is a tool_call with its status (a failed Edit changed
+// nothing), and an xMustard remember or verify call is its memory action
+// (hooks.OwnMemoryCall).
+var ledgerFileKinds = map[hooks.ToolClass]string{
+	hooks.ToolRead: workspaceops.LedgerFileRead, hooks.ToolEdit: workspaceops.LedgerFileModified,
+}
+
+// hookMaxChangedRows bounds the file_modified rows one shell call appends.
+const hookMaxChangedRows = 16
+
+// record queues one ledger row for the call's session (never waiting). A call with no
+// session id, or not bound to a workspace in scope, records nothing.
+func (s *hookServer) record(c *hookCall, ev workspaceops.LedgerEvent) {
+	if base := ledgerBase(c); base != nil {
+		ev.LedgerSession = *base
+		workspaceops.RecordSession(dataDir(), ev)
+	}
+}
+
+// ledgerBase is the call's session in the ledger's terms: nil when it has none, and in
+// read-only mode, where hooks change no shared state: no ledger row, and no boundary
+// work (snapshot, capsule, mined candidate).
+func ledgerBase(c *hookCall) *workspaceops.LedgerSession {
+	if !c.bound || c.in.SessionID == "" || postureFrom(c.r).readOnly() {
+		return nil
+	}
+	return &workspaceops.LedgerSession{WorkspaceID: c.ws.WorkspaceID, Root: c.ws.Root, Client: c.client.Name,
+		Session: c.in.SessionID, Agent: c.in.AgentID, Principal: c.caller, Transcript: c.in.TranscriptPath}
+}
+
+// recordCall records a tool call: its kind (ledgerFileKinds), its arguments' digest,
+// the file it read or changed, the handle of its captured output, and for a shell call
+// the command (redacted) and a failure's signature.
+func (s *hookServer) recordCall(c *hookCall, status string, obs *evidence.ObservationResult) {
+	ev := workspaceops.LedgerEvent{Tool: c.in.ToolName, Args: hooks.ArgsDigest(c.in, c.body), Status: status,
+		Path: workspaceops.RelativeToRoot(c.ws, c.in.ToolInput.TargetPath())}
+	if obs != nil && obs.Delivery != nil {
+		ev.Handle, ev.ExpiresAt = obs.Handle, obs.ExpiresAt
+		if code := obs.Facts.ExitCode; code != nil && *code != 0 {
+			ev.Status = workspaceops.LedgerError
+		}
+	}
+	ev.Kind = workspaceops.LedgerToolCall
+	if kind, ok := ledgerFileKinds[hooks.ClassOf(c.in.ToolName)]; ok && ev.Status == workspaceops.LedgerOK {
+		ev.Kind = kind
+	}
+	if kind, id, ok := hooks.OwnMemoryCall(c.in.ToolName, c.body); ok {
+		ev.Kind, ev.EntryID = kind, id
+	}
+	if hooks.ClassOf(c.in.ToolName) == hooks.ToolShell {
+		ev.Text = c.in.ToolInput.Command
+	}
+	if ev.Status == workspaceops.LedgerError {
+		ev.Signature = failureSignature(c.in.Error, obs)
+	}
+	s.record(c, ev)
+}
+
+// failureSignature names a failure: the failing tests the capture parsed, else the
+// first line of the error text.
+func failureSignature(errText string, obs *evidence.ObservationResult) string {
+	if obs != nil && len(obs.Facts.FailingTests) > 0 {
+		tests := obs.Facts.FailingTests
+		return strings.Join(tests[:min(len(tests), 3)], ", ")
+	}
+	for _, line := range strings.Split(errText, "\n") {
+		if line = strings.TrimSpace(line); line != "" && !strings.HasPrefix(line, "Exit code") {
+			return line
+		}
+	}
+	return strings.TrimSpace(errText)
 }
 
 // afterEdit feeds the dirty set and reports the syntax errors the edit introduced, per
@@ -697,7 +861,9 @@ func (s *hookServer) afterEdit(ctx context.Context, c *hookCall) hookResult {
 func (s *hookServer) afterCapture(ctx context.Context, c *hookCall) hookResult {
 	var res hookResult
 	var parts []string
-	if obs := s.capture(ctx, c); obs != nil {
+	obs := s.capture(ctx, c)
+	s.recordCall(c, workspaceops.LedgerOK, obs)
+	if obs != nil {
 		switch obs.Shape.Mode {
 		case evidence.ShapeReplace:
 			res.updated = obs.Shape.Payload
@@ -731,6 +897,9 @@ func (s *hookServer) afterShell(ctx context.Context, c *hookCall) string {
 			}
 		}
 		workspaceops.NoteChangedPaths(ctx, c.ws.Scope, rels)
+		for _, rel := range rels[:min(len(rels), hookMaxChangedRows)] {
+			s.record(c, workspaceops.LedgerEvent{Kind: workspaceops.LedgerFileModified, Tool: c.in.ToolName, Path: rel})
+		}
 	}
 	verb := hooks.GitHeadMove(c.in.ToolInput.Command)
 	if verb == "" {
@@ -780,10 +949,14 @@ func (s *hookServer) capture(ctx context.Context, c *hookCall) *evidence.Observa
 // postToolFailure captures a failed tool's error text for the run outcome (a failing
 // test, build or lint command) and names the failing tests it parsed.
 func (s *hookServer) postToolFailure(ctx context.Context, c *hookCall) hookResult {
-	if !c.bound || !hooks.Captured(c.in.ToolName) {
+	if !c.bound {
 		return hookResult{}
 	}
-	obs := s.capture(ctx, c)
+	var obs *evidence.ObservationResult
+	if hooks.Captured(c.in.ToolName) {
+		obs = s.capture(ctx, c)
+	}
+	s.recordCall(c, workspaceops.LedgerError, obs)
 	if obs == nil {
 		return hookResult{}
 	}
@@ -873,20 +1046,31 @@ func watchPaths(ws workspaceops.ResolvedWorkspace, anchors []string) []string {
 
 // --- enqueue-mode events ---
 
+// enqueue queues an Enqueue-mode event with its ledger view. Binding the workspace is
+// in-memory (the registry and the scope checks), so the answer is not delayed.
 func (s *hookServer) enqueue(c *hookCall) {
+	c.bound = s.resolve(c)
+	q := hookQueued{event: c.ev.Name, text: cmp.Or(c.in.Trigger, c.in.Reason), key: c.key, ledger: ledgerBase(c)}
 	select {
-	case s.queue <- hookQueued{event: c.ev.Name, key: c.key}:
+	case s.queue <- q:
 		hookStats.enqueued.Add(1)
 	default:
 		hookStats.dropped.Add(1)
 	}
 }
 
+// drain applies each queued event's steering effect and records its ledger boundary;
+// the boundary's work runs on the ledger writer, not here.
 func (s *hookServer) drain() {
 	for q := range s.queue {
-		if f := hookQueueEffects[q.event]; f != nil {
-			f(s.sessions, q.key)
+		e := hookEnqueued[q.event]
+		if e.effect != nil {
+			e.effect(s.sessions, q.key)
 		}
+		if q.ledger != nil {
+			workspaceops.RecordBoundary(dataDir(), e.boundary, workspaceops.LedgerEvent{LedgerSession: *q.ledger, Text: q.text})
+		}
+		hookStats.drained.Add(1)
 	}
 }
 

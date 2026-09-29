@@ -115,6 +115,17 @@ var sections = []Section{
 		Doc:     "promoted memory whose files drifted, promoted memory by verification mode, the pending memory awaiting your verification, and memory pressure (core_pct, pending_count)",
 	},
 	{
+		Name: "session", Cap: 3072,
+		// a handoff carries open failures and the proposals waiting for a verifier; a
+		// capsule's stale_paths are a stale signal
+		Members: []Member{
+			{Name: "session_handoff", Signal: true, Keep: []string{"from_session", "status"}},
+			{Name: "continuity", Signal: true}, {Name: "handoffs", Signal: true}, {Name: "last_sessions"},
+		},
+		Recover: "ground sections=session max_chars=N; ground session_id=ID restores that session's snapshot",
+		Doc:     "the prior session's handoff (its compaction snapshot, unexpired handles, proposals awaiting a distinct verifier, drift_stale; with session_id, your own session's to restore), what recent sessions left open, the latest handoff capsules with their stale paths, and the last sessions",
+	},
+	{
 		Name: "drift", Cap: 1536,
 		// Keep names Rust's DriftReport flags; a signal keeps every boolean anyway
 		Members: []Member{

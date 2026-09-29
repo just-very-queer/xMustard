@@ -95,6 +95,21 @@ func BuildSessionGroundingCtx(ctx context.Context, dataDir, workspaceID string) 
 // BuildSessionGroundingFor grounds a session for caller: pending_for_you counts the
 // pending memory caller neither authored nor voted on.
 func BuildSessionGroundingFor(ctx context.Context, dataDir, workspaceID, caller string) (*SessionGrounding, error) {
+	return BuildSessionGroundingWith(ctx, dataDir, workspaceID, GroundOptions{Caller: caller})
+}
+
+// GroundOptions are who asks ground and from which session.
+type GroundOptions struct {
+	Caller string
+	// SessionID is the caller's execution key (ground session_id): session_handoff then
+	// restores that session's snapshot when it has a ledger, and otherwise hands over
+	// the most recent other session.
+	SessionID string
+}
+
+// BuildSessionGroundingWith grounds a session with its options.
+func BuildSessionGroundingWith(ctx context.Context, dataDir, workspaceID string, opts GroundOptions) (*SessionGrounding, error) {
+	caller := opts.Caller
 	g := &SessionGrounding{WorkspaceID: workspaceID}
 	unknown, err := g.groundingIndex.build(ctx, dataDir, workspaceID)
 	if err != nil {
@@ -113,6 +128,7 @@ func BuildSessionGroundingFor(ctx context.Context, dataDir, workspaceID, caller 
 	}
 	g.stampGenerated()
 	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller)...)
+	g.Unknown = append(g.Unknown, g.groundingSession.buildSessions(ctx, dataDir, workspaceID, caller, opts.SessionID, driftStaleFlag(g.Drift))...)
 	g.summarize()
 	return g, nil
 }

@@ -13,7 +13,7 @@ import (
 
 // retainedEvidence captures an original in the workspace's evidence store and returns
 // its handle, issued to actor ("" for unauthenticated issuance).
-func retainedEvidence(t *testing.T, dir, ws, actor string) string {
+func retainedEvidence(t testing.TB, dir, ws, actor string) string {
 	t.Helper()
 	s := evidence.NewStore(dir, evidence.DefaultLimits())
 	sp, err := s.NewSpool(ws)

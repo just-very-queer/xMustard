@@ -1,0 +1,8 @@
+{
+  "session_id": "sess-9c2e",
+  "transcript_path": "/home/dev/.claude/projects/-repo/sess-9c2e.jsonl",
+  "cwd": "${ROOT}",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-opus-5"
+}
