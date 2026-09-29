@@ -27,9 +27,10 @@ import (
 // The token is never written into the entry. The JSON mcpServers form names
 // ${XMUSTARD_API_TOKEN}, which the client expands (http) or passes through the
 // environment (relay); Codex's config.toml names the variable itself
-// (bearer_token_env_var, env_vars). --client codex prints the TOML table for
-// ~/.codex/config.toml; every other client gets the JSON form. OpenCode's own `mcp`
-// form is WS-40b's, to be checked against the installed OpenCode first.
+// (bearer_token_env_var, env_vars) and OpenCode's config substitutes
+// {env:XMUSTARD_API_TOKEN}. --client codex prints the TOML table for
+// ~/.codex/config.toml, --client opencode the `mcp` object of opencode.json; every
+// other client gets the JSON mcpServers form.
 
 const tokenEnv = "XMUSTARD_API_TOKEN"
 
@@ -70,23 +71,50 @@ func newMCPEntry(transport, api, ws, client, mode string) (mcpEntry, bool) {
 // mcpConfigWriters render an entry in a client's own config syntax; a client not
 // listed takes the JSON mcpServers form.
 var mcpConfigWriters = map[string]func(io.Writer, mcpEntry) error{
-	"codex": writeCodexTOML,
+	"codex":    writeCodexTOML,
+	"opencode": writeOpenCodeJSON,
 }
 
 // writeMCPServersJSON prints {"mcpServers": {"xmustard": entry}}.
 func writeMCPServersJSON(w io.Writer, e mcpEntry) error {
 	var entry map[string]any
 	if e.url != "" {
-		headers := map[string]string{"Authorization": "Bearer ${" + tokenEnv + "}"}
-		maps.Copy(headers, e.headers)
-		entry = map[string]any{"type": "http", "url": e.url, "headers": headers}
+		entry = map[string]any{"type": "http", "url": e.url, "headers": e.headersWithToken("Bearer ${" + tokenEnv + "}")}
 	} else {
 		entry = map[string]any{"command": e.command, "args": e.args, "env": map[string]string{tokenEnv: "${" + tokenEnv + "}"}}
 	}
+	return writeIndentedJSON(w, map[string]any{"mcpServers": map[string]any{"xmustard": entry}})
+}
+
+// writeOpenCodeJSON prints the `mcp` object of opencode.json in OpenCode 2.x's form
+// (@opencode/schema 2.0.1 config/mcp.ts: mcp.servers.<name>, what `opencode mcp add`
+// writes): a remote server with url, headers and oauth false (no OAuth discovery
+// against the API), or a local one whose command is an argv array and whose
+// environment names the token. OpenCode substitutes {env:NAME} in its config text.
+// OpenCode 1.x takes the same entry one level up (mcp.<name>), a form 2.x still reads.
+func writeOpenCodeJSON(w io.Writer, e mcpEntry) error {
+	ref := "{env:" + tokenEnv + "}"
+	var entry map[string]any
+	if e.url != "" {
+		entry = map[string]any{"type": "remote", "url": e.url, "headers": e.headersWithToken("Bearer " + ref), "oauth": false}
+	} else {
+		entry = map[string]any{"type": "local", "command": append([]string{e.command}, e.args...), "environment": map[string]string{tokenEnv: ref}}
+	}
+	return writeIndentedJSON(w, map[string]any{"mcp": map[string]any{"servers": map[string]any{"xmustard": entry}}})
+}
+
+// headersWithToken is the entry's headers plus an Authorization header.
+func (e mcpEntry) headersWithToken(auth string) map[string]string {
+	headers := map[string]string{"Authorization": auth}
+	maps.Copy(headers, e.headers)
+	return headers
+}
+
+func writeIndentedJSON(w io.Writer, v any) error {
 	enc := json.NewEncoder(w)
 	enc.SetIndent("", "  ")
 	enc.SetEscapeHTML(false)
-	return enc.Encode(map[string]any{"mcpServers": map[string]any{"xmustard": entry}})
+	return enc.Encode(v)
 }
 
 // writeCodexTOML prints the [mcp_servers.xmustard] table of Codex's config.toml

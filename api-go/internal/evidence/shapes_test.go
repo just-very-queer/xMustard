@@ -35,7 +35,7 @@ func TestShapeValidatorsAcceptValidPayloads(t *testing.T) {
 		{"codex", "shell", `{"decision":"block","reason":"projected output"}`},
 		{"pi", "bash", `{"content":[{"type":"text","text":"x"}],"details":{"truncation":null},"isError":false}`},
 		{"pi", "read", `{"content":[{"type":"text","text":"x"},{"type":"image","data":"AAAA","mimeType":"image/png"}]}`},
-		{"opencode", "bash", `{"title":"bash","output":"x","metadata":{"exit":0}}`},
+		{"opencode", "shell", `{"content":"x"}`},
 		{"cursor", "MCP:tool", `{"content":[{"type":"text","text":"x"}],"isError":false}`},
 		{"mcp", "any", `{"content":[{"type":"text","text":"x"}]}`},
 	}
@@ -59,7 +59,8 @@ func TestShapeValidatorsRejectMismatches(t *testing.T) {
 		{"codex", "shell", `{"decision":"approve","reason":"x"}`, "not block"},
 		{"pi", "bash", `{"content":[{"type":"text"}]}`, "text block without text"},
 		{"pi", "bash", `{"content":[]}`, "empty content"},
-		{"opencode", "bash", `{"title":"t","output":"x"}`, "metadata missing"},
+		{"opencode", "shell", `{"title":"t","output":"x","metadata":{}}`, "content missing (the 1.x output object is not the payload)"},
+		{"opencode", "shell", `{"content":[{"type":"text","text":"x"}]}`, "content blocks instead of the text"},
 		{"cursor", "MCP:x", `{"content":[{"type":"image","data":"A","mimeType":"image/png"}]}`, "image in an MCP text replacement"},
 		{"mcp", "any", `{"text":"x"}`, "no content"},
 		{"nobody", "any", `{}`, "unknown client"},
@@ -505,18 +506,15 @@ func TestOtherClientShapes(t *testing.T) {
 		!strings.Contains(pp.Content[0].Text, "--- FAIL: TestParseValue") || res.Capture.CallID != "c7" || !res.Capture.IsError {
 		t.Fatalf("pi: %s %+v %+v", res.Family, res.Shape.Mode, pp)
 	}
-	// OpenCode tool.execute.after
-	oc := `{"tool":"bash","sessionID":"ses_1","callID":"call_1","args":{"command":"go test ./..."},"output":{"title":"go test","output":` +
-		jsonString(log) + `,"metadata":{"exit":1,"description":"tests"}}}`
+	// OpenCode's plugin body: the model-visible text as content, scalar metadata
+	oc := `{"tool":"shell","sessionID":"ses_1","id":"call_1","input":{"command":"go test ./..."},"content":` +
+		jsonString(log) + `,"metadata":{"exit":1,"truncated":false}}`
 	res = observe(t, s, FormatOpenCode, oc, CaptureMeta{Client: "opencode"})
-	var op struct {
-		Title    string
-		Output   string
-		Metadata map[string]any
-	}
+	var op struct{ Content string }
 	_ = json.Unmarshal(res.Shape.Payload, &op)
-	if res.Shape.Mode != ShapeReplace || op.Title != "go test" || op.Metadata["exit"] != float64(1) || !strings.Contains(op.Output, "xm-test/1") {
-		t.Fatalf("opencode: %+v %+v", res.Shape.Mode, op)
+	if res.Shape.Mode != ShapeReplace || res.Shape.Shape != "opencode.content" || !strings.Contains(op.Content, "xm-test/1") ||
+		res.Capture.CallID != "call_1" || res.Capture.ExitCode == nil || *res.Capture.ExitCode != 1 {
+		t.Fatalf("opencode: %+v %+v", res.Shape, op)
 	}
 	// Codex: decision block with the projection as the reason
 	cx := `{"session_id":"s","turn_id":"t","hook_event_name":"PostToolUse","tool_name":"shell","tool_input":{"command":["bash","-lc","go test ./..."],"workdir":"/repo"},"tool_response":{"output":` +

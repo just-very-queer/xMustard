@@ -56,11 +56,15 @@ it.
 
 ## Install (manual)
 
-1. Build the static client into the plugin's `hooks/bin/` (not a top-level `bin/`:
+1. Put the static client in the plugin's `hooks/bin/` (not a top-level `bin/`:
    Claude Code puts that on the Bash tool's `PATH`, and claude.ai and Cowork refuse to
-   install a plugin that has one):
+   install a plugin that has one). Release archives from v0.1.1 on include
+   `xmustard-hook`, so copy it from the unpacked archive, or build it from a checkout:
 
    ```sh
+   mkdir -p integrations/claude-code/hooks/bin
+   cp /path/to/xmustard-v0.1.1-<platform>/xmustard-hook integrations/claude-code/hooks/bin/
+   # or, from a source checkout:
    cd api-go && go build -o ../integrations/claude-code/hooks/bin/xmustard-hook ./cmd/xmustard-hook
    ```
 

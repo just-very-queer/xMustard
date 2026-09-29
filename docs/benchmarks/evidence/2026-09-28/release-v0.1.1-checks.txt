@@ -1,0 +1,150 @@
+# v0.1.1 release-tree checks, Linux x86_64 build box (AMD Ryzen 5 3500X, 6 cores), 2026-09-28
+# Tree: release/v0.1.1 at 9b6337e plus the docs-only fact-check corrections (no code change).
+# Synced to the box without .git and run through xm-remote-check.sh / xm-remote-run.sh.
+
+## xm-remote-check.sh all -count=1: Rust release build, cargo test (per-target results), clippy count, go vet, go test ./...
+test result: ok. 228 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.13s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.35s
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 11.31s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 323.33s
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.44s
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 5.48s
+test result: ok. 10 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 12.39s
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.25s
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.15s
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.55s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+clippy_warnings=6
+ok  	xmustard/api-go/cmd/xmustard-api	56.855s
+ok  	xmustard/api-go/cmd/xmustard-eval	18.917s
+ok  	xmustard/api-go/cmd/xmustard-hook	0.313s
+ok  	xmustard/api-go/cmd/xmustard-mcp	5.650s
+ok  	xmustard/api-go/cmd/xmustard-ops	2.487s
+ok  	xmustard/api-go/internal/anchor	0.011s
+ok  	xmustard/api-go/internal/budget	2.428s
+ok  	xmustard/api-go/internal/daemon	1.646s
+ok  	xmustard/api-go/internal/evidence	21.073s
+ok  	xmustard/api-go/internal/govstore	5.115s
+ok  	xmustard/api-go/internal/groundbudget	0.665s
+ok  	xmustard/api-go/internal/hooks	0.005s
+?   	xmustard/api-go/internal/hooks/transport	[no test files]
+ok  	xmustard/api-go/internal/injection	0.031s
+ok  	xmustard/api-go/internal/mcpserver	0.112s
+ok  	xmustard/api-go/internal/redact	46.675s
+ok  	xmustard/api-go/internal/review	0.021s
+ok  	xmustard/api-go/internal/rustcore	21.088s
+ok  	xmustard/api-go/internal/toolcompat	0.004s
+ok  	xmustard/api-go/internal/workspaceops	34.782s
+remote_exit=0
+
+## review build tag, shipped-binary dependencies, gofmt
+## go vet -tags review ./cmd/xmustard-ops ./internal/workspaceops && go test -count=1 -tags review -run 'Review|Merge' (same packages)
+ok  	xmustard/api-go/cmd/xmustard-ops	0.196s
+ok  	xmustard/api-go/internal/workspaceops	0.793s
+xmustard-api anchor/review deps: 0
+xmustard-mcp anchor/review deps: 0
+xmustard-ops anchor/review deps: 0
+xmustard-hook anchor/review deps: 0
+xmustard-ops -tags review: xmustard/api-go/internal/anchor xmustard/api-go/internal/review 
+gofmt -l: []
+remote_exit=0
+
+## host, redact benchmark, make bench-test, make bench-retrieval, Pi check, make release VERSION=v0.1.1
+## (make release ran with warm build caches, so its duration is not a cold-build time)
+== host
+Linux 7.0.0-34-generic x86_64
+6
+4.37 3.12 4.86 2/1124 4089244
+go version go1.26.1 linux/amd64
+rustc 1.93.1 (01f6ddf75 2026-02-11)
+v22.23.3
+== redact benchmark
+goos: linux
+goarch: amd64
+pkg: xmustard/api-go/internal/redact
+cpu: AMD Ryzen 5 3500X 6-Core Processor             
+BenchmarkWriter16MiB/sparse-6         	      10	 107818846 ns/op	 155.61 MB/s	  272181 B/op	    4239 allocs/op
+BenchmarkWriter16MiB/sparse-6         	      10	 109256594 ns/op	 153.56 MB/s	  258335 B/op	    4155 allocs/op
+BenchmarkWriter16MiB/sparse-6         	      10	 112270061 ns/op	 149.44 MB/s	  262042 B/op	    4156 allocs/op
+BenchmarkWriter16MiB/dense-6          	       3	 436282319 ns/op	  38.45 MB/s	  462920 B/op	      33 allocs/op
+BenchmarkWriter16MiB/dense-6          	       3	 443651749 ns/op	  37.82 MB/s	  462920 B/op	      33 allocs/op
+BenchmarkWriter16MiB/dense-6          	       3	 433852088 ns/op	  38.67 MB/s	  462920 B/op	      33 allocs/op
+PASS
+ok  	xmustard/api-go/internal/redact	7.381s
+== bench-test
+test_real_overrun_stays_invalid (test_rss_bench_v2.V1WorkloadValidity.test_real_overrun_stays_invalid) ... ok
+
+----------------------------------------------------------------------
+Ran 76 tests in 4.156s
+
+OK (skipped=3)
+== bench-retrieval
+mkdir -p bench-out
+scripts/bench/retrieval-gate.sh --report bench-out/retrieval-gate.json
+[PASS] fixture workspace loads — 200
+[PASS] cold: >= 12/12 gold in top 5 — 12/12, spans 10/10; misses []
+[PASS] cold: >= 10/10 gold spans in top 5 — 10/10
+[PASS] cold: gold-path MRR@5 >= 1.0 — 1.0000
+[PASS] cold: >= 6/6 body queries with the gold span in top 5 — 6/6; misses []
+[PASS] cold pass built the graph (first query is a cache miss) — graph_cache=miss files_parsed=15
+[PASS] explicit coverage loss: gen/huge.go (oversized) — reported oversized
+[PASS] explicit coverage loss: web/src/broken.ts (invalid_utf8) — reported invalid_utf8
+[PASS] coverage not claimed complete with losses present
+[PASS] warm: >= 12/12 gold in top 5 — 12/12, spans 10/10; misses []
+[PASS] warm: >= 10/10 gold spans in top 5 — 10/10
+[PASS] warm: gold-path MRR@5 >= 1.0 — 1.0000
+[PASS] warm: >= 6/6 body queries with the gold span in top 5 — 6/6; misses []
+[PASS] warm pass served from the cache without parsing — graph_cache=hit files_parsed=0
+[PASS] after-one-file-edit: >= 12/12 gold in top 5 — 12/12, spans 10/10; misses []
+[PASS] after-one-file-edit: >= 10/10 gold spans in top 5 — 10/10
+[PASS] after-one-file-edit: gold-path MRR@5 >= 1.0 — 1.0000
+[PASS] after-one-file-edit: >= 6/6 body queries with the gold span in top 5 — 6/6; misses []
+[PASS] recall unchanged or improved after one-file edit — 12 vs warm 12
+[PASS] one-file edit reparses only that file — files_parsed=1 files_reused=15 bytes_parsed=460
+[PASS] no stale hit presented as current — found_before=True stale_after=False served_key==current=True
+{"suite": "retrieval-gate", "passed": 21, "failed": 0}
+== pi check
+    1..5
+ok 11 - session_before_compact snapshot
+  ---
+  duration_ms: 83.781992
+  type: 'suite'
+  ...
+1..11
+# tests 45
+# suites 11
+# pass 45
+# fail 0
+# cancelled 0
+# skipped 0
+# todo 0
+# duration_ms 1140.3979
+== release
+make_release_exit=0 seconds=11
+	cat xmustard-v0.1.1-*.tar.gz.sha256 | LC_ALL=C sort -k 2 > SHA256SUMS
+xmustard-v0.1.1-linux-x86_64.tar.gz: OK
+cat "dist/SHA256SUMS"
+d9157a3870883426b078b381916690f0c7227df926829e9f7f1e9c2bbed36f7d  xmustard-v0.1.1-linux-x86_64.tar.gz
+total 24528
+-rw-rw-r-- 1 user user      102 Sep 28 21:36 SHA256SUMS
+drwxr-xr-x 2 user user     4096 Jan  1  1970 xmustard-v0.1.1-linux-x86_64
+-rw-rw-r-- 1 user user 25103705 Sep 28 21:36 xmustard-v0.1.1-linux-x86_64.tar.gz
+-rw-rw-r-- 1 user user      102 Sep 28 21:36 xmustard-v0.1.1-linux-x86_64.tar.gz.sha256
+d9157a3870883426b078b381916690f0c7227df926829e9f7f1e9c2bbed36f7d  xmustard-v0.1.1-linux-x86_64.tar.gz
+drwxr-xr-x 0/0               0 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/
+-rw-r--r-- 0/0            1078 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/LICENSE
+-rwxr-xr-x 0/0        22491298 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/xmustard-api
+-rwxr-xr-x 0/0        37211304 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/xmustard-core
+-rwxr-xr-x 0/0         7082146 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/xmustard-mcp
+-rwxr-xr-x 0/0        18829474 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/xmustard-ops
+-rwxr-xr-x 0/0          613648 1970-01-01 05:30 xmustard-v0.1.1-linux-x86_64/xmustard-relay
+xmustard-core GLIBC_2.39
+xmustard-relay GLIBC_2.34
+xmustard-api ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=3MkVjGh
+xmustard-ops ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=cE0kK5S
+xmustard-mcp ELF 64-bit LSB executable, x86-64, version 1 (SYSV), statically linked, Go BuildID=paxoaAR
+3.60 3.06 4.77 2/1119 4090983
+remote_exit=0

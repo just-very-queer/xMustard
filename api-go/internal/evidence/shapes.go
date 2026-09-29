@@ -47,16 +47,22 @@ type ClientPolicy struct {
 // UnitBytes is the MaxUnit of a client that measures replacement text in bytes.
 const UnitBytes = "bytes"
 
-// Codex spills hook text past 2,500 approximate tokens of 4 bytes each: the reason is
-// written to a temp file and the model gets a head-and-tail preview plus the file's
-// path (codex-rs hooks/src/output_spill.rs DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT;
-// utils/string/src/truncate.rs approx_token_count). A whole block reason must fit in
-// codexHookTextBytes; the projection leaves codexFooterReserve of it for the recovery
-// line and the data-framing note.
+// CodexHookTextBytes is the most hook text Codex passes on whole: past 2,500
+// approximate tokens of 4 bytes each it writes the text to a temp file and gives the
+// model a head-and-tail preview plus the file's path (codex-rs
+// hooks/src/output_spill.rs DEFAULT_HOOK_OUTPUT_TOKEN_LIMIT; utils/string/src/truncate.rs
+// approx_token_count). It bounds a whole block reason and, in the hook service, each
+// additionalContext. The projection leaves codexFooterReserve of a reason for the
+// recovery line and the data-framing note.
 const (
-	codexHookTextBytes = 2500 * 4
+	CodexHookTextBytes = 2500 * 4
 	codexFooterReserve = 1536
 )
+
+// openCodeToolBytes is OpenCode's default tool_output.max_bytes: 2.0.1 (ToolOutput)
+// and 1.18.33 (tool/truncate.ts) cut a tool's text past it, keeping the head, which
+// would drop the recovery line a replacement ends with.
+const openCodeToolBytes = 51200
 
 // clientPolicies is the adapter policy table. Targets lower the 64 KiB default where
 // the client's own limits make a smaller projection strictly better; caps come from
@@ -69,16 +75,18 @@ var clientPolicies = map[string]ClientPolicy{
 		Replacement: "PostToolUse hookSpecificOutput.updatedToolOutput (schema-matched for built-ins)", shaper: claudeShaper{}},
 	// Codex: PostToolUse decision "block" substitutes the reason as the result;
 	// additionalContextLimit defaults to 2,500 tokens and never raises the spill limit
-	"codex": {Client: "codex", Target: codexHookTextBytes - codexFooterReserve, MaxChars: codexHookTextBytes, MaxUnit: UnitBytes,
+	"codex": {Client: "codex", Target: CodexHookTextBytes - codexFooterReserve, MaxChars: CodexHookTextBytes, MaxUnit: UnitBytes,
 		ContextTokens: 2500, Replacement: "PostToolUse decision=block reason", shaper: codexShaper{}},
 	// Cursor replaces MCP results only (updated_mcp_tool_output); built-ins are observe-only
 	"cursor": {Client: "cursor", Target: 16 << 10, MaxChars: 30000, Replacement: "postToolUse updated_mcp_tool_output (MCP tools only)",
 		shaper: cursorShaper{}},
 	// Pi truncates its own tool output at 50 KB / 2,000 lines
 	"pi": {Client: "pi", Target: 32 << 10, MaxChars: 50000, Replacement: "tool_result {content, details, isError}", shaper: piShaper{}},
-	// OpenCode tool.execute.after mutates {title, output, metadata}
-	"opencode": {Client: "opencode", Target: 32 << 10, MaxChars: 50000, Replacement: "tool.execute.after {title, output, metadata}",
-		shaper: opencodeShaper{}},
+	// OpenCode: the plugin's tool execute.after hook replaces the model-visible text
+	// (2.x result.content; 1.x output.output, or an MCP result's content). OpenCode
+	// truncates tool text past 2,000 lines or 51,200 bytes (tool_output.max_bytes)
+	"opencode": {Client: "opencode", Target: 32 << 10, MaxChars: openCodeToolBytes, MaxUnit: UnitBytes,
+		Replacement: "tool execute.after content (2.x result.content; 1.x output.output or MCP content)", shaper: opencodeShaper{}},
 	// Letta Code reaches MCP through `letta mcp call` in Bash, clamped at 30,000 chars
 	"letta": {Client: "letta", Target: 24 << 10, MaxChars: 30000, ContextChars: 10000, Replacement: "MCP result via letta mcp call (30k Bash clamp)",
 		shaper: mcpShaper{}},
@@ -146,7 +154,7 @@ func (p ClientPolicy) capContext(s string) string {
 		n = p.ContextTokens * 3
 	}
 	if p.MaxUnit == UnitBytes {
-		return capBytes(s, n)
+		return CapBytes(s, n)
 	}
 	return capChars(s, n)
 }
@@ -272,8 +280,8 @@ func capChars(s string, n int) string {
 	return string(r[:n-1]) + "…"
 }
 
-// capBytes cuts s to at most n bytes on a rune boundary, the last three an ellipsis.
-func capBytes(s string, n int) string {
+// CapBytes cuts s to at most n bytes on a rune boundary, the last three an ellipsis.
+func CapBytes(s string, n int) string {
 	const ellipsis = "…"
 	if n <= len(ellipsis) || len(s) <= n {
 		return s
@@ -359,7 +367,29 @@ func (codexShaper) build(in ShapeInput) (json.RawMessage, error) {
 	}
 	// the recovery line goes last: a reason past the spill limit keeps its head and
 	// tail, so the handle survives the cut
-	return json.Marshal(map[string]any{"decision": "block", "reason": in.Proj.Text + "\n" + joinLines(in.Note, in.Footer)})
+	return json.Marshal(map[string]any{"decision": "block", "reason": joinLines(codexStatus(in), in.Proj.Text) + "\n" + joinLines(in.Note, in.Footer)})
+}
+
+// codexShell is the name Codex gives every shell tool in a hook payload
+// (core/src/tools/hook_names.rs).
+const codexShell = "Bash"
+
+// codexStatus is the line a shell call's reason starts with. The reason replaces the
+// whole model-facing output, header included, and that header's "Process exited with
+// code N" is the only place Codex puts the exit status: the payload has the output
+// text alone (core/src/tools/context.rs, ExecCommandToolOutput). So the reason gives
+// the status when the body carries one and otherwise says it is unknown, rather than
+// let a reduced output read as a finished success. It does not promise the full
+// output: the handle keeps what Codex handed the hook, its own preview of a long
+// output with the middle already cut.
+func codexStatus(in ShapeInput) string {
+	switch {
+	case in.Tool != codexShell || in.Body == nil:
+		return ""
+	case in.Body.ExitCode != nil:
+		return fmt.Sprintf("[xmustard] %s exited with code %d. Its output, reduced:", in.Tool, *in.Body.ExitCode)
+	}
+	return "[xmustard] exit status unknown: Codex does not pass it to hooks. The " + in.Tool + " output below is reduced; the last line names the captured output (Codex's preview)."
 }
 
 func (codexShaper) validate(_ string, v any) error {
@@ -401,38 +431,31 @@ func (piShaper) validate(_ string, v any) error {
 	return fields(asObject(v), "pi", req("content", isContentBlocks(true)), opt("isError", isBool))
 }
 
-// opencodeShaper returns tool.execute.after's {title, output, metadata}.
+// opencodeShaper returns {content}: the text the model reads in place of the tool's.
+// OpenCode 2.x builds the model text of every tool, built-in or MCP, from the
+// execute.after result's content; its structured output and metadata never reach the
+// model. The plugin applies the same text to 1.x's output.output (built-ins) or the
+// MCP result's content (integrations/opencode). read is observe-only: OpenCode already
+// numbers its lines ("12: text") and pages it (offset, 2,000 lines, 50 KiB), and the
+// read reducer would number them again.
 type opencodeShaper struct{}
 
-func (opencodeShaper) shape(string) (string, bool) { return "opencode.output", true }
+func (opencodeShaper) shape(tool string) (string, bool) {
+	if tool == "read" {
+		return "opencode.observe", false
+	}
+	return "opencode.content", true
+}
 
 func (opencodeShaper) build(in ShapeInput) (json.RawMessage, error) {
 	if err := textOnly(in); err != nil {
 		return nil, err
 	}
-	if in.Body != nil && in.Body.Incomplete {
-		return nil, fmt.Errorf("%w: metadata exceeds the skeleton bounds", errUnshapable)
-	}
-	title := in.Tool
-	if k := in.responseMember("title"); k != nil && k.Kind == 'v' {
-		var s string
-		if json.Unmarshal(k.Raw, &s) == nil {
-			title = s
-		}
-	}
-	var meta json.RawMessage = []byte("{}")
-	if k := in.responseMember("metadata"); k != nil {
-		raw, err := rebuild(k, in, nil)
-		if err != nil {
-			return nil, err
-		}
-		meta = raw
-	}
-	return json.Marshal(map[string]any{"title": title, "output": in.text(), "metadata": meta})
+	return json.Marshal(map[string]any{"content": in.text()})
 }
 
 func (opencodeShaper) validate(_ string, v any) error {
-	return fields(asObject(v), "opencode", req("title", isString), req("output", isString), req("metadata", isObject))
+	return fields(asObject(v), "opencode", req("content", isString))
 }
 
 // openCodeUnderscored are the OpenCode built-ins whose names hold an underscore. Any
