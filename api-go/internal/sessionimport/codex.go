@@ -48,15 +48,17 @@ func (c codex) Walk(ctx context.Context, opts Options, sink Sink) error {
 }
 
 // codexPayloads say how each payload type becomes a role and text.
-var codexPayloads = map[string]func(p *codexLine) (role, text string){
-	"message": func(p *codexLine) (string, string) {
-		t, _ := contentText(p.Payload.Content)
+var codexPayloads = map[string]func(p *codexLine, clip func(string) string) (role, text string){
+	"message": func(p *codexLine, clip func(string) string) (string, string) {
+		t, _ := contentText(p.Payload.Content, clip)
 		return roleOf(p.Payload.Role, false), t
 	},
-	"function_call": func(p *codexLine) (string, string) {
-		return "tool", "tool " + p.Payload.Name + ": " + rawText(p.Payload.Arguments)
+	"function_call": func(p *codexLine, clip func(string) string) (string, string) {
+		return "tool", "tool " + p.Payload.Name + ": " + rawText(p.Payload.Arguments, clip)
 	},
-	"function_call_output": func(p *codexLine) (string, string) { return "tool", rawText(p.Payload.Output) },
+	"function_call_output": func(p *codexLine, clip func(string) string) (string, string) {
+		return "tool", rawText(p.Payload.Output, clip)
+	},
 }
 
 func codexEvent(n int, raw []byte, em *emitter) error {
@@ -72,7 +74,7 @@ func codexEvent(n int, raw []byte, em *emitter) error {
 	if !ok || l.Type != "response_item" {
 		return nil
 	}
-	role, text := build(&l)
+	role, text := build(&l, em.tool)
 	if role == "" {
 		return nil
 	}

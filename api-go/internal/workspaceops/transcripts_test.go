@@ -8,7 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/sessionimport"
 )
 
@@ -245,4 +247,82 @@ func TestImportActorFailsClosed(t *testing.T) {
 		t.Fatalf("open mode: %q %v", who, err)
 	}
 	_ = errors.Is
+}
+
+// Imports are dated by their own last message, not by the import time: however many are
+// imported, a live session with a snapshot is still the one handed over.
+func TestImportsNeverStarveTheLiveSessionHandoff(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	live := ledgerSession(root, "claude", "sess-a", "agent-a")
+	recordAll(t, dir, live, LedgerEvent{Kind: LedgerPrompt, Text: "fix the rounding bug"})
+	RecordBoundary(dir, BoundaryPreCompact, LedgerEvent{LedgerSession: live, Text: "auto"})
+	flushLedger(t, dir)
+	many := map[string][]string{}
+	for i := range 25 {
+		many[fmt.Sprintf("imp%02d", i)] = []string{fmt.Sprintf("old question number %d about parsers", i)}
+	}
+	importClaude(t, dir, root, claudeStore(t, root, many))
+	var g SessionGrounding
+	g.groundingSession.buildSessions(context.Background(), dir, ledgerWS, "agent-a", "codex:sess-b", "", nil)
+	if g.SessionHandoff == nil || g.SessionHandoff.FromSession != "claude:sess-a" || len(g.LastSessions) != 1 {
+		t.Fatalf("handoff %+v, last %+v", g.SessionHandoff, g.LastSessions)
+	}
+	if len(g.RecentSessions) != bootstrapRecent || g.RecentSessions[0].ID != "claude:sess-a" {
+		t.Fatalf("recent %+v", g.RecentSessions)
+	}
+	for _, s := range g.RecentSessions[1:] {
+		if !strings.HasPrefix(s.LastSeenAt, "2026-09-0") {
+			t.Fatalf("an imported session is dated by the import, not its transcript: %+v", s)
+		}
+	}
+}
+
+// Retention deletes the rows of a transcript past its horizon; a re-import must not
+// write them again for the next pass to delete.
+func TestReimportAfterRetentionWritesNothing(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	at := time.Now().Add(-30 * 24 * time.Hour).UTC().Format(time.RFC3339)
+	line := fmt.Sprintf(`{"type":"user","sessionId":"old","cwd":%q,"timestamp":%q,"message":{"role":"user","content":"an old question about parsers"}}`, root, at)
+	store := t.TempDir()
+	if err := os.WriteFile(filepath.Join(store, "old.jsonl"), []byte(line+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if rep := importClaude(t, dir, root, store); rep.Messages != 1 {
+		t.Fatalf("first import %+v", rep)
+	}
+	later := time.Now().Add(100 * 24 * time.Hour)
+	CloseMemoryStores()
+	s, err := govstore.Open(context.Background(), memoryStorePath(dir), govstore.Options{Now: func() time.Time { return later }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rep, err := s.ApplyRetention(context.Background(), govstore.DefaultRetentionPolicy())
+	s.Close()
+	if err != nil || rep.SessionEvents != 1 {
+		t.Fatalf("retention %+v %v", rep, err)
+	}
+	importNow = func() time.Time { return later }
+	t.Cleanup(func() { importNow = time.Now })
+	if rep := importClaude(t, dir, root, store); rep.Messages != 0 || rep.Sessions != 0 {
+		t.Fatalf("re-import after retention wrote %+v", rep)
+	}
+}
+
+// MaxMessages bounds a session across runs: stored rows count toward it.
+func TestStoredMessagesCountTowardTheSessionBound(t *testing.T) {
+	dir, root := newLedgerFixture(t, true)
+	store := claudeStore(t, root, map[string][]string{"aaa": {"first question", "first answer"}})
+	importClaude(t, dir, root, store)
+	var kept int
+	err := memoryView(context.Background(), dir, ledgerWS, func(r govstore.Reader) error {
+		rows, err := r.RecentSessionEvents(context.Background(), govstore.RecentEventFilter{WorkspaceID: ledgerWS,
+			SessionID: sessionRow(ledgerWS, "claude-code:aaa"), Kinds: []string{LedgerMessage}, Limit: 1})
+		if len(rows) > 0 {
+			kept = importedKept(rows[0])
+		}
+		return err
+	})
+	if err != nil || kept != 2 {
+		t.Fatalf("stored count %d (%v), want 2", kept, err)
+	}
 }

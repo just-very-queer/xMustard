@@ -61,7 +61,7 @@ func claudeEvent(n int, raw []byte, em *emitter) error {
 	if em.s.Start.IsZero() {
 		em.s.Start = at
 	}
-	text, toolOnly := contentText(l.Message.Content)
+	text, toolOnly := contentText(l.Message.Content, em.tool)
 	role := roleOf(l.Message.Role, toolOnly)
 	if role == "" {
 		return nil

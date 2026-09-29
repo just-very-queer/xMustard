@@ -43,11 +43,17 @@ type BootstrapSession struct {
 }
 
 // bootstrap fills recent_sessions and relevant_sessions. own is the caller's execution
-// key, left out; sessions is the workspace's newest first.
-func (s *groundingSession) bootstrap(ctx context.Context, r govstore.Reader, ws, own, query string, sessions []govstore.Session) error {
+// key, left out. The recent sessions are read here, imported transcripts included, so
+// they are dated by their own last message and never displace the live sessions the
+// handoff reads.
+func (s *groundingSession) bootstrap(ctx context.Context, r govstore.Reader, ws, own, query string) error {
 	ownRow := ""
 	if own != "" {
 		ownRow = sessionRow(ws, own)
+	}
+	sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: ws, Limit: 4 * bootstrapRecent})
+	if err != nil {
+		return err
 	}
 	prior := slices.DeleteFunc(slices.Clone(sessions), func(x govstore.Session) bool { return x.ParentID != "" || x.ID == ownRow })
 	for _, x := range prior[:min(len(prior), bootstrapRecent)] {

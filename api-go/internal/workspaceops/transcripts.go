@@ -44,12 +44,24 @@ type ImportReport struct {
 	RecordClass string `json:"record_class"`
 }
 
+// importNow is the clock of the retention horizon (a test moves it).
+var importNow = time.Now
+
+// transcriptHorizon is how old an imported message may be: retention deletes transcript
+// rows older than this, so importing one would only be undone by the next pass, and its
+// resume point (the last stored row) would be gone by then.
+func transcriptHorizon() time.Duration {
+	return govstore.DefaultRetentionPolicy().SessionEvents[RetentionTranscript]
+}
+
 // ImportSessions streams one agent's session store into workspaceID's ledger as the
-// principal. A repeated import appends only the messages it has not seen.
+// principal. A repeated import appends only the messages it has not seen, and skips
+// those already past the transcript retention horizon (opts.Since only moves later).
 func ImportSessions(ctx context.Context, dataDir, workspaceID, principal string, src sessionimport.Source, opts sessionimport.Options) (ImportReport, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return ImportReport{}, err
 	}
+	opts.Since = laterOf(opts.Since, importNow().Add(-transcriptHorizon()))
 	sink := &importSink{ctx: ctx, dataDir: dataDir, ws: workspaceID, principal: ledgerPrincipal(principal), source: src.Name(),
 		rep: ImportReport{Source: src.Name(), Workspace: workspaceID, RecordClass: govstore.RecordRaw}}
 	err := src.Walk(ctx, opts, sink)
@@ -70,29 +82,30 @@ type importSink struct {
 
 	key, row string
 	pending  []govstore.SessionEventInput
-	title    string // the first user message when the store names none
+	title    string    // the first user message when the store names none
+	last     time.Time // the newest message time: the session ends there, not now
 }
 
 func (k *importSink) actor() govstore.Actor {
 	return govstore.Actor{Principal: k.principal, SessionID: k.key}
 }
 
-func (k *importSink) Begin(s sessionimport.Session) (int, error) {
+func (k *importSink) Begin(s sessionimport.Session) (int, int, error) {
 	if err := k.flush(); err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	k.key = ExecutionKey(k.source, s.ID, "")
 	k.row = sessionRow(k.ws, k.key)
-	k.title = ""
+	k.title, k.last = "", s.Start
 	in := govstore.SessionInput{ID: k.row, WorkspaceID: k.ws, Client: k.source, ExecutionKey: k.key, Branch: s.Branch,
 		Worktree: s.Project, RetentionClass: RetentionTranscript, Summary: cutBytes(LedgerExcerpt(s.Title), summaryMax)}
 	if s.Branch != "" {
 		in.ThreadID = "branch:" + s.Branch
 	}
 	if !s.Start.IsZero() {
-		in.At = s.Start.UTC().Format("2006-01-02T15:04:05.000Z")
+		in.At = s.Start.UTC().Format(importTimeFormat)
 	}
-	after := 0
+	var after, stored int
 	err := memoryUpdate(k.ctx, k.dataDir, k.ws, func(tx govstore.Tx) error {
 		if _, err := tx.UpsertSession(k.ctx, in, k.actor()); err != nil {
 			return err
@@ -100,34 +113,37 @@ func (k *importSink) Begin(s sessionimport.Session) (int, error) {
 		last, err := tx.RecentSessionEvents(k.ctx, govstore.RecentEventFilter{WorkspaceID: k.ws, SessionID: k.row,
 			Kinds: []string{LedgerMessage}, Limit: 1})
 		if err == nil && len(last) > 0 {
-			after = importedLine(last[0])
+			after, stored = importedLine(last[0]), importedKept(last[0])
 		}
 		return err
 	})
 	if err == nil {
 		k.rep.Sessions++
 	}
-	return after, mapStoreErr(err)
+	return after, stored, mapStoreErr(err)
 }
 
 // importedData is the JSON an imported row keeps.
 type importedData struct {
 	Line       int      `json:"line"`
+	Kept       int      `json:"kept,omitempty"` // the session's stored messages, this one included
 	Redactions int      `json:"redactions,omitempty"`
 	Flags      []string `json:"injection_flags,omitempty"`
 }
 
-func importedLine(ev govstore.SessionEvent) int {
-	var d importedData
+func decodeImported(ev govstore.SessionEvent) (d importedData) {
 	_ = json.Unmarshal(ev.Data, &d)
-	return d.Line
+	return d
 }
+
+func importedLine(ev govstore.SessionEvent) int { return decodeImported(ev).Line }
+func importedKept(ev govstore.SessionEvent) int { return decodeImported(ev).Kept }
 
 func (k *importSink) Message(m sessionimport.Message) error {
 	in := govstore.SessionEventInput{SessionID: k.row, Kind: LedgerMessage, RecordClass: govstore.RecordRaw, Role: m.Role,
-		Body: m.Text, RetentionClass: RetentionTranscript, Data: importedData{Line: m.Line, Redactions: m.Redactions, Flags: m.Flags}}
+		Body: m.Text, RetentionClass: RetentionTranscript, Data: importedData{Line: m.Line, Kept: m.Kept, Redactions: m.Redactions, Flags: m.Flags}}
 	if !m.At.IsZero() {
-		in.At = m.At.UTC().Format("2006-01-02T15:04:05.000Z")
+		in.At, k.last = m.At.UTC().Format(importTimeFormat), laterOf(k.last, m.At)
 	}
 	if k.title == "" && m.Role == "user" {
 		k.title = m.Text
@@ -158,10 +174,29 @@ func (k *importSink) End(_ sessionimport.Session, dropped int) error {
 		if s.Summary != "" {
 			summary = s.Summary
 		}
-		_, err = tx.EndSession(k.ctx, k.row, govstore.SessionEnded, summary, k.actor())
+		_, err = tx.EndSessionAt(k.ctx, k.row, govstore.SessionEnded, summary, k.endAt(), k.actor())
 		return err
 	})
 	return mapStoreErr(err)
+}
+
+func laterOf(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+	return a
+}
+
+const importTimeFormat = "2006-01-02T15:04:05.000Z"
+
+// endAt is when the imported session ended: its newest message, so last_seen_at keeps the
+// transcript's own date and imports never outrank live sessions. Empty (no dated
+// message) is now, as for any session.
+func (k *importSink) endAt() string {
+	if k.last.IsZero() {
+		return ""
+	}
+	return k.last.UTC().Format(importTimeFormat)
 }
 
 func (k *importSink) flush() error {

@@ -6,9 +6,15 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 )
+
+// plainID is what an OpenCode session or message id must look like before it is joined
+// into a path: the ids are untrusted JSON, and one such as ../../x or with glob
+// metacharacters would read files outside the store root.
+var plainID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]*$`)
 
 // opencode reads OpenCode's JSON storage: <root>/session/<project>/<id>.json (with the
 // directory and title), <root>/message/<session>/<id>.json and <root>/part/<message>/
@@ -53,7 +59,7 @@ func (o opencode) Walk(ctx context.Context, opts Options, sink Sink) error {
 	sort.Strings(sessions)
 	for _, path := range sessions {
 		var s opencodeSession
-		if !readJSON(path, &s) || s.ID == "" {
+		if !readJSON(path, &s) || !plainID.MatchString(s.ID) {
 			continue
 		}
 		start := parseTime(s.Time.Created)
@@ -81,13 +87,14 @@ func (o opencode) messages(ctx context.Context, root, session string, em *emitte
 			return ctx.Err()
 		}
 		var m opencodeMessage
-		if !readJSON(path, &m) {
+		if !readJSON(path, &m) || !plainID.MatchString(m.ID) {
 			continue
 		}
-		role, text := roleOf(m.Role, false), o.parts(root, m.ID)
+		role := roleOf(m.Role, false)
 		if role == "" {
 			continue
 		}
+		text := o.parts(root, m.ID, em)
 		if err := em.add(i+1, parseTime(m.Time.Created), role, text); err != nil {
 			return err
 		}
@@ -95,22 +102,30 @@ func (o opencode) messages(ctx context.Context, root, session string, em *emitte
 	return nil
 }
 
-// parts joins a message's text parts and tool calls.
-func (opencode) parts(root, message string) string {
+// parts joins a message's text parts and tool calls, each clipped as it is read, and
+// stops once the message's budget is spent, so a message with many large tool outputs
+// never holds more than one part beyond MaxMessageBytes.
+func (opencode) parts(root, message string, em *emitter) string {
 	files, _ := filepath.Glob(filepath.Join(root, "part", message, "*.json"))
 	sort.Strings(files)
 	var out []string
+	used := 0
 	for _, path := range files {
 		var p opencodePart
+		if used >= MaxMessageBytes {
+			break
+		}
 		if !readJSON(path, &p) {
 			continue
 		}
+		var text string
 		switch p.Type {
 		case "text":
-			out = append(out, p.Text)
+			text = em.clip(p.Text, MaxMessageBytes-used)
 		case "tool":
-			out = append(out, "tool "+p.Tool+": "+rawText(p.State.Input)+"\n"+p.State.Output)
+			text = em.tool("tool " + p.Tool + ": " + rawText(p.State.Input, em.tool) + "\n" + em.tool(p.State.Output))
 		}
+		out, used = append(out, text), used+len(text)+1
 	}
 	return strings.Join(out, "\n")
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 	"unicode/utf8"
 )
@@ -229,19 +230,20 @@ func (r *reader) SearchTranscripts(ctx context.Context, q TranscriptQuery) ([]Tr
 	}
 	where := []string{"transcript_fts MATCH ?", "s.workspace_id = ?"}
 	args := []any{match, q.WorkspaceID}
-	for _, f := range []struct{ clause, val string }{
-		{"s.session_id = ?", q.SessionID},
-		{"(ss.client = ? OR ss.agent_id = ?)", q.Agent},
-		{"(ss.execution_key = ? OR ss.thread_id = ?)", q.Conversation},
+	for _, f := range []struct {
+		clause string
+		val    string
+		binds  int // how many times the clause uses its value
+	}{
+		{"s.session_id = ?", q.SessionID, 1},
+		{"(ss.client = ? OR ss.agent_id = ?)", q.Agent, 2},
+		{"(ss.execution_key = ? OR ss.thread_id = ?)", q.Conversation, 2},
 	} {
 		if f.val == "" {
 			continue
 		}
 		where = append(where, f.clause)
-		args = append(args, f.val)
-		if strings.Count(f.clause, "?") == 2 {
-			args = append(args, f.val)
-		}
+		args = append(args, slices.Repeat([]any{f.val}, f.binds)...)
 	}
 	for _, b := range []struct{ op, val, field string }{{">=", q.Since, "since"}, {"<", q.Until, "until"}} {
 		v, err := inputTime(b.field, b.val)

@@ -74,7 +74,10 @@ type SessionFilter struct {
 	WorkspaceID string
 	ThreadID    string
 	Status      string
-	Limit       int
+	// ExcludeRetention leaves out the sessions of one retention class, in SQL, so a
+	// LIMIT counts only the rest (imported transcripts must not crowd out live sessions).
+	ExcludeRetention string
+	Limit            int
 }
 
 // SessionEvent is one immutable ledger row.
@@ -144,6 +147,9 @@ type RecentEventFilter struct {
 	SessionID      string
 	ExcludeSession string
 	Sessions       int
+	// ExcludeRetention leaves out the sessions of one retention class before the
+	// Sessions window is cut (a workspace-wide read only).
+	ExcludeRetention string
 	// Kinds selects the kinds; nil selects every kind.
 	Kinds []string
 	Limit int
@@ -163,6 +169,9 @@ type SessionReader interface {
 type SessionWriter interface {
 	UpsertSession(ctx context.Context, in SessionInput, actor Actor) (Session, error)
 	EndSession(ctx context.Context, id, status, summary string, actor Actor) (Session, error)
+	// EndSessionAt ends a session at a given time (RFC 3339; an imported session ends
+	// when its last message was written) without moving last_seen_at past it.
+	EndSessionAt(ctx context.Context, id, status, summary, at string, actor Actor) (Session, error)
 	AppendSessionEvent(ctx context.Context, in SessionEventInput, actor Actor) (SessionEvent, error)
 	TrimSessionEvents(ctx context.Context, sessionID string, kinds []string, keep int) (int64, error)
 }
@@ -201,6 +210,10 @@ func (r *reader) ListSessions(ctx context.Context, f SessionFilter) ([]Session, 
 	if f.Status != "" {
 		where = append(where, "status = ?")
 		args = append(args, f.Status)
+	}
+	if f.ExcludeRetention != "" {
+		where = append(where, "retention_class <> ?")
+		args = append(args, f.ExcludeRetention)
 	}
 	args = append(args, clampLimit(f.Limit))
 	rows, err := r.query(ctx, "SELECT "+sessionCols+" FROM sessions WHERE "+strings.Join(where, " AND ")+
@@ -300,9 +313,9 @@ func (r *reader) RecentSessionEvents(ctx context.Context, f RecentEventFilter) (
 		if n <= 0 {
 			n = defaultRecentSessions
 		}
-		where = `session_id IN (SELECT id FROM sessions WHERE workspace_id = ? AND id <> ?
+		where = `session_id IN (SELECT id FROM sessions WHERE workspace_id = ? AND id <> ? AND retention_class <> ?
 			ORDER BY last_seen_at DESC, pk DESC LIMIT ?)`
-		args = append(args, f.WorkspaceID, f.ExcludeSession, clampLimit(n))
+		args = append(args, f.WorkspaceID, f.ExcludeSession, f.ExcludeRetention, clampLimit(n))
 	}
 	if len(f.Kinds) > 0 {
 		where += " AND kind IN (" + placeholders(len(f.Kinds)) + ")"
@@ -374,6 +387,11 @@ func (t *txn) UpsertSession(ctx context.Context, in SessionInput, actor Actor) (
 // EndSession closes a session as ended or interrupted. Only the session's own principal
 // may end it.
 func (t *txn) EndSession(ctx context.Context, id, status, summary string, actor Actor) (Session, error) {
+	return t.EndSessionAt(ctx, id, status, summary, "", actor)
+}
+
+// EndSessionAt is EndSession with the end time given (empty is now).
+func (t *txn) EndSessionAt(ctx context.Context, id, status, summary, at string, actor Actor) (Session, error) {
 	if err := actor.validate(); err != nil {
 		return Session{}, err
 	}
@@ -390,8 +408,11 @@ func (t *txn) EndSession(ctx context.Context, id, status, summary string, actor 
 	if s.Principal != strings.TrimSpace(actor.Principal) {
 		return Session{}, fmt.Errorf("%w: session %s belongs to another principal", ErrConflict, id)
 	}
-	now := t.nowText()
-	res, err := t.exec(ctx, `UPDATE sessions SET status = ?, summary = ?, ended_at = ?, last_seen_at = ?
+	now, err := t.eventTime(at)
+	if err != nil {
+		return Session{}, err
+	}
+	res, err := t.exec(ctx, `UPDATE sessions SET status = ?, summary = ?, ended_at = ?, last_seen_at = max(last_seen_at, ?)
 		WHERE id = ? AND status = 'active'`, status, summary, now, now, id)
 	if err != nil {
 		return Session{}, err

@@ -60,11 +60,11 @@
             "type": "integer"
           },
           "paths": {
-            "description": "comma-separated files to focus on",
+            "description": "comma-separated repo-relative files to focus on",
             "type": "string"
           },
           "q": {
-            "description": "",
+            "description": "task query to rank memories by",
             "type": "string"
           },
           "workspace_id": {
@@ -263,11 +263,11 @@
             "type": "string"
           },
           "q": {
-            "description": "",
+            "description": "the search query",
             "type": "string"
           },
           "seed": {
-            "description": "graph-proximity anchor symbol",
+            "description": "symbol to anchor the graph-proximity lane",
             "type": "string"
           },
           "workspace_id": {
@@ -331,7 +331,7 @@
         "additionalProperties": false,
         "properties": {
           "path": {
-            "description": "file or directory path",
+            "description": "a repo-relative file or directory path",
             "maxLength": 4096,
             "type": "string"
           },
@@ -399,7 +399,7 @@
             "type": "string"
           },
           "symbol": {
-            "description": "",
+            "description": "symbol to compute blast radius for",
             "type": "string"
           },
           "to": {

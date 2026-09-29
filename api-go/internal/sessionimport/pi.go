@@ -52,7 +52,7 @@ func piEvent(n int, raw []byte, em *emitter) error {
 	case "session":
 		em.s.ID, em.s.Project, em.s.Start = nonEmpty(l.ID, em.s.ID), l.Cwd, parseTime(l.Timestamp)
 	case "message":
-		text, toolOnly := contentText(l.Message.Content)
+		text, toolOnly := contentText(l.Message.Content, em.tool)
 		if role := roleOf(l.Message.Role, toolOnly); role != "" {
 			return em.add(n, parseTime(l.Timestamp), role, text)
 		}

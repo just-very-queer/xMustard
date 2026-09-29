@@ -54,7 +54,9 @@ type Session struct {
 
 // Message is one normalized, redacted message. Line orders it within its session.
 type Message struct {
-	Line       int
+	Line int
+	// Kept is the count of this session's messages stored so far, this one included.
+	Kept       int
 	At         time.Time
 	Role       string // user | assistant | tool
 	Text       string
@@ -64,10 +66,11 @@ type Message struct {
 }
 
 // Sink receives a store's sessions. Begin returns the last message line it already
-// holds for the session, so a repeated import appends only what is new; End reports how
-// many messages the session had beyond MaxMessages.
+// holds for the session and how many messages it holds (their Kept count), so a repeated
+// import appends only what is new and MaxMessages bounds the session, not the run; End
+// reports how many messages the session had beyond MaxMessages.
 type Sink interface {
-	Begin(s Session) (after int, err error)
+	Begin(s Session) (after, stored int, err error)
 	Message(m Message) error
 	End(s Session, dropped int) error
 }
@@ -106,6 +109,8 @@ type emitter struct {
 	after   int
 	kept    int
 	dropped int
+	// redactions counts what clip redacted since the last message was emitted.
+	redactions int
 }
 
 func newEmitter(sink Sink, opts Options, s Session) *emitter {
@@ -121,10 +126,19 @@ func inProject(project, dir string) bool {
 	return dir == project || strings.HasPrefix(dir, strings.TrimRight(project, string(filepath.Separator))+string(filepath.Separator))
 }
 
-// roleLimits bounds a message's kept text by role.
-var roleLimits = map[string]int{"tool": MaxToolBytes}
+// clip redacts the whole text, then cuts it: redacting after the cut would leave a
+// secret that straddles the cut unmatched, and stored almost whole.
+func (e *emitter) clip(text string, limit int) string {
+	text, rep := redact.Default().String(text)
+	e.redactions += rep.Count
+	return cut(text, limit)
+}
+
+// tool clips one tool call or result to MaxToolBytes.
+func (e *emitter) tool(text string) string { return e.clip(text, MaxToolBytes) }
 
 func (e *emitter) add(line int, at time.Time, role, text string) error {
+	defer func() { e.redactions = 0 }()
 	text = strings.TrimSpace(text)
 	if text == "" || !e.opts.Since.IsZero() && !at.IsZero() && at.Before(e.opts.Since) {
 		return nil
@@ -134,7 +148,7 @@ func (e *emitter) add(line int, at time.Time, role, text string) error {
 			return errSkipSession
 		}
 		var err error
-		if e.after, err = e.sink.Begin(e.s); err != nil {
+		if e.after, e.kept, err = e.sink.Begin(e.s); err != nil {
 			return err
 		}
 		e.began = true
@@ -148,11 +162,13 @@ func (e *emitter) add(line int, at time.Time, role, text string) error {
 	}
 	e.kept++
 	limit := MaxMessageBytes
-	if l, ok := roleLimits[role]; ok {
-		limit = l
+	if role == "tool" {
+		limit = MaxToolBytes
 	}
-	text, rep := redact.Default().String(cut(text, limit))
-	return e.sink.Message(Message{Line: line, At: at, Role: role, Text: text, Redactions: rep.Count,
+	text = e.clip(text, limit)
+	red := e.redactions
+	e.redactions = 0
+	return e.sink.Message(Message{Line: line, Kept: e.kept, At: at, Role: role, Text: text, Redactions: red,
 		Flags: injection.Scan(text).Flags})
 }
 
@@ -296,7 +312,7 @@ var blockKinds = map[string]string{
 
 // contentText flattens message content (a string, or an array of blocks) into text and
 // reports whether it held only tool calls and results.
-func contentText(raw json.RawMessage) (text string, toolOnly bool) {
+func contentText(raw json.RawMessage, clip func(string) string) (text string, toolOnly bool) {
 	var s string
 	if json.Unmarshal(raw, &s) == nil {
 		return s, false
@@ -312,9 +328,9 @@ func contentText(raw json.RawMessage) (text string, toolOnly bool) {
 		case "text":
 			parts, toolOnly = append(parts, b.Text), false
 		case "call":
-			parts = append(parts, "tool "+b.Name+": "+rawText(firstRaw(b.Input, b.Arguments)))
+			parts = append(parts, clip("tool "+b.Name+": "+rawText(firstRaw(b.Input, b.Arguments), clip)))
 		case "result":
-			parts = append(parts, rawText(firstRaw(b.Content, b.Output)))
+			parts = append(parts, clip(rawText(firstRaw(b.Content, b.Output), clip)))
 		}
 	}
 	return strings.Join(parts, "\n"), toolOnly
@@ -329,11 +345,11 @@ func firstRaw(a, b json.RawMessage) json.RawMessage {
 
 // rawText is a JSON value as text: a string as is, an array of blocks flattened, any
 // other value compacted.
-func rawText(raw json.RawMessage) string {
+func rawText(raw json.RawMessage, clip func(string) string) string {
 	if len(raw) == 0 {
 		return ""
 	}
-	if t, _ := contentText(raw); t != "" {
+	if t, _ := contentText(raw, clip); t != "" {
 		return t
 	}
 	return string(raw)

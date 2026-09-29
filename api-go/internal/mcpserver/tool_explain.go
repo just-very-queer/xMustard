@@ -15,7 +15,7 @@ var explainTool = &Tool{
 	Description: "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.",
 	Args: []Arg{
 		workspaceArg,
-		{Name: "path", Type: typeString, MaxLen: maxPathArg, Desc: "file or directory path"},
+		{Name: "path", Type: typeString, MaxLen: maxPathArg, Desc: "a repo-relative file or directory path"},
 	},
 	// A symbol's context, the outline's depth and the output budget (WS-36): accepted
 	// everywhere, listed only in the full schema profile, documented at DocsURI.

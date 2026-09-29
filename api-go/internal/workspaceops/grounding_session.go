@@ -149,11 +149,13 @@ func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspace
 	now := time.Now().UTC()
 	root := contextRoot(dataDir, workspaceID)
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions})
-		if err != nil || len(sessions) == 0 {
+		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions,
+			ExcludeRetention: RetentionTranscript})
+		if err != nil {
 			return err
 		}
-		if err := s.bootstrap(ctx, r, workspaceID, sessionID, query, sessions); err != nil {
+		// the bootstrap reads every session, imported ones too, in its own query
+		if err := s.bootstrap(ctx, r, workspaceID, sessionID, query); err != nil || len(sessions) == 0 {
 			return err
 		}
 		main := mainSessions(sessions)
@@ -193,12 +195,13 @@ func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspace
 	return nil
 }
 
-// mainSessions leaves out subagent rows (they have a parent) and imported transcripts
-// (no snapshot, no handles: not a session to hand over).
+// mainSessions leaves out subagent rows (they have a parent). Imported transcripts
+// (no snapshot, no handles: not a session to hand over) are excluded in SQL by the
+// caller, so they never crowd live sessions out of the LIMIT.
 func mainSessions(list []govstore.Session) []govstore.Session {
 	var out []govstore.Session
 	for _, s := range list {
-		if s.ParentID == "" && s.RetentionClass != RetentionTranscript {
+		if s.ParentID == "" {
 			out = append(out, s)
 		}
 	}
@@ -212,7 +215,8 @@ func mainSessions(list []govstore.Session) []govstore.Session {
 func HookSessionHandoff(ctx context.Context, dataDir, workspaceID, principal, key string, own, prior bool) (*SessionHandoff, error) {
 	var h *SessionHandoff
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions})
+		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions,
+			ExcludeRetention: RetentionTranscript})
 		if err != nil {
 			return err
 		}
