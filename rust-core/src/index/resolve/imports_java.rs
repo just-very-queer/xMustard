@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use rusqlite::Result;
 
-use super::scope::{Bind, Db, FileCtx, Import, Module, Scheme};
+use super::scope::{Bind, Db, FileCtx, Import, Module, Scheme, Sym};
 
 /// Module lookups cached per run before the cache is cleared.
 const CACHE_MAX: usize = 1024;
@@ -47,6 +47,14 @@ impl Scheme for Java {
 
     fn reexports(&self, _imp: &Import) -> bool {
         false
+    }
+
+    fn package_scope(&self, db: &Db<'_>, from: &FileCtx, name: &str) -> Result<Option<Sym>> {
+        Ok(db
+            .in_lang_dir("java", from.dir(), name, name)?
+            .into_iter()
+            .find(|(s, _)| s.file != from.id)
+            .map(|(s, _)| s))
     }
 
     fn join(&self, base: &str, name: &str) -> String {

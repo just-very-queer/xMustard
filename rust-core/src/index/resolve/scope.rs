@@ -37,6 +37,8 @@ pub struct Rules {
     pub super_names: &'static [&'static str],
     /// A bare name inside a type may name one of its members (Java).
     pub implicit_this: bool,
+    /// A type's impl blocks may sit in any file of its crate's source directory (Rust).
+    pub crate_impls: bool,
     /// A name defined by one file of the family binds anywhere, at the global tier.
     pub global: bool,
     /// The `IMPORTS` edge reason of the family's import rows (Go, TS/JS read theirs
@@ -76,6 +78,7 @@ const RULES: [Rules; 5] = [
         self_kinds: &[],
         super_names: &[],
         implicit_this: false,
+        crate_impls: false,
         global: false,
         import_reason: "package",
     },
@@ -87,6 +90,7 @@ const RULES: [Rules; 5] = [
         self_kinds: &["Class"],
         super_names: &["super"],
         implicit_this: false,
+        crate_impls: false,
         global: true,
         import_reason: "import",
     },
@@ -98,6 +102,7 @@ const RULES: [Rules; 5] = [
         self_kinds: &["Impl", "Trait"],
         super_names: &[],
         implicit_this: false,
+        crate_impls: true,
         global: true,
         import_reason: "use",
     },
@@ -109,6 +114,7 @@ const RULES: [Rules; 5] = [
         self_kinds: &["Class"],
         super_names: &[],
         implicit_this: false,
+        crate_impls: false,
         global: true,
         import_reason: "py-import",
     },
@@ -120,6 +126,7 @@ const RULES: [Rules; 5] = [
         self_kinds: &["Class", "Enum", "Interface"],
         super_names: &["super"],
         implicit_this: true,
+        crate_impls: false,
         global: true,
         import_reason: "java-import",
     },
@@ -197,6 +204,16 @@ pub trait Scheme {
     /// The import makes the names it binds visible to the file's importers (Rust
     /// `pub use`, Python's `from .x import y` in a package).
     fn reexports(&self, imp: &Import) -> bool;
+    /// A class of the file's own package named `name`, in scope without an import (Java);
+    /// explicit imports shadow it and it shadows wildcard imports.
+    fn package_scope(
+        &self,
+        _db: &Db<'_>,
+        _from: &FileCtx,
+        _name: &str,
+    ) -> rusqlite::Result<Option<Sym>> {
+        Ok(None)
+    }
     /// The submodule `name` of module `base`.
     fn join(&self, base: &str, name: &str) -> String;
 }
@@ -414,7 +431,7 @@ impl Local {
     pub fn top_level(&self, name: &str) -> Option<&Sym> {
         self.symbols
             .values()
-            .filter(|s| !s.local && s.qname == name)
+            .filter(|s| !s.local && s.kind != "Impl" && s.qname == name)
             .min_by_key(|s| s.id)
     }
 
@@ -541,6 +558,7 @@ impl Db<'_> {
                 "SELECT {SYM_COLS} FROM symbols s INDEXED BY symbols_file
                  JOIN names n ON n.id = s.name_id
                  WHERE s.file_id = ?1 AND n.name = ?2 AND s.qualified_name = ?3 AND s.local = 0
+                   AND s.kind != 'Impl'
                  ORDER BY s.ord"
             ))?
             .query_map(rusqlite::params![fid, name, qname], sym)?
@@ -623,7 +641,7 @@ impl Db<'_> {
         let sql = format!(
             "SELECT DISTINCT s.file_id FROM symbols s JOIN names n ON n.id = s.name_id
              JOIN files f ON f.id = s.file_id
-             WHERE n.name = ?1 AND s.qualified_name = ?1 AND s.local = 0
+             WHERE n.name = ?1 AND s.qualified_name = ?1 AND s.local = 0 AND s.kind != 'Impl'
                AND f.lang IN ({}) ORDER BY f.path LIMIT ?2",
             family.rules().langs
         );
@@ -741,12 +759,14 @@ impl Db<'_> {
 
     /// Base-type hints of a type as written (`B`, or `q.B` through a qualifier), with
     /// the file whose scope they are read in: its `extends`/`implements` references
-    /// and, for a Rust type, the traits of the `impl Trait for T` blocks under `src`.
+    /// and, for a Rust type, the traits of the `impl Trait for T` blocks under `src`
+    /// (those carry their impl block's id: the caller checks the block's type is `ty`,
+    /// since the query matches by the type's simple name).
     pub fn base_hints(
         &self,
         ty: &Sym,
         rust_src: Option<&str>,
-    ) -> rusqlite::Result<Vec<(String, i64)>> {
+    ) -> rusqlite::Result<Vec<(String, i64, Option<i64>)>> {
         const HINT: &str = "CASE WHEN q.name IS NULL THEN n.name ELSE q.name || '.' || n.name END";
         let own = format!(
             "SELECT {HINT}, r.file_id FROM refs r JOIN names n ON n.id = r.name_id
@@ -758,13 +778,13 @@ impl Db<'_> {
             .prepare_cached(&own)?
             .query_map(
                 rusqlite::params![ty.file, ty.id, ref_kind::EXTENDS, ref_kind::IMPLEMENTS],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, None)),
             )?
-            .collect::<rusqlite::Result<Vec<(String, i64)>>>()?;
+            .collect::<rusqlite::Result<Vec<_>>>()?;
         if let Some(src) = rust_src {
             let (lo, hi) = dir_range(src);
             let impls = format!(
-                "SELECT {HINT}, r.file_id FROM symbols s JOIN files f ON f.id = s.file_id
+                "SELECT {HINT}, r.file_id, s.id FROM symbols s JOIN files f ON f.id = s.file_id
                  JOIN refs r ON r.file_id = s.file_id AND r.start_byte >= s.start_byte
                               AND r.start_byte < s.end_byte AND r.symbol_id = s.id
                  JOIN names n ON n.id = r.name_id LEFT JOIN names q ON q.id = r.qual_id
@@ -776,9 +796,9 @@ impl Db<'_> {
                 .prepare_cached(&impls)?
                 .query_map(
                     rusqlite::params![ty.name_id, ref_kind::IMPLEMENTS, lo, hi],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
+                    |r| Ok((r.get(0)?, r.get(1)?, Some(r.get(2)?))),
                 )?
-                .collect::<rusqlite::Result<Vec<(String, i64)>>>()?;
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             out.extend(rows);
         }
         Ok(out)

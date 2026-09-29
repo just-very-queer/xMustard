@@ -35,7 +35,8 @@ impl Scheme for Python {
     }
 
     fn binding(&self, imports: &[Import], local: &str) -> Option<Bind> {
-        imports.iter().find_map(|imp| {
+        // a later import rebinds the name
+        imports.iter().rev().find_map(|imp| {
             let (bound, bind) = match (imp.kind.as_str(), imp.name.as_deref(), imp.alias.as_deref())
             {
                 ("import", None, Some(alias)) => (alias, Bind::Module(imp.module.clone())),
@@ -73,17 +74,25 @@ impl Scheme for Python {
     }
 }
 
-/// The directories an absolute module path may be rooted at, most specific first is
-/// not needed: the repository root, `src`, then the importing file's ancestors.
-fn roots(from: &FileCtx) -> Vec<String> {
+/// The directories an absolute module path may be rooted at: the repository root, `src`,
+/// then (for a script, not a package member) the importing file's ancestors. A package
+/// member imports through the interpreter's path, so an ancestor directory is no root:
+/// `import json` in package `app` is the standard library, not `app/json.py`.
+fn roots(db: &Db<'_>, from: &FileCtx) -> Result<Vec<String>> {
     let mut out = vec![String::new(), "src".to_string()];
+    let init = [from.dir(), "__init__.py"]
+        .into_iter()
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("/");
+    let member = !from.dir().is_empty() && db.file_at(&init)?.is_some();
     let mut dir = from.dir();
-    while !dir.is_empty() {
+    while !member && !dir.is_empty() {
         out.push(dir.to_string());
         dir = dir.rsplit_once('/').map_or("", |(d, _)| d);
     }
     out.dedup();
-    out
+    Ok(out)
 }
 
 fn locate(db: &Db<'_>, from: &FileCtx, path: &str) -> Result<Module> {
@@ -91,7 +100,7 @@ fn locate(db: &Db<'_>, from: &FileCtx, path: &str) -> Result<Module> {
     let rest = &path[dots..];
     let segments: Vec<&str> = rest.split('.').filter(|s| !s.is_empty()).collect();
     let candidates: Vec<String> = match dots {
-        0 => roots(from),
+        0 => roots(db, from)?,
         n => {
             // one dot is the importing file's package, each more its parent
             let mut dir = from.dir();

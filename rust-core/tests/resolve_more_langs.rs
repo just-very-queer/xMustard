@@ -589,6 +589,169 @@ fn rust_binds_use_paths_trait_impls_and_associated_functions() {
 /// the calls that actually run (`sys.setprofile`); Java's and Rust's are the callee each
 /// call binds to by the language rules, checked to compile with javac and rustc.
 /// Precision is what EVAL-09 records; recall is reported alongside it.
+/// A repository of `(path, content)` files, built and indexed.
+fn built(files: &[(&str, &str)]) -> (TempDir, Connection) {
+    let dir = TempDir::new().unwrap();
+    for (rel, content) in files {
+        write(dir.path(), rel, content);
+    }
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "c"]);
+    let conn = db(&index("build", dir.path(), &[]));
+    (dir, conn)
+}
+
+#[test]
+fn rust_same_name_types_keep_their_own_methods_and_traits() {
+    let (_r, conn) = built(&[
+        (
+            "Cargo.toml",
+            "[package]\nname = \"x\"\nversion = \"0.1.0\"\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod a;\npub mod b;\npub mod app;\npub mod shapes;\npub mod shape_impl;\n",
+        ),
+        (
+            "src/a.rs",
+            "pub trait Named { fn label(&self) -> u8; }\npub struct Config {}\nimpl Config { pub fn fresh() {} }\n",
+        ),
+        (
+            "src/b.rs",
+            "pub trait Named { fn label(&self) -> u8; }\npub struct Config {}\nimpl Config { pub fn reload(&self) {} }\nimpl Named for Config { fn label(&self) -> u8 { 1 } }\n",
+        ),
+        (
+            "src/app.rs",
+            "use crate::a::Config;\npub fn run(c: Config) { c.reload(); c.label(); }\n",
+        ),
+        ("src/shapes.rs", "pub struct Circle { pub r: f64 }\n"),
+        (
+            "src/shape_impl.rs",
+            "use crate::shapes::Circle;\nimpl Circle {\n  pub fn make() -> Circle { Circle { r: 1.0 } }\n  pub fn scale(&self) -> f64 { self.r }\n}\n",
+        ),
+    ]);
+    let e = edges(&conn);
+    // a::Config has neither `reload` nor `label`: nothing binds them to b::Config
+    let wrong = |to: &str| {
+        e.keys()
+            .any(|k| k.0 == "src/app.rs" && k.2 == "CALLS" && k.3 == "src/b.rs" && k.4 == to)
+    };
+    assert!(!wrong("Config.reload"), "{:#?}", e.keys());
+    assert!(!wrong("Config.label"), "{:#?}", e.keys());
+    // an impl block in another file: the methods belong to the struct, and `Circle { r }`
+    // names the struct
+    let owner: String = conn
+        .query_row(
+            "SELECT s.kind FROM edges e JOIN symbols s ON s.id = e.src_symbol
+             JOIN symbols d ON d.id = e.dst_symbol
+             WHERE e.kind = 'HAS_METHOD' AND d.qualified_name = 'Circle.make'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(owner, "Struct");
+    edge(
+        &e,
+        ("src/shape_impl.rs", "Circle.make"),
+        "USES",
+        ("src/shapes.rs", "Circle"),
+        0.9,
+        "import",
+    );
+}
+
+#[test]
+fn java_single_type_import_shadows_the_same_package() {
+    let (_r, conn) = built(&[
+        (
+            "src/com/acme/util/Strings.java",
+            "package com.acme.util;\npublic class Strings { public static String shout(String s) { return s; } }\n",
+        ),
+        (
+            "src/com/acme/app/Strings.java",
+            "package com.acme.app;\npublic class Strings { public static String shout(String s) { return s; } }\n",
+        ),
+        (
+            "src/com/acme/app/Main.java",
+            "package com.acme.app;\nimport com.acme.util.Strings;\npublic class Main { void main() { Strings.shout(\"x\"); } }\n",
+        ),
+        (
+            "src/com/acme/app/Other.java",
+            "package com.acme.app;\npublic class Other { void go() { Strings.shout(\"x\"); } }\n",
+        ),
+    ]);
+    let e = edges(&conn);
+    let main = "src/com/acme/app/Main.java";
+    assert!(
+        has(
+            &e,
+            (main, "Main.main"),
+            "CALLS",
+            ("src/com/acme/util/Strings.java", "Strings.shout")
+        )
+        .is_some(),
+        "{:#?}",
+        e.keys()
+    );
+    assert!(
+        has(
+            &e,
+            (main, "Main.main"),
+            "CALLS",
+            ("src/com/acme/app/Strings.java", "Strings.shout")
+        )
+        .is_none()
+    );
+    // without an import the file's own package binds
+    edge(
+        &e,
+        ("src/com/acme/app/Other.java", "Other.go"),
+        "CALLS",
+        ("src/com/acme/app/Strings.java", "Strings.shout"),
+        0.9,
+        "static-member",
+    );
+}
+
+#[test]
+fn python_last_import_wins_and_a_package_does_not_import_its_own_siblings_as_roots() {
+    let (_r, conn) = built(&[
+        ("app/__init__.py", ""),
+        ("app/first.py", "def helper():\n    return 1\n"),
+        ("app/second.py", "def helper():\n    return 2\n"),
+        ("app/json.py", "def loads(s):\n    return s\n"),
+        (
+            "app/use.py",
+            "from app.first import helper\nfrom app.second import helper\nimport json\n\ndef run():\n    helper()\n    json.loads('1')\n",
+        ),
+    ]);
+    let e = edges(&conn);
+    assert!(
+        has(
+            &e,
+            ("app/use.py", "run"),
+            "CALLS",
+            ("app/second.py", "helper")
+        )
+        .is_some(),
+        "{:#?}",
+        e.keys()
+    );
+    assert!(
+        has(
+            &e,
+            ("app/use.py", "run"),
+            "CALLS",
+            ("app/first.py", "helper")
+        )
+        .is_none()
+    );
+    assert!(has(&e, ("app/use.py", "run"), "CALLS", ("app/json.py", "loads")).is_none());
+}
+
 #[test]
 fn precision_against_ground_truth() {
     let mut total = (0usize, 0usize, 0usize);

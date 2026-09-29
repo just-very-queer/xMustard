@@ -117,7 +117,7 @@ single-machine results, not universal ceilings.
 | Code index, full build | cline 2,660/2,660 files at 21.8-25.0 MiB (25.0 with the graph-segment write); pi-mono 1,636/1,636 at 20.9-22.5 MiB | macOS M1 | [WS-07](benchmarks/2026-09-25-ws07-index-rss.md), [WS-14](benchmarks/2026-09-26-ws14-resident-index.md) |
 | `ground` output budget | 19,544 B unbudgeted, 4,550 B at the default 6,000-character budget | pi-mono clone | [Build plan, WS-54 record](plans/2026-09-25-parity-build-plan.md) |
 | `recall` over 1,000 memories | p50 28.5 ms, p95 31.0 ms; API RSS 31.5 MB after 600 recalls | Linux x86_64 | [Build plan, WS-20 record](plans/2026-09-25-parity-build-plan.md) |
-| Resolver precision (CALLS edges) | Go and TS: 30 of 30 correct, recall 0.938. Python, Java, Rust: 33 of 33 correct, recall 33 of 33 | Small purpose-written fixtures | [WS-17](benchmarks/2026-09-26-ws17-resolver.md), [WS-39](benchmarks/2026-09-30-ws39-resolvers.md) |
+| Resolver precision (CALLS edges) | Go and TS: 30 of 30 correct, recall 0.938. Python, Java, Rust: 33 of 33 correct, recall 33 of 33 (hand-listed truth on small fixtures; no rust-analyzer, pyright or jdtls run) | Small purpose-written fixtures | [WS-17](benchmarks/2026-09-26-ws17-resolver.md), [WS-39](benchmarks/2026-09-30-ws39-resolvers.md) |
 | `tools/list`, lean, all nine tools | Capped at 8,888 B on protocol 2025-06-18 (119 B more than v0.1.0, for `impact`'s `path`) | Enforced by a test | [`tools_list_budget.json`](../api-go/internal/mcpserver/testdata/tools_list_budget.json) |
 
 Checks that passed on the v0.1.1 release tree: every cargo test target and all 20 Go

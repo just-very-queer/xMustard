@@ -73,6 +73,8 @@ const MAX_HIERARCHY: usize = 32;
 /// Re-export chains followed at most this deep (Rust `pub use`, Python `__init__`).
 const MAX_REEXPORT_DEPTH: usize = 6;
 /// Hierarchies cached per run before the cache is cleared.
+/// Same-named impl methods of other types read before those of the type are picked out.
+const IMPL_CANDIDATES: usize = 16;
 const HIERARCHY_CACHE_MAX: usize = 256;
 /// Files of one imported Go package that get a file-level IMPORTS edge.
 const MAX_PACKAGE_IMPORT_EDGES: usize = 64;
@@ -136,31 +138,7 @@ struct Hierarchy {
 }
 
 /// The module systems of the families that have module files.
-struct Schemes {
-    rust: imports_rust::Rust,
-    python: imports_python::Python,
-    java: imports_java::Java,
-}
-
-impl Schemes {
-    fn get(&self, family: Family) -> Option<&dyn Scheme> {
-        match family {
-            Family::Rust => Some(&self.rust),
-            Family::Python => Some(&self.python),
-            Family::Java => Some(&self.java),
-            Family::Go | Family::Ts => None,
-        }
-    }
-
-    fn get_mut(&mut self, family: Family) -> Option<&mut dyn Scheme> {
-        match family {
-            Family::Rust => Some(&mut self.rust),
-            Family::Python => Some(&mut self.python),
-            Family::Java => Some(&mut self.java),
-            Family::Go | Family::Ts => None,
-        }
-    }
-}
+type Schemes = HashMap<Family, Box<dyn Scheme>>;
 
 pub struct Resolver<'c> {
     db: Db<'c>,
@@ -176,11 +154,14 @@ impl<'c> Resolver<'c> {
         Resolver {
             db: Db { conn },
             modules: Modules::new(root),
-            schemes: Schemes {
-                rust: imports_rust::Rust::new(root),
-                python: imports_python::Python::default(),
-                java: imports_java::Java::default(),
-            },
+            schemes: HashMap::from([
+                (
+                    Family::Rust,
+                    Box::new(imports_rust::Rust::new(root)) as Box<dyn Scheme>,
+                ),
+                (Family::Python, Box::new(imports_python::Python::default())),
+                (Family::Java, Box::new(imports_java::Java::default())),
+            ]),
             globals: HashMap::new(),
             hierarchies: HashMap::new(),
             counters: ResolveCounters::default(),
@@ -367,14 +348,14 @@ impl<'c> Resolver<'c> {
     /// The files a module path names, read from `from`.
     fn module_of(&mut self, from: &FileCtx, path: &str) -> rusqlite::Result<Module> {
         let db = Db { conn: self.db.conn };
-        match self.schemes.get_mut(from.family) {
+        match self.schemes.get_mut(&from.family) {
             Some(scheme) => scheme.module(&db, from, path),
             None => Ok(Module::External),
         }
     }
 
     fn scheme(&self, family: Family) -> Option<&dyn Scheme> {
-        self.schemes.get(family)
+        self.schemes.get(&family).map(|s| s.as_ref())
     }
 
     /// The top-level (or `prefix`-nested) symbol `name` exported by `files`: declared in
@@ -594,24 +575,19 @@ impl<'c> Resolver<'c> {
     /// file, else the file's own Java package.
     fn lookup_scheme(&mut self, ctx: &FileCtx, name: &str) -> rusqlite::Result<Found> {
         let family = ctx.family;
-        if family == Family::Java
-            && let Some((s, _)) = self
-                .db
-                .in_lang_dir("java", ctx.dir(), name, name)?
-                .into_iter()
-                .find(|(s, _)| s.file != ctx.id)
-        {
-            return Ok(Found::Hit(s, Tier::ImportScoped, "same-package"));
-        }
         let Some(scheme) = self.scheme(family) else {
             return Ok(Found::Drop(Cause::External));
         };
+        // explicit imports, then the file's own package, then wildcard imports
         match scheme.binding(&ctx.imports, name) {
             Some(Bind::Item { module, name: item }) => {
                 return self.module_item(ctx, &module, &item, "import");
             }
             Some(Bind::Module(_)) => return Ok(Found::Module),
             None => {}
+        }
+        if let Some(s) = scheme.package_scope(&self.db, ctx, name)? {
+            return Ok(Found::Hit(s, Tier::ImportScoped, "same-package"));
         }
         let wildcards: Vec<String> = ctx
             .imports
@@ -643,9 +619,24 @@ impl<'c> Resolver<'c> {
         })
     }
 
+    /// The impl block `block` is `ty`'s: its type name resolves, from the block's own file,
+    /// to `ty` (an unresolved or ambiguous name is not decided: not the type's).
+    fn impl_block_of(&mut self, block: i64, ty: &Sym) -> rusqlite::Result<bool> {
+        let Some(imp) = self.db.symbol(block)? else {
+            return Ok(false);
+        };
+        let Some((ctx, _)) = self.db.file_ctx(imp.file)? else {
+            return Ok(false);
+        };
+        Ok(matches!(self.lookup(&ctx, &imp.name)?, Found::Hit(t, ..) if t.id == ty.id))
+    }
+
     /// Where a Rust type's impl blocks are searched: its crate's source directory.
     fn impl_scope(family: Family, path: &str) -> Option<String> {
-        (family == Family::Rust).then(|| imports_rust::src_root(path).to_string())
+        family
+            .rules()
+            .crate_impls
+            .then(|| imports_rust::src_root(path).to_string())
     }
 
     /// The order a member is searched in on `ty`: its bases resolved through the scope
@@ -671,7 +662,13 @@ impl<'c> Resolver<'c> {
                 };
                 let src = Self::impl_scope(family, &tctx.path);
                 let mut ids = Vec::new();
-                for (hint, file) in self.db.base_hints(&t, src.as_deref())? {
+                for (hint, file, block) in self.db.base_hints(&t, src.as_deref())? {
+                    // an impl block found by the type's simple name may be another type's
+                    if let Some(block) = block
+                        && !self.impl_block_of(block, &t)?
+                    {
+                        continue;
+                    }
                     let ctx = match file == tctx.id {
                         true => tctx.clone(),
                         false => match self.db.file_ctx(file)? {
@@ -717,16 +714,26 @@ impl<'c> Resolver<'c> {
                 // impl blocks of the type in other files of the crate: one is the member,
                 // several are ambiguous (a rebinding by module is not decided)
                 let own = self.db.in_file(ty.file, name, &qname)?;
-                match own.is_empty() {
-                    true => self.db.impl_methods(
-                        imports_rust::src_root(&ctx.path),
-                        &ty.name,
-                        name,
-                        ty.file,
-                        2,
-                    )?,
-                    false => own,
+                if !own.is_empty() {
+                    return Ok(own);
                 }
+                let mut found = Vec::new();
+                for m in self.db.impl_methods(
+                    imports_rust::src_root(&ctx.path),
+                    &ty.name,
+                    name,
+                    ty.file,
+                    IMPL_CANDIDATES,
+                )? {
+                    // the query matches by the type's simple name: keep the blocks of `ty`
+                    if let Some(block) = m.container
+                        && self.impl_block_of(block, ty)?
+                    {
+                        found.push(m);
+                    }
+                }
+                found.truncate(2);
+                found
             }
             Family::Ts | Family::Python | Family::Java => self.db.in_file(ty.file, name, &qname)?,
         })
@@ -987,7 +994,7 @@ impl<'c> Resolver<'c> {
         let Some((ctx, _)) = self.db.file_ctx(class.file)? else {
             return Ok(Found::Drop(Cause::Unresolved));
         };
-        let Some((hint, _)) = self.db.base_hints(class, None)?.into_iter().next() else {
+        let Some((hint, ..)) = self.db.base_hints(class, None)?.into_iter().next() else {
             return Ok(Found::Drop(Cause::Unresolved));
         };
         Ok(retag(self.hint_in(&ctx, &hint)?, "super"))
