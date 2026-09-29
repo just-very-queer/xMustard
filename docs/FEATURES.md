@@ -142,8 +142,9 @@ one applies and the tool's arguments; an unknown tool is a JSON-RPC `-32602`.
   approved; SessionStart adds ground's summary. No hook allows, denies or rewrites a
   tool call, an answer past about 200 ms leaves Claude Code's own output, and the API
   starts no process for a hook. Under 4 concurrent clients on the Linux build box,
-  PreToolUse(Read) answered in p50 4.2 ms and p95 7.5 ms. The static hook client is
-  built from a source checkout
+  PreToolUse(Read) answered in p50 4.2 ms and p95 7.5 ms. The static hook client
+  ships in the release archive (`xmustard-hook`) and can also be built from a source
+  checkout
   ([plugin README](../integrations/claude-code/README.md)).
 - **Documented clients.** Claude Code, Codex, Pi and any client that reads
   `mcpServers` JSON. The labels `claude-code`, `codex`, `cursor`, `opencode`, `pi` and
@@ -206,17 +207,18 @@ The full posture is in [SECURITY](SECURITY.md).
 
 ## Install
 
-- **Prebuilt archives** for macOS arm64 and Linux x86_64, each with five binaries and a
-  `.sha256` file, built by the tag-triggered release workflow. The macOS binaries carry
-  only an ad-hoc signature (no Developer ID). The Linux archive is built on Ubuntu
-  22.04, so its Rust binaries need glibc 2.35 at most (the exact floor was not
-  measured); the Go binaries are static.
+- **Prebuilt archives** for macOS arm64 and Linux x86_64, each with six binaries
+  (including the Claude Code plugin's `xmustard-hook`) and a `.sha256` file, built by
+  the tag-triggered release workflow. The macOS binaries carry only an ad-hoc
+  signature (no Developer ID). The Linux archive is built on Ubuntu 22.04, so its
+  Rust binaries need glibc 2.35 at most (the exact floor was not measured); the Go
+  binaries are static.
 - **From source** with `make build` (Go 1.26, Rust stable), or `make release` for the
   archive.
-- **Homebrew.** `packaging/homebrew/xmustard.rb` installs the v0.1.0 archive on macOS
-  arm64 and builds the v0.1.0 tag from source elsewhere, until
-  `packaging/homebrew/bump.sh` moves it to a newer release. Current Homebrew installs
-  formulae only from a tap, and there is no public tap yet.
+- **Homebrew.** `packaging/homebrew/xmustard.rb` installs the v0.1.1 archive on macOS
+  arm64 and builds the v0.1.1 tag from source elsewhere;
+  `packaging/homebrew/bump.sh` moves it to a newer release when one ships. Current
+  Homebrew installs formulae only from a tap, and there is no public tap yet.
 
 ## Planned, not in v0.1.1
 
