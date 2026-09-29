@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -61,6 +62,11 @@ type SessionInput struct {
 	Worktree       string
 	HeadSHA        string
 	RetentionClass string
+	// At (RFC 3339) dates an imported session: the time it started, or a later time
+	// its last_seen_at moves forward to. Empty is now.
+	At string
+	// Summary is set only on the insert of an imported session.
+	Summary string
 }
 
 // SessionFilter pages a workspace's sessions, most recently seen first.
@@ -108,6 +114,8 @@ type SessionEventInput struct {
 	Body           string
 	Data           any
 	RetentionClass string // default: the session's class
+	// At (RFC 3339) is when the event happened, for an imported one. Empty is now.
+	At string
 }
 
 // SessionEventFilter pages one session's ledger by sequence.
@@ -116,6 +124,14 @@ type SessionEventFilter struct {
 	AfterSeq  int64
 	Kinds     []string
 	Limit     int
+}
+
+// EventsAround reads the ledger rows around one event of a session (a hit's
+// expansion): up to Before rows before Seq, the row itself and up to After rows after.
+type EventsAround struct {
+	SessionID     string
+	Seq           int64
+	Before, After int
 }
 
 // RecentEventFilter reads the newest ledger rows of some kinds, newest first: of one
@@ -139,6 +155,7 @@ type SessionReader interface {
 	ListSessions(ctx context.Context, f SessionFilter) ([]Session, error)
 	ListSessionEvents(ctx context.Context, f SessionEventFilter) ([]SessionEvent, error)
 	RecentSessionEvents(ctx context.Context, f RecentEventFilter) ([]SessionEvent, error)
+	SessionEventsAround(ctx context.Context, f EventsAround) ([]SessionEvent, error)
 }
 
 // SessionWriter writes sessions and ledger rows. Ledger rows are immutable: they are
@@ -247,6 +264,23 @@ func (r *reader) sessionEvents(ctx context.Context, clause string, args ...any) 
 	return out, rows.Err()
 }
 
+// SessionEventsAround returns the rows around one event in sequence order.
+func (r *reader) SessionEventsAround(ctx context.Context, f EventsAround) ([]SessionEvent, error) {
+	if f.SessionID == "" {
+		return nil, fmt.Errorf("%w: session id is required", ErrInvalid)
+	}
+	before, err := r.sessionEvents(ctx, "session_id = ? AND seq < ? ORDER BY seq DESC LIMIT ?", f.SessionID, f.Seq, clampLimit(f.Before))
+	if err != nil {
+		return nil, err
+	}
+	after, err := r.sessionEvents(ctx, "session_id = ? AND seq >= ? ORDER BY seq LIMIT ?", f.SessionID, f.Seq, clampLimit(f.After+1))
+	if err != nil {
+		return nil, err
+	}
+	slices.Reverse(before)
+	return append(before, after...), nil
+}
+
 // defaultRecentSessions is how many recently seen sessions a workspace-wide
 // RecentSessionEvents reads.
 const defaultRecentSessions = 16
@@ -302,14 +336,17 @@ func (t *txn) UpsertSession(ctx context.Context, in SessionInput, actor Actor) (
 		}
 	}
 	principal := strings.TrimSpace(actor.Principal)
-	now := t.nowText()
+	now, err := t.eventTime(in.At)
+	if err != nil {
+		return Session{}, err
+	}
 	existing, err := t.GetSession(ctx, in.ID)
 	switch {
 	case err == nil:
 		if existing.WorkspaceID != in.WorkspaceID || existing.Principal != principal {
 			return Session{}, fmt.Errorf("%w: session %s belongs to another workspace or principal", ErrConflict, in.ID)
 		}
-		if _, err := t.exec(ctx, `UPDATE sessions SET last_seen_at = ?,
+		if _, err := t.exec(ctx, `UPDATE sessions SET last_seen_at = max(last_seen_at, ?),
 			head_sha = CASE WHEN ? <> '' THEN ? ELSE head_sha END,
 			branch = CASE WHEN ? <> '' THEN ? ELSE branch END,
 			worktree = CASE WHEN ? <> '' THEN ? ELSE worktree END WHERE id = ?`,
@@ -322,10 +359,10 @@ func (t *txn) UpsertSession(ctx context.Context, in SessionInput, actor Actor) (
 			retention = "session"
 		}
 		if _, err := t.exec(ctx, `INSERT INTO sessions (id, workspace_id, client, principal, principal_key, agent_id,
-			execution_key, parent_id, thread_id, branch, worktree, head_sha, started_at, last_seen_at, retention_class)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+			execution_key, parent_id, thread_id, branch, worktree, head_sha, started_at, last_seen_at, retention_class, summary)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 			in.ID, in.WorkspaceID, in.Client, principal, principalKey(principal), in.AgentID, in.ExecutionKey,
-			in.ParentID, in.ThreadID, in.Branch, in.Worktree, in.HeadSHA, now, now, retention); err != nil {
+			in.ParentID, in.ThreadID, in.Branch, in.Worktree, in.HeadSHA, now, now, retention, in.Summary); err != nil {
 			return Session{}, err
 		}
 	default:
@@ -404,7 +441,10 @@ func (t *txn) AppendSessionEvent(ctx context.Context, in SessionEventInput, acto
 	if in.Body != "" {
 		body, digest = in.Body, Digest(in.Body)
 	}
-	now := t.nowText()
+	now, err := t.eventTime(in.At)
+	if err != nil {
+		return SessionEvent{}, err
+	}
 	res, err := t.exec(ctx, `INSERT INTO session_events (session_id, workspace_id, kind, record_class, tool, args_digest,
 		handle, status, path, entry_id, role, body, body_digest, data, at, retention_class)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -417,7 +457,7 @@ func (t *txn) AppendSessionEvent(ctx context.Context, in SessionEventInput, acto
 	if err != nil {
 		return SessionEvent{}, err
 	}
-	if _, err := t.exec(ctx, "UPDATE sessions SET last_seen_at = ? WHERE id = ?", now, in.SessionID); err != nil {
+	if _, err := t.exec(ctx, "UPDATE sessions SET last_seen_at = max(last_seen_at, ?) WHERE id = ?", now, in.SessionID); err != nil {
 		return SessionEvent{}, err
 	}
 	evs, err := t.ListSessionEvents(ctx, SessionEventFilter{SessionID: in.SessionID, AfterSeq: seq - 1, Limit: 1})
@@ -454,4 +494,13 @@ func (t *txn) TrimSessionEvents(ctx context.Context, sessionID string, kinds []s
 		return 0, err
 	}
 	return rowsAffected(res), nil
+}
+
+// eventTime is the canonical time of a row: at when given (an imported row's own
+// time), else now.
+func (t *txn) eventTime(at string) (string, error) {
+	if at == "" {
+		return t.nowText(), nil
+	}
+	return inputTime("at", at)
 }

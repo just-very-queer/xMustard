@@ -25,9 +25,9 @@ var whyFailedTool = &Tool{
 	Advanced: []Arg{
 		{Name: "command", Type: typeString, MaxLen: 4096, Desc: "admins, if the operator enabled commands: test/build/lint argv to run"},
 		{Name: "cwd", Type: typeString, MaxLen: 1024, Desc: "repo-relative directory to run command in"},
-		{Name: "timeout_seconds", Type: typeInteger, Min: 1, Max: maxWhyFailedTimeout, Desc: "seconds before command's process group is killed (default 45)"},
-		{Name: "evidence_handle", Type: typeString, MaxLen: 256, Desc: "retained tool output to explain from its last MiB; records the outcome"},
-		{Name: "log", Type: typeString, MaxLen: 1 << 20, Desc: "pasted log to explain from its last MiB; records the outcome"},
+		{Name: "timeout_seconds", Type: typeInteger, Min: 1, Max: maxWhyFailedTimeout, Desc: "command kill timeout (default 45)"},
+		{Name: "evidence_handle", Type: typeString, MaxLen: 256, Desc: "retained tool output (last MiB); records the outcome"},
+		{Name: "log", Type: typeString, MaxLen: 1 << 20, Desc: "pasted log (last MiB); records the outcome"},
 	},
 	Doc: "### Command mode\n\n`command` is off unless the server's operator started it with XMUSTARD_WHY_FAILED_COMMANDS=1, " +
 		"and then runs only for an authenticated admin; every other caller gets 403. Enabled, it is trusted execution of " +

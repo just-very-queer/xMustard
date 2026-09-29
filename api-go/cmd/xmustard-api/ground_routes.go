@@ -56,8 +56,14 @@ func registerGroundRoutes(mux routeRegistrar) {
 				"argument": "session_id"})
 			return
 		}
+		query := strings.TrimSpace(q.Get("query"))
+		if len(query) > maxGroundQuery || !printable(query) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("query must be printable and at most %d bytes", maxGroundQuery),
+				"argument": "query"})
+			return
+		}
 		result, err := workspaceops.BuildSessionGroundingWith(r.Context(), dataDir(), r.PathValue("workspace_id"),
-			workspaceops.GroundOptions{Caller: callerOf(r).ID, SessionID: session, Since: since})
+			workspaceops.GroundOptions{Caller: callerOf(r).ID, SessionID: session, Since: since, Query: query})
 		if err != nil {
 			respondError(w, err)
 			return
@@ -89,6 +95,9 @@ func registerGroundRoutes(mux routeRegistrar) {
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})
 }
+
+// maxGroundQuery bounds ground's query (relevant sessions).
+const maxGroundQuery = 512
 
 // maxGroundSessionID bounds ground's session_id (an execution key is at most 200 bytes).
 const maxGroundSessionID = 200

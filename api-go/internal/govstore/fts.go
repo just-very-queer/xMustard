@@ -75,7 +75,10 @@ type TranscriptQuery struct {
 	SessionID   string
 	Since       string
 	Until       string
-	Limit       int
+	// Agent keeps sessions of one client or agent id (claude-code, codex, ...);
+	// Conversation keeps one execution key or thread.
+	Agent, Conversation string
+	Limit               int
 }
 
 // TranscriptHit is one ranked ledger row with a snippet around the first match.
@@ -87,6 +90,11 @@ type TranscriptHit struct {
 	At        string  `json:"at"`
 	Score     float64 `json:"score"`
 	Snippet   string  `json:"snippet"`
+	// RecordClass is raw for observations (transcript text, prompts), derived for a
+	// snapshot or an automatic capsule.
+	RecordClass  string `json:"record_class"`
+	Client       string `json:"client,omitempty"`
+	ExecutionKey string `json:"execution_key,omitempty"`
 }
 
 // SearchReader runs full-text queries.
@@ -221,9 +229,19 @@ func (r *reader) SearchTranscripts(ctx context.Context, q TranscriptQuery) ([]Tr
 	}
 	where := []string{"transcript_fts MATCH ?", "s.workspace_id = ?"}
 	args := []any{match, q.WorkspaceID}
-	if q.SessionID != "" {
-		where = append(where, "s.session_id = ?")
-		args = append(args, q.SessionID)
+	for _, f := range []struct{ clause, val string }{
+		{"s.session_id = ?", q.SessionID},
+		{"(ss.client = ? OR ss.agent_id = ?)", q.Agent},
+		{"(ss.execution_key = ? OR ss.thread_id = ?)", q.Conversation},
+	} {
+		if f.val == "" {
+			continue
+		}
+		where = append(where, f.clause)
+		args = append(args, f.val)
+		if strings.Count(f.clause, "?") == 2 {
+			args = append(args, f.val)
+		}
 	}
 	for _, b := range []struct{ op, val, field string }{{">=", q.Since, "since"}, {"<", q.Until, "until"}} {
 		v, err := inputTime(b.field, b.val)
@@ -236,8 +254,9 @@ func (r *reader) SearchTranscripts(ctx context.Context, q TranscriptQuery) ([]Tr
 		}
 	}
 	args = append(args, clampLimit(q.Limit))
-	rows, err := r.query(ctx, `SELECT s.seq, s.session_id, s.kind, s.role, s.at, -bm25(transcript_fts), coalesce(s.body, '')
-		FROM transcript_fts JOIN session_events s ON s.seq = transcript_fts.rowid
+	rows, err := r.query(ctx, `SELECT s.seq, s.session_id, s.kind, s.role, s.at, -bm25(transcript_fts), coalesce(s.body, ''),
+		s.record_class, ss.client, ss.execution_key
+		FROM transcript_fts JOIN session_events s ON s.seq = transcript_fts.rowid JOIN sessions ss ON ss.id = s.session_id
 		WHERE `+strings.Join(where, " AND ")+` ORDER BY bm25(transcript_fts), s.seq LIMIT ?`, args...)
 	if err != nil {
 		return nil, err
@@ -247,7 +266,7 @@ func (r *reader) SearchTranscripts(ctx context.Context, q TranscriptQuery) ([]Tr
 	for rows.Next() {
 		var h TranscriptHit
 		var body string
-		if err := rows.Scan(&h.Seq, &h.SessionID, &h.Kind, &h.Role, &h.At, &h.Score, &body); err != nil {
+		if err := rows.Scan(&h.Seq, &h.SessionID, &h.Kind, &h.Role, &h.At, &h.Score, &body, &h.RecordClass, &h.Client, &h.ExecutionKey); err != nil {
 			return nil, err
 		}
 		h.Snippet = snippet(body, terms, 160)

@@ -28,8 +28,8 @@ var recallTool = &Tool{
 	Description: "Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified|single_agent|self_asserted_open_mode (no auth/quorum). conflicts: claim/contradiction/path overlap.",
 	Args: []Arg{
 		workspaceArg,
-		{Name: "q", Type: typeString, Desc: "task query to rank memories by"},
-		{Name: "paths", Type: typeString, Desc: "comma-separated repo-relative files to focus on"},
+		{Name: "q", Type: typeString},
+		{Name: "paths", Type: typeString, Desc: "comma-separated files to focus on"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxRecallLimit, Desc: "max memories (default 8)"},
 	},
 	// Fetch by id (WS-19A), and filters, the verification queue, disclosure and the

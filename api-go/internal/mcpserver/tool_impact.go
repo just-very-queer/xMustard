@@ -11,7 +11,7 @@ var impactTool = &Tool{
 	Description: "Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
 	Args: []Arg{
 		workspaceArg,
-		{Name: "symbol", Type: typeString, Desc: "symbol to compute blast radius for"},
+		{Name: "symbol", Type: typeString},
 		{Name: "path", Type: typeString, MaxLen: maxPathArg, Desc: "a repo-relative file"},
 		{Name: "from", Type: typeString, Desc: "trace path from this symbol"},
 		{Name: "to", Type: typeString, Desc: "trace path to this symbol"},
@@ -30,10 +30,10 @@ var impactTool = &Tool{
 		{Name: "offset", Type: typeInteger, Min: 0, Max: 50000, Desc: "items skipped per depth tier"},
 		{Name: "summary_only", Type: typeBoolean, Desc: "counts, risk and envelope without items"},
 		{Name: "timeout_ms", Type: typeInteger, Min: 1, Max: 60000, Desc: "walk budget (default 10000)"},
-		{Name: "scope", Type: typeString, Enum: workspaceops.ChangeScopes, Desc: "symbols a diff touches, and their dependents"},
+		{Name: "scope", Type: typeString, Enum: workspaceops.ChangeScopes, Desc: "symbols a diff touches, and dependents"},
 		{Name: "base", Type: typeString, MaxLen: 256, Desc: "scope=compare|range: base revision"},
 		{Name: "head", Type: typeString, MaxLen: 256, Desc: "scope=compare|commit|range: head revision"},
-		{Name: "worktree", Type: typeString, MaxLen: 4096, Desc: "another checkout of this repository to diff"},
+		{Name: "worktree", Type: typeString, MaxLen: 4096, Desc: "another checkout to diff"},
 	}, budgetArgs("impact")...),
 	Doc: impactDoc + "\n" + budgetSpec("impact").Markdown(),
 	// depth is the API's query name; a UID goes where a symbol does

@@ -15,10 +15,10 @@ var searchTool = &Tool{
 	Description: "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path.",
 	Args: []Arg{
 		workspaceArg,
-		{Name: "q", Type: typeString, Required: true, Desc: "the search query"},
+		{Name: "q", Type: typeString, Required: true},
 		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "pattern", "symbol"}, Desc: "hybrid (default), pattern (ast-grep) or symbol"},
 		{Name: "lang", Type: typeString, Desc: "language hint for pattern mode"},
-		{Name: "seed", Type: typeString, Desc: "symbol to anchor the graph-proximity lane"},
+		{Name: "seed", Type: typeString, Desc: "graph-proximity anchor symbol"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits (default 10)"},
 	},
 	// Paging and path filters (WS-18), the symbol lookup's options and the output

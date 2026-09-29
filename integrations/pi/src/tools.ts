@@ -81,8 +81,8 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			"Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified|single_agent|self_asserted_open_mode (no auth/quorum). conflicts: claim/contradiction/path overlap.",
 		args: [
 			workspaceArg,
-			{ name: "q", type: "string", desc: "task query to rank memories by" },
-			{ name: "paths", type: "string", desc: "comma-separated repo-relative files to focus on" },
+			{ name: "q", type: "string", desc: "" },
+			{ name: "paths", type: "string", desc: "comma-separated files to focus on" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max memories (default 8)" },
 		],
 		// the MCP tool always budgets recall (max_chars, default 4000; tool_recall.go);
@@ -138,10 +138,10 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path.",
 		args: [
 			workspaceArg,
-			{ name: "q", type: "string", required: true, desc: "the search query" },
+			{ name: "q", type: "string", required: true, desc: "" },
 			{ name: "mode", type: "string", enum: ["hybrid", "pattern", "symbol"], desc: "hybrid (default), pattern (ast-grep) or symbol" },
 			{ name: "lang", type: "string", desc: "language hint for pattern mode" },
-			{ name: "seed", type: "string", desc: "symbol to anchor the graph-proximity lane" },
+			{ name: "seed", type: "string", desc: "graph-proximity anchor symbol" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 10)" },
 		],
 		build: (a) => ({
@@ -159,7 +159,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		description: "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.",
 		// symbol=, uid=, depth and the output budget are MCP advanced arguments this closed
 		// schema does not carry; path answers a file or a directory.
-		args: [workspaceArg, { name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file or directory path" }],
+		args: [workspaceArg, { name: "path", type: "string", maxLength: 4096, desc: "file or directory path" }],
 		build: (a) => ({ method: "GET", path: query(ws(a, "/explain-path"), "path", str(a, "path")) }),
 	},
 	{
@@ -168,7 +168,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			"Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
 		args: [
 			workspaceArg,
-			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
+			{ name: "symbol", type: "string", desc: "" },
 			{ name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file" },
 			{ name: "from", type: "string", desc: "trace path from this symbol" },
 			{ name: "to", type: "string", desc: "trace path to this symbol" },
