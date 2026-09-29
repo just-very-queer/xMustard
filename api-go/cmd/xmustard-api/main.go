@@ -60,12 +60,12 @@ func main() {
 		log.Fatal(err)
 	}
 	applyRuntimeHygiene()
-	// the watcher's changed paths are looked up in memory's anchor index (WS-28)
-	workspaceops.ObserveIndexedPaths(workspaceops.InvalidateWatchedRoot(dataDir()))
 	// Every request context derives from baseCtx, which shutdown cancels after the
 	// bounded drain so in-flight helper children end with the API.
 	baseCtx, cancelBase := context.WithCancel(context.Background())
 	defer cancelBase()
+	// the watcher's changed paths are looked up in memory's anchor index (WS-28)
+	workspaceops.ObserveIndexedPaths(workspaceops.InvalidateWatchedRoot(baseCtx, dataDir()))
 	srv := &http.Server{
 		Addr:        cfg.addr(),
 		Handler:     buildHandler(cfg, newAPIHandlerFor(cfg.posture)),

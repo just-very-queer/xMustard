@@ -484,6 +484,8 @@ type scoredEntry struct {
 	entry   ContextEntry
 	rank    govstore.RankEntry
 	details ScoreDetails
+	// shift moves the sort key off details.Total: diversification's pick order (WS-28).
+	shift float64
 	// withheld: the entry changed between ranking and loading, so it is not returned.
 	withheld bool
 }
@@ -493,8 +495,8 @@ type scoredEntry struct {
 func sortByScore(s []scoredEntry) {
 	sort.SliceStable(s, func(a, b int) bool {
 		x, y := s[a], s[b]
-		if x.details.Total != y.details.Total {
-			return x.details.Total > y.details.Total
+		if kx, ky := x.details.Total+x.shift, y.details.Total+y.shift; kx != ky {
+			return kx > ky
 		}
 		if x.rank.UpdatedAt != y.rank.UpdatedAt {
 			return x.rank.UpdatedAt > y.rank.UpdatedAt
@@ -671,27 +673,13 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
 		"generated_at":           nowUTC(),
 	}
-	for name, v := range map[string]any{"seed": nilIfEmptyMap(rk.seed), "as_of": nilIfEmpty(req.AsOf)} {
-		if v != nil {
-			res[name] = v
-		}
+	if len(rk.seed) > 0 {
+		res["seed"] = rk.seed
+	}
+	if req.AsOf != "" {
+		res["as_of"] = req.AsOf
 	}
 	return res, recallPage{candidates: candidates, span: span, cursor: cur, limit: limit, total: len(rk.ranked), claims: claims}, mismatched, nil
-}
-
-func nilIfEmptyMap(m map[string]any) any {
-	if len(m) == 0 {
-		return nil
-	}
-	return m
-}
-
-// nilIfEmpty is s, or nil when it is empty, so an absent argument leaves no member.
-func nilIfEmpty(s string) any {
-	if s == "" {
-		return nil
-	}
-	return s
 }
 
 // recallSpan is the part of a ranking one page reads: it loads [lo, hi) and scans

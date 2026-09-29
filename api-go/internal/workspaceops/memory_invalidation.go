@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"slices"
 	"strings"
@@ -50,6 +52,8 @@ type InvalidationReport struct {
 	Paths   int      `json:"paths"`
 	Checked int      `json:"anchors_checked"`
 	Marked  []string `json:"marked"`
+	// Truncated: more than maxInvalidationAnchors anchors lay in the paths; the rest were not checked.
+	Truncated bool `json:"truncated,omitempty"`
 }
 
 // anchorState is what an anchor hashes to now, in the baseline's own terms.
@@ -62,21 +66,23 @@ var missingState = anchorState{state: govstore.BaselineMissing}
 var anchorRehashers = map[string]struct {
 	baseline string
 	current  func(*rehashSession, govstore.Anchor) (anchorState, bool)
+	// atPromotion: the baseline is captured by the promotion itself, not afterwards.
+	atPromotion bool
 }{
-	govstore.AnchorPath:   {baselineFileKind, (*rehashSession).path},
-	govstore.AnchorSymbol: {baselineSymbolBody, (*rehashSession).symbol},
+	govstore.AnchorPath:   {baselineFileKind, (*rehashSession).path, true},
+	govstore.AnchorSymbol: {baselineSymbolBody, (*rehashSession).symbol, false},
 }
 
 // rehashSession caches the files and outlines one invalidation reads.
 type rehashSession struct {
 	ctx               context.Context
 	root, workspaceID string
-	files             map[string]*string
-	spans             map[string]symbolSpans
+	files             map[string]fileRead
+	outlines          map[string]outlineRead
 }
 
 func newRehashSession(ctx context.Context, root, workspaceID string) *rehashSession {
-	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID, files: map[string]*string{}, spans: map[string]symbolSpans{}}
+	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID, files: map[string]fileRead{}, outlines: map[string]outlineRead{}}
 }
 
 // path hashes a file's content; a file that is missing or unreadable is missing.
@@ -87,46 +93,70 @@ func (s *rehashSession) path(a govstore.Anchor) (anchorState, bool) {
 	return missingState, true
 }
 
-// text is a file's content, read once; nil when it is missing, too large or unreadable.
-func (s *rehashSession) text(rel string) *string {
-	if t, ok := s.files[rel]; ok {
-		return t
+// fileRead is one read of a file: its text, or why there is none. A file that is absent
+// is missing; one too large or unreadable is unknown, not missing.
+type fileRead struct {
+	text    string
+	ok      bool
+	missing bool
+}
+
+// text reads a file once.
+func (s *rehashSession) text(rel string) fileRead {
+	if r, ok := s.files[rel]; ok {
+		return r
 	}
-	var t *string
-	if content, ok := readWorkspaceText(s.root, rel, maxSymbolFileBytes); ok {
-		t = &content
+	r := fileRead{}
+	if r.text, r.ok = readWorkspaceText(s.root, rel, maxSymbolFileBytes); !r.ok {
+		f, err := openWorkspaceFileBeneath(s.root, rel)
+		if err == nil {
+			f.Close()
+		}
+		r.missing = errors.Is(err, fs.ErrNotExist)
 	}
-	s.files[rel] = t
-	return t
+	s.files[rel] = r
+	return r
 }
 
 // symbol hashes the lines of the declaration a symbol anchor names in the file its uid
-// gives. A symbol that no longer exists there, or a file that is gone, is missing; an
-// outline the code index could not give is unknown.
+// gives. A symbol that no longer exists in a complete outline, or a file that is gone,
+// is missing; an outline the code index could not give or gave in part, or a file too
+// large or unreadable, is unknown.
 func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	file, _, ok := strings.Cut(a.SymbolUID, "#")
 	if !ok || file == "" {
 		return anchorState{}, false
 	}
-	text := s.text(file)
-	if text == nil {
-		return missingState, true
+	src := s.text(file)
+	if !src.ok {
+		return missingState, src.missing
 	}
-	spans, ok := s.spans[file]
+	outline, ok := s.outlines[file]
 	if !ok {
-		var err error
-		if spans, err = symbolOutline(s.ctx, s.root, s.workspaceID, file); err != nil {
+		spans, err := symbolOutline(s.ctx, s.root, s.workspaceID, file)
+		outline = outlineRead{spans: spans, incomplete: errors.Is(err, errOutlineIncomplete)}
+		if err != nil && !outline.incomplete {
 			return anchorState{}, false
 		}
-		s.spans[file] = spans
+		s.outlines[file] = outline
 	}
-	body, found := spans.body(*text, a.Value)
+	body, found := outline.spans.body(src.text, a.Value)
 	if !found {
-		return missingState, true
+		return missingState, !outline.incomplete
 	}
 	sum := sha256.Sum256([]byte(body))
 	return anchorState{govstore.BaselineHash, hex.EncodeToString(sum[:])}, true
 }
+
+// outlineRead is a file's outline as read; incomplete when the code index cut it short.
+type outlineRead struct {
+	spans      symbolSpans
+	incomplete bool
+}
+
+// errOutlineIncomplete is returned with the spans that were read when the index cut the
+// outline short: a name missing from it is then unknown, not gone.
+var errOutlineIncomplete = errors.New("the code index cut the outline short")
 
 // symbolSpan is one declaration of a file: its name path and 1-based line range.
 type symbolSpan struct {
@@ -175,8 +205,9 @@ func symbolOutlineWithCore(ctx context.Context, root, workspaceID, rel string) (
 		return nil, err
 	}
 	var res struct {
-		Kind    string        `json:"kind"`
-		Symbols []outlineNode `json:"symbols"`
+		Kind      string        `json:"kind"`
+		Symbols   []outlineNode `json:"symbols"`
+		Truncated bool          `json:"symbols_truncated"`
 	}
 	if err := json.Unmarshal(raw, &res); err != nil {
 		return nil, err
@@ -193,6 +224,9 @@ func symbolOutlineWithCore(ctx context.Context, root, workspaceID, rel string) (
 		}
 	}
 	walk(res.Symbols)
+	if res.Truncated {
+		return out, errOutlineIncomplete
+	}
 	return out, nil
 }
 
@@ -223,10 +257,13 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 	defer cancel()
 	var anchors []govstore.Anchor
 	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) (err error) {
-		anchors, err = r.AnchorsInPaths(ctx, workspaceID, paths, maxInvalidationAnchors)
+		anchors, err = r.AnchorsInPaths(ctx, workspaceID, paths, maxInvalidationAnchors+1)
 		return err
 	}); err != nil {
 		return rep, err
+	}
+	if rep.Truncated = len(anchors) > maxInvalidationAnchors; rep.Truncated {
+		anchors = anchors[:maxInvalidationAnchors]
 	}
 	session := newRehashSession(ctx, root, workspaceID)
 	hit := map[string][]govstore.AnchorRef{}
@@ -299,8 +336,8 @@ func baselineSymbolAnchors(dataDir, workspaceID, entryID string) {
 	var baselines []govstore.Baseline
 	for _, a := range anchors {
 		rehash, ok := anchorRehashers[a.Kind]
-		if !ok || a.Kind == govstore.AnchorPath {
-			continue // file baselines are captured with the promotion itself
+		if !ok || rehash.atPromotion {
+			continue
 		}
 		if cur, known := rehash.current(session, a); known {
 			baselines = append(baselines, govstore.Baseline{Kind: a.Kind, Value: a.Value, State: cur.state, Hash: cur.hash,
@@ -394,7 +431,7 @@ type AtRiskMemory struct {
 // readAtRisk lists the served memories marked needs_reverify, the longest at risk first.
 func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID string) ([]AtRiskMemory, bool, error) {
 	entries, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
-		Limit: maxAtRisk + 1})
+		LongestStaleFirst: true, Limit: maxAtRisk + 1})
 	if err != nil {
 		return nil, false, err
 	}
@@ -440,17 +477,52 @@ var indexedPathsObserver func(root string, paths []string)
 func ObserveIndexedPaths(f func(root string, paths []string)) { indexedPathsObserver = f }
 
 // InvalidateWatchedRoot is the observer the API installs: it invalidates memory in every
-// workspace registered at root. A failure is logged by the caller's log, not fatal.
-func InvalidateWatchedRoot(dataDir string) func(root string, paths []string) {
+// workspace registered at root, under ctx (the API's, so shutdown cancels it). Batches
+// of one root are serialized and coalesced: paths that arrive while a pass runs join one
+// pending set that the next pass takes, so quick successive saves never overlap.
+func InvalidateWatchedRoot(ctx context.Context, dataDir string) func(root string, paths []string) {
+	var mu sync.Mutex
+	pending := map[string]map[string]bool{} // root -> paths waiting; a key present means a pass is running
 	return func(root string, paths []string) {
-		recs, err := ListWorkspaces(dataDir)
-		if err != nil {
+		mu.Lock()
+		set, running := pending[root]
+		if !running {
+			set = map[string]bool{}
+			pending[root] = set
+		}
+		for _, p := range paths {
+			set[p] = true
+		}
+		mu.Unlock()
+		if running {
 			return
 		}
-		for _, rec := range recs {
-			if ws, err := resolveWorkspace(dataDir, rec.WorkspaceID); err == nil && canonicalRoot(ws.Root) == canonicalRoot(root) {
-				_, _ = InvalidateMemory(context.Background(), dataDir, rec.WorkspaceID, paths)
+		go func() {
+			for {
+				mu.Lock()
+				batch := slices.Sorted(maps.Keys(pending[root]))
+				if len(batch) == 0 || ctx.Err() != nil {
+					delete(pending, root)
+					mu.Unlock()
+					return
+				}
+				clear(pending[root])
+				mu.Unlock()
+				invalidateRoot(ctx, dataDir, root, batch)
 			}
+		}()
+	}
+}
+
+// invalidateRoot invalidates memory in every workspace registered at root.
+func invalidateRoot(ctx context.Context, dataDir, root string, paths []string) {
+	recs, err := ListWorkspaces(dataDir)
+	if err != nil {
+		return
+	}
+	for _, rec := range recs {
+		if ws, err := resolveWorkspace(dataDir, rec.WorkspaceID); err == nil && canonicalRoot(ws.Root) == canonicalRoot(root) {
+			_, _ = InvalidateMemory(ctx, dataDir, rec.WorkspaceID, paths)
 		}
 	}
 }
@@ -462,13 +534,19 @@ var groundChangedFiles = workingChangedFiles
 // lists what is at risk: the working tree's changed files, and the paths a move of HEAD
 // since ground last looked changed. Changes that cannot be read are left to ground's
 // own index section to report; only a failure to look them up is returned.
-func invalidateForGround(ctx context.Context, dataDir, workspaceID string) error {
+func invalidateForGround(ctx context.Context, dataDir, workspaceID string, changes json.RawMessage) error {
 	root := contextRoot(dataDir, workspaceID)
 	if root == "" {
 		return nil
 	}
-	changed, _ := groundChangedFiles(ctx, dataDir, workspaceID)
+	changed, _ := decodeChangedFiles(changes)
+	if changes == nil {
+		changed, _ = groundChangedFiles(ctx, dataDir, workspaceID)
+	}
 	changed = append(changed, headMovedPaths(ctx, dataDir, workspaceID, root)...)
-	_, err := InvalidateMemory(ctx, dataDir, workspaceID, changed)
+	rep, err := InvalidateMemory(ctx, dataDir, workspaceID, changed)
+	if err == nil && rep.Truncated {
+		err = fmt.Errorf("more than %d anchors lie in the changed files; the rest were not checked", maxInvalidationAnchors)
+	}
 	return err
 }

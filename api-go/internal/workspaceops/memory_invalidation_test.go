@@ -178,12 +178,12 @@ func TestGroundListsAtRiskMemories(t *testing.T) {
 	t.Cleanup(func() { groundChangedFiles = orig })
 	groundChangedFiles = func(context.Context, string, string) ([]string, error) { return []string{"srv.go"}, nil }
 
-	scan, err := scanGroundMemory(f.dir, f.ws, "caller", groundStaleWindow, noSince, true)
+	scan, err := scanGroundMemory(f.dir, f.ws, "caller", groundStaleWindow, noSince, groundMemoryOptions{invalidate: true})
 	if err != nil || len(scan.atRisk) != 0 {
 		t.Fatalf("nothing changed yet: %+v, %v", scan.atRisk, err)
 	}
 	writeRepoFile(t, f.root, "srv.go", strings.Replace(srvSource, "8081", "8082", 1))
-	scan, err = scanGroundMemory(f.dir, f.ws, "caller", groundStaleWindow, noSince, true)
+	scan, err = scanGroundMemory(f.dir, f.ws, "caller", groundStaleWindow, noSince, groundMemoryOptions{invalidate: true})
 	if err != nil || len(scan.atRisk) != 1 || scan.invalidationErr != nil {
 		t.Fatalf("at risk %+v, %v, %v", scan.atRisk, err, scan.invalidationErr)
 	}
@@ -352,11 +352,11 @@ func TestRecallSeedRanksByGraphDistance(t *testing.T) {
 	var walked []string
 	seedNeighbours = func(_ context.Context, _, _, seed string) (seedHood, error) {
 		walked = append(walked, seed)
-		return seedHood{Found: true, Files: map[string]int{"a.go": 0, "b.go": 1, "far/c.go": 3},
-			Symbols: map[string]int{"a.go#A": 0}}, nil
+		return seedHood{Found: true, Files: map[string]int{"p/a.go": 0, "q/b.go": 1, "r/c.go": 3},
+			Symbols: map[string]int{"p/a.go#A": 0}}, nil
 	}
 	ids := map[string]string{}
-	for path, text := range map[string]string{"far/c.go": "far away note", "b.go": "one hop note", "a.go": "on the seed note", "elsewhere.go": "unrelated note"} {
+	for path, text := range map[string]string{"r/c.go": "far away note", "q/b.go": "one hop note", "p/a.go": "on the seed note", "elsewhere.go": "unrelated note"} {
 		e := approvedBy(t, dir, ws, "author", "approver", "agent", text+" for "+path)
 		// approvedBy declares no paths: attach one through the store as an anchor set
 		storeUpdate(t, dir, ws, func(tx govstore.Tx) error {
@@ -376,7 +376,7 @@ func TestRecallSeedRanksByGraphDistance(t *testing.T) {
 			t.Fatalf("no graph distance: %+v", e.ScoreDetails)
 		}
 	}
-	want := []string{ids["a.go"], ids["b.go"], ids["far/c.go"]}
+	want := []string{ids["p/a.go"], ids["q/b.go"], ids["r/c.go"]}
 	if !slices.Equal(order, want) {
 		t.Fatalf("order %v, want %v (walked %v)", order, want, walked)
 	}
@@ -459,5 +459,63 @@ func TestImpactAndExplainCarryMemories(t *testing.T) {
 	}
 	if got := WithImpactMemories(context.Background(), f.dir, f.ws, "reader", "", nil, json.RawMessage(`[1]`)); string(got) != `[1]` {
 		t.Fatalf("a result that is not an object changed: %s", got)
+	}
+}
+
+// The diversified order is what recall returns: the per-block re-sort keeps it.
+func TestRecallSeedPageIsDiversified(t *testing.T) {
+	dir, ws, _, _ := reviewRepo(t)
+	orig, origResolve := seedNeighbours, resolveSymbols
+	t.Cleanup(func() { seedNeighbours, resolveSymbols = orig, origResolve })
+	resolveSymbols = func(context.Context, string, string, []string) ([]symbolMatch, error) { return nil, nil }
+	files := []string{"x/a.go", "x/b.go", "x/c.go", "y/d.go"}
+	hood := seedHood{Found: true, Files: map[string]int{}}
+	ids := map[string]string{}
+	for _, path := range files {
+		hood.Files[path] = 0
+		e := approvedBy(t, dir, ws, "author", "approver", "agent", "note for "+path)
+		storeUpdate(t, dir, ws, func(tx govstore.Tx) error {
+			return tx.ReplaceAnchors(context.Background(), e.ID, []string{path}, nil, govstore.Actor{Principal: "test"})
+		})
+		ids[e.ID] = path
+	}
+	seedNeighbours = func(context.Context, string, string, string) (seedHood, error) { return hood, nil }
+	res, err := RecallWith(context.Background(), dir, ws, RecallRequest{Seed: "A", Limit: 10})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := res["entries"].([]ContextEntry)
+	if len(entries) != 4 {
+		t.Fatalf("%d entries", len(entries))
+	}
+	pos := slices.IndexFunc(entries, func(e ContextEntry) bool { return ids[e.ID] == "y/d.go" })
+	if pos == 3 {
+		t.Fatalf("the lone directory came last: the diversity order was lost")
+	}
+}
+
+// An outline the index cut short cannot say a symbol is gone: unknown, never stale. A
+// mark leaves updated_at alone.
+func TestTruncatedOutlineIsNotStaleAndMarkKeepsUpdatedAt(t *testing.T) {
+	f := newInvalidationFixture(t)
+	full := stubOutline(f.root)
+	symbolOutline = func(ctx context.Context, a, b, rel string) (symbolSpans, error) {
+		_, err := full(ctx, a, b, rel)
+		if err != nil {
+			return nil, err
+		}
+		return nil, errOutlineIncomplete // the symbol is not among those kept
+	}
+	writeRepoFile(t, f.root, "srv.go", "package server\n")
+	if rep, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"}); err != nil || len(rep.Marked) != 0 {
+		t.Fatalf("a truncated outline marked the memory: %+v, %v", rep, err)
+	}
+	before := f.entry(t).UpdatedAt
+	symbolOutline = full
+	if rep, _ := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"}); len(rep.Marked) != 1 {
+		t.Fatalf("%+v", rep)
+	}
+	if after := f.entry(t).UpdatedAt; after != before {
+		t.Fatalf("marking stale moved updated_at %s -> %s", before, after)
 	}
 }

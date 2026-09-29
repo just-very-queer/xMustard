@@ -80,12 +80,10 @@ func (p asOfPoint) holds(e govstore.RankEntry) bool {
 	if e.ValidFrom == "" || !p.reached(e.ValidFrom, e.ValidFromCommit) {
 		return false
 	}
-	for _, end := range []struct{ ts, commit string }{{e.InvalidatedAt, e.InvalidatedCommit}, {e.ExpiresAt, ""}} {
-		if end.ts != "" && p.reached(end.ts, end.commit) {
-			return false
-		}
+	if e.InvalidatedAt != "" && p.reached(e.InvalidatedAt, e.InvalidatedCommit) {
+		return false
 	}
-	return true
+	return e.ExpiresAt == "" || !p.reached(e.ExpiresAt, "")
 }
 
 // ancestryCache remembers whether one commit is an ancestor of another. It is bounded

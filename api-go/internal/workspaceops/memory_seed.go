@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"maps"
+	"math"
 	"path"
 	"slices"
 	"sort"
@@ -34,6 +35,8 @@ const (
 	graphWeight = 1.0
 	// mmrLambda is how much of a candidate's score a repeated topic or directory costs.
 	mmrLambda = 0.3
+	// mmrStep separates consecutive picks so a later sort keeps their order.
+	mmrStep = 1e-9
 )
 
 // seedHood is the seed's neighbourhood: hops to each file and symbol reached.
@@ -125,12 +128,10 @@ func (h seedHood) distance(a govstore.Anchor) (int, bool) {
 // memoryDistances maps each served memory anchored within the seed's neighbourhood to
 // its fewest hops, through the anchor index (only the neighbourhood's files are read).
 func memoryDistances(ctx context.Context, r govstore.Reader, workspaceID string, hood seedHood) (map[string]int, error) {
+	// nearest files first (then by name): the file and anchor caps keep the nearest
 	files := slices.Sorted(maps.Keys(hood.Files))
-	if len(files) > seedMaxFiles {
-		// keep the nearest files: sort by hops, then name
-		sort.SliceStable(files, func(a, b int) bool { return hood.Files[files[a]] < hood.Files[files[b]] })
-		files = files[:seedMaxFiles]
-	}
+	sort.SliceStable(files, func(a, b int) bool { return hood.Files[files[a]] < hood.Files[files[b]] })
+	files = files[:min(len(files), seedMaxFiles)]
 	anchors, err := r.AnchorsInPaths(ctx, workspaceID, files, seedMaxAnchors)
 	if err != nil {
 		return nil, err
@@ -158,6 +159,7 @@ func diversify(ranked []scoredEntry) {
 	head := ranked[:min(len(ranked), seedCandidates)]
 	picked := make([]scoredEntry, 0, len(head))
 	held := map[string]bool{}
+	floor := math.Inf(1)
 	rest := slices.Clone(head)
 	for len(rest) > 0 {
 		best, bestScore := 0, 0.0
@@ -178,6 +180,11 @@ func diversify(ranked []scoredEntry) {
 			}
 		}
 		chosen := rest[best]
+		// keep the pick order through later re-sorts: a strictly falling key, as an offset
+		// from the entry's own total so the stale penalty still moves it relative to it
+		key := math.Min(bestScore, floor-mmrStep)
+		floor = key
+		chosen.shift = key - chosen.details.Total
 		for _, k := range diversityKeys(chosen.rank) {
 			held[k] = true
 		}
@@ -185,6 +192,10 @@ func diversify(ranked []scoredEntry) {
 		rest = slices.Delete(rest, best, best+1)
 	}
 	copy(head, picked)
+	for i := len(head); i < len(ranked); i++ {
+		floor = math.Min(ranked[i].details.Total, floor-mmrStep)
+		ranked[i].shift = floor - ranked[i].details.Total
+	}
 }
 
 // diversityKeys are what two memories share when they are alike: a topic, a kind and the

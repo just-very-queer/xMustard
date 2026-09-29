@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"sort"
@@ -67,6 +68,10 @@ type groundMemoryOptions struct {
 	// at_risk_memories is read. It runs git and the core, so a hook (which starts no
 	// process) leaves it off and lists what earlier changes marked.
 	invalidate bool
+	// ctx bounds the invalidation (the caller's request); changes are the working-changes
+	// result the index section already read, so the invalidation does not read it again.
+	ctx     context.Context
+	changes json.RawMessage
 }
 
 // noSince is the since value of a ground call that names no revision.
@@ -80,7 +85,7 @@ const noSince = -1
 // memory_revision are null, stale_memory_complete is false, and the fields are listed
 // unknown.
 func (s *groundingMemory) build(dataDir, workspaceID, caller string, opts groundMemoryOptions) []GroundingUnknown {
-	scan, err := scanGroundMemory(dataDir, workspaceID, caller, groundStaleWindow, opts.since, opts.invalidate)
+	scan, err := scanGroundMemory(dataDir, workspaceID, caller, groundStaleWindow, opts.since, opts)
 	s.StaleMemoryChecked, s.StaleMemoryComplete, s.MemoryVerificationModes = scan.checked, scan.complete, scan.modes
 	if err != nil {
 		reason := "memory store unreadable: " + err.Error()
@@ -136,15 +141,15 @@ type groundMemoryScan struct {
 // mode and in the core tier, counts the pending entries awaiting the caller, and reads
 // the memory revision and, when since >= 0, the delta after since, from the same
 // snapshot.
-func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int64, invalidate bool) (groundMemoryScan, error) {
-	ctx := context.Background()
+func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int64, opts groundMemoryOptions) (groundMemoryScan, error) {
+	ctx := cmp.Or(opts.ctx, context.Background())
 	var view []govstore.RankEntry
 	var checkedEntries []ContextEntry
 	var events deltaEvents
 	baselined := 0
 	scan := groundMemoryScan{modes: newModeCounts()}
-	if invalidate {
-		scan.invalidationErr = invalidateForGround(ctx, dataDir, workspaceID)
+	if opts.invalidate {
+		scan.invalidationErr = invalidateForGround(ctx, dataDir, workspaceID, opts.changes)
 	}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
