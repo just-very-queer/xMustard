@@ -142,8 +142,9 @@ one applies and the tool's arguments; an unknown tool is a JSON-RPC `-32602`.
   approved; SessionStart adds ground's summary. No hook allows, denies or rewrites a
   tool call, an answer past about 200 ms leaves Claude Code's own output, and the API
   starts no process for a hook. Under 4 concurrent clients on the Linux build box,
-  PreToolUse(Read) answered in p50 4.2 ms and p95 7.5 ms. The static hook client is
-  built from a source checkout
+  PreToolUse(Read) answered in p50 4.2 ms and p95 7.5 ms. The static hook client
+  ships in the release archive (`xmustard-hook`) and can also be built from a source
+  checkout
   ([plugin README](../integrations/claude-code/README.md)).
 - **Documented clients.** Claude Code, Codex, Pi and any client that reads
   `mcpServers` JSON. The labels `claude-code`, `codex`, `cursor`, `opencode`, `pi` and

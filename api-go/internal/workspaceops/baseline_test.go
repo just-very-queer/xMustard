@@ -41,7 +41,8 @@ func useTestGovernor(t *testing.T, heavyWait time.Duration) {
 // stages "<reason> <head>" beside the baseline path (as `--stage` does) and drift reads
 // the published file. The current HEAD is the state file "head" (h1 when absent), so a
 // test moves HEAD by writing it; a baseline file that is not "<reason> <head>" reads as
-// unreadable. The state file "fail" makes index exit 1. It returns the state dir.
+// unreadable. The state file "fail" makes index exit 1. Each finished drift appends a
+// line to drift.log, each index its reason to index.log. It returns the state dir.
 func baselineCore(t *testing.T, indexDelay string) string {
 	t.Helper()
 	useTestGovernor(t, 5*time.Second)
@@ -59,7 +60,8 @@ case "$1 $2" in
     printf '{"has_baseline":true,"stale":%s,"head_changed":%s,"baseline_head":"%s","baseline_indexed_at":"2026-09-28T00:00:00Z","baseline_reason":"%s","baseline_dirty":false,"reasons":[]}' $moved $moved "$h" "$r"
   else
     printf '{"has_baseline":false,"stale":true,"head_changed":false,"baseline_head":null,"baseline_indexed_at":null,"baseline_reason":null,"baseline_dirty":null,"baseline_error":"index baseline unreadable: torn","reasons":["index baseline unreadable: torn"]}'
-  fi ;;
+  fi
+  echo drift >> "$S/drift.log" ;;
 "changetrack index")
   echo "$6" >> "$S/index.log"
   sleep ` + indexDelay + `
@@ -99,7 +101,12 @@ func seedBaselineWorkspace(t *testing.T) (dataDir, ws, root string) {
 
 func indexCalls(t *testing.T, state string) []string {
 	t.Helper()
-	raw, err := os.ReadFile(filepath.Join(state, "index.log"))
+	return stateLog(t, state, "index.log")
+}
+
+func stateLog(t *testing.T, state, name string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(state, name))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -198,6 +205,57 @@ func TestRegistrationCreatesTheBaselineAndGroundReportsIt(t *testing.T) {
 	}
 	if _, err := os.Stat(stagedBaselinePath(dataDir, ws)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("the staged build was put in place: %v", err)
+	}
+}
+
+// A registration that found no baseline and waits for the lock while an explicit
+// rebaseline (POST /index) holds it is answered by that build: it reads drift once and
+// builds nothing, so no drift core of its own overlaps the requests that follow the
+// rebaseline (WS-FIX-07). A holder that builds nothing leaves the registration to
+// re-read drift under the lock and build, as before.
+func TestRegistrationWaitingOutARebaselineReadsNoDriftAgain(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		rebuild   bool
+		wantIndex []string
+		wantDrift int
+	}{
+		{"a rebaseline meanwhile answers it", true, []string{"--reason=admin"}, 1},
+		{"no build meanwhile", false, []string{"--reason=registration"}, 3}, // before, under the lock, after its build
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			state := baselineCore(t, "0")
+			dataDir, ws, _ := seedBaselineWorkspace(t)
+			unlock, err := lockStore(baselinePath(dataDir, ws)) // RebaselineIndex's lock
+			if err != nil {
+				t.Fatal(err)
+			}
+			held := make(chan string, 1)
+			go func() { held <- EnsureRegistrationBaseline(context.Background(), dataDir, ws) }()
+			for deadline := time.Now().Add(10 * time.Second); len(stateLog(t, state, "drift.log")) == 0; {
+				if time.Now().After(deadline) {
+					unlock()
+					t.Fatal("registration never read drift")
+				}
+				time.Sleep(5 * time.Millisecond)
+			}
+			if tc.rebuild {
+				if _, err := buildBaseline(context.Background(), dataDir, ws, BaselineAdmin, "ops-admin"); err != nil {
+					unlock()
+					t.Fatal(err)
+				}
+			}
+			unlock()
+			if h := <-held; h != "" {
+				t.Fatalf("held = %q", h)
+			}
+			if got := indexCalls(t, state); !slices.Equal(got, tc.wantIndex) {
+				t.Fatalf("builds = %v, want %v", got, tc.wantIndex)
+			}
+			if got := len(stateLog(t, state, "drift.log")); got != tc.wantDrift {
+				t.Fatalf("registration read drift %d times, want %d", got, tc.wantDrift)
+			}
+		})
 	}
 }
 

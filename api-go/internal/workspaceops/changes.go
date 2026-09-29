@@ -250,6 +250,10 @@ func (d baselineState) autoRebuild(missing string) (reason, held string) {
 type baselineTrigger struct {
 	missing string
 	lock    func(key string) (func(), error)
+	// superseded, when set, reports under the lock that a build replaced the stored
+	// baseline after the caller read its drift. Only a caller that discards the drift
+	// sets it (see observedAt).
+	superseded func() bool
 }
 
 var (
@@ -260,9 +264,24 @@ var (
 	groundTrigger = baselineTrigger{missing: BaselineFirstGround, lock: tryLockStore}
 )
 
+// observedAt is t for a caller about to read drift that needs none back: a baseline
+// put in place at path after this call (every build renames a new file there) answers
+// the trigger, so the caller does not read drift again under the lock. Registration
+// uses it: after an explicit rebaseline it waited for, the re-read would only confirm
+// that build, and its core run would overlap the requests that follow (WS-FIX-07).
+func (t baselineTrigger) observedAt(path string) baselineTrigger {
+	before, _ := os.Stat(path)
+	t.superseded = func() bool {
+		after, err := os.Stat(path)
+		return err == nil && (before == nil || !os.SameFile(before, after))
+	}
+	return t
+}
+
 // maintainBaseline applies the automatic policy to drift. When a rebuild is due it
 // takes the baseline lock, re-reads drift (another caller may have rebuilt it), builds
 // it and returns the drift after the build. held says why a due rebuild did not happen.
+// A trigger whose baseline was superseded while it waited returns drift unchanged.
 func maintainBaseline(ctx context.Context, dataDir, workspaceID string, drift json.RawMessage, t baselineTrigger) (json.RawMessage, string) {
 	var st baselineState
 	if json.Unmarshal(drift, &st) != nil {
@@ -279,6 +298,9 @@ func maintainBaseline(ctx context.Context, dataDir, workspaceID string, drift js
 		return drift, notRunHoldPrefix + err.Error()
 	}
 	defer unlock()
+	if t.superseded != nil && t.superseded() {
+		return drift, ""
+	}
 	fresh, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return drift, notRunHoldPrefix + "drift failed: " + err.Error()
@@ -305,12 +327,14 @@ func maintainBaseline(ctx context.Context, dataDir, workspaceID string, drift js
 // its baseline now (or a rebuild when HEAD moved). It returns why a due build did not
 // happen, "" when none was due or it was built. The one-shot ops CLI runs it in line;
 // the API runs it detached (StartRegistrationBaseline). The first ground retries it.
+// A build put in place while it waits for the lock (an explicit rebaseline) answers it.
 func EnsureRegistrationBaseline(ctx context.Context, dataDir, workspaceID string) string {
+	t := registrationTrigger.observedAt(baselinePath(dataDir, workspaceID))
 	drift, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return "drift failed: " + err.Error()
 	}
-	_, held := maintainBaseline(ctx, dataDir, workspaceID, drift, registrationTrigger)
+	_, held := maintainBaseline(ctx, dataDir, workspaceID, drift, t)
 	return held
 }
 
