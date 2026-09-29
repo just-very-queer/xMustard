@@ -1,0 +1,116 @@
+{
+  "schema": "xmustard.eval.dedupe_conflicts/v1",
+  "requirement": "PAR-EVAL-02",
+  "workstream": "WS-27",
+  "description": "Deterministic duplicate and contradiction fixtures for propose-time review (api-go/internal/workspaceops memory_dedupe.go and memory_conflicts.go). No model runs: TestEval02DedupeConflictFixtures seeds each case's memories (served ones are approved by two peers), proposes the case's text (as a verifier when propose.reviewer is set, since only a reviewer is told about pending memory), and checks the result. expect.outcome is created or corroborated (duplicate_of names the seed restated); expect.duplicates and expect.conflicts map every seed the result names to its match (exact, near, similar) or conflict kind (claim, contradiction, path_overlap), and no other seed may appear; suggested_supersedes lists the seeds suggested, exactly. merge_into, when set, has two peers verify the proposal duplicate_of that seed; recall must then serve the seed and not the proposal. The service-port cases reuse the memories of eval/tasks/seed.yaml's service-agreed-port task.",
+  "cases": [
+    {
+      "id": "exact-restatement-corroborates",
+      "seed": [{"key": "fact", "content": "The payments service listens on port 8081 because the metrics sidecar owns 8080.", "served": true}],
+      "propose": {"content": "  the PAYMENTS service listens on port 8081 because the metrics sidecar owns 8080. "},
+      "expect": {"outcome": "corroborated", "duplicate_of": "fact", "duplicates": {"fact": "exact"}}
+    },
+    {
+      "id": "near-duplicate-is-reported",
+      "seed": [{"key": "fact", "content": "The payments service listens on port 8081 because the metrics sidecar owns 8080.", "served": true}],
+      "propose": {"content": "The payment service listens on port 8081 because the metrics sidecar owns 8080."},
+      "expect": {"outcome": "created", "duplicates": {"fact": "near"}, "suggested_supersedes": ["fact"]}
+    },
+    {
+      "id": "mid-similarity-is-reported",
+      "seed": [{"key": "fact", "content": "The payments service listens on port 8081 because the metrics sidecar owns 8080.", "served": true}],
+      "propose": {"content": "The payments service listens on port 8081; the metrics sidecar owns port 8080 and the admin UI 8082."},
+      "expect": {"outcome": "created", "duplicates": {"fact": "similar"}}
+    },
+    {
+      "id": "exact-duplicate-of-pending-is-created",
+      "seed": [{"key": "draft", "content": "Integration tests use the fake gateway on port 9099.", "served": false}],
+      "propose": {"content": "integration tests use the fake gateway on port 9099.", "reviewer": true},
+      "expect": {"outcome": "created", "duplicates": {"draft": "exact"}}
+    },
+    {
+      "id": "pending-text-is-hidden-from-a-non-reviewer",
+      "note": "A proposer without the verifier or human-approver role may not read unverified memory, so the review never reports a pending entry to it.",
+      "seed": [{"key": "draft", "content": "Integration tests use the fake gateway on port 9099.", "served": false}],
+      "propose": {"content": "integration tests use the fake gateway on port 9099."},
+      "expect": {"outcome": "created"}
+    },
+    {
+      "id": "short-generic-text-never-merges-fuzzily",
+      "seed": [{"key": "short", "content": "ok ok ok ok", "served": true}],
+      "propose": {"content": "ok ok ok ok ok"},
+      "expect": {"outcome": "created"}
+    },
+    {
+      "id": "quarantined-restatement-is-not-a-corroboration",
+      "seed": [{"key": "fact", "content": "Nightly exports land in the exports bucket under a date prefix.", "served": true}],
+      "propose": {"content": "Nightly exports land in the exports bucket under a date prefix.", "quarantined": true},
+      "expect": {"outcome": "created", "duplicates": {"fact": "exact"}}
+    },
+    {
+      "id": "claim-functional-predicate-conflict",
+      "seed": [{"key": "pin", "content": "The toolchain is pinned to Go 1.22 for the whole repository.", "served": true,
+        "claims": [{"subject": "go", "predicate": "pinned_to", "object": "1.22"}]}],
+      "propose": {"content": "We moved the toolchain to the next Go release last week.",
+        "claims": [{"subject": "go", "predicate": "pinned_to", "object": "1.23"}]},
+      "expect": {"outcome": "created", "conflicts": {"pin": "claim"}, "suggested_supersedes": ["pin"]}
+    },
+    {
+      "id": "claim-requires-is-multi-valued",
+      "seed": [{"key": "pg", "content": "The API needs a running Postgres for the ops layer.", "served": true,
+        "claims": [{"subject": "api", "predicate": "requires", "object": "postgres"}]}],
+      "propose": {"content": "The API also needs Redis for the job queue.",
+        "claims": [{"subject": "api", "predicate": "requires", "object": "redis"}]},
+      "expect": {"outcome": "created"}
+    },
+    {
+      "id": "claim-requires-versus-forbids",
+      "seed": [{"key": "pg", "content": "The API needs a running Postgres for the ops layer.", "served": true,
+        "claims": [{"subject": "api", "predicate": "requires", "object": "postgres"}]}],
+      "propose": {"content": "The API must not depend on a database server any more.",
+        "claims": [{"subject": "api", "predicate": "forbids", "object": "postgres"}]},
+      "expect": {"outcome": "created", "conflicts": {"pg": "claim"}, "suggested_supersedes": ["pg"]}
+    },
+    {
+      "id": "seed-port-infra-ticket-contradicts-decision",
+      "note": "seed.yaml service-agreed-port: port-infra-ticket (label contradiction, contradicts port-decision).",
+      "seed": [{"key": "port-decision", "served": true, "paths": ["server/config.go"],
+        "content": "Team decision (2026-08): the service listens on port 8081 because the metrics sidecar owns 8080."}],
+      "propose": {"paths": ["server/config.go"], "content": "Infra ticket (2026-03): the service should listen on port 9090."},
+      "expect": {"outcome": "created", "conflicts": {"port-decision": "contradiction"}, "suggested_supersedes": ["port-decision"]}
+    },
+    {
+      "id": "seed-port-reminder-duplicates-decision",
+      "note": "seed.yaml service-agreed-port: port-reminder (label duplicate, duplicate_of port-decision) is a paraphrase: its 3-gram Jaccard is 0.29, so propose-time review reports only the shared file, and the duplicate is resolved by verify(duplicate_of), after which recall serves the decision alone.",
+      "seed": [{"key": "port-decision", "served": true, "paths": ["server/config.go"],
+        "content": "Team decision (2026-08): the service listens on port 8081 because the metrics sidecar owns 8080."}],
+      "propose": {"paths": ["server/config.go"], "content": "Reminder: the service port is 8081; 8080 belongs to the metrics sidecar."},
+      "expect": {"outcome": "created", "conflicts": {"port-decision": "path_overlap"}},
+      "merge_into": "port-decision"
+    },
+    {
+      "id": "version-contradiction",
+      "seed": [{"key": "ci", "served": true, "paths": ["server/config.go"], "content": "CI runs Go 1.22 for the server/config.go package tests."}],
+      "propose": {"paths": ["server/config.go"], "content": "CI runs Go 1.23 for the server/config.go package tests."},
+      "expect": {"outcome": "created", "duplicates": {"ci": "similar"}, "conflicts": {"ci": "contradiction"}, "suggested_supersedes": ["ci"]}
+    },
+    {
+      "id": "command-contradiction",
+      "seed": [{"key": "check", "served": true, "paths": ["server/config.go"], "content": "Before committing server/config.go run `make check` from the repository root."}],
+      "propose": {"paths": ["server/config.go"], "content": "Before committing server/config.go run `make check-backend` from the repository root."},
+      "expect": {"outcome": "created", "duplicates": {"check": "similar"}, "conflicts": {"check": "contradiction"}, "suggested_supersedes": ["check"]}
+    },
+    {
+      "id": "negation-contradiction",
+      "seed": [{"key": "cache", "served": true, "paths": ["server/config.go"], "content": "Cache the parsed server/config.go values across requests."}],
+      "propose": {"paths": ["server/config.go"], "content": "Never cache the parsed server/config.go values across requests."},
+      "expect": {"outcome": "created", "duplicates": {"cache": "near"}, "conflicts": {"cache": "contradiction"}, "suggested_supersedes": ["cache"]}
+    },
+    {
+      "id": "unrelated-memories-of-one-file-overlap-only",
+      "seed": [{"key": "env", "served": true, "paths": ["server/config.go"], "content": "server/config.go reads the listen address from the environment."}],
+      "propose": {"paths": ["server/config.go"], "content": "Tests for server/config.go live next to it and use a temp dir."},
+      "expect": {"outcome": "created", "conflicts": {"env": "path_overlap"}}
+    }
+  ]
+}

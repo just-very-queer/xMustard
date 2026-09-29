@@ -344,7 +344,7 @@ func TestEventTableAndToolClasses(t *testing.T) {
 	if seen["WorktreeCreate"] {
 		t.Fatal("WorktreeCreate replaces git worktree creation and must not be hooked")
 	}
-	classes := map[string]ToolClass{"Grep": ToolSearch, "Read": ToolRead, "Write": ToolEdit, "Bash": ToolShell,
+	classes := map[string]ToolClass{"Grep": ToolSearch, "Read": ToolRead, "Write": ToolEdit, "apply_patch": ToolEdit, "Bash": ToolShell,
 		"mcp__github__search": ToolCapture, "mcp__xmustard__search": ToolOther, "mcp__plugin_xmustard_xmustard__recall": ToolOther, "Agent": ToolOther}
 	for tool, want := range classes {
 		if got := ClassOf(tool); got != want {

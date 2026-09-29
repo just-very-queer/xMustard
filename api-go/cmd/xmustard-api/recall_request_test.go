@@ -34,9 +34,11 @@ func TestRecallVerificationQueueOverHTTP(t *testing.T) {
 	}
 	e := call("alice", "POST", "/context", `{"content":"the queue drains nightly","kind":"decision","tags":["ops"]}`, http.StatusOK)
 	id := e["id"].(string)
-	for _, q := range []string{"?status=awaiting_me", "?status=pending", "?include_pending=true"} {
+	for _, q := range []string{"?status=awaiting_me", "?status=pending", "?include_pending=true", "?include_merged=true"} {
 		call("rita", "GET", "/context/active"+q, "", http.StatusForbidden)
 	}
+	call("bob", "GET", "/context/active?include_merged=true&subject=queue&predicate=runs_with", "", http.StatusOK)
+	call("bob", "GET", "/context/active?predicate=runs_with", "", http.StatusBadRequest)
 	if got := call("rita", "GET", "/context/active?query=queue", "", http.StatusOK); got["returned"] != float64(0) {
 		t.Fatalf("default recall must be verified-only: %v", got)
 	}
@@ -61,7 +63,7 @@ func TestRecallVerificationQueueOverHTTP(t *testing.T) {
 	// unverified reads fail closed (401) and verified recall still works
 	off := httptest.NewServer(bodyLimitMiddleware(newAPIHandler())) // buildHandler skips auth when off
 	t.Cleanup(off.Close)
-	for _, q := range []string{"?status=pending", "?status=awaiting_me", "?include_pending=true", "?entry_id=" + id + "&history=true"} {
+	for _, q := range []string{"?status=pending", "?status=awaiting_me", "?include_pending=true", "?include_merged=true", "?entry_id=" + id + "&history=true"} {
 		if code, out := sendJSON(t, "GET", off.URL+"/api/workspaces/wsQueueHTTP/context/active"+q, "", ""); code != http.StatusUnauthorized {
 			t.Fatalf("anonymous %s: want 401, got %d %v", q, code, out)
 		}

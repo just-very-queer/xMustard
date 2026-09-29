@@ -159,7 +159,13 @@ func (f *hookFixture) fakeWorker(t testing.TB) {
 
 func (f *hookFixture) post(t testing.TB, token, event, body string) (int, []byte) {
 	t.Helper()
-	req, _ := http.NewRequest("POST", f.srv.URL+"/api/hooks/claude/"+event, strings.NewReader(body))
+	return f.postTo(t, token, "claude", event, body)
+}
+
+// postTo posts one event to a client's hook route.
+func (f *hookFixture) postTo(t *testing.T, token, client, event, body string) (int, []byte) {
+	t.Helper()
+	req, _ := http.NewRequest("POST", f.srv.URL+"/api/hooks/"+client+"/"+event, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)

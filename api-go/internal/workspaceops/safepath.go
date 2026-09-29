@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"unicode"
@@ -100,23 +101,49 @@ func resolveWorkspacePath(root, rel string) (string, error) {
 // swapping the path for a symlink after validation can't redirect the read
 // (XM-PRO-007).
 func readWorkspaceRegularFile(root, rel string) ([]byte, bool) {
-	f, err := openWorkspaceFileBeneath(root, rel)
-	if err != nil {
+	f, _, ok := openWorkspaceRegularFile(root, rel, maxRefFileBytes)
+	if !ok {
 		return nil, false
 	}
 	defer f.Close()
-	info, err := f.Stat() // fstat on the held fd — not a re-stat by path
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, false
-	}
-	if info.Size() > maxRefFileBytes {
-		return nil, false
-	}
 	data, err := io.ReadAll(io.LimitReader(f, maxRefFileBytes+1))
 	if err != nil || int64(len(data)) > maxRefFileBytes {
 		return nil, false
 	}
 	return data, true
+}
+
+// readWorkspaceText reads a file as readWorkspaceRegularFile does, capped at limit
+// bytes, into one string allocation of the file's size (no byte-slice copy).
+func readWorkspaceText(root, rel string, limit int64) (string, bool) {
+	f, size, ok := openWorkspaceRegularFile(root, rel, limit)
+	if !ok {
+		return "", false
+	}
+	defer f.Close()
+	var b strings.Builder
+	b.Grow(int(size))
+	n, err := io.Copy(&b, io.LimitReader(f, limit+1))
+	if err != nil || n > limit {
+		return "", false
+	}
+	return b.String(), true
+}
+
+// openWorkspaceRegularFile opens rel beneath root through the symlink-refusing fd walk
+// and returns it with its size when it is a regular file of at most limit bytes; the
+// caller closes it.
+func openWorkspaceRegularFile(root, rel string, limit int64) (*os.File, int64, bool) {
+	f, err := openWorkspaceFileBeneath(root, rel)
+	if err != nil {
+		return nil, 0, false
+	}
+	info, err := f.Stat() // fstat on the held fd — not a re-stat by path
+	if err != nil || !info.Mode().IsRegular() || info.Size() > limit {
+		f.Close()
+		return nil, 0, false
+	}
+	return f, info.Size(), true
 }
 
 // ErrPathEscapesWorkspace is the error a caller-supplied path gets when it is absolute,

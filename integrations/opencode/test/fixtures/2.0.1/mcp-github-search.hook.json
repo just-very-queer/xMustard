@@ -1,0 +1,265 @@
+{
+	"tool": "github_search_code",
+	"sessionID": "ses_fixture",
+	"agent": "build",
+	"messageID": "msg_fixture",
+	"id": "call_mcp",
+	"input": {
+		"q": "handler"
+	},
+	"status": "completed",
+	"result": {
+		"output": {
+			"total_count": 40,
+			"incomplete_results": false,
+			"items": [
+				{
+					"path": "src/mod0/handler_0.ts",
+					"repository": "acme/app",
+					"score": 1,
+					"fragment": "export function handler0(req: Request) { return route(req, 0); }"
+				},
+				{
+					"path": "src/mod1/handler_1.ts",
+					"repository": "acme/app",
+					"score": 0.999,
+					"fragment": "export function handler1(req: Request) { return route(req, 1); }"
+				},
+				{
+					"path": "src/mod2/handler_2.ts",
+					"repository": "acme/app",
+					"score": 0.998,
+					"fragment": "export function handler2(req: Request) { return route(req, 2); }"
+				},
+				{
+					"path": "src/mod3/handler_3.ts",
+					"repository": "acme/app",
+					"score": 0.997,
+					"fragment": "export function handler3(req: Request) { return route(req, 3); }"
+				},
+				{
+					"path": "src/mod4/handler_4.ts",
+					"repository": "acme/app",
+					"score": 0.996,
+					"fragment": "export function handler4(req: Request) { return route(req, 4); }"
+				},
+				{
+					"path": "src/mod5/handler_5.ts",
+					"repository": "acme/app",
+					"score": 0.995,
+					"fragment": "export function handler5(req: Request) { return route(req, 5); }"
+				},
+				{
+					"path": "src/mod6/handler_6.ts",
+					"repository": "acme/app",
+					"score": 0.994,
+					"fragment": "export function handler6(req: Request) { return route(req, 6); }"
+				},
+				{
+					"path": "src/mod7/handler_7.ts",
+					"repository": "acme/app",
+					"score": 0.993,
+					"fragment": "export function handler7(req: Request) { return route(req, 7); }"
+				},
+				{
+					"path": "src/mod8/handler_8.ts",
+					"repository": "acme/app",
+					"score": 0.992,
+					"fragment": "export function handler8(req: Request) { return route(req, 8); }"
+				},
+				{
+					"path": "src/mod0/handler_9.ts",
+					"repository": "acme/app",
+					"score": 0.991,
+					"fragment": "export function handler9(req: Request) { return route(req, 9); }"
+				},
+				{
+					"path": "src/mod1/handler_10.ts",
+					"repository": "acme/app",
+					"score": 0.99,
+					"fragment": "export function handler10(req: Request) { return route(req, 10); }"
+				},
+				{
+					"path": "src/mod2/handler_11.ts",
+					"repository": "acme/app",
+					"score": 0.989,
+					"fragment": "export function handler11(req: Request) { return route(req, 11); }"
+				},
+				{
+					"path": "src/mod3/handler_12.ts",
+					"repository": "acme/app",
+					"score": 0.988,
+					"fragment": "export function handler12(req: Request) { return route(req, 12); }"
+				},
+				{
+					"path": "src/mod4/handler_13.ts",
+					"repository": "acme/app",
+					"score": 0.987,
+					"fragment": "export function handler13(req: Request) { return route(req, 13); }"
+				},
+				{
+					"path": "src/mod5/handler_14.ts",
+					"repository": "acme/app",
+					"score": 0.986,
+					"fragment": "export function handler14(req: Request) { return route(req, 14); }"
+				},
+				{
+					"path": "src/mod6/handler_15.ts",
+					"repository": "acme/app",
+					"score": 0.985,
+					"fragment": "export function handler15(req: Request) { return route(req, 15); }"
+				},
+				{
+					"path": "src/mod7/handler_16.ts",
+					"repository": "acme/app",
+					"score": 0.984,
+					"fragment": "export function handler16(req: Request) { return route(req, 16); }"
+				},
+				{
+					"path": "src/mod8/handler_17.ts",
+					"repository": "acme/app",
+					"score": 0.983,
+					"fragment": "export function handler17(req: Request) { return route(req, 17); }"
+				},
+				{
+					"path": "src/mod0/handler_18.ts",
+					"repository": "acme/app",
+					"score": 0.982,
+					"fragment": "export function handler18(req: Request) { return route(req, 18); }"
+				},
+				{
+					"path": "src/mod1/handler_19.ts",
+					"repository": "acme/app",
+					"score": 0.981,
+					"fragment": "export function handler19(req: Request) { return route(req, 19); }"
+				},
+				{
+					"path": "src/mod2/handler_20.ts",
+					"repository": "acme/app",
+					"score": 0.98,
+					"fragment": "export function handler20(req: Request) { return route(req, 20); }"
+				},
+				{
+					"path": "src/mod3/handler_21.ts",
+					"repository": "acme/app",
+					"score": 0.979,
+					"fragment": "export function handler21(req: Request) { return route(req, 21); }"
+				},
+				{
+					"path": "src/mod4/handler_22.ts",
+					"repository": "acme/app",
+					"score": 0.978,
+					"fragment": "export function handler22(req: Request) { return route(req, 22); }"
+				},
+				{
+					"path": "src/mod5/handler_23.ts",
+					"repository": "acme/app",
+					"score": 0.977,
+					"fragment": "export function handler23(req: Request) { return route(req, 23); }"
+				},
+				{
+					"path": "src/mod6/handler_24.ts",
+					"repository": "acme/app",
+					"score": 0.976,
+					"fragment": "export function handler24(req: Request) { return route(req, 24); }"
+				},
+				{
+					"path": "src/mod7/handler_25.ts",
+					"repository": "acme/app",
+					"score": 0.975,
+					"fragment": "export function handler25(req: Request) { return route(req, 25); }"
+				},
+				{
+					"path": "src/mod8/handler_26.ts",
+					"repository": "acme/app",
+					"score": 0.974,
+					"fragment": "export function handler26(req: Request) { return route(req, 26); }"
+				},
+				{
+					"path": "src/mod0/handler_27.ts",
+					"repository": "acme/app",
+					"score": 0.973,
+					"fragment": "export function handler27(req: Request) { return route(req, 27); }"
+				},
+				{
+					"path": "src/mod1/handler_28.ts",
+					"repository": "acme/app",
+					"score": 0.972,
+					"fragment": "export function handler28(req: Request) { return route(req, 28); }"
+				},
+				{
+					"path": "src/mod2/handler_29.ts",
+					"repository": "acme/app",
+					"score": 0.971,
+					"fragment": "export function handler29(req: Request) { return route(req, 29); }"
+				},
+				{
+					"path": "src/mod3/handler_30.ts",
+					"repository": "acme/app",
+					"score": 0.97,
+					"fragment": "export function handler30(req: Request) { return route(req, 30); }"
+				},
+				{
+					"path": "src/mod4/handler_31.ts",
+					"repository": "acme/app",
+					"score": 0.969,
+					"fragment": "export function handler31(req: Request) { return route(req, 31); }"
+				},
+				{
+					"path": "src/mod5/handler_32.ts",
+					"repository": "acme/app",
+					"score": 0.968,
+					"fragment": "export function handler32(req: Request) { return route(req, 32); }"
+				},
+				{
+					"path": "src/mod6/handler_33.ts",
+					"repository": "acme/app",
+					"score": 0.967,
+					"fragment": "export function handler33(req: Request) { return route(req, 33); }"
+				},
+				{
+					"path": "src/mod7/handler_34.ts",
+					"repository": "acme/app",
+					"score": 0.966,
+					"fragment": "export function handler34(req: Request) { return route(req, 34); }"
+				},
+				{
+					"path": "src/mod8/handler_35.ts",
+					"repository": "acme/app",
+					"score": 0.965,
+					"fragment": "export function handler35(req: Request) { return route(req, 35); }"
+				},
+				{
+					"path": "src/mod0/handler_36.ts",
+					"repository": "acme/app",
+					"score": 0.964,
+					"fragment": "export function handler36(req: Request) { return route(req, 36); }"
+				},
+				{
+					"path": "src/mod1/handler_37.ts",
+					"repository": "acme/app",
+					"score": 0.963,
+					"fragment": "export function handler37(req: Request) { return route(req, 37); }"
+				},
+				{
+					"path": "src/mod2/handler_38.ts",
+					"repository": "acme/app",
+					"score": 0.962,
+					"fragment": "export function handler38(req: Request) { return route(req, 38); }"
+				},
+				{
+					"path": "src/mod3/handler_39.ts",
+					"repository": "acme/app",
+					"score": 0.961,
+					"fragment": "export function handler39(req: Request) { return route(req, 39); }"
+				}
+			]
+		},
+		"content": [
+			{
+				"type": "text",
+				"text": "{\"total_count\":40,\"incomplete_results\":false,\"items\":[{\"path\":\"src/mod0/handler_0.ts\",\"repository\":\"acme/app\",\"score\":1,\"fragment\":\"export function handler0(req: Request) { return route(req, 0); }\"},{\"path\":\"src/mod1/handler_1.ts\",\"repository\":\"acme/app\",\"score\":0.999,\"fragment\":\"export function handler1(req: Request) { return route(req, 1); }\"},{\"path\":\"src/mod2/handler_2.ts\",\"repository\":\"acme/app\",\"score\":0.998,\"fragment\":\"export function handler2(req: Request) { return route(req, 2); }\"},{\"path\":\"src/mod3/handler_3.ts\",\"repository\":\"acme/app\",\"score\":0.997,\"fragment\":\"export function handler3(req: Request) { return route(req, 3); }\"},{\"path\":\"src/mod4/handler_4.ts\",\"repository\":\"acme/app\",\"score\":0.996,\"fragment\":\"export function handler4(req: Request) { return route(req, 4); }\"},{\"path\":\"src/mod5/handler_5.ts\",\"repository\":\"acme/app\",\"score\":0.995,\"fragment\":\"export function handler5(req: Request) { return route(req, 5); }\"},{\"path\":\"src/mod6/handler_6.ts\",\"repository\":\"acme/app\",\"score\":0.994,\"fragment\":\"export function handler6(req: Request) { return route(req, 6); }\"},{\"path\":\"src/mod7/handler_7.ts\",\"repository\":\"acme/app\",\"score\":0.993,\"fragment\":\"export function handler7(req: Request) { return route(req, 7); }\"},{\"path\":\"src/mod8/handler_8.ts\",\"repository\":\"acme/app\",\"score\":0.992,\"fragment\":\"export function handler8(req: Request) { return route(req, 8); }\"},{\"path\":\"src/mod0/handler_9.ts\",\"repository\":\"acme/app\",\"score\":0.991,\"fragment\":\"export function handler9(req: Request) { return route(req, 9); }\"},{\"path\":\"src/mod1/handler_10.ts\",\"repository\":\"acme/app\",\"score\":0.99,\"fragment\":\"export function handler10(req: Request) { return route(req, 10); }\"},{\"path\":\"src/mod2/handler_11.ts\",\"repository\":\"acme/app\",\"score\":0.989,\"fragment\":\"export function handler11(req: Request) { return route(req, 11); }\"},{\"path\":\"src/mod3/handler_12.ts\",\"repository\":\"acme/app\",\"score\":0.988,\"fragment\":\"export function handler12(req: Request) { return route(req, 12); }\"},{\"path\":\"src/mod4/handler_13.ts\",\"repository\":\"acme/app\",\"score\":0.987,\"fragment\":\"export function handler13(req: Request) { return route(req, 13); }\"},{\"path\":\"src/mod5/handler_14.ts\",\"repository\":\"acme/app\",\"score\":0.986,\"fragment\":\"export function handler14(req: Request) { return route(req, 14); }\"},{\"path\":\"src/mod6/handler_15.ts\",\"repository\":\"acme/app\",\"score\":0.985,\"fragment\":\"export function handler15(req: Request) { return route(req, 15); }\"},{\"path\":\"src/mod7/handler_16.ts\",\"repository\":\"acme/app\",\"score\":0.984,\"fragment\":\"export function handler16(req: Request) { return route(req, 16); }\"},{\"path\":\"src/mod8/handler_17.ts\",\"repository\":\"acme/app\",\"score\":0.983,\"fragment\":\"export function handler17(req: Request) { return route(req, 17); }\"},{\"path\":\"src/mod0/handler_18.ts\",\"repository\":\"acme/app\",\"score\":0.982,\"fragment\":\"export function handler18(req: Request) { return route(req, 18); }\"},{\"path\":\"src/mod1/handler_19.ts\",\"repository\":\"acme/app\",\"score\":0.981,\"fragment\":\"export function handler19(req: Request) { return route(req, 19); }\"},{\"path\":\"src/mod2/handler_20.ts\",\"repository\":\"acme/app\",\"score\":0.98,\"fragment\":\"export function handler20(req: Request) { return route(req, 20); }\"},{\"path\":\"src/mod3/handler_21.ts\",\"repository\":\"acme/app\",\"score\":0.979,\"fragment\":\"export function handler21(req: Request) { return route(req, 21); }\"},{\"path\":\"src/mod4/handler_22.ts\",\"repository\":\"acme/app\",\"score\":0.978,\"fragment\":\"export function handler22(req: Request) { return route(req, 22); }\"},{\"path\":\"src/mod5/handler_23.ts\",\"repository\":\"acme/app\",\"score\":0.977,\"fragment\":\"export function handler23(req: Request) { return route(req, 23); }\"},{\"path\":\"src/mod6/handler_24.ts\",\"repository\":\"acme/app\",\"score\":0.976,\"fragment\":\"export function handler24(req: Request) { return route(req, 24); }\"},{\"path\":\"src/mod7/handler_25.ts\",\"repository\":\"acme/app\",\"score\":0.975,\"fragment\":\"export function handler25(req: Request) { return route(req, 25); }\"},{\"path\":\"src/mod8/handler_26.ts\",\"repository\":\"acme/app\",\"score\":0.974,\"fragment\":\"export function handler26(req: Request) { return route(req, 26); }\"},{\"path\":\"src/mod0/handler_27.ts\",\"repository\":\"acme/app\",\"score\":0.973,\"fragment\":\"export function handler27(req: Request) { return route(req, 27); }\"},{\"path\":\"src/mod1/handler_28.ts\",\"repository\":\"acme/app\",\"score\":0.972,\"fragment\":\"export function handler28(req: Request) { return route(req, 28); }\"},{\"path\":\"src/mod2/handler_29.ts\",\"repository\":\"acme/app\",\"score\":0.971,\"fragment\":\"export function handler29(req: Request) { return route(req, 29); }\"},{\"path\":\"src/mod3/handler_30.ts\",\"repository\":\"acme/app\",\"score\":0.97,\"fragment\":\"export function handler30(req: Request) { return route(req, 30); }\"},{\"path\":\"src/mod4/handler_31.ts\",\"repository\":\"acme/app\",\"score\":0.969,\"fragment\":\"export function handler31(req: Request) { return route(req, 31); }\"},{\"path\":\"src/mod5/handler_32.ts\",\"repository\":\"acme/app\",\"score\":0.968,\"fragment\":\"export function handler32(req: Request) { return route(req, 32); }\"},{\"path\":\"src/mod6/handler_33.ts\",\"repository\":\"acme/app\",\"score\":0.967,\"fragment\":\"export function handler33(req: Request) { return route(req, 33); }\"},{\"path\":\"src/mod7/handler_34.ts\",\"repository\":\"acme/app\",\"score\":0.966,\"fragment\":\"export function handler34(req: Request) { return route(req, 34); }\"},{\"path\":\"src/mod8/handler_35.ts\",\"repository\":\"acme/app\",\"score\":0.965,\"fragment\":\"export function handler35(req: Request) { return route(req, 35); }\"},{\"path\":\"src/mod0/handler_36.ts\",\"repository\":\"acme/app\",\"score\":0.964,\"fragment\":\"export function handler36(req: Request) { return route(req, 36); }\"},{\"path\":\"src/mod1/handler_37.ts\",\"repository\":\"acme/app\",\"score\":0.963,\"fragment\":\"export function handler37(req: Request) { return route(req, 37); }\"},{\"path\":\"src/mod2/handler_38.ts\",\"repository\":\"acme/app\",\"score\":0.962,\"fragment\":\"export function handler38(req: Request) { return route(req, 38); }\"},{\"path\":\"src/mod3/handler_39.ts\",\"repository\":\"acme/app\",\"score\":0.961,\"fragment\":\"export function handler39(req: Request) { return route(req, 39); }\"}]}"
+			}
+		]
+	}
+}

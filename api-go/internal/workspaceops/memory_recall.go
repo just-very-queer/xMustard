@@ -229,6 +229,11 @@ type RecallRequest struct {
 	IncludePending    bool
 	IncludeSuperseded bool
 	ShowExpired       bool
+	// IncludeMerged adds entries merged into another as its duplicate (PAR-GOV-03).
+	IncludeMerged bool
+	// Subject keeps entries with a claim on it; Predicate narrows that to one predicate
+	// (PAR-GOV-10). Predicate needs Subject.
+	Subject, Predicate string
 	// Cursor continues a previous page (next_cursor).
 	Cursor string
 	// NamesOnly returns ids, titles, topic, state, stale and paths only.
@@ -266,7 +271,8 @@ func servedStates(r RecallRequest) []string {
 	for _, opt := range []struct {
 		on    bool
 		state string
-	}{{r.IncludePending, govstore.RankPending}, {r.IncludeSuperseded, govstore.RankSuperseded}, {r.ShowExpired, govstore.RankExpired}} {
+	}{{r.IncludePending, govstore.RankPending}, {r.IncludeSuperseded, govstore.RankSuperseded}, {r.ShowExpired, govstore.RankExpired},
+		{r.IncludeMerged, govstore.RankMerged}} {
 		if opt.on {
 			states = append(states, opt.state)
 		}
@@ -285,11 +291,11 @@ func (r RecallRequest) States() ([]string, error) {
 	return pick(r), nil
 }
 
-// ReadsUnverified reports whether the request can return pending (unverified) text,
-// which only a reviewer may read.
+// ReadsUnverified reports whether the request can return pending or merged text, which
+// may be unverified and only a reviewer may read.
 func (r RecallRequest) ReadsUnverified() bool {
 	states, _ := r.States()
-	return slices.Contains(states, govstore.RankPending)
+	return slices.ContainsFunc(states, func(s string) bool { return s == govstore.RankPending || s == govstore.RankMerged })
 }
 
 // validate checks the arguments that are rejected, never clamped, and normalizes the
@@ -297,6 +303,10 @@ func (r RecallRequest) ReadsUnverified() bool {
 func (r *RecallRequest) validate() error {
 	if _, err := r.States(); err != nil {
 		return err
+	}
+	if r.Subject, r.Predicate = claimSubject(r.Subject), strings.ToLower(strings.TrimSpace(r.Predicate)); r.Predicate != "" &&
+		(r.Subject == "" || !govstore.ValidPredicate(r.Predicate)) {
+		return fmt.Errorf("predicate %q needs a subject and must be a claim predicate: %w", r.Predicate, ErrInvalidInput)
 	}
 	if len(r.SessionID) > RecallMaxSessionID {
 		return fmt.Errorf("session_id is longer than %d bytes: %w", RecallMaxSessionID, ErrInvalidInput)
@@ -340,8 +350,9 @@ func parseRecallTime(s string) (string, error) {
 const storeTimeLayout = "2006-01-02T15:04:05.000000000Z"
 
 // filters are the request's entry predicates, one per given field. awaits decides
-// awaiting_me (see awaitingCaller).
-func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool) []func(govstore.RankEntry) bool {
+// awaiting_me (see awaitingCaller); claimed holds the entries with a claim on the
+// subject.
+func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool, claimed map[string]bool) []func(govstore.RankEntry) bool {
 	var out []func(govstore.RankEntry) bool
 	add := func(given bool, f func(govstore.RankEntry) bool) {
 		if given {
@@ -364,6 +375,7 @@ func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool) []func(govs
 		return strings.EqualFold(strings.TrimSpace(e.Author), strings.TrimSpace(r.By))
 	})
 	add(r.Status == "awaiting_me", awaits)
+	add(r.Subject != "", func(e govstore.RankEntry) bool { return claimed[e.ID] })
 	return out
 }
 
@@ -465,21 +477,6 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		return recallRanking{}, err
 	}
 	qtokens := memoryTokens(req.Query)
-	var ranking []govstore.RankEntry
-	var bm25 map[string]float64
-	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		var err error
-		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller}); err != nil {
-			return err
-		}
-		if len(qtokens) > 0 {
-			bm25, err = r.MemoryScores(ctx, workspaceID, strings.Join(slices.Sorted(maps.Keys(qtokens)), " "))
-		}
-		return err
-	})
-	if err != nil {
-		return recallRanking{}, err
-	}
 	// path signal: explicit query paths, else the files currently being worked on.
 	// Explicit query/paths gate relevance; with neither, the current working changes
 	// only boost matching memories so a dirty tree still yields recency top-N.
@@ -488,12 +485,37 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	if !explicit {
 		focus = recallChangedFiles(ctx, dataDir, workspaceID)
 	}
+	var ranking []govstore.RankEntry
+	var bm25, boosts map[string]float64
+	var boostWhy map[string][]string
+	var claimed map[string]bool
+	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		var err error
+		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller}); err != nil {
+			return err
+		}
+		if len(qtokens) > 0 {
+			if bm25, err = r.MemoryScores(ctx, workspaceID, strings.Join(slices.Sorted(maps.Keys(qtokens)), " ")); err != nil {
+				return err
+			}
+		}
+		if boosts, boostWhy, err = queryAnchorBoosts(ctx, r, readableAnchors(workspaceID, req.ReadsUnverified()), req.Query, focus); err != nil {
+			return err
+		}
+		if req.Subject != "" {
+			claimed, err = claimedEntries(ctx, r, workspaceID, req.Subject, req.Predicate)
+		}
+		return err
+	})
+	if err != nil {
+		return recallRanking{}, err
+	}
 	hasSignal := explicit && (len(qtokens) > 0 || len(focus) > 0)
 	var awaits func(govstore.RankEntry) bool
 	if req.Status == "awaiting_me" {
 		awaits = awaitingCaller(dataDir, req.Caller)
 	}
-	filters := req.filters(awaits)
+	filters := req.filters(awaits, claimed)
 	read := len(ranking)
 	// the signals are scaled over what the caller can see: an entry in another state,
 	// or filtered out, never sets the bm25 scale or the recency origin
@@ -501,6 +523,7 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		return slices.ContainsFunc(filters, func(keep func(govstore.RankEntry) bool) bool { return !keep(e) })
 	})
 	sig := newRecallSignals(visible, bm25, focus)
+	sig.anchorBoost, sig.anchorWhy = boosts, boostWhy
 	out := recallRanking{hasSignal: hasSignal, read: read, ranked: make([]scoredEntry, 0, len(visible))}
 	for _, e := range visible {
 		d := sig.score(e)
@@ -548,7 +571,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	if recallBeforeContentLoad != nil {
 		recallBeforeContentLoad()
 	}
-	mismatched, err := loadCandidates(ctx, dataDir, workspaceID, candidates)
+	mismatched, claims, err := loadCandidates(ctx, dataDir, workspaceID, candidates)
 	if err != nil {
 		return nil, recallPage{}, 0, err
 	}
@@ -578,7 +601,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		"total_matches":          len(rk.ranked),
 		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
 		"generated_at":           nowUTC(),
-	}, recallPage{candidates: candidates, span: span, cursor: cur, limit: limit, total: len(rk.ranked)}, mismatched, nil
+	}, recallPage{candidates: candidates, span: span, cursor: cur, limit: limit, total: len(rk.ranked), claims: claims}, mismatched, nil
 }
 
 // recallSpan is the part of a ranking one page reads: it loads [lo, hi) and scans
@@ -603,12 +626,14 @@ func pageSpan(cur recallCursor, limit, total int) recallSpan {
 // loadCandidates replaces each ranked candidate with its full state and content, read
 // in one snapshot. Content is bound to the revision the candidate was ranked with: a
 // candidate that left its rank state, or now carries another revision, is mismatched,
-// flagged withheld and left without content. It returns how many were mismatched.
-func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates []scoredEntry) (int, error) {
+// flagged withheld and left without content. It returns how many were mismatched, and
+// the candidates' claims for the conflict tiers.
+func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates []scoredEntry) (int, map[string][]govstore.Claim, error) {
 	if len(candidates) == 0 {
-		return 0, nil
+		return 0, nil, nil
 	}
 	loaded := map[string]ContextEntry{}
+	var claims map[string][]govstore.Claim
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		bound := make([]govstore.Entry, 0, len(candidates))
 		ranked := map[string]string{}
@@ -634,10 +659,14 @@ func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates
 		for _, e := range withContent {
 			loaded[e.ID] = e
 		}
+		if err != nil {
+			return err
+		}
+		claims, err = r.ClaimsFor(ctx, slices.Collect(maps.Keys(loaded)))
 		return err
 	})
 	if err != nil {
-		return 0, err
+		return 0, nil, err
 	}
 	mismatched := 0
 	for i := range candidates {
@@ -650,7 +679,7 @@ func loadCandidates(ctx context.Context, dataDir, workspaceID string, candidates
 		}
 		c.entry = e
 	}
-	return mismatched, nil
+	return mismatched, claims, nil
 }
 
 // stalenessChecks counts drift checks that hash referenced files — a test hook for
@@ -705,37 +734,5 @@ func memoryTokenList(text string) []string {
 		out = append(out, t)
 	}
 	sort.Strings(out)
-	return out
-}
-
-// MemoryConflict flags a file that two or more active memories reference, so the
-// agent can reconcile them before trusting either. Detection is path-overlap only;
-// it does not compare content for semantic contradictions.
-type MemoryConflict struct {
-	Path     string   `json:"path"`
-	EntryIDs []string `json:"entry_ids"`
-	Titles   []string `json:"titles"`
-}
-
-func overlappingMemory(entries []ContextEntry) []MemoryConflict {
-	byPath := map[string][]ContextEntry{}
-	for _, e := range entries {
-		for _, p := range e.Paths {
-			byPath[p] = append(byPath[p], e)
-		}
-	}
-	out := []MemoryConflict{}
-	for p, es := range byPath {
-		if len(es) < 2 {
-			continue
-		}
-		c := MemoryConflict{Path: p}
-		for _, e := range es {
-			c.EntryIDs = append(c.EntryIDs, e.ID)
-			c.Titles = append(c.Titles, fallbackString(e.Title, e.ID))
-		}
-		out = append(out, c)
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].Path < out[j].Path })
 	return out
 }

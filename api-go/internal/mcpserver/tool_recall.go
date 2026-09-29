@@ -21,11 +21,11 @@ const (
 // their own names.
 var recallQueryArgs = []string{"paths", "limit", "entry_id", "history", "explain", "kind", "tags", "topic",
 	"path_prefix", "since", "until", "by", "status", "include_pending", "include_superseded", "show_expired",
-	"cursor", "names_only", "render", "session_id"}
+	"include_merged", "subject", "predicate", "cursor", "names_only", "render", "session_id"}
 
 var recallTool = &Tool{
 	Name:        "recall",
-	Description: "Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified | single_agent | self_asserted_open_mode (no auth/quorum). conflicts: path overlap, not contradiction.",
+	Description: "Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms >=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified|single_agent|self_asserted_open_mode (no auth/quorum). conflicts: claim/contradiction/path overlap.",
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Desc: "task query to rank memories by"},
@@ -42,6 +42,9 @@ var recallTool = &Tool{
 		{Name: "include_pending", Type: typeBoolean},
 		{Name: "include_superseded", Type: typeBoolean},
 		{Name: "show_expired", Type: typeBoolean},
+		{Name: "include_merged", Type: typeBoolean},
+		{Name: "subject", Type: typeString, MaxLen: 256},
+		{Name: "predicate", Type: typeString},
 		{Name: "kind", Type: typeString, List: true, MaxLen: 512},
 		{Name: "tags", Type: typeString, List: true, MaxLen: 1024},
 		{Name: "topic", Type: typeString},
@@ -60,10 +63,17 @@ var recallTool = &Tool{
 		"pending (the verification queue) or awaiting_me (pending entries you neither authored nor voted on); " +
 		"pending entries are labelled trust=unverified with votes_needed, and reading them needs the verifier or " +
 		"human-approver role. `include_pending`, `include_superseded` and `show_expired` add those states to " +
-		"promoted memory. `kind` is one of remember's kinds. `topic` matches the topic and every topic under it (a/b " +
+		"promoted memory; `include_merged` adds memories merged into another as its duplicate (verify " +
+		"`duplicate_of`), which may be unverified and so needs the same roles as pending. `subject` keeps " +
+		"memories with a structured claim on it (see remember's `claims`), `predicate` one kind of claim. " +
+		"`kind` is one of remember's kinds. `topic` matches the topic and every topic under it (a/b " +
 		"matches a/b/c). `path_prefix` keeps entries with a path under it. `since` and `until` bound updated_at " +
 		"(a UTC date or RFC 3339 time; until is exclusive). `by` keeps one author's entries. `explain` adds " +
-		"score_details (bm25, path, anchor, trust, recency, feedback, stale_penalty, total, reasons). " +
+		"score_details (bm25, path, anchor, trust, recency, feedback, stale_penalty, total, reasons); the anchor " +
+		"signal also counts the paths, symbols, commands, env keys and error codes the query names, each worth " +
+		"0.5/(1+0.001(n-1)^2) where n memories share it. `conflicts` are advisory, labeled by tier: 1 `claim`, " +
+		"2 `contradiction` (a shared file, most words in common, different numbers, versions or commands, or " +
+		"one-sided negation), 3 `path_overlap`. " +
 		"`names_only` returns id, title, topic, state, stale and paths; `render=compact` one line per entry; " +
 		"fetch the full entry with `entry_id`. `max_chars` budgets the whole result (default 4000): entries " +
 		"that do not fit are left out, the last one may come back with content_truncated, and output_budget " +

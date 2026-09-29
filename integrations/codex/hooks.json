@@ -1,0 +1,95 @@
+{
+  "description": "xMustard hook client (xmustard-ops codex-hooks config)",
+  "hooks": {
+    "PostCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex PostCompact",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "^(Bash|apply_patch|mcp__.+)$",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex PostToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Bash|apply_patch",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex PreToolUse",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SessionEnd": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex SessionEnd",
+            "timeout": 2
+          }
+        ]
+      }
+    ],
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex SessionStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex SubagentStart",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex SubagentStop",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-hook codex UserPromptSubmit",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

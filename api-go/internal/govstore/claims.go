@@ -28,10 +28,13 @@ const (
 	RelationReferences  = "references"
 )
 
+// Predicates is the claim vocabulary, in its documented order.
+var Predicates = []string{PredicateRequires, PredicateForbids, PredicateRunsWith, PredicateConfiguredAs,
+	PredicatePinnedTo, PredicateDeprecatedBy, PredicateOwnedBy, PredicateReplaces}
+
 var (
-	validPredicates = set(PredicateRequires, PredicateForbids, PredicateRunsWith, PredicateConfiguredAs,
-		PredicatePinnedTo, PredicateDeprecatedBy, PredicateOwnedBy, PredicateReplaces)
-	validRelations = set(RelationSupersedes, RelationDuplicates, RelationRefines, RelationContradicts,
+	validPredicates = set(Predicates...)
+	validRelations  = set(RelationSupersedes, RelationDuplicates, RelationRefines, RelationContradicts,
 		RelationMergedInto, RelationReferences)
 )
 
@@ -86,6 +89,8 @@ type Relation struct {
 // ClaimReader reads claims and relations.
 type ClaimReader interface {
 	ListClaims(ctx context.Context, f ClaimFilter) ([]Claim, error)
+	// ClaimsFor returns the claims of many entries at once, keyed by entry id.
+	ClaimsFor(ctx context.Context, ids []string) (map[string][]Claim, error)
 	ConflictingClaims(ctx context.Context, workspaceID, subject, predicate string) ([]ClaimConflict, error)
 	ListRelations(ctx context.Context, entryID string) ([]Relation, error)
 }
@@ -135,6 +140,33 @@ func (r *reader) ListClaims(ctx context.Context, f ClaimFilter) ([]Claim, error)
 	}
 	return out, rows.Err()
 }
+
+// ClaimsFor reads the claims of many entries in bounded batches.
+func (r *reader) ClaimsFor(ctx context.Context, ids []string) (map[string][]Claim, error) {
+	out := make(map[string][]Claim, len(ids))
+	for start := 0; start < len(ids); start += maxInArgs {
+		chunk := ids[start:min(start+maxInArgs, len(ids))]
+		args := make([]any, len(chunk))
+		for i, id := range chunk {
+			args[i] = id
+		}
+		rows, err := r.query(ctx, `SELECT entry_id, revision, subject, subject_kind, predicate, object, created_at
+			FROM claims WHERE entry_id IN (`+placeholders(len(chunk))+`) ORDER BY entry_id, pk`, args...)
+		if err != nil {
+			return nil, err
+		}
+		var c Claim
+		if err := eachRow(rows, func() { out[c.EntryID] = append(out[c.EntryID], c) }, func() error {
+			return rows.Scan(&c.EntryID, &c.Revision, &c.Subject, &c.SubjectKind, &c.Predicate, &c.Object, &c.CreatedAt)
+		}); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// ValidPredicate reports whether p is in the fixed claim vocabulary.
+func ValidPredicate(p string) bool { return validPredicates[p] }
 
 // ConflictingClaims pairs active claims on the same subject and predicate whose
 // objects differ. Predicate "" checks every predicate of the subject.

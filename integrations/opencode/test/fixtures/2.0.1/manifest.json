@@ -1,0 +1,22 @@
+{
+	"opencode": "2.0.1",
+	"binary_sha256": "ecd111efdbea132f7a33d0ce51041665a93d4e382232bf014a5072b73fcb2b6a",
+	"snippets": {
+		"grep": "4cb66a1ed647b2ec",
+		"read": "7b44b33974939634",
+		"shellNI": "9a29fcc214a7fdb2",
+		"shellCI": "0fa94fefd51ea8b5",
+		"shellDL": "239b81b498875557",
+		"mcpError": "e2e4cd75d9049704",
+		"mcpResult": "0854557c0ce82b70",
+		"hookCompleted": "a992ed26382e7ab6",
+		"hookFailed": "e2e4f195497bc291"
+	},
+	"cases": [
+		"shell-go-test-fail",
+		"grep-100-matches",
+		"read-numbered",
+		"mcp-github-search",
+		"mcp-error"
+	]
+}

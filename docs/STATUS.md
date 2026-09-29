@@ -1,196 +1,280 @@
-# Current status — 2026-09-24
+# Status
 
-**Baseline assessment:** substantial working foundation; not yet a demonstrated
-reliable, resource-bounded competitor-parity product. The core memory loop works
-in a live small fixture. The September audit findings below describe that
-baseline; see candidate disposition before treating them as current source truth.
+xMustard v0.1.1 is out. It gives the coding agents you already use one small, local
+MCP server for three jobs: seeing what changed in the repository, finding the right
+code, and sharing memory that another agent has checked. This page covers what ships,
+what was measured, what is still missing, and what comes next.
 
-## Implementation candidate — imported, uncommitted, verification complete
+Updated 2026-09-28 for `v0.1.1`, cut from `feat/parity-v2` at `1c64982`. The full
+change list is in the [v0.1.1 release notes](releases/v0.1.1.md); the first release's
+are in the [v0.1.0 notes](releases/v0.1.0.md).
 
-The reviewed candidate is now imported into the main working tree, remains
-uncommitted, and is not shipped. It repairs selected audited Go/Rust contracts,
-adds bounded recoverable delivery for xMustard's own MCP surface, and adds one
-pinned Pi adapter. Fable's final source review is approved. All current backend,
-MCP, retrieval, Pi, and fixed-workload RSS gates pass on the imported candidate.
-The remaining decision is human review of the exact diff and merge; no automatic
-merge or repository-enforced human gate is claimed.
+## At a glance
 
-| Candidate evidence | Result | What it does not establish |
-| --- | --- | --- |
-| Backend tests/build and Rust checks | Main-worktree `make check-backend` passes: all 7 Go packages, 148 Rust tests, Clippy exits 0 with 11 existing warnings; uncached Go suite also passes all 7 packages | No warning-clean claim; does not establish broad language/repository coverage or task-quality parity |
-| MCP evidence E2E | Main-worktree provenance-bound run: 23/23 checks pass, including bounded recall, exact recovery, authorization, expiry, cancellation and unchanged URI after restart; focused evidence and shim race checks also pass separately | Scoped to these MCP contracts; no other client/gateway parity implied |
-| Retrieval fixture | Main-worktree provenance-bound gold gate: 12/12 across cold/warm/edit; spans 10/10 | Lexical-leaning regression only—not held-out localization quality, task success, or competitor parity |
-| Rust index review | Fable Recheck 2 approved Rust source hash `d039d76d…7a358`; imported current core is `d644743b…` | Review/tests do not establish broader retrieval quality or task-quality parity |
-| Pi adapter | Main-worktree run on current Rust core `d644743b…`: 17 unit + 15 actual pinned-runtime checks; all nine tools pass using disposable native Postgres fixture for diagnostics | Root run record binds main binaries; the Pi summary itself has no binary hashes. One adapter only; fixture is not a default DB dependency or SQL-correctness proof; no native host-tool or universal client claim |
-| Sampled process-tree RSS | Main run passes 19/19 at 80,592,896 B (80.6 MB), 853 valid samples. Two same-source/script/fixture candidate runs pass 19/19 at 72.3 and 84.9 MB. Each fully recovered four 16 MiB originals plus a repeat (1,280 pages) and exercised a real 503 refusal | Fixed workload on one machine; sampled peaks are not a universal RSS ceiling or hardware-bandwidth/task-quality proof |
-
-The main RSS/MCP/gold JSONs carry the matching Go/Rust source and untracked-source
-digests (`e0e282e6…`, `61245cae…`). Their script and fixture provenance also
-matches the two isolated runs. The main Go binaries have different hashes because
-the build path is embedded. The Pi summary does not carry executable hashes; the
-root invocation record binds its run to the main API/MCP binaries and current core
-(see the final [Fable source review](reviews/2026-09-24-fable-code-review.md)).
-
-Detailed scope: [Go report](reviews/2026-09-24-implementation-results.md),
-[Rust report](reviews/2026-09-24-rust-implementation-results.md),
-[Pi report](reviews/2026-09-24-pi-implementation-results.md), and
-[resource benchmark](benchmarks/2026-09-24-lean-context.md). Current main-worktree
-[RSS](benchmarks/evidence/2026-09-24/main-rss.json),
-[MCP](benchmarks/evidence/2026-09-24/main-mcp.json),
-[retrieval](benchmarks/evidence/2026-09-24/main-gold.json), and
-[Pi E2E](benchmarks/evidence/2026-09-24/pi-e2e-summary-main.json) records are
-linked here; only the first three JSONs carry source/build provenance. Their
-Go/Rust source-diff and untracked-source digests match the reviewed candidate
-(`e0e282e6…`, `61245cae…`). The Pi binary binding is documented in the root run
-record cited above.
-
-All required checks for this imported candidate tranche are green. A separate
-database-free diagnostics plan is an unimplemented next-stage proposal; Fable
-review returned `CHANGES_REQUIRED`. It is not an acceptance gate for this tranche.
-Held-out task quality, broad
-competitor parity, hardware memory bandwidth, and universal RSS claims remain
-unproven.
-
-Reviewed implementation: `cd13e2b78a9fadcbcd760b19442d5992136b1db0`, local branch
-`feat/product-v1`. The worktree was clean at review start. At that baseline review,
-the source defects listed below remained open; candidate disposition follows.
-
-## Product direction
-
-The owner confirmed shared, verified memory and repository intelligence for
-existing coding agents, current competitor comparisons across both categories,
-and a local/no-Docker default targeting roughly 50–100 MB. UI is out of scope.
-The subsequent clarification includes concurrent/cross-session/cross-repo work,
-tool-context compression, investigation of a Needle-like local helper, and human
-final code-merge authority. See [vision](VISION.md), the proposed
-[context layer](CONTEXT_LAYER.md), and the
-[current parity review](research/COMPETITOR_PARITY_2026-09-24.md).
-
-The candidate implements only recoverable projection on xMustard's own MCP path
-and one Pi extension. An upstream gateway, other native-client result hooks,
-helper-model integration, and human-specific merge enforcement are **not
-implemented**. Existing memory promotion counts peer votes; run-plan approval
-starts work and does not establish human approval of a Git merge. The owner
-clarified that "cheaper than OpenHands" refers to a lighter harness, context
-shedding and better indexing, not API-price reductions. Comparative harness RSS,
-allocation/copy overhead and hardware memory bandwidth remain unmeasured.
-
-## Live GitHub state
-
-Checked through GitHub and remote refs on 2026-09-24; local tracking refs were not
-treated as current remote truth.
-
-| Item | Observed state |
+| | |
 | --- | --- |
-| Public repository | [just-very-queer/xMustard](https://github.com/just-very-queer/xMustard), MIT, default branch `main` |
-| Public main | [`2c312338`](https://github.com/just-very-queer/xMustard/commit/2c312338aeddf829c811c606481b6edff652dd10), PR #7 merged June 22 |
-| Remote feature | [`3f28eef7`](https://github.com/just-very-queer/xMustard/commit/3f28eef72f373d62e69001fd0170c571ae1fc577) |
-| Local development | `cd13e2b`, **21 commits ahead of remote feature, zero behind** |
-| Feature vs main | Remote feature 18 ahead / 3 behind; the three main-only commits are merges #4, #5, #7. Local has 39 feature-line commits after their common ancestor. [Comparison](https://github.com/just-very-queer/xMustard/compare/main...feat/product-v1) |
-| CI / releases | No Actions workflows or runs; no tags or releases |
-| Work tracking | No issues; [PR #3](https://github.com/just-very-queer/xMustard/pull/3) is open, conflicting, with no checks |
+| Release | [v0.1.1 on GitHub](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.1), cut 2026-09-28. The tag-triggered release workflow builds the archives and drafts the release; the owner publishes it |
+| Prebuilt archives | macOS arm64 (built on `macos-15`) and Linux x86_64 (built on `ubuntu-22.04`), each with a `.sha256` file, plus `SHA256SUMS` |
+| Binaries | `xmustard-api`, `xmustard-ops`, `xmustard-core`, `xmustard-relay`, and the older Go stdio shim `xmustard-mcp`. The Claude Code plugin's `xmustard-hook` is built from source |
+| MCP surface | Nine tools on protocol 2025-06-18 (2024-11-05 is also negotiated) |
+| Clients | Any MCP client, over Streamable HTTP or the stdio relay. Claude Code has a plugin with hooks, and Pi its own extension. Codex, OpenCode and Cursor connect through MCP configuration only |
+| Default posture | Local, no Docker. The API binds `127.0.0.1:8042` and serves the core profile |
+| License | MIT, except the Apache-2.0 finding-anchoring files (linked only into `review`-tagged builds in v0.1.1; see `NOTICE`). After v0.1.1, memory anchors link them into every build, beside the Apache-2.0 Graphiti dedupe port (`api-go/internal/dedupe/minhash.go`) |
+| Next | Codex, OpenCode and Cursor adapters, and the parity gate. Development continues on `feat/parity-v2`; see [In progress](#in-progress) |
 
-At review start the local and published README were byte-identical, despite
-the local code being ahead. The published overview therefore still contains
-unqualified completion claims and contradictory migration language. This review
-did not push, merge, change repository settings, or modify that PR.
+## What ships in v0.1.1
 
-## Fresh verification (baseline review)
+**Know what changed before you edit.** `ground` reports what changed, went stale,
+broke or got blocked since the baseline, including changed signatures. Its answer fits
+a budget of 6,000 characters by default. On a pi-mono clone where 60 files gained a new
+leading parameter, it returned 4,550 B instead of 19,544 B and still counted all 200
+contract breaks.
 
-| Check | Result and limit |
-| --- | --- |
-| Go build | All six packages pass |
-| Go tests | All six packages pass: 277 top-level tests passed, 3 initially skipped. Fresh Rust parity rerun passed; **278/280 exercised**, two live Postgres tests remain skipped |
-| Rust tests | **114 passed**, no failures or ignored tests, default features |
-| Rust binary build | Passed; fresh debug core used for integration checks |
-| Clippy | Exit 0, **12 warnings**; not warning-clean |
-| Isolated HTTP + stdio MCP | **18 checks passed**, including authenticated propose/verify/recall and drift after edit |
-| Optional frontend | Build passes; lint fails with four hook errors. Recorded baseline only; UI changes excluded |
-| Reorganization checks | Curated Markdown links resolve; historical document bodies preserved; diff whitespace check and formula Ruby syntax pass; Make recipe dry runs and missing-root rejection verified |
+**Memory that someone else checked.** `remember` proposes a fact, decision or gotcha.
+It is promoted only after approvals from 2 distinct principals other than its author
+(the default threshold). `recall` ranks memory for the task at hand and marks an entry
+stale when a file it names has changed, at every path depth (v0.1.1 fixed the even-depth
+bug of v0.1.0). With no tokens minted, the API runs in open
+mode: every write is labelled `self_asserted_open_mode` and is never peer-verified.
 
-Details: [Go audit](reviews/2026-09-24-go-audit.md),
-[Rust audit](reviews/2026-09-24-rust-audit.md), and
-[live smoke](reviews/2026-09-24-runtime-smoke.md).
+**Find code by the words inside it.** `search` fuses BM25 over function bodies, comments,
+names, paths and doc sections with identifier match, trigram typo tolerance, reference
+degree and proximity (RRF, K=60). Hits come back as `path:line` with snippets and
+reasons. On the retrieval gate's gold fixture, 6 of 6 body-term queries now land in
+the top 5, up from 0 of 6.
 
-The frontend lint errors are in `AdminPanel.tsx:65,147,209` and
-`MemoryPanel.tsx:38`. No browser workflow was tested. The UI also lacks bearer
-token plumbing and assumes the full API rather than core-only mode; it is not a
-release-ready authenticated frontend.
+**Index the whole repository.** The old 800-file cap is gone. Every eligible file is
+indexed up to a declared envelope (10,000 files and 100,000 symbols by default); past
+it, the index is partial and says so. On a cline clone it indexed 2,660 of 2,660 files
+(51,263 symbols) at a 21.8-25.0 MiB peak across the recorded runs (25.0 MiB with the
+graph-segment write that v0.1.1's index build performs), and a one-file update took
+140-265 ms under shared load. Fifteen tree-sitter packs cover Rust, Go, TypeScript,
+TSX, JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash, and
+coverage is reported per language. With the resident worker on, a watcher
+turns edits into incremental updates: on a 5,000-file tree an edit reached the index in
+p50 424 ms on Linux and 488 ms on macOS (in-process loop), 497 ms on Linux through the
+API.
 
-## Highest-priority baseline findings
+**See the blast radius.** `explain` describes a file; a directory path returns an error.
+`impact` walks references from a symbol, from a file (`path=`), between two symbols, or
+from your current changes. For Go and TS/JS, a resolver adds typed symbol edges (CALLS, USES, ACCESSES,
+EXTENDS, IMPLEMENTS, IMPORTS, HAS_METHOD, HAS_PROPERTY) with confidence tiers. The
+`impact` tool itself walks a lexical file graph, so edges at distance 1 or more are
+leads, not proof.
 
-| Finding | Evidence level | Effect |
-| --- | --- | --- |
-| Repeated unstaged edits reuse a stale symbol graph | Reproduced in an isolated repository | Search can return a removed symbol as current; Git porcelain whitespace is trimmed before fixed-column parsing |
-| Graph indexes only 32 symbols per file without reporting truncation | Reproduced with a 70-function file | Search/impact omit real code while file coverage says complete |
-| Plain `recall` bypasses the bounded ranking path | Source-confirmed route/control flow | Reads and drift-checks all promoted entries instead of top-N |
-| Main returns before the shutdown goroutine completes | Source-confirmed lifecycle | Run interruption, child cleanup, and Postgres flush can be cut short |
-| Non-loopback auth interlock admits `AUTH=off` when tokens exist | Source-confirmed condition mismatch | Supported remote-bind configurations can disable authentication |
-| MCP cancellation stops the HTTP client but is not threaded through core handlers | Source-confirmed call chain | Rust work can continue after a tool is cancelled |
-| Shared transient-byte accounting is not enforced on all work | Source-confirmed paths | At the audit revision the 50–100 MB target was unproven; unconditional charges and uncharged calls allowed excess work |
+**Explain a failure.** `why_failed` reads a run id, a pasted log or an evidence handle
+and returns the error lines and implicated files. Its outcomes show up in
+`ground.recent_failed_runs`. Command mode is off by default and needs
+`XMUSTARD_WHY_FAILED_COMMANDS=1` plus an admin token.
 
-These rows are findings against the reviewed baseline commit, not a fresh list of
-known defects in the candidate. The candidate addresses several of them; exact
-scope and regression evidence are in the implementation reports. The candidate
-does not establish that every route is covered or that enforced byte admission
-forms a hard RSS ceiling. The three passing sampled runs include original recovery
-expansions and the measured xMustard-owned process tree, but establish only that
-fixed workload on that machine. They do not establish other workload performance
-or hardware bandwidth.
+**Stay light per agent.** A client that speaks Streamable HTTP uses `/mcp` on the API
+and runs no extra process. A stdio client can use `xmustard-relay`: 2,192-2,240 KiB RSS
+per agent, against 13,824-13,888 KiB for the Go shim.
 
-The baseline metadata/content race in ranked recall under concurrent edits was
-reproduced; the candidate fixes it with a regression test. The retained goal
-runtime still loses acknowledged creates under concurrency and accepts
-failed-test evidence for completion; both are reproduced, deferred
-secondary-platform defects.
+**Keep humans in charge of merges.** `xmustard-ops approve|reject|queue` records human
+votes on pending memory. `xmustard-ops review approve|revoke` records merge
+attestations bound to a reviewed diff and its base, and `review gate` checks them.
+xMustard never merges.
 
-## Strategic and delivery gaps
+**Reduce what Claude Code reads.** The plugin in `integrations/claude-code` replaces a
+large Bash, Read, Grep, Glob or WebFetch output with its redacted reduction behind a
+recovery handle, and adds index hits and human-approved memory before searches and
+file reads. No hook allows, denies or rewrites a tool call, and the API starts no
+process for one. Captured output from any client is redacted before it is kept, and
+the output of a secret path is refused.
 
-- The memory harness implements paired statistical analysis, **not** a task
-  executor, held-out corpus, or measured solve-rate benefit.
-- Default retrieval uses lexical/hash-based signals and a mostly lexical graph.
-  Optional ONNX inference does not establish a persisted neural vector index;
-  its heavy feature was not built or benchmarked in this review.
-- Language coverage, cross-repo behavior, real client compatibility, and
-  comparable retrieval quality need explicit parity tests.
-- The baseline audit did not complete a sustained process-tree RSS test or live
-  Postgres verification. The imported candidate's fixed-workload RSS gate now
-  passes; the Pi diagnostics E2E uses a disposable native Postgres fixture.
-  Optional Postgres mirror correctness remains a separate deferred gate; this
-  does not establish general SQL correctness.
-- Homebrew instructions did not constitute a working release path: the formula
-  is HEAD-only and the named public tap was not found. Installed binaries do not
-  include the SQL asset required by the optional Postgres bootstrap path.
-- Existing tracked runtime data needs a separate hygiene review. This pass
-  preserved the records and did not remove data or rewrite Git history.
+**Run it as a service.** `xmustard-ops setup` installs a launchd agent or systemd
+socket and service with no credential in the unit; `xmustard-ops store backup|check|restore`
+backs up, checks and restores the memory database, and the API checks its store at
+start-up.
 
-## Reorganization completed in this review
+**Safe defaults.** The API refuses a non-loopback bind unless `XMUSTARD_AUTH=required`
+with minted tokens and TLS (or `XMUSTARD_ALLOW_INSECURE_BIND=1` behind a TLS proxy).
+Tokens carry roles (`admin`, `human-approver`, `indexer`, `verifier`, `proposer`,
+`reader`). Search refuses secret paths, memory is redacted on ingest, and recalled
+memory carries flags from an instruction-pattern scan. Argument errors come back as
+tool results the agent can read, with a hint. Details: [Security](SECURITY.md).
 
-- Established [one documentation entrypoint](README.md), current vision,
-  implementation map, status, and [ordered backlog](ROADMAP.md).
-- Preserved previous architecture/status/roadmap under `docs/history/` and
-  indexed available conversations, decisions, and unavailable transcript gaps.
-- Aligned README, AGENTS, and OpenHands guidance with Go/Rust and the confirmed
-  agent-facing focus; removed obsolete Python checks and global completion claims.
-- Allowlisted the curated documentation set while leaving raw sessions and
-  private working material ignored.
-- Added phony Make targets so backend/frontend startup recipes execute; repaired
-  the `scan` CLI invocation and added backend/frontend check entrypoints.
-- Corrected the packaging caveat from eight to nine tools; packaging remains
-  a development starting point, not a verified release.
+**Connect your agent.** Any MCP client can connect over HTTP or through the relay.
+`xmustard-ops mcp-config` prints the `mcpServers` entry (Codex's `config.toml` table with
+`--client codex`) and never writes the token in literally. The
+[README](../README.md#connect-your-agent) has recipes for Claude Code, its plugin and
+Codex. Pi has its own extension in [`integrations/pi`](../integrations/pi/README.md).
 
-Code-module directories and persisted data paths remain stable. Their real
-coupling needs behavior-level repairs and deliberate extraction, not a bulk move.
+## Measured
 
-## Review coverage
+Each number names its platform or setup, and its source. Sampled peaks are
+single-machine results, not universal ceilings.
 
-The review inventoried the active Go, Rust, frontend, build and SQL surfaces and
-inspected their principal contracts and implementations. Detailed correctness
-review concentrated on the agent-facing paths and shared runtime/storage seams;
-this is not a claim of formal line-by-line verification of all source and tests.
+| What | Result | Platform | Source |
+| --- | --- | --- | --- |
+| Budget gate v2, CI suite, v0.1.1 release tree | 66.6 MiB (frozen v1 workload, stdio shim) and 60.8 MiB (2 agents through `xmustard-relay`), both PASS; line 95.4 MiB. v0.1.0's release commit: 70.5 and 68.8 MiB | Linux x86_64, release core and relay, worker off | [Gate v2 report](benchmarks/evidence/2026-09-28/release-v0.1.1-gate-v2-ci.md), [v0.1.1 notes](releases/v0.1.1.md), [v0.1.0 notes](releases/v0.1.0.md) |
+| Retrieval gate | 21 of 21 checks on the v0.1.1 release tree: 12/12 gold paths and 10/10 spans in the top 5, gold-path MRR@5 1.0, 6/6 body-term queries, cold, warm and after a one-file edit | Linux x86_64 | [Release-tree log](benchmarks/evidence/2026-09-28/release-v0.1.1-checks.txt), [WS-18](benchmarks/2026-09-28-ws18-hybrid-search.md) |
+| Watcher freshness, edit to index | p50 424 ms (max 447) inotify and 488 ms (max 504) FSEvents in the in-process loop; 497 ms (max 549) through the API | 5,000-file tree; Linux x86_64 and Apple M1 | [WS-15](benchmarks/2026-09-28-ws15-watcher.md) |
+| Claude Code hooks under load | PreToolUse(Read) p50 4.2 ms, p95 7.5 ms; PostToolUse(Bash, 30,000 characters) p50 4.0 ms, p95 8.5 ms, 600 of 600 replaced; 0 spawns; API peak 41.7 MiB | Linux x86_64, 600 calls of each event from 4 concurrent clients | [Build plan, WS-23 record](plans/2026-09-25-parity-build-plan.md) |
+| Capture redactor | Live heap at most 0.4 MiB on 16 MiB of pure secrets; raw 16 MiB captures at 31.4-33.0 MB/s against 33.3-39.3 pass-through | Linux x86_64, load 6 to 10 | [Release notes](releases/v0.1.1.md#capture-redaction) |
+| Relay vs Go shim, RSS per stdio agent | 2,192-2,240 KiB vs 13,824-13,888 KiB | macOS arm64 | [WS-13](benchmarks/2026-09-26-ws13-relay-rss.md) |
+| Code index, full build | cline 2,660/2,660 files at 21.8-25.0 MiB (25.0 with the graph-segment write); pi-mono 1,636/1,636 at 20.9-22.5 MiB | macOS M1 | [WS-07](benchmarks/2026-09-25-ws07-index-rss.md), [WS-14](benchmarks/2026-09-26-ws14-resident-index.md) |
+| `ground` output budget | 19,544 B unbudgeted, 4,550 B at the default 6,000-character budget | pi-mono clone | [Build plan, WS-54 record](plans/2026-09-25-parity-build-plan.md) |
+| `recall` over 1,000 memories | p50 28.5 ms, p95 31.0 ms; API RSS 31.5 MB after 600 recalls | Linux x86_64 | [Build plan, WS-20 record](plans/2026-09-25-parity-build-plan.md) |
+| Resolver precision (CALLS edges) | 30 of 30 correct, recall 0.938 | Small purpose-written fixtures | [WS-17](benchmarks/2026-09-26-ws17-resolver.md) |
+| `tools/list`, lean, all nine tools | Capped at 8,888 B on protocol 2025-06-18 (119 B more than v0.1.0, for `impact`'s `path`) | Enforced by a test | [`tools_list_budget.json`](../api-go/internal/mcpserver/testdata/tools_list_budget.json) |
 
-All **62 available archived project conversations** were read at the conversational
-message level (995 substantive messages). Two indexed older Codex transcripts
-and the June Claude conversation are unavailable locally. All tool payloads were
-parsed where present, but not exhaustively re-audited. See the
-[history index](history/README.md) for exact scope and provenance.
+Checks that passed on the v0.1.1 release tree: every cargo test target and all 20 Go
+packages, the `review`-tagged vet and tests, `make bench-test` (76 tests, 3 skipped),
+the retrieval gate, the Pi check (45 tests) and a local `make release` for
+linux-x86_64, which builds with `cargo build --release --locked`. Clippy reports 6
+warnings. The log:
+[release-v0.1.1-checks.txt](benchmarks/evidence/2026-09-28/release-v0.1.1-checks.txt).
+
+What these numbers do not show:
+
+- **Token savings and task success.** The repository records no real-model run yet.
+  `xmustard-eval` can run paired arms, and gate v2's token figures are a bytes/4
+  estimate, not a tokenizer count.
+- **Retrieval quality on real repositories.** The gold fixture is a handcrafted
+  14-file repository.
+- **Resolver precision on real repositories.** The fixtures are small and were written
+  for the test.
+- **Parity.** This is not a parity claim. The parity-scale suite has not passed its
+  95.4 MiB line, and the final parity gate arrives with WS-50.
+- **Real-model evaluation.** The `parity-v1` corpus (eight tasks with hidden oracles)
+  ran only with fake drivers.
+
+## Known limits in v0.1.1
+
+- **Not a parity claim.** The parity-scale suite (4 agents, 2 hot repositories, 4
+  worktrees) has not passed its 95.4 MiB line; its 4-agent, two-repository and
+  four-worktree scenarios have not been run. With the resident worker on, the 2-agent
+  scenario is over the line (201-209 MiB, the worker alone at 171-185 MiB), before and
+  after the watcher alike; WS-15 reads that as the worker building the legacy graph,
+  which was not measured. With the worker off, WS-14 measured it at 94.0 MiB on macOS.
+  On the evaluation corpus's real repositories (pi-mono, cline), the process tree
+  peaked at 91.7-120.9 MiB through the stdio shim, over the line in 5, 8 and 7 of 10
+  runs. The final parity gate arrives with WS-50.
+- **The Pi adapter e2e passes in part: 9 of its 18 tests.** Its unit tests and the
+  WS-24 capture suite pass. Nine tests need a multi-page result from `impact` with no
+  arguments, which a freshly baselined fixture no longer produces; a large-result
+  fixture is an open WS-24 follow-up.
+- **The Claude Code plugin needs a source checkout.** Its hook client is not in the
+  release archive. Index hits and syntax reports in hooks, and the watcher, need
+  `XMUSTARD_CORE_WORKER=1`. A static hook client that gives up in the last ~20 ms of
+  its budget on a loaded host drops an answer the daemon counted as delivered, so those
+  memories are not pushed again in that context until compaction. Codex, OpenCode and
+  Cursor get MCP configuration only; their adapters are WS-40.
+- **Redaction is pattern-based.** A secret no rule knows is kept as written, and a
+  secret file read through a shell (`cat .env`) or matched by a directory search is
+  checked by content only. A secret split across two output strings of one hook body
+  is not joined.
+- **Upgrading from v0.1.0.** The governance store moves to schema version 3, which
+  v0.1.0 cannot open; back it up first (`xmustard-ops store backup`, with `--data-dir`
+  for a store at the relative default). Memories promoted under v0.1.0 and anchored at
+  an even path depth recorded that file as missing, so recall now flags them stale: the
+  file reads as present, which drift treats as missing-to-present, so each such memory
+  goes stale on its first drift check, once. Re-verifying it takes a fresh baseline. No
+  migration rewrites these baselines, because a stored missing-file sentinel cannot be
+  told apart from a file that really was missing.
+- **`diagnostics` needs Postgres.** Without `postgres_dsn` in `<data dir>/settings.json`
+  it returns "Postgres DSN is required to read diagnostics". The `XMUSTARD_PG_DSN`
+  environment variable does not supply it.
+- **Set an absolute data directory.** `XMUSTARD_DATA_DIR` defaults to `../backend/data`
+  relative to the process working directory, release binaries included. A service
+  installed by `xmustard-ops setup` gets an absolute one. The service commands
+  (`setup`, `daemon`, `store`, `uninstall`) take `XMUSTARD_DATA_DIR` only when it is
+  absolute, and otherwise use the platform's data directory.
+- **The resident worker is opt-in.** `XMUSTARD_CORE_WORKER=1` turns it on. Without it,
+  each call starts a one-shot `xmustard-core` and nothing is watched. After the worker's
+  2-minute idle exit, nothing is watched until the next call. Each refresh batch still
+  scans the tracked files (16-23 ms at 5,000 files, 114-153 ms at 50,000).
+- **`impact` is lexical.** Its edges come from symbol names and import lines, and a
+  name shorter than 4 characters makes no edge.
+- **`search` in pattern mode needs `ast-grep` on `PATH`.** Without it, `mode=pattern`
+  answers engine `"none"` with no matches and no error, the same as a pattern that
+  matches nothing.
+- **First ground while xMustard is busy.** The memory governor can refuse the first
+  auto-registration baseline. That ground then reports no baseline, and a later one
+  builds it.
+- **Platforms.** Prebuilt archives cover macOS arm64 and Linux x86_64 only. macOS
+  binaries carry only an ad-hoc signature, so a browser download needs
+  `xattr -d com.apple.quarantine xmustard-*`. The Linux archive is built on Ubuntu
+  22.04, so its Rust binaries need glibc 2.35 at most; the exact floor was not measured.
+  The service needs launchd or systemd.
+- **Service.** launchd has no socket activation for the cgo-free API, so the macOS
+  agent refuses connections while it restarts. A hung daemon is not detected (no
+  watchdog). `store restore` is offline: it stops the daemon. Under systemd,
+  `daemon status` starts the daemon. The real-launchd integration test was not run.
+- **Homebrew.** The in-repo formula pins v0.1.0 (the prebuilt archive on macOS arm64,
+  a source build elsewhere) until `packaging/homebrew/bump.sh` moves it. There is no
+  tap yet.
+- **One Rust memory line is close.** Before WS-FIX-06, the debug-build index-build
+  and resident-service RSS tests failed now and then under load on the shared build
+  box; WS-FIX-06 gave debug builds their own RSS bounds, and every recorded full run
+  since has passed. The release-profile resident line is the close one (+12.9 to
+  +13.4 MiB against +15 MiB). In v0.1.1 `make check-backend` runs only the debug
+  profile; since WS-35 it also runs both release lines (`make check-rss-lines`).
+  The resident-graph test is ignored off Linux, the reference platform.
+- **Checks, not guarantees.** The injection scan matches known instruction patterns,
+  so a paraphrase passes. Merge attestations are records; they block a merge only where
+  a hook or CI check runs `xmustard-ops review gate`.
+- **Tracked runtime data.** Files under `backend/data` are still tracked; `.gitignore`
+  now ignores the directory, and untracking the 80 files waits on the owner.
+
+## In progress
+
+As of 2026-09-28. Workstream numbers refer to the
+[parity build plan](plans/2026-09-25-parity-build-plan.md).
+
+**Merged into `feat/parity-v2` after the v0.1.1 cut**
+
+- **WS-35**: impact v2 (tiers, risk, epistemic envelope, typed filters). `symbol=` walks
+  resolved Go and TS/JS edges, `scope=` maps a Git diff to symbols, and every diff runs
+  through one hardened Git policy (`gitdiff`). The index's graph segment moves to CSR
+  format 2; a v0.1.1 segment is read through the legacy graph until the next
+  `index update` rewrites it.
+- **WS-27**: dedupe, code anchors, tiered conflicts and structured claims for memory.
+  The governance store moves to schema version 4, which v0.1.1 cannot open.
+- **WS-40a**: Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
+  eight Codex events to `/api/hooks/codex/<Event>`, and `xmustard-ops codex-hooks
+  config|status|trust` writes `hooks.json` and records trust only after the user types
+  `trust` at their own terminal. Needs a source build until the next release.
+- **WS-40b**: the OpenCode plugin (`integrations/opencode`), written against the 2.x
+  plugin API and checked against OpenCode 2.0.1, with a 1.x entrypoint. It adds the MCP
+  entry, reduces large tool results through `POST .../evidence/capture?format=opencode`
+  and masks older results on 2.x. `mcp-config --client opencode` prints `opencode.json`'s
+  `mcp` object. Loaded from a source checkout.
+
+**On workstream branches, not yet merged**
+
+- **WS-31** (`parity/ws-31`): tiered memory, write policy and guidance artifacts.
+- **WS-33** (`parity/ws-33`): session ledger, compaction snapshot and cross-client
+  handoff.
+- **WS-36** (`parity/ws-36`): symbol navigation behind search, explain and impact.
+- **WS-42** (`parity/ws-42`): repeat guard and revision-keyed result cache.
+- **WS-CQ-01** (`parity/ws-cq-01`): one route list for the API.
+
+**Planned**
+
+- WS-21B: hardening for `why_failed` command mode.
+- A large-result fixture for the Pi adapter e2e (WS-24 follow-up).
+- Wave 3, including WS-50 (the parity evaluation suite and final parity-scale gate).
+
+## Check it yourself
+
+```bash
+make check-backend      # Go tests and build, cargo test, the release RSS lines, cargo clippy
+make bench-test         # gate v2 unit tests, no binaries needed
+make bench-retrieval    # retrieval gate
+make bench-gate         # budget gate v2, CI suite
+cd integrations/pi && npm ci && npm run check
+```
+
+After a Rust change, rebuild the release core (`make build`) or point
+`XMUSTARD_CORE_BIN` at a fresh build. The Go API otherwise runs whatever
+`xmustard-core` it finds first.
+
+## Earlier status
+
+The v0.1.0 status page, as refreshed after that release, is in Git at
+`git show b994a9c:docs/STATUS.md`. The 2026-09-24 pre-release review, its baseline audit
+and its evidence tables are at `git show v0.1.0:docs/STATUS.md`. The reports it cites are listed under History
+in the [documentation map](README.md).

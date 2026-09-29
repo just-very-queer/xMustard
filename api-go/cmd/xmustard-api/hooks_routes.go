@@ -30,20 +30,23 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
-// Claude Code hook service (WS-23; PAR-HAR-01, PAR-HAR-02, PAR-ADP-06, PAR-CTX-01,
-// PAR-FRESH-07, PAR-PROV-07, PAR-RT-12). Claude Code posts each hook event's JSON to
-// POST /api/hooks/claude/<Event> (an http hook, or the static client xmustard-hook
-// over the Unix socket for the events that only take command hooks) and reads the
-// answer as hook JSON output:
+// Hook service (WS-23, WS-40a; PAR-HAR-01, PAR-HAR-02, PAR-ADP-06, PAR-ADP-07,
+// PAR-CTX-01, PAR-FRESH-07, PAR-PROV-07, PAR-RT-12). A client posts each hook event's
+// JSON to POST /api/hooks/<client>/<Event> and reads the answer as hook JSON output in
+// its own schema (hooks.Client): Claude Code through http hooks, or through the static
+// client xmustard-hook over the Unix socket for the events that only take command
+// hooks; Codex, which has no http handler, through xmustard-hook for every event. The
+// handlers are shared by event name:
 //
 //   - PostToolUse captures the native tool's output (redacted, reduced by its tool
 //     family, retained behind a recoverable handle) and returns the shape-matched
-//     updatedToolOutput; an Edit or Write feeds the dirty set and reports the syntax
-//     errors it introduced; a git command that moves HEAD earns a freshness notice.
+//     replacement (Claude Code's updatedToolOutput, Codex's block reason); an Edit,
+//     Write or apply_patch feeds the dirty set and reports the syntax errors it
+//     introduced; a git command that moves HEAD earns a freshness notice.
 //   - PreToolUse injects, for Grep, Glob and Bash rg|grep, the index hits and the
-//     verified memories for the pattern, and for Read and Edit the memories bound to
-//     the path (stale ones labeled); a burst of searches earns a nudge (2-minute
-//     cooldown).
+//     verified memories for the pattern, and for Read, Edit and apply_patch the
+//     memories bound to the paths (stale ones labeled); a burst of searches earns a
+//     nudge (2-minute cooldown).
 //   - SessionStart and SubagentStart inject ground's spawn-free part and the core-tier
 //     memories; UserPromptSubmit the memories a prompt keyword triggers.
 //   - FileChanged feeds the dirty set (the resident watcher's pending batch, WS-15);
@@ -62,10 +65,10 @@ import (
 // empty 200, and so is a body it cannot read or a workspace out of scope, so the client
 // keeps its original output. Authentication stays fail-closed: a missing, expired or
 // reader-only token gets the middleware's 401 or 403, which Claude Code shows as a
-// non-blocking hook error. The service starts no process for a hook (Claude Code starts
-// the static client for the command-hook events): Rust work runs only on a resident
-// worker that is already running, and the repository identity is never sampled (a
-// hook-delivered observation is captured_identity=unknown).
+// non-blocking hook error (the static client prints nothing). The service starts no
+// process for a hook (the client starts xmustard-hook for command hooks): Rust work
+// runs only on a resident worker that is already running, and the repository identity
+// is never sampled (a hook-delivered observation is captured_identity=unknown).
 //
 // Route gates: every event is its own route with a row in routeGateTable (hookGate): core,
 // the proposer role (a hook runs for an agent session; no non-GET route grants reader),
@@ -133,6 +136,7 @@ type hookServer struct {
 // hookCall is one hook request being answered.
 type hookCall struct {
 	r      *http.Request
+	client hooks.Client
 	ev     hooks.Event
 	in     hooks.Input
 	body   []byte
@@ -216,16 +220,18 @@ func newHookServer(store *evidence.Store) *hookServer {
 	return s
 }
 
-// registerHookRoutes mounts one route per Claude Code event.
+// registerHookRoutes mounts one route per client event.
 func registerHookRoutes(mux routeRegistrar, store *evidence.Store) *hookServer {
 	s := newHookServer(store)
-	for _, ev := range hooks.Events {
-		mux.HandleFunc("POST /api/hooks/claude/"+ev.Name, s.handle(ev))
+	for _, client := range hooks.Clients {
+		for _, ev := range client.Events {
+			mux.HandleFunc("POST /api/hooks/"+client.Name+"/"+ev.Name, s.handle(client, ev))
+		}
 	}
 	return s
 }
 
-func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
+func (s *hookServer) handle(client hooks.Client, ev hooks.Event) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		// the body-limit middleware admitted and capped it; Claude Code clamps tool
 		// output (Bash at 30,000 characters), so a hook body is small
@@ -240,7 +246,7 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 			return
 		}
 		caller, _ := principalScope(r)
-		call := &hookCall{r: r, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID, in.AgentID)}
+		call := &hookCall{r: r, client: client, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID, in.AgentID)}
 		if ev.Mode == hooks.Enqueue {
 			s.enqueue(call)
 			writeHookAnswer(w, nil)
@@ -249,7 +255,7 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 		ctx, cancel := context.WithTimeout(budget.WithoutHeavyWait(r.Context()), hookBudget())
 		defer cancel()
 		type answered struct {
-			out       *hooks.Output
+			out       *hooks.Reply
 			delivered []string
 			after     func(*http.Request)
 		}
@@ -286,9 +292,9 @@ func (s *hookServer) handle(ev hooks.Event) http.HandlerFunc {
 	}
 }
 
-// answer runs the event's handler and builds its output (nil when the budget ran out)
-// and the memory ids the output delivers.
-func (s *hookServer) answer(ctx context.Context, c *hookCall) (*hooks.Output, []string, func(*http.Request)) {
+// answer runs the event's handler and writes its answer in the client's schema (nil
+// when the budget ran out or there is nothing to say) and the memory ids it delivers.
+func (s *hookServer) answer(ctx context.Context, c *hookCall) (*hooks.Reply, []string, func(*http.Request)) {
 	c.bound = s.resolve(c)
 	res := hookHandlers[c.ev.Name](s, ctx, c)
 	if ctx.Err() != nil {
@@ -298,19 +304,19 @@ func (s *hookServer) answer(ctx context.Context, c *hookCall) (*hooks.Output, []
 		res.context = hooks.Compose(res.context, s.sessions.BusyNote(c.key))
 	}
 	hookStats.answered.Add(1)
-	out := hooks.Answer(c.ev, res.context, res.updated, res.watch)
+	out := c.client.Reply(c.ev, hooks.Result{Context: res.context, Updated: res.updated, Watch: res.watch})
 	return out, delivered(out, res.offered), res.after
 }
 
 // delivered lists the offered memory ids whose text the answer carries: a frame or a
 // note that was composed out, or cut by the context cap, delivers nothing.
-func delivered(out *hooks.Output, offered map[string]string) []string {
+func delivered(out *hooks.Reply, offered map[string]string) []string {
 	if out == nil {
 		return nil
 	}
 	var ids []string
 	for id, text := range offered {
-		if text != "" && strings.Contains(out.HookSpecificOutput.AdditionalContext, text) {
+		if text != "" && strings.Contains(out.Context, text) {
 			ids = append(ids, id)
 		}
 	}
@@ -318,10 +324,10 @@ func delivered(out *hooks.Output, offered map[string]string) []string {
 }
 
 // writeHookAnswer writes an answer: 200 with an empty body when there is nothing to say.
-func writeHookAnswer(w http.ResponseWriter, out *hooks.Output) error {
+func writeHookAnswer(w http.ResponseWriter, out *hooks.Reply) error {
 	var body []byte
 	if out != nil {
-		body, _ = json.Marshal(out)
+		body = out.Body
 		w.Header().Set("Content-Type", "application/json")
 	}
 	w.Header().Set("Content-Length", strconv.Itoa(len(body)))
@@ -374,7 +380,7 @@ func (s *hookServer) sessionStart(ctx context.Context, c *hookCall) hookResult {
 		s.sessions.Compacted(c.key) // what was pushed is gone from the context
 	}
 	s.record(c, workspaceops.LedgerEvent{Kind: workspaceops.LedgerSessionStart, Text: c.in.Source})
-	return s.grounding(ctx, c, true, s.sessionContext(ctx, c)...)
+	return s.grounding(ctx, c, c.ev.WatchPaths, s.sessionContext(ctx, c)...)
 }
 
 // subagentStart grounds a subagent: its hooks carry its agent_id, so it gets a
@@ -578,20 +584,44 @@ func (s *hookServer) searchContext(ctx context.Context, c *hookCall) hookResult 
 	return hookResult{context: hooks.Compose(memory, hooks.RenderHits(q, hits, hookSearchHits), nudge), offered: offered}
 }
 
-// fileContext is a Read or Edit's context: the memories bound to the file. Before an
-// edit it also keeps the file's syntax errors as the baseline of the post-edit delta.
+// fileContext is a Read, Edit or apply_patch's context: the memories bound to its
+// files. Before an edit it also keeps the files' syntax errors as the baseline of the
+// post-edit delta.
 func (s *hookServer) fileContext(ctx context.Context, c *hookCall) hookResult {
-	rel := workspaceops.RelativeToRoot(c.ws, c.in.ToolInput.TargetPath())
-	if rel == "" {
+	rels := c.targets()
+	if len(rels) == 0 {
 		return hookResult{}
 	}
 	var wg sync.WaitGroup
 	if hooks.ClassOf(c.in.ToolName) == hooks.ToolEdit {
-		wg.Go(func() { s.baseline(ctx, c, rel) })
+		wg.Go(func() { s.baseline(ctx, c, rels) })
 	}
-	memory, offered := s.memoryContext(ctx, c, "", []string{rel})
+	memory, offered := s.memoryContext(ctx, c, "", rels)
 	wg.Wait()
 	return hookResult{context: memory, offered: offered}
+}
+
+// targets are the call's files inside the workspace root, relative to it.
+func (c *hookCall) targets() []string {
+	var rels []string
+	for _, p := range c.in.Targets() {
+		if rel := workspaceops.RelativeToRoot(c.ws, p); rel != "" {
+			rels = append(rels, rel)
+		}
+	}
+	return rels
+}
+
+// moves maps each file the call renames a file to onto that file, both inside the
+// workspace root and relative to it.
+func (c *hookCall) moves() map[string]string {
+	out := map[string]string{}
+	for to, from := range c.in.Moves() {
+		if rt, rf := workspaceops.RelativeToRoot(c.ws, to), workspaceops.RelativeToRoot(c.ws, from); rt != "" && rf != "" {
+			out[rt] = rf
+		}
+	}
+	return out
 }
 
 // memoryContext pushes the served memories recall ranks for a pattern or a path; they
@@ -611,7 +641,11 @@ func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query strin
 	}
 	recall := fmt.Sprintf("recall(query=%q)", query)
 	if len(paths) > 0 {
-		recall = fmt.Sprintf("recall(paths=[%q])", paths[0])
+		quoted := make([]string, len(paths))
+		for i, p := range paths {
+			quoted[i] = strconv.Quote(p)
+		}
+		recall = "recall(paths=[" + strings.Join(quoted, ", ") + "])"
 	}
 	return s.push(ctx, c, injection.SurfaceHook, ids, stale, recall, hooks.MaxContextChars)
 }
@@ -670,19 +704,32 @@ func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Su
 	return hooks.ComposeWithin(room, append(frames, note)...), offered
 }
 
-// baseline keeps a file's syntax errors before an edit. A file that does not exist
-// yet has an empty baseline: every error of the new file is new.
-func (s *hookServer) baseline(ctx context.Context, c *hookCall, rel string) {
-	raw, err := hookSyntax(ctx, c.ws, []string{rel})
+// baseline keeps the files' syntax errors before an edit (one worker read for all of
+// them). A file that does not exist yet has an empty baseline: every error of the new
+// file is new. A file an apply_patch renames keeps its errors: the destination, which
+// does not exist yet, takes its source's baseline.
+func (s *hookServer) baseline(ctx context.Context, c *hookCall, rels []string) {
+	raw, err := hookSyntax(ctx, c.ws, rels)
 	files, perr := hooks.ParseSyntax(raw)
-	if err != nil || perr != nil || len(files) != 1 {
+	if err != nil || perr != nil {
 		return
 	}
-	switch files[0].Status {
-	case "checked":
-		s.sessions.SetBaseline(c.key, rel, files[0].Keys())
-	case "unreadable":
-		s.sessions.SetBaseline(c.key, rel, nil)
+	before := map[string][]string{}
+	for _, f := range files {
+		switch f.Status {
+		case "checked":
+			before[f.Path] = f.Keys()
+		case "unreadable":
+			before[f.Path] = nil
+		}
+	}
+	for to, from := range c.moves() {
+		if errs, ok := before[from]; ok {
+			before[to] = errs
+		}
+	}
+	for rel, errs := range before {
+		s.sessions.SetBaseline(c.key, rel, errs)
 	}
 }
 
@@ -777,21 +824,35 @@ func failureSignature(errText string, obs *evidence.ObservationResult) string {
 	return strings.TrimSpace(errText)
 }
 
-// afterEdit feeds the dirty set and reports the syntax errors the edit introduced.
+// afterEdit feeds the dirty set and reports the syntax errors the edit introduced, per
+// file (an apply_patch may change several).
 func (s *hookServer) afterEdit(ctx context.Context, c *hookCall) hookResult {
-	rel := workspaceops.RelativeToRoot(c.ws, c.in.ToolInput.TargetPath())
-	if rel == "" {
+	rels := c.targets()
+	if len(rels) == 0 {
 		return hookResult{}
 	}
-	workspaceops.NoteChangedPaths(ctx, c.ws.Scope, []string{rel})
-	before, had := s.sessions.TakeBaseline(c.key, rel)
-	raw, err := hookSyntax(ctx, c.ws, []string{rel})
+	workspaceops.NoteChangedPaths(ctx, c.ws.Scope, rels)
+	type baseline struct {
+		errs []string
+		had  bool
+	}
+	before := make(map[string]baseline, len(rels)) // taken even if the check fails: a baseline serves one edit
+	for _, rel := range rels {
+		errs, had := s.sessions.TakeBaseline(c.key, rel)
+		before[rel] = baseline{errs, had}
+	}
+	raw, err := hookSyntax(ctx, c.ws, rels)
 	files, perr := hooks.ParseSyntax(raw)
-	if err != nil || perr != nil || len(files) != 1 || files[0].Status != "checked" {
+	if err != nil || perr != nil {
 		return hookResult{}
 	}
-	f := files[0]
-	return hookResult{context: hooks.SyntaxNote(rel, hooks.NewErrors(before, f.Errors), had, f.Truncated)}
+	var notes []string
+	for _, f := range files {
+		if b := before[f.Path]; f.Status == "checked" {
+			notes = append(notes, hooks.SyntaxNote(f.Path, hooks.NewErrors(b.errs, f.Errors), b.had, f.Truncated))
+		}
+	}
+	return hookResult{context: hooks.Compose(notes...)}
 }
 
 // afterCapture replaces a native tool's output with its reduction when it was reduced
@@ -853,7 +914,7 @@ func (s *hookServer) afterShell(ctx context.Context, c *hookCall) string {
 
 // capture stream-decodes the hook body into the spool through the capture redactor
 // (fail-closed as on the capture route: a redactor failure retains nothing), reduces
-// it by tool family and shapes it for Claude Code. nil when capture is not possible
+// it by tool family and shapes it for the client. nil when capture is not possible
 // now (no redactor, memory refused, the output of a secret path, a redactor failure,
 // another error): the client keeps its output. Only a refusal for memory counts as a
 // busy skip; a secret path or a redactor failure is not the daemon being busy.
@@ -873,7 +934,7 @@ func (s *hookServer) capture(ctx context.Context, c *hookCall) *evidence.Observa
 	actor, enforced := principalScope(c.r)
 	res, err := s.store.Observe(ctx, s.reg, evidence.ObservationInput{
 		WorkspaceID: c.ws.WorkspaceID, RepoScope: c.ws.Scope, Actor: actor, AuthEnforced: enforced,
-		Format: evidence.FormatClaude, Body: bytes.NewReader(c.body), Meta: evidence.CaptureMeta{Client: hooks.Client},
+		Format: evidence.HookFormat(c.client.Format), Body: bytes.NewReader(c.body), Meta: evidence.CaptureMeta{Client: c.client.Name},
 		Redact: func(w io.Writer) evidence.StreamRedactor { return &failClosed{next: redact(w)} },
 	})
 	if err != nil {

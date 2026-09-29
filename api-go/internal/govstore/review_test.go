@@ -521,7 +521,7 @@ func TestMigrationUpgradesV2FileToReviewSubjects(t *testing.T) {
 		t.Fatalf("upgrade: %v", err)
 	}
 	defer s.Close()
-	if info, err := s.SchemaInfo(ctx); err != nil || info.Version != 3 {
+	if info, err := s.SchemaInfo(ctx); err != nil || info.Version != LatestSchemaVersion() {
 		t.Fatalf("schema after upgrade = %+v, %v", info, err)
 	}
 	as, _ := s.ListAnchors(ctx, "m1")
