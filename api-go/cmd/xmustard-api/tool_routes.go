@@ -29,11 +29,17 @@ func search(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	limit := queryInt(r, "limit", 25)
+	limit := queryInt(r, "limit", workspaceops.DefaultSearchLimit)
 	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
 	var result json.RawMessage
 	var err error
 	switch {
+	case q.Get("mode") == "symbol":
+		// name-path lookup over the code index (WS-36): q is a name path.
+		var req workspaceops.SymbolSearchRequest
+		if req, err = workspaceops.ParseSymbolSearch(q, limit); err == nil {
+			result, err = workspaceops.SymbolSearchCtx(r.Context(), dd, ws, req)
+		}
 	case q.Get("mode") == "pattern":
 		// structural AST search: the query is an ast-grep pattern (e.g. `$A && $A()`).
 		pat, perr := workspaceops.SearchSemanticPatternCtx(r.Context(), dd, ws, query, q.Get("lang"), q.Get("path"), limit)
@@ -56,29 +62,18 @@ func search(w http.ResponseWriter, r *http.Request) {
 	reply(w, result, err, respondError)
 }
 
-// explainPath explains one file, enriched best-effort with its community cluster
-// (its functional neighbourhood: "where does this file sit in the repo") and the
-// freshness and coverage of the code graph behind it.
+// explainPath explains one file (its explanation, outline and cluster) or a directory
+// (its outline), or a symbol's context (?symbol= a name path, ?uid= a symbol's UID),
+// with staged fallback (WS-36). The output budget and paging (max_chars, limit, cursor)
+// are the tool budget middleware's (tool_budget_routes.go).
 func explainPath(w http.ResponseWriter, r *http.Request) {
-	ws, path := r.PathValue("workspace_id"), r.URL.Query().Get("path")
-	result, err := workspaceops.ExplainPathCtx(r.Context(), dataDir(), ws, path)
+	req, err := workspaceops.ParseExplain(r.URL.Query(), callerOf(r).ID)
 	if err != nil {
-		explainFailure(w, err)
+		respondError(w, err)
 		return
 	}
-	graph, gerr := workspaceops.PathGraphCtx(r.Context(), dataDir(), ws, path)
-	switch {
-	case gerr != nil:
-		writeJSON(w, http.StatusOK, result)
-	case graph.Cluster != nil:
-		writeJSON(w, http.StatusOK, map[string]any{
-			"explanation": result, "cluster": graph.Cluster,
-			"freshness": graph.Freshness, "coverage": graph.Coverage,
-		})
-	default:
-		result.Freshness, result.Coverage = graph.Freshness, graph.Coverage
-		writeJSON(w, http.StatusOK, result)
-	}
+	result, err := workspaceops.ExplainCtx(r.Context(), dataDir(), r.PathValue("workspace_id"), req)
+	reply(w, result, err, explainFailure)
 }
 
 // explainFailure: a path that escapes the workspace (or other bad input) is a 400,
