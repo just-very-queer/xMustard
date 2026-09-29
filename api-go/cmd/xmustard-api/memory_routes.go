@@ -141,6 +141,27 @@ func registerMemoryRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /api/workspaces/{workspace_id}/context/{entry_id}/restore", func(w http.ResponseWriter, r *http.Request) {
 		approverLifecycleWrite(w, r, workspaceops.RestoreContext)
 	})
+	// The standing-memory projection (WS-31): the core tier the injection policy admits
+	// and the deferred index, compiled from promoted state and cached by memory revision.
+	// The MCP server puts its text in initialize.instructions; clients that drop the
+	// instructions read it as xmustard://memory/core or through the orient prompt.
+	mux.HandleFunc("GET /api/workspaces/{workspace_id}/memory/core", func(w http.ResponseWriter, r *http.Request) {
+		budget := 0
+		if v := r.URL.Query().Get("max_chars"); v != "" {
+			n, err := strconv.Atoi(v)
+			if err != nil {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "max_chars must be an integer", "argument": "max_chars"})
+				return
+			}
+			budget = n
+		}
+		p, err := workspaceops.CoreProjection(r.Context(), dataDir(), r.PathValue("workspace_id"), budget)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, p)
+	})
 }
 
 // approverLifecycleWrite runs one reasoned lifecycle change as an admin or human
@@ -169,8 +190,23 @@ func approverLifecycleWrite(w http.ResponseWriter, r *http.Request,
 var memoryAuthorityErrors = []error{workspaceops.ErrNotEntryAuthor, workspaceops.ErrApproverRequired,
 	workspaceops.ErrVerifierRequired, workspaceops.ErrSameOwner}
 
-// respondMemoryWrite answers a governed-memory write.
+// respondMemoryWrite answers a governed-memory write. A write the memory policy refuses
+// answers its violations ({field, rule, limit, actual}): 403, audited, when only a human
+// approver could make it (protected fields and patterns), 400 otherwise.
 func respondMemoryWrite(w http.ResponseWriter, r *http.Request, caller memoryCaller, result any, err error) {
+	var pv *workspaceops.MemoryPolicyError
+	if errors.As(err, &pv) {
+		status := http.StatusBadRequest
+		if pv.NeedsHumanApprover() {
+			status = http.StatusForbidden
+			workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{
+				Action: "denied", Actor: caller.id(), Detail: err.Error(),
+				Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
+			})
+		}
+		writeJSON(w, status, map[string]any{"error": err.Error(), "violations": pv.Violations})
+		return
+	}
 	for _, denied := range memoryAuthorityErrors {
 		if errors.Is(err, denied) {
 			workspaceops.RecordAuthAudit(dataDir(), workspaceops.AuthAuditEvent{

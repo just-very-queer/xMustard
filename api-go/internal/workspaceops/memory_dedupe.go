@@ -104,10 +104,10 @@ type reviewInput struct {
 	// intent: the proposal names supersedes, claims or relations, so it is more than
 	// a restatement.
 	intent bool
-	// the classification and expiry the proposal asks for
-	kind, topic, expires string
-	tags                 []string
-	quarantine           string
+	// the classification, expiry and tier the proposal asks for
+	kind, topic, expires, tier string
+	tags                       []string
+	quarantine                 string
 	// reviewer: the proposer may read unverified memory (verifier or human-approver).
 	// Pending entries are its duplicates and neighbours only then, so a proposal is
 	// never an oracle for pending text its author may not read.
@@ -134,6 +134,10 @@ var corroborationBlocks = []corroborationBlock{
 		func(in reviewInput, _ *reviewCandidate) bool { return in.intent }},
 	{"the proposal asks for another kind, topic, tags or expiry",
 		func(in reviewInput, c *reviewCandidate) bool { return in.classifiedOtherwise(c.entry) }},
+	// a corroboration changes no tier (a tier change is governed: SetMemoryTier)
+	{"the proposal asks for another tier", func(in reviewInput, c *reviewCandidate) bool {
+		return in.tier != "" && in.tier != fallbackString(c.entry.Tier, TierDeferred)
+	}},
 	// a corroboration records no paths, so a declared path the memory lacks would be lost
 	{"it declares paths the memory does not have", func(in reviewInput, c *reviewCandidate) bool {
 		return slices.ContainsFunc(in.declared, func(p string) bool { return !slices.Contains(c.view.Paths, p) })

@@ -28,14 +28,14 @@ var rememberTool = &Tool{
 	// Lifecycle writes (WS-19A): accepted on every call, listed only in the full schema
 	// profile, documented at DocsURI.
 	Advanced: []Arg{
-		{Name: "op", Type: typeString, Enum: []string{"propose", "supersede", "edit", "retire", "restore"},
+		{Name: "op", Type: typeString, Enum: []string{"propose", "supersede", "edit", "retire", "restore", "tier"},
 			Desc: "default propose"},
-		{Name: "entry_id", Type: typeString, Desc: "target of edit/retire/restore"},
+		{Name: "entry_id", Type: typeString, Desc: "target of edit/retire/restore/tier"},
 		{Name: "base_revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "edit: revision read (CAS)"},
 		{Name: "reason", Type: typeString, MaxLen: maxVerifyNote, Desc: "required unless proposing"},
 		{Name: "old_string", Type: typeString, Desc: "edit: text to replace once"},
 		{Name: "new_string", Type: typeString, Desc: "edit: replacement, or appended"},
-		{Name: "description", Type: typeString, Desc: "edit: new description"},
+		{Name: "description", Type: typeString, Desc: "one-line description (deferred index)"},
 		{Name: "supersedes", Type: typeString, List: true, MaxLen: 1024, Desc: "entries this replaces"},
 		{Name: "expires", Type: typeString, Desc: "last UTC date served (YYYY-MM-DD)"},
 		// Provenance (WS-19B): checked before the write.
@@ -50,6 +50,8 @@ var rememberTool = &Tool{
 		// Structured claims and typed relations (WS-27).
 		{Name: "claims", Type: typeString, MaxLen: 4096},
 		{Name: "relations", Type: typeString, List: true, MaxLen: 1024},
+		// Tiers (WS-31): core is pushed into every session; a protected field.
+		{Name: "tier", Type: typeString, Enum: []string{"core", "deferred"}, Desc: "core needs a human approver"},
 	},
 	Doc: "### Handoff capsules\n\n`kind=handoff` stores a handoff capsule for the next session, in any client, instead of " +
 		"proposing a memory: session evidence, never verified or pushed as memory. `content` is one JSON object " +
@@ -85,7 +87,12 @@ var rememberTool = &Tool{
 		"compare case-insensitively, and recall filters on them with `subject` and `predicate`. `relations` " +
 		"are `kind:entry_id` edges, the kind one of refines, contradicts, duplicates, references. A principal " +
 		"may hold at most XMUSTARD_MEMORY_PENDING_QUOTA (500) pending proposals per workspace, and a " +
-		"workspace at most XMUSTARD_MEMORY_ACTIVE_ENVELOPE (100000) active memories.",
+		"workspace at most XMUSTARD_MEMORY_ACTIVE_ENVELOPE (100000) active memories. " +
+		"`tier`: core memory is pushed into every session (initialize instructions, SessionStart) once a human approver " +
+		"approved its served revision; deferred memory (the default) appears there only as a title in the deferred index. " +
+		"Choosing a tier, at proposal or with op=tier (entry_id, tier, reason), needs a human approver, and core must fit the " +
+		"workspace's core budget. The workspace's write policy checks every write server-side: a refusal lists its " +
+		"violations as {field, rule, limit, actual}.",
 	// Proposing is additive (never destroys state) and not idempotent: each call is a
 	// new proposal.
 	Annotations: Annotations{Title: "Propose a memory"},
@@ -97,7 +104,7 @@ var rememberTool = &Tool{
 		// content goes in the JSON BODY, not the URL, so durable memory text is not
 		// exposed in access logs / error strings (XM-NEW-018).
 		payload := map[string]any{}
-		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id", "kind", "topic", "session_id"} {
+		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id", "kind", "topic", "tier", "session_id"} {
 			if a[k] != "" {
 				payload[k] = a[k]
 			}

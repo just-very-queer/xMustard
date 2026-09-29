@@ -443,6 +443,13 @@ func (g *SessionGrounding) summarize() {
 	if g.PendingForYou != nil && *g.PendingForYou > 0 {
 		g.Summary += fmt.Sprintf(" %d pending memory await your verification (recall status=awaiting_me).", *g.PendingForYou)
 	}
+	if g.Onboarding != nil {
+		g.Summary += " No promoted memory yet: onboarding lists what to propose first."
+	}
+	if d := g.MemoryDelta; d != nil {
+		g.Summary += fmt.Sprintf(" Memory since revision %d: %d added, %d changed, %d superseded, %d stale, %d removed (revision %d).",
+			d.Since, len(d.Added), len(d.Changed), len(d.Superseded), len(d.Stale), len(d.Removed), d.Revision)
+	}
 	if h := g.SessionHandoff; h != nil {
 		verb := "Handoff from session"
 		if h.Restore {

@@ -301,6 +301,10 @@ func contextEntryFrom(e govstore.Entry, votes []govstore.Vote, anchors []govstor
 		Revision: e.Revision, SupersededBy: e.SupersededBy, InvalidatedAt: e.InvalidatedAt, ExpiresAt: e.ExpiresAt,
 		Supersedes: pendingSupersedes(e),
 		Kind:       e.Kind, Topic: e.Topic, Tags: e.Tags, Quarantine: e.Metadata[govstore.MetaQuarantine],
+		Description: e.Description,
+	}
+	if e.Tier == govstore.TierCore {
+		ce.Tier = govstore.TierCore
 	}
 	if e.HeadRevision > e.Revision {
 		ce.PendingRevision = e.HeadRevision

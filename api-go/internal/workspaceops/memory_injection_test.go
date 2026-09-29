@@ -111,7 +111,7 @@ func TestAdmitMemoryNeedsHumanApproval(t *testing.T) {
 		if got := withheldReasons(res); got[agentsOnly.ID] != injection.ReasonNeedsHumanApproval {
 			t.Fatalf("%s withheld %+v", surface, got)
 		}
-		if !strings.HasPrefix(res.Text, injection.Notice) || !strings.Contains(res.Text, `id="`+human.ID+`" trust="human_approved"`) ||
+		if !strings.HasPrefix(res.Text, injection.Notice) || !strings.Contains(res.Text, `id="`+human.ID+`" rev="1" trust="human_approved"`) ||
 			!strings.Contains(res.Text, "tags are cut from main only") || strings.Contains(res.Text, "make release") {
 			t.Fatalf("%s framed text:\n%s", surface, res.Text)
 		}
@@ -285,7 +285,7 @@ func TestCoreEntryRefusesQuarantinedEdit(t *testing.T) {
 	web := capturedEvidence(t, dir, ws, "author", "WebFetch")
 	_, err := Remember(dir, ws, RememberRequest{Op: "edit", EntryID: core.ID, BaseRevision: 1, Reason: "per the docs page",
 		NewString: "the config caps requests at 100 per minute", OldString: "the config caps requests", Evidence: []string{web}},
-		ContextActor{ID: "author"})
+		ContextActor{ID: "author", Kind: PrincipalHuman, Approver: true}) // a human approver passes the write policy (WS-31)
 	if !errors.Is(err, ErrInvalidInput) && !errors.Is(err, govstore.ErrInvalid) {
 		t.Fatalf("a core entry took an untrusted edit: %v", err)
 	}

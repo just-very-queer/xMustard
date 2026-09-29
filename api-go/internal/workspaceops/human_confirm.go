@@ -74,10 +74,12 @@ func opSet(ops ...string) map[string]bool {
 }
 
 var (
-	proposeOps = opSet("propose", "supersede")
-	contentOps = opSet("propose", "supersede", "edit")
-	editOps    = opSet("edit")
-	entryOps   = opSet("edit", "retire", "restore") // the ops that name an existing entry
+	proposeOps   = opSet("propose", "supersede")
+	contentOps   = opSet("propose", "supersede", "edit")
+	editOps      = opSet("edit")
+	describedOps = opSet("propose", "supersede", "edit")
+	tierOps      = opSet("propose", "supersede", "tier")
+	entryOps     = opSet("edit", "retire", "restore", "tier") // the ops that name an existing entry
 )
 
 // rememberFields are the request fields shown for each op, in order: the fields the op
@@ -109,7 +111,8 @@ var rememberFields = []struct {
 	}},
 	{"old_string", editOps, func(q RememberRequest) string { return shownText(q.OldString) }},
 	{"new_string", editOps, func(q RememberRequest) string { return shownText(q.NewString) }},
-	{"description", editOps, func(q RememberRequest) string {
+	{"tier", tierOps, func(q RememberRequest) string { return shownText(q.Tier) }},
+	{"description", describedOps, func(q RememberRequest) string {
 		if q.Description != nil && *q.Description == "" {
 			return "(cleared)"
 		}

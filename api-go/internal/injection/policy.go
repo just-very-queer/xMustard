@@ -15,6 +15,10 @@ const (
 	// SurfaceCore is memory pushed into every session unasked: the core-tier projection
 	// in initialize.instructions and SessionStart (WS-31).
 	SurfaceCore Surface = "core"
+	// SurfaceIndex is the deferred index pushed beside the core tier (WS-31): the title
+	// and one-line description of served memory, never its content, so an agent knows
+	// what recall holds without calling it.
+	SurfaceIndex Surface = "index"
 )
 
 // Basis is how strongly a memory is verified, weakest first.
@@ -66,12 +70,15 @@ type surfacePolicy struct {
 }
 
 // surfaces is the policy table. Core-tier and hook-injected memory need a human
-// approver's approval.
+// approver's approval. The deferred index carries only titles and one-line
+// descriptions of served memory, so it needs the memory to be served (self-asserted
+// or stronger) and, like every pushed surface, neither quarantined nor flagged.
 var surfaces = map[Surface]surfacePolicy{
 	SurfaceRecall:   {},
 	SurfaceEvidence: {},
 	SurfaceHook:     {push: true, minBasis: BasisHumanApproved},
 	SurfaceCore:     {push: true, minBasis: BasisHumanApproved},
+	SurfaceIndex:    {push: true, minBasis: BasisSelfAsserted},
 }
 
 // Pushed reports whether s reaches the agent without being asked for.

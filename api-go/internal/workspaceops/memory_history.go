@@ -59,7 +59,7 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer boo
 		} else if withheld != "" {
 			out["content_withheld"] = withheld
 		}
-		ce.InjectionFlags = injection.Scan(ce.Title, ce.Content).Flags
+		ce.InjectionFlags = injection.Scan(ce.Title, ce.Description, ce.Content).Flags
 		ce.ContentDigest = ""
 		out["entry"] = ce
 		if err := addDerivation(ctx, r, e, out); err != nil {

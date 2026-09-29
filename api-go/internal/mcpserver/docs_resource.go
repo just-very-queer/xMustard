@@ -110,6 +110,11 @@ func docsList() []map[string]any {
 		"uri": DocsURI, "name": "xMustard tool arguments not in tools/list", "mimeType": "text/markdown",
 		"description": "Arguments tools/call accepts beyond the listed schema, the output-budget contracts of ground, search, explain and impact, search mode=symbol, explain's outline and symbol context, and hidden aliases.",
 	}, {
+		"uri": MemoryCoreURI, "name": "xMustard standing memory", "mimeType": "application/json",
+		"description": "The standing-memory projection of the session's workspace: the human-approved core tier, each entry " +
+			"pinned to its approved revision, and the deferred index of titles, stamped with the memory revision (text holds " +
+			"what initialize.instructions carries).",
+	}, {
 		"uri": MemoryIndexURI, "name": "xMustard promoted memory titles", "mimeType": "application/json",
 		"description": "recall(names_only=true) over promoted memory of the session's workspace: id, title, topic, state, stale and paths, " +
 			"best first; next_cursor continues it through recall. Fetch an entry with recall(entry_id).",
@@ -175,6 +180,9 @@ func (s *Session) readResource(ctx context.Context, params json.RawMessage) (any
 	}
 	if p.URI == MemoryIndexURI {
 		return s.memoryIndex(ctx)
+	}
+	if p.URI == MemoryCoreURI {
+		return s.memoryCore(ctx)
 	}
 	if r := s.srv.opts.Resources; r != nil {
 		return r.Read(ctx, params)

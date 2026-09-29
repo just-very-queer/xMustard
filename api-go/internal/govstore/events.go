@@ -63,6 +63,10 @@ const (
 	EventReviewFinding  = "review_finding"
 	EventReviewTriage   = "review_triage"
 	EventReviewReanchor = "review_reanchor"
+	// EventMemoryPolicy records a change of a workspace's memory write policy (WS-31,
+	// PAR-GOV-07): the digests of the old and new policy and the admin human approver
+	// who set it. It names no entry.
+	EventMemoryPolicy = "memory_policy"
 	// EventCorroborate records a principal restating a served memory instead of adding
 	// a duplicate (WS-27): its first restatement, or one citing new evidence.
 	EventCorroborate = "corroborate"
@@ -74,7 +78,7 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
 	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
 	EventMergeApproval, EventMergeApprovalRevoked, EventReviewRecord, EventReviewFinding, EventReviewTriage,
-	EventReviewReanchor, EventCorroborate)
+	EventReviewReanchor, EventMemoryPolicy, EventCorroborate)
 
 // eventSubjects is the subject kind each review event type names. Every other type
 // names a memory (or nothing), so AppendEvent, which writes memory events, can never
@@ -128,6 +132,10 @@ type EventInput struct {
 // EventReader reads the history.
 type EventReader interface {
 	ListEvents(ctx context.Context, f EventFilter) ([]Event, error)
+	// MemoryRevision is the workspace's memory revision: the seq of its newest event,
+	// 0 when it has none. Every write appends an event, so it grows with every change
+	// of the workspace's memory (WS-31, PAR-HAR-03).
+	MemoryRevision(ctx context.Context, workspaceID string) (int64, error)
 }
 
 // EventWriter appends to the history. There is no update or delete.
@@ -297,4 +305,17 @@ func (r *reader) ListEvents(ctx context.Context, f EventFilter) ([]Event, error)
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// MemoryRevision reads the seq of the workspace's newest event from the
+// (workspace_id, seq) index.
+func (r *reader) MemoryRevision(ctx context.Context, workspaceID string) (int64, error) {
+	if err := validID("workspace", workspaceID); err != nil {
+		return 0, err
+	}
+	var rev int64
+	if err := r.queryRow(ctx, "SELECT coalesce(max(seq), 0) FROM events WHERE workspace_id = ?", workspaceID).Scan(&rev); err != nil {
+		return 0, fmt.Errorf("memory revision of %s: %w", workspaceID, err)
+	}
+	return rev, nil
 }

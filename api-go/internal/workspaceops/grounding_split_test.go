@@ -9,7 +9,8 @@ import (
 // The section split of grounding.go must not change the `ground` wire shape: the
 // same keys, in the same order, with the same values. ("unknown" is added only
 // when a field could not be determined; see grounding_unknown_test.go. WS-22 added
-// "baseline" after "drift".)
+// "baseline" after "drift"; WS-31 added "memory_revision" and "memory_budget" after
+// "memory_pressure", with "onboarding" and "memory_delta" only when they apply.)
 func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	dataDir, ws := seedGroundBenchWorkspace(t)
 	g, err := BuildSessionGrounding(dataDir, ws)
@@ -39,7 +40,7 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	want := []string{"workspace_id", "drift", "baseline", "changed_files", "dirty_symbols", "contract_breaks", "broken_contracts",
 		"coverage", "recent_failed_runs", "blocked_by_dirty_state", "blocked_by_failing_verification", "stale_memory",
 		"stale_memory_checked", "stale_memory_total", "stale_memory_complete", "memory_verification_modes",
-		"pending_for_you", "memory_pressure", "summary", "generated_at"}
+		"pending_for_you", "memory_pressure", "memory_revision", "memory_budget", "summary", "generated_at"}
 	if strings.Join(keys, ",") != strings.Join(want, ",") {
 		t.Fatalf("ground keys changed:\n got %v\nwant %v", keys, want)
 	}

@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"unicode"
 
@@ -37,6 +38,16 @@ func registerGroundRoutes(mux routeRegistrar) {
 			writeJSON(w, http.StatusBadRequest, body)
 			return
 		}
+		since := int64(-1)
+		if q.Has("since_revision") {
+			n, err := strconv.ParseInt(q.Get("since_revision"), 10, 64)
+			if err != nil || n < 0 || len(q["since_revision"]) > 1 {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"error": "since_revision must be one non-negative integer (a memory_revision ground returned)",
+					"argument": "since_revision", "reason": "invalid"})
+				return
+			}
+			since = n
+		}
 		// session_id names the caller's session (an execution key): its own snapshot is
 		// restored when it has one, else the prior session is handed over (WS-33)
 		session := strings.TrimSpace(q.Get("session_id"))
@@ -46,7 +57,7 @@ func registerGroundRoutes(mux routeRegistrar) {
 			return
 		}
 		result, err := workspaceops.BuildSessionGroundingWith(r.Context(), dataDir(), r.PathValue("workspace_id"),
-			workspaceops.GroundOptions{Caller: callerOf(r).ID, SessionID: session})
+			workspaceops.GroundOptions{Caller: callerOf(r).ID, SessionID: session, Since: since})
 		if err != nil {
 			respondError(w, err)
 			return

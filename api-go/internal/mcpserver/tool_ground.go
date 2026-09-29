@@ -18,6 +18,8 @@ var groundTool = &Tool{
 			Desc: "sections to return (summary always; default all)"},
 		{Name: "max_chars", Type: typeInteger, Min: groundbudget.MinMaxChars, Max: groundbudget.MaxMaxChars,
 			Desc: "result budget in characters (default 6000)"},
+		// WS-31: what changed in served memory after a memory_revision ground returned.
+		{Name: "since_revision", Type: typeInteger, Min: 0, Max: maxMemoryRevision, Desc: "memory_delta after this memory_revision"},
 		// The caller's session (WS-33): its snapshot is restored after a compaction.
 		{Name: "session_id", Type: typeString, MaxLen: maxSessionKey},
 	},
@@ -42,6 +44,11 @@ var groundTool = &Tool{
 		if maxChars == "" {
 			maxChars = strconv.Itoa(groundbudget.DefaultMaxChars)
 		}
-		return "GET", query(wsPath(a, "/session-grounding"), "sections", a["sections"], "max_chars", maxChars, "session_id", a["session_id"]), ""
+		return "GET", query(wsPath(a, "/session-grounding"), "sections", a["sections"], "max_chars", maxChars,
+			"since_revision", a["since_revision"], "session_id", a["session_id"]), ""
 	},
 }
+
+// maxMemoryRevision bounds since_revision: the largest integer a JSON number carries
+// exactly.
+const maxMemoryRevision = 1<<53 - 1

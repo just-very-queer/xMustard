@@ -108,6 +108,9 @@ func openMCPSession(r *http.Request) (*mcpserver.Server, error) {
 		// caller, so the registration scope (WS-09B) decides it
 		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
 		HomeDir:      home,
+		// the binding (or the header) names the workspace, so initialize can append its
+		// standing memory
+		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
 	}), nil
 }
 

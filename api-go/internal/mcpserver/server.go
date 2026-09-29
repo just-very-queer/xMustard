@@ -170,8 +170,12 @@ type Options struct {
 	AutoRegister bool
 	// HomeDir is never auto-registered, even when it is a git repository.
 	HomeDir string
-	Name    string
-	Version string
+	// StandingMemory appends the workspace's standing-memory projection to
+	// initialize.instructions (standing_memory.go); XMUSTARD_MCP_STANDING_MEMORY=0 turns
+	// it off in the shims.
+	StandingMemory bool
+	Name           string
+	Version        string
 }
 
 // Server holds what every session shares.
@@ -234,7 +238,7 @@ func (s *Session) Version() string {
 func (s *Session) Handle(ctx context.Context, method string, params json.RawMessage) (any, *RPCError) {
 	switch method {
 	case "initialize":
-		return s.initialize(params)
+		return s.initialize(ctx, params)
 	case "ping":
 		return map[string]any{}, nil
 	case "tools/list":
@@ -250,6 +254,10 @@ func (s *Session) Handle(ctx context.Context, method string, params json.RawMess
 		return map[string]any{"resourceTemplates": []map[string]any{}}, nil
 	case "resources/read":
 		return s.readResource(ctx, params)
+	case "prompts/list":
+		return promptsList(), nil
+	case "prompts/get":
+		return s.getPrompt(ctx, params)
 	}
 	return nil, &RPCError{Code: CodeMethodNotFound, Message: "method not found: " + method}
 }
@@ -270,7 +278,7 @@ func (s *Session) Notify(method string, _ json.RawMessage) {
 	}
 }
 
-func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
+func (s *Session) initialize(ctx context.Context, params json.RawMessage) (any, *RPCError) {
 	var p struct {
 		ProtocolVersion string `json:"protocolVersion"`
 		Capabilities    struct {
@@ -291,12 +299,12 @@ func (s *Session) initialize(params json.RawMessage) (any, *RPCError) {
 	s.roots = nil
 	s.rootsGen++
 	s.mu.Unlock()
-	caps := map[string]any{"tools": map[string]any{}, "resources": map[string]any{}}
+	caps := map[string]any{"tools": map[string]any{}, "resources": map[string]any{}, "prompts": map[string]any{}}
 	return map[string]any{
 		"protocolVersion": v,
 		"capabilities":    caps,
 		"serverInfo":      map[string]any{"name": s.srv.opts.Name, "version": s.srv.opts.Version},
-		"instructions":    Instructions,
+		"instructions":    instructionsWith(s.standingMemory(ctx)),
 	}, nil
 }
 
