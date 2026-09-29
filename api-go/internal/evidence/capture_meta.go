@@ -56,6 +56,10 @@ type ObservationInput struct {
 	// Adapters that must retain an output they will replace later (Pi masking and
 	// compaction) ask for MinCaptureTarget, so any output above it gets a handle.
 	Target int
+	// Upstream is the original the client already persisted, when it says so; it is
+	// verified against UpstreamRoots and kept as a reference instead of a copy (WS-41).
+	Upstream      *UpstreamRef
+	UpstreamRoots []string
 }
 
 // MinCaptureTarget and MaxCaptureTarget bound ObservationInput.Target.
@@ -96,6 +100,7 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 		return nil, err
 	}
 	defer sp.Discard()
+	sp.SetClass(ClassHook) // a client's native output, captured by hook or wrapper
 	meta := in.Meta
 	meta.Client = strings.ToLower(strings.TrimSpace(meta.Client))
 	if meta.Client == "" {
@@ -183,6 +188,7 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 		WorkspaceID: in.WorkspaceID, RepoScope: in.RepoScope, Actor: in.Actor, AuthEnforced: in.AuthEnforced,
 		Issuer: "capture:" + meta.Client, SessionID: meta.SessionID, AgentID: meta.AgentID, CallID: meta.CallID, Tool: meta.Tool,
 		ToolVersion: meta.ToolVersion, ArgsDigest: meta.ArgsDigest, IsError: meta.IsError, ContentType: meta.ContentType,
+		Class: ClassHook, Upstream: in.Upstream, UpstreamRoots: in.UpstreamRoots,
 		// no RepoKey: the producing repository state was not observed
 	})
 	if err != nil {

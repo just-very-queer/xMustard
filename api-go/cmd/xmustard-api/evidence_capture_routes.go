@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -148,9 +151,15 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 			scope.Close()
 		}
 		actor, enforced := principalScope(r)
+		upstream, err := upstreamRef(q)
+		if err != nil {
+			badCapture(w, "invalid_upstream", err.Error())
+			return
+		}
 		res, err := store.Observe(r.Context(), reg, evidence.ObservationInput{
 			WorkspaceID: ws, RepoScope: workspaceops.WorkspaceRepoScope(dataDir(), ws), Actor: actor, AuthEnforced: enforced,
 			Format: format, Body: r.Body, Meta: meta, Sel: sel, Target: derefInt(target),
+			Upstream: upstream, UpstreamRoots: upstreamRoots(workspaceops.WorkspaceRepoScope(dataDir(), ws)),
 			Redact: func(w io.Writer) evidence.StreamRedactor { return &failClosed{next: redact(w)} },
 		})
 		if err != nil {
@@ -231,6 +240,33 @@ func withTokenEstimate(d *evidence.Delivery) any {
 	}{d, evidence.EstimateTokens(d.Projection), evidence.TokenEstimator}
 }
 
+// upstreamRef reads the optional upstream reference (upstream_path, upstream_sha256,
+// upstream_bytes): all three or none.
+func upstreamRef(q url.Values) (*evidence.UpstreamRef, error) {
+	path, sum, size := q.Get("upstream_path"), q.Get("upstream_sha256"), q.Get("upstream_bytes")
+	if path == "" && sum == "" && size == "" {
+		return nil, nil
+	}
+	n, err := strconv.ParseInt(size, 10, 64)
+	if err != nil || path == "" || sum == "" {
+		return nil, errors.New("upstream_path, upstream_sha256 and upstream_bytes must all be given")
+	}
+	return &evidence.UpstreamRef{Path: path, SHA256: sum, Bytes: n}, nil
+}
+
+// upstreamRoots are where a referenced original may live: the workspace repository and
+// the operator's XMUSTARD_UPSTREAM_ROOTS (a path list), such as a client's tool-result
+// directory. Nothing else is readable through a reference.
+func upstreamRoots(repo string) []string {
+	roots := []string{repo}
+	for _, p := range filepath.SplitList(os.Getenv("XMUSTARD_UPSTREAM_ROOTS")) {
+		if filepath.IsAbs(p) {
+			roots = append(roots, p)
+		}
+	}
+	return roots
+}
+
 func badCapture(w http.ResponseWriter, reason, msg string) {
 	writeJSON(w, http.StatusBadRequest, map[string]any{"error": msg, "reason": reason})
 }
@@ -245,6 +281,7 @@ var captureErrors = []struct {
 	{io.ErrUnexpectedEOF, http.StatusBadRequest, "incomplete_body"},
 	{evidence.ErrBadBody, http.StatusBadRequest, "bad_body"},
 	{evidence.ErrInvalidSearch, http.StatusBadRequest, "invalid_search"},
+	{evidence.ErrUpstreamInvalid, http.StatusBadRequest, "upstream_invalid"},
 	{evidence.ErrSecretPath, http.StatusUnprocessableEntity, "secret_path"},
 	{errRedactionFailed, http.StatusServiceUnavailable, "redaction_failed"},
 }
