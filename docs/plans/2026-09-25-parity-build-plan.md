@@ -1974,6 +1974,7 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
   - diagnostics and why_failed need a source revision, which the repository identity does not cover; a consumer that cannot name the stored run gets no key for them (fail closed).
   - The most recent planner result stays whole even when older than the window; upstream summarized it with the rest. A stub never replaces a shorter result, so the ported tests pad the results they expect compacted; upstream compacted once the whole transcript passed a size threshold, and its tests appended thousands of noise lines.
   - Upstream's head-and-tail fallback, which sliced the transcript once summaries were not enough, is not ported: compaction never cuts text (PAR-CTX-08).
+- *Review round (branch parity/ws-42, 2026-09-29).* Inspection found the library complete against the goal, requirements and both PAR rows above (PAR-CTX-06, PAR-CTX-08, PAR-CTX-14 all satisfied by the 2026-09-28 record); no further implementation was needed. feat/parity-v2 had moved since (WS-40a, WS-40b, REL-011, at 2ad3315) with no overlap in the evidence/compaction packages; merged in cleanly (no conflicts). Reran the full remote suite (Linux build box) after the merge: `go test ./...` and `go build ./...` both green across all api-go packages, `cargo test` green (rust-core), `cargo clippy` holds at 6 warnings (base line, not risen), rss_lines=ok. No deviations beyond the 2026-09-28 record.
 
 ### WS-43 — Opt-in upstream MCP gateway, progress event bus and memory notifications
 
