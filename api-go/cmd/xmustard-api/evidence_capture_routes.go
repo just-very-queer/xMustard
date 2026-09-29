@@ -153,7 +153,7 @@ func registerEvidenceCaptureRoutes(mux routeRegistrar, store *evidence.Store) {
 		actor, enforced := principalScope(r)
 		upstream, err := upstreamRef(q)
 		if err != nil {
-			badCapture(w, "invalid_upstream", err.Error())
+			badCapture(w, "upstream_invalid", err.Error())
 			return
 		}
 		res, err := store.Observe(r.Context(), reg, evidence.ObservationInput{
@@ -281,8 +281,8 @@ var captureErrors = []struct {
 	{io.ErrUnexpectedEOF, http.StatusBadRequest, "incomplete_body"},
 	{evidence.ErrBadBody, http.StatusBadRequest, "bad_body"},
 	{evidence.ErrInvalidSearch, http.StatusBadRequest, "invalid_search"},
+	{evidence.ErrSecretPath, http.StatusUnprocessableEntity, "secret_path"}, // before upstream_invalid: a secret-path claim wraps both
 	{evidence.ErrUpstreamInvalid, http.StatusBadRequest, "upstream_invalid"},
-	{evidence.ErrSecretPath, http.StatusUnprocessableEntity, "secret_path"},
 	{errRedactionFailed, http.StatusServiceUnavailable, "redaction_failed"},
 }
 

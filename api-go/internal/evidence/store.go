@@ -371,6 +371,10 @@ type Spool struct {
 	st        *wsState
 	discarded bool
 	class     RetentionClass
+	// upstream marks a spool whose capture keeps a reference, not a copy: it is
+	// admitted against the workspace quota only.
+	upstream bool
+	refused  string // why the spool stopped at the quota
 }
 
 // SetClass sets the retention class the spool's bytes are admitted under (default own).
@@ -430,14 +434,18 @@ func (s *Store) admitPending(sp *Spool, n int64) bool {
 	st := sp.st
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	refuse := func(used int64) string { return s.refusal(st, sp.class, sp.upstream, used, sp.n, n) }
 	free := sp.n+n <= int64(s.limits.ProjectionTarget)
 	if !free {
 		used, err := s.retainedLocked(sp.ws, st, false)
 		if err != nil {
 			return false
 		}
-		if !s.admits(st, sp.class, used, sp.n, n) {
-			if used, err = s.retainedLocked(sp.ws, st, true); err != nil || !s.admits(st, sp.class, used, sp.n, n) {
+		if sp.refused = refuse(used); sp.refused != "" {
+			if used, err = s.retainedLocked(sp.ws, st, true); err != nil {
+				return false
+			}
+			if sp.refused = refuse(used); sp.refused != "" {
 				return false
 			}
 		}
@@ -493,7 +501,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		return nil, fmt.Errorf("%w (%d bytes)", ErrTooLarge, s.limits.MaxOriginal)
 	}
 	if sp.quotaFull {
-		return nil, fmt.Errorf("%w (workspace %s quota %d bytes)", ErrQuotaFull, req.WorkspaceID, s.limits.WorkspaceQuota)
+		return nil, fmt.Errorf("%w (workspace %s: %s)", ErrQuotaFull, req.WorkspaceID, cmp.Or(sp.refused, "quota full"))
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err // a cancelled call never issues a handle
@@ -571,9 +579,13 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	// only the charge beyond them (re-checked after a reclaim).
 	charge := obs.charge()
 	extra := charge - sp.n
-	if !s.admits(st, class, used, sp.n, extra) {
-		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil || !s.admits(st, class, used, sp.n, extra) {
-			return nil, fmt.Errorf("%w (%d of %d bytes retained for workspace %s)", ErrQuotaFull, used, s.limits.WorkspaceQuota, req.WorkspaceID)
+	refuse := func(used int64) string { return s.refusal(st, class, sp.upstream, used, sp.n, extra) }
+	if why := refuse(used); why != "" {
+		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil {
+			return nil, err
+		}
+		if why = refuse(used); why != "" {
+			return nil, fmt.Errorf("%w (workspace %s: %s)", ErrQuotaFull, req.WorkspaceID, why)
 		}
 	}
 	if err := ctx.Err(); err != nil {

@@ -48,19 +48,39 @@ func TestCaptureRouteUpstreamReference(t *testing.T) {
 	if code != http.StatusConflict || !strings.Contains(string(b), "upstream_reference") {
 		t.Fatalf("read of an upstream handle: %d %s", code, b)
 	}
-	// fail closed: a wrong hash, a partial claim, and a file outside the roots
-	for name, mutate := range map[string]func(url.Values){
-		"wrong hash": func(v url.Values) { v.Set("upstream_sha256", strings.Repeat("0", 64)) },
-		"partial":    func(v url.Values) { v.Del("upstream_bytes") },
-		"outside":    func(v url.Values) { t.Setenv("XMUSTARD_UPSTREAM_ROOTS", t.TempDir()) },
+	// fail closed: each case runs with its own roots and must name its own reason
+	other := filepath.Join(root, "other.txt")
+	if err := os.WriteFile(other, []byte(log+"x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	osum := sha256.Sum256([]byte(log + "x"))
+	for name, c := range map[string]struct {
+		mutate func(url.Values)
+		roots  string
+		code   int
+		reason string
+	}{
+		"wrong hash": {func(v url.Values) { v.Set("upstream_sha256", strings.Repeat("0", 64)) }, root, 400, "upstream_invalid"},
+		"partial":    {func(v url.Values) { v.Del("upstream_bytes") }, root, 400, "upstream_invalid"},
+		"outside":    {func(url.Values) {}, t.TempDir(), 400, "upstream_invalid"},
+		"another file than the body": {func(v url.Values) {
+			v.Set("upstream_path", other)
+			v.Set("upstream_sha256", hex.EncodeToString(osum[:]))
+			v.Set("upstream_bytes", strconv.Itoa(len(log)+1))
+		}, root, 400, "upstream_invalid"},
+		"secret path": {func(v url.Values) { v.Set("upstream_path", filepath.Join(root, ".ssh", "id_rsa")) }, root, 422, "secret_path"},
 	} {
-		v := url.Values{}
-		for k, x := range q {
-			v[k] = x
-		}
-		mutate(v)
-		if code, b, _ := f.do(t, "POST", path+v.Encode(), tok, strings.NewReader(log), nil); code != http.StatusBadRequest {
-			t.Errorf("%s: %d %s, want 400", name, code, b)
-		}
+		t.Run(name, func(t *testing.T) {
+			t.Setenv("XMUSTARD_UPSTREAM_ROOTS", c.roots)
+			v := url.Values{}
+			for k, x := range q {
+				v[k] = x
+			}
+			c.mutate(v)
+			code, b, _ := f.do(t, "POST", path+v.Encode(), tok, strings.NewReader(log), nil)
+			if code != c.code || !strings.Contains(string(b), `"reason":"`+c.reason+`"`) {
+				t.Errorf("%d %s, want %d %s", code, b, c.code, c.reason)
+			}
+		})
 	}
 }

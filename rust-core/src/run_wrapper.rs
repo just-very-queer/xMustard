@@ -28,7 +28,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
-use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
 use sha2::{Digest, Sha256};
 
 use crate::dispatch::{Args, ChildExit, CmdError, CmdResult, Output};
@@ -139,10 +139,11 @@ fn io_failed(what: &'static str) -> impl Fn(io::Error) -> CmdError {
     move |e| CmdError::failed(format!("run: {what}: {e}"))
 }
 
-/// What the child printed: the spool (`None` once it passed the cap), the byte total
-/// and the last `tail_cap` bytes.
+/// What the child printed: the spool (`None` once dropped, with `lost` saying why),
+/// the byte total and the last `tail_cap` bytes.
 struct Drained {
     spool: Option<File>,
+    lost: String,
     total: u64,
     tail: Vec<u8>,
 }
@@ -150,6 +151,7 @@ struct Drained {
 /// Reads the child's output to EOF in fixed chunks. Memory is one chunk plus the tail.
 fn drain(mut pipe: File, limits: Limits) -> io::Result<Drained> {
     let mut spool = Some(private_spool()?);
+    let mut lost = String::new();
     let (mut total, mut buf) = (0u64, vec![0u8; CHUNK]);
     let mut tail: VecDeque<u8> = VecDeque::with_capacity(limits.tail_cap + CHUNK);
     loop {
@@ -163,16 +165,24 @@ fn drain(mut pipe: File, limits: Limits) -> io::Result<Drained> {
         tail.extend(&buf[..n]);
         tail.drain(..tail.len().saturating_sub(limits.tail_cap));
         if total > limits.spool_cap {
-            spool = None; // the original can no longer be kept whole; keep draining
+            // the original can no longer be kept whole; keep draining
+            spool = None;
+            lost = format!(
+                "its output exceeds the {}-byte capture limit",
+                limits.spool_cap
+            );
         } else if spool
             .as_mut()
             .is_some_and(|f| f.write_all(&buf[..n]).is_err())
         {
-            spool = None; // a full disk must not stall the child: degrade to the tail
+            // a full disk must not stall the child: degrade to the tail
+            spool = None;
+            lost = "the output spool could not be written".into();
         }
     }
     Ok(Drained {
         spool,
+        lost,
         total,
         tail: tail.into_iter().collect(),
     })
@@ -235,10 +245,7 @@ fn present(
         return String::new();
     }
     let attempt = match out.spool.as_mut() {
-        None => Err(format!(
-            "output of {} bytes exceeds the {}-byte capture limit",
-            out.total, limits.spool_cap
-        )),
+        None => Err(format!("{} ({} bytes)", out.lost, out.total)),
         Some(spool) => capture(target, argv, exit, spool, out.total),
     };
     attempt.unwrap_or_else(|why| passthrough(out, limits, &why))
@@ -289,6 +296,10 @@ fn capture(
         .as_deref()
         .ok_or("no workspace (XMUSTARD_WORKSPACE_ID)")?;
     let (host, port) = split_api(&target.api)?;
+    // the upload is plain http and unredacted until the server redacts it: only loopback
+    if !is_loopback(&host) {
+        return Err("refusing to upload output over plain http to a non-loopback host".into());
+    }
     let exit_code = match exit {
         ChildExit::Code(c) => c,
         ChildExit::Signal(n) => 128 + n,
@@ -305,11 +316,6 @@ fn capture(
         enc(ws)
     );
     if let Some(token) = &target.token {
-        if !is_loopback(&host) {
-            return Err(
-                "refusing to send the API token over plain http to a non-loopback host".into(),
-            );
-        }
         head.push_str(&format!("Authorization: Bearer {token}\r\n"));
     }
     head.push_str("\r\n");

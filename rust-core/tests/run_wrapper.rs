@@ -223,6 +223,25 @@ fn a_token_is_never_sent_to_a_non_loopback_host() {
 }
 
 #[test]
+fn output_is_never_uploaded_to_a_non_loopback_host_even_without_a_token() {
+    let o = Command::new(BIN)
+        .args([
+            "run",
+            "--workspace",
+            "ws",
+            "--api",
+            "http://example.invalid:9",
+            "--",
+            "echo",
+            "x",
+        ])
+        .env_remove("XMUSTARD_API_TOKEN")
+        .output()
+        .unwrap();
+    assert!(text(&o).contains("non-loopback"), "{}", text(&o));
+}
+
+#[test]
 fn one_hundred_megabytes_stream_through_in_bounded_memory() {
     let out = tempfile::tempfile().unwrap();
     let mut cmd = Command::new(BIN);

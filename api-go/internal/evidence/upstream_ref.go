@@ -43,6 +43,11 @@ func invalidUpstream(format string, a ...any) error {
 	return fmt.Errorf("%w: %s", ErrUpstreamInvalid, fmt.Sprintf(format, a...))
 }
 
+// Matches reports whether the claim is for content of the given hash and size.
+func (r UpstreamRef) Matches(sum string, n int64) bool {
+	return r.Bytes == n && strings.EqualFold(r.SHA256, sum)
+}
+
 // Verify checks the reference: an absolute regular file (not a symlink) inside one of
 // roots, not a secret path, whose streamed SHA-256 and size equal the claim. Guards
 // run in order and fail closed; the file is read in fixed 64 KiB chunks.

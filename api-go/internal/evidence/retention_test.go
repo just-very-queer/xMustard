@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -175,5 +176,55 @@ func TestUpstreamHashStreamsInFixedChunks(t *testing.T) {
 	cancel()
 	if _, _, err := hashStream(ctx, &countingReader{left: size}, size); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled hashStream = %v", err)
+	}
+}
+
+// A reference must describe the uploaded bytes: a valid file that is not the output
+// is refused, and a hook JSON body keeps a copy instead of a reference.
+func TestUpstreamReferenceIsBoundToTheUploadedBody(t *testing.T) {
+	s, _ := testStore(t, nil)
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("orig\n"), 30<<10)
+	ref := upstreamFile(t, dir, data)
+	observe := func(body []byte) error {
+		_, err := s.Observe(context.Background(), nil, ObservationInput{WorkspaceID: "ws", Format: FormatRaw,
+			Body: bytes.NewReader(body), Meta: CaptureMeta{Tool: "Bash"}, Upstream: &ref, UpstreamRoots: []string{dir}})
+		return err
+	}
+	if err := observe(append(bytes.Clone(data), "more\n"...)); !errors.Is(err, ErrUpstreamInvalid) {
+		t.Fatalf("a body other than the referenced file: %v, want ErrUpstreamInvalid", err)
+	}
+	if err := observe(data); err != nil {
+		t.Fatalf("the matching body: %v", err)
+	}
+}
+
+// An upstream capture is charged to the workspace only: a full hook class does not
+// refuse it, and a class refusal names the class.
+func TestUpstreamCaptureSkipsClassQuota(t *testing.T) {
+	s, _ := testStore(t, func(l *Limits) { l.WorkspaceQuota = 200 << 10 })
+	dir := t.TempDir()
+	if _, err := captureClass(t, s, "ws", ClassHook, bytes.Repeat([]byte("h"), 120<<10), nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	data := bytes.Repeat([]byte("orig\n"), 12<<10)
+	ref := upstreamFile(t, dir, data)
+	sp, err := s.NewSpool("ws")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sp.SetClass(ClassHook)
+	sp.upstream = true
+	sp.Write(data)
+	if sp.QuotaFull() {
+		t.Fatalf("an upstream spool was refused by the class quota: %s", sp.refused)
+	}
+	if _, err := s.Capture(context.Background(), sp, CaptureRequest{WorkspaceID: "ws", RepoScope: "/repo", Issuer: "test",
+		Tool: "Bash", Status: 200, ContentType: "text/plain", Retain: true, Class: ClassHook, Upstream: &ref, UpstreamRoots: []string{dir}}); err != nil {
+		t.Fatal(err)
+	}
+	_, err = captureClass(t, s, "ws", ClassHook, bytes.Repeat([]byte("h"), 60<<10), nil, nil)
+	if !errors.Is(err, ErrQuotaFull) || !strings.Contains(err.Error(), "hook class quota") {
+		t.Fatalf("a full hook class: %v, want ErrQuotaFull naming the class", err)
 	}
 }

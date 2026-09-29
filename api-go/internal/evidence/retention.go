@@ -1,10 +1,14 @@
 package evidence
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 // Retention classes (WS-41, PAR-CTX-09). Retained originals fall in three classes with
-// their own TTL and quota share, so a burst of one kind cannot expire or starve
-// another:
+// their own TTL and quota share, so a burst of one kind cannot expire another. Only
+// hook and snapshot are capped below the workspace quota; own may take all of it, and no
+// class has reserved room:
 //   - hook: a client's native tool output captured through a hook or the command wrapper
 //   - own: an xMustard tool's result retained for its handle
 //   - snapshot: a point-in-time capture kept for later comparison
@@ -38,9 +42,6 @@ var classPolicies = map[RetentionClass]classPolicy{
 	ClassSnapshot: {ttlFactor: 3, quotaPerK: 250},
 }
 
-// Classes lists the classes in policy-table order (tests, diagnostics).
-func Classes() []RetentionClass { return []RetentionClass{ClassHook, ClassOwn, ClassSnapshot} }
-
 // normalize maps an empty or unknown class to ClassOwn, the class every capture had
 // before classes existed.
 func (c RetentionClass) normalize() RetentionClass {
@@ -69,9 +70,17 @@ func (o Observation) charge() int64 {
 	return retainedCharge(o.RawBytes)
 }
 
-// admits reports whether n more bytes fit the workspace quota and class c's quota,
+// refusal says why n more bytes do not fit the workspace quota or class c's quota,
 // given what is retained, pending in open spools, and own (the caller's bytes already
-// counted in pending, which convert to the class's retained charge).
-func (s *Store) admits(st *wsState, c RetentionClass, used, own, n int64) bool {
-	return used+st.pending+n <= s.limits.WorkspaceQuota && st.byClass[c]+own+n <= s.limits.ClassQuota(c)
+// counted in pending, which convert to the class's retained charge). Empty means they
+// fit. A spool for an upstream reference (classless) is checked against the workspace
+// only, since a committed reference costs no class quota.
+func (s *Store) refusal(st *wsState, c RetentionClass, classless bool, used, own, n int64) string {
+	if used+st.pending+n > s.limits.WorkspaceQuota {
+		return fmt.Sprintf("%d of %d workspace bytes retained", used, s.limits.WorkspaceQuota)
+	}
+	if cq := s.limits.ClassQuota(c); !classless && st.byClass[c]+own+n > cq {
+		return fmt.Sprintf("%s class quota of %d bytes is full", c, cq)
+	}
+	return ""
 }

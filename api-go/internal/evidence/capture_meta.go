@@ -101,6 +101,14 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	}
 	defer sp.Discard()
 	sp.SetClass(ClassHook) // a client's native output, captured by hook or wrapper
+	raw := in.Format == FormatRaw || in.Format == ""
+	// A reference is bound to the uploaded bytes, which only a raw body is: a hook
+	// JSON body's output strings are not a file, so its claim is ignored and a copy kept.
+	upstream := in.Upstream
+	if !raw {
+		upstream = nil
+	}
+	sp.upstream = upstream != nil
 	meta := in.Meta
 	meta.Client = strings.ToLower(strings.TrimSpace(meta.Client))
 	if meta.Client == "" {
@@ -167,6 +175,11 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 	if path, pattern := secretPath(body, in.Sel); pattern != "" {
 		return nil, fmt.Errorf("%w (%q matches %s)", ErrSecretPath, path, pattern)
 	}
+	if upstream != nil && !upstream.Matches(body.BodySHA256, body.BodyBytes) {
+		// the claim must describe the bytes uploaded (before redaction), or the recovery
+		// path would lead to an unrelated original
+		return nil, invalidUpstream("the reference does not describe the captured output")
+	}
 	sel := selectorFor(meta, body, in.Sel)
 	red, argv0 := reg.Select(sel)
 	pol := PolicyFor(meta.Client)
@@ -188,7 +201,7 @@ func (s *Store) Observe(ctx context.Context, reg *Registry, in ObservationInput)
 		WorkspaceID: in.WorkspaceID, RepoScope: in.RepoScope, Actor: in.Actor, AuthEnforced: in.AuthEnforced,
 		Issuer: "capture:" + meta.Client, SessionID: meta.SessionID, AgentID: meta.AgentID, CallID: meta.CallID, Tool: meta.Tool,
 		ToolVersion: meta.ToolVersion, ArgsDigest: meta.ArgsDigest, IsError: meta.IsError, ContentType: meta.ContentType,
-		Class: ClassHook, Upstream: in.Upstream, UpstreamRoots: in.UpstreamRoots,
+		Class: ClassHook, Upstream: upstream, UpstreamRoots: in.UpstreamRoots,
 		// no RepoKey: the producing repository state was not observed
 	})
 	if err != nil {
