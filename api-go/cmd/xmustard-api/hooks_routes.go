@@ -431,7 +431,7 @@ func (s *hookServer) sessionContext(ctx context.Context, c *hookCall) []string {
 	if !c.bound || c.in.SessionID == "" || c.in.AgentID != "" {
 		return nil
 	}
-	key := workspaceops.ExecutionKey(hooks.Client, c.in.SessionID, "")
+	key := workspaceops.ExecutionKey(c.client.Name, c.in.SessionID, "")
 	parts := []string{fmt.Sprintf("[xmustard session] this session is %s. Before it ends, remember(kind=\"handoff\", session_id=%q, "+
 		"content=<capsule JSON>, paths=...) leaves a handoff for the next session; ground session_id=%s restores its state.", key, key, key)}
 	mode, ok := hookHandoffs[c.in.Source]
@@ -777,7 +777,7 @@ func ledgerBase(c *hookCall) *workspaceops.LedgerSession {
 	if !c.bound || c.in.SessionID == "" || postureFrom(c.r).readOnly() {
 		return nil
 	}
-	return &workspaceops.LedgerSession{WorkspaceID: c.ws.WorkspaceID, Root: c.ws.Root, Client: hooks.Client,
+	return &workspaceops.LedgerSession{WorkspaceID: c.ws.WorkspaceID, Root: c.ws.Root, Client: c.client.Name,
 		Session: c.in.SessionID, Agent: c.in.AgentID, Principal: c.caller, Transcript: c.in.TranscriptPath}
 }
 
