@@ -375,7 +375,8 @@ func sessionCapsule(ctx context.Context, r govstore.Reader, workspaceID, key str
 // latestHandoffs reads the workspace's newest capsules (across its most recently seen
 // sessions), each with the paths that changed since it was stored.
 func latestHandoffs(ctx context.Context, r govstore.Reader, root, workspaceID string, limit int) ([]HandoffRecord, error) {
-	rows, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, Kinds: []string{LedgerHandoff}, Limit: limit})
+	rows, err := r.RecentSessionEvents(ctx, govstore.RecentEventFilter{WorkspaceID: workspaceID, Kinds: []string{LedgerHandoff}, Limit: limit,
+		ExcludeRetention: RetentionTranscript})
 	if err != nil {
 		return nil, err
 	}

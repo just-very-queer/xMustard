@@ -122,6 +122,17 @@ type ContextEntry struct {
 	SupersededBy    string   `json:"superseded_by,omitempty"`
 	InvalidatedAt   string   `json:"invalidated_at,omitempty"`
 	ExpiresAt       string   `json:"expires_at,omitempty"`
+	// ValidFrom and InvalidatedAt bound the memory's world-time interval, each with the
+	// commit HEAD was at (PAR-PROV-02). NeedsReverify is the persisted drift flag
+	// (PAR-PROV-03): StaleSince is when a change first hit an anchor, StaleAnchors the
+	// anchors it hit ("kind:value"), StaleCommit the commit it was observed at.
+	ValidFrom         string   `json:"valid_from,omitempty"`
+	ValidFromCommit   string   `json:"valid_from_commit,omitempty"`
+	InvalidatedCommit string   `json:"invalidated_commit,omitempty"`
+	NeedsReverify     bool     `json:"needs_reverify,omitempty"`
+	StaleSince        string   `json:"stale_since,omitempty"`
+	StaleCommit       string   `json:"stale_commit,omitempty"`
+	StaleAnchors      []string `json:"stale_anchors,omitempty"`
 	// Diff is the line diff from the served revision to the pending revision a verify
 	// voted on (PAR-GOV-05).
 	Diff string `json:"diff,omitempty"`
@@ -445,7 +456,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		out.Warnings = append(out.Warnings, fmt.Sprintf("expires %q is not a date or RFC 3339 time; no expiry set", req.Expires))
 	}
 	if promoted {
-		recordVerifyFeedback(dataDir, workspaceID, out.ID, out.Paths)
+		afterBaseline(dataDir, workspaceID, out)
 	}
 	return &out, nil
 }

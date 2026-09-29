@@ -200,12 +200,13 @@ var explainLadders = []*Ladder{
 	},
 	{
 		Shape: "file (symbols)", Match: "symbols",
-		Lists:   []List{{Member: "cluster.files"}, {Member: "symbols", GroupBy: "kind", Paged: true}},
+		Lists:   []List{{Member: "memories"}, {Member: "cluster.files"}, {Member: "symbols", GroupBy: "kind", Paged: true}},
 		Signals: envelope,
 		Keep:    envelopeKeep,
 		Rungs: []Rung{
 			signalCounts,
 			signalFlags,
+			{Name: "memories_trimmed", Op: opFit, List: "memories", Doc: "fewer attached memories, best first"},
 			{Name: "cluster_trimmed", Op: opFit, List: "cluster.files", Doc: "the cluster lists fewer member files (size keeps the count)"},
 			{Name: "depth0", List: "symbols", Drop: []string{"children"}, Doc: "symbols lose their children (depth 0)"},
 			{Name: "trimmed", Op: opFit, List: "symbols", Doc: "fewer symbols, in line order; next_cursor continues"},
@@ -270,12 +271,13 @@ var impactLadders = []*Ladder{
 	{
 		// impact v2 (WS-35) groups dependents by depth tier; its limit and offset page a tier
 		Shape: "by depth tier (by_depth)", Match: "by_depth",
-		Lists:   []List{{Member: "affected_modules"}, {Member: "by_depth"}},
+		Lists:   []List{{Member: "memories"}, {Member: "affected_modules"}, {Member: "by_depth"}},
 		Signals: append([]string{"epistemic", "counts"}, envelope...),
 		Keep:    envelopeKeep,
 		Rungs: []Rung{
 			signalCounts,
 			signalFlags,
+			{Name: "memories_trimmed", Op: opFit, List: "memories", Doc: "fewer attached memories, best first"},
 			{Name: "modules_trimmed", Op: opFit, List: "affected_modules", Doc: "fewer affected modules, largest first"},
 			{Name: "tiers_trimmed", Op: opFitEach, List: "by_depth", Each: "items", Doc: "each depth tier keeps its first items (total keeps the count)"},
 			{Name: "tiers_total", Op: opTotal, List: "by_depth", Doc: "only counts remain"},
@@ -284,12 +286,13 @@ var impactLadders = []*Ladder{
 	},
 	{
 		Shape: "blast radius (impacted)", Match: "impacted",
-		Lists:   []List{{Member: "defined_in"}, {Member: "impacted", GroupBy: "distance"}},
+		Lists:   []List{{Member: "memories"}, {Member: "defined_in"}, {Member: "impacted", GroupBy: "distance"}},
 		Signals: envelope,
 		Keep:    envelopeKeep,
 		Rungs: []Rung{
 			signalCounts,
 			signalFlags,
+			{Name: "memories_trimmed", Op: opFit, List: "memories", Doc: "fewer attached memories, best first"},
 			{Name: "defined_trimmed", Op: opFit, List: "defined_in", Doc: "fewer defining files"},
 			{Name: "trimmed", Op: opFit, List: "impacted", Doc: "fewer impacted files, nearest first"},
 			{Name: "counts", Op: opCount, List: "impacted", Doc: "impacted files become impacted_by_distance"},

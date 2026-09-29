@@ -182,6 +182,11 @@ func workingChangedFiles(ctx context.Context, dataDir, workspaceID string) ([]st
 	if err != nil {
 		return nil, fmt.Errorf("working changes unavailable: %w", err)
 	}
+	return decodeChangedFiles(raw)
+}
+
+// decodeChangedFiles reads the changed paths of a working-changes result.
+func decodeChangedFiles(raw json.RawMessage) ([]string, error) {
 	var cs struct {
 		ChangedFiles []struct {
 			Path string `json:"path"`

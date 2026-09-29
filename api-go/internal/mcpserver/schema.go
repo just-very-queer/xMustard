@@ -147,7 +147,10 @@ func (t *Tool) inputSchema(profile SchemaProfile) map[string]any {
 		args = append(append([]Arg{}, t.Args...), t.Advanced...)
 	}
 	for _, a := range args {
-		p := map[string]any{"type": a.Type, "description": a.Desc}
+		p := map[string]any{"type": a.Type}
+		if a.Desc != "" { // an empty description is noise in every session's prompt prefix
+			p["description"] = a.Desc
+		}
 		if len(a.Enum) > 0 && !a.List { // a list's elements are checked on tools/call
 			p["enum"] = a.Enum
 		}

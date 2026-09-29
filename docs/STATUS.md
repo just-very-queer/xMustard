@@ -233,6 +233,13 @@ As of 2026-09-28. Workstream numbers refer to the
   `index update` rewrites it.
 - **WS-27**: dedupe, code anchors, tiered conflicts and structured claims for memory.
   The governance store moves to schema version 4, which v0.1.1 cannot open.
+- **WS-28**: change-driven memory invalidation. A change (ground's working-tree changes
+  and HEAD moves, the watcher's incremental batches) is looked up in the anchor index and
+  only the affected path and symbol-body anchors are re-hashed; a mismatch persists
+  `stale_observed` and `needs_reverify`, `ground` lists `at_risk_memories`, and a distinct
+  verifier's approval clears one. `recall` gains `as_of`, `valid_only` and `seed`
+  (graph-proximity ranking with bounded diversity), and `explain` and `impact` carry the
+  memories anchored to what they describe. No schema change.
 - **WS-40a**: Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
   eight Codex events to `/api/hooks/codex/<Event>`, and `xmustard-ops codex-hooks
   config|status|trust` writes `hooks.json` and records trust only after the user types

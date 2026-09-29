@@ -16,6 +16,7 @@ pub mod lsp;
 pub mod lsp_session;
 pub mod ownership;
 pub mod repomap;
+pub mod run_wrapper;
 pub mod scanner;
 pub mod search;
 pub mod secretpath;

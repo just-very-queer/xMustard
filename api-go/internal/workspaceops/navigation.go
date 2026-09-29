@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -193,7 +194,7 @@ func ExplainCtx(ctx context.Context, dataDir, workspaceID string, req ExplainReq
 	if info.IsDir() {
 		return overviewOf(ctx, root, workspaceID, rel, depthOr(req.Depth, 0))
 	}
-	return explainFile(ctx, dataDir, workspaceID, root, rel, depthOr(req.Depth, 1))
+	return explainFile(ctx, dataDir, workspaceID, req.Caller, root, rel, depthOr(req.Depth, 1))
 }
 
 func depthOr(depth, fallback int) int {
@@ -220,7 +221,7 @@ var overviewMembers = []string{"symbols", "symbols_total", "symbols_by_kind", "s
 
 // explainFile is the file's explanation, its cluster (its functional neighbourhood)
 // and the freshness and coverage of the graph behind it, plus its outline.
-func explainFile(ctx context.Context, dataDir, workspaceID, root, rel string, depth int) (json.RawMessage, error) {
+func explainFile(ctx context.Context, dataDir, workspaceID, caller, root, rel string, depth int) (json.RawMessage, error) {
 	explanation, err := ExplainPathCtx(ctx, dataDir, workspaceID, rel)
 	if err != nil {
 		return nil, err
@@ -244,6 +245,9 @@ func explainFile(ctx context.Context, dataDir, workspaceID, root, rel string, de
 			return nil, err
 		}
 	}
+	// the memories anchored to the file, with their trust and stale labels (WS-28)
+	key, memories := anchoredMemories(ctx, dataDir, workspaceID, caller, "", []string{rel})
+	out[key] = memories
 	// the outline is best-effort too: a core failure is named, not fatal
 	var members map[string]json.RawMessage
 	outline, err := overviewOf(ctx, root, workspaceID, rel, depth)
@@ -291,7 +295,6 @@ func explainSymbol(ctx context.Context, dataDir, workspaceID string, req Explain
 // ranked by the symbol's name, as compact lines. It never fails the explanation: a
 // recall that fails is named under memories_unavailable.
 func withSymbolMemories(ctx context.Context, dataDir, workspaceID, caller string, raw json.RawMessage) json.RawMessage {
-	var res map[string]json.RawMessage
 	var found struct {
 		Found  bool `json:"found"`
 		Symbol struct {
@@ -299,22 +302,73 @@ func withSymbolMemories(ctx context.Context, dataDir, workspaceID, caller string
 			Path string `json:"path"`
 		} `json:"symbol"`
 	}
-	if json.Unmarshal(raw, &res) != nil || json.Unmarshal(raw, &found) != nil || !found.Found {
+	if json.Unmarshal(raw, &found) != nil || !found.Found {
 		return raw
 	}
-	rec, err := RecallWith(ctx, dataDir, workspaceID, RecallRequest{
-		Query: found.Symbol.Name, Paths: []string{found.Symbol.Path}, Limit: navMemories, Render: "compact", Caller: caller,
-	})
-	if err != nil {
-		res["memories_unavailable"], _ = json.Marshal(err.Error())
-	} else {
-		res["memories"], _ = json.Marshal(rec["entries"])
+	return withMemories(ctx, dataDir, workspaceID, caller, raw, found.Symbol.Name, []string{found.Symbol.Path})
+}
+
+// impactMemoryPaths bounds the direct dependents' files impact looks for memory on.
+const impactMemoryPaths = 10
+
+// WithImpactMemories attaches to an impact result the served memory anchored to the
+// files the target is defined in and its direct dependents' (depth 1), as compact lines
+// with trust and stale labels (WS-28). paths adds files the request named; a result that
+// is not a graph answer is returned as it is.
+func WithImpactMemories(ctx context.Context, dataDir, workspaceID, caller, query string, paths []string, raw json.RawMessage) json.RawMessage {
+	var res struct {
+		DefinedIn []string `json:"defined_in"`
+		ByDepth   []struct {
+			Depth int `json:"depth"`
+			Items []struct {
+				Path string `json:"path"`
+			} `json:"items"`
+		} `json:"by_depth"`
 	}
+	if json.Unmarshal(raw, &res) != nil {
+		return raw
+	}
+	files := append(slices.Clone(paths), res.DefinedIn...)
+	var dependents []string
+	for _, tier := range res.ByDepth {
+		if tier.Depth == 1 {
+			for _, it := range tier.Items {
+				dependents = append(dependents, it.Path)
+			}
+		}
+	}
+	files = append(files, dependents[:min(len(dependents), impactMemoryPaths)]...)
+	return withMemories(ctx, dataDir, workspaceID, caller, raw, query, cleanPaths(files))
+}
+
+// withMemories attaches memories to a JSON object result, or returns it unchanged when
+// it is not one.
+func withMemories(ctx context.Context, dataDir, workspaceID, caller string, raw json.RawMessage, query string, paths []string) json.RawMessage {
+	var res map[string]json.RawMessage
+	if json.Unmarshal(raw, &res) != nil || res == nil {
+		return raw
+	}
+	key, v := anchoredMemories(ctx, dataDir, workspaceID, caller, query, paths)
+	res[key], _ = json.Marshal(v)
 	out, err := json.Marshal(res)
 	if err != nil {
 		return raw
 	}
 	return out
+}
+
+// anchoredMemories is the member an explanation or impact result carries: the served
+// memory recall ranks for query and paths (compact lines: trust, state and stale
+// labels) under "memories", or the reason it could not under "memories_unavailable".
+// It never fails the answer it decorates.
+func anchoredMemories(ctx context.Context, dataDir, workspaceID, caller, query string, paths []string) (string, any) {
+	rec, err := RecallWith(ctx, dataDir, workspaceID, RecallRequest{
+		Query: query, Paths: paths, Limit: navMemories, Render: "compact", Caller: caller,
+	})
+	if err != nil {
+		return "memories_unavailable", err.Error()
+	}
+	return "memories", rec["entries"]
 }
 
 // explainCursors page the list an explain result returns (a file's symbols, a

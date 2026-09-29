@@ -56,6 +56,10 @@ func TestRecallVerificationQueueOverHTTP(t *testing.T) {
 	call("bob", "GET", "/context/active?max_chars=5", "", http.StatusBadRequest)
 	call("bob", "GET", "/context/active?max_chars=x", "", http.StatusBadRequest)
 	call("bob", "GET", "/context/active?status=everything", "", http.StatusBadRequest)
+	// WS-28: as_of names a time or a commit of the repository, valid_only keeps open intervals
+	call("bob", "GET", "/context/active?as_of=not-a-commit", "", http.StatusBadRequest)
+	call("bob", "GET", "/context/active?as_of=2020-01-01&valid_only=true", "", http.StatusOK)
+	call("bob", "GET", "/context/active?as_of="+strings.Repeat("a", 300), "", http.StatusBadRequest)
 	call("bob", "GET", "/context/active?session_id="+strings.Repeat("s", workspaceops.RecallMaxSessionID+1), "", http.StatusBadRequest)
 	call("bob", "GET", "/context/active?session_id="+strings.Repeat("s", workspaceops.RecallMaxSessionID), "", http.StatusOK)
 

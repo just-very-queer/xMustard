@@ -117,6 +117,9 @@ const COMMANDS: &[Command] = &[
     // Tree-sitter syntax errors of a few changed files (the hook service's post-edit
     // diagnostics delta): bounded, in-process, no child.
     cmd("syntax-check", Residency::Resident, syntax_check),
+    // Command wrapper (WS-41): runs an arbitrary child and streams its output, so it
+    // keeps the per-call process boundary.
+    cmd("run", Residency::OneShot, xmustard_core::run_wrapper::run),
 ];
 
 const fn cmd(name: &'static str, residency: Residency, run: fn(Args) -> CmdResult) -> Command {
@@ -143,6 +146,10 @@ fn main() {
     match (entry.run)(args.collect::<Vec<_>>().into_iter()) {
         Ok(Output::Json(body)) => println!("{body}"),
         Ok(Output::Text(body)) => print!("{body}"),
+        Ok(Output::Exit(body, exit)) => {
+            print!("{body}");
+            std::process::exit(xmustard_core::run_wrapper::end_like(exit));
+        }
         Err(err) => {
             eprintln!("{}", err.message);
             std::process::exit(err.code);

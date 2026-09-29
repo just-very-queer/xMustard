@@ -363,7 +363,7 @@ func TestNewSessionInAnotherClientGetsPriorSnapshotAndProposals(t *testing.T) {
 	flushLedger(t, dir)
 
 	var g SessionGrounding
-	if unknown := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "codex:sess-b", nil); len(unknown) != 0 {
+	if unknown := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "codex:sess-b", "", nil); len(unknown) != 0 {
 		t.Fatalf("unknown %+v", unknown)
 	}
 	h := g.SessionHandoff
@@ -403,7 +403,7 @@ func TestNewSessionInAnotherClientGetsPriorSnapshotAndProposals(t *testing.T) {
 		t.Fatalf("hook handoff %+v %v", hook, err)
 	}
 	var own SessionGrounding
-	own.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "claude:sess-a", nil)
+	own.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "claude:sess-a", "", nil)
 	if own.SessionHandoff == nil || !own.SessionHandoff.Restore || own.SessionHandoff.FromSession != "claude:sess-a" {
 		t.Fatalf("restore %+v", own.SessionHandoff)
 	}
@@ -661,7 +661,7 @@ func TestAgentCapsuleIsWhatSessionEndHandsOver(t *testing.T) {
 			t.Fatalf("%s: snapshot %+v", when, h.Snapshot)
 		}
 		var g SessionGrounding
-		g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "codex:s2", nil)
+		g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-a", "codex:s2", "", nil)
 		if g.SessionHandoff == nil || g.SessionHandoff.Capsule == nil || g.SessionHandoff.Capsule.Capsule.NextStep != next ||
 			g.Continuity == nil || !slices.ContainsFunc(g.Continuity.OpenItems, func(i ContinuityItem) bool { return i.Text == next }) {
 			t.Fatalf("%s: ground %+v", when, g.groundingSession)
@@ -799,7 +799,7 @@ func BenchmarkSessionHandoff(b *testing.B) {
 	b.Run("ground-session-section", func(b *testing.B) {
 		for b.Loop() {
 			var g SessionGrounding
-			if u := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-b", "", nil); u != nil || g.SessionHandoff == nil {
+			if u := g.groundingSession.buildSessions(ctx, dir, ledgerWS, "agent-b", "", "", nil); u != nil || g.SessionHandoff == nil {
 				b.Fatal(u)
 			}
 		}

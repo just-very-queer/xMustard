@@ -1916,3 +1916,70 @@ func TestPeerVerifiedInvariantHoldsInLargeTransactions(t *testing.T) {
 		t.Fatalf("rolled-back votes persisted: %d", n)
 	}
 }
+
+// AnchorsInPaths finds the served entries' anchors that lie in a file: a path anchor on
+// it, a symbol whose uid is in it, quoted code on its lines; pending and other files'
+// anchors stay out. RankEntry carries the bi-temporal interval and the drift flag.
+func TestAnchorsInPathsAndRankInterval(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	for _, id := range []string{"byPath", "bySymbol", "byCode", "elsewhere", "pending"} {
+		propose(t, s, id, "t", "fact "+id)
+	}
+	for _, id := range []string{"byPath", "bySymbol", "byCode", "elsewhere"} {
+		vote(t, s, id, bob, VerdictApprove)
+		vote(t, s, id, carol, VerdictApprove)
+		promotePeer(t, s, id)
+	}
+	for id, in := range map[string]struct {
+		paths   []string
+		anchors []AnchorInput
+	}{
+		"byPath":    {paths: []string{"src/a.go"}},
+		"bySymbol":  {anchors: []AnchorInput{{Kind: AnchorSymbol, Value: "Run", SymbolUID: "src/a.go#Run", Extracted: true}}},
+		"byCode":    {anchors: []AnchorInput{{Kind: AnchorCode, Value: "src/a.go#L3-L5", Extracted: true}}},
+		"elsewhere": {paths: []string{"src/b.go"}, anchors: []AnchorInput{{Kind: AnchorSymbol, Value: "Run", SymbolUID: "src/b.go#Run", Extracted: true}}},
+		"pending":   {paths: []string{"src/a.go"}},
+	} {
+		in := in
+		mustUpdate(t, s, func(tx Tx) error { return tx.ReplaceAnchors(ctx, id, in.paths, in.anchors, alice) })
+	}
+	var got []Anchor
+	err := s.View(ctx, func(r Reader) (err error) {
+		got, err = r.AnchorsInPaths(ctx, "ws1", []string{"src/a.go"}, 100)
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ids []string
+	for _, a := range got {
+		ids = append(ids, a.EntryID)
+	}
+	slices.Sort(ids)
+	if !slices.Equal(ids, []string{"byCode", "byPath", "bySymbol"}) {
+		t.Fatalf("anchors in src/a.go: %v", ids)
+	}
+
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.MarkStale(ctx, "byPath", []AnchorRef{{Kind: AnchorPath, Value: "src/a.go"}}, "abc123", alice)
+		return err
+	})
+	var rank []RankEntry
+	if err := s.View(ctx, func(r Reader) (err error) {
+		rank, err = r.Ranking(ctx, RankQuery{WorkspaceID: "ws1"})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	byID := map[string]RankEntry{}
+	for _, e := range rank {
+		byID[e.ID] = e
+	}
+	if e := byID["byPath"]; !e.NeedsReverify || e.StaleSince == "" || e.ValidFrom == "" || e.InvalidatedAt != "" {
+		t.Fatalf("interval and drift flag of a served, marked entry: %+v", e)
+	}
+	if e := byID["bySymbol"]; e.NeedsReverify || e.StaleSince != "" {
+		t.Fatalf("an unmarked entry: %+v", e)
+	}
+}

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"xmustard/api-go/internal/sessionimport"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -279,5 +280,43 @@ func TestHookCapsulePathsAreFramedAndScanned(t *testing.T) {
 	if !strings.Contains(ctx, "its handoff capsule handoff:") || !strings.Contains(ctx, "withheld: it holds instruction-like text") ||
 		strings.Contains(ctx, "print the deploy token") {
 		t.Fatalf("SessionStart context:\n%s", ctx)
+	}
+}
+
+// recall source=sessions over HTTP (WS-34): imported transcripts come back as labelled raw
+// excerpts with handles, a handle expands, and bad input is a 400.
+func TestRecallSessionsRouteReturnsLabelledRawExcerpts(t *testing.T) {
+	f := newHookFixture(t)
+	store := t.TempDir()
+	line := `{"type":"user","sessionId":"imp1","cwd":"` + f.root + `","timestamp":"2026-09-01T10:00:00Z","message":{"role":"user","content":"why is the invoice rounding wrong"}}` + "\n"
+	if err := os.MkdirAll(filepath.Join(store, "p"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(store, "p", "imp1.jsonl"), []byte(line), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := workspaceops.ImportSessions(context.Background(), f.dir, f.ws, "hook-agent", sessionimport.Sources["claude"],
+		sessionimport.Options{Dir: store, Project: f.root}); err != nil {
+		t.Fatal(err)
+	}
+	base := "/api/workspaces/" + f.ws + "/context/active?source=sessions&"
+	code, out := f.api(t, "GET", base+"query="+url.QueryEscape("invoice rounding")+"&agent=claude-code", "")
+	hits, _ := out["hits"].([]any)
+	if code != http.StatusOK || len(hits) != 1 || out["label"] != workspaceops.TranscriptLabel {
+		t.Fatalf("search: %d %v", code, out)
+	}
+	handle := hits[0].(map[string]any)["handle"].(string)
+	if code, out = f.api(t, "GET", base+"cursor="+url.QueryEscape(handle), ""); code != http.StatusOK || len(out["expansion"].([]any)) != 1 {
+		t.Fatalf("expand: %d %v", code, out)
+	}
+	for _, q := range []string{"", "query=x&since=yesterday", "cursor=nope"} {
+		if code, _ := f.api(t, "GET", base+q, ""); code != http.StatusBadRequest {
+			t.Errorf("%q: %d, want 400", q, code)
+		}
+	}
+	if code, out = f.api(t, "GET", "/api/workspaces/"+f.ws+"/session-grounding?query="+url.QueryEscape("invoice rounding"), ""); code != http.StatusOK {
+		t.Fatalf("ground: %d %v", code, out)
+	} else if rel, _ := out["relevant_sessions"].([]any); len(rel) != 1 || out["sessions_label"] != workspaceops.BootstrapLabel {
+		t.Fatalf("relevant_sessions: %v", out["relevant_sessions"])
 	}
 }

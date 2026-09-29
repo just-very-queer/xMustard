@@ -111,13 +111,15 @@ var sections = []Section{
 			{Name: "stale_memory_complete", Signal: true}, {Name: "memory_verification_modes", Signal: true},
 			{Name: "pending_for_you", Signal: true}, {Name: "memory_pressure", Signal: true},
 			{Name: "memory_revision", Signal: true},
+			// a memory a change reached is a stale signal: reduced to its count, never dropped
+			{Name: "at_risk_memories", Signal: true}, {Name: "at_risk_truncated"},
 			// a signal: superseded, stale and removed memory is never dropped silently
 			{Name: "memory_delta", Signal: true, Keep: []string{"since", "revision", "truncated"}},
 			{Name: "onboarding", Signal: true, Keep: []string{"needed"}},
 			{Name: "memory_budget", Keep: []string{"revision", "core_entries", "core_withheld", "tokens_est"}},
 		},
 		Recover: "ground sections=memory; recall flags each stale memory; recall status=awaiting_me lists pending_for_you",
-		Doc: "promoted memory whose files drifted, promoted memory by verification mode, the pending memory awaiting your " +
+		Doc: "promoted memory whose files drifted, the memories your changes reached (at_risk_memories: the working-tree changes and HEAD moves are looked up in the anchor index first, and each memory is marked needs_reverify), promoted memory by verification mode, the pending memory awaiting your " +
 			"verification, memory pressure (core_pct, pending_count), the memory revision, what the session's standing-memory " +
 			"projection pushes (memory_budget), onboarding when no memory is promoted, and with since_revision what changed " +
 			"after that revision (memory_delta: added, changed, superseded, stale and removed entry ids)",
@@ -129,6 +131,7 @@ var sections = []Section{
 		Members: []Member{
 			{Name: "session_handoff", Signal: true, Keep: []string{"from_session", "status"}},
 			{Name: "continuity", Signal: true}, {Name: "handoffs", Signal: true}, {Name: "last_sessions"},
+			{Name: "recent_sessions"}, {Name: "relevant_sessions"}, {Name: "sessions_label"},
 		},
 		Recover: "ground sections=session max_chars=N; ground session_id=ID restores that session's snapshot",
 		Doc:     "the prior session's handoff (its compaction snapshot, unexpired handles, proposals awaiting a distinct verifier, drift_stale; with session_id, your own session's to restore), what recent sessions left open, the latest handoff capsules with their stale paths, and the last sessions",

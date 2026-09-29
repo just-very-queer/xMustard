@@ -306,32 +306,33 @@ func writeEvidenceError(w http.ResponseWriter, err error) {
 	writeJSON(w, status, map[string]any{"error": err.Error(), "reason": reason})
 }
 
+// evidenceStatuses are the evidence errors in match order.
+var evidenceStatuses = []struct {
+	err    error
+	status int
+	reason string
+}{
+	{evidence.ErrTooLarge, http.StatusRequestEntityTooLarge, "too_large"},
+	{evidence.ErrQuotaFull, http.StatusInsufficientStorage, "quota_full"},
+	{evidence.ErrExpired, http.StatusGone, "expired"},
+	{evidence.ErrRevoked, http.StatusGone, "revoked"},
+	{evidence.ErrDenied, http.StatusForbidden, "denied"},
+	{evidence.ErrMissing, http.StatusNotFound, "missing"},
+	{evidence.ErrInvalidHandle, http.StatusNotFound, "invalid_handle"},
+	{evidence.ErrInvalidRange, http.StatusRequestedRangeNotSatisfiable, "invalid_range"},
+	{evidence.ErrUnsupported, http.StatusUnsupportedMediaType, "unsupported"},
+	{evidence.ErrUpstreamRef, http.StatusConflict, "upstream_reference"},
+	{evidence.ErrCorrupt, http.StatusInternalServerError, "corrupt"},
+}
+
 // evidenceErrorStatus classifies an evidence error as an HTTP status and a reason.
 func evidenceErrorStatus(err error) (int, string) {
-	status, reason := http.StatusInternalServerError, "internal"
-	switch {
-	case errors.Is(err, evidence.ErrTooLarge):
-		status, reason = http.StatusRequestEntityTooLarge, "too_large"
-	case errors.Is(err, evidence.ErrQuotaFull):
-		status, reason = http.StatusInsufficientStorage, "quota_full"
-	case errors.Is(err, evidence.ErrExpired):
-		status, reason = http.StatusGone, "expired"
-	case errors.Is(err, evidence.ErrRevoked):
-		status, reason = http.StatusGone, "revoked"
-	case errors.Is(err, evidence.ErrDenied):
-		status, reason = http.StatusForbidden, "denied"
-	case errors.Is(err, evidence.ErrMissing):
-		status, reason = http.StatusNotFound, "missing"
-	case errors.Is(err, evidence.ErrInvalidHandle):
-		status, reason = http.StatusNotFound, "invalid_handle"
-	case errors.Is(err, evidence.ErrInvalidRange):
-		status, reason = http.StatusRequestedRangeNotSatisfiable, "invalid_range"
-	case errors.Is(err, evidence.ErrUnsupported):
-		status, reason = http.StatusUnsupportedMediaType, "unsupported"
-	case errors.Is(err, evidence.ErrCorrupt):
-		status, reason = http.StatusInternalServerError, "corrupt"
+	for _, m := range evidenceStatuses {
+		if errors.Is(err, m.err) {
+			return m.status, m.reason
+		}
 	}
-	return status, reason
+	return http.StatusInternalServerError, "internal"
 }
 
 func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {

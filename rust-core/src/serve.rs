@@ -816,7 +816,7 @@ fn run_job(shared: &Shared, job: Job) {
             c.completed.fetch_add(1, Ordering::Relaxed);
             shared.send(Some(id), &[prefix.as_bytes(), body.as_bytes(), b"}"]);
         }
-        Ok(Ok(Output::Text(_))) => {
+        Ok(Ok(Output::Text(_) | Output::Exit(..))) => {
             c.failed.fetch_add(1, Ordering::Relaxed);
             shared.send_error(
                 Some(id),

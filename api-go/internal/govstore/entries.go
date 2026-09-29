@@ -186,8 +186,10 @@ type EntryFilter struct {
 	ScopeKey      string
 	ServedOnly    bool // promoted, active and unexpired now
 	NeedsReverify bool
-	AfterCursor   int64
-	Limit         int
+	// LongestStaleFirst orders by stale_since (oldest first) before the limit applies.
+	LongestStaleFirst bool
+	AfterCursor       int64
+	Limit             int
 }
 
 // Promotion is the result of the caller's vote reconciliation.
@@ -392,8 +394,12 @@ func (r *reader) ListEntries(ctx context.Context, f EntryFilter) ([]Entry, error
 		where = append(where, "e.needs_reverify = 1")
 	}
 	args = append(args, clampLimit(f.Limit))
+	order := "e.pk"
+	if f.LongestStaleFirst {
+		order = "e.stale_since, e.pk"
+	}
 	rows, err := r.query(ctx, "SELECT "+entryCols+" FROM entries e WHERE "+strings.Join(where, " AND ")+
-		" ORDER BY e.pk LIMIT ?", args...)
+		" ORDER BY "+order+" LIMIT ?", args...)
 	if err != nil {
 		return nil, err
 	}

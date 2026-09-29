@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"os"
+	"strconv"
 
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -111,8 +112,14 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 		result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
 	case workspaceops.ImpactBlast:
 		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+		if err == nil {
+			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+		}
 	case workspaceops.ImpactFile:
 		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
+		if err == nil {
+			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, "", []string{q.Get("path")}, result)
+		}
 	case workspaceops.ImpactChanges:
 		result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
 	default:
@@ -127,6 +134,8 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 func recall(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	switch {
+	case q.Get("source") == "sessions":
+		recallSessions(w, r)
 	case q.Get("scope") == "all":
 		recallAllActive(w, r)
 	case q.Get("entry_id") != "":
@@ -134,6 +143,17 @@ func recall(w http.ResponseWriter, r *http.Request) {
 	default:
 		recallRanked(w, r)
 	}
+}
+
+// recallSessions searches past session transcripts (WS-34): raw observations, a
+// reader's read like the rest of recall, labelled and injection-scanned.
+func recallSessions(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	limit, _ := strconv.Atoi(q.Get("limit"))
+	result, err := workspaceops.SearchSessions(r.Context(), dataDir(), r.PathValue("workspace_id"), workspaceops.SessionSearch{
+		Query: q.Get("query"), Since: q.Get("since"), Until: q.Get("until"), Agent: q.Get("agent"),
+		Conversation: q.Get("conversation"), Cursor: q.Get("cursor"), Limit: min(limit, maxRecallLimit)})
+	reply(w, result, err, respondError)
 }
 
 // recallAllActive is the complete promoted history: every entry, every drift hash.

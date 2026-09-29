@@ -22,6 +22,17 @@ pub enum Output {
     /// Verbatim text, such as a Markdown projection, printed without a trailing
     /// newline. `serve` refuses it, so text-producing subcommands are one-shot only.
     Text(String),
+    /// Verbatim text, then the process ends the way a wrapped child did (WS-41, `run`).
+    /// One-shot only, like `Text`.
+    Exit(String, ChildExit),
+}
+
+/// How a wrapped child ended, for the CLI to repeat.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChildExit {
+    Code(i32),
+    /// Killed by this signal number: the CLI ends itself with the same signal.
+    Signal(i32),
 }
 
 /// A failed subcommand. The CLI prints `message` to stderr and exits with `code`:

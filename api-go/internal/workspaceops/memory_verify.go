@@ -169,7 +169,7 @@ func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextAct
 		return nil, err
 	}
 	if promoted {
-		recordVerifyFeedback(dataDir, workspaceID, out.ID, out.Paths)
+		afterBaseline(dataDir, workspaceID, out)
 	}
 	red.annotate(&out)
 	return &out, nil
@@ -209,6 +209,13 @@ func castVerdict(ctx context.Context, tx govstore.Tx, dataDir, workspaceID, root
 		return out, promoted, err
 	}
 	out, promoted, err := settleEntry(ctx, tx, workspaceID, in.EntryID, threshold, root, actor)
+	if err == nil && in.Verdict == govstore.VerdictApprove {
+		var cleared bool
+		if cleared, err = reverifyOnApprove(ctx, tx, root, e, ce, voter, actor); cleared {
+			out.NeedsReverify, out.StaleSince, out.StaleCommit, out.StaleAnchors = false, "", "", nil
+			promoted = true // re-baselined: the symbol anchors follow the commit, like a promotion's
+		}
+	}
 	if move, ok := onQuorum[in.Verdict]; ok && err == nil {
 		return move(ctx, tx, workspaceID, out, in, actor)
 	}

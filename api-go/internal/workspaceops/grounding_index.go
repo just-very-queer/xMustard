@@ -14,7 +14,9 @@ import (
 // A count is null (unknown) when the change-tracking result could not be decoded
 // or lacks it; it is never reported as 0.
 type groundingIndex struct {
-	Drift json.RawMessage `json:"drift"`
+	// changesRaw is the working-changes result, kept for the memory section's invalidation.
+	changesRaw json.RawMessage
+	Drift      json.RawMessage `json:"drift"`
 	// Baseline is the index baseline drift and contract breaks compare against, after
 	// the automatic policy ran (see maintainBaseline); null, and listed unknown, when
 	// there is none.
@@ -62,6 +64,7 @@ func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string)
 	if err != nil {
 		return nil, err
 	}
+	s.changesRaw = changesRaw
 	var unknown []GroundingUnknown
 	if u := s.buildCoverage(ctx, dataDir, workspaceID); u != nil {
 		unknown = append(unknown, *u)
