@@ -1,0 +1,10 @@
+{"type":"object","additionalProperties":false,"required":["findings","coverage"],
+ "properties":{
+  "findings":{"type":"array","items":{"type":"object","additionalProperties":false,
+    "required":["path","content","existing_code","category","severity","start_line","end_line"],
+    "properties":{"path":{"type":"string"},"content":{"type":"string"},"existing_code":{"type":"string"},
+      "category":{"type":"string","enum":["bug","security","performance","maintainability","test","style","documentation","other"]},
+      "severity":{"type":"string","enum":["critical","high","medium","low"]},
+      "start_line":{"type":"integer"},"end_line":{"type":"integer"}}}},
+  "coverage":{"type":"array","items":{"type":"object","additionalProperties":false,"required":["path","status","reason"],
+    "properties":{"path":{"type":"string"},"status":{"type":"string","enum":["reviewed","not_reviewed"]},"reason":{"type":"string"}}}}}}
