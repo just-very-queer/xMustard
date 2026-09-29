@@ -78,16 +78,16 @@ var argHints = func() map[hintKey]string {
 		args []string
 		hint string
 	}{
-		{"explain", []string{"symbol", "name", "function", "q", "query"},
-			"explain takes a file or directory path; for a symbol, search(q=...) finds it and impact(symbol=...) gives its blast radius"},
+		{"explain", []string{"name", "function", "q", "query"},
+			"explain takes path= (a file or directory), symbol= (a name path such as Store/Capture) or uid=; search(q=...) finds a name"},
 		{"impact", []string{"q", "query", "text"},
 			"impact takes symbol=, path= (a file), from= and to=, or no arguments for the current changes; search(q=...) finds a name"},
 		{"impact", []string{"paths", "files"},
 			"impact takes one file as path=; call it once per file"},
 		{"search", []string{"path", "paths", "file", "files", "dir", "directory"},
-			"search narrows files with path_glob= (a glob, ** crosses /); explain(path=...) describes one file and impact(path=...) lists what references it"},
+			"search narrows files with path_glob= (a glob, ** crosses /); explain(path=...) describes a file or directory and impact(path=...) lists what references it"},
 		{"search", []string{"symbol"},
-			"search takes q=; seed= ranks results near a symbol, and impact(symbol=...) gives its blast radius"},
+			"search takes q=; mode=symbol looks q up as a name path, seed= ranks results near a symbol, and impact(symbol=...) gives its blast radius"},
 		{"ground", []string{"q", "query", "path", "paths"},
 			"ground takes no query or path; recall(q=..., paths=...) ranks memory and search(q=...) finds code"},
 		{"diagnostics", []string{"path", "paths", "file"},

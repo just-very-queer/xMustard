@@ -17,10 +17,10 @@ var impactTool = &Tool{
 		{Name: "to", Type: typeString, Desc: "trace path to this symbol"},
 		{Name: "max_depth", Type: typeInteger, Min: 1, Max: maxImpactDepth, Desc: "hops (default 3; path= 4)"},
 	},
-	// Impact v2 (WS-35): typed filters, per-depth paging and diff-to-symbol scopes are
-	// accepted everywhere and listed only in the full schema profile; the docs resource
-	// documents them.
-	Advanced: []Arg{
+	// Impact v2 (WS-35): typed filters, per-depth paging and diff-to-symbol scopes, and
+	// the output budget (WS-36), are accepted everywhere and listed only in the full
+	// schema profile; the docs resource documents them.
+	Advanced: append([]Arg{
 		{Name: "direction", Type: typeString, Enum: []string{"upstream", "downstream"}, Desc: "dependents (default) or dependencies"},
 		{Name: "relation_types", Type: typeString, List: true, Enum: workspaceops.RelationTypes, MaxLen: 128,
 			Desc: "edge kinds to walk (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)"},
@@ -34,8 +34,8 @@ var impactTool = &Tool{
 		{Name: "base", Type: typeString, MaxLen: 256, Desc: "scope=compare|range: base revision"},
 		{Name: "head", Type: typeString, MaxLen: 256, Desc: "scope=compare|commit|range: head revision"},
 		{Name: "worktree", Type: typeString, MaxLen: 4096, Desc: "another checkout of this repository to diff"},
-	},
-	Doc: impactDoc,
+	}, budgetArgs("impact")...),
+	Doc: impactDoc + "\n" + budgetSpec("impact").Markdown(),
 	// depth is the API's query name; a UID goes where a symbol does
 	Aliases:     map[string]string{"depth": "max_depth", "uid": "symbol"},
 	PathArg:     "path",
@@ -62,7 +62,8 @@ var impactTool = &Tool{
 			}
 			kv = append(kv, param, a[name])
 		}
-		return "GET", query(wsPath(a, "/changes/since-index"), kv...), ""
+		// the output budget follows the tool's own arguments (WS-36)
+		return "GET", query(wsPath(a, "/changes/since-index"), append(kv, budgetQuery("impact", a)...)...), ""
 	},
 }
 

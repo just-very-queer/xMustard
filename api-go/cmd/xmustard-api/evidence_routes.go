@@ -42,7 +42,7 @@ func newAPIHandlerFor(p exposurePosture) http.Handler {
 	registerEvidenceCaptureRoutes(mux, store)
 	registerOutcomeRoutes(mux, store)
 	registerHookRoutes(mux, store)
-	return routeGateMiddleware(p, mux, evidenceDeliveryMiddleware(store, mux))
+	return routeGateMiddleware(p, mux, evidenceDeliveryMiddleware(store, toolBudgetMiddleware(mux)))
 }
 
 // coreTools maps the nine MCP tool names to the route that serves them.

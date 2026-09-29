@@ -20,6 +20,10 @@ const searchWindow = 200
 // maxSearchCursorLen bounds a cursor before it is decoded.
 const maxSearchCursorLen = 64
 
+// DefaultSearchLimit is the page size of a search that names no limit: ten hits keep a
+// default result lean (WS-36); the rest continue at next_cursor.
+const DefaultSearchLimit = 10
+
 // maxSearchPathGlobLen bounds path_glob (the MCP argument's maxLength): the core
 // matches it against every candidate path.
 const maxSearchPathGlobLen = 256
@@ -91,7 +95,7 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	}
 	limit := req.Limit
 	if limit <= 0 {
-		limit = 25
+		limit = DefaultSearchLimit
 	}
 	limit = min(limit, searchWindow-offset) // a page stops at the window
 	read := ensureCodeIndex(ctx, root)
@@ -113,28 +117,24 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if err != nil {
 		return nil, err
 	}
-	return withSearchCursor(read.annotate(out), offset, ranking), nil
+	return withListCursor(read.annotate(out), "hits", offset, ranking), nil
 }
 
-// withSearchCursor adds next_cursor when ranked hits remain inside the window.
-func withSearchCursor(raw json.RawMessage, offset int, ranking []byte) json.RawMessage {
-	var page struct {
-		Total int               `json:"total"`
-		Hits  []json.RawMessage `json:"hits"`
-	}
-	if json.Unmarshal(raw, &page) != nil {
+// withListCursor adds next_cursor when ranked items of the list member remain inside
+// the window.
+func withListCursor(raw json.RawMessage, list string, offset int, ranking []byte) json.RawMessage {
+	var page map[string]json.RawMessage
+	var total int
+	var items []json.RawMessage
+	if json.Unmarshal(raw, &page) != nil || json.Unmarshal(page["total"], &total) != nil || json.Unmarshal(page[list], &items) != nil {
 		return raw
 	}
-	next := offset + len(page.Hits)
-	if len(page.Hits) == 0 || next >= page.Total || next >= searchWindow {
+	next := offset + len(items)
+	if len(items) == 0 || next >= total || next >= searchWindow {
 		return raw
 	}
-	var res map[string]json.RawMessage
-	if json.Unmarshal(raw, &res) != nil {
-		return raw
-	}
-	res["next_cursor"], _ = json.Marshal(encodeSearchCursor(next, ranking))
-	b, err := json.Marshal(res)
+	page["next_cursor"], _ = json.Marshal(encodeSearchCursor(next, ranking))
+	b, err := json.Marshal(page)
 	if err != nil {
 		return raw
 	}

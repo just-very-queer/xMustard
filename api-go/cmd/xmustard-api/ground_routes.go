@@ -90,14 +90,5 @@ func printable(s string) bool {
 // the budgeted reply can name its recovery handle; a plain HTTP call is told how to
 // get the unbudgeted result instead.
 func retainGround(r *http.Request, raw []byte) groundbudget.Recovery {
-	keep := retainOriginalFrom(r.Context())
-	if keep == nil {
-		return groundbudget.Recovery{Unavailable: "not a delivered call: omit sections and max_chars for the unbudgeted result"}
-	}
-	d, err := keep(raw)
-	if err != nil {
-		_, reason := evidenceErrorStatus(err)
-		return groundbudget.Recovery{Unavailable: "evidence " + reason}
-	}
-	return groundbudget.Recovery{Handle: d.Handle, URI: d.ResourceURI}
+	return retainBudgeted(r, raw, "omit sections and max_chars for the unbudgeted result")
 }

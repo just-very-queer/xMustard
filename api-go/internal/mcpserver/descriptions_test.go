@@ -12,10 +12,11 @@ import (
 // toolDescriptionBudget caps the bytes agents read in tools/list every session.
 // The nine descriptions totalled 1808 bytes before search/impact/recall were rewritten
 // to state their limits; they totalled 1794, 1735 once search described BM25 (WS-18),
-// 1703 once impact described the resolved graph (WS-35), and 1699 with impact's path=
-// clause (WS-FIX-05) merged into it.
+// 1703 once impact described the resolved graph (WS-35), 1699 with impact's path=
+// clause (WS-FIX-05) merged into it, and 1697 once search named mode=symbol in place of
+// pattern mode's example (WS-36).
 // Lower this when one shrinks; do not raise it.
-const toolDescriptionBudget = 1699
+const toolDescriptionBudget = 1697
 
 // Descriptions are an agent's only model of a tool. search, impact and recall must
 // name the heuristics they run on, so an agent does not read a name-level fuzzy match
