@@ -24,6 +24,7 @@ import (
 //   - trust: the verification mode, the approvals, and the rank state.
 //   - recency: decays with age behind the newest entry the caller can see.
 //   - feedback: the helpful, misleading and stale_harm outcomes on the served revision.
+//   - graph: with a seed, graphWeight/(1+hops) for the nearest anchor in the code graph.
 //   - stale_penalty: the entry's files drifted since it was verified (candidate window).
 const (
 	bm25Weight     = 3.0
@@ -57,22 +58,25 @@ var (
 
 // ScoreDetails is an entry's ranking, signal by signal. Total is their sum.
 type ScoreDetails struct {
-	BM25         float64  `json:"bm25"`
-	Path         float64  `json:"path"`
-	Anchor       float64  `json:"anchor"`
-	Trust        float64  `json:"trust"`
-	Recency      float64  `json:"recency"`
-	Feedback     float64  `json:"feedback"`
-	StalePenalty float64  `json:"stale_penalty"`
-	Total        float64  `json:"total"`
-	Reasons      []string `json:"reasons,omitempty"`
+	BM25   float64 `json:"bm25"`
+	Path   float64 `json:"path"`
+	Anchor float64 `json:"anchor"`
+	Graph  float64 `json:"graph,omitempty"`
+	// GraphDistance is the hops from recall's seed to the nearest anchor (PAR-RCL-03).
+	GraphDistance *int     `json:"graph_distance,omitempty"`
+	Trust         float64  `json:"trust"`
+	Recency       float64  `json:"recency"`
+	Feedback      float64  `json:"feedback"`
+	StalePenalty  float64  `json:"stale_penalty"`
+	Total         float64  `json:"total"`
+	Reasons       []string `json:"reasons,omitempty"`
 }
 
 // relevance is the task-match part of the score: what an explicit signal gates on.
-func (d ScoreDetails) relevance() float64 { return d.BM25 + d.Path + d.Anchor }
+func (d ScoreDetails) relevance() float64 { return d.BM25 + d.Path + d.Anchor + d.Graph }
 
 func (d *ScoreDetails) sum() {
-	d.Total = round3(d.BM25 + d.Path + d.Anchor + d.Trust + d.Recency + d.Feedback + d.StalePenalty)
+	d.Total = round3(d.BM25 + d.Path + d.Anchor + d.Graph + d.Trust + d.Recency + d.Feedback + d.StalePenalty)
 }
 
 func (d *ScoreDetails) because(format string, args ...any) {
@@ -101,6 +105,8 @@ type recallSignals struct {
 	newest      time.Time
 	anchorBoost map[string]float64
 	anchorWhy   map[string][]string
+	// graph is each memory's hops from recall's seed, for those within its neighbourhood.
+	graph map[string]int
 }
 
 func newRecallSignals(view []govstore.RankEntry, bm25 map[string]float64, focus []string) recallSignals {
@@ -147,6 +153,10 @@ func (s recallSignals) score(e govstore.RankEntry) ScoreDetails {
 	if b := s.anchorBoost[e.ID]; b > 0 {
 		d.Anchor = round3(d.Anchor + b)
 		d.because("anchors %s", strings.Join(s.anchorWhy[e.ID], ", "))
+	}
+	if hops, ok := s.graph[e.ID]; ok {
+		d.Graph, d.GraphDistance = round3(graphSignal(hops)), &hops
+		d.because("%d hops from the seed", hops)
 	}
 	approvals := min(e.Approvals, maxApprovals)
 	d.Trust = round3(modeTrust[e.VerificationMode] + stateTrust[e.State] + approvalWeight*float64(approvals))

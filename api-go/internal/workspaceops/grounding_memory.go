@@ -41,6 +41,12 @@ type groundingMemory struct {
 	Onboarding *Onboarding `json:"onboarding,omitempty"`
 	// MemoryDelta answers since_revision (PAR-HAR-03).
 	MemoryDelta *MemoryDelta `json:"memory_delta,omitempty"`
+	// AtRiskMemories are the served memories a change reached: the caller's working
+	// changes and HEAD moves are looked up in the anchor index before this list is read,
+	// and each is marked needs_reverify (WS-28, PAR-PROV-03). At most maxAtRisk.
+	AtRiskMemories []AtRiskMemory `json:"at_risk_memories"`
+	// AtRiskTruncated: more than maxAtRisk memories are at risk.
+	AtRiskTruncated bool `json:"at_risk_truncated,omitempty"`
 }
 
 // MemoryPressure is how full shared memory is: the percentage of served memory in the
@@ -57,6 +63,10 @@ type groundMemoryOptions struct {
 	// budget adds memory_budget (the projection); hooks compile the projection
 	// themselves and leave it out.
 	budget bool
+	// invalidate looks the working changes and HEAD moves up in the anchor index before
+	// at_risk_memories is read. It runs git and the core, so a hook (which starts no
+	// process) leaves it off and lists what earlier changes marked.
+	invalidate bool
 }
 
 // noSince is the since value of a ground call that names no revision.
@@ -70,30 +80,35 @@ const noSince = -1
 // memory_revision are null, stale_memory_complete is false, and the fields are listed
 // unknown.
 func (s *groundingMemory) build(dataDir, workspaceID, caller string, opts groundMemoryOptions) []GroundingUnknown {
-	scan, err := scanGroundMemory(dataDir, workspaceID, caller, groundStaleWindow, opts.since)
+	scan, err := scanGroundMemory(dataDir, workspaceID, caller, groundStaleWindow, opts.since, opts.invalidate)
 	s.StaleMemoryChecked, s.StaleMemoryComplete, s.MemoryVerificationModes = scan.checked, scan.complete, scan.modes
 	if err != nil {
 		reason := "memory store unreadable: " + err.Error()
 		var out []GroundingUnknown
-		for _, f := range []string{"stale_memory", "stale_memory_total", "memory_verification_modes", "pending_for_you", "memory_pressure", "memory_revision"} {
+		for _, f := range []string{"stale_memory", "stale_memory_total", "memory_verification_modes", "pending_for_you", "memory_pressure", "memory_revision", "at_risk_memories"} {
 			out = append(out, GroundingUnknown{Field: f, Reason: reason})
 		}
 		return out
 	}
 	s.StaleMemory, s.StaleMemoryTotal, s.PendingForYou = &scan.stale, &scan.total, &scan.forYou
 	s.MemoryPressure, s.MemoryRevision, s.MemoryDelta = &scan.pressure, &scan.revision, scan.delta
+	s.AtRiskMemories, s.AtRiskTruncated = scan.atRisk, scan.atRiskTruncated
+	var unknown []GroundingUnknown
+	if scan.invalidationErr != nil {
+		unknown = append(unknown, GroundingUnknown{Field: "at_risk_memories", Reason: "changes not checked against memory anchors: " + scan.invalidationErr.Error()})
+	}
 	if scan.total == 0 {
 		s.Onboarding = &Onboarding{Needed: true, Propose: onboardingChecklist}
 	}
 	if !opts.budget {
-		return nil
+		return unknown
 	}
 	p, err := CoreProjection(context.Background(), dataDir, workspaceID, ProjectionDefaultChars)
 	if err != nil {
-		return []GroundingUnknown{{Field: "memory_budget", Reason: "memory projection unavailable: " + err.Error()}}
+		return append(unknown, GroundingUnknown{Field: "memory_budget", Reason: "memory projection unavailable: " + err.Error()})
 	}
 	s.MemoryBudget = memoryBudgetOf(p)
-	return nil
+	return unknown
 }
 
 // groundStaleWindow bounds how many promoted memories `ground` drift-checks.
@@ -108,6 +123,11 @@ type groundMemoryScan struct {
 	pressure              MemoryPressure
 	revision              int64
 	delta                 *MemoryDelta
+	atRisk                []AtRiskMemory
+	atRiskTruncated       bool
+	// invalidationErr: the changes could not be read or looked up, so at_risk lists only
+	// what earlier changes marked.
+	invalidationErr error
 }
 
 // scanGroundMemory reads served and pending memory from content-free metadata in one
@@ -116,13 +136,16 @@ type groundMemoryScan struct {
 // mode and in the core tier, counts the pending entries awaiting the caller, and reads
 // the memory revision and, when since >= 0, the delta after since, from the same
 // snapshot.
-func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int64) (groundMemoryScan, error) {
+func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int64, invalidate bool) (groundMemoryScan, error) {
 	ctx := context.Background()
 	var view []govstore.RankEntry
 	var checkedEntries []ContextEntry
 	var events deltaEvents
 	baselined := 0
 	scan := groundMemoryScan{modes: newModeCounts()}
+	if invalidate {
+		scan.invalidationErr = invalidateForGround(ctx, dataDir, workspaceID)
+	}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
 		if scan.revision, err = r.MemoryRevision(ctx, workspaceID); err != nil {
@@ -147,8 +170,11 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 			return err
 		}
 		if since >= 0 {
-			events, err = readDeltaEvents(ctx, r, workspaceID, since)
+			if events, err = readDeltaEvents(ctx, r, workspaceID, since); err != nil {
+				return err
+			}
 		}
+		scan.atRisk, scan.atRiskTruncated, err = readAtRisk(ctx, r, workspaceID)
 		return err
 	})
 	if err != nil {

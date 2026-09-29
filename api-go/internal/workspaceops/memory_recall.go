@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"xmustard/api-go/internal/gitdiff"
 	"xmustard/api-go/internal/govstore"
 )
 
@@ -87,6 +88,19 @@ func computeStaleness(root string, entry *ContextEntry) {
 		sort.Strings(stale)
 		entry.Stale = true
 		entry.StalePaths = stale
+	}
+}
+
+// markPersistedStale folds the persisted drift (a change observed on an anchor, PAR-PROV-03)
+// into the read-time verdict: an entry that needs re-verification is stale, and the
+// anchors the change hit are its stale paths where drift-on-recall found none.
+func markPersistedStale(entry *ContextEntry) {
+	if !entry.NeedsReverify {
+		return
+	}
+	entry.Stale = true
+	if len(entry.StalePaths) == 0 {
+		entry.StalePaths = slices.Clone(entry.StaleAnchors)
 	}
 }
 
@@ -236,6 +250,12 @@ type RecallRequest struct {
 	// Subject keeps entries with a claim on it; Predicate narrows that to one predicate
 	// (PAR-GOV-10). Predicate needs Subject.
 	Subject, Predicate string
+	// AsOf keeps the memories whose world-time interval held at a commit or time, the
+	// superseded and expired ones included; ValidOnly keeps those still valid now
+	// (PAR-PROV-02). Seed ranks by graph distance from a symbol (PAR-RCL-03).
+	AsOf      string
+	ValidOnly bool
+	Seed      string
 	// Cursor continues a previous page (next_cursor).
 	Cursor string
 	// NamesOnly returns ids, titles, topic, state, stale and paths only.
@@ -250,6 +270,8 @@ type RecallRequest struct {
 	SessionID string
 	// Caller is the principal recalling, for awaiting_me and the seen-set key.
 	Caller string
+	// asOf is AsOf resolved against the repository, set while ranking.
+	asOf *asOfPoint
 }
 
 // Recall output budget bounds, in characters of the JSON result (Mem0's default).
@@ -270,11 +292,13 @@ var recallStatuses = map[string]func(RecallRequest) []string{
 // servedStates is served memory plus the states the include flags opt into.
 func servedStates(r RecallRequest) []string {
 	states := []string{govstore.RankServed}
+	// an as_of reads the states a memory's interval can have closed in
+	historic := r.AsOf != ""
 	for _, opt := range []struct {
 		on    bool
 		state string
-	}{{r.IncludePending, govstore.RankPending}, {r.IncludeSuperseded, govstore.RankSuperseded}, {r.ShowExpired, govstore.RankExpired},
-		{r.IncludeMerged, govstore.RankMerged}} {
+	}{{r.IncludePending, govstore.RankPending}, {r.IncludeSuperseded || historic, govstore.RankSuperseded},
+		{r.ShowExpired || historic, govstore.RankExpired}, {r.IncludeMerged, govstore.RankMerged}} {
 		if opt.on {
 			states = append(states, opt.state)
 		}
@@ -312,6 +336,14 @@ func (r *RecallRequest) validate() error {
 	}
 	if len(r.SessionID) > RecallMaxSessionID {
 		return fmt.Errorf("session_id is longer than %d bytes: %w", RecallMaxSessionID, ErrInvalidInput)
+	}
+	if r.Seed = strings.TrimSpace(r.Seed); r.Seed != "" {
+		if err := CheckNamePath(r.Seed); err != nil {
+			return err
+		}
+	}
+	if r.AsOf = strings.TrimSpace(r.AsOf); len(r.AsOf) > gitdiff.MaxRefLen {
+		return fmt.Errorf("as_of is longer than %d bytes: %w", gitdiff.MaxRefLen, ErrInvalidInput)
 	}
 	r.Topic = normalizeTopic(r.Topic)
 	tier, err := normalizeTier(r.Tier)
@@ -382,6 +414,8 @@ func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool, claimed map
 	add(r.By != "", func(e govstore.RankEntry) bool {
 		return strings.EqualFold(strings.TrimSpace(e.Author), strings.TrimSpace(r.By))
 	})
+	add(r.asOf != nil, func(e govstore.RankEntry) bool { return r.asOf.holds(e) })
+	add(r.ValidOnly, func(e govstore.RankEntry) bool { return e.InvalidatedAt == "" && e.State == govstore.RankServed })
 	add(r.Status == "awaiting_me", awaits)
 	add(r.Subject != "", func(e govstore.RankEntry) bool { return claimed[e.ID] })
 	return out
@@ -475,6 +509,8 @@ type recallRanking struct {
 	hasSignal bool
 	// read counts the entries read in the request's states, before filters and gating.
 	read int
+	// seed reports the graph walk of recall(seed=), nil without one.
+	seed map[string]any
 }
 
 // rankRecall reads the ranking view in the request's states, filters it, and scores
@@ -489,11 +525,25 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	// Explicit query/paths gate relevance; with neither, the current working changes
 	// only boost matching memories so a dirty tree still yields recency top-N.
 	focus := cleanPaths(req.Paths)
-	explicit := req.Query != "" || len(focus) > 0
+	explicit := req.Query != "" || len(focus) > 0 || req.Seed != ""
 	if !explicit {
 		focus = recallChangedFiles(ctx, dataDir, workspaceID)
 	}
+	if req.AsOf != "" {
+		point, err := resolveAsOf(ctx, contextRoot(dataDir, workspaceID), req.AsOf)
+		if err != nil {
+			return recallRanking{}, err
+		}
+		req.asOf = &point
+	}
+	var hood seedHood
+	if req.Seed != "" {
+		if hood, err = seedNeighbours(ctx, dataDir, workspaceID, req.Seed); err != nil {
+			return recallRanking{}, fmt.Errorf("seed %q: %w", req.Seed, err)
+		}
+	}
 	var ranking []govstore.RankEntry
+	var distances map[string]int
 	var bm25, boosts map[string]float64
 	var boostWhy map[string][]string
 	var claimed map[string]bool
@@ -513,12 +563,15 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		if req.Subject != "" {
 			claimed, err = claimedEntries(ctx, r, workspaceID, req.Subject, req.Predicate)
 		}
+		if err == nil && hood.Found {
+			distances, err = memoryDistances(ctx, r, workspaceID, hood)
+		}
 		return err
 	})
 	if err != nil {
 		return recallRanking{}, err
 	}
-	hasSignal := explicit && (len(qtokens) > 0 || len(focus) > 0)
+	hasSignal := explicit && (len(qtokens) > 0 || len(focus) > 0 || req.Seed != "")
 	var awaits func(govstore.RankEntry) bool
 	if req.Status == "awaiting_me" {
 		awaits = awaitingCaller(dataDir, req.Caller)
@@ -531,8 +584,12 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		return slices.ContainsFunc(filters, func(keep func(govstore.RankEntry) bool) bool { return !keep(e) })
 	})
 	sig := newRecallSignals(visible, bm25, focus)
-	sig.anchorBoost, sig.anchorWhy = boosts, boostWhy
+	sig.anchorBoost, sig.anchorWhy, sig.graph = boosts, boostWhy, distances
 	out := recallRanking{hasSignal: hasSignal, read: read, ranked: make([]scoredEntry, 0, len(visible))}
+	if req.Seed != "" {
+		out.seed = map[string]any{"symbol": req.Seed, "found": hood.Found, "neighbourhood_files": len(hood.Files),
+			"memories_near": len(distances), "max_hops": seedHops}
+	}
 	for _, e := range visible {
 		d := sig.score(e)
 		// explicit query/paths gate relevance: irrelevant memory is dropped.
@@ -543,6 +600,9 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		out.ranked = append(out.ranked, scoredEntry{entry: ContextEntry{ID: e.ID, UpdatedAt: e.UpdatedAt, ContentDigest: e.ContentDigest}, rank: e, details: d})
 	}
 	sortByScore(out.ranked)
+	if req.Seed != "" {
+		diversify(out.ranked)
+	}
 	return out, nil
 }
 
@@ -588,6 +648,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	for i := range candidates {
 		c := &candidates[i]
 		computeStaleness(root, &c.entry)
+		markPersistedStale(&c.entry)
 		c.details.stale(c.entry.StalePaths)
 	}
 	for i := 0; i < len(candidates); i += cur.block {
@@ -595,7 +656,7 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	}
 
 	requireMulti, threshold := contextDefaults(dataDir)
-	return map[string]any{
+	res := map[string]any{
 		"workspace_id":           workspaceID,
 		"query":                  req.Query,
 		"status":                 fallbackString(req.Status, "promoted"),
@@ -609,7 +670,28 @@ func recallOnce(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		"total_matches":          len(rk.ranked),
 		"drift_checked":          len(candidates), // every returned entry is in this set (checked)
 		"generated_at":           nowUTC(),
-	}, recallPage{candidates: candidates, span: span, cursor: cur, limit: limit, total: len(rk.ranked), claims: claims}, mismatched, nil
+	}
+	for name, v := range map[string]any{"seed": nilIfEmptyMap(rk.seed), "as_of": nilIfEmpty(req.AsOf)} {
+		if v != nil {
+			res[name] = v
+		}
+	}
+	return res, recallPage{candidates: candidates, span: span, cursor: cur, limit: limit, total: len(rk.ranked), claims: claims}, mismatched, nil
+}
+
+func nilIfEmptyMap(m map[string]any) any {
+	if len(m) == 0 {
+		return nil
+	}
+	return m
+}
+
+// nilIfEmpty is s, or nil when it is empty, so an absent argument leaves no member.
+func nilIfEmpty(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 // recallSpan is the part of a ranking one page reads: it loads [lo, hi) and scans

@@ -21,7 +21,7 @@ const (
 // their own names.
 var recallQueryArgs = []string{"paths", "limit", "entry_id", "history", "explain", "kind", "tier", "tags", "topic",
 	"path_prefix", "since", "until", "by", "status", "include_pending", "include_superseded", "show_expired",
-	"include_merged", "subject", "predicate", "cursor", "names_only", "render", "session_id"}
+	"include_merged", "subject", "predicate", "as_of", "valid_only", "seed", "cursor", "names_only", "render", "session_id"}
 
 var recallTool = &Tool{
 	Name:        "recall",
@@ -45,6 +45,9 @@ var recallTool = &Tool{
 		{Name: "include_merged", Type: typeBoolean},
 		{Name: "subject", Type: typeString, MaxLen: 256},
 		{Name: "predicate", Type: typeString},
+		{Name: "as_of", Type: typeString, MaxLen: 256},
+		{Name: "valid_only", Type: typeBoolean},
+		{Name: "seed", Type: typeString, MaxLen: maxPathArg},
 		{Name: "kind", Type: typeString, List: true, MaxLen: 512},
 		{Name: "tier", Type: typeString, Enum: []string{"core", "deferred"}},
 		{Name: "tags", Type: typeString, List: true, MaxLen: 1024},
@@ -67,6 +70,12 @@ var recallTool = &Tool{
 		"promoted memory; `include_merged` adds memories merged into another as its duplicate (verify " +
 		"`duplicate_of`), which may be unverified and so needs the same roles as pending. `subject` keeps " +
 		"memories with a structured claim on it (see remember's `claims`), `predicate` one kind of claim. " +
+		"`as_of` (a commit or an RFC 3339 time) keeps the memories whose validity interval (`valid_from` to `invalidated_at`, " +
+		"each with its commit, ancestry decided by git and cached) held then, including memories since superseded or expired; " +
+		"`valid_only` keeps only those still valid now. `seed` (a symbol name path or UID) ranks the served memories anchored " +
+		"within 3 hops of it in the code graph, each earning 1/(1+hops) (`score_details.graph_distance`), and reorders the best " +
+		"100 for diversity; `seed` reports the walk. A memory a change reached carries `needs_reverify`, `stale_since` and " +
+		"`stale_anchors`; ground lists them as `at_risk_memories`, and a distinct verifier's approval re-baselines and clears one. " +
 		"`kind` is one of remember's kinds; `tier` keeps core or deferred memory. `topic` matches the topic and every topic under it (a/b " +
 		"matches a/b/c). `path_prefix` keeps entries with a path under it. `since` and `until` bound updated_at " +
 		"(a UTC date or RFC 3339 time; until is exclusive). `by` keeps one author's entries. `explain` adds " +

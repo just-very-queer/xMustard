@@ -108,6 +108,10 @@ type AnchorReader interface {
 	// AnchorFanout counts, per value of q.Values, the workspace's entries holding it as
 	// an anchor of q.Kind, under q's lifecycle flags (Limit and NewestFirst are unused).
 	AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]int, error)
+	// AnchorsInPaths returns the anchors of the workspace's served entries that lie in
+	// one of paths (PAR-PROV-03): a path anchor on it, a symbol anchor whose uid is
+	// "path#name" or a code anchor "path#Lstart-Lend" in it. At most limit rows.
+	AnchorsInPaths(ctx context.Context, workspaceID string, paths []string, limit int) ([]Anchor, error)
 }
 
 // AnchorWriter writes anchors, baselines and drift observations.
@@ -321,6 +325,60 @@ func (r *reader) AnchorFanout(ctx context.Context, q AnchorQuery) (map[string]in
 		var v string
 		var n int
 		if err := eachRow(rows, func() { out[v] = n }, func() error { return rows.Scan(&v, &n) }); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// anchorColsA is anchorCols on the alias a.
+const anchorColsA = `a.entry_id, a.ordinal, a.kind, a.value, a.declared, a.symbol_uid, a.baseline_state, a.baseline_hash,
+	a.baseline_kind, a.baseline_commit, coalesce(a.baseline_at, ''), coalesce(a.stale_since, ''), a.stale_commit`
+
+// anchorFileExpr is the file an anchor lies in: its value for a path anchor, else the
+// part of its uid (symbol) or value (code) before "#".
+const anchorFileExpr = `CASE a.kind WHEN 'path' THEN a.value
+	WHEN 'symbol' THEN substr(a.symbol_uid, 1, instr(a.symbol_uid, '#') - 1)
+	ELSE substr(a.value, 1, instr(a.value, '#') - 1) END`
+
+// AnchorsInPaths finds the served entries' anchors that lie in paths. Path anchors use
+// the (kind, value) index; symbol and code anchors are scanned by kind.
+func (r *reader) AnchorsInPaths(ctx context.Context, workspaceID string, paths []string, limit int) ([]Anchor, error) {
+	if err := validID("workspace", workspaceID); err != nil {
+		return nil, err
+	}
+	var out []Anchor
+	for start := 0; start < len(paths); start += maxInArgs {
+		chunk := paths[start:min(start+maxInArgs, len(paths))]
+		in := placeholders(len(chunk))
+		args := make([]any, 0, 2*len(chunk)+4)
+		for range 2 {
+			for _, p := range chunk {
+				args = append(args, p)
+			}
+		}
+		lifecycle, lifecycleArgs := r.anchorLifecycle(AnchorQuery{ServedOnly: true})
+		args = append(append(append(args, workspaceID), lifecycleArgs...), clampLimit(limit))
+		rows, err := r.query(ctx, "SELECT "+anchorColsA+` FROM anchors a JOIN entries e ON e.id = a.entry_id
+			WHERE (a.kind = 'path' AND a.value IN (`+in+`)
+			   OR a.kind IN ('symbol', 'code') AND (`+anchorFileExpr+`) IN (`+in+`))
+			AND e.workspace_id = ?`+lifecycle+` ORDER BY e.pk, a.ordinal LIMIT ?`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			a, err := scanAnchor(rows)
+			if err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out = append(out, a)
+		}
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
 			return nil, err
 		}
 	}

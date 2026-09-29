@@ -40,7 +40,7 @@ func TestGroundingSplitKeepsWireShape(t *testing.T) {
 	want := []string{"workspace_id", "drift", "baseline", "changed_files", "dirty_symbols", "contract_breaks", "broken_contracts",
 		"coverage", "recent_failed_runs", "blocked_by_dirty_state", "blocked_by_failing_verification", "stale_memory",
 		"stale_memory_checked", "stale_memory_total", "stale_memory_complete", "memory_verification_modes",
-		"pending_for_you", "memory_pressure", "memory_revision", "memory_budget", "summary", "generated_at"}
+		"pending_for_you", "memory_pressure", "memory_revision", "memory_budget", "at_risk_memories", "summary", "generated_at"}
 	if strings.Join(keys, ",") != strings.Join(want, ",") {
 		t.Fatalf("ground keys changed:\n got %v\nwant %v", keys, want)
 	}
