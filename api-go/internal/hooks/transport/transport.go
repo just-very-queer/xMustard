@@ -20,6 +20,25 @@ const SocketEnv = "XMUSTARD_HOOK_SOCKET"
 // without it the daemon resolves the registered root that holds the event's cwd.
 const WorkspaceHeader = "X-Xmustard-Workspace"
 
+// ValidWorkspaceID reports a pin the client sends and a Codex hooks.json may carry:
+// 1-128 of the daemon's safe-id characters (letters, digits, '_', '.' and '-'), not "..".
+func ValidWorkspaceID(s string) bool {
+	return SafeChars(s, 128, "_.-") && !strings.Contains(s, "..")
+}
+
+// SafeChars reports a non-empty s of at most max ASCII letters, digits and extra bytes.
+func SafeChars(s string, max int, extra string) bool {
+	if s == "" || len(s) > max {
+		return false
+	}
+	for _, r := range s {
+		if !('0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || strings.ContainsRune(extra, r)) {
+			return false
+		}
+	}
+	return true
+}
+
 // SocketPath is the hook socket: SocketEnv, else xmustard/hook.sock under
 // $XDG_RUNTIME_DIR, else under a per-user directory of the OS temp dir; "" when
 // disabled. getenv is os.Getenv outside tests.

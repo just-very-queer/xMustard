@@ -144,9 +144,9 @@ func reducerCorpus() []corpusCase {
 	// grep family (reduceGrouped, parseGrepLine)
 	add(corpusCase{name: "grep/numbered", raw: grepOutput(30, 4), sel: bash("rg -n needle src")})
 	add(corpusCase{name: "grep/heading", raw: rgHeading(40, 3), sel: bash("rg --heading -n -C1 needle")})
-	add(corpusCase{name: "grep/count", raw: grepCount(700), sel: bash("grep -rc needle src")})
+	add(corpusCase{name: "grep/count", raw: grepCountOutput(700), sel: bash("grep -rc needle src")})
 	add(corpusCase{name: "grep/files", raw: grepFiles(900), sel: bash("grep -rl needle src")})
-	add(corpusCase{name: "grep/unnumbered", raw: grepUnnumbered(300), sel: bash("grep -r -C1 needle src")})
+	add(corpusCase{name: "grep/unnumbered", raw: grepUnnumberedOutput(300), sel: bash("grep -r -C1 needle src")})
 	add(corpusCase{name: "grep/notices", raw: grepNotices(60), sel: Selector{Client: "pi", Tool: "grep"}})
 	add(corpusCase{name: "grep/no-matches", raw: noisyShell(), sel: bash("rg needle")})
 	arr, arrSecs := sections("filenames[]", grepFiles(700))
@@ -222,7 +222,7 @@ func rgHeading(files, per int) []byte {
 	return b.Bytes()
 }
 
-func grepCount(n int) []byte {
+func grepCountOutput(n int) []byte {
 	var b bytes.Buffer
 	for i := 0; i < n; i++ {
 		fmt.Fprintf(&b, "src/dir%02d/file_%04d.go:%d\n", i%9, i, (i*7)%13)
@@ -238,7 +238,7 @@ func grepFiles(n int) []byte {
 	return b.Bytes()
 }
 
-func grepUnnumbered(n int) []byte {
+func grepUnnumberedOutput(n int) []byte {
 	var b bytes.Buffer
 	for i := 0; i < n; i++ {
 		p := fmt.Sprintf("docs/part%02d/page_%03d.md", i%6, i/3)

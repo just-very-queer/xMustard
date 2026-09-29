@@ -126,6 +126,16 @@ var routeGateTable = map[string]routeGate{
 	"POST /api/hooks/claude/SubagentStop":       hookGate("queued; answered at once"),
 	"POST /api/hooks/claude/SessionEnd":         hookGate("queued; answered at once (1.5 s SessionEnd budget)"),
 
+	// --- core: Codex hook service (hooks_routes.go, WS-40a; posted by xmustard-hook) ---
+	"POST /api/hooks/codex/SessionStart":     hookGate("ground's spawn-free part and core-tier memories as context"),
+	"POST /api/hooks/codex/SubagentStart":    hookGate("the same context for a subagent, which has steering state of its own"),
+	"POST /api/hooks/codex/UserPromptSubmit": hookGate("memories a prompt keyword triggers"),
+	"POST /api/hooks/codex/PreToolUse":       hookGate("index hits and memories for a Bash search or the files of an apply_patch"),
+	"POST /api/hooks/codex/PostToolUse":      hookGate("captures the caller's own tool output; decision=block with the projection as reason"),
+	"POST /api/hooks/codex/PostCompact":      hookGate("queued; answered at once"),
+	"POST /api/hooks/codex/SubagentStop":     hookGate("queued; answered at once"),
+	"POST /api/hooks/codex/SessionEnd":       hookGate("queued; answered at once"),
+
 	// --- platform: operator configuration ---
 	"GET /api/runtimes":                platformGate(roleReader, ""),
 	"GET /api/settings":                platformGate(roleReader, ""),

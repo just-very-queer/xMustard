@@ -1,0 +1,27 @@
+{
+  "name": "@xmustard/opencode-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "OpenCode plugin for xMustard: registers the xMustard MCP server, reduces large tool results through xMustard's evidence capture and masks older ones behind recovery handles. Targets the OpenCode 2.x plugin API (setup); a 1.x entrypoint (server) reduces results and registers the server.",
+  "type": "module",
+  "license": "UNLICENSED",
+  "main": "./index.ts",
+  "exports": {
+    ".": "./index.ts"
+  },
+  "engines": {
+    "node": ">=22.18.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --test test/unit.test.ts",
+    "check": "npm run typecheck && npm test",
+    "record": "node test/fixtures/record.mjs",
+    "smoke": "node test/smoke/smoke.mjs"
+  },
+  "devDependencies": {
+    "@opencode/plugin": "2.0.1",
+    "@types/node": "24.3.1",
+    "typescript": "5.9.2"
+  }
+}
