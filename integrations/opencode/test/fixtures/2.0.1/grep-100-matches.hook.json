@@ -1,0 +1,721 @@
+{
+	"tool": "grep",
+	"sessionID": "ses_fixture",
+	"agent": "build",
+	"messageID": "msg_fixture",
+	"id": "call_grep",
+	"input": {
+		"pattern": "needle",
+		"path": "src"
+	},
+	"status": "completed",
+	"result": {
+		"output": [
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_000.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_000.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_000.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_000.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_000.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_001.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_001.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_001.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_001.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_001.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_002.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_002.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_002.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_002.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_002.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_003.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_003.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_003.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_003.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_003.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_004.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_004.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_004.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_004.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_004.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_005.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_005.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_005.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_005.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_005.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_006.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_006.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_006.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_006.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_006.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_007.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_007.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_007.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_007.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_007.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_008.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_008.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_008.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_008.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_008.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_009.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_009.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_009.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_009.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_009.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_010.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_010.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_010.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_010.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_010.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_011.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_011.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_011.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_011.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_011.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_012.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_012.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_012.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_012.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_012.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_013.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_013.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_013.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_013.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg06/file_013.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_014.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_014.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_014.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_014.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg00/file_014.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_015.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_015.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_015.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_015.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg01/file_015.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_016.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_016.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_016.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_016.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg02/file_016.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_017.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_017.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_017.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_017.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg03/file_017.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_018.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_018.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_018.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_018.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg04/file_018.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_019.go"
+				},
+				"line": 10,
+				"text": "\tfoo := callSomething(0) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_019.go"
+				},
+				"line": 13,
+				"text": "\tfoo := callSomething(1) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_019.go"
+				},
+				"line": 16,
+				"text": "\tfoo := callSomething(2) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_019.go"
+				},
+				"line": 19,
+				"text": "\tfoo := callSomething(3) // matches needle"
+			},
+			{
+				"entry": {
+					"path": "/Users/dev/repo/src/pkg05/file_019.go"
+				},
+				"line": 22,
+				"text": "\tfoo := callSomething(4) // matches needle"
+			}
+		],
+		"content": "Found 100 matches\n/Users/dev/repo/src/pkg00/file_000.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg01/file_001.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg02/file_002.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg03/file_003.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg04/file_004.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg05/file_005.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg06/file_006.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg00/file_007.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg01/file_008.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg02/file_009.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg03/file_010.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg04/file_011.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg05/file_012.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg06/file_013.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg00/file_014.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg01/file_015.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg02/file_016.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg03/file_017.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg04/file_018.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle\n\n/Users/dev/repo/src/pkg05/file_019.go:\n  Line 10: \tfoo := callSomething(0) // matches needle\n  Line 13: \tfoo := callSomething(1) // matches needle\n  Line 16: \tfoo := callSomething(2) // matches needle\n  Line 19: \tfoo := callSomething(3) // matches needle\n  Line 22: \tfoo := callSomething(4) // matches needle",
+		"metadata": {
+			"matches": 100,
+			"truncated": false
+		}
+	}
+}

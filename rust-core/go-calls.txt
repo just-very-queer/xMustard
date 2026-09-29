@@ -57,6 +57,7 @@ called symbolgraph hotspots
 called symbolgraph impact
 called symbolgraph impact-file
 called symbolgraph overview
+called symbolgraph resolve
 called symbolgraph trace
 called syntax-check
 called watch done

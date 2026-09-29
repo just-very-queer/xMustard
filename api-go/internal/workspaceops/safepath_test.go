@@ -72,3 +72,24 @@ func TestReadWorkspaceRegularFileSizeCap(t *testing.T) {
 		t.Fatal("directory must be rejected")
 	}
 }
+
+// Nested files read at every depth: the fd walk once took a two-component path for the
+// root itself when the kernel reused the root's fd number for the file.
+func TestReadWorkspaceRegularFileNestedPaths(t *testing.T) {
+	root := t.TempDir()
+	for _, rel := range []string{"a.go", "server/config.go", "pkg/sub/handler.go", "a/b/c/d.go"} {
+		p := filepath.Join(root, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(rel), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if data, ok := readWorkspaceRegularFile(root, rel); !ok || string(data) != rel {
+			t.Fatalf("%s: read %q ok=%v", rel, data, ok)
+		}
+	}
+	if _, ok := readWorkspaceRegularFile(root, "."); ok {
+		t.Fatal("the root itself read as a file")
+	}
+}

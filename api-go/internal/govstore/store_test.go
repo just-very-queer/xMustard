@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -1186,6 +1187,58 @@ func TestPurgedEntryTakesNoNewText(t *testing.T) {
 	}
 	if last := evs[len(evs)-1]; last.Type != EventPurge || last.Note != "credential" {
 		t.Fatalf("last event = %+v", last)
+	}
+}
+
+// The lifecycle flags scope an anchor lookup and its fan-out alike: every lifecycle by
+// default, active entries (pending included) with ActiveOnly, served ones with
+// ServedOnly.
+func TestAnchorLookupLifecycleFlags(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	for _, id := range []string{"served", "pending", "retracted"} {
+		propose(t, s, id, "t", "fact "+id, "src/a.go")
+	}
+	for _, id := range []string{"served", "retracted"} {
+		vote(t, s, id, bob, VerdictApprove)
+		vote(t, s, id, carol, VerdictApprove)
+		promotePeer(t, s, id)
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.Transition(ctx, "retracted", TransitionInput{To: LifecycleRetracted}, alice)
+		return err
+	})
+	for _, c := range []struct {
+		name  string
+		scope AnchorQuery
+		want  string
+	}{
+		{"every lifecycle", AnchorQuery{}, "pending,retracted,served"},
+		{"active", AnchorQuery{ActiveOnly: true}, "pending,served"},
+		{"served", AnchorQuery{ActiveOnly: true, ServedOnly: true}, "served"},
+	} {
+		q := c.scope
+		q.WorkspaceID, q.Kind, q.Values = "ws1", AnchorPath, []string{"src/a.go"}
+		hits, err := s.EntriesByAnchor(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		want := strings.Split(c.want, ",")
+		var ids []string
+		for _, h := range hits {
+			ids = append(ids, h.EntryID)
+			if h.Fanout != len(want) {
+				t.Fatalf("%s: hit %+v counts %d, want %d", c.name, h, h.Fanout, len(want))
+			}
+		}
+		slices.Sort(ids)
+		fanout, err := s.AnchorFanout(ctx, q)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !slices.Equal(ids, want) || fanout["src/a.go"] != len(want) {
+			t.Fatalf("%s: hits %v fanout %v, want %v", c.name, ids, fanout, want)
+		}
 	}
 }
 
