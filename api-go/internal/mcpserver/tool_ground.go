@@ -22,13 +22,16 @@ var groundTool = &Tool{
 		{Name: "since_revision", Type: typeInteger, Min: 0, Max: maxMemoryRevision, Desc: "memory_delta after this memory_revision"},
 		// The caller's session (WS-33): its snapshot is restored after a compaction.
 		{Name: "session_id", Type: typeString, MaxLen: maxSessionKey},
+		// WS-34: the task, to bootstrap a new session with relevant past sessions.
+		{Name: "query", Type: typeString, MaxLen: 512, Desc: "the task: adds relevant_sessions"},
 	},
 	Doc: groundbudget.Markdown() + "\n### Sessions\n\n`session_handoff` hands the prior session's state (its compaction " +
 		"snapshot of at most 2 KB, unexpired evidence handles, proposals awaiting a distinct verifier, drift_stale) to " +
 		"a new session in any client. `session_id` names your own session (an execution key such as `claude:<session>`): " +
 		"when it has a ledger, `session_handoff` restores its snapshot instead (`restore: true`), which a client without " +
 		"a compaction hook calls after compacting. `continuity` lists what recent sessions left open, `handoffs` the " +
-		"latest handoff capsules with the paths changed since, and `last_sessions` the last sessions. All of it is " +
+		"latest handoff capsules with the paths changed since, and `last_sessions` the last sessions. `query` (the task, at most 512 bytes) adds `relevant_sessions`: " +
+		"past sessions ranked against it. All of it is " +
 		"derived from the session ledger: lightweight context, not verified memory.\n",
 	Annotations: Annotations{Title: "Ground the session", ReadOnly: true},
 	// Only members that are never null are declared. A count or blocked flag ground
@@ -45,7 +48,7 @@ var groundTool = &Tool{
 			maxChars = strconv.Itoa(groundbudget.DefaultMaxChars)
 		}
 		return "GET", query(wsPath(a, "/session-grounding"), "sections", a["sections"], "max_chars", maxChars,
-			"since_revision", a["since_revision"], "session_id", a["session_id"]), ""
+			"since_revision", a["since_revision"], "session_id", a["session_id"], "query", a["query"]), ""
 	},
 }
 

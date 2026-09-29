@@ -107,6 +107,8 @@ type GroundOptions struct {
 	SessionID string
 	// Since asks for memory_delta after this memory revision (WS-31); negative asks for none.
 	Since int64
+	// Query asks for the sessions relevant to it (relevant_sessions, PAR-RCL-08).
+	Query string
 }
 
 // BuildSessionGroundingWith grounds a session with its options.
@@ -131,7 +133,7 @@ func BuildSessionGroundingWith(ctx context.Context, dataDir, workspaceID string,
 	g.stampGenerated()
 	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller,
 		groundMemoryOptions{since: max(opts.Since, noSince), budget: true})...)
-	g.Unknown = append(g.Unknown, g.groundingSession.buildSessions(ctx, dataDir, workspaceID, caller, opts.SessionID, driftStaleFlag(g.Drift))...)
+	g.Unknown = append(g.Unknown, g.groundingSession.buildSessions(ctx, dataDir, workspaceID, caller, opts.SessionID, opts.Query, driftStaleFlag(g.Drift))...)
 	g.summarize()
 	return g, nil
 }

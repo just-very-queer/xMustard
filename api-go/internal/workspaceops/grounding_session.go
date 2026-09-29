@@ -30,6 +30,12 @@ type groundingSession struct {
 	Handoffs []HandoffView `json:"handoffs,omitempty"`
 	// LastSessions are the most recently seen sessions (main threads), newest first.
 	LastSessions []SessionBrief `json:"last_sessions,omitempty"`
+	// RecentSessions and RelevantSessions are the new-session bootstrap (PAR-RCL-08):
+	// up to 5 recent prior sessions (any agent, imported ones too) and, when ground got a
+	// query, up to 5 relevant ones. Labelled lightweight context, not confirmed facts.
+	RecentSessions   []BootstrapSession `json:"recent_sessions,omitempty"`
+	RelevantSessions []BootstrapSession `json:"relevant_sessions,omitempty"`
+	BootstrapLabel   string             `json:"sessions_label,omitempty"`
 }
 
 func (s *groundingSession) stampGenerated() {
@@ -139,12 +145,17 @@ const (
 
 // buildSessions fills the session members. caller is the principal asking, sessionID
 // its execution key ("" when it gave none); driftStale is the drift section's flag.
-func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspaceID, caller, sessionID string, driftStale *bool) []GroundingUnknown {
+func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspaceID, caller, sessionID, query string, driftStale *bool) []GroundingUnknown {
 	now := time.Now().UTC()
 	root := contextRoot(dataDir, workspaceID)
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions})
-		if err != nil || len(sessions) == 0 {
+		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions,
+			ExcludeRetention: RetentionTranscript})
+		if err != nil {
+			return err
+		}
+		// the bootstrap reads every session, imported ones too, in its own query
+		if err := s.bootstrap(ctx, r, workspaceID, sessionID, query); err != nil || len(sessions) == 0 {
 			return err
 		}
 		main := mainSessions(sessions)
@@ -176,7 +187,7 @@ func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspace
 	if err != nil {
 		reason := "session ledger unreadable: " + err.Error()
 		var out []GroundingUnknown
-		for _, f := range []string{"session_handoff", "continuity", "handoffs", "last_sessions"} {
+		for _, f := range []string{"session_handoff", "continuity", "handoffs", "last_sessions", "recent_sessions", "relevant_sessions"} {
 			out = append(out, GroundingUnknown{Field: f, Reason: reason})
 		}
 		return out
@@ -184,7 +195,9 @@ func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspace
 	return nil
 }
 
-// mainSessions leaves out subagent rows (they have a parent).
+// mainSessions leaves out subagent rows (they have a parent). Imported transcripts
+// (no snapshot, no handles: not a session to hand over) are excluded in SQL by the
+// caller, so they never crowd live sessions out of the LIMIT.
 func mainSessions(list []govstore.Session) []govstore.Session {
 	var out []govstore.Session
 	for _, s := range list {
@@ -202,7 +215,8 @@ func mainSessions(list []govstore.Session) []govstore.Session {
 func HookSessionHandoff(ctx context.Context, dataDir, workspaceID, principal, key string, own, prior bool) (*SessionHandoff, error) {
 	var h *SessionHandoff
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions})
+		sessions, err := r.ListSessions(ctx, govstore.SessionFilter{WorkspaceID: workspaceID, Limit: 4 * groundLastSessions,
+			ExcludeRetention: RetentionTranscript})
 		if err != nil {
 			return err
 		}

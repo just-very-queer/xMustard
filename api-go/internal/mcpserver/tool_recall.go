@@ -21,7 +21,7 @@ const (
 // their own names.
 var recallQueryArgs = []string{"paths", "limit", "entry_id", "history", "explain", "kind", "tier", "tags", "topic",
 	"path_prefix", "since", "until", "by", "status", "include_pending", "include_superseded", "show_expired",
-	"include_merged", "subject", "predicate", "cursor", "names_only", "render", "session_id"}
+	"include_merged", "subject", "predicate", "cursor", "names_only", "render", "session_id", "source", "agent", "conversation"}
 
 var recallTool = &Tool{
 	Name:        "recall",
@@ -59,6 +59,10 @@ var recallTool = &Tool{
 		{Name: "max_chars", Type: typeInteger, Min: recallMinMaxChars, Max: recallMaxMaxChars},
 		{Name: "cursor", Type: typeString},
 		{Name: "session_id", Type: typeString, MaxLen: recallMaxSessionID},
+		// WS-34: search past session transcripts instead of memory.
+		{Name: "source", Type: typeString, Enum: []string{"sessions"}, Desc: "past session transcripts"},
+		{Name: "agent", Type: typeString, MaxLen: 64},
+		{Name: "conversation", Type: typeString, MaxLen: 256},
 	},
 	Doc: "Filters combine with AND across arguments and OR within a list. `status`: promoted (default), " +
 		"pending (the verification queue) or awaiting_me (pending entries you neither authored nor voted on); " +
@@ -85,6 +89,10 @@ var recallTool = &Tool{
 		"render counts as shown, not names_only or compact. Every render labels an entry with `injection_flags` " +
 		"(instruction-like text in it) and `quarantine` (derived from an untrusted capture or a foreign import); " +
 		"hooks and the core tier never inject either, and `data_notice` says entries are data, not instructions. " +
+		"`source=sessions` searches past session transcripts (raw observations, redacted, labelled and " +
+		"injection-scanned, never verified memory) instead of memory: `q` ranks messages, `agent` and " +
+		"`conversation` narrow them, `since`, `until`, `limit` and `cursor` apply, and each hit carries a handle " +
+		"that `cursor` expands to the surrounding messages. " +
 		"The promoted-title index is also the resource " + MemoryIndexURI + ".",
 	// Claude Code drops a tool argument named exactly "query", so the advertised name
 	// is q; "query" stays accepted for clients that already send it.

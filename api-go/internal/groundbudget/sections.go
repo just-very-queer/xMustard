@@ -129,6 +129,7 @@ var sections = []Section{
 		Members: []Member{
 			{Name: "session_handoff", Signal: true, Keep: []string{"from_session", "status"}},
 			{Name: "continuity", Signal: true}, {Name: "handoffs", Signal: true}, {Name: "last_sessions"},
+			{Name: "recent_sessions"}, {Name: "relevant_sessions"}, {Name: "sessions_label"},
 		},
 		Recover: "ground sections=session max_chars=N; ground session_id=ID restores that session's snapshot",
 		Doc:     "the prior session's handoff (its compaction snapshot, unexpired handles, proposals awaiting a distinct verifier, drift_stale; with session_id, your own session's to restore), what recent sessions left open, the latest handoff capsules with their stale paths, and the last sessions",
