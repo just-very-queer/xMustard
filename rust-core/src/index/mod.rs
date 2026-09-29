@@ -1397,6 +1397,9 @@ fn incremental(
             }
         }
     }
+    for p in &touched_paths {
+        affected.extend(resolve::importers_of(&conn, p).map_err(sql_err)?);
+    }
     let resolve_ids: Vec<i64> = affected.iter().copied().collect();
     writer::resolve_imports(&conn, Some(&resolve_ids)).map_err(sql_err)?;
     affected.extend(edges::files_referencing(&conn, &deps.names).map_err(sql_err)?);

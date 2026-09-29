@@ -35,7 +35,7 @@ pub const MAX_SYMBOLS_PER_FILE: usize = crate::treesitter::MAX_SYMBOLS_PER_FILE;
 pub const MAX_REFS_PER_FILE: usize = 100_000;
 
 /// Bump when extraction output changes for the same bytes. Part of the analyzer version.
-pub const EXTRACTOR_REVISION: u32 = 5;
+pub const EXTRACTOR_REVISION: u32 = 6;
 
 /// Longest container prefix spelled out in a qualified name. A deeper prefix is replaced
 /// by `~<hash of the prefix>`, so qualified names, UIDs and scope frames stay bounded
@@ -599,7 +599,7 @@ impl<'a> Walker<'a> {
     /// Record the qualifiers of `node`'s identifier children: the object name of a
     /// member access, or the type a declaration gives its binding names.
     fn note_quals(&mut self, node: Node<'_>, kind: &str) {
-        if !(self.lang == Lang::Go || self.lang.is_js_family()) {
+        if !(matches!(self.lang, Lang::Go | Lang::Rust) || self.lang.is_js_family()) {
             return;
         }
         if let Some((object, member)) = member_fields(kind) {
@@ -608,7 +608,7 @@ impl<'a> Walker<'a> {
                 node.child_by_field_name(member),
             ) && is_simple_qualifier(o)
             {
-                let q = self.intern(self.text(o));
+                let q = self.qualifier_index(o);
                 self.quals.insert(m.id(), q);
             }
             return;
@@ -622,11 +622,28 @@ impl<'a> Walker<'a> {
             // Go's short declaration binds through an expression list.
             let b = match b.kind() {
                 "expression_list" => b.named_child(0).unwrap_or(b),
+                // Rust `let mut x`
+                "mut_pattern" => {
+                    let mut c = b.walk();
+                    b.named_children(&mut c)
+                        .find(|n| n.kind() == "identifier")
+                        .unwrap_or(b)
+                }
                 _ => b,
             };
             if b.kind() == "identifier" {
                 self.quals.insert(b.id(), hint);
             }
+        }
+    }
+
+    /// The qualifier name of an access object; a Rust path is spelled with dots
+    /// (`a::b` → `a.b`), like every other language's.
+    fn qualifier_index(&mut self, object: Node<'_>) -> u32 {
+        let t = self.text(object);
+        match t.contains("::") {
+            true => self.intern_owned(t.replace("::", ".")),
+            false => self.intern(t),
         }
     }
 
@@ -637,7 +654,7 @@ impl<'a> Walker<'a> {
             "parameter_declaration" | "variadic_parameter_declaration" | "var_spec" => {
                 ("name", node.child_by_field_name("type"))
             }
-            "required_parameter" | "optional_parameter" => {
+            "required_parameter" | "optional_parameter" | "parameter" | "let_declaration" => {
                 ("pattern", node.child_by_field_name("type"))
             }
             "variable_declarator" => ("name", node.child_by_field_name("type")),
@@ -648,7 +665,7 @@ impl<'a> Walker<'a> {
             return type_name_node(t).map(|n| (bindings, self.type_text(n)));
         }
         let value = match kind {
-            "variable_declarator" => node.child_by_field_name("value")?,
+            "variable_declarator" | "let_declaration" => node.child_by_field_name("value")?,
             "short_var_declaration" => {
                 let (left, right) = (
                     node.child_by_field_name("left")?,
@@ -666,7 +683,10 @@ impl<'a> Walker<'a> {
 
     /// A type name as written, without whitespace (`pkg.T`, `ns.Widget`).
     fn type_text(&self, n: Node<'_>) -> String {
-        self.text(n).split_whitespace().collect()
+        self.text(n)
+            .split_whitespace()
+            .collect::<String>()
+            .replace("::", ".")
     }
 
     /// The type an initializer constructs: `new T()`, `T{...}`, `&T{...}`, `new(T)`,
@@ -677,8 +697,12 @@ impl<'a> Walker<'a> {
             "new_expression" => named(value.child_by_field_name("constructor")),
             "composite_literal" => named(value.child_by_field_name("type")),
             "unary_expression" => self.constructed_type(value.child_by_field_name("operand")?),
+            "struct_expression" => named(value.child_by_field_name("name")),
             "call_expression" => {
                 let f = value.child_by_field_name("function")?;
+                if f.kind() == "scoped_identifier" {
+                    return self.rust_constructed(f);
+                }
                 let (package, callee) = match f.kind() {
                     "selector_expression" => (
                         f.child_by_field_name("operand")
@@ -703,6 +727,13 @@ impl<'a> Walker<'a> {
             }
             _ => None,
         }
+    }
+
+    /// `T::new(..)` / `T::default()`: the type a Rust constructor path names.
+    fn rust_constructed(&self, path: Node<'_>) -> Option<String> {
+        let name = self.text(path.child_by_field_name("name")?);
+        let ty = path.child_by_field_name("path").and_then(type_name_node)?;
+        matches!(name, "new" | "default").then(|| self.type_text(ty))
     }
 
     fn leave(&mut self, node: Node<'_>) {
@@ -1069,18 +1100,30 @@ fn member_fields(kind: &str) -> Option<(&'static str, &'static str)> {
     Some(match kind {
         "member_expression" => ("object", "property"),
         "selector_expression" => ("operand", "field"),
+        "field_expression" => ("value", "field"),
+        "scoped_identifier" | "scoped_type_identifier" => ("path", "name"),
         "qualified_type" => ("package", "name"),
         "nested_type_identifier" => ("module", "name"),
         _ => return None,
     })
 }
 
-/// A member access's object is a plain name (`a`, `pkg`, `this`, `super`).
+/// A member access's object is a plain name (`a`, `pkg`, `this`, `super`, `self`) or a
+/// Rust path of them (`crate::a`).
 fn is_simple_qualifier(object: Node<'_>) -> bool {
     matches!(
         object.kind(),
-        "identifier" | "package_identifier" | "type_identifier" | "this" | "super"
-    )
+        "identifier"
+            | "package_identifier"
+            | "type_identifier"
+            | "this"
+            | "super"
+            | "self"
+            | "crate"
+    ) || (object.kind() == "scoped_identifier"
+        && object
+            .child_by_field_name("path")
+            .is_none_or(is_simple_qualifier))
 }
 
 /// The named type a type expression is about: `T`, `*T`, `pkg.T`, `T<A>`, `: T`,
@@ -1092,7 +1135,8 @@ fn type_name_node(n: Node<'_>) -> Option<Node<'_>> {
             n.named_child(0).and_then(type_name_node)
         }
         "generic_type" => n.child_by_field_name("type").and_then(type_name_node),
-        "qualified_type" | "nested_type_identifier" => Some(n),
+        "reference_type" => n.child_by_field_name("type").and_then(type_name_node),
+        "qualified_type" | "nested_type_identifier" | "scoped_type_identifier" => Some(n),
         "member_expression" => match n.child_by_field_name("object")?.kind() {
             "identifier" => Some(n),
             _ => n.child_by_field_name("property"),

@@ -52,8 +52,8 @@ fn fixture() -> TempDir {
     );
     write(
         root,
-        "py/app.py",
-        "def handler(x):\n    return x\n\n\ndef handler(x, y):\n    return x + y\n\n\nclass Service:\n    def run(self):\n        return handler(1, 2)\n\n    def helper(self):\n        return self.run()\n",
+        "rb/app.rb",
+        "def handler(x)\n  x\nend\n\ndef handler(x, y)\n  x + y\nend\n\nclass Service\n  def run\n    handler(1, 2)\n  end\n\n  def helper\n    self.run\n  end\nend\n",
     );
     git(root, &["init", "-q"]);
     git(root, &["config", "user.email", "t@t"]);
@@ -287,7 +287,7 @@ fn file_and_directory_overviews() {
         .iter()
         .map(|x| x["path"].as_str().unwrap())
         .collect();
-    assert_eq!(dirs, ["py", "svc", "web"], "{top}");
+    assert_eq!(dirs, ["rb", "svc", "web"], "{top}");
     assert_eq!(nav("overview", root, &[], "nope")["kind"], "not_indexed");
     assert_eq!(nav("overview", root, &[], "sv")["kind"], "not_indexed");
 }
@@ -346,7 +346,7 @@ fn context_groups_references_by_relation() {
             .iter()
             .all(|e| e["layer"].as_u64().unwrap() <= 2)
     );
-    // a language without the resolver: name matches, a lower bound
+    // a language without the resolver (Ruby): name matches, a lower bound
     let py = nav("context", root, &[], "Service/run");
     let helper = py["incoming"]
         .as_array()

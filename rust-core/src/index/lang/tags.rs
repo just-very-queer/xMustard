@@ -67,8 +67,95 @@ fn specificity(kind: u8) -> u8 {
         ref_kind::TYPE => 0,
         ref_kind::MEMBER => 1,
         ref_kind::CALL => 2,
+        ref_kind::BIND => 4,
         _ => 3,
     }
+}
+
+/// Member accesses the scope resolver types through their object: (language, access
+/// node kind, object field, member field).
+const MEMBER_ACCESS: &[(Lang, &str, &str, &str)] = &[
+    (Lang::Python, "attribute", "object", "attribute"),
+    (Lang::Java, "field_access", "object", "field"),
+    (Lang::Java, "method_invocation", "object", "name"),
+];
+
+/// Node kinds an access object may have to serve as a qualifier: a plain name, `this`,
+/// `super`, or a dotted chain of names (`pkg.mod`).
+const QUALIFIER_KINDS: &[&str] = &[
+    "identifier",
+    "this",
+    "super",
+    "attribute",
+    "type_identifier",
+];
+
+/// Bindings whose declaration names their type: (language, kind of the bound name's
+/// parent, hops from that parent to the declaration, the declaration's type field).
+const BIND_TYPES: &[(Lang, &str, usize, &str)] = &[
+    (Lang::Java, "formal_parameter", 0, "type"),
+    (Lang::Java, "variable_declarator", 1, "type"),
+    (Lang::Python, "typed_parameter", 0, "type"),
+    (Lang::Python, "typed_default_parameter", 0, "type"),
+];
+
+/// The qualifier of a member reference: the dotted name of its access object.
+fn qualifier(lang: Lang, node: Node<'_>, src: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    let &(_, _, object, member) = MEMBER_ACCESS
+        .iter()
+        .find(|(l, kind, ..)| *l == lang && *kind == parent.kind())?;
+    if parent.child_by_field_name(member)?.id() != node.id() {
+        return None;
+    }
+    let obj = parent.child_by_field_name(object)?;
+    let t = text(src, obj);
+    let plain = t
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'$'));
+    (QUALIFIER_KINDS.contains(&obj.kind()) && plain).then(|| t.to_string())
+}
+
+/// A type as written, up to its generic arguments or array brackets (`a.B<C>[]` → `a.B`).
+fn type_name(t: &str) -> Option<String> {
+    let n: String = t
+        .trim_matches(['"', '\''])
+        .chars()
+        .take_while(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+        .collect();
+    (!n.is_empty()).then_some(n)
+}
+
+/// The type a binding's declaration names, or the class its initializer constructs
+/// (`var x = new T()`, Python `x = T()` in a function).
+fn bind_hint(lang: Lang, node: Node<'_>, src: &[u8]) -> Option<String> {
+    let parent = node.parent()?;
+    let declared = BIND_TYPES
+        .iter()
+        .find(|(l, kind, ..)| *l == lang && *kind == parent.kind())
+        .and_then(|&(_, _, hops, field)| {
+            let mut decl = parent;
+            for _ in 0..hops {
+                decl = decl.parent()?;
+            }
+            type_name(text(src, decl.child_by_field_name(field)?)).filter(|t| t != "var")
+        });
+    declared.or_else(|| {
+        let value = match parent.kind() {
+            "variable_declarator" => parent.child_by_field_name("value")?,
+            "assignment" => parent.child_by_field_name("right")?,
+            _ => return None,
+        };
+        let ctor = match value.kind() {
+            "object_creation_expression" => value.child_by_field_name("type")?,
+            "call" => value.child_by_field_name("function")?,
+            _ => return None,
+        };
+        let t = type_name(text(src, ctor))?;
+        // Python constructors are called by their class name: capitalized
+        let class = t.rsplit('.').next().unwrap_or(&t);
+        (lang != Lang::Python || class.starts_with(char::is_uppercase)).then_some(t)
+    })
 }
 
 fn text<'s>(src: &'s [u8], n: Node<'_>) -> &'s str {
@@ -327,6 +414,16 @@ fn references(
                     (facts.names.len() - 1) as u32
                 });
                 let pos = node.start_position();
+                let qual = match kind {
+                    ref_kind::BIND => bind_hint(lang, node, src),
+                    _ => qualifier(lang, node, src),
+                }
+                .map_or(-1, |q| {
+                    *name_ix.entry(q.clone()).or_insert_with(|| {
+                        facts.names.push(q);
+                        (facts.names.len() - 1) as u32
+                    }) as i32
+                });
                 facts.refs.push(RefFact(
                     ni,
                     pos.row as u32 + 1,
@@ -335,8 +432,7 @@ fn references(
                     open.last().map(|o| o.1 as i32).unwrap_or(-1),
                     kind,
                     fl,
-                    // no qualifier: the scope resolver covers only walker languages
-                    -1,
+                    qual,
                 ));
             }
         }
