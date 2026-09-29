@@ -349,14 +349,14 @@ func TestCompactStubURIStaysWithinOnePageForLargeOriginals(t *testing.T) {
 	rt := StoreRetainer{Store: store, WorkspaceID: "ws", RepoScope: "/repo", Actor: "agent-a", AuthEnforced: true, Issuer: "http"}
 	big := strings.Repeat("x", int(evidence.DefaultPageSize)+4096)
 	in := anthropicSession(t,
-		user(toolUse("call-1", "search", map[string]any{"q": "a"})),
-		assistant(toolResult("call-1", big, false)),
-		user(toolUse("call-2", "search", map[string]any{"q": "b"})),
-		assistant(toolResult("call-2", "small"+padding, false)),
-		user(toolUse("call-3", "search", map[string]any{"q": "c"})),
-		assistant(toolResult("call-3", "small"+padding, false)),
-		user(toolUse("call-4", "search", map[string]any{"q": "d"})),
-		assistant(toolResult("call-4", "small"+padding, false)),
+		assistant(toolUse("call-1", "search", map[string]any{"q": "a"})),
+		user(toolResult("call-1", big, false)),
+		assistant(toolUse("call-2", "search", map[string]any{"q": "b"})),
+		user(toolResult("call-2", "small"+padding, false)),
+		assistant(toolUse("call-3", "search", map[string]any{"q": "c"})),
+		user(toolResult("call-3", "small"+padding, false)),
+		assistant(toolUse("call-4", "search", map[string]any{"q": "d"})),
+		user(toolResult("call-4", "small"+padding, false)),
 	)
 	res, err := Compact(context.Background(), Formats["anthropic"], in, rt, Options{Workspace: "ws", KeepRecent: 1})
 	if err != nil {
