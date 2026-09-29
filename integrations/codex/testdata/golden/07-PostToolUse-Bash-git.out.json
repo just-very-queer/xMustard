@@ -1,0 +1,6 @@
+{
+  "hookSpecificOutput": {
+    "hookEventName": "PostToolUse",
+    "additionalContext": "[xmustard] `git commit` changed HEAD or the working tree. The code index, drift and memory staleness are re-read on the next ground, search, explain or impact call; hook hits from the index are as of its last refresh until then."
+  }
+}

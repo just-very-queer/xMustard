@@ -37,7 +37,7 @@ const (
 	FormatCodex    HookFormat = "codex"    // Codex PostToolUse (codex-rs hooks/src/schema.rs PostToolUseCommandInput)
 	FormatCursor   HookFormat = "cursor"   // Cursor postToolUse / afterShellExecution / afterMCPExecution
 	FormatPi       HookFormat = "pi"       // Pi tool_result event
-	FormatOpenCode HookFormat = "opencode" // OpenCode tool.execute.after (tool, args, output)
+	FormatOpenCode HookFormat = "opencode" // the OpenCode plugin's flat tool body (integrations/opencode)
 )
 
 // ErrBadBody reports a hook body that is not the declared JSON layout.
@@ -156,6 +156,7 @@ const (
 	roleError          // a failure message (Claude PostToolUseFailure "error"): a non-empty string
 	roleIsError
 	roleCommand // Cursor afterShellExecution command (a tool-input field at the root)
+	roleMeta    // tool metadata the model never reads (OpenCode): scalars only, for the exit code and status
 )
 
 var hookRoles = map[HookFormat]map[string]hookRole{
@@ -171,7 +172,14 @@ var hookRoles = map[HookFormat]map[string]hookRole{
 		"command": roleCommand, "error": roleError},
 	FormatPi: {"type": roleEvent, "toolName": roleTool, "sessionId": roleSession, "toolCallId": roleCall, "input": roleInput,
 		"content": roleResponseMember, "details": roleResponseMember, "isError": roleIsError},
-	FormatOpenCode: {"tool": roleTool, "sessionID": roleSession, "callID": roleCall, "args": roleInput, "output": roleResponse},
+	// OpenCode's plugin posts one flat body for both plugin APIs, named as the 2.x
+	// execute.after input names them: content is the model-visible text (2.x
+	// result.content, 1.x output.output or the MCP CallToolResult text), metadata the
+	// result's metadata and error a failed call's message. The structured 2.x
+	// result.output and 1.x metadata.output repeat that text and are never posted; a
+	// metadata string never becomes a section.
+	FormatOpenCode: {"tool": roleTool, "sessionID": roleSession, "id": roleCall, "input": roleInput,
+		"content": roleResponseMember, "metadata": roleMeta, "error": roleError},
 }
 
 // HookFormats lists the accepted body formats.
@@ -811,6 +819,8 @@ func (d *hookDecoder) decodeRoot(roles map[string]hookRole) error {
 			return err
 		case roleInput:
 			return d.decodeInput(c)
+		case roleMeta:
+			return d.decodeMeta(key, c)
 		case roleResponse:
 			n, err := d.walk(key, "", 0)
 			d.body.Response = n
@@ -851,6 +861,27 @@ func (d *hookDecoder) decodeRoot(roles map[string]hookRole) error {
 		return err
 	}
 	return nil
+}
+
+// decodeMeta reads a metadata object the model never reads (OpenCode's result
+// metadata). Its scalar members report the exit code (metadata.exit), an error flag
+// and status members; strings, objects and arrays are skipped, so no metadata text
+// becomes a section or reaches the projection.
+func (d *hookDecoder) decodeMeta(key string, c byte) error {
+	if c != '{' {
+		return d.skip(1)
+	}
+	return d.eachMember(func(k string) error {
+		c, err := d.peek()
+		if err != nil {
+			return err
+		}
+		if c == '"' || c == '{' || c == '[' {
+			return d.skip(1)
+		}
+		_, err = d.walk(k, key+"."+k, 1)
+		return err
+	})
 }
 
 func (d *hookDecoder) valueScalar(c byte) ([]byte, error) {

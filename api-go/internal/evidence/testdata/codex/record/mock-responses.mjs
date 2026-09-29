@@ -1,7 +1,10 @@
 // A local stand-in for the Responses API, so `codex exec` runs one tool call with no
 // model: a turn's first request gets a function call (exec_command, or the cilogs MCP
 // tool when the prompt says CALL_MCP), the follow-up gets a final message.
-// Usage: XM_SHELL='<script>' node mock-responses.mjs <port>
+// Usage: XM_SHELL='<script>' [XM_LOG=<file>] node mock-responses.mjs <port>
+// XM_LOG appends each request's input items as one JSON line: what the model was sent,
+// hook context and a PostToolUse block's reason included.
+import fs from "node:fs";
 import http from "node:http";
 const port = Number(process.argv[2] || 18765);
 const sse = (events) => events.map((e) => `event: ${e.type}\ndata: ${JSON.stringify(e)}\n\n`).join("");
@@ -20,6 +23,7 @@ http
 				return res.end();
 			}
 			const input = JSON.parse(body).input || [];
+			if (process.env.XM_LOG) fs.appendFileSync(process.env.XM_LOG, JSON.stringify(input) + "\n");
 			const id = `resp-${++n}`;
 			const text = JSON.stringify(input);
 			const item = input.some((i) => i.type === "function_call_output")
