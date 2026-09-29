@@ -146,6 +146,10 @@ type Observation struct {
 	WorkspaceQuota int64  `json:"workspace_quota"`
 	Revoked        bool   `json:"revoked,omitempty"`
 	Projection     Record `json:"projection"`
+	// RetentionClass is the class whose TTL and quota this original is under (WS-41).
+	RetentionClass RetentionClass `json:"retention_class,omitempty"`
+	// Upstream is set when the client holds the original: no raw.bin is kept.
+	Upstream *UpstreamRef `json:"upstream,omitempty"`
 	// Quarantine says why content derived from this capture is quarantined (WS-56): it
 	// captured an untrusted tool (injection.CaptureQuarantine), or an xMustard result
 	// that carried quarantined memory (injection.CarriedQuarantine). Empty when it is not.
@@ -177,6 +181,13 @@ type CaptureRequest struct {
 	// the result itself (ground's output budget) and names the returned handle in its
 	// reply. The delivery then carries no projection.
 	Retain bool
+	// Class is the retention class; empty takes the spool's (SetClass), else own.
+	Class RetentionClass
+	// Upstream says the client already persisted the original. When the capture would
+	// be retained, a verified reference is kept instead of a copy. UpstreamRoots
+	// confine where the referenced file may be.
+	Upstream      *UpstreamRef
+	UpstreamRoots []string
 }
 
 // Identity is a repository identity observation (Rust `repo-key` contract: key plus
@@ -218,6 +229,10 @@ type Delivery struct {
 	// InjectionFlags are the instruction patterns the projection matches (WS-56): tool
 	// output is data, and a client should present flagged output as such.
 	InjectionFlags []string `json:"injection_flags,omitempty"`
+	// RetentionClass and Upstream: the class of the retained original, and the
+	// reference kept in place of a copy when the client persisted it (WS-41).
+	RetentionClass RetentionClass `json:"retention_class,omitempty"`
+	Upstream       *UpstreamRef   `json:"upstream,omitempty"`
 }
 
 // Page is one authorized byte range of a retained original, base64-encoded (standard
@@ -277,9 +292,10 @@ type Store struct {
 // wsState is one workspace's quota accounting. Every field is guarded by mu.
 type wsState struct {
 	mu      sync.Mutex
-	loaded  bool  // used reflects disk (rebuilt lazily after restart or on pressure)
-	used    int64 // quota charge of retained unexpired originals (retainedCharge)
-	pending int64 // bytes in open spools
+	loaded  bool                     // used reflects disk (rebuilt lazily after restart or on pressure)
+	used    int64                    // quota charge of retained unexpired originals (Observation.charge)
+	byClass map[RetentionClass]int64 // used, split by retention class
+	pending int64                    // bytes in open spools
 }
 
 // NewStore opens (without scanning) the store under dataDir.
@@ -354,6 +370,23 @@ type Spool struct {
 	ws        string
 	st        *wsState
 	discarded bool
+	class     RetentionClass
+	// upstream marks a spool whose capture keeps a reference, not a copy: it is
+	// admitted against the workspace quota only.
+	upstream bool
+	refused  string // why the spool stopped at the quota
+}
+
+// SetClass sets the retention class the spool's bytes are admitted under (default own).
+func (sp *Spool) SetClass(c RetentionClass) { sp.class = c.normalize() }
+
+// add moves the retained charge of class c by n (negative on release). Caller holds st.mu.
+func (st *wsState) add(c RetentionClass, n int64) {
+	if st.byClass == nil {
+		st.byClass = map[RetentionClass]int64{}
+	}
+	st.used = max(0, st.used+n)
+	st.byClass[c] = max(0, st.byClass[c]+n)
 }
 
 // NewSpool opens a spool file in the workspace's evidence directory.
@@ -372,7 +405,7 @@ func (s *Store) NewSpool(ws string) (*Spool, error) {
 	s.mu.Lock()
 	s.active[f.Name()] = struct{}{}
 	s.mu.Unlock()
-	return &Spool{f: f, max: s.limits.MaxOriginal, store: s, ws: ws, st: s.state(ws)}, nil
+	return &Spool{f: f, max: s.limits.MaxOriginal, store: s, ws: ws, st: s.state(ws), class: ClassOwn}, nil
 }
 
 // Write appends to the spool; past the capture cap or the workspace quota it stops
@@ -401,14 +434,18 @@ func (s *Store) admitPending(sp *Spool, n int64) bool {
 	st := sp.st
 	st.mu.Lock()
 	defer st.mu.Unlock()
+	refuse := func(used int64) string { return s.refusal(st, sp.class, sp.upstream, used, sp.n, n) }
 	free := sp.n+n <= int64(s.limits.ProjectionTarget)
 	if !free {
 		used, err := s.retainedLocked(sp.ws, st, false)
 		if err != nil {
 			return false
 		}
-		if used+st.pending+n > s.limits.WorkspaceQuota {
-			if used, err = s.retainedLocked(sp.ws, st, true); err != nil || used+st.pending+n > s.limits.WorkspaceQuota {
+		if sp.refused = refuse(used); sp.refused != "" {
+			if used, err = s.retainedLocked(sp.ws, st, true); err != nil {
+				return false
+			}
+			if sp.refused = refuse(used); sp.refused != "" {
 				return false
 			}
 		}
@@ -464,7 +501,7 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		return nil, fmt.Errorf("%w (%d bytes)", ErrTooLarge, s.limits.MaxOriginal)
 	}
 	if sp.quotaFull {
-		return nil, fmt.Errorf("%w (workspace %s quota %d bytes)", ErrQuotaFull, req.WorkspaceID, s.limits.WorkspaceQuota)
+		return nil, fmt.Errorf("%w (workspace %s: %s)", ErrQuotaFull, req.WorkspaceID, cmp.Or(sp.refused, "quota full"))
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err // a cancelled call never issues a handle
@@ -499,13 +536,21 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	}
 	key, _ := handleKey(handle)
 	now := s.now().UTC()
+	class := cmp.Or(req.Class, sp.class).normalize()
+	if req.Upstream != nil {
+		// fail closed: a claim the file does not bear out is refused, not retained
+		if err := req.Upstream.Verify(ctx, req.UpstreamRoots); err != nil {
+			return nil, err
+		}
+	}
 	obs := Observation{
 		Version: DeliveryVersion, WorkspaceID: req.WorkspaceID, RepoScope: req.RepoScope,
 		Actor: req.Actor, AuthEnforced: req.AuthEnforced, Issuer: req.Issuer, SessionID: req.SessionID,
 		AgentID: req.AgentID, CallID: req.CallID, Tool: req.Tool, ToolVersion: req.ToolVersion, ArgsDigest: req.ArgsDigest,
 		CapturedAt: now.Format(time.RFC3339Nano), Status: req.Status, IsError: req.IsError,
 		ContentType: req.ContentType, RawSHA256: sum, RawBytes: sp.n,
-		ExpiresAt: now.Add(s.limits.Retention).Format(time.RFC3339Nano), WorkspaceQuota: s.limits.WorkspaceQuota,
+		ExpiresAt: now.Add(s.limits.TTL(class)).Format(time.RFC3339Nano), WorkspaceQuota: s.limits.WorkspaceQuota,
+		RetentionClass: class, Upstream: req.Upstream,
 		Projection: rec, Quarantine: cmp.Or(injection.CaptureQuarantine(req.Tool), carried),
 	}
 	// identity is bound only when complete identities sampled before and after
@@ -532,10 +577,15 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	}
 	// this spool's bytes are already inside pending; converting them to retained adds
 	// only the charge beyond them (re-checked after a reclaim).
-	extra := retainedCharge(sp.n) - sp.n
-	if used+st.pending+extra > s.limits.WorkspaceQuota {
-		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil || used+st.pending+extra > s.limits.WorkspaceQuota {
-			return nil, fmt.Errorf("%w (%d of %d bytes retained for workspace %s)", ErrQuotaFull, used, s.limits.WorkspaceQuota, req.WorkspaceID)
+	charge := obs.charge()
+	extra := charge - sp.n
+	refuse := func(used int64) string { return s.refusal(st, class, sp.upstream, used, sp.n, extra) }
+	if why := refuse(used); why != "" {
+		if used, err = s.retainedLocked(req.WorkspaceID, st, true); err != nil {
+			return nil, err
+		}
+		if why = refuse(used); why != "" {
+			return nil, fmt.Errorf("%w (workspace %s: %s)", ErrQuotaFull, req.WorkspaceID, why)
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -549,18 +599,22 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		return nil, err
 	}
-	// raw is stored (renamed into place) before the metadata that makes it readable.
-	if err := os.Rename(sp.f.Name(), filepath.Join(dir, "raw.bin")); err != nil {
-		_ = os.RemoveAll(dir)
-		return nil, err
+	// raw is stored (renamed into place) before the metadata that makes it readable;
+	// an upstream reference keeps no raw (the discarded spool is the only copy).
+	if obs.Upstream == nil {
+		if err := os.Rename(sp.f.Name(), filepath.Join(dir, "raw.bin")); err != nil {
+			_ = os.RemoveAll(dir)
+			return nil, err
+		}
 	}
 	if err := writeJSONAtomic(filepath.Join(dir, "meta.json"), obs); err != nil {
 		_ = os.RemoveAll(dir)
 		return nil, err
 	}
-	st.used += retainedCharge(sp.n)
+	st.add(class, charge)
 	st.pending = max(0, st.pending-sp.n)
 	sp.n = 0 // ownership moved to retained; Discard must not release it again
+	d.RetentionClass, d.Upstream = class, obs.Upstream
 	d.Handle, d.ResourceURI, d.ExpiresAt, d.CapturedKey, d.PageSize = handle, ResourceURI(handle, req.WorkspaceID), obs.ExpiresAt, obs.CapturedKey, s.limits.PageSize
 	return d, nil
 }
@@ -629,9 +683,12 @@ func (s *Store) openOriginalLocked(req ReadRequest, dir string, st *wsState) (*o
 	exp, _ := time.Parse(time.RFC3339Nano, obs.ExpiresAt)
 	if !s.now().Before(exp) {
 		if err := os.RemoveAll(dir); err == nil && st.loaded {
-			st.used = max(0, st.used-retainedCharge(obs.RawBytes))
+			st.add(obs.RetentionClass.normalize(), -obs.charge())
 		}
 		return nil, obs, ErrExpired
+	}
+	if obs.Upstream != nil {
+		return nil, obs, fmt.Errorf("%w: %s (sha256 %s, %d bytes)", ErrUpstreamRef, obs.Upstream.Path, obs.Upstream.SHA256, obs.Upstream.Bytes)
 	}
 	if req.Offset < 0 || req.Offset > obs.RawBytes {
 		return nil, obs, fmt.Errorf("%w: offset %d outside 0..%d", ErrInvalidRange, req.Offset, obs.RawBytes)
@@ -690,7 +747,7 @@ func (s *Store) Revoke(req ReadRequest) error {
 	}
 	obs.Revoked = true
 	if st.loaded {
-		st.used = max(0, st.used-retainedCharge(obs.RawBytes))
+		st.add(obs.RetentionClass.normalize(), -obs.charge())
 	}
 	return writeJSONAtomic(filepath.Join(dir, "meta.json"), obs)
 }
@@ -704,7 +761,7 @@ func (s *Store) RevokeWorkspace(ws string) error {
 	st := s.state(ws)
 	st.mu.Lock()
 	defer st.mu.Unlock()
-	st.loaded, st.used = false, 0
+	st.loaded, st.used, st.byClass = false, 0, nil
 	return os.RemoveAll(dir)
 }
 
@@ -734,6 +791,7 @@ func (s *Store) retainedLocked(ws string, st *wsState, rescan bool) (int64, erro
 	}
 	now := s.now()
 	var used int64
+	byClass := map[RetentionClass]int64{}
 	for _, e := range ents {
 		p := filepath.Join(dir, e.Name())
 		if strings.HasPrefix(e.Name(), ".spool-") {
@@ -755,9 +813,10 @@ func (s *Store) retainedLocked(ws string, st *wsState, rescan bool) (int64, erro
 			_ = os.RemoveAll(p)
 			continue
 		}
-		used += retainedCharge(obs.RawBytes)
+		used += obs.charge()
+		byClass[obs.RetentionClass.normalize()] += obs.charge()
 	}
-	st.used, st.loaded = used, true
+	st.used, st.byClass, st.loaded = used, byClass, true
 	return used, nil
 }
 
