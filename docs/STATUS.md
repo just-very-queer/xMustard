@@ -15,7 +15,7 @@ are in the [v0.1.0 notes](releases/v0.1.0.md).
 | --- | --- |
 | Release | [v0.1.1 on GitHub](https://github.com/just-very-queer/xMustard/releases/tag/v0.1.1), cut 2026-09-28. The tag-triggered release workflow builds the archives and drafts the release; the owner publishes it |
 | Prebuilt archives | macOS arm64 (built on `macos-15`) and Linux x86_64 (built on `ubuntu-22.04`), each with a `.sha256` file, plus `SHA256SUMS` |
-| Binaries | `xmustard-api`, `xmustard-ops`, `xmustard-core`, `xmustard-relay`, and the older Go stdio shim `xmustard-mcp`. The Claude Code plugin's `xmustard-hook` is built from source |
+| Binaries | `xmustard-api`, `xmustard-ops`, `xmustard-core`, `xmustard-relay`, the older Go stdio shim `xmustard-mcp`, and the Claude Code plugin's `xmustard-hook` — all six ship in the release archive |
 | MCP surface | Nine tools on protocol 2025-06-18 (2024-11-05 is also negotiated) |
 | Clients | Any MCP client, over Streamable HTTP or the stdio relay. Claude Code has a plugin with hooks, and Pi its own extension. Codex, OpenCode and Cursor connect through MCP configuration only |
 | Default posture | Local, no Docker. The API binds `127.0.0.1:8042` and serves the core profile |
@@ -199,8 +199,8 @@ What these numbers do not show:
   agent refuses connections while it restarts. A hung daemon is not detected (no
   watchdog). `store restore` is offline: it stops the daemon. Under systemd,
   `daemon status` starts the daemon. The real-launchd integration test was not run.
-- **Homebrew.** The in-repo formula pins v0.1.0 (the prebuilt archive on macOS arm64,
-  a source build elsewhere) until `packaging/homebrew/bump.sh` moves it. There is no
+- **Homebrew.** The in-repo formula pins v0.1.1 (the prebuilt archive on macOS arm64,
+  a source build elsewhere), moved by `packaging/homebrew/bump.sh`. There is no
   tap yet.
 - **One Rust memory line is close.** Before WS-FIX-06, the debug-build index-build
   and resident-service RSS tests failed now and then under load on the shared build

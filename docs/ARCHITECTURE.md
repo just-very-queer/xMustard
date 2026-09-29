@@ -175,7 +175,7 @@ The default Rust build does not enable `semantic-onnx`, the opt-in neural lane.
 
 ## Binaries
 
-A release archive holds five binaries and the LICENSE. `make release VERSION=vX.Y.Z`
+A release archive holds six binaries and the LICENSE. `make release VERSION=vX.Y.Z`
 builds it for the host (Rust with `cargo build --release --locked`, Go with
 `CGO_ENABLED=0 -trimpath`, build paths remapped, archive entries with the commit's
 time, fixed modes and owner 0), and `.github/workflows/release.yml` runs it on a
@@ -191,12 +191,13 @@ formula to it.
 | `xmustard-relay` | Rust | Stdio relay to `/mcp` for command-only clients |
 | `xmustard-mcp` | Go | Deprecated stdio shim, kept for compatibility |
 | `xmustard-ops` | Go | Local operator CLI: approvals, merge attestations, `mcp-config`, `setup` and `uninstall`, `daemon status\|restart\|stop`, `store backup\|check\|restore` |
+| `xmustard-hook` | Go | The Claude Code plugin's static hook client (about 3.5 MB, under 5 MiB RSS) |
 
-`make build` builds all five from source, and `make install PREFIX=/usr/local` copies
-them into `$(PREFIX)/bin` (`Makefile`). The Claude Code plugin's static hook client,
-`xmustard-hook` (Go, about 3.5 MB, under 5 MiB RSS), is not in the archive or in
-`make build`: the plugin's README builds it into `integrations/claude-code/hooks/bin/`.
-Release builds leave the `review` build tag off.
+`make build` builds all six from source, and `make install PREFIX=/usr/local` copies
+them into `$(PREFIX)/bin` (`Makefile`). `xmustard-hook` ships in the release archive
+as of v0.1.1; the plugin's own README also builds it directly into
+`integrations/claude-code/hooks/bin/` for local plugin development. Release builds
+leave the `review` build tag off.
 
 ## Public agent interface
 

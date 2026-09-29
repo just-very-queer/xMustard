@@ -76,10 +76,16 @@ measurements, upgrade steps and known limits:
 ### Known limits
 - The Pi adapter e2e passes 9 of its 18 tests: nine need a multi-page `impact` result
   that a freshly baselined fixture no longer produces (a WS-24 follow-up).
-- The Claude Code plugin's hook client is not in the release archive; build it from a
-  source checkout. Codex, OpenCode and Cursor get MCP configuration only.
+- Codex, OpenCode and Cursor get MCP configuration only; no plugin ships for them.
 - The parity-scale suite has not passed its 95.4 MiB line. The full list is in the
   [release notes](releases/v0.1.1.md#known-limits).
+
+### Docs corrected after release
+- README, STATUS, ARCHITECTURE, FEATURES and the v0.1.1 release notes still said five
+  binaries, `xmustard-hook` not in the archive, and the Homebrew formula pinning
+  v0.1.0 after d771ea0 shipped `xmustard-hook` in the release archive and in
+  `make build`/`make install`, and after 853e21f moved the formula to v0.1.1.
+  Corrected the facts; no behavior changed.
 
 ## [0.1.0] - 2026-09-28
 

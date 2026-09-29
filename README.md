@@ -240,7 +240,7 @@ call, and a slow answer (past about 200 ms) leaves Claude Code's own output. Fro
 checkout, with Go 1.26:
 
 ```bash
-# 1. build the static hook client into the plugin (it is not in the release archive)
+# 1. build the static hook client into the plugin (skip if you copied it from the release archive)
 (cd api-go && go build -o ../integrations/claude-code/hooks/bin/xmustard-hook ./cmd/xmustard-hook)
 # 2. run the API with the resident worker, which serves index hits and syntax errors to hooks
 XMUSTARD_CORE_WORKER=1 xmustard-api      # or: xmustard-ops setup --env XMUSTARD_CORE_WORKER=1
@@ -489,12 +489,12 @@ workstream: [build plan](docs/plans/2026-09-25-parity-build-plan.md).
 
 ## Build from source
 
-With Go 1.26 and stable Rust (the release workflow pins 1.93.1), `make build` builds all five
+With Go 1.26 and stable Rust (the release workflow pins 1.93.1), `make build` builds all six
 binaries. `make install` copies them into `$PREFIX/bin`; the default `PREFIX=/usr/local` usually
 needs `sudo`, and `make install PREFIX=$HOME/.local` does not. `make release VERSION=v0.1.1`
 builds the release archive for your platform. The Homebrew formula in
-[`packaging/homebrew/xmustard.rb`](packaging/homebrew/xmustard.rb) installs the v0.1.0 archive on
-macOS arm64 and builds the v0.1.0 tag from source elsewhere until it is moved to v0.1.1
+[`packaging/homebrew/xmustard.rb`](packaging/homebrew/xmustard.rb) installs the v0.1.1 archive on
+macOS arm64 and builds the v0.1.1 tag from source elsewhere
 (`packaging/homebrew/bump.sh`); Homebrew installs formulae only from a tap, so copy it into a
 local one (`brew tap-new`) until a public tap exists.
 
