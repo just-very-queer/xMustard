@@ -2,8 +2,10 @@ package main
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"strings"
+	"unicode"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/groundbudget"
@@ -35,7 +37,16 @@ func registerGroundRoutes(mux routeRegistrar) {
 			writeJSON(w, http.StatusBadRequest, body)
 			return
 		}
-		result, err := workspaceops.BuildSessionGroundingFor(r.Context(), dataDir(), r.PathValue("workspace_id"), callerOf(r).ID)
+		// session_id names the caller's session (an execution key): its own snapshot is
+		// restored when it has one, else the prior session is handed over (WS-33)
+		session := strings.TrimSpace(q.Get("session_id"))
+		if len(session) > maxGroundSessionID || !printable(session) {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": fmt.Sprintf("session_id must be printable and at most %d bytes", maxGroundSessionID),
+				"argument": "session_id"})
+			return
+		}
+		result, err := workspaceops.BuildSessionGroundingWith(r.Context(), dataDir(), r.PathValue("workspace_id"),
+			workspaceops.GroundOptions{Caller: callerOf(r).ID, SessionID: session})
 		if err != nil {
 			respondError(w, err)
 			return
@@ -66,6 +77,13 @@ func registerGroundRoutes(mux routeRegistrar) {
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})
+}
+
+// maxGroundSessionID bounds ground's session_id (an execution key is at most 200 bytes).
+const maxGroundSessionID = 200
+
+func printable(s string) bool {
+	return strings.IndexFunc(s, func(r rune) bool { return !unicode.IsPrint(r) }) < 0
 }
 
 // retainGround keeps the unbudgeted ground result as evidence on a delivered call, so

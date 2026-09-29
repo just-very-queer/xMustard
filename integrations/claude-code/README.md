@@ -32,7 +32,7 @@ The Answer column lists what an answer can carry. "Nothing" means an empty 200.
 
 | Event | Hook type | Answer | What xMustard does |
 | --- | --- | --- | --- |
-| `SessionStart` | command: starts `hooks/bin/xmustard-hook` | `additionalContext`, `watchPaths` | Adds ground's spawn-free summary (failed runs, stale and pending memory) and the core-tier memories as context. Returns `watchPaths`: the files memory is anchored to. |
+| `SessionStart` | command: starts `hooks/bin/xmustard-hook` | `additionalContext`, `watchPaths` | Adds ground's spawn-free summary (failed runs, stale and pending memory), the session's execution key (`claude:<session_id>`), the session state below, and the core-tier memories as context. After a compaction (`source=compact`) it restores the session's snapshot taken at PreCompact; at a new session (`startup`) it hands over a prior session's snapshot and handoff capsule (the agent's own, else the automatic one), from any client: your own ended session first, and one not ended or of another principal labeled so. Each is scanned and framed as data, and withheld with a note when it holds instruction-like text. Returns `watchPaths`: the files memory is anchored to. |
 | `SubagentStart` | http | `additionalContext` | The same context for the subagent. A subagent has steering state of its own (keyed by its `agent_id`), so a memory pushed into the main thread is pushed into the subagent too, and the reverse. |
 | `UserPromptSubmit` | http | `additionalContext` | Pushes the memories that a keyword in the prompt triggers. A memory tagged `trigger-deploy` is pushed when the prompt says "deploy". |
 | `PreToolUse` (Grep, Glob, Bash, Read, Edit, Write, NotebookEdit) | http | `additionalContext` | For Grep, Glob and a Bash `rg`/`grep`: the index hits (BM25, names, graph proximity) and memories for the pattern. For Read and Edit: the memories bound to the file, stale ones labeled. Before an edit, it records the file's syntax errors. A burst of searches earns one nudge toward `search`/`impact` (2-minute cooldown). The tool call itself is never changed. |
@@ -43,10 +43,21 @@ The Answer column lists what an answer can carry. "Nothing" means an empty 200.
 | `CwdChanged` | http | `watchPaths` | Returns the `watchPaths` of the new directory's workspace; `[]`, which clears the list, when the directory is in none. |
 | `FileChanged` | http | nothing | Adds the file to the index watcher's pending batch (when a watcher runs). The next read re-samples the repository identity. |
 | `WorktreeRemove` | command: starts `hooks/bin/xmustard-hook` | nothing | Forgets the cached identity of a worktree at or under the workspace root. It is a command hook because the client always exits 0, and a failing WorktreeRemove hook blocks the removal. |
-| `PreCompact`, `PostCompact`, `Stop`, `SubagentStop`, `SessionEnd` | http | nothing | Queued and answered at once (SessionEnd hooks share a 1.5 s budget). After compaction, memories may be pushed again. SubagentStop drops the subagent's steering state, SessionEnd the session's. |
+| `PreCompact`, `PostCompact`, `Stop`, `SubagentStop`, `SessionEnd` | http | nothing | Queued and answered at once (SessionEnd hooks share a 1.5 s budget); the session ledger does the work afterwards. PreCompact takes the session's snapshot (at most 2 KB: goal, open failures with their handles, active files, pending proposals, decisions, next step). Stop mines candidate memories (always pending). SessionEnd mines, hashes a reference to the transcript, ends the session with its summary, and stores an automatic handoff capsule (unless the agent wrote one) and a final snapshot. In read-only mode (`XMUSTARD_READ_ONLY=1`) the ledger records nothing. After compaction, memories may be pushed again. SubagentStop drops the subagent's steering state, SessionEnd the session's. |
 
 `WorktreeCreate` is not hooked: a WorktreeCreate hook replaces Claude Code's own git
 worktree creation.
+
+The events also feed the session ledger (WS-33): each tool call with a digest of its
+arguments, its evidence handle and its status; the files read and changed; redacted
+excerpts of prompts and shell commands; memory proposals and verdicts; compactions.
+Before a session ends, the agent can leave a handoff capsule with
+`remember(kind="handoff", session_id="claude:<session_id>", content=<capsule JSON>)`
+(the schema is at `xmustard://docs/tools`). Any client reads the handoff with
+`ground`: `session_handoff`, `continuity`, `handoffs` and `last_sessions`, and
+`ground session_id=<key>` restores a session's own snapshot where no compaction hook
+runs. The capsule and the snapshot are client-neutral (`xmustard.handoff/v1`,
+`xmustard.snapshot/v1`).
 
 Pushed memory is only memory that a human approver approved, that is not quarantined
 and that holds no instruction-like text. It arrives inside `<xmustard-data>` blocks. A
@@ -130,6 +141,9 @@ transcript; the command hooks stay silent.
   tree-sitter syntax errors only.
 - `mcp_tool` hooks: SessionStart takes command and `mcp_tool` hooks only, and Claude
   Code skips `mcp_tool` hooks at launch, so SessionStart uses the static client.
+- Session ledger feeds from other clients (Codex, OpenCode, Cursor: WS-40) and the
+  import of past sessions (WS-34). Their adapters produce the same `LedgerSession`
+  rows and read the same capsule and snapshot formats.
 
 ## Fixtures
 

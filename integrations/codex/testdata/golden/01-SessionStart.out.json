@@ -1,6 +1,6 @@
 {
   "hookSpecificOutput": {
     "hookEventName": "SessionStart",
-    "additionalContext": "[xmustard ground] workspace wsHooks at ${ROOT}: 0 failed run(s), 0 stale memory, 0 pending memory await your verification. Changes, drift and index coverage are not sampled by hooks; the xmustard ground tool reports them."
+    "additionalContext": "[xmustard ground] workspace wsHooks at ${ROOT}: 0 failed run(s), 0 stale memory, 0 pending memory await your verification. Changes, drift and index coverage are not sampled by hooks; the xmustard ground tool reports them.\n\n[xmustard session] this session is codex:01a0e76d-8f1c-7612-a5ba-bf9093182dc5. Before it ends, remember(kind=\"handoff\", session_id=\"codex:01a0e76d-8f1c-7612-a5ba-bf9093182dc5\", content=\u003ccapsule JSON\u003e, paths=...) leaves a handoff for the next session; ground session_id=codex:01a0e76d-8f1c-7612-a5ba-bf9093182dc5 restores its state."
   }
 }

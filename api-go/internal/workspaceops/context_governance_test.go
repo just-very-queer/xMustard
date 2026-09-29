@@ -7,7 +7,7 @@ import (
 	"testing"
 )
 
-func writeTestSettings(t *testing.T, dir string, s appSettings) {
+func writeTestSettings(t testing.TB, dir string, s appSettings) {
 	t.Helper()
 	if err := writeJSON(filepath.Join(dir, "settings.json"), s); err != nil {
 		t.Fatalf("write settings: %v", err)

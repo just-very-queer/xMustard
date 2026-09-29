@@ -118,18 +118,36 @@ type SessionEventFilter struct {
 	Limit     int
 }
 
+// RecentEventFilter reads the newest ledger rows of some kinds, newest first: of one
+// session, or of a workspace's most recently seen sessions (WS-33: the latest snapshot,
+// the latest handoff capsules).
+type RecentEventFilter struct {
+	WorkspaceID string
+	// SessionID reads one session; "" reads the workspace's Sessions most recently seen
+	// sessions (default 16), leaving out ExcludeSession.
+	SessionID      string
+	ExcludeSession string
+	Sessions       int
+	// Kinds selects the kinds; nil selects every kind.
+	Kinds []string
+	Limit int
+}
+
 // SessionReader reads sessions and their ledgers.
 type SessionReader interface {
 	GetSession(ctx context.Context, id string) (Session, error)
 	ListSessions(ctx context.Context, f SessionFilter) ([]Session, error)
 	ListSessionEvents(ctx context.Context, f SessionEventFilter) ([]SessionEvent, error)
+	RecentSessionEvents(ctx context.Context, f RecentEventFilter) ([]SessionEvent, error)
 }
 
-// SessionWriter writes sessions and ledger rows. Ledger rows are immutable.
+// SessionWriter writes sessions and ledger rows. Ledger rows are immutable: they are
+// appended, and deleted by retention or by a bound (TrimSessionEvents), never rewritten.
 type SessionWriter interface {
 	UpsertSession(ctx context.Context, in SessionInput, actor Actor) (Session, error)
 	EndSession(ctx context.Context, id, status, summary string, actor Actor) (Session, error)
 	AppendSessionEvent(ctx context.Context, in SessionEventInput, actor Actor) (SessionEvent, error)
+	TrimSessionEvents(ctx context.Context, sessionID string, kinds []string, keep int) (int64, error)
 }
 
 const sessionCols = `id, workspace_id, client, principal, agent_id, execution_key, parent_id, thread_id, branch,
@@ -199,9 +217,15 @@ func (r *reader) ListSessionEvents(ctx context.Context, f SessionEventFilter) ([
 		}
 	}
 	args = append(args, clampLimit(f.Limit))
-	rows, err := r.query(ctx, `SELECT seq, session_id, workspace_id, kind, record_class, tool, args_digest, handle, status,
-		path, entry_id, role, coalesce(body, ''), body_digest, coalesce(data, ''), at, retention_class
-		FROM session_events WHERE `+strings.Join(where, " AND ")+` ORDER BY seq LIMIT ?`, args...)
+	return r.sessionEvents(ctx, strings.Join(where, " AND ")+" ORDER BY seq LIMIT ?", args...)
+}
+
+const sessionEventCols = `seq, session_id, workspace_id, kind, record_class, tool, args_digest, handle, status,
+	path, entry_id, role, coalesce(body, ''), body_digest, coalesce(data, ''), at, retention_class`
+
+// sessionEvents reads the ledger rows a WHERE clause (with its ORDER and LIMIT) selects.
+func (r *reader) sessionEvents(ctx context.Context, clause string, args ...any) ([]SessionEvent, error) {
+	rows, err := r.query(ctx, "SELECT "+sessionEventCols+" FROM session_events WHERE "+clause, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -221,6 +245,39 @@ func (r *reader) ListSessionEvents(ctx context.Context, f SessionEventFilter) ([
 		out = append(out, ev)
 	}
 	return out, rows.Err()
+}
+
+// defaultRecentSessions is how many recently seen sessions a workspace-wide
+// RecentSessionEvents reads.
+const defaultRecentSessions = 16
+
+// RecentSessionEvents returns the newest ledger rows of the selected kinds, newest
+// first. Both forms read through the (session_id, seq) index: a workspace-wide read
+// takes the workspace's most recently seen sessions first (sessions_workspace).
+func (r *reader) RecentSessionEvents(ctx context.Context, f RecentEventFilter) ([]SessionEvent, error) {
+	if err := validID("workspace", f.WorkspaceID); err != nil {
+		return nil, err
+	}
+	where, args := "", []any{}
+	if f.SessionID != "" {
+		where, args = "session_id = ? AND workspace_id = ?", append(args, f.SessionID, f.WorkspaceID)
+	} else {
+		n := f.Sessions
+		if n <= 0 {
+			n = defaultRecentSessions
+		}
+		where = `session_id IN (SELECT id FROM sessions WHERE workspace_id = ? AND id <> ?
+			ORDER BY last_seen_at DESC, pk DESC LIMIT ?)`
+		args = append(args, f.WorkspaceID, f.ExcludeSession, clampLimit(n))
+	}
+	if len(f.Kinds) > 0 {
+		where += " AND kind IN (" + placeholders(len(f.Kinds)) + ")"
+		for _, k := range f.Kinds {
+			args = append(args, k)
+		}
+	}
+	args = append(args, clampLimit(f.Limit))
+	return r.sessionEvents(ctx, where+" ORDER BY seq DESC LIMIT ?", args...)
 }
 
 // UpsertSession starts a session, or refreshes last_seen_at and the mutable context
@@ -277,7 +334,8 @@ func (t *txn) UpsertSession(ctx context.Context, in SessionInput, actor Actor) (
 	return t.GetSession(ctx, in.ID)
 }
 
-// EndSession closes a session as ended or interrupted.
+// EndSession closes a session as ended or interrupted. Only the session's own principal
+// may end it.
 func (t *txn) EndSession(ctx context.Context, id, status, summary string, actor Actor) (Session, error) {
 	if err := actor.validate(); err != nil {
 		return Session{}, err
@@ -288,6 +346,13 @@ func (t *txn) EndSession(ctx context.Context, id, status, summary string, actor 
 	if len(summary) > maxNoteLen {
 		return Session{}, fmt.Errorf("%w: summary longer than %d bytes", ErrInvalid, maxNoteLen)
 	}
+	s, err := t.GetSession(ctx, id)
+	if err != nil {
+		return Session{}, err
+	}
+	if s.Principal != strings.TrimSpace(actor.Principal) {
+		return Session{}, fmt.Errorf("%w: session %s belongs to another principal", ErrConflict, id)
+	}
 	now := t.nowText()
 	res, err := t.exec(ctx, `UPDATE sessions SET status = ?, summary = ?, ended_at = ?, last_seen_at = ?
 		WHERE id = ? AND status = 'active'`, status, summary, now, now, id)
@@ -295,9 +360,6 @@ func (t *txn) EndSession(ctx context.Context, id, status, summary string, actor 
 		return Session{}, err
 	}
 	if rowsAffected(res) == 0 {
-		if _, err := t.GetSession(ctx, id); err != nil {
-			return Session{}, err
-		}
 		return Session{}, fmt.Errorf("%w: session %s is not active", ErrInvalid, id)
 	}
 	return t.GetSession(ctx, id)
@@ -366,4 +428,30 @@ func (t *txn) AppendSessionEvent(ctx context.Context, in SessionEventInput, acto
 		return SessionEvent{}, ErrNotFound
 	}
 	return evs[0], nil
+}
+
+// TrimSessionEvents bounds one session's ledger: of the rows of the given kinds (nil:
+// every kind) it keeps the newest keep and deletes the older ones, returning how many
+// it deleted. Deleting is how retention and bounds end a row; nothing rewrites one.
+func (t *txn) TrimSessionEvents(ctx context.Context, sessionID string, kinds []string, keep int) (int64, error) {
+	if err := validID("session", sessionID); err != nil {
+		return 0, err
+	}
+	if keep < 0 {
+		return 0, fmt.Errorf("%w: keep %d", ErrInvalid, keep)
+	}
+	where, args := "session_id = ?", []any{sessionID}
+	if len(kinds) > 0 {
+		where += " AND kind IN (" + placeholders(len(kinds)) + ")"
+		for _, k := range kinds {
+			args = append(args, k)
+		}
+	}
+	args = append(args, keep)
+	res, err := t.exec(ctx, `DELETE FROM session_events WHERE seq IN (SELECT seq FROM session_events WHERE `+where+`
+		ORDER BY seq DESC LIMIT -1 OFFSET ?)`, args...)
+	if err != nil {
+		return 0, err
+	}
+	return rowsAffected(res), nil
 }

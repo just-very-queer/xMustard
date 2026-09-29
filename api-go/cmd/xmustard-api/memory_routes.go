@@ -36,6 +36,13 @@ func registerMemoryRoutes(mux routeRegistrar) {
 		if len(req.Paths) == 0 && q.Get("paths") != "" {
 			req.Paths = strings.Split(q.Get("paths"), ",")
 		}
+		// a handoff capsule is session evidence, not memory (WS-33): schema-checked and
+		// stored in the session ledger, never proposed or verified
+		if strings.EqualFold(strings.TrimSpace(req.Kind), workspaceops.LedgerHandoff) {
+			result, err := workspaceops.RememberHandoff(dataDir(), r.PathValue("workspace_id"), req, req.SessionID, caller.actor())
+			respondMemoryWrite(w, r, caller, result, err)
+			return
+		}
 		if _, ok := holdForHuman(w, r, caller, func() (workspaceops.HumanConfirmation, error) {
 			return workspaceops.DescribeRemember(dataDir(), r.PathValue("workspace_id"), req)
 		}); !ok {
