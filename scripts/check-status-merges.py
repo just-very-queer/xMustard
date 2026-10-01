@@ -1,0 +1,108 @@
+#!/usr/bin/env python3
+"""Check that docs/STATUS.md's "In progress" section agrees with the merge history.
+
+Every workstream row in that section must name a merge commit that exists and is
+the workstream's own merge into feat/parity-v2, and every post-cut merge must have
+a row. Read-only: it runs git plumbing and parses one markdown file.
+"""
+from __future__ import annotations
+
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+STATUS = Path("docs/STATUS.md")
+# The section describes workstreams merged into feat/parity-v2 after the v0.1.1 cut;
+# its own header says so. Merges below that cut are described in "What ships in
+# v0.1.1" and "Measured" instead, and are out of scope here.
+CUT = "09d2a1f"
+# Merges that are not product workstreams and so have no STATUS.md row: the release
+# merge-back, and the plan-hygiene WS-DOC rows (they change the plan, not the product).
+NOT_WORKSTREAMS = {"rel-011", "ws-doc-01"}
+
+
+def git(*args: str) -> str:
+    return subprocess.run(
+        ["git", *args], check=True, capture_output=True, text=True
+    ).stdout.strip()
+
+
+def slug_of(ident: str) -> str:
+    """WS-40a -> ws-40a, WS-CQ-01 -> ws-cq-01."""
+    return "ws-" + ident.lower()
+
+
+def merged_workstreams() -> dict[str, str]:
+    """slug -> merge sha, for merges at or after CUT on the first-parent chain."""
+    lines = git("log", "--first-parent", "--format=%h %s").splitlines()
+    cutoff_index = next(i for i, l in enumerate(lines) if l.startswith(CUT + " "))
+    kept: dict[str, str] = {}
+    for line in lines[: cutoff_index + 1]:
+        sha, subject = line.split(" ", 1)
+        m = re.fullmatch(r"merge: parity/(\S+) into feat/parity-v2", subject)
+        if m:
+            kept[m.group(1)] = sha
+    return kept
+
+
+def section_rows(text: str) -> list[tuple[str, str | None]]:
+    """The merged list's rows as (workstream id, sha or None)."""
+    start = text.index("**Merged into `feat/parity-v2`")
+    end = text.index("**On workstream branches", start)
+    rows = []
+    for line in text[start:end].splitlines():
+        m = re.match(r"- \*\*WS-([0-9A-Za-z-]+)\*\*(?: \(`([0-9a-f]{7})`\))?:", line)
+        if m:
+            rows.append((m.group(1), m.group(2)))
+    return rows
+
+
+def main() -> int:
+    text = STATUS.read_text()
+    rows = section_rows(text)
+    merged = merged_workstreams()
+    errors: list[str] = []
+
+    unmerged = text[text.index("**On workstream branches"):]
+    unmerged = unmerged[: unmerged.index("**Planned")]
+    stale = re.findall(r"\*\*WS-([0-9A-Za-z-]+)\*\*", unmerged)
+    if stale:
+        errors.append(f"still listed as unmerged: {', '.join(sorted(set(stale)))}")
+
+    named = {slug_of(ident) for ident, _ in rows}
+    missing = sorted(set(merged) - named - NOT_WORKSTREAMS)
+    if missing:
+        errors.append(f"merged but no row in the section: {', '.join(missing)}")
+
+    for ident, sha in rows:
+        slug = slug_of(ident)
+        if sha is None:
+            errors.append(f"WS-{ident} has no merge sha")
+            continue
+        if merged.get(slug) != sha:
+            errors.append(
+                f"WS-{ident} cites {sha}, but its merge is {merged.get(slug)}"
+            )
+            continue
+        if git("cat-file", "-t", sha) != "commit":
+            errors.append(f"WS-{ident} cites {sha}, which is not a commit")
+
+    for line in ("This is not a parity claim",):
+        if line not in text:
+            errors.append(f"missing required sentence: {line!r}")
+
+    for sha in re.findall(r"\]\((benchmarks/[^)]+)\)", text):
+        if not (STATUS.parent / sha).is_file():
+            errors.append(f"benchmark link does not resolve: {sha}")
+
+    if errors:
+        for e in errors:
+            print(f"FAIL {e}", file=sys.stderr)
+        return 1
+    print(f"OK {len(rows)} merged rows, {len(merged)} post-cut merges, all shas agree")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
