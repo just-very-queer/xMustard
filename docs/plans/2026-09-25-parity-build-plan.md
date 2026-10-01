@@ -739,9 +739,9 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - For each id in 16..34 and 21B, `grep -c "^### WS-<id> "` is exactly 1.
 - `git diff` is deletions plus the ported lines only, so a reviewer can read the port list and check each entry.
 
-**Acceptance.** Each id in 16..34 and 21B appears once; re-running the script lists 0 unported lines; the diff holds deletions and the listed ports and nothing else.
+**Acceptance.** Each id in 16..34 and 21B appears once; re-running the script lists 0 unported lines; the diff holds deletions and the listed ports and nothing else. One line is deliberately not ported, so the condition "0 unported" is met only after this exception is applied: copy 2's older `*tools/list bytes.*` bullet is dropped because copy 1 already carries a newer variant of the same bullet that describes the shipped code. The port list and this exception are both in the record.
 
-**Collision risk.** None: a docs-only change to one file, from a worktree branched at the current `feat/parity-v2` tip. The canonical copy's line numbers shift once copy 2 is deleted, so any row citing `P:n` for a plan line above 1712 moves down by the number of deleted lines. The script and the commit body carry before/after line numbers for every id so a later reader can re-derive the citation.
+**Collision risk.** None: a docs-only change to one file, from a worktree branched at the current `feat/parity-v2` tip. Deleting copy 2 removes a block that sits *after* the canonical copy, so every line after the deleted block moves *up* by the number of deleted lines (944 in this commit), and the canonical WS-16..WS-34 lines stay put apart from this section's own additions. A row citing `P:n` for a plan line at or after the deleted block must move its citation *up*, not down. Per-id before/after line numbers are in the implementation record below so a later reader can re-derive every citation.
 
 ### WS-16 — Language packs via the provider contract
 
