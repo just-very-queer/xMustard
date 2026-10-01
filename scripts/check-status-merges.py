@@ -23,6 +23,10 @@ NOT_WORKSTREAMS = {"rel-011"}
 DOC_ROW = re.compile(r"^ws-doc-")
 
 
+class CheckError(Exception):
+    """The check cannot run: the checkout does not support what it needs."""
+
+
 def git(*args: str) -> str:
     return subprocess.run(
         ["git", *args], check=True, capture_output=True, text=True
@@ -35,9 +39,21 @@ def slug_of(ident: str) -> str:
 
 
 def merged_workstreams() -> dict[str, str]:
-    """slug -> merge sha, for merges at or after CUT on the first-parent chain."""
+    """slug -> merge sha, for merges at or after CUT on the first-parent chain.
+
+    The chain is walked to CUT inclusive. A checkout that does not contain CUT
+    (a shallow clone, or history rewritten under it) reports that as a diagnostic
+    failure rather than dying inside next().
+    """
     lines = git("log", "--first-parent", "--format=%h %s").splitlines()
-    cutoff_index = next(i for i, l in enumerate(lines) if l.startswith(CUT + " "))
+    cutoff_index = next(
+        (i for i, l in enumerate(lines) if l.startswith(CUT + " ")), None
+    )
+    if cutoff_index is None:
+        raise CheckError(
+            f"cutoff commit {CUT} is not on the first-parent chain of this checkout; "
+            "the post-cut window cannot be established (shallow clone?)"
+        )
     kept: dict[str, str] = {}
     for line in lines[: cutoff_index + 1]:
         sha, subject = line.split(" ", 1)
@@ -110,4 +126,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except CheckError as exc:
+        print(f"CHECK-CANNOT-RUN {exc}", file=sys.stderr)
+        sys.exit(2)
