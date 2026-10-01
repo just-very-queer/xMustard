@@ -75,10 +75,9 @@ def section_rows(text: str) -> list[tuple[str, str | None]]:
     return rows
 
 
-def main() -> int:
-    text = STATUS.read_text()
+def check(text: str, merged: dict[str, str]) -> list[str]:
+    """Every rule the section must satisfy, as a list of failure messages."""
     rows = section_rows(text)
-    merged = merged_workstreams()
     errors: list[str] = []
 
     unmerged = text[text.index("**On workstream branches"):]
@@ -116,7 +115,78 @@ def main() -> int:
     for sha in re.findall(r"\]\((benchmarks/[^)]+)\)", text):
         if not (STATUS.parent / sha).is_file():
             errors.append(f"benchmark link does not resolve: {sha}")
+    return errors
 
+
+def self_test(text: str, merged: dict[str, str]) -> int:
+    """Each rule, broken on purpose, must be reported. Nothing else may be."""
+    base = section_rows(text)
+    if not base:
+        print("FAIL self-test: the real section parsed no rows", file=sys.stderr)
+        return 1
+    ident, sha = next((i, s) for i, s in base if s)
+
+    start = text.index("**On workstream branches")
+    end = text.index("**Planned", start)
+    unmerged_block = text[start:end]
+
+    cases = [
+        ("a row dropped from the merged list",
+         lambda t: t.replace(f"- **WS-{ident}** (`{sha}`)", "- (removed)", 1),
+         "merged but no row in the section"),
+        ("a row citing another workstream's merge",
+         lambda t: t.replace(f"- **WS-{ident}** (`{sha}`)", f"- **WS-{ident}** (`{'0' * 7}`)", 1),
+         f"WS-{ident} cites"),
+        ("a row with no sha",
+         lambda t: t.replace(f"- **WS-{ident}** (`{sha}`)", f"- **WS-{ident}**", 1),
+         f"WS-{ident} has no merge sha"),
+        ("a merged row still listed as unmerged",
+         lambda t: t.replace(unmerged_block, unmerged_block + f"- **WS-{ident}** (`parity/ws-{ident.lower()}`)\n\n", 1),
+         f"still listed as unmerged: ws-{ident.lower()}"),
+        ("the parity claim removed",
+         lambda t: t.replace("This is not a parity claim.", "This is a parity claim.", 1),
+         "missing required sentence"),
+        ("a benchmark link that resolves to nothing",
+         lambda t: t + "\n[gone](benchmarks/does-not-exist.md)\n",
+         "benchmark link does not resolve"),
+    ]
+    if check(text, merged):
+        print("FAIL self-test: the real document does not pass its own check", file=sys.stderr)
+        return 1
+    # A row for a workstream that has not merged belongs in the unmerged list, so
+    # listing one must NOT be reported. Without this the check would reject every
+    # active branch and still pass this self-test.
+    active = text.replace(
+        unmerged_block,
+        unmerged_block + "- **WS-NOTMERGED** (`parity/ws-notmerged`)\n\n",
+        1,
+    )
+    if check(active, merged):
+        print(
+            "FAIL self-test: listing a not-yet-merged workstream was reported",
+            file=sys.stderr,
+        )
+        return 1
+    failures = []
+    for name, break_it, want in cases:
+        errors = check(break_it(text), merged)
+        if not any(want in e for e in errors):
+            failures.append(f"{name}: expected {want!r}, got {errors or 'no error'}")
+    if failures:
+        for f in failures:
+            print(f"FAIL self-test {f}", file=sys.stderr)
+        return 1
+    print(f"SELF-TEST OK {len(cases)} rules, each caught when broken")
+    return 0
+
+
+def main() -> int:
+    text = STATUS.read_text()
+    rows = section_rows(text)
+    merged = merged_workstreams()
+    if "--self-test" in sys.argv:
+        return self_test(text, merged)
+    errors = check(text, merged)
     if errors:
         for e in errors:
             print(f"FAIL {e}", file=sys.stderr)
