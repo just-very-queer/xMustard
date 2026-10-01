@@ -38,20 +38,20 @@ def slug_of(ident: str) -> str:
     return "ws-" + ident.lower()
 
 
-def merged_workstreams() -> dict[str, str]:
-    """slug -> merge sha, for merges at or after CUT on the first-parent chain.
+def merged_workstreams(cut: str = CUT) -> dict[str, str]:
+    """slug -> merge sha, for merges at or after `cut` on the first-parent chain.
 
-    The chain is walked to CUT inclusive. A checkout that does not contain CUT
+    The chain is walked to `cut` inclusive. A checkout that does not contain `cut`
     (a shallow clone, or history rewritten under it) reports that as a diagnostic
     failure rather than dying inside next().
     """
     lines = git("log", "--first-parent", "--format=%h %s").splitlines()
     cutoff_index = next(
-        (i for i, l in enumerate(lines) if l.startswith(CUT + " ")), None
+        (i for i, l in enumerate(lines) if l.startswith(cut + " ")), None
     )
     if cutoff_index is None:
         raise CheckError(
-            f"cutoff commit {CUT} is not on the first-parent chain of this checkout; "
+            f"cutoff commit {cut} is not on the first-parent chain of this checkout; "
             "the post-cut window cannot be established (shallow clone?)"
         )
     kept: dict[str, str] = {}
@@ -167,6 +167,37 @@ def self_test(text: str, merged: dict[str, str]) -> int:
             file=sys.stderr,
         )
         return 1
+    # A merge that needs no STATUS.md row (plan hygiene, release merge-back) must not
+    # be demanded. This branch carries no ws-doc-* merge of its own, so the exemption
+    # is exercised against an injected merge set rather than by the real history.
+    injected = dict(merged, **{"ws-doc-99": "0" * 7, "rel-011": "0" * 7})
+    if check(text, injected):
+        print(
+            "FAIL self-test: a merge exempt from STATUS.md was demanded a row",
+            file=sys.stderr,
+        )
+        return 1
+    # And an injected product workstream with no row must still be demanded.
+    if not any(
+        "ws-doc-99" not in e and "ws-99" in e
+        for e in check(text, dict(merged, **{"ws-99": "0" * 7}))
+    ):
+        print(
+            "FAIL self-test: an injected unlisted workstream was not demanded",
+            file=sys.stderr,
+        )
+        return 1
+    # A checkout whose chain does not reach the cutoff must say so, not raise.
+    try:
+        merged_workstreams(cut="deadbee")
+    except CheckError:
+        pass
+    else:
+        print(
+            "FAIL self-test: a missing cutoff did not raise CheckError",
+            file=sys.stderr,
+        )
+        return 1
     failures = []
     for name, break_it, want in cases:
         errors = check(break_it(text), merged)
@@ -176,7 +207,8 @@ def self_test(text: str, merged: dict[str, str]) -> int:
         for f in failures:
             print(f"FAIL self-test {f}", file=sys.stderr)
         return 1
-    print(f"SELF-TEST OK {len(cases)} rules, each caught when broken")
+    checks = len(cases) + 4
+    print(f"SELF-TEST OK {checks} rules, each caught when broken")
     return 0
 
 
