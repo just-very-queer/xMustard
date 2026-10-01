@@ -768,9 +768,10 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Requirements.** No new PAR ids: this row is documentation hygiene. It closes no requirement; it stops documentation asserting behaviour the code no longer has.
 
-**Files.** `docs/STATUS.md`, `docs/plans/2026-09-25-parity-build-plan.md`, `goal/xmustard_parity_completion_goal.md`
+**Files.** `docs/STATUS.md`, `docs/plans/2026-09-25-parity-build-plan.md`, `goal/xmustard_parity_completion_goal.md`, `scripts/check-status-merges.py`
 
 **Tests required.**
+- `scripts/check-status-merges.py` parses the "In progress" section and compares it against `git log --first-parent`: no post-cut merge lacks a row, each row's sha is that workstream's own merge, every row names a sha, and nothing merged is still listed as unmerged. One mutation per reported defect turns it red (rows in `reviews/ws-doc-02/r2/slop-audit.md` S5).
 - Every sha cited in the changed text exists: `git cat-file -t <sha>` is `commit` for each.
 - `rg -c 'not a parity claim' docs/STATUS.md` is at least 1. The wording is G§5.8's and stays.
 - H0: `git ls-files --error-unmatch docs/benchmarks/2026-09-30-ws39-resolvers.md` succeeds, so the file the new WS-39 row cites is tracked and not only a local gitignored file.
