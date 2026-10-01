@@ -762,6 +762,24 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *Checks.* `BOXALL` on the reviewed commit: `remote_exit=0`, `clippy_warnings=6` (the merge-base count), `rss_lines=ok`, 24 Go packages ok (`logs/ws-doc-01-check-*.log`). `slop-audit.md` S1/S2/S11/S14 clean; no changed `.go`/`.rs` files.
 - *Follow-ups.* None outstanding at this head: a repository-wide search for `P:<n>` citations (`rg -n 'P:[0-9]+'` across the tree, plan included) returns nothing, so no citation points into the deleted copy-2 range and none needs re-pointing. Any future row that cites plan lines by number should cite the canonical section for its id.
 
+### WS-DOC-02 — Bring STATUS.md and the WS-24 record in line with merged code
+
+**Goal.** `docs/STATUS.md`'s "In progress" section still reads as of 2026-09-28: it lists five workstreams as sitting on unmerged branches, omits three that have since merged, and never names the wave-3 merges. The WS-24 record's requirement-status and blocked-outside bullets name WS-05 and WS-41 as open blockers that have since merged. Bring both in line with what `feat/parity-v2` ships, and mark the superseded goal file with one top line.
+
+**Requirements.** No new PAR ids: this row is documentation hygiene. It closes no requirement; it stops documentation asserting behaviour the code no longer has.
+
+**Files.** `docs/STATUS.md`, `docs/plans/2026-09-25-parity-build-plan.md`, `goal/xmustard_parity_completion_goal.md`
+
+**Tests required.**
+- Every sha cited in the changed text exists: `git cat-file -t <sha>` is `commit` for each.
+- `rg -c 'not a parity claim' docs/STATUS.md` is at least 1. The wording is G§5.8's and stays.
+- H0: `git ls-files --error-unmatch docs/benchmarks/2026-09-30-ws39-resolvers.md` succeeds, so the file the new WS-39 row cites is tracked and not only a local gitignored file.
+- Each WS-NN row moved from "On workstream branches" to merged names the merge commit that actually merged it, read from `git log --first-parent --oneline`.
+
+**Acceptance.** STATUS.md's "In progress" names every wave-3 merge that `git log --first-parent` shows, each with its real merge sha, and no longer claims WS-31, WS-33, WS-36, WS-42 or CQ-01 are unmerged. The WS-24 record states that WS-FIX-03 shipped the production redactor (`0b7474d`) and that PAR-ADP-09's WS-41 dependency (`xmustard-core run --`) exists, keeps the nine failing Pi e2e tests and PAR-ADP-09 as open, and says plainly what still does not pass. `goal/xmustard_parity_completion_goal.md` carries one prepended line naming this goal as its successor; that file is not otherwise read. "Not a parity claim" stays.
+
+**Collision risk.** Docs only, three files, from a worktree branched at the current `feat/parity-v2` tip. The plan file is edited in two places far apart: this section (after WS-DOC-01) and the WS-24 record. Both are prose inside existing sections, so a concurrent WS-DOC-01-style deletion of a plan block could shift line numbers under them; §4.8 step 2 re-reads the diff after merging `feat/parity-v2`.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
