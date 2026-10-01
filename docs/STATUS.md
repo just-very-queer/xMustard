@@ -227,25 +227,25 @@ first-parent merge commit on `feat/parity-v2`.
 
 **Merged into `feat/parity-v2` after the v0.1.1 cut**
 
-- **WS-35**: impact v2 (tiers, risk, epistemic envelope, typed filters). `symbol=` walks
+- **WS-35** (`09d2a1f`): impact v2 (tiers, risk, epistemic envelope, typed filters). `symbol=` walks
   resolved Go and TS/JS edges, `scope=` maps a Git diff to symbols, and every diff runs
   through one hardened Git policy (`gitdiff`). The index's graph segment moves to CSR
   format 2; a v0.1.1 segment is read through the legacy graph until the next
   `index update` rewrites it.
-- **WS-27**: dedupe, code anchors, tiered conflicts and structured claims for memory.
+- **WS-27** (`9394ee9`): dedupe, code anchors, tiered conflicts and structured claims for memory.
   The governance store moves to schema version 4, which v0.1.1 cannot open.
-- **WS-28**: change-driven memory invalidation. A change (ground's working-tree changes
+- **WS-28** (`3e5f242`): change-driven memory invalidation. A change (ground's working-tree changes
   and HEAD moves, the watcher's incremental batches) is looked up in the anchor index and
   only the affected path and symbol-body anchors are re-hashed; a mismatch persists
   `stale_observed` and `needs_reverify`, `ground` lists `at_risk_memories`, and a distinct
   verifier's approval clears one. `recall` gains `as_of`, `valid_only` and `seed`
   (graph-proximity ranking with bounded diversity), and `explain` and `impact` carry the
   memories anchored to what they describe. No schema change.
-- **WS-40a**: Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
+- **WS-40a** (`221f81e`): Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
   eight Codex events to `/api/hooks/codex/<Event>`, and `xmustard-ops codex-hooks
   config|status|trust` writes `hooks.json` and records trust only after the user types
   `trust` at their own terminal. Needs a source build until the next release.
-- **WS-40b**: the OpenCode plugin (`integrations/opencode`), written against the 2.x
+- **WS-40b** (`2ad3315`): the OpenCode plugin (`integrations/opencode`), written against the 2.x
   plugin API and checked against OpenCode 2.0.1, with a 1.x entrypoint. It adds the MCP
   entry, reduces large tool results through `POST .../evidence/capture?format=opencode`
   and masks older results on 2.x. `mcp-config --client opencode` prints `opencode.json`'s
