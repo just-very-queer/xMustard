@@ -1,3 +1,5 @@
+> **Superseded.** This goal was never executed and is replaced by `goal/xmustard_commandcode_goal.md` (the xMustard parity Command Code hand-off goal, 2026-10-02). Its section 2 state, its executor split and its OpenCode channel are stale; its rules and anti-slop appendix carried forward there.
+
 # xMustard parity completion goal (feat/parity-v2 HEAD 5e8cb3a)
 
 **Written:** 2026-09-30 ~03:30 IST, from `feat/parity-v2` at `5e8cb3a` (tip after WS-39 merged; integration tree clean, no `MERGE_HEAD`, no merge lock). **Audience:** two Codex-family executors, **gpt-6-luna** (Luna: writer/builder, well-specified rows) and **gpt-6.1-sol** (Sol: large, cross-cutting and design-first rows, and whatever Luna cannot take). **Owner:** asleep for stretches of the next four days; cleanup session **Sunday 2026-10-04 (IST)**. **Precedence:** the plan's row text wins for scope; this file wins for order, ownership and authority; Part A/B of the appendix (§9) win for review, evidence and the merge gate. Paths are repository-relative unless they start with `/`.

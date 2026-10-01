@@ -221,8 +221,9 @@ What these numbers do not show:
 
 ## In progress
 
-As of 2026-09-28. Workstream numbers refer to the
-[parity build plan](plans/2026-09-25-parity-build-plan.md).
+As of 2026-10-02. Workstream numbers refer to the
+[parity build plan](plans/2026-09-25-parity-build-plan.md). Each merge is named by its
+first-parent merge commit on `feat/parity-v2`.
 
 **Merged into `feat/parity-v2` after the v0.1.1 cut**
 
@@ -249,20 +250,45 @@ As of 2026-09-28. Workstream numbers refer to the
   entry, reduces large tool results through `POST .../evidence/capture?format=opencode`
   and masks older results on 2.x. `mcp-config --client opencode` prints `opencode.json`'s
   `mcp` object. Loaded from a source checkout.
+- **WS-CQ-01** (`4ca0cc7`): one route list for the API, split from `registerRoutes` into
+  per-area route modules with table-driven registration.
+- **WS-42** (`b40475d`): repeat guard and revision-keyed result cache. A per-session guard
+  keyed on (tool, canonical args, raw sha, repo revision) answers `unchanged since call X`
+  for repeated reads, with exemptions for side-effecting calls; a byte-capped cache
+  serves search, explain, impact and diagnostics per revision.
+- **WS-36** (`51e6a06`): symbol navigation behind search, explain and impact.
+  `search mode=symbol` with the name-path grammar, `include_body` sliced from disk,
+  `include_info`, `depth`, `max_matches` with a refine map and an ambiguity envelope;
+  explain gains a directory overview and symbol 360 context. Results run through
+  per-shape output ladders (`toolbudget`) so a default answer stays small.
+- **WS-31** (`e8e5c6d`): tiered memory, write policy and guidance artifacts. Served memory
+  is `core` or `deferred` under a core character budget; `remember` takes `tier` and
+  `op=tier`, and tier is a protected field, so changing it needs a human approver.
+- **WS-34** (`68324ce`): session transcript store, session search and new-session
+  bootstrap. Imported messages are raw-observation ledger rows with their own timestamps,
+  searchable by date, agent and conversation; they never displace live sessions in the
+  handoff and continuity lists.
+- **WS-41** (`f426999`): command-wrapper reducer, retention classes and upstream
+  references. `xmustard-core run -- <argv>` streams a child's output to the spool with a
+  bounded tail, preserves its exit code and prints a projection plus a handle. Retention
+  classes (hook-captured, own outputs, snapshots) get separate TTLs as shares of one
+  workspace quota, and a client that already persisted the original is referenced by
+  hash.
+- **WS-39** (`5e8cb3a`): scope/import resolvers for Rust (use paths, impl blocks, traits),
+  Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), on the
+  same confidence tiers, provenance and drop counters as the Go and TS/JS resolvers.
+  Measurements in `benchmarks/2026-09-30-ws39-resolvers.md`.
 
 **On workstream branches, not yet merged**
 
-- **WS-31** (`parity/ws-31`): tiered memory, write policy and guidance artifacts.
-- **WS-33** (`parity/ws-33`): session ledger, compaction snapshot and cross-client
-  handoff.
-- **WS-36** (`parity/ws-36`): symbol navigation behind search, explain and impact.
-- **WS-42** (`parity/ws-42`): repeat guard and revision-keyed result cache.
-- **WS-CQ-01** (`parity/ws-cq-01`): one route list for the API.
+- None. Every workstream started through 2026-09-30 is merged; the next batch is the
+  parity plan's Phase A to Phase D hygiene and review-finding rows, tracked in the plan.
 
 **Planned**
 
 - WS-21B: hardening for `why_failed` command mode.
-- A large-result fixture for the Pi adapter e2e (WS-24 follow-up).
+- A large-result fixture for the Pi adapter e2e (WS-24 follow-up; WS-41 removed the
+  `run --` dependency, the fixture itself is still missing).
 - Wave 3, including WS-50 (the parity evaluation suite and final parity-scale gate).
 
 ## Check it yourself
