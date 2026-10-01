@@ -221,48 +221,79 @@ What these numbers do not show:
 
 ## In progress
 
-As of 2026-09-28. Workstream numbers refer to the
-[parity build plan](plans/2026-09-25-parity-build-plan.md).
+As of 2026-10-02. Workstream numbers refer to the
+[parity build plan](plans/2026-09-25-parity-build-plan.md). Each merge is named by its
+first-parent merge commit on `feat/parity-v2`.
 
 **Merged into `feat/parity-v2` after the v0.1.1 cut**
 
-- **WS-35**: impact v2 (tiers, risk, epistemic envelope, typed filters). `symbol=` walks
+- **WS-35** (`09d2a1f`): impact v2 (tiers, risk, epistemic envelope, typed filters). `symbol=` walks
   resolved Go and TS/JS edges, `scope=` maps a Git diff to symbols, and every diff runs
   through one hardened Git policy (`gitdiff`). The index's graph segment moves to CSR
   format 2; a v0.1.1 segment is read through the legacy graph until the next
   `index update` rewrites it.
-- **WS-27**: dedupe, code anchors, tiered conflicts and structured claims for memory.
+- **WS-27** (`9394ee9`): dedupe, code anchors, tiered conflicts and structured claims for memory.
   The governance store moves to schema version 4, which v0.1.1 cannot open.
-- **WS-28**: change-driven memory invalidation. A change (ground's working-tree changes
+- **WS-28** (`3e5f242`): change-driven memory invalidation. A change (ground's working-tree changes
   and HEAD moves, the watcher's incremental batches) is looked up in the anchor index and
   only the affected path and symbol-body anchors are re-hashed; a mismatch persists
   `stale_observed` and `needs_reverify`, `ground` lists `at_risk_memories`, and a distinct
   verifier's approval clears one. `recall` gains `as_of`, `valid_only` and `seed`
   (graph-proximity ranking with bounded diversity), and `explain` and `impact` carry the
   memories anchored to what they describe. No schema change.
-- **WS-40a**: Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
+- **WS-40a** (`221f81e`): Codex hooks (`integrations/codex`). `xmustard-hook codex <Event>` posts
   eight Codex events to `/api/hooks/codex/<Event>`, and `xmustard-ops codex-hooks
   config|status|trust` writes `hooks.json` and records trust only after the user types
   `trust` at their own terminal. Needs a source build until the next release.
-- **WS-40b**: the OpenCode plugin (`integrations/opencode`), written against the 2.x
+- **WS-40b** (`2ad3315`): the OpenCode plugin (`integrations/opencode`), written against the 2.x
   plugin API and checked against OpenCode 2.0.1, with a 1.x entrypoint. It adds the MCP
   entry, reduces large tool results through `POST .../evidence/capture?format=opencode`
   and masks older results on 2.x. `mcp-config --client opencode` prints `opencode.json`'s
   `mcp` object. Loaded from a source checkout.
+- **WS-CQ-01** (`4ca0cc7`): one route list for the API, split from `registerRoutes` into
+  per-area route modules with table-driven registration.
+- **WS-33** (`5235a78`): session ledger, compaction snapshot and cross-client handoff. A
+  durable ledger per workspace, client, session and principal records tool calls with
+  argument digests and evidence handles, files read and modified, decisions and errors;
+  a 2 KB priority-tiered PreCompact snapshot is re-injected at SessionStart, and a
+  handoff capsule carries one session's state to the next.
+- **WS-42** (`b40475d`): repeat guard and revision-keyed result cache. A per-session guard
+  keyed on (tool, canonical args, raw sha, repo revision) answers `unchanged since call X`
+  for repeated reads, with exemptions for side-effecting calls; a byte-capped cache
+  serves search, explain, impact and diagnostics per revision.
+- **WS-36** (`51e6a06`): symbol navigation behind search, explain and impact.
+  `search mode=symbol` with the name-path grammar, `include_body` sliced from disk,
+  `include_info`, `depth`, `max_matches` with a refine map and an ambiguity envelope;
+  explain gains a directory overview and symbol 360 context. Results run through
+  per-shape output ladders (`toolbudget`) so a default answer stays small.
+- **WS-31** (`e8e5c6d`): tiered memory, write policy and guidance artifacts. Served memory
+  is `core` or `deferred` under a core character budget; `remember` takes `tier` and
+  `op=tier`, and tier is a protected field, so changing it needs a human approver.
+- **WS-34** (`68324ce`): session transcript store, session search and new-session
+  bootstrap. Imported messages are raw-observation ledger rows with their own timestamps,
+  searchable by date, agent and conversation; they never displace live sessions in the
+  handoff and continuity lists.
+- **WS-41** (`f426999`): command-wrapper reducer, retention classes and upstream
+  references. `xmustard-core run -- <argv>` streams a child's output to the spool with a
+  bounded tail, preserves its exit code and prints a projection plus a handle. Retention
+  classes (hook-captured, own outputs, snapshots) get separate TTLs as shares of one
+  workspace quota, and a client that already persisted the original is referenced by
+  hash.
+- **WS-39** (`5e8cb3a`): scope/import resolvers for Rust (use paths, impl blocks, traits),
+  Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), on the
+  same confidence tiers, provenance and drop counters as the Go and TS/JS resolvers.
+  Measurements in [WS-39](benchmarks/2026-09-30-ws39-resolvers.md).
 
 **On workstream branches, not yet merged**
 
-- **WS-31** (`parity/ws-31`): tiered memory, write policy and guidance artifacts.
-- **WS-33** (`parity/ws-33`): session ledger, compaction snapshot and cross-client
-  handoff.
-- **WS-36** (`parity/ws-36`): symbol navigation behind search, explain and impact.
-- **WS-42** (`parity/ws-42`): repeat guard and revision-keyed result cache.
-- **WS-CQ-01** (`parity/ws-cq-01`): one route list for the API.
+- None. Every workstream started through 2026-09-30 is merged; the next batch is the
+  parity plan's Phase A to Phase D hygiene and review-finding rows, tracked in the plan.
 
 **Planned**
 
 - WS-21B: hardening for `why_failed` command mode.
-- A large-result fixture for the Pi adapter e2e (WS-24 follow-up).
+- A large-result fixture for the Pi adapter e2e (WS-24 follow-up; WS-41 removed the
+  `run --` dependency, the fixture itself is still missing).
 - Wave 3, including WS-50 (the parity evaluation suite and final parity-scale gate).
 
 ## Check it yourself
