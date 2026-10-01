@@ -252,6 +252,11 @@ first-parent merge commit on `feat/parity-v2`.
   `mcp` object. Loaded from a source checkout.
 - **WS-CQ-01** (`4ca0cc7`): one route list for the API, split from `registerRoutes` into
   per-area route modules with table-driven registration.
+- **WS-33** (`5235a78`): session ledger, compaction snapshot and cross-client handoff. A
+  durable ledger per workspace, client, session and principal records tool calls with
+  argument digests and evidence handles, files read and modified, decisions and errors;
+  a 2 KB priority-tiered PreCompact snapshot is re-injected at SessionStart, and a
+  handoff capsule carries one session's state to the next.
 - **WS-42** (`b40475d`): repeat guard and revision-keyed result cache. A per-session guard
   keyed on (tool, canonical args, raw sha, repo revision) answers `unchanged since call X`
   for repeated reads, with exemptions for side-effecting calls; a byte-capped cache
@@ -277,7 +282,7 @@ first-parent merge commit on `feat/parity-v2`.
 - **WS-39** (`5e8cb3a`): scope/import resolvers for Rust (use paths, impl blocks, traits),
   Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), on the
   same confidence tiers, provenance and drop counters as the Go and TS/JS resolvers.
-  Measurements in `benchmarks/2026-09-30-ws39-resolvers.md`.
+  Measurements in [WS-39](benchmarks/2026-09-30-ws39-resolvers.md).
 
 **On workstream branches, not yet merged**
 

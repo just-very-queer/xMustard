@@ -1,4 +1,4 @@
-> **Superseded.** This goal was never executed and is replaced by `goal/xmustard_commandcode_goal.md` (the xMustard parity Command Code hand-off goal, 2026-10-02). Its section 2 state, its executor split and its OpenCode channel are stale; its rules and anti-slop appendix carried forward there.
+> **Superseded.** This goal was never executed. Its live successor is the xMustard parity Command Code hand-off goal of 2026-10-02, kept outside the repository at `.git/xm-parity/goal/xmustard_commandcode_goal.md` in the owner's checkout: this goal's §2 state, executor split and OpenCode channel are stale, while its rules and anti-slop appendix carried forward into that file.
 
 # xMustard parity completion goal (feat/parity-v2 HEAD 5e8cb3a)
 
