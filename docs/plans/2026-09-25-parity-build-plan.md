@@ -726,6 +726,23 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
   - Gate: `scripts/bench/rss_bench_v2.py`, its test and the README; `scripts/bench/budget_ledger.json` (a prose `note` on the WS-15 line, not a governance change: `rss_v2.sh ledger --diff` lists none).
   - Docs: `docs/ARCHITECTURE.md`, `docs/benchmarks/2026-09-28-ws15-watcher.md` and its evidence under `docs/benchmarks/evidence/2026-09-28/ws15-*`.
 
+### WS-DOC-01 — Remove the duplicated WS-16..WS-34 sections from the plan
+
+**Goal.** The plan carries two copies of the WS-16..WS-34 sections. Copy 1 (the canonical one) holds the ids and the implementation records; copy 2, introduced by `09d58ee`, repeats the same headings with older text. Collapse them to one copy, porting every line copy 2 carries that copy 1 does not, so nothing is lost.
+
+**Requirements.** No PAR ids: this row is plan hygiene, not a capability. It touches the section bodies of WS-16..WS-34 and WS-21B, whose own PAR ids stay where they are.
+
+**Files.** `docs/plans/2026-09-25-parity-build-plan.md`
+
+**Tests required.**
+- A script lists, per `### WS-NN` section, every line of copy 2 absent from copy 1. It runs before the edit (the lines to port) and after it (expect 0).
+- For each id in 16..34 and 21B, `grep -c "^### WS-<id> "` is exactly 1.
+- `git diff` is deletions plus the ported lines only, so a reviewer can read the port list and check each entry.
+
+**Acceptance.** Each id in 16..34 and 21B appears once; re-running the script lists 0 unported lines; the diff holds deletions and the listed ports and nothing else.
+
+**Collision risk.** None: a docs-only change to one file, from a worktree branched at the current `feat/parity-v2` tip. The canonical copy's line numbers shift once copy 2 is deleted, so any row citing `P:n` for a plan line above 1712 moves down by the number of deleted lines. The script and the commit body carry before/after line numbers for every id so a later reader can re-derive the citation.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
