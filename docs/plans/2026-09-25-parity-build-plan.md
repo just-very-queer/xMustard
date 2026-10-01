@@ -796,6 +796,24 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - Review: rounds 1-3, `gate=PASS` at `reviews/ws-doc-02/r3`, triage-check AGREE. Ten findings, all fixed (`aa9adda`, `fd820eb`, `015c50b`, `811c2f0`, `6b9de96`, `0f4fc38`).
 - Next step: free space on the box, then run `BOXALL` on `0f4fc38`. If it is green, merge with `--no-ff` under the lock and re-run `BOXALL` on the merge commit. No code changed, so the gate only has to confirm the tree still builds; `scripts/check-status-merges.py` must also stay green after the merge, since this task's own merge adds a `ws-doc-*` row it exempts by pattern.
 
+### WS-HYG-01 — Re-measure the tools/list byte caps and drop the provisional wording
+
+**Goal.** `api-go/internal/mcpserver/testdata/tools_list_budget.json` holds `tools/list` byte caps whose `about` field admits they are "provisional sums pending a remote re-measurement", and the record in WS-33 (line 1717 of the pre-dedup file) says the same. The sums were computed by hand from each merged workstream's own stated delta, never measured at the tip. WS-HYG-01 substitutes the sizes `TestToolsListStaysWithinByteCaps -v` actually reports at the tip into the full caps, drops both "provisional" phrases from `about`, and records one sentence saying the caps were re-measured and on what date.
+
+**Requirements.** No new PAR ids. This is the H0 remainder of tools/list hygiene: the caps are a tested contract (`TestToolsListStaysWithinByteCaps`) whose `lean` caps already equal measured sizes and whose `full` caps are hand-summed. It closes no requirement; it stops the record asserting a number it never measured.
+
+**Files.** `api-go/internal/mcpserver/testdata/tools_list_budget.json`, `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- `go test -count=1 -v -run TestToolsListStaysWithinByteCaps ./internal/mcpserver` passes with the substituted caps, and its `-v` output names each measured size.
+- The `lean` caps are unchanged by this row: each measured lean size is at or under its cap, and no lean cap rises.
+- Each measured size is at or under the cap it replaces, or the row stops (below). A cap that would rise is a STOP, not a substitution.
+- After the edit `rg -ci provisional` on the JSON file prints 0.
+
+**Acceptance.** The `full` caps in `testdata/tools_list_budget.json` equal the sizes `TestToolsListStaysWithinByteCaps -v` reports at the tip for every schema profile, protocol version and role profile. The `lean` caps are untouched, and every one is still at or above its measured size (so a shrink in a lean profile would be recorded, not silently kept as headroom). Both "provisional" phrases are gone from `about`; the WS-33 record's "Marked provisional in the `about` field" line is corrected to name this row. `about` gains one sentence naming the re-measurement and its date. `CAPS` passes and the measured sizes equal the caps where the acceptance requires it. If any measured size exceeds its current cap, the task stops and reports rather than raising a cap (a cap rise is an owner decision under G§5.8, and the goal's stop conditions treat a cap that would rise as a STOP).
+
+**Collision risk.** One JSON testdata file plus this section of the plan. The JSON file is read by `cmd/xmustard-api` at runtime for `role_profiles` and by `internal/mcpserver`'s cap test for the caps, and it is not written by any other row in the queue; the last rows that touched it (WS-28, WS-31) are merged. The plan section is new and sits between WS-DOC-02 and WS-16, so it moves every later `### WS-` heading down by its own length; §4.8 step 2 re-reads the plan diff after merging `feat/parity-v2`.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
