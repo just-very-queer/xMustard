@@ -19,7 +19,8 @@ STATUS = Path("docs/STATUS.md")
 CUT = "09d2a1f"
 # Merges that are not product workstreams and so have no STATUS.md row: the release
 # merge-back, and the plan-hygiene WS-DOC rows (they change the plan, not the product).
-NOT_WORKSTREAMS = {"rel-011", "ws-doc-01"}
+NOT_WORKSTREAMS = {"rel-011"}
+DOC_ROW = re.compile(r"^ws-doc-")
 
 
 def git(*args: str) -> str:
@@ -66,12 +67,16 @@ def main() -> int:
 
     unmerged = text[text.index("**On workstream branches"):]
     unmerged = unmerged[: unmerged.index("**Planned")]
-    stale = re.findall(r"\*\*WS-([0-9A-Za-z-]+)\*\*", unmerged)
+    listed = {slug_of(i) for i in re.findall(r"\*\*WS-([0-9A-Za-z-]+)\*\*", unmerged)}
+    # A workstream already merged must not still be listed as unmerged. One that has
+    # not merged is legitimate there: that is what the list is for.
+    stale = sorted(listed & set(merged))
     if stale:
-        errors.append(f"still listed as unmerged: {', '.join(sorted(set(stale)))}")
+        errors.append(f"still listed as unmerged: {', '.join(stale)}")
 
     named = {slug_of(ident) for ident, _ in rows}
-    missing = sorted(set(merged) - named - NOT_WORKSTREAMS)
+    expected = {s for s in merged if s not in NOT_WORKSTREAMS and not DOC_ROW.match(s)}
+    missing = sorted(expected - named)
     if missing:
         errors.append(f"merged but no row in the section: {', '.join(missing)}")
 
