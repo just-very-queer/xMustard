@@ -790,6 +790,12 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *Checks.* `python3 scripts/check-status-merges.py` and `--self-test` (both pass); `python3 -m py_compile scripts/check-status-merges.py`; `git cat-file -t` and `git log -1 --format=%s` on all 13 shas in STATUS.md, each the 2-parent merge of the workstream its row names; `git ls-files --error-unmatch docs/benchmarks/2026-09-30-ws39-resolvers.md` (H0); `git diff --numstat -- goal/xmustard_parity_completion_goal.md` = 2 added 0 removed; `sed -n '605,618p' integrations/pi/src/delivery.ts` for the pause conditions. Not run: `BOXALL` and `PI`, box disk full.
 - *Follow-ups.* Re-run the Pi e2e once the box has free space, to say whether WS-24's nine failures still stand (owner: whoever owns the fixture; it is WS-44's 44e scope).
 
+**PARKED (2026-10-02).** Not merged: the review is complete and the gate passes, but the build box's root filesystem is at 100%, so `BOXALL` cannot run and the goal's merge rule requires `remote_exit=0` on the merged commit. Nothing about the task is unfinished.
+- Last sha `0f4fc38` on `parity/ws-doc-02`, branched at `24a80be`. Worktree `/private/tmp/claude-501/xm-wt/ws-doc-02`, kept.
+- Works: STATUS.md's 13 merged rows, the WS-24 record correction, the superseded-goal line, `scripts/check-status-merges.py` and its `--self-test`. Local: `OK 13 merged rows, 15 post-cut merges, all shas agree` and `SELF-TEST OK 10 rules, each caught when broken`.
+- Review: rounds 1-3, `gate=PASS` at `reviews/ws-doc-02/r3`, triage-check AGREE. Ten findings, all fixed (`aa9adda`, `fd820eb`, `015c50b`, `811c2f0`, `6b9de96`, `0f4fc38`).
+- Next step: free space on the box, then run `BOXALL` on `0f4fc38`. If it is green, merge with `--no-ff` under the lock and re-run `BOXALL` on the merge commit. No code changed, so the gate only has to confirm the tree still builds; `scripts/check-status-merges.py` must also stay green after the merge, since this task's own merge adds a `ws-doc-*` row it exempts by pattern.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
