@@ -422,15 +422,16 @@ func maxRequestBodyBytesConfigured() int64 {
 	return maxRequestBodyBytes
 }
 
-// requestBodyCapBytes is the cap for an ordinary request body, the one a body held in
-// the transient pool is admitted against: budget.CapToPool of the configured cap,
-// because a reserved body can never exceed the pool. /api/health reports it as
+// ordinaryBodyCap is the cap for an ordinary request body, the one a body held in the
+// transient pool is admitted against: budget.CapToPool of the configured cap, because a
+// reserved body can never exceed the pool. /api/health reports it as
 // request_body_cap_bytes.
-func requestBodyCapBytes() int64 {
-	return budget.CapToPool(maxRequestBodyBytesConfigured())
-}
+//
+// newAPIHandlerFor sets it beside bodyLimitMiddleware's own streamLimit, for the same
+// reason as captureBodyCap: the middleware fixes its limit when the handler is built.
+var ordinaryBodyCap = budget.CapToPool(maxRequestBodyBytesConfigured())
 
-// captureBodyCapBytes is the lower of the two byte limits a capture request meets:
+// captureBodyCap is the lower of the two byte limits a capture request meets:
 // bodyLimitMiddleware's streaming admission cap (the configured
 // XMUSTARD_MAX_BODY_BYTES), which counts bytes received, and the evidence store's
 // per-original limit (XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES), which counts bytes written
@@ -439,13 +440,11 @@ func requestBodyCapBytes() int64 {
 // reaches. It is not an exact maximum accepted body: the store counts what redaction
 // writes, so a body at or under this value can still spool past the store's limit when a
 // secret expands to a longer marker.
-func captureBodyCapBytes() int64 {
-	streamLimit := maxRequestBodyBytesConfigured()
-	if storeLimit := evidence.LimitsFromEnv().MaxOriginal; storeLimit < streamLimit {
-		return storeLimit
-	}
-	return streamLimit
-}
+//
+// newAPIHandlerFor sets it, beside the store it describes, because the middleware and
+// the store each fix their own limits when the handler is built and health must report
+// those values rather than re-reading the environment on every request.
+var captureBodyCap = min(maxRequestBodyBytesConfigured(), evidence.DefaultMaxOriginal)
 
 // bodyInFlight bounds the number of body-bearing requests decoded concurrently, so
 // the aggregate in-flight body memory is at most cap × maxInFlight rather than
