@@ -919,15 +919,16 @@ pub fn search(
     };
     // The proximity lane does not run in text mode, so its blast-radius walk is not read:
     // the traversal is bounded by the graph depth but scales with the seed's reach.
-    let seed_impact = (!body_only)
-        .then(|| effective_seed.as_ref())
-        .flatten()
-        .and_then(|seed_name| {
+    let seed_impact = if body_only {
+        None
+    } else {
+        effective_seed.as_ref().and_then(|seed_name| {
             graph
                 .impact(seed_name, PROXIMITY_DEPTH)
                 .inspect_err(|e| read_errors.push(("seed impact", e.clone())))
                 .ok()
-        });
+        })
+    };
     if let Some(impact) = seed_impact {
         let mut prox: HashMap<String, f64> = HashMap::new();
         // The proximity map is keyed by path and read straight off the seed's blast
