@@ -831,3 +831,56 @@ fn resident_bm25_cache_stays_within_its_line() {
         );
     }
 }
+
+/// A resident service stops answering from its cached snapshot when the index
+/// directory stops being one a reader may trust (WS-FIX-11).
+///
+/// This is the path the unit-level tests cannot reach: `Snapshots::open` serves a
+/// cached snapshot whenever the store's stat stamp is unchanged, so a directory the
+/// operator widened *after* the first query is never re-examined unless the check runs
+/// on the cache hit. Two searches prove it: one populates the cache, then the mode is
+/// widened, then the next must not answer from the store.
+#[test]
+fn a_resident_service_drops_its_cached_snapshot_when_the_dir_widens() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function alphaOnlyName() { return 1; }\n")]);
+    let root = r.path().to_str().unwrap().to_string();
+    let dir = TempDir::new().unwrap();
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let built = Command::new(BIN)
+        .args(["index", "build", &root])
+        .env("XMUSTARD_INDEX_DIR", dir.path())
+        .output()
+        .unwrap();
+    assert!(
+        built.status.success(),
+        "{}",
+        String::from_utf8_lossy(&built.stderr)
+    );
+
+    let mut s = Serve::start(dir.path(), "off");
+    let first = s.call("search", &[&root, "ws", "alphaOnlyName", "25"]);
+    assert_eq!(
+        first["freshness"]["source"].as_str(),
+        Some("resident_index"),
+        "{first:#}"
+    );
+
+    // the operator widens the directory after the snapshot was cached; the store's
+    // stamp is unchanged, so only an explicit re-check notices
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+    let second = s.call("search", &[&root, "ws", "alphaOnlyName", "25"]);
+    assert_ne!(
+        second["freshness"]["source"].as_str(),
+        Some("resident_index"),
+        "a resident service kept answering from a group-writable index directory: {second:#}"
+    );
+
+    fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let third = s.call("search", &[&root, "ws", "alphaOnlyName", "25"]);
+    assert_eq!(
+        third["freshness"]["source"].as_str(),
+        Some("resident_index"),
+        "the resident index did not come back after chmod 700: {third:#}"
+    );
+}

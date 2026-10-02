@@ -2351,7 +2351,8 @@ fn a_search_does_not_answer_from_a_writable_index_dir() {
     // served from the trusted directory: the index itself answers
     let trusted = search_in(&named);
     assert_eq!(
-        trusted["freshness"]["source"], "index",
+        trusted["freshness"]["source"].as_str(),
+        Some("index"),
         "the trusted directory did not serve the index: {trusted:#}"
     );
 
@@ -2360,7 +2361,8 @@ fn a_search_does_not_answer_from_a_writable_index_dir() {
     fs::set_permissions(&named, fs::Permissions::from_mode(0o770)).unwrap();
     let untrusted = search_in(&named);
     assert_ne!(
-        untrusted["freshness"]["source"], "index",
+        untrusted["freshness"]["source"].as_str(),
+        Some("index"),
         "a search answered from a group-writable index directory: {untrusted:#}"
     );
     assert_eq!(
@@ -2372,8 +2374,8 @@ fn a_search_does_not_answer_from_a_writable_index_dir() {
     // permanent loss of the index
     fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
-        search_in(&named)["freshness"]["source"],
-        "index",
+        search_in(&named)["freshness"]["source"].as_str(),
+        Some("index"),
         "the index did not come back after chmod 700"
     );
 }

@@ -1024,10 +1024,9 @@ impl Snapshots {
         if let Some(e) = state.as_mut()
             && Some(e.stamp) == now_stamp
         {
-            // A cached snapshot is served only while its directory is still one a reader may
-            // trust: the store can sit unchanged inside a directory the operator has since
-            // widened, and an unchanged stamp would otherwise skip the check entirely
-            // (WS-FIX-11).
+            // The same rule the reload below applies, needed here because this arm
+            // returns before reaching it: a cached snapshot outlives a directory the
+            // operator has since widened (WS-FIX-11).
             if let Some(dir) = e.loc.db.parent()
                 && super::check_index_dir(dir, operator_named(root)).is_err()
             {
@@ -1051,6 +1050,18 @@ impl Snapshots {
                 }
             },
         };
+        // A cached snapshot is served only while its directory is still one a reader may
+        // trust. The store's own stamp does not notice a directory that was widened
+        // after the snapshot was loaded, and a read-only connection creates the WAL on
+        // its first use, so the stamp is not even stable between two reads of an
+        // unchanged store. The check therefore runs on the way into the reload too, not
+        // only on a cache hit (WS-FIX-11).
+        if let Some(dir) = loc.db.parent()
+            && super::check_index_dir(dir, operator_named(root)).is_err()
+        {
+            *state = None;
+            return None;
+        }
         let Some(st) = stamp(&loc.db) else {
             *state = None;
             return None;
