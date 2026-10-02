@@ -409,6 +409,37 @@ fn a_seed_set_truncated_by_the_target_cap_is_never_exact() {
     assert_eq!(v["epistemic"]["causes"]["targets_truncated"], 1, "{v:#}");
 }
 
+// The converse, and the case review round 1 caught: a target that EXPANDS to more than
+// MAX_TARGETS seeds keeps every one of them, so nothing was dropped and the answer stays
+// `exact`. A file walks with the symbols it declares, so a file with 25 top-level
+// declarations produces 25 seeds through ONE lookup node. Capping the displayed target
+// list is not the same as losing a seed, and conflating them made this answer a lower
+// bound it had not earned.
+#[test]
+fn a_seed_set_that_expands_past_the_target_cap_is_still_exact() {
+    let mut decls = String::new();
+    for i in 0..25 {
+        decls.push_str(&format!(
+            "export function wide{i:02}(): number {{ return {i}; }}\n"
+        ));
+    }
+    let r = repo(&[
+        ("src/wide.ts".to_string(), decls),
+        (
+            "src/user.ts".to_string(),
+            "import { wide00, wide24 } from './wide';\nexport function caller(): number { return wide00() + wide24(); }\n".to_string(),
+        ),
+    ]);
+    build(r.path());
+    let v = sg("impact", r.path(), &["--limit=500"], &["src/wide.ts"]);
+    // 25 seeds from one lookup node: the displayed list is capped, nothing was dropped
+    assert_eq!(v["targets_truncated"], true, "{v:#}");
+    // and the dependent behind the LAST declaration is still found
+    assert!(names(&v).contains("caller"), "{v:#}");
+    assert_eq!(v["epistemic"]["completeness"], "exact", "{v:#}");
+    assert_eq!(v["epistemic"]["causes"], serde_json::json!({}), "{v:#}");
+}
+
 #[test]
 fn trace_reports_hops_direction_furthest_and_caps() {
     let r = graph_fixture();
