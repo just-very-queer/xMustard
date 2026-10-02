@@ -49,9 +49,13 @@ const (
 
 // InvalidationReport is what one invalidation looked at and marked.
 type InvalidationReport struct {
-	Paths   int      `json:"paths"`
-	Checked int      `json:"anchors_checked"`
-	Marked  []string `json:"marked"`
+	Paths   int `json:"paths"`
+	Checked int `json:"anchors_checked"`
+	// Reanchored counts the quoted-code anchors that followed their code to new lines
+	// (WS-28B). They are not drift and not marked: the memory still points at what it
+	// quoted, one range over.
+	Reanchored int      `json:"anchors_reanchored,omitempty"`
+	Marked     []string `json:"marked"`
 	// Truncated: more than maxInvalidationAnchors anchors lay in the paths; the rest were not checked.
 	Truncated bool `json:"truncated,omitempty"`
 }
@@ -77,6 +81,7 @@ var anchorRehashers = map[string]struct {
 type rehashSession struct {
 	ctx               context.Context
 	root, workspaceID string
+	dataDir           string
 	files             map[string]fileRead
 	outlines          map[string]outlineRead
 }
@@ -266,6 +271,7 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 		anchors = anchors[:maxInvalidationAnchors]
 	}
 	session := newRehashSession(ctx, root, workspaceID)
+	session.dataDir = dataDir
 	hit := map[string][]govstore.AnchorRef{}
 	for _, a := range anchors {
 		rehash, ok := anchorRehashers[a.Kind]
@@ -277,6 +283,14 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 			hit[a.EntryID] = append(hit[a.EntryID], govstore.AnchorRef{Kind: a.Kind, Value: a.Value})
 		}
 	}
+	// A quoted-code anchor has no baseline: its lines shift with every edit above them,
+	// so it is re-found and either followed or marked (WS-28B). The pass marks the
+	// entries whose code is gone, so it reports those entries itself rather than letting
+	// the MarkStale below name them: that one is idempotent and would find them already
+	// flagged, and the report would read empty while ground lists them at risk.
+	reanchored, codeMarked := reanchorCode(ctx, session, anchors)
+	rep.Reanchored = reanchored
+	rep.Marked = append(rep.Marked, slices.Sorted(maps.Keys(codeMarked))...)
 	if len(hit) == 0 {
 		return rep, nil
 	}

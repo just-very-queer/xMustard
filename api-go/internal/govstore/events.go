@@ -70,6 +70,9 @@ const (
 	// EventCorroborate records a principal restating a served memory instead of adding
 	// a duplicate (WS-27): its first restatement, or one citing new evidence.
 	EventCorroborate = "corroborate"
+	// EventAnchorReanchor records a memory's quoted-code anchor following its code to
+	// the lines it moved to (WS-28B): the range it left and the range it took.
+	EventAnchorReanchor = "anchor_reanchor"
 )
 
 var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, EventEdit, EventRevisionAccepted,
@@ -78,7 +81,7 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
 	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
 	EventMergeApproval, EventMergeApprovalRevoked, EventReviewRecord, EventReviewFinding, EventReviewTriage,
-	EventReviewReanchor, EventMemoryPolicy, EventCorroborate)
+	EventReviewReanchor, EventMemoryPolicy, EventCorroborate, EventAnchorReanchor)
 
 // eventSubjects is the subject kind each review event type names. Every other type
 // names a memory (or nothing), so AppendEvent, which writes memory events, can never

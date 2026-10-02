@@ -355,7 +355,9 @@ func locateQuote(path, content, code string) (start, end int, ok bool) {
 // once, as a code anchor "path#Lstart-Lend". Files are read one at a time, in order,
 // only while a block is unplaced, and only within the quote placement bounds; the
 // placement's bytes are reserved in the transient pool first, and a refusal skips it
-// with a warning.
+// with a warning. Each placed anchor carries snippetID as its symbol_uid: WS-28B
+// re-anchors a code anchor by the snippet it placed, and the line range in the value is
+// exactly what such a move rewrites.
 func quoteAnchors(root string, quotes, files []string) ([]govstore.AnchorInput, string) {
 	if root == "" || len(quotes) == 0 || len(files) == 0 {
 		return nil, ""
@@ -385,9 +387,9 @@ func quoteAnchors(root string, quotes, files []string) ([]govstore.AnchorInput, 
 		}
 	}
 	var out []govstore.AnchorInput
-	for _, v := range placed {
+	for i, v := range placed {
 		if v != "" {
-			out = append(out, govstore.AnchorInput{Kind: govstore.AnchorCode, Value: v, Extracted: true})
+			out = append(out, govstore.AnchorInput{Kind: govstore.AnchorCode, Value: v, Extracted: true, SymbolUID: snippetID(quotes[i])})
 		}
 	}
 	return out, ""
