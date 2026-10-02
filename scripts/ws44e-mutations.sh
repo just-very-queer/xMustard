@@ -81,7 +81,7 @@ mutate M1 "${TAB}if (!enabled) return;" "" || true
 
 mutate M2 'command.trim() === "" || ALREADY_WRAPPED.test(command.trim())' 'ALREADY_WRAPPED.test(command.trim())' || true
 
-mutate M3 'event.toolName !== "bash"' 'false' || true
+mutate M3 'if (!isRecord(event) || event.toolName !== "bash") return;' 'if (!isRecord(event)) return;'
 
 mutate M4 'if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return;' 'if (ALREADY_WRAPPED.test(command.trim())) return;' || true
 
