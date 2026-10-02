@@ -2250,6 +2250,20 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
 - **Checks.** `gofmt -l` empty on all four changed `.go`; `go vet ./internal/mcpserver ./internal/toolcompat` clean; `go test -p 1 -count=1 ./internal/mcpserver ./internal/toolcompat` ok. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — the row changes no index, no memory, no Pi source, no route gate, no projection and no `tools/list` byte, so §3.0 names none of them.
 - **Follow-ups.** (a) The other raw-map visits in `mcpserver` were checked and are order-insensitive: `dispatch.go:118` sums argument bytes for a budget reservation and `docs_resource.go:158` copies a map, so neither depends on visit order. `compat.go:84` (`aliasNorms`) ranges `aliased` but sorts immediately after. No further deterministic-order work is needed in this package on this ground. (b) FU:263's two under-asserting tests were not named in the FU line; this record names the two it fixed, and other packages may hold more instances of the same pattern. (c) The `api-go/cmd/xmustard-mcp/main.go` `buildArgs` that `search` surfaced is the pre-WS-04 stdio shim's own copy, indexed at the owner's `feat/product-v1`; it does not exist on this branch (WS-04 moved argument building into `mcpserver`), and no `range raw` remains in the shim, so this fix covers that path too.
 
+### WS-FIX-25 — Watcher `detail` strings are not injection-scanned; the ARCHITECTURE index claim
+
+**Goal.** Close the WS-56 follow-up recorded at FU:231 ("ground coverage carries watcher `detail` strings built from paths that WS-56 does not scan (low risk; directory names could carry injection text) -> WS-56 follow-up") and the row's second half.
+1. The watcher builds its `detail` from repository-controlled path text with no admission scan. `watch.rs` `add_watch` formats `path.display()` into `"the OS watch limit was reached (inotify max_user_watches, ENOSPC) at {}"` and `"watching {} failed: {e}"`; `start_native` formats `layout.root.display()` into `"{} cannot be watched"`; `degrade` carries that text into `inner.detail`, and `Root::status()` serialises it as the `"detail"` field. A directory name is attacker-chosen for any path a client can create, so this text can carry instruction-like prose, invisible framing characters and bidi overrides into a field xMustard hands to an agent. Every other pushed surface (`AdmitMemory`, WS-56) scans first; this one does not.
+2. The row also records that `docs/ARCHITECTURE.md` says the code index store is unread. At `b8df1e0` that sentence is gone: the `Code index store` row now describes `index.db` per workspace, readers holding snapshots and the freshness envelope, and the stale phrase is not in `docs/`. Recorded as already fixed rather than re-fixed.
+
+**Requirements.** PAR-SEC-02, PAR-ADP-01, PAR-HAR-03 (text xMustard pushes into an agent's context is scanned and labelled as data; the same content as a path or as prose cannot become an instruction).
+
+**Files.** `rust-core/src/index/watch.rs` (the repository-controlled path text in the `detail` builders, and its tests), `docs/ARCHITECTURE.md` (checked, unchanged: the stale claim is already absent), `docs/plans/2026-09-25-parity-build-plan.md` (this record).
+
+**Tests required.** A test that builds each `detail` string with a directory name carrying instruction-like prose, a zero-width character and a bidi override, and asserts none of that text survives into `Root::status()["detail"]` while the sentence's own operator-facing facts (the watch limit, the failing path's position) still do. A second case that a normal path name still renders unchanged, so the defence cannot pass by blanking the field.
+
+**Acceptance.** An injected `detail` is refused or neutralised by the boundary scan, asserted by a test that fails without the change (measured before the fix, §Implementation record). No `tools/list` byte, projection, route gate, memory shape or index byte changes; `BOX1` focused and `BOXALL` pass.
+
 ### WS-37 — Static-embedding semantic lane with binary/int8 vector index
 
 **Goal.** Deliver the following:
