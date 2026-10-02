@@ -77,8 +77,12 @@ type SavedIssueViewRequest struct {
 // "/", "\", a NUL and a control character all refused. It is not workspaceops's own
 // validateSafeID because that one has no length ceiling, and an unbounded id grows a
 // file name and an activity line with no bound.
+//
+// The one extra refusal is a lone ".", which transport.ValidWorkspaceID accepts and
+// the read layer's safeSegment does not: it answers 400 invalid_id for a wildcard of
+// exactly ".", so an id of "." would be stored and then unreachable.
 func checkPlatformID(kind, id string) error {
-	if !transport.ValidWorkspaceID(id) {
+	if id == "." || !transport.ValidWorkspaceID(id) {
 		return fmt.Errorf("invalid %s id: %w", kind, ErrInvalidInput)
 	}
 	return nil
@@ -96,12 +100,18 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 	if err != nil {
 		return nil, err
 	}
+	// The supplied id is checked before the trim: firstNonEmptyPtr trims, so
+	// checking its result would turn "TRK_0001\n" into a valid "TRK_0001" and
+	// normalize a control character at either end away instead of refusing it. An
+	// absent or blank id still falls through to the generated one.
+	if request.BugID != nil && strings.TrimSpace(*request.BugID) != "" {
+		if err := checkPlatformID("issue", *request.BugID); err != nil {
+			return nil, err
+		}
+	}
 	bugID := strings.TrimSpace(firstNonEmptyPtr(request.BugID))
 	if bugID == "" {
 		bugID = nextTrackerIssueID(tracked)
-	}
-	if err := checkPlatformID("issue", bugID); err != nil {
-		return nil, err
 	}
 	for _, item := range tracked {
 		if item.BugID == bugID {

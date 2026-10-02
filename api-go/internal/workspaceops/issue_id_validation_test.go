@@ -18,9 +18,9 @@ const (
 
 // A create must not mint an id the read layer then refuses. The read layer accepts a
 // platform wildcard that is one safe segment, so each id below is one this API would
-// answer 400 invalid_id for on the next read of the object it just wrote. The control
-// character is embedded: CreateIssue trims a leading or trailing space, so a
-// trailing newline is normalized away before any id rule sees it.
+// answer 400 invalid_id for on the next read of the object it just wrote. The leading
+// and trailing control characters are the whole id apart from a space, which the
+// create trims; they must still be refused rather than normalized away.
 func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -31,6 +31,9 @@ func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 		{"nul byte", "TRK_0001\x00"},
 		{"backslash", `TRK_0001\x`},
 		{"embedded control character", "TRK_0001\n0002"},
+		{"trailing control character", "TRK_0001\n"},
+		{"leading control character", "\nTRK_0001"},
+		{"a lone dot", "."},
 		{"over long", strings.Repeat("a", overLongID)},
 	}
 	for _, c := range cases {
@@ -123,7 +126,9 @@ func TestCreateSavedViewKeepsANameThatSlugsCleanly(t *testing.T) {
 }
 
 // The minted id is bounded at create, so a stored view id is always short enough to
-// be carried by a path and hashed into an activity id.
+// be carried by a path and hashed into an activity id. The length is asserted
+// together with the charset and the ".." rule, because a ceiling that only checks
+// length would still let an id the read layer refuses through.
 func TestMintedViewIdStaysWithinTheLengthCeiling(t *testing.T) {
 	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
 
@@ -135,6 +140,14 @@ func TestMintedViewIdStaysWithinTheLengthCeiling(t *testing.T) {
 	}
 	if len(view.ViewID) > idLenCeiling {
 		t.Fatalf("view id is %d bytes, over the %d ceiling", len(view.ViewID), idLenCeiling)
+	}
+	for _, r := range view.ViewID {
+		if !('0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || r == '_' || r == '.' || r == '-') {
+			t.Fatalf("minted view id %q holds %q, which the read layer refuses", view.ViewID, r)
+		}
+	}
+	if strings.Contains(view.ViewID, "..") {
+		t.Fatalf("minted view id %q holds a parent segment", view.ViewID)
 	}
 }
 

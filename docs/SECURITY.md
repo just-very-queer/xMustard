@@ -378,13 +378,16 @@ Anything else answers `400 invalid_id`. The run store also refuses a run id that
 not a plain identifier.
 
 Issue and view ids are also checked when they are created, so a create cannot mint an
-id the read layer would refuse. `POST /api/workspaces/{workspace_id}/issues` and
-`POST /api/workspaces/{workspace_id}/views` refuse a `bug_id` or view name that is
-not a plain identifier (letters, digits, `_`, `.`, `-`, at most 128, no `..`, no `/`,
-`\`, NUL or control character) with `400`. The rule is the same one a hook's
-`XMUSTARD_WORKSPACE_ID` pin gets. The ids other producers mint are unaffected: the
-GitHub import's `GH-<n>`, the generated `TRK_%04d`, and the ledger's `P0_25M03_001`
-all pass.
+id the read layer would refuse. `POST /api/workspaces/{workspace_id}/issues` refuses a
+`bug_id` that is not a plain identifier (letters, digits, `_`, `.`, `-`, at most 128,
+no `..`, no `/`, `\`, NUL or control character, and not a lone `.`) with `400`, checked
+before the value is trimmed, so a control character at either end is refused rather
+than normalized away. `POST /api/workspaces/{workspace_id}/views` checks the id it
+generates from the name, so a free-form name with spaces still creates; what is
+refused is a name that would slug to an unusable id. Both use the rule a hook's
+`XMUSTARD_WORKSPACE_ID` pin gets, so a stored id is always one the read routes carry.
+The ids other producers mint are unaffected: the GitHub import's `GH-<n>`, the
+generated `TRK_%04d`, and the ledger's `P0_25M03_001` all pass.
 
 If the mux matches a route that has no gate row, the request answers
 `500 unclassified_route` instead of reaching the handler. `gatedMux` does not expose
