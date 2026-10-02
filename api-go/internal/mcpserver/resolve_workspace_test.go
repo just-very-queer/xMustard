@@ -169,6 +169,9 @@ func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
 	if !res["isError"].(bool) || !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
 		t.Fatalf("the second failure must open the back-off window: %v", text(res))
 	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	s.mu.Unlock()
 	for i := 0; i < 3; i++ {
 		res, _ = call(t, s, "ground", map[string]any{})
 		if !res["isError"].(bool) {
@@ -188,35 +191,43 @@ func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
 }
 
 // A registered working directory still answers every call while the client's roots
-// are unknown, and still registers nothing. The window is checked by state rather
-// than by wall clock, so the test cannot fail when the host is loaded.
+// are unknown, and still registers nothing. The window is pinned far into the future
+// before the calls that must land inside it, so a slow host cannot expire it and the
+// request count becomes a deterministic assertion.
 func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
 	other := tempRepo(t)
 	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "other-ws", Root: other}}}
 	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
 	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy, busy}}
 	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	// the first two failures open the window
+	for i := 0; i < 2; i++ {
+		if _, _ = call(t, s, "ground", map[string]any{}); client.count() != i+1 {
+			t.Fatalf("after %d calls roots/list was asked %d times", i+1, client.count())
+		}
+	}
+	s.mu.Lock()
+	windowed := s.roots != nil && s.roots.transient && !s.roots.retryAt.IsZero()
+	if windowed {
+		s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	}
+	s.mu.Unlock()
+	if !windowed {
+		t.Fatal("two failures must leave the answer cached with a window")
+	}
+
 	for i := 0; i < 4; i++ {
 		res, _ := call(t, s, "ground", map[string]any{})
 		if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD || ws.Registered {
-			t.Fatalf("call %d: a registered working directory must answer: %+v", i+1, ws)
+			t.Fatalf("call %d: a registered working directory must answer: %+v", i+3, ws)
 		}
 	}
 	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
 		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
 	}
-	// The second failure opened the window, so the calls above added no request. The
-	// assertion is that the cache was consulted, not that the clock held: a window
-	// that expired mid-test would let the next call re-ask, which is correct
-	// behaviour and must not fail this test.
-	s.mu.Lock()
-	cached := s.roots
-	s.mu.Unlock()
-	if cached == nil || !cached.transient || cached.retryAt.IsZero() {
-		t.Fatalf("the failure must be cached with a window: %+v", cached)
-	}
-	if asked := client.count(); asked > 2 {
-		t.Fatalf("roots/list asked %d times; a call reopened the window", asked)
+	if asked := client.count(); asked != 2 {
+		t.Fatalf("roots/list asked %d times inside the window; the calls above must be served from cache", asked)
 	}
 }
 
@@ -265,6 +276,9 @@ func TestMalformedRootsAnswerIsAskedAgain(t *testing.T) {
 	if n := client.count(); n != 2 {
 		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
 	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	s.mu.Unlock()
 	// calls inside the window are served from the cached failure, so no further
 	// request is sent even when the answer would be malformed again
 	for i := 0; i < 3; i++ {
