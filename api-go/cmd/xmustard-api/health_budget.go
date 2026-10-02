@@ -20,6 +20,7 @@ type healthBudget struct {
 	budget.Snapshot
 	CoreWorker          rustcore.WorkerHealth `json:"core_worker"`
 	RequestBodyCapBytes int64                 `json:"request_body_cap_bytes"`
+	CaptureBodyCapBytes int64                 `json:"capture_body_cap_bytes"`
 	InFlightBodies      slotStatus            `json:"in_flight_bodies"`
 }
 
@@ -106,6 +107,7 @@ func healthBudgetBlock() healthBudget {
 		Snapshot:            budget.Status(),
 		CoreWorker:          rustcore.CoreWorkerHealth(),
 		RequestBodyCapBytes: requestBodyCapBytes(),
+		CaptureBodyCapBytes: captureBodyCapBytes(),
 		InFlightBodies:      slotStatus{Cap: cap(bodyInFlight), InUse: len(bodyInFlight)},
 	}
 }

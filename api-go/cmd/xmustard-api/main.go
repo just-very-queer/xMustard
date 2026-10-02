@@ -422,14 +422,24 @@ func maxRequestBodyBytesConfigured() int64 {
 	return maxRequestBodyBytes
 }
 
-// requestBodyCapBytes is the largest request body the capture route actually accepts:
-// the smaller of the streaming admission cap (bodyLimitMiddleware's streamLimit, the
-// configured XMUSTARD_MAX_BODY_BYTES) and the evidence store's per-original limit
-// (XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES), which refuses a spooled original past it with
-// 413 too_large. Whichever binds first is what the server enforces, so health reports
-// that and not either limit alone. bodyLimitMiddleware keeps its own streamLimit for
-// the reserved/streamed split; this is what /api/health advertises.
+// requestBodyCapBytes is the cap for an ordinary request body, the one a body held in
+// the transient pool is admitted against: budget.CapToPool of the configured cap,
+// because a reserved body can never exceed the pool. /api/health reports it as
+// request_body_cap_bytes.
 func requestBodyCapBytes() int64 {
+	return budget.CapToPool(maxRequestBodyBytesConfigured())
+}
+
+// captureBodyCapBytes is the lower of the two byte limits a capture request meets:
+// bodyLimitMiddleware's streaming admission cap (the configured
+// XMUSTARD_MAX_BODY_BYTES), which counts bytes received, and the evidence store's
+// per-original limit (XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES), which counts bytes written
+// to the spool. /api/health reports it as capture_body_cap_bytes, so the advertised
+// number is a limit the server actually enforces on capture rather than one it never
+// reaches. It is not an exact maximum accepted body: the store counts what redaction
+// writes, so a body at or under this value can still spool past the store's limit when a
+// secret expands to a longer marker.
+func captureBodyCapBytes() int64 {
 	streamLimit := maxRequestBodyBytesConfigured()
 	if storeLimit := evidence.LimitsFromEnv().MaxOriginal; storeLimit < streamLimit {
 		return storeLimit
