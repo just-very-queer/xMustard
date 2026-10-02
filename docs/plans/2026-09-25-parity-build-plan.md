@@ -3148,11 +3148,11 @@ Read-only rename/delete impact plans (IMP-09) and exact/regex search (RET-09) ma
 | 59a | this section, the folds, the overlap rulings | — (planning) | none (docs) | S |
 | 59b | `search mode=text`; `lang` becomes a filter for hybrid, not a pattern-mode hint | PAR-RET-01 remainder (body search) | `CAPS`, `RET`, `BOXALL` | M |
 | 59c | `search mode=exact\|regex` as a bounded pread lane: line, byte and time caps; linear-time regex | PAR-RET-09 | `CAPS`, `RET`, `BOXALL` | M |
-| 59d | `impact op=refs\|definition\|implementations`: containing symbol, kind, line, ±1-line snippet, per-edge provenance and confidence; degradation no snippets → per-file counts → total | PAR-IMP-03 | `CAPS`, `BOXALL` | M |
+| 59d | `impact op=refs\|definition\|implementations`: containing symbol, kind, line, ±1-line snippet, per-edge provenance and confidence; occurrence paging `limit`/`cursor`/`max_chars` and degradation no snippets → per-file counts → total | PAR-IMP-03 | `CAPS`, `BOXALL` | M |
 | 59e | `impact` paging remainder: `has_more` / `next_cursor` for the operations form, reusing search's cursor code | PAR-CTX-05 (impact remainder) | `CAPS`, `BOXALL` | S |
-| 59f | read-only `impact op=rename\|delete` plans; a lexical-only plan is labelled unsafe | PAR-IMP-09 | `CAPS`, `BOXALL` | M |
+| 59f | read-only `impact op=rename\|delete` plans; `op=rename` takes `new_name`, and a lexical-only plan is labelled unsafe | PAR-IMP-09 | `CAPS`, `BOXALL` | M |
 
-PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operation paging that WS-59 adds, and the parts no sub-task below covers stay unowned rather than closed. PAR-IMP-03 is owned whole by 59d, degradation ladder included.
+PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operation paging that WS-59 adds, and the parts no sub-task below covers stay unowned rather than closed. PAR-IMP-03 is owned whole by 59d: its occurrence paging (`limit`, `cursor`, `max_chars`) is part of the occurrences form 59d adds, and 59e generalises the cursor for the form WS-59 already ships rather than owning a second page surface.
 
 **Files.** `docs/plans/2026-09-25-parity-build-plan.md` only. No source file is read for behaviour and none is changed; the facts quoted below were verified with `rg` on the tree at this branch's base (`e3a6d00`).
 
