@@ -12,12 +12,12 @@ var searchQueryArgs = []string{"q", "mode", "lang", "seed", "limit", "cursor", "
 
 var searchTool = &Tool{
 	Name:        "search",
-	Description: "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over bodies, comments, names, paths and docs; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: a chunk's text; mode=pattern: ast-grep; mode=symbol: name path.",
+	Description: "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over bodies, comments, names, paths and docs; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: chunk text; mode=pattern: ast-grep; mode=symbol: name path.",
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
-		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (a chunk's text), pattern or symbol"},
-		{Name: "lang", Type: typeString, Desc: "language hint for pattern mode; a filter otherwise"},
+		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (chunk text), pattern or symbol"},
+		{Name: "lang", Type: typeString, Desc: "language hint for pattern mode; filter otherwise"},
 		{Name: "seed", Type: typeString, Desc: "symbol for the proximity lane"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits (default 10)"},
 	},
