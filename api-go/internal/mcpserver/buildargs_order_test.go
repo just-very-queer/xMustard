@@ -78,8 +78,13 @@ func TestBuildArgsAnswersTheSameCallTheSameWayEveryTime(t *testing.T) {
 	// A call that succeeds must build the same arguments every time, so a hidden
 	// alias folds onto its canonical name the same way whatever the visit order.
 	// This one supplies the alias and its canonical name together with the same
-	// value, so it exercises precedence: the canonical spelling wins, the alias is
-	// recorded, and the built map holds the canonical key once.
+	// value. Equal values cannot show which spelling supplied it, so what this
+	// case proves is that the alias is seen and recorded as an alias folded onto
+	// its canonical name (the recorded map holds uid -> symbol and the built map
+	// holds symbol once), and that both spellings yield one built argument
+	// whatever the visit order. Precedence between two *different* values is not
+	// this test's subject: BuildArgs refuses that with a conflict error, and the
+	// order test above covers which spelling that refusal names.
 	aliasOK, _ := ToolByName("impact")
 	wantArgs := map[string]string{"workspace_id": "ws", "symbol": "Store/Capture", "from": "A", "to": "B"}
 	wantAliased := map[string]string{"uid": "symbol"}
