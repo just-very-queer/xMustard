@@ -2226,6 +2226,20 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
 - **Checks.** `gofmt -l` empty on `internal/toolbudget` and `internal/mcpserver`; `go vet` clean on both; `go test -p 1 -count=1 ./internal/toolbudget ./internal/mcpserver` ok (`logs/ws-fix-18-r4-mac-final-20261002T100557Z.log`). Five mutation rows in `reviews/ws-fix-18/r4/slop-audit.md` S5, four failing their named test; the fifth is the twice-survived subject, both surviving runs kept. Not run: `RET`, `BUD`, `PI`, `SECDOC`, `GOLD` — the row changes no index, no memory, no Pi source, no route gate, no projection and no `tools/list` byte, so §3.0 names none of them.
 - **Follow-ups.** (a) `explain` and the other budgeted tools carry no equivalent member, so nothing else needed the same treatment; the scoping test is what keeps that true as ladders change. (b) Proposed owner for the gate tooling: `xm-review-run.sh`'s summary printed `codex_spec=0` and `ocr_review=0` against channel files holding 1 and 1 findings — **tenth row to record it**; the counts were read from the channel files. (c) A `fix_commit` that exists in no branch passes nothing, but the gate resolves it through `git rev-parse` and would have refused this row's r2 triage; it went unnoticed because round 2's own gate run was never completed.
 
+### WS-FIX-24 — WS-FIX-05 minors: deterministic argument visiting, and two tests that check less than their comments claim
+
+**Goal.** Close the two minors the WS-FIX-05 review deferred (FU:263: "map-order argument visiting can name a repairable argument instead of the bad one; two tests check less than their comments claim").
+1. `mcpserver.BuildArgs` walks the raw argument map with `for k, v := range raw`, so Go's randomized map order decides (a) which of several bad arguments is reported and (b) which spelling of an aliased argument wins `args[name] = val`. `impact` carries hidden aliases (`depth`→`max_depth`, `uid`→`symbol`), so a call can be answered about a repairable alias while the genuinely bad argument goes unreported, and `{"uid":"A","symbol":"B"}` silently keeps whichever the map iterator reached last. Visiting `raw` in sorted key order makes the reported argument and the winning value a function of the arguments alone.
+2. Two tests assert less than their comment claims; both are strengthened so the property each comment states is actually checked and fails on mutation.
+
+**Requirements.** PAR-ADP-01, PAR-ADP-02, PAR-HAR-03 (an agent reading an argument error learns what is actually wrong, and the same call always gets the same answer).
+
+**Files.** `api-go/internal/mcpserver/schema.go` (the visiting order in `BuildArgs`), `api-go/internal/mcpserver/server_test.go` (the deterministic-order test and the strengthened assertion), `docs/plans/2026-09-25-parity-build-plan.md` (this record).
+
+**Tests required.** A test that builds the same call repeatedly (many iterations, so a randomized order would show) and asserts the reported argument, the message and the resulting `args` map are identical every time, for a call carrying both a repairable alias and a bad argument, and for a call setting a hidden alias and its canonical name to different values. Both existing tests whose comments overstate their checks are strengthened so each stated property fails on its own mutation.
+
+**Acceptance.** Both cases are asserted by a test that fails without the change (measured before the fix, §Implementation record). No `tools/list` byte, projection, memory shape or route gate changes; `MAC` passes.
+
 ### WS-37 — Static-embedding semantic lane with binary/int8 vector index
 
 **Goal.** Deliver the following:
