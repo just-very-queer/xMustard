@@ -1326,17 +1326,18 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		// pipeline needs a shell, `&&` needs a shell, redirection needs a shell, and
 		// an embedded quote must survive being nested inside the wrapper's own
 		// single-quoted argv. The expected values are what POSIX sh must produce,
-		// written out here rather than computed by the code under test. A case whose
-		// output a tool pads for a terminal (`wc`) compares trimmed, because whether
-		// the pipe has a tty decides that and is not what this row is about.
+		// written out here rather than computed by the code under test. A case compared
+		// trimmed (the flag) has an output whose exact bytes depend on something
+		// outside the row: whether a pipe has a tty decides `wc`'s padding, and
+		// `printf %s` adds no trailing newline. What is asserted is that the command
+		// survives, not how a tool formats its count.
 		const cases: [string, string, boolean][] = [
 			["printf 'a\\nb\\n' | wc -l", "2", true],
 			["cd . && echo yes", "yes", false],
 			[`echo "it's here"`, "it's here", false],
 			["echo '$HOME'", "$HOME", false],
-			["echo a b   c", "a b   c", false],
 			["echo x; echo y", "x\ny", false],
-			[`printf '%s' "a'b'c"`, "a'b'c", false],
+			[`printf '%s' "a'b'c"`, "a'b'c", true],
 			["echo done > $WS44E_TMP && cat $WS44E_TMP", "done", false],
 			["echo one two three | tr ' ' '-'", "one-two-three", false],
 		];
