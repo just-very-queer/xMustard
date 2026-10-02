@@ -15,20 +15,24 @@ echo "TREE=$ROOT"
 SRC=integrations/pi/src/commandwrap.ts
 CFG=integrations/pi/src/config.ts
 DLV=integrations/pi/src/delivery.ts
+IDX=integrations/pi/src/index.ts
 RUST=rust-core/src/run_wrapper.rs
 PRISTINE="$(mktemp -d)"
 cp "$SRC" "$PRISTINE/commandwrap.ts"
 cp "$CFG" "$PRISTINE/config.ts"
 cp "$DLV" "$PRISTINE/delivery.ts"
+cp "$IDX" "$PRISTINE/index.ts"
 cp "$RUST" "$PRISTINE/run_wrapper.rs"
 
 restore() {
 	cp "$PRISTINE/commandwrap.ts" "$SRC"
 	cp "$PRISTINE/config.ts" "$CFG"
 	cp "$PRISTINE/delivery.ts" "$DLV"
+	cp "$PRISTINE/index.ts" "$IDX"
 	cp "$PRISTINE/run_wrapper.rs" "$RUST"
 	if cmp -s "$PRISTINE/commandwrap.ts" "$SRC" && cmp -s "$PRISTINE/config.ts" "$CFG" \
-		&& cmp -s "$PRISTINE/delivery.ts" "$DLV" && cmp -s "$PRISTINE/run_wrapper.rs" "$RUST"; then
+		&& cmp -s "$PRISTINE/delivery.ts" "$DLV" && cmp -s "$PRISTINE/index.ts" "$IDX" \
+		&& cmp -s "$PRISTINE/run_wrapper.rs" "$RUST"; then
 		echo "RESTORED=$1 clean=yes"
 	else
 		echo "RESTORED=$1 clean=no"
@@ -129,7 +133,19 @@ mutate M15 'if (!isRecord(event) || event.toolName !== "bash") return false;' ''
 # M16: the token gate is removed, so the wrapper is handed an argv with no way to
 # authenticate and every wrapped call fails inside the wrapper instead of running
 # natively.
-mutate M16 'return !!opts.wrapperToken;' 'return true;' "$SRC" || true
+mutate M16 'return !!opts.wrapperToken && opts.wrapperToken.trim() === opts.token?.trim();' 'return !!opts.wrapperToken;' || true
+
+# M19: the API-base reconciliation is dropped, so a session pointed at one server
+# captures through the wrapper into another.
+mutate M19 'if (opts.wrapperApiBase !== undefined && opts.wrapperApiBase !== opts.apiBase) return false;' '' || true
+
+# M20: every program gets a second word, so `echo hunter2` can put hunter2 in the
+# capture query.
+mutate M20 'Some(one) if SUBCOMMAND_PROGRAMS.contains(&one) => {' 'Some(one) if true => {' "$RUST" || true
+
+# M21: a handle in the result text no longer activates expansion, so the model holds
+# a recovery handle and no tool to use it with.
+mutate M21 'return resultCarriesHandle(content);' 'return false;' "$SRC" || true
 
 # M17: the interpreter falls back to sh, so bash-only syntax fails on a host whose
 # /bin/sh is dash (measured on the build box: /bin/sh -> dash).
@@ -137,12 +153,13 @@ mutate M17 'const SHELL = "bash";' 'const SHELL = "sh";' "$SRC" || true
 
 # M18: the run_wrapper's command hint keeps naming the shell, so a wrapped `git diff`
 # is reduced by the generic shell reducer instead of the diff family.
-mutate M18 'if argv.get(1).is_some_and(|f| f == "-c") {' 'if false {' "$RUST" || true
+mutate M18 'let words = argv.get(1).is_some_and(|f| f == "-c")' 'let words = false.then(|| argv.get(2).map(String::as_str))' "$RUST" || true
 
 restore ALL
 echo "=== final byte-compare"
 cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \
-	&& cmp "$PRISTINE/delivery.ts" "$DLV" && cmp "$PRISTINE/run_wrapper.rs" "$RUST" \
+	&& cmp "$PRISTINE/delivery.ts" "$DLV" && cmp "$PRISTINE/index.ts" "$IDX" \
+	&& cmp "$PRISTINE/run_wrapper.rs" "$RUST" \
 	&& echo "TREE_CLEAN=yes" || echo "TREE_CLEAN=no"
 rm -rf "$PRISTINE"
 echo "=== SUMMARY applied=$APPLIED survived=$SURVIVORS not_applied=$NOT_APPLIED"

@@ -29,10 +29,9 @@ import {
 	renderDelivery,
 	renderPage,
 	runTool,
-	textBlocks,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
-import { mutateBashInput, shellQuote, shouldWrapBash } from "../src/commandwrap.ts";
+import { mutateBashInput, shellQuote, shouldActivateExpand, shouldWrapBash } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -1427,13 +1426,15 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		assert.deepEqual(wrapInput({ command: twice }, "ws-1", true), { command: twice });
 	});
 
-	// The hook's two refusals, before any workspace lookup is paid for.
+	// The hook's refusals, before any workspace lookup is paid for.
 	const bash = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: { command: "ls" } };
-	const ON = { enabled: true, tokenConfigured: false, wrapperToken: undefined };
+	const BASE = "http://127.0.0.1:8077";
+	const ON = { enabled: true, tokenConfigured: false, token: undefined, wrapperToken: undefined, wrapperApiBase: undefined, apiBase: BASE };
 
 	test("the hook wraps a bash call when the knob is on and no token is at stake", () => {
 		assert.equal(shouldWrapBash(bash, ON), true);
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "t" }), true, "a wrapper token does not block the wrap");
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: BASE }), true, "the same base is not a conflict");
 	});
 
 	test("the hook refuses when the knob is off", () => {
@@ -1449,15 +1450,29 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		}
 	});
 
-	test("the hook refuses when the API needs a token the wrapper cannot be handed", () => {
+	test("the hook refuses unless the wrapper can authenticate with this process's own token", () => {
 		// The wrapper reads XMUSTARD_API_TOKEN from its own environment and a
 		// tool_call hook cannot change it, so a token this process cannot pass on
 		// means the wrapped command would fail inside the wrapper. It runs natively
 		// instead and projectBuiltin captures the result.
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperToken: undefined }), false, "no wrapper token at all");
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperToken: "" }), false, "an empty wrapper token is no token");
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperToken: "t" }), true, "a wrapper token makes the wrap safe");
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: false, wrapperToken: undefined }), true, "no token configured means nothing to pass");
+		const authed = { ...ON, tokenConfigured: true, token: "secret" };
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: undefined }), false, "no wrapper token at all");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "" }), false, "an empty wrapper token is no token");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "   " }), false, "whitespace is not a token; the wrapper's nonblank() ignores it");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "other" }), false, "a different token would authenticate as somebody else");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "secret" }), true, "the same token wraps");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: " secret " }), true, "padding is the same credential, since the adapter trims its own");
+		assert.equal(shouldWrapBash(bash, ON), true, "no token configured means nothing to pass");
+	});
+
+	test("the hook refuses when the wrapper would reach a different API than this adapter", () => {
+		// The wrapper defaults to its own API when nothing is passed, so only a base
+		// that differs from the adapter's has to be reconciled. A different server
+		// means the capture lands outside the workspace the adapter resolved.
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "http://127.0.0.1:8042" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "" }), false, "an empty base is not the adapter's");
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: BASE }), true);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: undefined }), true, "unset means the wrapper's own default");
 	});
 });
 
@@ -1486,22 +1501,20 @@ describe("a wrapper result activates expansion (WS-44e)", () => {
 		assert.equal(carriesHandle(['[xmustard evidence] {"handle":""}']), false, "an empty handle is not a handle");
 	});
 
-	test("a small wrapped bash result passes through, and the handle is read off its text", async () => {
-		// The wrapped result is already reduced, so projectBuiltin never reaches the
-		// capture path that used to call onHandle. The handle is read by the
-		// tool_result hook from carriesHandle, before the built-ins guard, so it is
-		// found whether or not this tool is configured for projection.
-		const resolve = async () => "w1";
-		const wrapped = { toolCallId: "w", toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: `projected output\n${footer("xm1.abc123")}` }], details: undefined, isError: false };
-		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, wrapped, {}, () => assert.fail("onHandle belongs to the hook now"));
-		assert.equal(out, undefined, "already small: nothing to replace, and it is passed through");
-		assert.equal(carriesHandle(textBlocks(wrapped.content) ?? []), true, "the hook's own check finds the handle");
-
-		const notOurs = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { ...wrapped, toolName: "read" }, {}, () => {});
-		assert.equal(notOurs, undefined, "a tool outside the builtins set is not projected at all");
-		assert.equal(carriesHandle(textBlocks(wrapped.content) ?? []), true, "which is why the hook checks before it calls in here");
-
-		assert.equal(carriesHandle(textBlocks([{ type: "text", text: "total 4\ndrwx" }]) ?? []), false, "an ordinary result has no handle");
+	test("a wrapper handle activates expansion whatever the built-ins set says", () => {
+		// The rule the tool_result hook applies to every result, before it decides
+		// anything else. It takes only the content, so the answer cannot depend on the
+		// tool or on XMUSTARD_PI_BUILTINS: the reduction already happened inside the
+		// wrapper, and whether the result is then projected is a separate decision.
+		const wrapped = [{ type: "text" as const, text: `projected output\n${footer("xm1.abc123")}` }];
+		const ordinary = [{ type: "text" as const, text: "total 4\ndrwxr-xr-x 2 root root 4096 ." }];
+		assert.equal(shouldActivateExpand(wrapped), true, "a wrapped result offers expansion");
+		assert.equal(shouldActivateExpand(ordinary), false, "an ordinary bash result does not");
+		assert.equal(shouldActivateExpand([{ type: "image", data: "x" }]), false, "a non-text block is never a handle");
+		assert.equal(shouldActivateExpand([]), false);
+		// A handle buried in a longer result, as it is when the wrapper's projection
+		// carries several blocks.
+		assert.equal(shouldActivateExpand([...ordinary, ...wrapped]), true, "not anchored to the first block");
 	});
 });
 

@@ -22,6 +22,8 @@
 // always runs and its result is never lost, so a malformed argv must never reach
 // the shell in place of the model's command.
 
+import { resultCarriesHandle } from "./delivery.ts";
+
 export const WRAPPER = "xmustard-core run";
 // The program the wrapped command runs as, and the flag that gives it the string.
 // `bash`, not `sh`: the tool being wrapped is Pi's `bash`, whose semantics are
@@ -66,27 +68,51 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 }
 
 // shouldWrapBash is the tool_call hook's decision, as a pure function of what the
-// hook can see. It is kept out of the hook body so the two refusals are testable
+// hook can see. It is kept out of the hook body so the refusals are testable
 // without a running Pi extension host: a tool that is not bash, and a session whose
-// token the wrapper cannot be handed.
+// API the wrapper cannot be pointed at with a credential it holds.
 //
-// The second refusal is not a nicety. The wrapper authenticates with
-// XMUSTARD_API_TOKEN from its own environment (rust-core/src/run_wrapper.rs) and this
-// adapter reads XMUSTARD_TOKEN; a tool_call hook cannot change the child
-// environment. Putting the token on the command line instead would write it into
-// Pi's session transcript, the masking walk and every capture body. So the wrap
-// happens only when the wrapper can authenticate with exactly the credential this
-// process holds — the same value, not merely the presence of a variable. Two
-// different tokens would make the wrapper's capture POST a 401 and fall back to
-// unreduced output, which is the very thing the wrap exists to prevent. When the
-// tokens cannot be reconciled the command runs natively and projectBuiltin captures
-// its result through the adapter, which can authenticate.
+// Both refusals are about the wrapper's ability to reach the same server this
+// adapter uses. The wrapper authenticates with XMUSTARD_API_TOKEN from its own
+// environment (rust-core/src/run_wrapper.rs) and this adapter reads XMUSTARD_TOKEN;
+// a tool_call hook cannot change the child environment, and a token on the command
+// line would be written into Pi's session transcript, the masking walk and every
+// capture body. So the argv may only name the wrapper when the wrapper would reach
+// the same endpoint with a credential this process holds: the base it is pointed at
+// must be this adapter's, and when a token is configured the wrapper's own must be
+// the same one. Otherwise the command runs natively and projectBuiltin captures its
+// result through the adapter, which can authenticate.
 export function shouldWrapBash(
 	event: unknown,
-	opts: { enabled: boolean; tokenConfigured: boolean; wrapperToken: string | undefined },
+	opts: {
+		enabled: boolean;
+		tokenConfigured: boolean;
+		token: string | undefined;
+		wrapperToken: string | undefined;
+		wrapperApiBase: string | undefined;
+		apiBase: string;
+	},
 ): boolean {
 	if (!opts.enabled) return false;
 	if (!isRecord(event) || event.toolName !== "bash") return false;
+	// A default base is what the wrapper uses when nothing is passed, so only a base
+	// that differs from the adapter's own needs reconciling.
+	if (opts.wrapperApiBase !== undefined && opts.wrapperApiBase !== opts.apiBase) return false;
 	if (!opts.tokenConfigured) return true;
-	return !!opts.wrapperToken;
+	// Compared as trimmed values, because the adapter trims XMUSTARD_TOKEN and the
+	// wrapper's nonblank() ignores whitespace only: a token that differs by padding
+	// is the same credential, and one that differs in substance is not usable.
+	return !!opts.wrapperToken && opts.wrapperToken.trim() === opts.token?.trim();
+}
+
+// shouldActivateExpand reports whether a finished tool result must offer
+// xmustard_expand. A wrapper projection already carries its handle in the text and
+// never reaches the capture path that would otherwise notice, so the rule is its own
+// function rather than a line in the tool_result hook: the hook needs a live
+// ExtensionAPI and the rule is what the hook calls, so a unit test can reach the
+// rule but not the call. It is deliberately independent of the tool and of the
+// built-ins set — whether a result is then projected is that set's decision, and a
+// handle the model cannot spend is worse than a large result.
+export function shouldActivateExpand(content: unknown[]): boolean {
+	return resultCarriesHandle(content);
 }

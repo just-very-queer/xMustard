@@ -327,12 +327,17 @@ It is off by default because it changes what Pi executes. A command that is blan
 already wrapped, or in a session with no resolvable workspace is left exactly as the
 model wrote it, and so is every tool that is not `bash`.
 
-One condition decides the wrap against a token. The wrapper authenticates with
+Two conditions decide the wrap against the API. The wrapper authenticates with
 `XMUSTARD_API_TOKEN` from its own environment and this adapter reads `XMUSTARD_TOKEN`,
 and a `tool_call` hook cannot change the child environment; a token on the command
-line would land in Pi's transcript, the masking walk and every capture body. So when
-the API needs a token and `XMUSTARD_API_TOKEN` is not set, the command runs natively
-and `projectBuiltin` captures it through the adapter, which can authenticate.
+line would land in Pi's transcript, the masking walk and every capture body. The
+wrapper also defaults to its own API base, so a session whose `XMUSTARD_API_BASE` is
+unset while this adapter is pointed elsewhere would capture into a different server.
+So the argv names the wrapper only when the wrapper's token is this process's own
+token and its API base is this adapter's base. Otherwise the command runs natively,
+and `projectBuiltin` captures it through the adapter, which can authenticate — where
+that tool is configured for projection and the result is over the projection target,
+since neither holds for a tool outside `XMUSTARD_PI_BUILTINS` or a small result.
 
 A wrapped result carries its `[xmustard evidence]` handle in the text, and that handle
 activates `xmustard_expand` whatever `XMUSTARD_PI_BUILTINS` says — including `none`,

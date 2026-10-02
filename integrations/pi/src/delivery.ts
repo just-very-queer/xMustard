@@ -683,6 +683,14 @@ export function carriesHandle(texts: readonly string[]): boolean {
 	return texts.some((t) => HANDLE_IN_TEXT.test(t));
 }
 
+// resultCarriesHandle is the one rule the tool_result hook applies to every result
+// before it decides anything else: does this text already name a recovery handle? It
+// is a named function rather than a line in the hook so the unit suite can reach it
+// without a live ExtensionAPI. A non-text block (an image) is not a handle.
+export function resultCarriesHandle(content: unknown[]): boolean {
+	return carriesHandle(textBlocks(content) ?? []);
+}
+
 // projectBuiltin is the tool_result handler for Pi's built-in tools. A text result
 // larger than the projection target is captured and replaced by its projection with
 // a recovery line; isError is never touched and details are kept. A result that

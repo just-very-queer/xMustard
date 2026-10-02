@@ -401,9 +401,17 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
+/// Programs whose second word selects the reducer on the Go side (registry.go's
+/// `argvFamily` switches on argv0 and its subcommand). The hint's second word is only
+/// sent for one of these, so a bare `echo hunter2` cannot put `hunter2` in the capture
+/// query: for any other program the first word is the whole hint, which is all the
+/// registry needs to classify it.
+const SUBCOMMAND_PROGRAMS: [&str; 8] = ["go", "git", "cargo", "npm", "pnpm", "yarn", "kubectl", "docker"];
+
 /// What the server may learn of the command line to pick a reducer: the program's name
-/// and, when it is a plain word, its first argument (`git diff`). The rest of the line
-/// can hold tokens or secrets, so it never leaves the process.
+/// and, when it is a plain word and the program is one whose subcommand selects a
+/// family, that argument (`git diff`). The rest of the line can hold tokens or
+/// secrets, so it never leaves the process.
 ///
 /// A client that cannot replace a shell result rewrites the command into
 /// `<shell> -c <command>` (the Pi adapter's WS-44e wrap). The program is then the
@@ -419,22 +427,35 @@ fn command_hint(argv: &[String]) -> String {
             && !s.starts_with('-')
     };
     // A shell invocation's words come from the string the shell will run, so the
-    // hint describes the command and not the shell that every command shares.
-    let words: Vec<&str> = if argv.get(1).is_some_and(|f| f == "-c") {
-        argv.get(2)
-            .map(|c| c.split_whitespace().collect())
-            .unwrap_or_default()
-    } else {
-        argv.iter().map(String::as_str).collect()
-    };
+    // hint describes the command and not the shell that every command shares. Only
+    // the first two words are ever looked at, and the string is split lazily, so a
+    // long generated command costs two words rather than one Vec of all of them.
+    let words = argv.get(1).is_some_and(|f| f == "-c")
+        .then(|| argv.get(2).map(String::as_str))
+        .flatten()
+        .map(|c| c.split_whitespace().take(2).collect::<Vec<&str>>())
+        .unwrap_or_else(|| argv.iter().map(String::as_str).take(2).collect());
     // The program's name, and its first plain argument: `git diff --stat` is `git
     // diff`, not `git --stat` and not `git`. A path is reduced to its basename
     // first, as it was before a shell invocation was recognised. The two words are
-    // taken positionally from the start, because dropping a non-plain word would
-    // pair a later one with an earlier one's role. Nothing past the second word is
-    // read, so a token or secret further along the line never leaves the process.
+    // taken positionally, because dropping a non-plain word would pair a later one
+    // with an earlier one's role. Nothing past the second word is read, so a token
+    // or secret further along the line never leaves the process.
+    //
+    // `plain` is the disclosure rule and it has not changed: alphanumeric, `.`, `_`
+    // and `-`, never leading `-`. A word holding a quote, a redirect, a glob, a
+    // substitution or a path separator is not metadata and is not sent.
     let first = words.first().map(|w| basename(w)).filter(|w| plain(w));
-    match (first, words.get(1).copied().filter(|w| plain(w))) {
+    let sub = match first {
+        // Only a program the registry dispatches on can use its subcommand; for
+        // anything else a second word is an argument, not a family selector, and
+        // sending it would disclose an argument the caller never meant to.
+        Some(one) if SUBCOMMAND_PROGRAMS.contains(&one) => {
+            words.get(1).copied().filter(|w| plain(w))
+        }
+        _ => None,
+    };
+    match (first, sub) {
         (Some(one), Some(two)) => format!("{one} {two}"),
         (Some(one), None) => one.to_string(),
         _ => name.to_string(),
@@ -477,23 +498,50 @@ mod tests {
             command_hint(&a(&["/bin/bash", "-c", "cargo clippy --all"])),
             "cargo clippy"
         );
-        // A leading cd or env is not the program, and nothing past the second plain
-        // word is taken, so a token later in the line never reaches the hint.
-        assert_eq!(
-            command_hint(&a(&["bash", "-c", "cd sub && git diff"])),
-            "cd sub"
-        );
+        // Nothing past the second word is taken, so a token later in the line never
+        // reaches the hint.
         assert_eq!(
             command_hint(&a(&["bash", "-c", "git diff --stat"])),
             "git diff"
         );
-        // A word holding a redirect or a substitution is not a program name, and
-        // dropping it to reach a later plain word would mis-pair the two.
-        assert_eq!(command_hint(&a(&["bash", "-c", "git >out diff"])), "git");
+        // A leading cd is the program as far as the hint goes; the registry has no
+        // family for it and does not need one.
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "cd sub && git diff"])),
+            "cd"
+        );
         assert_eq!(command_hint(&a(&["bash", "-c", "ls"])), "ls");
         assert_eq!(command_hint(&a(&["bash", "-c", ""])), "bash");
         assert_eq!(command_hint(&a(&["bash", "-c"])), "bash");
         assert_eq!(command_hint(&a(&["bash"])), "bash");
+    }
+
+    #[test]
+    fn command_hint_sends_a_second_word_only_where_the_registry_dispatches_on_one() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The subcommand programs: argvFamily switches on argv0 and its subcommand,
+        // so both words are what it needs.
+        for program in ["go", "git", "cargo", "npm", "docker"] {
+            assert_eq!(
+                command_hint(&a(&["bash", "-c", &format!("{program} sub")])),
+                format!("{program} sub"),
+                "{program} sub"
+            );
+        }
+        // Everything else: the first word is the whole hint. An argument is not a
+        // family selector, and `echo hunter2` must not put hunter2 in the query.
+        for (command, want) in [
+            ("echo hunter2", "echo"),
+            ("curl https://h/?k=secret", "curl"),
+            ("pytest -k secret", "pytest"),
+            ("ls -la /home/user", "ls"),
+            ("sed -i s/a/b/ f", "sed"),
+        ] {
+            assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
+        }
+        // A word holding a redirect, a glob or a substitution is never a plain word.
+        assert_eq!(command_hint(&a(&["bash", "-c", "go test ./..."])), "go test");
+        assert_eq!(command_hint(&a(&["bash", "-c", "go >out"])), "go");
     }
 
     #[test]
