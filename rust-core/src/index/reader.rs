@@ -48,12 +48,21 @@ struct Location {
     db: PathBuf,
 }
 
-/// The index of `root`, when the root is indexable and has a store.
+/// The index of `root`, when the root is indexable and has a store. None when the
+/// directory is one a reader must not trust, so a poisoned store is never opened
+/// (WS-FIX-11).
 fn locate(root: &Path) -> Option<Location> {
     let cfg = IndexConfig::load(root).ok()?;
     let layout = scan::layout(root, &cfg).ok()?;
-    let db = super::index_dir(&layout.root, layout.git_dir.as_deref(), &cfg).join(DB_FILE);
-    db.exists().then_some(Location { db })
+    let dir = super::index_dir(&layout.root, layout.git_dir.as_deref(), &cfg);
+    let db = dir.join(DB_FILE);
+    if !db.exists() {
+        return None;
+    }
+    super::check_index_dir(&dir, cfg.index_dir.is_some())
+        .inspect_err(|e| eprintln!("index: {e}"))
+        .ok()?;
+    Some(Location { db })
 }
 
 /// Stat of the store and its WAL: a commit or a swap changes it.

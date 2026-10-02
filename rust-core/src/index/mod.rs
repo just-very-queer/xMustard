@@ -215,15 +215,87 @@ pub fn index_dir(root: &Path, git_dir: Option<&Path>, cfg: &IndexConfig) -> Path
     }
 }
 
+/// Classify an existing index directory: is it a plain directory ours to use, and does
+/// it carry a group- or other-write bit?
+///
+/// An existing directory the operator named (`operator_named`: `--index-dir`,
+/// `XMUSTARD_INDEX_DIR`) keeps its read and execute bits, because those leak only the
+/// directory listing and the operator chose them; a group- or other-**write** bit is a
+/// hole, since any other local user could replace `index.db` and poison what the index
+/// answers, and the owner-only mode of the files inside it does not stop that. The
+/// default per-scope directory is ours and is tightened instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirTrust {
+    /// Ours to tighten to `0o700`: created by us, or the default per-scope directory.
+    Managed,
+    /// The operator's own directory, safe to use as it stands.
+    OperatorKept,
+}
+
+#[cfg(unix)]
+fn classify_dir(dir: &Path, meta: &fs::Metadata, operator_named: bool) -> Result<DirTrust, String> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(format!(
+            "{}: index directory belongs to another user",
+            dir.display()
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    // 0o022, not 0o077: only the write bits are a hole.
+    if !operator_named {
+        return Ok(DirTrust::Managed);
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{}: index directory is writable by other users (mode 0o{mode:03o}); another \
+             local user could replace {DB_FILE}. Run `chmod 700 {}`",
+            dir.display(),
+            dir.display()
+        ));
+    }
+    Ok(DirTrust::OperatorKept)
+}
+
+#[cfg(not(unix))]
+fn classify_dir(
+    dir: &Path,
+    _meta: &fs::Metadata,
+    operator_named: bool,
+) -> Result<DirTrust, String> {
+    Ok(if operator_named {
+        DirTrust::OperatorKept
+    } else {
+        DirTrust::Managed
+    })
+}
+
+/// Refuse an index directory a reader must not trust, without creating or tightening
+/// anything: a reader that found the directory unacceptable has to say so rather than
+/// fall back to an unindexed answer, because the alternative is answering from a store
+/// another local user planted. Ok when `dir` does not exist, since there is then nothing
+/// to read.
+pub(super) fn check_index_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(e)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "{}: index directory is not a plain directory",
+            dir.display()
+        ));
+    }
+    let _ = classify_dir(dir, &meta, operator_named)?;
+    Ok(())
+}
+
 /// Create `dir` (and missing parents) readable by its owner only, and refuse a
-/// directory that is a symlink or belongs to another user: the index holds identifiers
-/// and postings of the source, and with `full` retention the source itself. An existing
-/// directory the operator named (`operator_named`: `--index-dir`, `XMUSTARD_INDEX_DIR`)
-/// keeps its read and execute bits, because those leak only the directory listing and
-/// the operator chose them; a group- or other-**write** bit is refused outright, since
-/// any other local user could replace `index.db` and poison what the index answers,
-/// and the owner-only mode of the files inside it does not stop that. The default
-/// per-scope directory is ours and is tightened.
+/// directory that is a symlink, belongs to another user, or that another local user can
+/// write: the index holds identifiers and postings of the source, and with `full`
+/// retention the source itself.
 fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", dir.display());
     let existed = fs::symlink_metadata(dir).is_ok();
@@ -242,31 +314,11 @@ fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
             dir.display()
         ));
     }
+    let trust = classify_dir(dir, &meta, operator_named)?;
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.uid() != rustix::process::geteuid().as_raw() {
-            return Err(format!(
-                "{}: index directory belongs to another user",
-                dir.display()
-            ));
-        }
-        let mode = meta.mode() & 0o777;
-        // 0o022, not 0o077: only the write bits are a hole.
-        match (mode & 0o022 != 0, existed && operator_named) {
-            (true, true) => {
-                return Err(format!(
-                    "{}: index directory is writable by other users (mode 0o{mode:03o}); \
-                     another local user could replace {}. Run `chmod 700 {}`",
-                    dir.display(),
-                    DB_FILE,
-                    dir.display()
-                ));
-            }
-            // A read-permissive operator directory is left as chosen.
-            (false, true) => {}
-            _ => fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?,
-        }
+    if trust == DirTrust::Managed && !existed {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
     }
     Ok(())
 }
@@ -1514,6 +1566,9 @@ fn open_read_only(
     if !path.exists() {
         return Ok((root, path, None));
     }
+    // A reader that found the directory unacceptable must refuse rather than answer
+    // from a store another local user could have replaced (WS-FIX-11).
+    check_index_dir(path.parent().unwrap_or(&root), cfg.index_dir.is_some())?;
     let conn =
         Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql_err)?;
     schema::configure(&conn).map_err(sql_err)?;
