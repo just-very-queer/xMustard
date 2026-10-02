@@ -327,6 +327,40 @@ func TestCachedRootsFailureTextIsBounded(t *testing.T) {
 	}
 }
 
+// A malformed answer must contribute no roots at all. Go's decoder fills array
+// elements before it reports a later type error, so an answer whose first root is
+// usable and whose second is a number parses partially; the usable one is still
+// discarded, because the answer was rejected as a whole.
+func TestMalformedRootsAnswerContributesNoRoots(t *testing.T) {
+	partial := tempRepo(t)
+	other := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "other-ws", Root: other}}}
+	halfValid := func() (json.RawMessage, error) {
+		return json.RawMessage(`{"roots": [{"uri": "file://` + partial + `"}, {"uri": 7}]}`), nil
+	}
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){halfValid}}
+	s := newSession(t, api, Options{Cwd: other, AutoRegister: true}, client, "2025-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	// A rejected answer supplies no root, so resolution falls through to the
+	// registered working directory rather than to the answer's usable first root.
+	if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD {
+		t.Fatalf("a rejected answer must not supply a root: %+v", ws)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("a root from a rejected answer was registered (%d loads)", n)
+	}
+	s.mu.Lock()
+	paths, st := len(s.roots.paths), s.roots.transient
+	s.mu.Unlock()
+	if paths != 0 {
+		t.Fatalf("%d roots kept from a rejected answer", paths)
+	}
+	if !st {
+		t.Fatal("a rejected answer must stay transient")
+	}
+}
+
 // A client that does not implement roots/list says so once; that answer is kept.
 func TestRootsMethodNotFoundIsKept(t *testing.T) {
 	repo := tempRepo(t)

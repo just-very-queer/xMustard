@@ -414,13 +414,17 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			} `json:"roots"`
 		}
 		if err := json.Unmarshal(raw, &r); err != nil {
-			// the client answered, but the answer cannot be read: transient, so it is
-			// asked again rather than cached as "the client has no usable roots"
+			// The client answered, but the answer cannot be read: transient, so it is
+			// asked again rather than cached as "the client has no usable roots". The
+			// decoder fills array elements before it reports a later type error, so a
+			// rejected answer can still hold usable roots; r is not walked, which drops
+			// them.
 			st.err, st.transient = "roots/list answer is malformed: "+clip(err.Error(), rootsErrClip), true
 			if after := rootsBackoff(cached, false); after > 0 {
 				st.retryAt = time.Now().Add(after)
 				st.err += fmt.Sprintf(" (asked again after %s)", after)
 			}
+			break
 		}
 		for _, root := range r.Roots {
 			if u, err := url.Parse(root.URI); err == nil && u.Scheme == "file" && filepath.IsAbs(u.Path) {
