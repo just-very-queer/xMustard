@@ -2139,6 +2139,18 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
 - *Checks (2026-09-29, local, box down).* `cargo build --release --locked`: builds. `cargo test --release`: every suite `ok`, 0 failed (navigation.rs's 5 tests included). `cargo clippy`: 6 warnings, unchanged from the `2ad3315` baseline (`--all-targets` shows 2 more from test code; the Makefile's plain `cargo clippy` is the comparable count). `gofmt -l` clean on every changed file. `go build ./...` and `XMUSTARD_CORE_BIN=<local release core> go vet ./...`: clean. `go test -p 2 -count=1 ./...` and a repeat at `-p 1`: `TestExplainPagesADirectory`, `TestSymbolNavigationRoutes` (both in `cmd/xmustard-api`), `TestHealthFullViewIsForOperatorsOnly` and `xmustard-mcp`'s `TestShimNegotiatesBeforePipelinedRequests` failed intermittently, every failure logging `xmustard overloaded: transient budget exhausted` or `heavy slot refused` against the soft memory ceiling — this 8 GB Mac running the real resident rust-core workers for the full suite at once, not a code defect. Isolated (`-run`, one test file's worth at a time) and at `-count=5`, all four passed every time, matching this branch's own earlier note about `TestCodexEventWithAWorkspacePin` under the same constraint. Pi `node --test test/unit.test.ts`: 45/45.
 - *Deviations.* None beyond the route-file mechanics above; no requirement or interface changed.
 
+### WS-FIX-18 — WS-36 deferred minors: an accurate hybrid `omitted` and a `source_identity` fixture case
+
+**Goal.** Close the two minors WS-36 deferred as "not cheap" (this file's WS-36 *Deferred (minor, not cheap)* bullet). (1) A hybrid search page's `omitted` member goes stale after the ladder's `trimmed` rung cuts `hits`: the member keeps the producer's page value (hits after the page) while the delivered result carries fewer hits, so `omitted + returned != total` and an agent reading it undercounts what the answer left out. (2) The `signal_flags` fixture carries no `coverage.source_identity` member, so the rung's promise to keep it is never exercised by a test.
+
+**Requirements.** PAR-RET-01, PAR-HAR-03, PAR-CTX-05 (search result honesty and its budget report); the search hit contract at this file's WS-18 row (`omitted` counts the ranked hits after the page) and WS-36's *Signals and report* rule.
+
+**Files.** `api-go/internal/toolbudget/apply.go` (the `omitted` rewrite in the paged-list render path), `api-go/internal/toolbudget/apply_test.go` (both cases), `docs/plans/2026-09-25-parity-build-plan.md` (this record).
+
+**Tests required.** (1) A test that drives the hybrid ladder to a `trimmed` stage and asserts `omitted == total - len(hits)` on the delivered result, at a page offset above zero as well as at zero. (2) The shared `envelopeMembers` fixture gains a `source_identity` object, and the `signal_flags` test asserts it survives that rung and is not reported in `output_budget.signals`.
+
+**Acceptance.** Both cases are asserted by a test that fails without the change (measured before the fix, §Implementation record). `omitted` stays the producer's value when the budget cut nothing. `CAPS`, `MAC` and `BOXALL` pass; no `tools/list` byte, projection or memory-store shape changes.
+
 ### WS-37 — Static-embedding semantic lane with binary/int8 vector index
 
 **Goal.** Deliver the following:
