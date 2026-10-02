@@ -135,12 +135,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over bodies, comments, names, paths and docs; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: chunk text; mode=pattern: ast-grep; mode=symbol: name path.",
+			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: chunk text; mode=pattern: ast-grep; mode=symbol: name path.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the query" },
 			{ name: "mode", type: "string", enum: ["hybrid", "text", "pattern", "symbol"], desc: "hybrid (default), text (chunk text), pattern or symbol" },
-			{ name: "lang", type: "string", desc: "language hint for pattern mode; filter otherwise" },
+			{ name: "lang", type: "string", desc: "pattern: ast-grep hint; else filter" },
 			{ name: "seed", type: "string", desc: "symbol for the proximity lane" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 10)" },
 		],
