@@ -205,16 +205,17 @@ func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
 	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
 		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
 	}
-	// The second failure opened the window, so the calls above added no request; the
-	// count is read against the window rather than against a duration.
+	// The second failure opened the window, so the calls above added no request. The
+	// assertion is that the cache was consulted, not that the clock held: a window
+	// that expired mid-test would let the next call re-ask, which is correct
+	// behaviour and must not fail this test.
 	s.mu.Lock()
-	window := time.Until(s.roots.retryAt)
-	asked := client.count()
+	cached := s.roots
 	s.mu.Unlock()
-	if window <= 0 {
-		t.Fatalf("the back-off window is not open after two failures (%s)", window)
+	if cached == nil || !cached.transient || cached.retryAt.IsZero() {
+		t.Fatalf("the failure must be cached with a window: %+v", cached)
 	}
-	if asked > 2 {
+	if asked := client.count(); asked > 2 {
 		t.Fatalf("roots/list asked %d times; a call reopened the window", asked)
 	}
 }
