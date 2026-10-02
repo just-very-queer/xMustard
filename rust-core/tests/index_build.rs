@@ -2075,8 +2075,11 @@ fn max_size_ignore_files_keep_the_worker_bounded() {
     );
 }
 
+/// A directory the operator named keeps its mode when it carries no group- or
+/// other-write bit. `0o755` is the read-permissive case the old warning existed
+/// for, and it keeps working: only the write bits are a refusal (WS-FIX-11).
 #[test]
-fn an_operator_named_index_dir_keeps_its_mode() {
+fn an_operator_named_index_dir_keeps_its_read_permissive_mode() {
     use std::os::unix::fs::PermissionsExt;
     let r = repo(&[("a.ts", "export function a() {}\n")]);
     let shared = TempDir::new().unwrap();
@@ -2095,8 +2098,9 @@ fn an_operator_named_index_dir_keeps_its_mode() {
     let rep = ok_json(&out);
     assert_eq!(mode(&named), 0o755, "the operator's directory was chmodded");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("accessible to other users"),
-        "no warning"
+        !String::from_utf8_lossy(&out.stderr).contains("index: warning"),
+        "a read-permissive directory should not warn at all: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(mode(Path::new(rep["index_path"].as_str().unwrap())), 0o600);
     assert_eq!(mode(&named.join("index.lock")), 0o600);
@@ -2108,4 +2112,327 @@ fn an_operator_named_index_dir_keeps_its_mode() {
         &["--index-dir", created.to_str().unwrap()],
     );
     assert_eq!(mode(&created), 0o700);
+}
+
+/// An existing operator-named index directory that another local user can write
+/// is refused: it is a poison channel, since such a user can replace `index.db`
+/// or `index.lock` even though both are created 0o600 (WS-FIX-11). The refusal
+/// names the mode and the remedy.
+#[test]
+fn a_writable_operator_named_index_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    // 0o777: other-writable, 0o775: group-writable only. The group bit is the
+    // same hole, so both are refused.
+    for mode_oct in [0o777u32, 0o775] {
+        let r = repo(&[("a.ts", "export function a() {}\n")]);
+        let shared = TempDir::new().unwrap();
+        let named = shared.path().join("shared");
+        fs::create_dir(&named).unwrap();
+        fs::set_permissions(&named, fs::Permissions::from_mode(mode_oct)).unwrap();
+        let out = run(&[
+            "index",
+            "build",
+            r.path().to_str().unwrap(),
+            "--index-dir",
+            named.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            !out.status.success(),
+            "0o{mode_oct:o} index dir was accepted: {stderr}"
+        );
+        assert!(
+            stderr.contains("chmod 700"),
+            "0o{mode_oct:o}: no chmod remedy in the refusal: {stderr}"
+        );
+        assert!(
+            stderr.contains(&named.display().to_string()),
+            "0o{mode_oct:o}: the refusal does not name the directory: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("0o{mode_oct:o}")),
+            "0o{mode_oct:o}: the refusal does not name the offending mode: {stderr}"
+        );
+        assert!(
+            !named.join(xmustard_core::index::DB_FILE).exists(),
+            "0o{mode_oct:o}: refused build still wrote an index"
+        );
+        // the refusal must not have tightened the operator's directory for them
+        let still = fs::metadata(&named).unwrap().permissions().mode() & 0o777;
+        assert_eq!(still, mode_oct, "0o{mode_oct:o}: the refusal chmodded it");
+    }
+}
+
+/// The refusal is on the write bits alone: an execute bit for group and other, with no
+/// write bit for either, is accepted. This pins the mask to `0o022` rather than to
+/// `0o077`, which is the bug WS-FIX-11 fixes.
+///
+/// The two cases are `0o710` (group may traverse, other has no bits at all) and `0o711`
+/// (group and other may both traverse). Neither may write, so both are accepted; the old
+/// `0o077` mask warned on both.
+#[test]
+fn an_execute_only_operator_named_index_dir_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+    for mode_oct in [0o710u32, 0o711] {
+        let r = repo(&[("a.ts", "export function a() {}\n")]);
+        let shared = TempDir::new().unwrap();
+        let named = shared.path().join("shared");
+        fs::create_dir(&named).unwrap();
+        fs::set_permissions(&named, fs::Permissions::from_mode(mode_oct)).unwrap();
+        let out = run(&[
+            "index",
+            "build",
+            r.path().to_str().unwrap(),
+            "--index-dir",
+            named.to_str().unwrap(),
+        ]);
+        let rep = ok_json(&out);
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode(&named),
+            mode_oct,
+            "0o{mode_oct:o}: the operator's directory was chmodded"
+        );
+        assert_eq!(
+            mode(&named.join(xmustard_core::index::DB_FILE)),
+            0o600,
+            "0o{mode_oct:o}"
+        );
+        assert!(
+            rep["index_path"]
+                .as_str()
+                .unwrap()
+                .ends_with(xmustard_core::index::DB_FILE),
+            "0o{mode_oct:o}"
+        );
+    }
+}
+
+/// An **existing** operator-named directory already at `0700` is accepted and kept. The
+/// sibling assertion in `an_operator_named_index_dir_keeps_its_read_permissive_mode`
+/// covers a directory the core creates, which cannot catch a regression limited to an
+/// existing one, so this is the spec's `0700` case as its own test (WS-FIX-11).
+#[test]
+fn an_existing_private_operator_named_index_dir_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function a() {}\n")]);
+    let shared = TempDir::new().unwrap();
+    let named = shared.path().join("shared");
+    fs::create_dir(&named).unwrap();
+    fs::write(named.join("notes.txt"), "unrelated\n").unwrap();
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    let out = run(&[
+        "index",
+        "build",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]);
+    let rep = ok_json(&out);
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&named), 0o700, "the operator's directory was chmodded");
+    assert_eq!(mode(&named.join(xmustard_core::index::DB_FILE)), 0o600);
+    assert!(
+        named.join("notes.txt").exists(),
+        "the build disturbed the directory"
+    );
+    assert_eq!(
+        rep["index_path"].as_str().unwrap(),
+        named.join(xmustard_core::index::DB_FILE).to_str().unwrap()
+    );
+}
+
+/// A **reader** refuses the same directory a writer refuses, and says so instead of
+/// answering from a store another local user could have replaced (WS-FIX-11). Without
+/// this the guard covers `index build` only, and a read would consume exactly the
+/// poisoned `index.db` the writer refused to create.
+///
+/// `index stats` is the read-only path through `open_read_only`; `index search` reaches
+/// the same store through `reader::locate`.
+#[test]
+fn a_read_refuses_a_writable_operator_named_index_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function alpha() { return 1; }\n")]);
+    let shared = TempDir::new().unwrap();
+    let named = shared.path().join("shared");
+    fs::create_dir(&named).unwrap();
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    let built = run(&[
+        "index",
+        "build",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]);
+    ok_json(&built);
+
+    // group-writable, holding a valid index a reader would otherwise serve
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o770)).unwrap();
+    let read = run(&[
+        "index",
+        "stats",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]);
+    let stderr = String::from_utf8_lossy(&read.stderr).into_owned();
+    assert!(
+        !read.status.success(),
+        "a reader served an index from a group-writable directory: {stderr}"
+    );
+    assert!(
+        stderr.contains("writable by other users") && stderr.contains("chmod 700"),
+        "the reader's refusal is not the guard's refusal: {stderr}"
+    );
+    assert!(
+        stderr.contains(&named.display().to_string()),
+        "the reader's refusal does not name the directory: {stderr}"
+    );
+
+    // the same directory is served once the operator has tightened it
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    let again = run(&[
+        "index",
+        "stats",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]);
+    let rep = ok_json(&again);
+    assert_eq!(
+        rep["exists"], true,
+        "no index reported after chmod 700: {rep:#}"
+    );
+}
+
+/// The refusal reaches the **search** path too, which opens the store through
+/// `reader::locate` rather than `open_read_only`. A search in an untrusted directory
+/// does not answer from the store another local user planted (WS-FIX-11).
+///
+/// The assertion is on the *provenance* of the answer, not on whether a symbol was
+/// found. Search legitimately degrades: it recomputes a graph from the working tree, so
+/// a symbol it finds that way is a correct answer to a different question. What must
+/// not happen is the store being read, which is what `freshness.source` and the
+/// degradation line report: a served index answers `source: "index"`, a refused one
+/// falls back and says so.
+#[test]
+fn a_search_does_not_answer_from_a_writable_index_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[
+        ("a.ts", "export function alphaOnlyName() { return 1; }\n"),
+        ("b.ts", "export function betaOnlyName() { return 2; }\n"),
+    ]);
+    let shared = TempDir::new().unwrap();
+    let named = shared.path().join("shared");
+    fs::create_dir(&named).unwrap();
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    ok_json(&run(&[
+        "index",
+        "build",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]));
+
+    let search_in = |dir: &Path| -> Value {
+        let out = Command::new(BIN)
+            .args(["search", r.path().to_str().unwrap(), "ws", "alphaOnlyName"])
+            .env("XMUSTARD_INDEX_DIR", dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "search failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // served from the trusted directory: the index itself answers
+    let trusted = search_in(&named);
+    assert_eq!(
+        trusted["freshness"]["source"].as_str(),
+        Some("index"),
+        "the trusted directory did not serve the index: {trusted:#}"
+    );
+
+    // group-writable: the store is not opened, and the answer says it came from
+    // somewhere else rather than from the planted index
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o770)).unwrap();
+    let untrusted = search_in(&named);
+    assert_ne!(
+        untrusted["freshness"]["source"].as_str(),
+        Some("index"),
+        "a search answered from a group-writable index directory: {untrusted:#}"
+    );
+    assert_eq!(
+        untrusted["coverage"]["work"]["graph_cache"], "miss",
+        "the untrusted store was still read: {untrusted:#}"
+    );
+    // a refusal and a repository that was never indexed both reach the caller as no
+    // index, so the answer has to say which it was: a silent degradation reads as
+    // "never indexed" and sends the operator looking in the wrong place.
+    let detail = untrusted["coverage"]["work"]["graph_cache_detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        detail.contains("refused") && detail.contains("chmod 700"),
+        "the degradation does not name the refusal: {detail}"
+    );
+
+    // and it serves again once the operator tightens it, so the refusal is not a
+    // permanent loss of the index
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        search_in(&named)["freshness"]["source"].as_str(),
+        Some("index"),
+        "the index did not come back after chmod 700"
+    );
+}
+
+/// A **default** per-scope index directory that already exists and is permissive is
+/// tightened to `0700`, not left as it is (WS-FIX-11). The operator named nothing
+/// here, so the directory is ours at any mode; round 2 found that restricting the
+/// tightening to freshly created directories left an existing one exactly as wide,
+/// which is a regression against the behaviour before this row.
+#[test]
+fn an_existing_permissive_default_index_dir_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function a() {}\n")]);
+    // no --index-dir and no XMUSTARD_INDEX_DIR: the default per-scope directory, which
+    // the build reports so the test does not have to re-derive it
+    let out = run(&["index", "build", r.path().to_str().unwrap()]);
+    let rep = ok_json(&out);
+    let scope = PathBuf::from(rep["index_path"].as_str().unwrap())
+        .parent()
+        .expect("an index path has a directory")
+        .to_path_buf();
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "a directory the core created is not private"
+    );
+
+    // widened behind the build, the way another local user or a careless umask would
+    fs::set_permissions(&scope, fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    ok_json(&run(&["index", "build", r.path().to_str().unwrap()]));
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "an existing default index directory was left world-writable"
+    );
+    // the store inside it is owner-only too, which is where the facts live
+    assert_eq!(
+        fs::metadata(scope.join(xmustard_core::index::DB_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
 }
