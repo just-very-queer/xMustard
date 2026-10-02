@@ -58,15 +58,21 @@ func newCodeFixture(t *testing.T) codeFixture {
 // anchor every edit to a declared file reaches.
 func (f codeFixture) rebaselinePath(t *testing.T) {
 	t.Helper()
+	f.rebaselinePathFor(t, f.memory.ID)
+}
+
+// rebaselinePathFor is rebaselinePath for a second entry in the same workspace.
+func (f codeFixture) rebaselinePathFor(t *testing.T, entryID string) {
+	t.Helper()
 	actor := invalidationActor(f.root)
 	if err := memoryUpdate(context.Background(), f.dir, f.ws, func(tx govstore.Tx) error {
-		return tx.SetBaselines(context.Background(), f.memory.ID,
+		return tx.SetBaselines(context.Background(), entryID,
 			pathBaselines(capturePathHashes(f.root, []string{"srv.go"})), actor.HeadSHA, actor)
 	}); err != nil {
 		t.Fatal(err)
 	}
 	if err := memoryUpdate(context.Background(), f.dir, f.ws, func(tx govstore.Tx) error {
-		return tx.ClearDrift(context.Background(), f.memory.ID, actor)
+		return tx.ClearDrift(context.Background(), entryID, actor)
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -239,13 +245,18 @@ func TestCodeAnchorRewrittenInPlaceIsDriftNotAMove(t *testing.T) {
 	}
 }
 
-// A block that now appears twice cannot be told apart from the one the anchor names, so
-// the anchor stays and the memory is not marked: an edit elsewhere in the file put no
-// memory's code at risk.
+// A block whose copy now sits above the anchor's own lines and whose original lines hold
+// something else cannot be told from the one the anchor names: Reanchor returns an
+// unanchored, ambiguous answer, the anchor stays and the memory is not marked. An edit
+// elsewhere in the file put no memory's code at risk, and marking an ambiguous anchor
+// would claim otherwise.
 func TestCodeAnchorAmbiguousAfterTheEditIsUnknown(t *testing.T) {
 	f := newCodeFixture(t)
-	dup := "package srv\n\nconst (\n\tReadTimeout = 5\n\tWriteTimeout = 10\n)\n"
-	writeRepoFile(t, f.root, "srv.go", dup+"\n"+dup+"func Serve() {}\n")
+	// The block appears twice: once at lines the anchor does not name, once where the
+	// anchor's own lines now hold other code. Neither is the anchor's range, so the match
+	// at the anchor's StartLine cannot decide it.
+	dup := "package srv\n\nfunc Serve() {}\n\nconst (\n\tReadTimeout = 5\n\tWriteTimeout = 10\n)\n"
+	writeRepoFile(t, f.root, "srv.go", dup+"\n"+dup)
 	f.rebaselinePath(t)
 
 	rep, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"})
@@ -257,6 +268,158 @@ func TestCodeAnchorAmbiguousAfterTheEditIsUnknown(t *testing.T) {
 	}
 	if e := f.entry(t); e.NeedsReverify {
 		t.Fatalf("an ambiguous quote marked the memory: %+v", e)
+	}
+}
+
+// A memory quoting two blocks whose stored digests do not match the blocks its served
+// content holds in that order is unknown, and neither anchor moves. Pairing by position
+// instead of by digest hands each anchor the other block's snippet, so an edit that moves
+// one block but not the other moves each anchor onto the *other* block's lines: the
+// outcome this must not produce, and the reason the pairing checks the digest.
+func TestCodeAnchorMispairedBlocksAreUnknown(t *testing.T) {
+	f := newCodeFixture(t)
+	// A second block the file holds, so both quotes are placed and two code anchors exist.
+	const retrySource = "\nconst (\n\tReadTimeout = 1\n\tWriteTimeout = 2\n)\n"
+	const retry = "and the retry bounds:\n\n```go\nReadTimeout = 1\nWriteTimeout = 2\n```\n"
+	both := func(head string) string {
+		return head + strings.Replace(quoteSource, "func Serve() {}", retrySource+"func Serve() {}", 1)
+	}
+	writeRepoFile(t, f.root, "srv.go", both(""))
+	e, err := Remember(f.dir, f.ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{
+		Title: "timeouts", Content: quoteMemory + retry, Permission: "readwrite", Paths: []string{"srv.go"}}},
+		ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	// The invalidation reads served entries only, so this second memory must be promoted
+	// or its anchors are never looked at and the test would pass without testing anything.
+	e, err = VerifyContext(f.dir, f.ws, e.ID, "peer-1", true, "")
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if e, err = VerifyContextOutcome(f.dir, f.ws, e.ID, ContextActor{ID: "approver2", Kind: "agent", Verifier: true},
+		VerifyRequest{}); err != nil || !e.Promoted {
+		t.Fatalf("the second memory is not promoted: %+v, %v", e, err)
+	}
+	var anchors []govstore.Anchor
+	if err := memoryView(context.Background(), f.dir, f.ws, func(r govstore.Reader) (err error) {
+		anchors, err = r.ListAnchors(context.Background(), e.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	var code []govstore.Anchor
+	for _, a := range anchors {
+		if a.Kind == govstore.AnchorCode {
+			code = append(code, a)
+		}
+	}
+	if len(code) != 2 {
+		t.Fatalf("want two code anchors, got %d of %+v", len(code), anchors)
+	}
+	// Swap the two anchors' digests: each now names the block the other placed.
+	if err := memoryUpdate(context.Background(), f.dir, f.ws, func(tx govstore.Tx) error {
+		return tx.ReplaceAnchors(context.Background(), e.ID, []string{"srv.go"}, []govstore.AnchorInput{
+			{Kind: govstore.AnchorCode, Value: code[0].Value, Extracted: true, SymbolUID: code[1].SymbolUID},
+			{Kind: govstore.AnchorCode, Value: code[1].Value, Extracted: true, SymbolUID: code[0].SymbolUID},
+		}, govstore.Actor{Principal: "tester", Owner: "tester", Kind: "agent"})
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// An edit between the two blocks: the first moves down one line, the second does not,
+	// so pairing by position would move anchor 0 onto the second block's lines.
+	const block = "const (\n\tReadTimeout = 5\n\tWriteTimeout = 10\n)\n"
+	edited := strings.Replace(quoteSource, block, block+"// between\n", 1)
+	if edited == quoteSource {
+		t.Fatal("the block was not found in the fixture source")
+	}
+	writeRepoFile(t, f.root, "srv.go", both(edited))
+	f.rebaselinePathFor(t, e.ID)
+
+	rep, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The fixture's own memory quotes one block, which the insert above moved: it follows
+	// its code, as the first test asserts. Only the mispaired entry must stay put, so the
+	// report is read against that entry's id rather than the fixture's.
+	if slices.Contains(rep.Marked, e.ID) {
+		t.Fatalf("the mispaired entry was marked: %+v", rep)
+	}
+	var after []govstore.Anchor
+	if err := memoryView(context.Background(), f.dir, f.ws, func(r govstore.Reader) (err error) {
+		after, err = r.ListAnchors(context.Background(), e.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Pairing by position instead of by digest moves the first anchor onto the retry
+	// block's lines (measured: srv.go#L4-L5 -> srv.go#L19-L20 on this fixture), which is
+	// the failure this row exists to prevent. The two anchors must keep their values.
+	for _, a := range after {
+		if a.Kind == govstore.AnchorCode && a.Value != code[0].Value && a.Value != code[1].Value {
+			t.Fatalf("a mispaired anchor was moved to %q", a.Value)
+		}
+	}
+}
+
+// A memory quoting more blocks than the placement bound re-anchors only the ones it
+// placed: the surplus is unknown rather than re-found, so a change to the fifth block
+// marks nothing and moves nothing.
+func TestCodeAnchorBeyondThePlacementBoundIsUnknown(t *testing.T) {
+	f := newCodeFixture(t)
+	// One more block than maxQuotedBlocks (4). The file holds all of them, so every block
+	// except the surplus is placed and the anchor set is what the bound leaves behind.
+	var src, text strings.Builder
+	for i := range maxQuotedBlocks + 1 {
+		src.WriteString("const (\n\tLimit" + string(rune('a'+i)) + " = " + string(rune('1'+i)) + "\n)\n\n")
+		text.WriteString("and bound " + string(rune('A'+i)) + ":\n\n```go\nLimit" + string(rune('a'+i)) +
+			" = " + string(rune('1'+i)) + "\n```\n\n")
+	}
+	file := "package srv\n\n" + src.String() + "func Serve() {}\n"
+	writeRepoFile(t, f.root, "srv.go", file)
+	e, err := Remember(f.dir, f.ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{
+		Title: "bounds", Content: text.String(), Permission: "readwrite", Paths: []string{"srv.go"}}},
+		ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	e, err = VerifyContext(f.dir, f.ws, e.ID, "peer-1", true, "")
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if e, err = VerifyContextOutcome(f.dir, f.ws, e.ID, ContextActor{ID: "approver2", Kind: "agent", Verifier: true},
+		VerifyRequest{}); err != nil || !e.Promoted {
+		t.Fatalf("not promoted: %+v, %v", e, err)
+	}
+	var anchors []govstore.Anchor
+	if err := memoryView(context.Background(), f.dir, f.ws, func(r govstore.Reader) (err error) {
+		anchors, err = r.ListAnchors(context.Background(), e.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	placed := 0
+	for _, a := range anchors {
+		if a.Kind == govstore.AnchorCode {
+			placed++
+		}
+	}
+	if placed != maxQuotedBlocks {
+		t.Fatalf("the placement placed %d code anchors, want the bound %d (%+v)", placed, maxQuotedBlocks, anchors)
+	}
+	// Remove the surplus block's text from the file: only an implementation that re-anchors
+	// past the bound would try to place it, and would then mark the memory.
+	surplus := "Limit" + string(rune('a'+maxQuotedBlocks)) + " = " + string(rune('1'+maxQuotedBlocks))
+	writeRepoFile(t, f.root, "srv.go", strings.Replace(file, surplus+"\n", "", 1))
+	f.rebaselinePathFor(t, e.ID)
+
+	rep, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(rep.Marked, e.ID) {
+		t.Fatalf("a block past the placement bound marked the memory: %+v", rep)
 	}
 }
 
