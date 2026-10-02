@@ -55,16 +55,18 @@ func lookupWorkspace(dataDir, rootPath string, sameDir bool) (WorkspaceRootLooku
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return found, nil
 	}
-	byID, err := registryRecords(dataDir, mark, registryNow())
+	_, items, err := registryRecordsAndList(dataDir, mark, registryNow())
 	if err != nil {
 		return found, nil
 	}
 	registered := func(it workspaceRecord) WorkspaceRootLookup {
 		return WorkspaceRootLookup{ID: it.WorkspaceID, Name: it.Name, RootPath: it.RootPath, Registered: true}
 	}
-	// Sorted by the same key ListWorkspaces sorts by, so the records a root can
-	// match are visited in the same order they were when this read the file.
-	for _, it := range sortedWorkspaceRecords(byID) {
+	// The list, not byID: a hand-edited registry can hold two records under one
+	// workspace id, and this matches on a root, so it has to see both. Sorted by
+	// the key ListWorkspaces sorts by, so the record a root matches first is the
+	// same one it did when this read the file.
+	for _, it := range sortedWorkspaceRecords(items) {
 		if filepath.Clean(it.RootPath) == root {
 			return registered(it), nil
 		}
@@ -73,7 +75,7 @@ func lookupWorkspace(dataDir, rootPath string, sameDir bool) (WorkspaceRootLooku
 	if !sameDir || err != nil {
 		return found, nil
 	}
-	for _, it := range sortedWorkspaceRecords(byID) {
+	for _, it := range sortedWorkspaceRecords(items) {
 		stat := os.Stat
 		if it.RegisterRoot != "" {
 			stat = os.Lstat
@@ -85,14 +87,12 @@ func lookupWorkspace(dataDir, rootPath string, sameDir bool) (WorkspaceRootLooku
 	return found, nil
 }
 
-// sortedWorkspaceRecords returns the cached records in the order ListWorkspaces
-// hands out (name case-insensitively, then workspace id), so a reader that used to
-// re-parse the file visits the same record first for the same inputs.
-func sortedWorkspaceRecords(byID map[string]workspaceRecord) []workspaceRecord {
-	items := make([]workspaceRecord, 0, len(byID))
-	for _, it := range byID {
-		items = append(items, it)
-	}
-	slices.SortFunc(items, compareWorkspaceRecords)
-	return items
+// sortedWorkspaceRecords orders the registry's records the way ListWorkspaces
+// hands them out (name case-insensitively, then workspace id), over a copy of the
+// slice the decode produced: the cache's own slice is shared and must not be
+// reordered, and this reader's own order is what it must compare against.
+func sortedWorkspaceRecords(items []workspaceRecord) []workspaceRecord {
+	ordered := slices.Clone(items)
+	slices.SortFunc(ordered, compareWorkspaceRecords)
+	return ordered
 }

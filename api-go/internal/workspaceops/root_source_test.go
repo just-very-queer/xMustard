@@ -57,6 +57,17 @@ func TestConfineAnchorPathsFollowsTheRootToolPathsUse(t *testing.T) {
 	if !errors.Is(err, ErrPathEscapesWorkspace) {
 		t.Fatalf("a symlink leaving the root the tool paths use must be refused, got %v %v", out, err)
 	}
+
+	// The other direction: a symlink that leaves the *registry* root sits inside
+	// the root the tool paths use, and the tool path follows that link too, so it
+	// must be admitted. The old reader consulted workspaces.json first and refused
+	// it, which is the other half of the divergence.
+	if err := os.Symlink(t.TempDir(), filepath.Join(regRoot, "inside-link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+	if out, err := confineAnchorPaths(dataDir, workspaceID, []string{"inside-link"}); err != nil {
+		t.Fatalf("a path inside the root the tool paths use must be admitted, got %v %v", out, err)
+	}
 }
 
 // A registry the process cannot decode must not open confinement up. With the
@@ -238,12 +249,83 @@ func TestConfineAnchorPathsRechecksAnUnscannedNonAdminRoot(t *testing.T) {
 	}
 }
 
-// Root lookup answers the same before and after the registry cache has been warmed
-// by the readers that share it, so moving lookupWorkspace onto the cache cannot
-// change what an already-read registry says. The four rows are the shapes the API
-// uses it for: an unregistered root, a registered root, its spelling with a
-// trailing separator, and a root under a workspace registered through a symlink.
-func TestLookupWorkspaceRootIsUnchangedByTheWarmedRegistryCache(t *testing.T) {
+// A hand-edited registry can hold two records under one workspace id. The cache's
+// id-keyed map keeps one of them, but a root lookup matches on a *root*, so it has
+// to see both: before this row read the file it did, and a lookup that dropped one
+// would report a registered root as unregistered.
+func TestLookupWorkspaceRootSeesEveryRecordUnderADuplicateID(t *testing.T) {
+	dataDir := t.TempDir()
+	first, second := filepath.Join(t.TempDir(), "first"), filepath.Join(t.TempDir(), "second")
+	for _, r := range []string{first, second} {
+		if err := os.MkdirAll(r, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeJSON(workspacesPath(dataDir), []workspaceRecord{
+		{WorkspaceID: "dup", Name: "Aaa", RootPath: first},
+		{WorkspaceID: "dup", Name: "Bbb", RootPath: second},
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range []struct {
+		root string
+		name string
+	}{{first, "Aaa"}, {second, "Bbb"}} {
+		got, err := LookupWorkspaceRoot(dataDir, c.root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.Registered || got.ID != "dup" || got.Name != c.name {
+			t.Fatalf("root %s: got %+v, want registered id dup name %s", filepath.Base(c.root), got, c.name)
+		}
+		if id, err := WorkspaceIDForRoot(dataDir, c.root); err != nil || id != "dup" {
+			t.Fatalf("WorkspaceIDForRoot(%s): %q %v", filepath.Base(c.root), id, err)
+		}
+	}
+}
+
+// The reader this row moved, reimplemented here over ListWorkspaces, is the oracle
+// for what it answered before: the file, read every call, no cache. The cases are
+// the shapes the API uses it for — an unregistered root, a registered root, its
+// spelling with a trailing separator, and a symlinked root (which matches only
+// under LookupWorkspaceDir).
+func lookupOverListWorkspaces(t *testing.T, dataDir, rootPath string, sameDir bool) WorkspaceRootLookup {
+	t.Helper()
+	root, err := filepath.Abs(strings.TrimSpace(rootPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := WorkspaceRootLookup{ID: workspaceIDForPath(root), RootPath: root}
+	items, err := ListWorkspaces(dataDir)
+	if err != nil {
+		return found
+	}
+	registered := func(it workspaceRecord) WorkspaceRootLookup {
+		return WorkspaceRootLookup{ID: it.WorkspaceID, Name: it.Name, RootPath: it.RootPath, Registered: true}
+	}
+	for _, it := range items {
+		if filepath.Clean(it.RootPath) == root {
+			return registered(it)
+		}
+	}
+	want, err := os.Stat(root)
+	if !sameDir || err != nil {
+		return found
+	}
+	for _, it := range items {
+		stat := os.Stat
+		if it.RegisterRoot != "" {
+			stat = os.Lstat
+		}
+		if info, err := stat(it.RootPath); err == nil && os.SameFile(want, info) {
+			return registered(it)
+		}
+	}
+	return found
+}
+
+func TestLookupWorkspaceRootAnswersWhatTheFileReaderAnswered(t *testing.T) {
 	dataDir := t.TempDir()
 	repo := fakeRepo(t, filepath.Join(t.TempDir(), "repo"))
 	link := filepath.Join(t.TempDir(), "link")
@@ -285,19 +367,16 @@ func TestLookupWorkspaceRootIsUnchangedByTheWarmedRegistryCache(t *testing.T) {
 		}
 		return out
 	}
-	before := read()
 	for i, c := range cases {
-		if before[i].Registered != c.registered || before[i].ID != c.id {
-			t.Fatalf("%s: got %+v, want registered=%v id=%s", c.name, before[i], c.registered, c.id)
+		// The oracle is the pre-move reader itself, not a second call to the code
+		// under test, so this cannot compare a cold read with a warm one.
+		want := lookupOverListWorkspaces(t, dataDir, c.root, c.sameDir)
+		got := read()[i]
+		if got != want {
+			t.Fatalf("%s: got %+v, want the file reader's %+v", c.name, got, want)
 		}
-	}
-	// Warm the shared registry cache through a reader that reads it, then read again.
-	if _, err := confineAnchorPaths(dataDir, workspaceIDForPath(repo), []string{"inside.txt"}); err != nil {
-		t.Fatal(err)
-	}
-	for i, c := range cases {
-		if after := read()[i]; after != before[i] {
-			t.Fatalf("%s: warmed cache changed the answer: %+v vs %+v", c.name, after, before[i])
+		if got.Registered != c.registered || got.ID != c.id {
+			t.Fatalf("%s: got %+v, want registered=%v id=%s", c.name, got, c.registered, c.id)
 		}
 	}
 
@@ -311,5 +390,34 @@ func TestLookupWorkspaceRootIsUnchangedByTheWarmedRegistryCache(t *testing.T) {
 	renamed, err := LookupWorkspaceRoot(dataDir, repo)
 	if err != nil || !renamed.Registered || renamed.Name != "Renamed" {
 		t.Fatalf("a record changed after the cache was warmed must be seen: %+v %v", renamed, err)
+	}
+
+	// The lookup orders a copy: the cache's own slice is shared by every reader and
+	// must keep the order the file is in, or a reader that sorts it in place
+	// decides the order every later reader sees. Two records are needed for that to
+	// be visible, so "Aaa" is registered after "Renamed" and sorts before it.
+	other := fakeRepo(t, filepath.Join(t.TempDir(), "other"))
+	if _, err := upsertLoadedWorkspace(dataDir, other, "Aaa", nowUTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := LookupWorkspaceRoot(dataDir, other); err != nil {
+		t.Fatal(err)
+	}
+	fromFile, err := ListWorkspaces(dataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cached := registry.records[dataDir]
+	if cached == nil {
+		t.Fatal("the registry cache holds no records after two lookups")
+	}
+	if len(cached.list) != len(fromFile) {
+		t.Fatalf("the cache holds %d records, the file has %d", len(cached.list), len(fromFile))
+	}
+	for i := range fromFile {
+		if cached.list[i].WorkspaceID != fromFile[i].WorkspaceID {
+			t.Fatalf("record %d: the cache reordered the file's records (%s vs %s)",
+				i, cached.list[i].WorkspaceID, fromFile[i].WorkspaceID)
+		}
 	}
 }
