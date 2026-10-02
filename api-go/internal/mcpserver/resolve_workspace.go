@@ -58,6 +58,11 @@ const (
 	// longer than a prompt failure: it already cost the caller rootsTimeout.
 	rootsRetryAfter        = 15 * time.Second
 	rootsRetryAfterFailure = time.Second
+	// rootsErrClip bounds a cached roots/list failure text. A failure is kept for
+	// the session even when it has no back-off window, and the client's message
+	// can be as large as one transport message (8 MiB by default), so it is clipped
+	// before it is stored.
+	rootsErrClip = 200
 	// listingMissRefresh is how old the cached listing must be before a workspace id
 	// missing from it triggers a re-read (to learn the root of a new workspace).
 	listingMissRefresh = 10 * time.Second
@@ -393,10 +398,11 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 	case err != nil && errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
 		st.err = "the client does not implement roots/list"
 	case err != nil:
-		st.err, st.transient = "roots/list failed: "+err.Error(), true
-		// The first prompt failure gets no window, so a client that fails once is
-		// asked again on the next call; the state is kept either way, so the next
-		// failure is known to be the second in a row and can back off.
+		// A failure is now kept even without a window, so its text outlives the call
+		// and is held for the session. The client's message can be as large as one
+		// transport message (8 MiB by default), so it is clipped before it is stored
+		// rather than after it is reported.
+		st.err, st.transient = "roots/list failed: "+clip(err.Error(), rootsErrClip), true
 		if after := rootsBackoff(cached, errors.Is(err, context.DeadlineExceeded)); after > 0 {
 			st.retryAt = time.Now().Add(after)
 			st.err += fmt.Sprintf(" (asked again after %s)", after)
@@ -410,7 +416,7 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 		if err := json.Unmarshal(raw, &r); err != nil {
 			// the client answered, but the answer cannot be read: transient, so it is
 			// asked again rather than cached as "the client has no usable roots"
-			st.err, st.transient = "roots/list answer is malformed: "+err.Error(), true
+			st.err, st.transient = "roots/list answer is malformed: "+clip(err.Error(), rootsErrClip), true
 			if after := rootsBackoff(cached, false); after > 0 {
 				st.retryAt = time.Now().Add(after)
 				st.err += fmt.Sprintf(" (asked again after %s)", after)

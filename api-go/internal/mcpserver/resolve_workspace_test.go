@@ -299,6 +299,34 @@ func TestMalformedRootsAnswerIsAskedAgain(t *testing.T) {
 	}
 }
 
+// A failure is cached for the session, so its text is held for the session's
+// lifetime. The client's message can be as large as one transport message, so the
+// cached text is bounded and the reported error still names the cause.
+func TestCachedRootsFailureTextIsBounded(t *testing.T) {
+	other := tempRepo(t)
+	huge := strings.Repeat("x", 64*1024)
+	api := &fakeAPI{}
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){
+		fail(fmt.Errorf("client error -32603: %w", errors.New(huge))),
+		fail(fmt.Errorf("client error -32603: %w", errors.New(huge))),
+	}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if len(text(res)) > rootsErrClip+512 {
+		t.Fatalf("the reported error is %d bytes, over the clip", len(text(res)))
+	}
+	if !strings.Contains(text(res), "client error -32603") {
+		t.Fatalf("the clipped error must still name the cause: %v", text(res))
+	}
+	s.mu.Lock()
+	cached := len(s.roots.err)
+	s.mu.Unlock()
+	if cached > rootsErrClip+128 {
+		t.Fatalf("the cached failure text is %d bytes; a failure is held for the whole session", cached)
+	}
+}
+
 // A client that does not implement roots/list says so once; that answer is kept.
 func TestRootsMethodNotFoundIsKept(t *testing.T) {
 	repo := tempRepo(t)
