@@ -652,7 +652,7 @@ func TestReaderWriteRouteGuardCatchesAMethodLessRow(t *testing.T) {
 
 // Each entry of methodlessReadOnlyExemptions must answer a write method exactly as it
 // answers a read: the same status and the same body. A handler that starts honouring a
-// write method changes one of the two, so the exemption stays a measured property of the
+// write method answers differently, so the exemption stays a measured property of the
 // handler rather than a claim about it. A reader token takes healthResponse's non-full
 // branch, which returns static limits and no counters, so a read answer is stable enough
 // to compare against.
