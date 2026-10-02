@@ -41,8 +41,10 @@ func assertNamesFileAndOffset(t *testing.T, err error, path string, wantOffset i
 	if !strings.Contains(msg, "offset") {
 		t.Fatalf("%s: error does not name an offset: %v", context, err)
 	}
-	if !strings.Contains(msg, strconv.Itoa(wantOffset)) {
-		t.Fatalf("%s: error does not carry the parse offset %d: %v", context, wantOffset, err)
+	// anchored on the phrase, not the bare digits: a low offset such as 1 would
+	// otherwise match any 1 inside a temporary path.
+	if want := "at offset " + strconv.Itoa(wantOffset); !strings.Contains(msg, want) {
+		t.Fatalf("%s: error does not carry %q: %v", context, want, err)
 	}
 }
 
@@ -155,7 +157,8 @@ func TestReadJSONNamesTheFileAndOffsetOnADecodeError(t *testing.T) {
 		N int `json:"n"`
 	}
 	err := readJSON(path, &target)
-	// the offending byte is the ']' where a value was expected; its index is the last
-	// byte of the fixture, which the test reads off the string
-	assertNamesFileAndOffset(t, err, path, strings.Index(body, "]"), "readJSON")
+	// The offending byte is the ']' where a value was expected. json.SyntaxError.Offset
+	// is one-based, so the 0-based index of that byte plus one is what the message
+	// carries; the index comes off the fixture string, not from the decoder.
+	assertNamesFileAndOffset(t, err, path, strings.Index(body, "]")+1, "readJSON")
 }
