@@ -894,12 +894,19 @@ pub fn search(
     });
     if let Some(impact) = seed_impact {
         let mut prox: HashMap<String, f64> = HashMap::new();
+        // The proximity map is keyed by path and read straight off the seed's blast
+        // radius, so it must go through `admit` like every other lane: a `lang` or a
+        // `path_glob` filter that left it out would rank a hit the filter excluded.
         for d in &impact.defined_in {
-            prox.insert(d.clone(), 1.0); // the seed's own file: distance 0
+            if admit(d) {
+                prox.insert(d.clone(), 1.0); // the seed's own file: distance 0
+            }
         }
         for f in &impact.impacted {
-            prox.entry(f.path.clone())
-                .or_insert(1.0 / (f.distance as f64 + 1.0));
+            if admit(&f.path) {
+                prox.entry(f.path.clone())
+                    .or_insert(1.0 / (f.distance as f64 + 1.0));
+            }
         }
         for c in cands.iter_mut().filter(|c| c.kind != Kind::Doc) {
             if let Some(&p) = prox.get(&*c.path) {
