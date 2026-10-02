@@ -1082,7 +1082,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
 | `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |
 | `POST /api/workspaces/{workspace_id}/index` | core | indexer | refused |  | rebaseline the index; agents cannot reset it |
-| `GET /api/workspaces/{workspace_id}/memory/core` | core | reader | served |  | standing-memory projection: human-approved core tier and the deferred index |
+| `GET /api/workspaces/{workspace_id}/memory/core` | core | reader | served | recall | standing-memory projection: human-approved core tier and the deferred index; recall's gate row, so a deployment that disables recall serves neither |
 | `GET /api/workspaces/{workspace_id}/outcomes` | core | reader | served |  | run-independent outcomes, newest first; reads only |
 | `DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}` | core | admin | refused |  | removes one outcome (a secret the redactor missed in its command or tail) |
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
