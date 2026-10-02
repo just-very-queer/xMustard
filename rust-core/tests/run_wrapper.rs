@@ -260,7 +260,7 @@ fn a_signal_that_arrives_after_the_child_ended_still_ends_the_wrapper() {
     // (measured: a first version survived its mutation, reporting the child's code).
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let api = format!("http://{}", listener.local_addr().unwrap());
-    let mut wrapper = Command::new(BIN)
+    let wrapper = Command::new(BIN)
         .arg("run")
         .arg("--api")
         .arg(&api)
