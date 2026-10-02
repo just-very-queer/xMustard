@@ -421,6 +421,13 @@ func maxRequestBodyBytesConfigured() int64 {
 	return maxRequestBodyBytes
 }
 
+// requestBodyCapBytes is the cap a request body is admitted against: the configured
+// cap, which bodyLimitMiddleware applies to a route that streams its body to disk
+// (streamsRequestBody, which capture is). /api/health reports this, so the advertised
+// limit is the one the server enforces on capture, not the pool-capped limit that
+// applies only to a body reserved in the transient pool.
+func requestBodyCapBytes() int64 { return maxRequestBodyBytesConfigured() }
+
 // bodyInFlight bounds the number of body-bearing requests decoded concurrently, so
 // the aggregate in-flight body memory is at most cap × maxInFlight rather than
 // cap × (unbounded concurrent agents) — a single 32 MiB cap alone cannot hold the

@@ -149,10 +149,44 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	}
 	num(t, b, "transient_pool", "max")
 	num(t, b, "children", "cap")
-	if num(t, b, "request_body_cap_bytes") > num(t, b, "transient_pool", "max") {
-		t.Fatalf("request body cap must not exceed the pool: %v", b)
-	}
+	// request_body_cap_bytes is asserted for real in TestHealthRequestBodyCapIsTheRealAdmissionCap;
+	// this block's former "must not exceed the pool" check pinned the pool-capped value and is gone.
 	num(t, b, "in_flight_bodies", "cap")
+}
+
+// Correction to a pre-fix assertion: request_body_cap_bytes is the configured
+// admission cap, which the capture route (a streamed route) is admitted against, and
+// that is not bounded by the transient pool. It used to be reported pool-capped, so an
+// operator sizing an upload was told 24 MiB while capture accepted 32 MiB.
+func TestHealthRequestBodyCapIsTheRealAdmissionCap(t *testing.T) {
+	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "")
+	want := maxRequestBodyBytesConfigured()
+	if got := healthBudgetBlock().RequestBodyCapBytes; got != want {
+		t.Fatalf("default cap: want %d (the configured admission cap), got %d", want, got)
+	}
+
+	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "5000000")
+	if want := maxRequestBodyBytesConfigured(); want != 5000000 {
+		t.Fatalf("operator override not applied: %d", want)
+	}
+	if got := healthBudgetBlock().RequestBodyCapBytes; got != 5000000 {
+		t.Fatalf("overridden cap: want 5000000, got %d", got)
+	}
+}
+
+// The reported cap is the limit a streamed route (capture) is admitted against, so it
+// is the middleware's streamLimit and not the pool-capped reservedLimit.
+func TestHealthRequestBodyCapMatchesTheCaptureRouteLimit(t *testing.T) {
+	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "")
+	streamLimit := maxRequestBodyBytesConfigured()
+	if got := healthBudgetBlock().RequestBodyCapBytes; got != streamLimit {
+		t.Fatalf("health cap %d is not the capture route's limit %d", got, streamLimit)
+	}
+	// the middleware must still cap a reserved body at the pool; this row does not
+	// change that, it only changes what health reports.
+	if reserved := budget.CapToPool(streamLimit); streamLimit <= reserved {
+		t.Fatalf("fixture assumption: configured cap %d must exceed the pool-capped %d for the test to distinguish them", streamLimit, reserved)
+	}
 }
 
 // Correction to PAR-RT-04: no capture path waits on the heavy slot. With the slot held

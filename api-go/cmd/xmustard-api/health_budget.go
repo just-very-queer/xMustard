@@ -105,7 +105,7 @@ func healthBudgetBlock() healthBudget {
 	return healthBudget{
 		Snapshot:            budget.Status(),
 		CoreWorker:          rustcore.CoreWorkerHealth(),
-		RequestBodyCapBytes: budget.CapToPool(maxRequestBodyBytesConfigured()),
+		RequestBodyCapBytes: requestBodyCapBytes(),
 		InFlightBodies:      slotStatus{Cap: cap(bodyInFlight), InUse: len(bodyInFlight)},
 	}
 }
