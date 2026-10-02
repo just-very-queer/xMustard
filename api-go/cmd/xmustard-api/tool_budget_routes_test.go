@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -36,12 +37,19 @@ const isolatedRun = "XMUSTARD_TEST_ISOLATED_RUN"
 // SoftCeilingBytes. A long parent binary grows past that line before its last tests run,
 // so the refusal is a property of when the test is reached rather than of the test. A
 // fresh binary has a fresh, small tree, so the production governor admits the update and
-// the assertions below run against it unchanged — no ceiling, wait or bound is touched.
+// the assertions run against it unchanged — no ceiling, wait or bound is touched.
 //
-// The parent builds the child's command from the same flags it received, so `-run`, `-v`,
-// `-count`, `XMUSTARD_CORE_BIN` and every other flag that shapes the run carry over. The
-// child runs only body, and in the parent body does nothing, so each side runs every test
-// exactly once. A child failure fails the parent with the child's own output.
+// The parent's command is built from the flags it received, so `-run`, `-v`,
+// `XMUSTARD_CORE_BIN` and every other flag that shapes the run carry over. Two do not:
+// -test.count and -test.run, which isolatedTest sets itself. The count is dropped because
+// the parent already repeats — forwarding it would run the body count-squared times in
+// one child, and those repeats grow the child back over the line this helper exists to
+// avoid. The run pattern is replaced rather than added, so a parent's own -run narrows to
+// this one test and a run flag that already names it is not duplicated.
+//
+// Each side runs every test exactly once, and a child that skipped or failed is not a
+// pass: the child's own verdict decides, so a build without the core binary reports the
+// test as skipped instead of quietly passing.
 func isolatedTest(t *testing.T, body func(t *testing.T)) {
 	t.Helper()
 	if os.Getenv(isolatedRun) != "" {
@@ -52,15 +60,38 @@ func isolatedTest(t *testing.T, body func(t *testing.T)) {
 	if err != nil {
 		t.Fatalf("the test binary path: %v", err)
 	}
-	args := append([]string{}, os.Args[1:]...)
-	args = append(args, "-test.run=^"+t.Name()+"$")
+	args := isolatedArgs(t.Name())
 	cmd := exec.Command(exe, args...)
 	cmd.Env = append(os.Environ(), isolatedRun+"=1")
 	out, err := cmd.CombinedOutput()
 	t.Logf("isolated %s in a fresh process (pid %d):\n%s", t.Name(), cmd.Process.Pid, out)
-	if err != nil {
+	switch {
+	case err != nil:
 		t.Fatalf("isolated %s: %v", t.Name(), err)
+	case bytes.Contains(out, []byte("--- SKIP: "+t.Name())):
+		t.Skipf("isolated %s skipped: %s", t.Name(), isolatedSummary(out))
 	}
+}
+
+// isolatedArgs is the child's argument list: the parent's flags with -test.count and
+// -test.run replaced by values that run this one test exactly once.
+func isolatedArgs(name string) []string {
+	args := make([]string, 0, len(os.Args)+2)
+	for _, a := range os.Args[1:] {
+		if strings.HasPrefix(a, "-test.count") || strings.HasPrefix(a, "-test.run") {
+			continue
+		}
+		args = append(args, a)
+	}
+	return append(args, "-test.count=1", "-test.run=^"+name+"$")
+}
+
+// isolatedSummary is the child's own summary, which names what it skipped for.
+func isolatedSummary(out []byte) string {
+	if i := bytes.LastIndexByte(out, '\n'); i >= 0 {
+		return strings.TrimSpace(string(out[i+1:]))
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func budgetGet(t *testing.T, u string, hdr map[string]string) (int, map[string]any) {
