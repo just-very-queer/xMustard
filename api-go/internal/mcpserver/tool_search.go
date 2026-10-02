@@ -12,13 +12,13 @@ var searchQueryArgs = []string{"q", "mode", "lang", "seed", "limit", "cursor", "
 
 var searchTool = &Tool{
 	Name:        "search",
-	Description: "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: a chunk's own text only. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path.",
+	Description: "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over bodies, comments, names, paths and docs; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: a chunk's text; mode=pattern: ast-grep; mode=symbol: name path.",
 	Args: []Arg{
 		workspaceArg,
-		{Name: "q", Type: typeString, Required: true, Desc: "the search query"},
-		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (a chunk's own text), pattern (ast-grep) or symbol"},
-		{Name: "lang", Type: typeString, MaxLen: 32, Desc: "hybrid|text: only this language; pattern: ast-grep language hint"},
-		{Name: "seed", Type: typeString, Desc: "symbol to anchor the graph-proximity lane"},
+		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
+		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (a chunk's text), pattern or symbol"},
+		{Name: "lang", Type: typeString, Desc: "language hint for pattern mode; a filter otherwise"},
+		{Name: "seed", Type: typeString, Desc: "symbol for the proximity lane"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits (default 10)"},
 	},
 	// Paging and path filters (WS-18), the symbol lookup's options and the output
@@ -30,7 +30,7 @@ var searchTool = &Tool{
 		{Name: "depth", Type: typeInteger, Min: 0, Max: workspaceops.NavMaxDepth, Desc: "mode=symbol: child levels"},
 		{Name: "include_body", Type: typeBoolean, Desc: "mode=symbol: add bodies"},
 		{Name: "include_info", Type: typeBoolean, Desc: "mode=symbol: add signatures, docs"},
-		{Name: "substring", Type: typeBoolean, Desc: "mode=symbol: substring match"},
+		{Name: "substring", Type: typeBoolean, Desc: "mode=symbol: substring"},
 	}, budgetArgs("search")...),
 	Doc: symbolSearchDoc + "\n" + budgetSpec("search").Markdown(),
 	// Claude Code drops a tool argument named exactly "query" (see recall).

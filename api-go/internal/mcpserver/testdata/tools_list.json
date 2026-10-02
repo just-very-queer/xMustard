@@ -239,13 +239,12 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=text: a chunk's own text only. mode=pattern: ast-grep (`$A \u0026\u0026 $A()`); mode=symbol: name path.",
+      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over bodies, comments, names, paths and docs; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=text: a chunk's text; mode=pattern: ast-grep; mode=symbol: name path.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "lang": {
-            "description": "hybrid|text: only this language; pattern: ast-grep language hint",
-            "maxLength": 32,
+            "description": "language hint for pattern mode; a filter otherwise",
             "type": "string"
           },
           "limit": {
@@ -255,7 +254,7 @@
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default), text (a chunk's own text), pattern (ast-grep) or symbol",
+            "description": "hybrid (default), text (a chunk's text), pattern or symbol",
             "enum": [
               "hybrid",
               "text",
@@ -265,11 +264,11 @@
             "type": "string"
           },
           "q": {
-            "description": "the search query",
+            "description": "the query",
             "type": "string"
           },
           "seed": {
-            "description": "symbol to anchor the graph-proximity lane",
+            "description": "symbol for the proximity lane",
             "type": "string"
           },
           "workspace_id": {
