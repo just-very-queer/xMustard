@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"unicode/utf8"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -103,8 +104,10 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if len(req.PathGlob) > maxSearchPathGlobLen {
 		return nil, fmt.Errorf("path_glob is longer than %d bytes: %w", maxSearchPathGlobLen, ErrInvalidInput)
 	}
-	if len(req.Lang) > maxSearchLangLen {
-		return nil, fmt.Errorf("lang is longer than %d bytes: %w", maxSearchLangLen, ErrInvalidInput)
+	// Characters, not bytes: the MCP argument advertises maxLength 256, and JSON Schema
+	// counts characters, so a 256-rune value is schema-valid and must reach the core.
+	if utf8.RuneCountInString(req.Lang) > maxSearchLangLen {
+		return nil, fmt.Errorf("lang is longer than %d characters: %w", maxSearchLangLen, ErrInvalidInput)
 	}
 	// Only `text` is ever sent to the core, which is `hybrid` when the flag is absent, so
 	// an unrecognised mode would be answered by the hybrid. The route validates before it

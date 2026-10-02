@@ -16,8 +16,8 @@ var searchTool = &Tool{
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
-		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (body), pattern, symbol"},
-		{Name: "lang", Type: typeString, MaxLen: 256, Desc: "pattern: ast-grep hint; else filter"},
+		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (body)"},
+		{Name: "lang", Type: typeString, MaxLen: 256, Desc: "pattern: ast-grep hint; else filter, not symbol"},
 		{Name: "seed", Type: typeString, Desc: "proximity seed symbol"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits (default 10)"},
 	},

@@ -244,7 +244,7 @@
         "additionalProperties": false,
         "properties": {
           "lang": {
-            "description": "pattern: ast-grep hint; else filter",
+            "description": "pattern: ast-grep hint; else filter, not symbol",
             "maxLength": 256,
             "type": "string"
           },
@@ -255,7 +255,7 @@
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default), text (body), pattern, symbol",
+            "description": "hybrid (default), text (body)",
             "enum": [
               "hybrid",
               "text",

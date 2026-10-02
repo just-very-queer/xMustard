@@ -139,9 +139,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the query" },
-			{ name: "mode", type: "string", enum: ["hybrid", "text", "pattern", "symbol"], desc: "hybrid (default), text (chunk text), pattern or symbol" },
-			{ name: "lang", type: "string", desc: "pattern: ast-grep hint; else filter" },
-			{ name: "seed", type: "string", desc: "symbol for the proximity lane" },
+			{ name: "mode", type: "string", enum: ["hybrid", "text", "pattern", "symbol"], desc: "hybrid (default), text (body)" },
+			{ name: "lang", type: "string", maxLength: 256, desc: "pattern: ast-grep hint; else filter, not symbol" },
+			{ name: "seed", type: "string", desc: "proximity seed symbol" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 10)" },
 		],
 		build: (a) => ({
