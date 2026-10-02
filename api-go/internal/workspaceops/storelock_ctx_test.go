@@ -152,8 +152,13 @@ func TestACancelledWaiterDoesNotDenyTheLockToTheNextOne(t *testing.T) {
 	go func() { _, err := RebaselineIndex(ctx, dataDir, ws, "ops-cancelled"); waiterErr <- err }()
 	time.Sleep(200 * time.Millisecond)
 	cancel()
-	if err := <-waiterErr; !errors.Is(err, context.Canceled) {
-		t.Fatalf("the first waiter must answer context.Canceled, got %v", err)
+	select {
+	case err := <-waiterErr:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("the first waiter must answer context.Canceled, got %v", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("the cancelled waiter never answered")
 	}
 
 	built := make(chan error, 1)
