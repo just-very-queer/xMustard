@@ -155,71 +155,64 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	num(t, b, "in_flight_bodies", "cap")
 }
 
-// Correction to a pre-fix assertion: request_body_cap_bytes is the configured
-// admission cap, which the capture route (a streamed route) is admitted against, and
-// that is not bounded by the transient pool. It used to be reported pool-capped, so an
-// operator sizing an upload was told 24 MiB while capture accepted 32 MiB.
+// request_body_cap_bytes is the effective capture admission cap. It used to be
+// pool-capped, then the streaming cap alone; neither is what the capture route
+// enforces, because a spooled original is refused past
+// evidence.LimitsFromEnv().MaxOriginal (16 MiB by default) with 413 too_large. The
+// effective cap is the lower of the two limits, and the field is read from a real HTTP
+// health response and compared with it.
 //
-// The field is read from a real HTTP health response and compared with the limit
-// bodyLimitMiddleware actually enforces on a streamed route, measured by finding the
-// body length it answers 413 for. Comparing against the middleware rather than against
-// maxRequestBodyBytesConfigured() keeps the two in step even if the pool is resized.
+// The environment is cleared before the fixture builds its server, so the server the
+// response comes from and the helper both read the same values.
 func TestHealthRequestBodyCapIsTheRealAdmissionCap(t *testing.T) {
-	f := newEvidenceFixture(t, true)
 	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "")
-	enforced := streamedBodyLimitEnforcedByMiddleware(t)
+	t.Setenv("XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES", "")
+	f := newEvidenceFixture(t, true)
 
+	want := effectiveCaptureBodyCap()
 	h := getHealth(t, f.srv.URL)
 	b := dig(t, h, "budget")
-	if got := num(t, b, "request_body_cap_bytes"); got != float64(enforced) {
-		t.Fatalf("request_body_cap_bytes: want the cap the capture route is admitted against (%d), got %d", enforced, int64(got))
+	if got := num(t, b, "request_body_cap_bytes"); got != float64(want) {
+		t.Fatalf("request_body_cap_bytes: want the effective capture cap %d, got %d", want, int64(got))
+	}
+	// With defaults the evidence store's original limit is what binds, so the reported
+	// value must be the store's, not the 32 MiB streaming cap.
+	if want != evidence.LimitsFromEnv().MaxOriginal {
+		t.Fatalf("defaults: want the store's MaxOriginal %d to bind, got %d", evidence.LimitsFromEnv().MaxOriginal, want)
 	}
 
-	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "5000000")
-	if want := maxRequestBodyBytesConfigured(); want != 5000000 {
-		t.Fatalf("operator override not applied: %d", want)
-	}
+	t.Setenv("XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES", "5000000")
 	if got := healthBudgetBlock().RequestBodyCapBytes; got != 5000000 {
-		t.Fatalf("overridden cap: want 5000000, got %d", got)
+		t.Fatalf("store override: want 5000000, got %d", got)
+	}
+	t.Setenv("XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES", "")
+	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "5000000")
+	if got := healthBudgetBlock().RequestBodyCapBytes; got != 5000000 {
+		t.Fatalf("body override below the store limit: want 5000000, got %d", got)
+	}
+	// A body-cap override above the store's limit must not raise the advertised cap
+	// past what the store accepts: the store's limit still binds. This is also the case
+	// that separates the effective cap from the pool-capped one, because the configured
+	// cap here exceeds the transient pool, which CapToPool would lower.
+	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "67108864")
+	if got := requestBodyCapBytes(); got != evidence.LimitsFromEnv().MaxOriginal {
+		t.Fatalf("body override above the store limit: want the store's %d, got %d", evidence.LimitsFromEnv().MaxOriginal, got)
+	}
+	if capped := budget.CapToPool(maxRequestBodyBytesConfigured()); capped == evidence.LimitsFromEnv().MaxOriginal {
+		t.Fatalf("fixture: the pool-capped and store limits coincide (%d), so this case cannot tell them apart", capped)
 	}
 }
 
-// streamedBodyLimitEnforcedByMiddleware measures the largest declared body a capture
-// route is admitted against, by finding the boundary at which bodyLimitMiddleware
-// starts answering 413. It reports the enforced limit rather than recomputing it, so it
-// holds whatever the pool size is. bodyLimitMiddleware refuses when ContentLength is
-// greater than the limit, so the limit is the largest length not refused.
-func streamedBodyLimitEnforcedByMiddleware(t *testing.T) int64 {
-	t.Helper()
-	h := bodyLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-	}))
-	refused := func(n int64) bool {
-		// a real body reader, or bodyLimitMiddleware short-circuits on http.NoBody and
-		// never applies the cap; the reader is never read, only the declared length is.
-		req := httptest.NewRequest("POST", "/api/workspaces/ws/evidence/capture", bytes.NewReader(make([]byte, 1)))
-		req.ContentLength = n
-		w := httptest.NewRecorder()
-		h.ServeHTTP(w, req)
-		return w.Code == http.StatusRequestEntityTooLarge
+// effectiveCaptureBodyCap mirrors requestBodyCapBytes so the test's expected value is
+// not the production expression it is checking. It reads the two limits independently
+// from the middleware and the evidence package.
+func effectiveCaptureBodyCap() int64 {
+	streamLimit := maxRequestBodyBytesConfigured()
+	storeLimit := evidence.LimitsFromEnv().MaxOriginal
+	if storeLimit < streamLimit {
+		return storeLimit
 	}
-	hi := int64(1)
-	for !refused(hi) {
-		hi <<= 1
-		if hi > 1<<40 {
-			t.Fatalf("no body length up to 1 TiB is refused; the capture route cap is not enforced by this middleware")
-		}
-	}
-	lo := hi >> 1 // the largest accepted length; 0 if even 1 byte is refused
-	for hi-lo > 1 {
-		mid := (lo + hi) / 2
-		if refused(mid) {
-			hi = mid
-		} else {
-			lo = mid
-		}
-	}
-	return lo
+	return streamLimit
 }
 
 // Correction to PAR-RT-04: no capture path waits on the heavy slot. With the slot held

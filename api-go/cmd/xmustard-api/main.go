@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -421,13 +422,20 @@ func maxRequestBodyBytesConfigured() int64 {
 	return maxRequestBodyBytes
 }
 
-// requestBodyCapBytes is the cap a request body is admitted against: the configured
-// cap, which bodyLimitMiddleware applies to a route that streams its body to disk
-// (streamsRequestBody, which capture is). It is the single read point for both the
-// middleware's streamLimit and /api/health's request_body_cap_bytes, so the advertised
-// limit is the one the server enforces on capture, not the pool-capped limit that
-// applies only to a body reserved in the transient pool.
-func requestBodyCapBytes() int64 { return maxRequestBodyBytesConfigured() }
+// requestBodyCapBytes is the largest request body the capture route actually accepts:
+// the smaller of the streaming admission cap (bodyLimitMiddleware's streamLimit, the
+// configured XMUSTARD_MAX_BODY_BYTES) and the evidence store's per-original limit
+// (XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES), which refuses a spooled original past it with
+// 413 too_large. Whichever binds first is what the server enforces, so health reports
+// that and not either limit alone. bodyLimitMiddleware keeps its own streamLimit for
+// the reserved/streamed split; this is what /api/health advertises.
+func requestBodyCapBytes() int64 {
+	streamLimit := maxRequestBodyBytesConfigured()
+	if storeLimit := evidence.LimitsFromEnv().MaxOriginal; storeLimit < streamLimit {
+		return storeLimit
+	}
+	return streamLimit
+}
 
 // bodyInFlight bounds the number of body-bearing requests decoded concurrently, so
 // the aggregate in-flight body memory is at most cap × maxInFlight rather than
@@ -456,7 +464,7 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 	// A body reserved in the transient pool can never exceed the pool, so its cap is
 	// the pool size (a permanent 413, not a retried 503). A body its handler streams to
 	// disk (streamsRequestBody) is never reserved, so it keeps the configured cap.
-	streamLimit := requestBodyCapBytes()
+	streamLimit := maxRequestBodyBytesConfigured()
 	reservedLimit := budget.CapToPool(streamLimit)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Every request gets a transient-byte ledger held until the handler returns
