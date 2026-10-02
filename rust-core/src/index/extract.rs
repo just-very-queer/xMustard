@@ -512,7 +512,8 @@ impl<'a> Walker<'a> {
         // outermost wrapper is held in
         let mut up = up;
         let mut field = field.to_string();
-        while let (kind, pf) = at(up) {
+        loop {
+            let (kind, pf) = at(up);
             if !WRITE_WRAPPERS.contains(&kind) {
                 break;
             }
