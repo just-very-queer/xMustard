@@ -474,8 +474,14 @@ func anchorsWithFanout(ctx context.Context, r govstore.Reader, e govstore.Entry,
 	}
 	out := make([]MemoryAnchor, len(anchors))
 	for i, a := range anchors {
-		out[i] = MemoryAnchor{Kind: a.Kind, Value: a.Value, SymbolUID: a.SymbolUID, Declared: a.Declared,
+		out[i] = MemoryAnchor{Kind: a.Kind, Value: a.Value, Declared: a.Declared,
 			Fanout: fanout[govstore.AnchorRef{Kind: a.Kind, Value: a.Value}] + self}
+		// A code anchor's symbol_uid is the digest of the block it placed (WS-28B), not a
+		// name path, and this projection documents symbol_uid as "path#name". The digest
+		// stays in the store, where the re-anchor reads it.
+		if a.Kind != govstore.AnchorCode {
+			out[i].SymbolUID = a.SymbolUID
+		}
 	}
 	return out, nil
 }
