@@ -49,25 +49,29 @@ fn a_child_killed_by_a_signal_kills_the_wrapper_the_same_way() {
     );
 }
 
-/// A child that reports which signals reached it, on one line each, through a file, and
-/// outlives a wrapper that is gone: it ignores SIGTERM, so the only way it learns of one
-/// is that the wrapper forwarded it.
-const WATCHDOG: &str = r#"trap '' TERM INT QUIT HUP
-printf '%s' "$$" > "$1/pid"
-printf 'ready\n' > "$1/ready"
+/// A child that records each signal it is sent, one line each, and outlives a wrapper that
+/// is gone. It traps every signal it watches, so a recorded line proves the wrapper
+/// delivered the signal rather than that the child noticed its pipe close; and `stop` lets a
+/// test end it cleanly instead of leaving it to time out.
+const WATCHDOG: &str = r#"WM_DIR="$1"
+note() { printf '%s\n' "$1" >> "$WM_DIR/log"; }
+trap 'note TERM' TERM
+trap 'note INT' INT
+trap 'note QUIT' QUIT
+trap 'note HUP' HUP
+trap 'note USR1' USR1
+printf '%s' "$$" > "$WM_DIR/pid"
+printf 'ready\n' > "$WM_DIR/ready"
 i=0
-while [ "$i" -lt 600 ]; do
+while [ "$i" -lt 900 ]; do
   i=$((i+1))
-  if [ -f "$1/stop" ]; then printf 'outlived\n' >> "$1/log"; exit 9; fi
-  for s in TERM INT QUIT HUP USR1; do
-    if [ -f "$1/$s" ]; then printf '%s\n' "$s" >> "$1/log"; fi
-  done
+  [ -f "$WM_DIR/stop" ] && exit 0
   sleep 0.05
 done
-printf 'timeout\n' >> "$1/log"
+printf 'timeout\n' >> "$WM_DIR/log"
 exit 9"#;
 
-/// The wrapper's own pid, started with a child that watches for forwarded signals.
+/// Starts the wrapper over a signal-watching child and waits for the child to be ready.
 fn watchdog(dir: &std::path::Path) -> std::process::Child {
     let mut c = Command::new(BIN);
     c.arg("run")
@@ -79,12 +83,14 @@ fn watchdog(dir: &std::path::Path) -> std::process::Child {
         .arg(dir.to_str().unwrap());
     c.env_remove("XMUSTARD_WORKSPACE_ID")
         .env_remove("XMUSTARD_API_TOKEN");
-    c.spawn().unwrap()
+    let child = c.spawn().unwrap();
+    await_file(&dir.join("ready"));
+    child
 }
 
 /// Blocks until `path` exists, so a test never races the child's first write.
 fn await_file(path: &std::path::Path) {
-    for _ in 0..600 {
+    for _ in 0..900 {
         if path.exists() {
             return;
         }
@@ -93,23 +99,35 @@ fn await_file(path: &std::path::Path) {
     panic!("{} never appeared", path.display());
 }
 
-fn signal(pid: u32, sig: &str) {
-    let status = Command::new("kill")
-        .args([format!("-{sig}"), pid.to_string()])
-        .status()
-        .unwrap();
-    assert!(status.success(), "kill -{sig} {pid}");
-}
-
 fn seen(dir: &std::path::Path) -> String {
     std::fs::read_to_string(dir.join("log")).unwrap_or_default()
 }
 
-/// The wrapper's own pid, from the pid the child's first line gives away: the shell wrote
-/// its own `$$`, which is the wrapper's child, so the wrapper is its parent.
-fn wrapper_pid(child_pid: &str) -> u32 {
+/// Blocks until `text` shows in the child's log, so a test asserts what the child saw and
+/// not only where the wrapper ended.
+fn await_seen(dir: &std::path::Path, text: &str) -> String {
+    for _ in 0..900 {
+        let log = seen(dir);
+        if log.contains(text) {
+            return log;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    seen(dir)
+}
+
+/// The child's own pid, the one the wrapper signals.
+fn child_pid(dir: &std::path::Path) -> String {
+    std::fs::read_to_string(dir.join("pid"))
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+/// The wrapper's pid: the child recorded its own `$$`, so its parent is the wrapper.
+fn wrapper_pid(dir: &std::path::Path) -> u32 {
     let ppid = Command::new("ps")
-        .args(["-o", "ppid=", "-p", child_pid])
+        .args(["-o", "ppid=", "-p", &child_pid(dir)])
         .output()
         .unwrap();
     String::from_utf8_lossy(&ppid.stdout)
@@ -118,20 +136,90 @@ fn wrapper_pid(child_pid: &str) -> u32 {
         .expect("the wrapper's pid")
 }
 
+/// Signals the wrapper by its own pid, which is the case WS-41's deviation (2) missed: a
+/// terminal reaches the child through the process group, a client timeout does not.
+fn signal_wrapper(dir: &std::path::Path, sig: &str) {
+    let status = Command::new("kill")
+        .args([format!("-{sig}"), wrapper_pid(dir).to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success(), "kill -{sig} on the wrapper");
+}
+
+/// Ends the watchdog child, so a test never leaves one running past itself.
+fn release(dir: &std::path::Path) {
+    let _ = std::fs::write(dir.join("stop"), "");
+}
+
 #[test]
 fn a_term_sent_to_the_wrapper_reaches_the_child() {
     let dir = tempfile::tempdir().unwrap();
     let mut wrapper = watchdog(dir.path());
-    await_file(&dir.path().join("ready"));
-    let child_pid = std::fs::read_to_string(dir.path().join("pid")).unwrap();
-    let wrapper_pid = wrapper_pid(child_pid.trim());
-    signal(wrapper_pid, "TERM");
+    signal_wrapper(dir.path(), "TERM");
+    let log = await_seen(dir.path(), "TERM");
+    assert!(log.contains("TERM"), "the child was never told: {log:?}");
+    release(dir.path());
     let status = wrapper.wait().unwrap();
     assert!(
-        seen(dir.path()).contains("TERM"),
-        "the child was never told; wrapper status {:?}",
-        status
+        !seen(dir.path()).contains("outlived"),
+        "the wrapper ended before the child did"
     );
+    let _ = status;
+}
+
+#[test]
+fn a_child_killed_by_a_forwarded_signal_kills_the_wrapper_the_same_way() {
+    // a child that does NOT trap, so the forwarded SIGTERM ends it; the wrapper must then
+    // end with that signal, the rule the self-signalled child already had
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .args(["sleep", "30"])
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN");
+    let mut wrapper = c.spawn().unwrap();
+    await_sleeping(wrapper.id());
+    Command::new("kill")
+        .args(["-TERM", &wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    let status = wrapper.wait().unwrap();
+    assert_eq!(status.signal(), Some(15), "wrapper status {status:?}");
+}
+
+/// Blocks until the wrapper's own child is running, so the signal is not sent into a window
+/// where the wrapper has not spawned yet.
+fn await_sleeping(wrapper: u32) {
+    for _ in 0..900 {
+        let out = Command::new("pgrep")
+            .args(["-P", &wrapper.to_string()])
+            .output()
+            .unwrap();
+        if out.status.success() && !out.stdout.is_empty() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!("the wrapper never spawned its child");
+}
+
+#[test]
+fn the_wrapper_does_not_swallow_a_signal_it_does_not_forward() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrapper = watchdog(dir.path());
+    let child = child_pid(dir.path());
+    // USR1 is not in FORWARDED, so the wrapper's own disposition is untouched: it dies, and
+    // the child is not told.
+    Command::new("kill")
+        .args(["-USR1", &wrapper_pid(dir.path()).to_string()])
+        .status()
+        .unwrap();
+    let status = wrapper.wait().unwrap();
+    assert_eq!(status.signal(), Some(10), "wrapper status {status:?}");
+    release(dir.path());
+    let _ = std::process::Command::new("kill")
+        .args(["-TERM", &child])
+        .status();
 }
 
 #[test]

@@ -9,6 +9,11 @@
 //! * The wrapper reads the pipe in 64 KiB chunks into an unlinked 0600 spool file
 //!   (capped) and a rolling tail, so its memory is O(chunk + tail) whatever the child
 //!   prints: 100 MB of output never sits in memory.
+//! * A signal sent to the *wrapper* is forwarded to the child. The wrapper is the process a
+//!   client times out on and an operator `kill`s, and the child is the work: without the
+//!   forward the wrapper dies on the default disposition and leaves the child running,
+//!   holding whatever it took. The wrapper then ends with the child's own outcome, so a
+//!   shell's WIFSIGNALED still sees what really happened.
 //! * The spool is POSTed to the API's `evidence/capture` route. Redaction, reduction,
 //!   retention and quota are the server's: the wrapper never reduces or stores output
 //!   itself, and every byte a projection or a retained original carries went through the
@@ -26,6 +31,7 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::thread;
 use std::time::Duration;
 
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
@@ -98,9 +104,11 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
             return Ok(Output::Exit(text, ChildExit::Code(code)));
         }
     };
+    let mut forwarder = Forwarder::start(spawned.id());
     drop(child); // the parent's copies of the write end must close for EOF
     let drained = drain(File::from(read_end), limits);
     let status = spawned.wait().map_err(io_failed("wait"))?;
+    forwarder.stop();
     let exit = exit_of(status);
     let mut drained = drained.map_err(io_failed("read child output"))?;
     let text = present(&target, &argv, exit, &mut drained, limits);
@@ -137,6 +145,92 @@ fn nonblank(v: Option<String>) -> Option<String> {
 
 fn io_failed(what: &'static str) -> impl Fn(io::Error) -> CmdError {
     move |e| CmdError::failed(format!("run: {what}: {e}"))
+}
+
+/// The signals the wrapper forwards to its child, as the signal numbers `signal-hook`
+/// delivers. Only these: a signal the wrapper was not asked to forward keeps the
+/// disposition it had, so the wrapper neither swallows it nor dies from one.
+const FORWARDED: &[i32] = &[
+    signal_hook::consts::signal::SIGHUP,
+    signal_hook::consts::signal::SIGINT,
+    signal_hook::consts::signal::SIGQUIT,
+    signal_hook::consts::signal::SIGTERM,
+];
+
+/// Forwards a termination signal to the child while the wrapper runs.
+///
+/// The wrapper is the process a client times out on and an operator `kill`s, so without
+/// this the wrapper dies on the default disposition and the child keeps running: it is
+/// orphaned and keeps whatever it took (a lock, a temp file, a port) until it ends on its
+/// own. A terminal signal reaches the child through the process group, which is what
+/// WS-41's deviation (2) recorded; a signal to the wrapper's own pid does not, and that is
+/// the case this closes.
+///
+/// The child's outcome is still what the wrapper reports: `wait` reaps the real status, so
+/// a child that survives the signal and exits 0 makes the wrapper exit 0, and one the
+/// signal killed makes the wrapper end with that signal as before.
+struct Forwarder {
+    handle: Option<signal_hook::iterator::Handle>,
+    watcher: Option<thread::JoinHandle<()>>,
+}
+
+impl Forwarder {
+    /// Starts forwarding to `pid`. A failure to install is not fatal: the wrapper then
+    /// behaves as it did before, which is worse for the child but never worse than not
+    /// running the command at all, so the refusal is a note rather than an error.
+    fn start(pid: u32) -> Self {
+        let Some((handle, watcher)) = Self::install(pid) else {
+            return Self {
+                handle: None,
+                watcher: None,
+            };
+        };
+        Self {
+            handle: Some(handle),
+            watcher: Some(watcher),
+        }
+    }
+
+    /// Registers the forwarded signals and starts the thread that relays them to `pid`.
+    /// `None` when the platform refuses the registration.
+    fn install(pid: u32) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
+        let child = rustix::process::Pid::from_raw(pid as i32).expect("a spawned child has a pid");
+        let mut signals = signal_hook::iterator::Signals::new(FORWARDED)
+            .map_err(|e| io::Error::other(e.to_string()))
+            .inspect_err(|e| {
+                eprintln!("xmustard run: signals are not forwarded to the child: {e}");
+            })
+            .ok()?;
+        let handle = signals.handle();
+        let watcher = thread::spawn(move || {
+            for sig in signals.forever() {
+                let Some(sig) = rustix::process::Signal::from_named_raw(sig) else {
+                    continue;
+                };
+                // ESRCH: the child is already gone, which is the normal race at exit
+                let _ = rustix::process::kill_process(child, sig);
+            }
+        });
+        Some((handle, watcher))
+    }
+
+    /// Stops forwarding and joins the watcher, so the handler is unregistered and the
+    /// default disposition restored before the wrapper ends: `end_like` re-raises the
+    /// child's signal against the default, and a handler still installed would swallow it.
+    fn stop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.close();
+        }
+        if let Some(watcher) = self.watcher.take() {
+            let _ = watcher.join();
+        }
+    }
+}
+
+impl Drop for Forwarder {
+    fn drop(&mut self) {
+        self.stop();
+    }
 }
 
 /// What the child printed: the spool (`None` once dropped, with `lost` saying why),
@@ -218,15 +312,19 @@ fn exit_of(status: ExitStatus) -> ChildExit {
 }
 
 /// The process exit code that repeats `exit`. A signal ends this process with the same
-/// signal (default disposition), so a shell's WIFSIGNALED sees what the child did;
-/// when that cannot end it, 128 + n, the shell convention, is returned.
+/// signal, so a shell's WIFSIGNALED sees what the child did; when that cannot end it,
+/// 128 + n, the shell convention, is returned.
+///
+/// The re-raise goes through `emulate_default_handler`, which restores the default
+/// disposition before raising. A plain `kill_process(getpid(), sig)` would be swallowed if a
+/// handler were still installed: `signal-hook-registry`'s `unregister` documents that it does
+/// not restore the previous disposition, so a signal sent here after `Forwarder::stop` would
+/// find this process's handler still in place and do nothing.
 pub fn end_like(exit: ChildExit) -> i32 {
     match exit {
         ChildExit::Code(c) => c,
         ChildExit::Signal(n) => {
-            if let Some(sig) = rustix::process::Signal::from_named_raw(n) {
-                let _ = rustix::process::kill_process(rustix::process::getpid(), sig);
-            }
+            let _ = signal_hook::low_level::emulate_default_handler(n);
             128 + n
         }
     }
