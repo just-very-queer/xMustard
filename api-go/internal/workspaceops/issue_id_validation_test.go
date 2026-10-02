@@ -34,11 +34,13 @@ func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 		{"trailing control character", "TRK_0001\n"},
 		{"leading control character", "\nTRK_0001"},
 		{"a lone dot", "."},
+		{"whitespace only", "\n\t "},
 		{"over long", strings.Repeat("a", overLongID)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+			before := artifactState(t, dataDir, workspaceID)
 
 			_, err := CreateIssue(dataDir, workspaceID, IssueCreateRequest{
 				BugID:    stringPtr(c.bugID),
@@ -49,13 +51,16 @@ func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 				t.Fatalf("CreateIssue(%q): want ErrInvalidInput, got %v", c.bugID, err)
 			}
 			assertIssueNotStored(t, dataDir, workspaceID, c.bugID)
+			assertArtifactsUnchanged(t, before, dataDir, workspaceID)
 		})
 	}
 }
 
 // A view id is minted from the name through url.QueryEscape, which escapes "/" and
-// "\" but leaves "." and an unbounded length alone. The name is refused here rather
-// than an id the URL layer cannot carry being written.
+// "\" but leaves "." and an unbounded length alone, and turns a space into "+" and a
+// literal "%" into "%25". The name is refused here rather than an id the URL layer
+// cannot carry being written, so the percent-escaped characters are cases too: an id
+// holding "%" reads back through a different value than it was stored under.
 func TestCreateSavedViewRefusesANameThatWouldMintAnUnusableId(t *testing.T) {
 	cases := []struct {
 		name string
@@ -64,11 +69,14 @@ func TestCreateSavedViewRefusesANameThatWouldMintAnUnusableId(t *testing.T) {
 		{"parent traversal", "../../escape"},
 		{"dot segments", ".. .."},
 		{"nul byte", "view\x00name"},
+		{"percent sign", "100% done"},
+		{"ampersand", "wip & done"},
 		{"over long", strings.Repeat("v", overLongID)},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+			before := artifactState(t, dataDir, workspaceID)
 
 			_, err := CreateSavedView(dataDir, workspaceID, SavedIssueViewRequest{
 				Name:  c.view,
@@ -78,6 +86,7 @@ func TestCreateSavedViewRefusesANameThatWouldMintAnUnusableId(t *testing.T) {
 				t.Fatalf("CreateSavedView(%q): want ErrInvalidInput, got %v", c.view, err)
 			}
 			assertNoViewsStored(t, dataDir, workspaceID)
+			assertArtifactsUnchanged(t, before, dataDir, workspaceID)
 		})
 	}
 }
@@ -181,5 +190,45 @@ func assertNoViewsStored(t *testing.T, dataDir, workspaceID string) {
 	}
 	if trimmed := strings.TrimSpace(string(content)); trimmed != "" && trimmed != "[]" && trimmed != "null" {
 		t.Fatalf("a refused view was written to saved_views.json: %s", trimmed)
+	}
+}
+
+// artifactState is every file a create can write: the tracker, the views, the
+// workspace snapshot and the activity log. A refusal must leave all four byte for
+// byte as they were, so the assertions compare against the pre-call contents rather
+// than searching for the refused id: a write that omitted the id would still slip
+// past a search.
+func artifactState(t *testing.T, dataDir, workspaceID string) map[string]string {
+	t.Helper()
+	dir := filepath.Join(dataDir, "workspaces", workspaceID)
+	state := map[string]string{}
+	for _, name := range []string{
+		"tracker_issues.json", "saved_views.json", "snapshot.json", "activity.jsonl",
+	} {
+		content, err := os.ReadFile(filepath.Join(dir, name))
+		if os.IsNotExist(err) {
+			state[name] = "" // absent before, and must still be absent
+			continue
+		}
+		if err != nil {
+			t.Fatalf("read %s: %v", name, err)
+		}
+		state[name] = string(content)
+	}
+	return state
+}
+
+// assertArtifactsUnchanged fails when a refused create touched any artifact, and
+// treats a file that was absent before and exists now as a write too.
+func assertArtifactsUnchanged(t *testing.T, before map[string]string, dataDir, workspaceID string) {
+	t.Helper()
+	after := artifactState(t, dataDir, workspaceID)
+	for name, want := range before {
+		if got := after[name]; got != want {
+			if want == "" {
+				t.Fatalf("a refused create wrote %s (%d bytes)", name, len(got))
+			}
+			t.Fatalf("a refused create rewrote %s", name)
+		}
 	}
 }

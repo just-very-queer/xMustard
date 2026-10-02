@@ -102,9 +102,12 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 	}
 	// The supplied id is checked before the trim: firstNonEmptyPtr trims, so
 	// checking its result would turn "TRK_0001\n" into a valid "TRK_0001" and
-	// normalize a control character at either end away instead of refusing it. An
-	// absent or blank id still falls through to the generated one.
-	if request.BugID != nil && strings.TrimSpace(*request.BugID) != "" {
+	// normalize a control character at either end away instead of refusing it. The
+	// gate is on the raw string being non-empty, not on its trimmed form, so a
+	// supplied id that is only control characters is still a supplied id and is
+	// refused; only an absent or genuinely empty one falls through to the generated
+	// TRK_%04d.
+	if request.BugID != nil && *request.BugID != "" {
 		if err := checkPlatformID("issue", *request.BugID); err != nil {
 			return nil, err
 		}
