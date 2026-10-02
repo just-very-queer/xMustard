@@ -18,20 +18,25 @@ import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
 import { createMasker, type EntryView } from "./masking.ts";
-import { TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
+import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
 
 // toolParameters renders a spec as TypeBox, serializing to exactly toJsonSchema (the
-// MCP tools/list inputSchema).
+// MCP tools/list inputSchema). The adapter registers the "full" profile: Pi validates
+// every call against this closed schema, so an argument the server accepts on tools/call
+// but the schema omits could never be sent from Pi (WS-FIX-26).
 export function toolParameters(spec: ToolSpec): TSchema {
 	const props: Record<string, TSchema> = {};
-	for (const a of spec.args) {
+	// an argument with no description carries no description key, as tools/list does
+	const desc = (a: (typeof spec.args)[number]): { description?: string } => (a.desc ? { description: a.desc } : {});
+	for (const a of allArgs(spec)) {
 		let schema: TSchema;
-		if (a.type === "boolean") schema = Type.Boolean({ description: a.desc });
-		else if (a.type === "integer") schema = Type.Integer({ description: a.desc, minimum: a.minimum, maximum: a.maximum });
+		if (a.type === "boolean") schema = Type.Boolean(desc(a));
+		else if (a.type === "integer") schema = Type.Integer({ ...desc(a), minimum: a.minimum, maximum: a.maximum });
+		else if (a.type === "number") schema = Type.Number({ ...desc(a), minimum: a.minimum, maximum: a.maximum });
 		// {type:"string", enum} exactly as MCP tools/list (same shape as pi-ai's StringEnum)
-		else if (a.enum) schema = Type.Unsafe<string>({ type: "string", description: a.desc, enum: a.enum });
-		else schema = Type.String(a.maxLength ? { description: a.desc, maxLength: a.maxLength } : { description: a.desc });
+		else if (a.enum) schema = Type.Unsafe<string>({ type: "string", ...desc(a), enum: a.enum });
+		else schema = Type.String(a.maxLength ? { ...desc(a), maxLength: a.maxLength } : desc(a));
 		props[a.name] = a.required ? schema : Type.Optional(schema);
 	}
 	return Type.Object(props, { additionalProperties: false });

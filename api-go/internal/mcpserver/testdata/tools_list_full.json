@@ -1,0 +1,998 @@
+{
+  "protocolVersion": "2025-06-18",
+  "tools": [
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "Ground the session"
+      },
+      "description": "Orient before acting: what changed, is stale, broken or blocked since the baseline, with index drift and contract breaks (changed signatures).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_chars": {
+            "description": "result budget in characters (default 6000)",
+            "maximum": 65536,
+            "minimum": 2000,
+            "type": "integer"
+          },
+          "query": {
+            "description": "the task: adds relevant_sessions",
+            "maxLength": 512,
+            "type": "string"
+          },
+          "sections": {
+            "description": "sections to return (summary always; default all)",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "since_revision": {
+            "description": "memory_delta after this memory_revision",
+            "maximum": 9007199254740991,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "ground",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "Recall shared memory"
+      },
+      "description": "Shared memory RANKED by query/paths (BM25+path+trust+recency+feedback); non-matches dropped (terms \u003e=3 chars). No args: top-N by working-tree overlap, then recency. verification_mode: peer_verified|single_agent|self_asserted_open_mode (no auth/quorum). conflicts: claim/contradiction/path overlap.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "agent": {
+            "maxLength": 64,
+            "type": "string"
+          },
+          "as_of": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "by": {
+            "type": "string"
+          },
+          "conversation": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "cursor": {
+            "type": "string"
+          },
+          "entry_id": {
+            "description": "fetch one entry, any state",
+            "type": "string"
+          },
+          "explain": {
+            "type": "boolean"
+          },
+          "history": {
+            "description": "with entry_id: revisions, events (verifier)",
+            "type": "boolean"
+          },
+          "include_merged": {
+            "type": "boolean"
+          },
+          "include_pending": {
+            "type": "boolean"
+          },
+          "include_superseded": {
+            "type": "boolean"
+          },
+          "kind": {
+            "maxLength": 512,
+            "type": "string"
+          },
+          "limit": {
+            "description": "max memories (default 8)",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_chars": {
+            "maximum": 10000,
+            "minimum": 1000,
+            "type": "integer"
+          },
+          "names_only": {
+            "type": "boolean"
+          },
+          "path_prefix": {
+            "type": "string"
+          },
+          "paths": {
+            "description": "comma-separated repo-relative files to focus on",
+            "type": "string"
+          },
+          "predicate": {
+            "type": "string"
+          },
+          "q": {
+            "description": "task query to rank memories by",
+            "type": "string"
+          },
+          "render": {
+            "enum": [
+              "full",
+              "compact"
+            ],
+            "type": "string"
+          },
+          "seed": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 128,
+            "type": "string"
+          },
+          "show_expired": {
+            "type": "boolean"
+          },
+          "since": {
+            "type": "string"
+          },
+          "source": {
+            "description": "past session transcripts",
+            "enum": [
+              "sessions"
+            ],
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "promoted",
+              "pending",
+              "awaiting_me"
+            ],
+            "type": "string"
+          },
+          "subject": {
+            "maxLength": 256,
+            "type": "string"
+          },
+          "tags": {
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "tier": {
+            "enum": [
+              "core",
+              "deferred"
+            ],
+            "type": "string"
+          },
+          "topic": {
+            "type": "string"
+          },
+          "until": {
+            "type": "string"
+          },
+          "valid_only": {
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "recall",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "drift_checked": {
+            "type": "integer"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "ranked": {
+            "type": "boolean"
+          },
+          "returned": {
+            "type": "integer"
+          },
+          "stale_count": {
+            "type": "integer"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false,
+        "title": "Propose a memory"
+      },
+      "description": "Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "base_revision": {
+            "description": "edit: revision read (CAS)",
+            "maximum": 1073741824,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "claims": {
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "content": {
+            "description": "the memory text to propose",
+            "type": "string"
+          },
+          "description": {
+            "description": "one-line description (deferred index)",
+            "type": "string"
+          },
+          "entry_id": {
+            "description": "target of edit/retire/restore/tier",
+            "type": "string"
+          },
+          "evidence": {
+            "description": "evidence handles it rests on",
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "expires": {
+            "description": "last UTC date served (YYYY-MM-DD)",
+            "type": "string"
+          },
+          "kind": {
+            "enum": [
+              "project_knowledge",
+              "decision",
+              "constraint",
+              "workflow",
+              "procedure",
+              "gotcha",
+              "measurement",
+              "convention",
+              "handoff",
+              "candidate",
+              "maintenance"
+            ],
+            "type": "string"
+          },
+          "new_string": {
+            "description": "edit: replacement, or appended",
+            "type": "string"
+          },
+          "old_string": {
+            "description": "edit: text to replace once",
+            "type": "string"
+          },
+          "op": {
+            "description": "default propose",
+            "enum": [
+              "propose",
+              "supersede",
+              "edit",
+              "retire",
+              "restore",
+              "tier"
+            ],
+            "type": "string"
+          },
+          "paths": {
+            "description": "comma-separated repo-relative files the memory is about",
+            "type": "string"
+          },
+          "reason": {
+            "description": "required unless proposing",
+            "maxLength": 1000,
+            "type": "string"
+          },
+          "relations": {
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "run_id": {
+            "description": "run it came from",
+            "type": "string"
+          },
+          "session_id": {
+            "maxLength": 200,
+            "type": "string"
+          },
+          "supersedes": {
+            "description": "entries this replaces",
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "tags": {
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "tier": {
+            "description": "core needs a human approver",
+            "enum": [
+              "core",
+              "deferred"
+            ],
+            "type": "string"
+          },
+          "title": {
+            "description": "short title",
+            "type": "string"
+          },
+          "topic": {
+            "description": "a/b/c",
+            "type": "string"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "remember",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "promoted": {
+            "type": "boolean"
+          },
+          "required_verifications": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "verification_mode": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": true,
+        "openWorldHint": false,
+        "readOnlyHint": false,
+        "title": "Verify a memory"
+      },
+      "description": "Verify (approve/reject) a peer's proposed memory; it promotes once enough DISTINCT agents approve. Your identity is your auth token; approve defaults true.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "approve": {
+            "description": "approve (default true) or reject",
+            "type": "boolean"
+          },
+          "entry_id": {
+            "description": "the id of the memory entry",
+            "type": "string"
+          },
+          "evidence_handle": {
+            "description": "evidence the verdict rests on",
+            "type": "string"
+          },
+          "note": {
+            "description": "reason for the verdict, stored with the vote",
+            "maxLength": 1000,
+            "type": "string"
+          },
+          "outcome": {
+            "description": "overrides approve",
+            "enum": [
+              "approve",
+              "reject",
+              "retract",
+              "duplicate_of",
+              "helpful",
+              "misleading",
+              "stale_harm"
+            ],
+            "type": "string"
+          },
+          "revision": {
+            "description": "pending edit to vote on",
+            "maximum": 1073741824,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "target": {
+            "description": "duplicate_of: the kept entry",
+            "type": "string"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "entry_id"
+        ],
+        "type": "object"
+      },
+      "name": "verify",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "id": {
+            "type": "string"
+          },
+          "promoted": {
+            "type": "boolean"
+          },
+          "required_verifications": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "verification_mode": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "Search code"
+      },
+      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep (`$A \u0026\u0026 $A()`); mode=symbol: name path.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "cursor": {
+            "description": "next_cursor of the previous page",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "depth": {
+            "description": "mode=symbol: child levels",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "include_body": {
+            "description": "mode=symbol: add bodies",
+            "type": "boolean"
+          },
+          "include_info": {
+            "description": "mode=symbol: add signatures, docs",
+            "type": "boolean"
+          },
+          "kinds": {
+            "description": "mode=symbol: Function,Method or -Variable",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "lang": {
+            "description": "language hint for pattern mode",
+            "type": "string"
+          },
+          "limit": {
+            "description": "max hits (default 10)",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_chars": {
+            "description": "result budget (default 8000)",
+            "maximum": 65536,
+            "minimum": 2000,
+            "type": "integer"
+          },
+          "mode": {
+            "description": "hybrid (default), pattern (ast-grep) or symbol",
+            "enum": [
+              "hybrid",
+              "pattern",
+              "symbol"
+            ],
+            "type": "string"
+          },
+          "path_glob": {
+            "description": "only paths matching this glob (** crosses /)",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "q": {
+            "description": "the search query",
+            "type": "string"
+          },
+          "seed": {
+            "description": "symbol to anchor the graph-proximity lane",
+            "type": "string"
+          },
+          "substring": {
+            "description": "mode=symbol: substring match",
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "q"
+        ],
+        "type": "object"
+      },
+      "name": "search",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "hits": {
+            "type": "array"
+          },
+          "match_count": {
+            "type": "integer"
+          },
+          "next_cursor": {
+            "type": "string"
+          },
+          "omitted": {
+            "type": "integer"
+          },
+          "query": {
+            "type": "string"
+          },
+          "total": {
+            "type": "integer"
+          },
+          "truncated": {
+            "type": "boolean"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "Explain a path"
+      },
+      "description": "Explain a file or directory: purpose, role, key symbols, and how to run/verify it.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "chain_depth": {
+            "description": "symbol=: extra edge layers",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "cursor": {
+            "description": "next_cursor of the previous page",
+            "maxLength": 64,
+            "type": "string"
+          },
+          "depth": {
+            "description": "outline child levels",
+            "maximum": 3,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "include_content": {
+            "description": "symbol=: add its body",
+            "type": "boolean"
+          },
+          "limit": {
+            "description": "items per page",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_chars": {
+            "description": "result budget (default 6000)",
+            "maximum": 65536,
+            "minimum": 2000,
+            "type": "integer"
+          },
+          "path": {
+            "description": "a repo-relative file or directory path",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "symbol": {
+            "description": "a name path: its context",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "uid": {
+            "description": "a symbol UID: its context",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "explain",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "cluster": {
+            "type": "object"
+          },
+          "coverage": {
+            "type": "object"
+          },
+          "explanation": {
+            "type": "object"
+          },
+          "freshness": {
+            "type": "object"
+          },
+          "role": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "Estimate change impact"
+      },
+      "description": "Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=\u0026to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "base": {
+            "description": "scope=compare|range: base revision",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "direction": {
+            "description": "dependents (default) or dependencies",
+            "enum": [
+              "upstream",
+              "downstream"
+            ],
+            "type": "string"
+          },
+          "from": {
+            "description": "trace path from this symbol",
+            "type": "string"
+          },
+          "head": {
+            "description": "scope=compare|commit|range: head revision",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "include_tests": {
+            "description": "walk test files (default false)",
+            "type": "boolean"
+          },
+          "limit": {
+            "description": "items per depth tier (default 50)",
+            "maximum": 500,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_chars": {
+            "description": "result budget (default 8000)",
+            "maximum": 65536,
+            "minimum": 2000,
+            "type": "integer"
+          },
+          "max_depth": {
+            "description": "hops (default 3; path= 4)",
+            "maximum": 32,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "min_confidence": {
+            "description": "skip edges below this confidence",
+            "maximum": 1,
+            "minimum": 0,
+            "type": "number"
+          },
+          "offset": {
+            "description": "items skipped per depth tier",
+            "maximum": 50000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "path": {
+            "description": "a repo-relative file",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "relation_types": {
+            "description": "edge kinds to walk (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)",
+            "maxLength": 128,
+            "type": "string"
+          },
+          "scope": {
+            "description": "symbols a diff touches, and their dependents",
+            "enum": [
+              "unstaged",
+              "staged",
+              "all",
+              "workspace",
+              "compare",
+              "commit",
+              "range"
+            ],
+            "type": "string"
+          },
+          "summary_only": {
+            "description": "counts, risk and envelope without items",
+            "type": "boolean"
+          },
+          "symbol": {
+            "description": "symbol to compute blast radius for",
+            "type": "string"
+          },
+          "timeout_ms": {
+            "description": "walk budget (default 10000)",
+            "maximum": 60000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "to": {
+            "description": "trace path to this symbol",
+            "type": "string"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          },
+          "worktree": {
+            "description": "another checkout of this repository to diff",
+            "maxLength": 4096,
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "impact",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "by_depth": {
+            "type": "array"
+          },
+          "coverage": {
+            "type": "object"
+          },
+          "found": {
+            "type": "boolean"
+          },
+          "freshness": {
+            "type": "object"
+          },
+          "impacted_count": {
+            "type": "integer"
+          },
+          "length": {
+            "type": "integer"
+          },
+          "risk": {
+            "type": "string"
+          },
+          "since": {
+            "type": "string"
+          },
+          "symbol": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "openWorldHint": false,
+        "readOnlyHint": true,
+        "title": "Read diagnostics"
+      },
+      "description": "Current normalized diagnostics (errors/warnings) for the workspace.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "diagnostics",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "workspace_id": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    },
+    {
+      "_meta": {
+        "anthropic/maxResultSizeChars": 132096
+      },
+      "annotations": {
+        "destructiveHint": true,
+        "idempotentHint": false,
+        "openWorldHint": false,
+        "readOnlyHint": false,
+        "title": "Explain a failure"
+      },
+      "description": "Why a run_id, log or evidence_handle failed: error lines, implicated files.",
+      "inputSchema": {
+        "additionalProperties": false,
+        "properties": {
+          "command": {
+            "description": "admins, if the operator enabled commands: test/build/lint argv to run",
+            "maxLength": 4096,
+            "type": "string"
+          },
+          "cwd": {
+            "description": "repo-relative directory to run command in",
+            "maxLength": 1024,
+            "type": "string"
+          },
+          "evidence_handle": {
+            "description": "retained tool output to explain from its last MiB; records the outcome",
+            "maxLength": 256,
+            "type": "string"
+          },
+          "log": {
+            "description": "pasted log to explain from its last MiB; records the outcome",
+            "maxLength": 1048576,
+            "type": "string"
+          },
+          "run_id": {
+            "description": "run/outcome id",
+            "type": "string"
+          },
+          "timeout_seconds": {
+            "description": "seconds before command's process group is killed (default 45)",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "workspace_id": {
+            "description": "workspace id; auto-resolved if omitted",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "name": "why_failed",
+      "outputSchema": {
+        "properties": {
+          "_xmustard": {
+            "type": "object"
+          },
+          "failed": {
+            "type": "boolean"
+          },
+          "generated_at": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      }
+    }
+  ]
+}
