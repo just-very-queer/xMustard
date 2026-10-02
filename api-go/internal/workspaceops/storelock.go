@@ -46,7 +46,18 @@ import (
 // by exactly one caller at a time.
 type storeGate chan struct{}
 
+// acquire takes the gate or reports that ctx ended first. The free slot is preferred
+// over an already-done ctx: a select over both ready cases picks at random, so a gate
+// that is free and a ctx that ended before the call would otherwise be admitted about
+// half the time. Taking the lock when it is free costs nothing — the holder is this
+// caller — and it keeps the uncontended path deterministic, which is what every
+// context-free caller of this package has always got.
 func (g storeGate) acquire(ctx context.Context) bool {
+	select {
+	case g <- struct{}{}:
+		return true
+	default:
+	}
 	select {
 	case g <- struct{}{}:
 		return true
@@ -102,7 +113,9 @@ func tryLockStore(key string) (func(), error) { return acquireStore(nil, key, fa
 // ends while another caller holds the key gives up the wait and answers ctx.Err(), and
 // leaves both locks untaken so the next caller is unaffected. A wait that gives up never
 // falls through to the store, so nothing is mutated on a cancelled path.
-func lockStoreCtx(ctx context.Context, key string) (func(), error) { return acquireStore(ctx, key, true) }
+func lockStoreCtx(ctx context.Context, key string) (func(), error) {
+	return acquireStore(ctx, key, true)
+}
 
 func acquireStore(ctx context.Context, key string, wait bool) (func(), error) {
 	gate := storeLocks.get(key)
