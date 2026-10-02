@@ -429,11 +429,15 @@ func validGateRole(role string) bool {
 
 // toolGates maps each MCP tool to the pattern of its primary route: the one whose role
 // makes the tool usable. A tool served by more than one route (why_failed reads with
-// GET and records with POST) is usable through its read route; its other routes carry
-// the tool name so that disabling the tool refuses them too.
+// GET and records with POST; recall reads /context/active and the /memory/core
+// projection) is usable through its read route; its other routes carry the tool name so
+// that disabling the tool refuses them too. The patterns are visited in sorted order,
+// so when several routes for one tool are alike the same one always wins: iterating the
+// map would otherwise make whoami's tool list flap between restarts.
 func toolGates() map[string]string {
 	out := map[string]string{}
-	for pattern, g := range routeGateTable {
+	for _, pattern := range sortedGatePatterns() {
+		g := routeGateTable[pattern]
 		if g.Tool == "" {
 			continue
 		}

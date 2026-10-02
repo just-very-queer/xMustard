@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -210,5 +211,21 @@ func TestToolGatesAreTheNineCoreTools(t *testing.T) {
 		if tool := routeGateTable[pattern].Tool; tool != "" && coreTools[tool] && !delivered[tool] {
 			t.Errorf("gate %s names tool %s, which evidence delivery does not map", pattern, tool)
 		}
+	}
+}
+
+// A tool served by several alike routes resolves to the same one every time. Map
+// iteration order is randomized per range, so a tool with two non-mutating routes
+// would otherwise pick a different primary route per call, and whoami's tool list
+// would flap.
+func TestToolGatesAreStableAcrossCalls(t *testing.T) {
+	first := toolGates()
+	for i := 0; i < 50; i++ {
+		if got := toolGates(); !maps.Equal(got, first) {
+			t.Fatalf("toolGates changed between calls: %v then %v", first, got)
+		}
+	}
+	if first["recall"] != "GET /api/workspaces/{workspace_id}/context/active" {
+		t.Fatalf("recall's primary route is %q, want its read route", first["recall"])
 	}
 }
