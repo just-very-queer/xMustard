@@ -10,9 +10,13 @@ import (
 )
 
 // budgetServer serves the real handler stack over workerWorkspace's repository with
-// the real core (one-shot calls, no resident worker).
+// the real core (one-shot calls, no resident worker). roomyGovernor admits the index
+// update these reads depend on whatever this test binary's own tree measures: the
+// governor compares the measured process tree against its soft ceiling, so in a full
+// parallel run sibling test binaries push this one over the line (WS-FLK-06).
 func budgetServer(t *testing.T) (base string) {
 	t.Helper()
+	roomyGovernor(t)
 	core := realCoreBinary(t)
 	_, dir, ws := workerWorkspace(t)
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
