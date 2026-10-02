@@ -379,6 +379,36 @@ fn zero_upstream_callers_is_unknown_with_a_note() {
     assert_eq!(missing["graph"], "none");
 }
 
+// A name defined by more files than the seed cap truncates the seed set: the walk
+// never reaches the definers past the cap, so the answer is a lower bound even though
+// nothing else bounded it. `exact` here would be the one value `impactDoc` tells an
+// agent means "no cap could hide a dependent".
+#[test]
+fn a_seed_set_truncated_by_the_target_cap_is_never_exact() {
+    // MAX_TARGETS is 20; 25 definers plus one dependent on the 25th file puts a real
+    // dependent past the cap.
+    let mut list: Vec<(String, String)> = Vec::new();
+    for i in 0..25 {
+        list.push((
+            format!("src/gen/def{i:02}.ts"),
+            format!("export function shared(): number {{ return {i}; }}\n"),
+        ));
+    }
+    // the dependent hangs off the LAST definer, which the cap never seeds
+    list.push((
+        "src/app.ts".to_string(),
+        "import { shared } from './gen/def24';\nexport function caller(): number { return shared(); }\n".to_string(),
+    ));
+    let r = repo(&list);
+    build(r.path());
+    let v = sg("impact", r.path(), &["--limit=500"], &["shared"]);
+    assert_eq!(v["targets_truncated"], true, "{v:#}");
+    // the dependent is only reachable through a definer the cap dropped
+    assert!(!names(&v).contains("caller"), "{v:#}");
+    assert_eq!(v["epistemic"]["completeness"], "lower_bound", "{v:#}");
+    assert_eq!(v["epistemic"]["causes"]["targets_truncated"], 1, "{v:#}");
+}
+
 #[test]
 fn trace_reports_hops_direction_furthest_and_caps() {
     let r = graph_fixture();
