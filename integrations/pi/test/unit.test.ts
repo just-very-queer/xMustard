@@ -1274,8 +1274,13 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 
 	// shRuns is the independent check that the wrapped argv still performs the
 	// model's command. It runs the wrapped command field through a real shell, the
-	// same way the wrapper's Command::new(&argv[0]) does.
-	const shRuns = (argv: string): string => execFileSync("/bin/sh", ["-c", argv], { encoding: "utf8" });
+	// same way the wrapper's Command::new(&argv[0]) does. WS44E_TMP points the
+	// redirection cases at a temp path so no case writes into the package directory.
+	let shRunSeq = 0;
+	const shRuns = (argv: string): string => execFileSync("/bin/sh", ["-c", argv], {
+		encoding: "utf8",
+		env: { ...process.env, WS44E_TMP: path.join(os.tmpdir(), `ws44e-${process.pid}-${shRunSeq++}`) },
+	});
 
 	test("off by default: a bash command is byte-identical when the knob is unset", () => {
 		const input = { command: "ls -la /tmp" };
@@ -1318,19 +1323,21 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 
 	test("the wrapped command still does what the model asked, checked by sh itself", () => {
 		// Each case is one that a bare `Command::new(&argv[0])` would break: a
-		// pipeline needs a shell, `&&` needs a shell, and an embedded quote must
-		// survive being nested inside the wrapper's own single-quoted argv. The
-		// expected values are what POSIX sh must produce, written out here rather
-		// than computed by the code under test.
+		// pipeline needs a shell, `&&` needs a shell, redirection needs a shell, and
+		// an embedded quote must survive being nested inside the wrapper's own
+		// single-quoted argv. The expected values are what POSIX sh must produce,
+		// written out here rather than computed by the code under test; wc pads with
+		// leading spaces, which is part of its documented output.
 		const cases: [string, string][] = [
-			["printf 'a\\nb\\n' | wc -l", "2"],
+			["printf 'a\\nb\\n' | wc -l", "       2"],
 			["cd . && echo yes", "yes"],
 			[`echo "it's here"`, "it's here"],
 			["echo '$HOME'", "$HOME"],
 			["echo a b   c", "a b   c"],
 			["echo x; echo y", "x\ny"],
 			[`printf '%s' "a'b'c"`, "a'b'c"],
-			["echo done > f && cat f", "done"],
+			["echo done > $WS44E_TMP && cat $WS44E_TMP", "done"],
+			["echo one two three | tr ' ' '-'", "one-two-three"],
 		];
 		for (const [command, want] of cases) {
 			const argv = argvFields(command);
