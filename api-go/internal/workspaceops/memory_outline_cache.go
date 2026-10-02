@@ -2,7 +2,6 @@ package workspaceops
 
 import (
 	"maps"
-	"path/filepath"
 	"sync"
 	"time"
 
@@ -76,24 +75,36 @@ func outlineHashKey(workspaceID, root, rel string) string {
 
 // markOutlineFile reads the mark a cache entry for rel must match to be a hit: the same
 // identity helpers this package's workspace registry keys files with, so one file has one
-// notion of "unchanged" here. A file that cannot be stat'd has no mark and is never a hit.
+// notion of "unchanged" here. A file that cannot be opened has no mark and is never a hit.
+//
+// The mark is taken from the descriptor the workspace reader opens, not from statMark on
+// the path: the reader refuses a symlink component, and a mark taken through a symlink
+// could identify a file the reader would refuse, so a warm entry would answer a path the
+// confined read rejects. The cache must never be the weaker of the two.
 func markOutlineFile(root, rel string) (fileMark, bool) {
-	m, err := statMark(filepath.Join(root, filepath.FromSlash(rel)))
-	if err != nil || !m.exists {
+	f, err := openWorkspaceFileBeneath(root, rel)
+	if err != nil {
 		return fileMark{}, false
 	}
-	return m, true
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return fileMark{}, false
+	}
+	return fileMarkFromInfo(info), true
 }
 
 // trustedOutlineMark is a mark old enough to serve from the cache. A file written inside
 // the racy window has a mark another write inside the same tick can share, so it is read
-// rather than cached until it ages out; that is the registry's rule for the same reason. A
-// zero window closes it, which is what a test needs and production never does.
+// rather than cached until it ages out; that is the registry's rule for the same reason.
+// fileMark.trusted already subtracts registryRacyWindow from readAt, and
+// outlineHashTrustWindow is that same window, so readAt is passed through unchanged; a
+// test sets the window to zero to close the rule.
 func trustedOutlineMark(m fileMark, readAt time.Time) bool {
 	if outlineHashTrustWindow <= 0 {
 		return true
 	}
-	return m.trusted(readAt.Add(-outlineHashTrustWindow))
+	return m.trusted(readAt)
 }
 
 // outlineHashesFor returns a file's cached body hashes when its mark is unchanged and old
@@ -113,10 +124,10 @@ func outlineHashesFor(workspaceID, root, rel string, mark fileMark, readAt time.
 
 // storeOutlineHash adds one declaration's hash to a file's entry, creating the entry when
 // there is none, in one operation under the cache lock so two passes extending the same
-// entry cannot drop each other's hash. mark must be the mark the body was hashed under,
-// and the caller must have re-read it after the read (see trustedOutlineMark); an
-// untrusted entry, an entry past the byte ceiling and a new entry past the entry bound are
-// not stored.
+// entry cannot drop each other's hash. mark must be the mark the body was hashed under and
+// the caller must have re-read it after the read (see trustedOutlineMark); an untrusted
+// mark is refused, and so is any result past the byte ceiling or, for a new entry, past the
+// entry bound. The ceiling is checked on every store, not only when an entry is created.
 func storeOutlineHash(workspaceID, root, rel string, mark fileMark, readAt time.Time, want, hash string) {
 	if !trustedOutlineMark(mark, readAt) {
 		return
@@ -137,19 +148,26 @@ func storeOutlineHash(workspaceID, root, rel string, mark fileMark, readAt time.
 	}
 	hashes[want] = hash
 	held := outlineHashHeld(hashes)
-	if grow {
-		held = old.held + outlineHashHeldOf(want, hash)
-	} else {
-		if cached {
-			outlineHashes.held -= old.held
-			delete(outlineHashes.byKey, key)
-		}
-		if len(outlineHashes.byKey) >= outlineHashMaxEntries || outlineHashes.held+held > outlineHashMaxHeld {
-			return
-		}
+	// The budget this store would move the total to: grow adds to the entry already
+	// counted, everything else replaces it, so the old entry's bytes leave the total once.
+	moved := outlineHashes.held - heldBefore(old, cached, grow) + held
+	if moved > outlineHashMaxHeld {
+		return
+	}
+	if !grow && len(outlineHashes.byKey) >= outlineHashMaxEntries {
+		return
 	}
 	outlineHashes.byKey[key] = &outlineHashEntry{hashes: hashes, mark: mark, held: held}
-	outlineHashes.held += held - oldHeld(old, cached, grow)
+	outlineHashes.held = moved
+}
+
+// heldBefore is the entry's contribution to the total before this store: a grown entry was
+// already counted, a replaced one was, and an absent one was not.
+func heldBefore(old *outlineHashEntry, cached, grow bool) int64 {
+	if !cached || grow {
+		return 0
+	}
+	return old.held
 }
 
 // outlineHashHeld is the bytes one entry's map retains: each key and value, plus a fixed
@@ -161,20 +179,6 @@ func outlineHashHeld(hashes map[string]string) int64 {
 		n += int64(len(k) + len(v))
 	}
 	return n
-}
-
-// outlineHashHeldOf is what one key adds to an entry that already holds it.
-func outlineHashHeldOf(want, hash string) int64 {
-	return int64(len(want) + len(hash) + outlineHashEntryOverhead)
-}
-
-// oldHeld is the entry's contribution to the total before this store, so the caller can
-// credit the delta exactly once.
-func oldHeld(old *outlineHashEntry, cached, grow bool) int64 {
-	if !cached || grow {
-		return 0
-	}
-	return old.held
 }
 
 // clearOutlineHashes drops every entry: the reclaim hook and tests both use it.

@@ -501,7 +501,7 @@ func TestInvalidationCacheIsBoundedAndStillReads(t *testing.T) {
 
 	sess := newRehashSession(context.Background(), f.root, f.ws)
 	sess.dataDir = f.dir
-	if r := sess.text("srv.go"); !r.ok {
+	if r := sess.text("srv.go", fileMark{}); !r.ok {
 		t.Fatalf("srv.go is not readable: %+v", r)
 	}
 	if sess.held == 0 {
@@ -512,7 +512,7 @@ func TestInvalidationCacheIsBoundedAndStillReads(t *testing.T) {
 		sess.held += big
 	}
 	before := sess.held
-	r := sess.text("big.go")
+	r := sess.text("big.go", fileMark{})
 	if !r.ok || len(r.text) != big {
 		t.Fatalf("big.go is not readable past the bound: ok=%v len=%d", r.ok, len(r.text))
 	}
@@ -523,7 +523,7 @@ func TestInvalidationCacheIsBoundedAndStillReads(t *testing.T) {
 		t.Fatal("a file read past the bound was cached")
 	}
 	// A file that fits is still cached: the bound costs a repeat read, not correctness.
-	if r := sess.text("srv.go"); !r.ok {
+	if r := sess.text("srv.go", fileMark{}); !r.ok {
 		t.Fatalf("a cached file stopped being readable: %+v", r)
 	}
 }

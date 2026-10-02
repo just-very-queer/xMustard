@@ -126,21 +126,26 @@ func (s *rehashSession) path(a govstore.Anchor) (anchorState, bool) {
 }
 
 // fileRead is one read of a file: its text, or why there is none. A file that is absent
-// is missing; one too large or unreadable is unknown, not missing.
+// is missing; one too large or unreadable is unknown, not missing. mark is the identity
+// the text was read under, so a later anchor that finds the file moved re-reads it rather
+// than hashing an older text against a newer mark.
 type fileRead struct {
 	text    string
 	ok      bool
 	missing bool
+	mark    fileMark
 }
 
 // text reads a file once. Past maxInvalidationCacheBytes the file is read and handed back
 // without being retained, so one pass cannot hold every file a large change touches; the
-// cost is one read per anchor that needs the same file.
-func (s *rehashSession) text(rel string) fileRead {
-	if r, ok := s.files[rel]; ok {
+// cost is one read per anchor that needs the same file. want is the mark the caller has
+// already read; when it differs from the one the retained text was read under, the file is
+// read again.
+func (s *rehashSession) text(rel string, want fileMark) fileRead {
+	if r, ok := s.files[rel]; ok && (r.mark == want || !want.exists) {
 		return r
 	}
-	r := fileRead{}
+	r := fileRead{mark: want}
 	if r.text, r.ok = readWorkspaceText(s.root, rel, maxSymbolFileBytes); !r.ok {
 		f, err := openWorkspaceFileBeneath(s.root, rel)
 		if err == nil {
@@ -179,11 +184,15 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	if hasMark {
 		if hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark, readAt); hit {
 			if h, named := hashes[want]; named {
-				return anchorState{govstore.BaselineHash, h}, true
+				// The mark is re-read before the hit is served, so a file that changed
+				// between this pass's stat and the lookup does not answer from the entry.
+				if after, still := markOutlineFile(s.root, file); !still || after == mark {
+					return anchorState{govstore.BaselineHash, h}, true
+				}
 			}
 		}
 	}
-	src := s.text(file)
+	src := s.text(file, mark)
 	if !src.ok {
 		return missingState, src.missing
 	}
@@ -197,6 +206,9 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	}
 	sum := sha256.Sum256([]byte(body))
 	h := hex.EncodeToString(sum[:])
+	// The file was hashed, whatever happens to the cache below: files_hashed counts files
+	// whose body a pass computed, not files whose hash it kept.
+	s.countHashedFile(file)
 	// An incomplete outline is not cached: the index may name declarations it did not
 	// return, so an entry built from a partial outline could answer "missing" wrongly.
 	// The mark is re-read after the hash, so a file that changed while it was read is
@@ -209,12 +221,8 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	return anchorState{govstore.BaselineHash, h}, true
 }
 
-// storeBody adds one declaration's hash to the file's cache entry and counts the file once
-// per pass. The add itself is atomic under the cache lock (see storeOutlineHash), so two
-// passes extending one entry cannot drop each other's hash; the count is what the report
-// calls files_hashed, and a file the cache refuses still counts, because its body was
-// computed and thrown away.
-func (s *rehashSession) storeBody(file string, mark fileMark, readAt time.Time, want, hash string) {
+// countHashedFile counts a file once per pass, whatever the cache did with its hash.
+func (s *rehashSession) countHashedFile(file string) {
 	if s.hashedFiles == nil {
 		s.hashedFiles = map[string]bool{}
 	}
@@ -222,6 +230,12 @@ func (s *rehashSession) storeBody(file string, mark fileMark, readAt time.Time, 
 		s.hashedFiles[file] = true
 		s.hashed++
 	}
+}
+
+// storeBody adds one declaration's hash to the file's cache entry. The add is one
+// operation under the cache lock (see storeOutlineHash), so two passes extending one entry
+// cannot drop each other's hash.
+func (s *rehashSession) storeBody(file string, mark fileMark, readAt time.Time, want, hash string) {
 	storeOutlineHash(s.workspaceID, s.root, file, mark, readAt, want, hash)
 }
 

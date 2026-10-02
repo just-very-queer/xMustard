@@ -84,6 +84,126 @@ func TestAFileChangedWhileItWasReadIsNotCached(t *testing.T) {
 	}
 }
 
+// The cache must never be the weaker of the two readers. The workspace reader refuses a
+// path with a symlink component; a mark taken by path through a symlink would let a warm
+// entry answer a path that reader rejects, so the mark is taken from the same confined
+// open and a symlinked file has no mark at all.
+func TestASymlinkedFileHasNoMarkAndIsNeverServed(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	root := t.TempDir()
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "secret.go"), []byte("package secret\n\nfunc S() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "pkg"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(root, "pkg", "link.go")
+	if err := os.Symlink(filepath.Join(outside, "secret.go"), link); err != nil {
+		t.Skipf("symlinks unavailable here: %v", err)
+	}
+
+	if _, ok := markOutlineFile(root, "pkg/link.go"); ok {
+		t.Fatal("a symlinked file has a mark, so a warm entry could answer a path the workspace reader refuses")
+	}
+	// And the reader the invalidation falls back to refuses it too, so nothing is hashed
+	// from the symlink's target.
+	if text, ok := readWorkspaceText(root, "pkg/link.go", maxSymbolFileBytes); ok {
+		t.Fatalf("the workspace reader read a symlinked path: %q", text)
+	}
+}
+
+// The byte ceiling is checked on every store, not only when an entry is created: growing an
+// entry past the ceiling is refused, and the total the governor sees does not move.
+func TestGrowingAnEntryPastTheByteCeilingIsRefused(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	root := t.TempDir()
+	rel := "grow/x.go"
+	if err := os.MkdirAll(filepath.Join(root, "grow"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, rel), []byte("package grow\n\nfunc X() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mark, ok := markOutlineFile(root, rel)
+	if !ok {
+		t.Fatal("grow/x.go has no mark")
+	}
+
+	// One key that nearly fills the ceiling, then one that would cross it.
+	storeOutlineHash("ws", root, rel, mark, time.Now(), "Big", strings.Repeat("a", outlineHashMaxHeld-1024))
+	before, _ := outlineHashUsed()
+	if before == 0 {
+		t.Fatal("the first key was refused")
+	}
+	storeOutlineHash("ws", root, rel, mark, time.Now(), "Over", strings.Repeat("b", outlineHashMaxHeld))
+	if after, _ := outlineHashUsed(); after != before {
+		t.Fatalf("a refused growth moved the total from %d to %d", before, after)
+	}
+	hashes, hit := outlineHashesFor("ws", root, rel, mark, time.Now())
+	if !hit {
+		t.Fatal("the entry vanished")
+	}
+	if _, kept := hashes["Over"]; kept {
+		t.Fatal("the key past the ceiling was kept")
+	}
+	if _, kept := hashes["Big"]; !kept {
+		t.Fatal("the key that fitted was dropped")
+	}
+}
+
+// The held total is exact across a replacement: replacing an entry releases its old bytes
+// once, not twice, so the governor is not told the cache is smaller than it is.
+func TestTheHeldTotalIsExactAcrossAReplacement(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	root := t.TempDir()
+	rel := "swap/x.go"
+	if err := os.MkdirAll(filepath.Join(root, "swap"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, rel), []byte("package swap\n\nfunc X() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	first, _ := markOutlineFile(root, rel)
+	storeOutlineHash("ws", root, rel, first, time.Now(), "A", strings.Repeat("a", 4096))
+	afterFirst, _ := outlineHashUsed()
+	if afterFirst == 0 {
+		t.Fatal("the first entry stored nothing")
+	}
+
+	// The file is rewritten, so the mark moves and the entry is replaced, not grown.
+	if err := os.WriteFile(filepath.Join(root, rel), []byte("package swap\n\nfunc X() int { return 2 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	second, ok := markOutlineFile(root, rel)
+	if !ok || second == first {
+		t.Fatal("the rewrite did not move the mark")
+	}
+	storeOutlineHash("ws", root, rel, second, time.Now(), "B", strings.Repeat("b", 8192))
+	afterSecond, _ := outlineHashUsed()
+	if afterSecond <= afterFirst {
+		t.Fatalf("a replacement left the total at %d, want the new entry's own bytes counted once over %d", afterSecond, afterFirst)
+	}
+	// With one entry left, the total must be exactly that entry's own held bytes: an old
+	// entry released twice would understate it.
+	outlineHashes.Lock()
+	entries := len(outlineHashes.byKey)
+	var held int64
+	for _, e := range outlineHashes.byKey {
+		held += e.held
+	}
+	outlineHashes.Unlock()
+	if entries != 1 {
+		t.Fatalf("the cache holds %d entries after a replacement, want 1", entries)
+	}
+	if afterSecond != held {
+		t.Fatalf("the total is %d but the entries hold %d: the old bytes were not released exactly once", afterSecond, held)
+	}
+}
+
 // A mark inside the racy window is neither served nor stored, the way the workspace
 // registry treats the same fileMark: on a coarse-timestamp filesystem two same-size writes
 // inside one tick share a mark, so such an entry could outlive the edit it describes.
