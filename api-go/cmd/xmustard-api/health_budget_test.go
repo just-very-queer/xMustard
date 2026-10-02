@@ -149,8 +149,9 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	}
 	num(t, b, "transient_pool", "max")
 	num(t, b, "children", "cap")
-	// request_body_cap_bytes is asserted for real in TestHealthRequestBodyCapIsTheRealAdmissionCap;
-	// this block's former "must not exceed the pool" check pinned the pool-capped value and is gone.
+	// request_body_cap_bytes is asserted against the enforced limit in
+	// TestHealthRequestBodyCapIsTheRealAdmissionCap; this block's former "must not
+	// exceed the pool" check pinned the pool-capped value and is gone.
 	num(t, b, "in_flight_bodies", "cap")
 }
 
@@ -158,11 +159,20 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 // admission cap, which the capture route (a streamed route) is admitted against, and
 // that is not bounded by the transient pool. It used to be reported pool-capped, so an
 // operator sizing an upload was told 24 MiB while capture accepted 32 MiB.
+//
+// The field is read from a real HTTP health response and compared with the limit
+// bodyLimitMiddleware actually enforces on a streamed route, measured by finding the
+// body length it answers 413 for. Comparing against the middleware rather than against
+// maxRequestBodyBytesConfigured() keeps the two in step even if the pool is resized.
 func TestHealthRequestBodyCapIsTheRealAdmissionCap(t *testing.T) {
+	f := newEvidenceFixture(t, true)
 	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "")
-	want := maxRequestBodyBytesConfigured()
-	if got := healthBudgetBlock().RequestBodyCapBytes; got != want {
-		t.Fatalf("default cap: want %d (the configured admission cap), got %d", want, got)
+	enforced := streamedBodyLimitEnforcedByMiddleware(t)
+
+	h := getHealth(t, f.srv.URL)
+	b := dig(t, h, "budget")
+	if got := num(t, b, "request_body_cap_bytes"); got != float64(enforced) {
+		t.Fatalf("request_body_cap_bytes: want the cap the capture route is admitted against (%d), got %d", enforced, int64(got))
 	}
 
 	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "5000000")
@@ -174,19 +184,42 @@ func TestHealthRequestBodyCapIsTheRealAdmissionCap(t *testing.T) {
 	}
 }
 
-// The reported cap is the limit a streamed route (capture) is admitted against, so it
-// is the middleware's streamLimit and not the pool-capped reservedLimit.
-func TestHealthRequestBodyCapMatchesTheCaptureRouteLimit(t *testing.T) {
-	t.Setenv("XMUSTARD_MAX_BODY_BYTES", "")
-	streamLimit := maxRequestBodyBytesConfigured()
-	if got := healthBudgetBlock().RequestBodyCapBytes; got != streamLimit {
-		t.Fatalf("health cap %d is not the capture route's limit %d", got, streamLimit)
+// streamedBodyLimitEnforcedByMiddleware measures the largest declared body a capture
+// route is admitted against, by finding the boundary at which bodyLimitMiddleware
+// starts answering 413. It reports the enforced limit rather than recomputing it, so it
+// holds whatever the pool size is. bodyLimitMiddleware refuses when ContentLength is
+// greater than the limit, so the limit is the largest length not refused.
+func streamedBodyLimitEnforcedByMiddleware(t *testing.T) int64 {
+	t.Helper()
+	h := bodyLimitMiddleware(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	refused := func(n int64) bool {
+		// a real body reader, or bodyLimitMiddleware short-circuits on http.NoBody and
+		// never applies the cap; the reader is never read, only the declared length is.
+		req := httptest.NewRequest("POST", "/api/workspaces/ws/evidence/capture", bytes.NewReader(make([]byte, 1)))
+		req.ContentLength = n
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, req)
+		return w.Code == http.StatusRequestEntityTooLarge
 	}
-	// the middleware must still cap a reserved body at the pool; this row does not
-	// change that, it only changes what health reports.
-	if reserved := budget.CapToPool(streamLimit); streamLimit <= reserved {
-		t.Fatalf("fixture assumption: configured cap %d must exceed the pool-capped %d for the test to distinguish them", streamLimit, reserved)
+	hi := int64(1)
+	for !refused(hi) {
+		hi <<= 1
+		if hi > 1<<40 {
+			t.Fatalf("no body length up to 1 TiB is refused; the capture route cap is not enforced by this middleware")
+		}
 	}
+	lo := hi >> 1 // the largest accepted length; 0 if even 1 byte is refused
+	for hi-lo > 1 {
+		mid := (lo + hi) / 2
+		if refused(mid) {
+			hi = mid
+		} else {
+			lo = mid
+		}
+	}
+	return lo
 }
 
 // Correction to PAR-RT-04: no capture path waits on the heavy slot. With the slot held
