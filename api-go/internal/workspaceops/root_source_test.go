@@ -110,6 +110,24 @@ func TestConfineAnchorPathsStillRechecksANonAdminRoot(t *testing.T) {
 	}
 }
 
+// A workspace with no snapshot and no registry record cannot be resolved at all.
+// That is not a refusal: confinement falls back to the lexical checks, which still
+// refuse an escape, an absolute path and a control character while admitting a
+// plain relative path.
+func TestConfineAnchorPathsFallsBackToLexicalChecksForAnUnresolvableWorkspace(t *testing.T) {
+	dataDir := t.TempDir()
+
+	got, err := confineAnchorPaths(dataDir, "wsUnknown", []string{"inside.txt"})
+	if err != nil || len(got) != 1 || got[0] != "inside.txt" {
+		t.Fatalf("an unresolvable workspace still confines lexically: %v %v", got, err)
+	}
+	for _, escape := range []string{"../escape.txt", "/etc/passwd", "with\x00nul"} {
+		if out, err := confineAnchorPaths(dataDir, "wsUnknown", []string{escape}); err == nil {
+			t.Fatalf("%q must be refused with no root to check against, got %v", escape, out)
+		}
+	}
+}
+
 // No registry file at all: the snapshot root still confines, an escape is still
 // refused, and the root lookup still answers the derived unregistered id. Neither
 // reader may start refusing because the registry is absent.
@@ -131,16 +149,24 @@ func TestReadersWithoutARegistryKeepTheSnapshotRoot(t *testing.T) {
 }
 
 // A workspace the registry file does not list still confines against the snapshot
-// root: the registry is the first source, not the only one.
+// root: the registry is the first source, not the only one. The snapshot root is in
+// force, not merely present, so a symlink out of it is refused.
 func TestConfineAnchorPathsFallsBackToTheSnapshotRootForAnUnlistedWorkspace(t *testing.T) {
 	dataDir := t.TempDir()
-	agedWrite(t, snapshotPath(dataDir, "wsOnlySnap"), snapshotWithRoot("wsOnlySnap", t.TempDir()), time.Hour)
+	root := t.TempDir()
+	agedWrite(t, snapshotPath(dataDir, "wsOnlySnap"), snapshotWithRoot("wsOnlySnap", root), time.Hour)
 	agedWrite(t, workspacesPath(dataDir), []workspaceRecord{{
 		WorkspaceID: "wsOther", Name: "other", RootPath: t.TempDir(),
 	}}, time.Hour)
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
 	if out, err := confineAnchorPaths(dataDir, "wsOnlySnap", []string{"ok.txt"}); err != nil {
 		t.Fatalf("a workspace the registry does not list still confines against the snapshot: %v %v", out, err)
+	}
+	if out, err := confineAnchorPaths(dataDir, "wsOnlySnap", []string{"link"}); !errors.Is(err, ErrPathEscapesWorkspace) {
+		t.Fatalf("the snapshot root must be in force, not merely used: got %v %v", out, err)
 	}
 }
 
@@ -205,5 +231,17 @@ func TestLookupWorkspaceRootIsUnchangedByTheWarmedRegistryCache(t *testing.T) {
 		if after := read()[i]; after != before[i] {
 			t.Fatalf("%s: warmed cache changed the answer: %+v vs %+v", c.name, after, before[i])
 		}
+	}
+
+	// A registry that changes after the cache was warmed is still observed: the
+	// cache is keyed on the file's stat identity, so a reader that skipped that
+	// key would keep answering from the stale records. The change is to a record
+	// already cached (its name), which is what a stale answer would get wrong.
+	if _, err := upsertLoadedWorkspace(dataDir, repo, "Renamed", nowUTC(), nil); err != nil {
+		t.Fatal(err)
+	}
+	renamed, err := LookupWorkspaceRoot(dataDir, repo)
+	if err != nil || !renamed.Registered || renamed.Name != "Renamed" {
+		t.Fatalf("a record changed after the cache was warmed must be seen: %+v %v", renamed, err)
 	}
 }
