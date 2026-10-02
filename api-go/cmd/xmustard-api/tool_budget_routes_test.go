@@ -40,12 +40,10 @@ const isolatedRun = "XMUSTARD_TEST_ISOLATED_RUN"
 // the assertions run against it unchanged — no ceiling, wait or bound is touched.
 //
 // The parent's command is built from the flags it received, so `-run`, `-v`,
-// `XMUSTARD_CORE_BIN` and every other flag that shapes the run carry over. Two do not:
-// -test.count and -test.run, which isolatedTest sets itself. The count is dropped because
-// the parent already repeats — forwarding it would run the body count-squared times in
-// one child, and those repeats grow the child back over the line this helper exists to
-// avoid. The run pattern is replaced rather than added, so a parent's own -run narrows to
-// this one test and a run flag that already names it is not duplicated.
+// `XMUSTARD_CORE_BIN` and every other flag that shapes the run carry over. Three do not:
+// -test.count, -test.run and -test.cpu, which isolatedArgs sets itself. Each would put
+// repeats back inside one child process, growing it back over the line this helper exists
+// to keep it under.
 //
 // Each side runs every test exactly once, and a child that skipped or failed is not a
 // pass: the child's own verdict decides, so a build without the core binary reports the
@@ -73,17 +71,51 @@ func isolatedTest(t *testing.T, body func(t *testing.T)) {
 	}
 }
 
-// isolatedArgs is the child's argument list: the parent's flags with -test.count and
-// -test.run replaced by values that run this one test exactly once.
+// isolatedArgs is the child's argument list: the parent's flags, minus the three that
+// decide how many times, or in how many configurations, one process runs a test, plus
+// -test.v so the child's own --- SKIP line is always in the output the parent reads.
+//
+// -test.count and -test.cpu would put the repeats back inside a single child, growing it
+// over the line this helper isolates against. -test.v is not dropped but forced: Go prints
+// --- SKIP only under it, so without it a child that skipped exits zero and the parent
+// reports a pass over assertions it never ran.
+//
+// The dropped flags go in both spellings. `-test.run TestX -test.count 2` leaves each
+// value as a positional argument, which stops the flag parser before the appended
+// -test.run and lets the child run the whole package, so a dropped flag without "=" also
+// drops the argument after it — but only when that argument is not itself a flag, since
+// `-test.count -test.v` gives -test.count no value.
 func isolatedArgs(name string) []string {
-	args := make([]string, 0, len(os.Args)+2)
+	args := make([]string, 0, len(os.Args)+4)
+	dropValue := false
 	for _, a := range os.Args[1:] {
-		if strings.HasPrefix(a, "-test.count") || strings.HasPrefix(a, "-test.run") {
+		if dropValue && !strings.HasPrefix(a, "-") {
+			dropValue = false
+			continue
+		}
+		dropValue = false
+		if flag, value, split := strings.Cut(a, "="); isolatedArgsDrop(flag) {
+			dropValue = !split || value != ""
+			continue
+		}
+		if isolatedArgsDrop(a) {
+			dropValue = true
 			continue
 		}
 		args = append(args, a)
 	}
-	return append(args, "-test.count=1", "-test.run=^"+name+"$")
+	return append(args, "-test.count=1", "-test.cpu=1", "-test.v=true", "-test.run=^"+name+"$")
+}
+
+// isolatedArgsDrop reports whether a flag changes how many times, or in how many
+// configurations, one process runs a test. Each would put the repeats back inside a single
+// child, which is the growth this helper isolates against.
+func isolatedArgsDrop(flag string) bool {
+	switch flag {
+	case "-test.count", "-test.run", "-test.cpu":
+		return true
+	}
+	return false
 }
 
 // isolatedSummary is the child's own summary, which names what it skipped for.
