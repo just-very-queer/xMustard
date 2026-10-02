@@ -117,12 +117,10 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		t.Setenv("XMUSTARD_AUTH", mode)
 		for who, tok := range tokens {
 			time.Sleep(300 * time.Millisecond) // past the health sample cache
-			// The heavy slot is held for the whole test, so the watchdog samples
-			// the tree on its own 250 ms clock for the duration. A restricted poll
-			// must not sample, but only the samples taken *by the poll* say that;
-			// a global counter also moves when the watchdog ticks inside the
-			// window, which is the watchdog doing its job, not a leak. Attribute
-			// the samples instead of racing the ticker.
+			// The heavy slot is held for the whole test, so the watchdog samples on
+			// its own 250 ms clock throughout. Only a sample taken by the poll shows a
+			// restricted poll sampling; a global counter also moves when the watchdog
+			// ticks, which is the watchdog working, not a leak.
 			inPoll.Store(true)
 			before := pollSamples.Load()
 			h := health(tok)
