@@ -845,7 +845,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *What was built.* `rust-core/src/index/watch.rs`, `rust-core/src/run_wrapper.rs` and `rust-core/src/syntaxcheck.rs` (1, 1 and 5 diff hunks) through `cargo fmt`. No `.go` file changed: `gofmt -l api-go` was already empty at `15595d4`. The `Makefile` gains two `check-backend` steps, `gofmt -l api-go` failing on any output and `cargo fmt --check` failing on any exit.
 - *Deviations.* (1) The FU list this row started from named seven Rust files; four of them (`indexcache.rs`, `scanner.rs`, `verification.rs`, `bin/xmustard-core.rs`) are not flagged at the tip and three of those paths (`src/index/indexcache.rs`, `src/index/scanner.rs`, `src/index/verification.rs`) do not exist — the files live at `src/indexcache.rs`, `src/scanner.rs`, `src/verification.rs`. The row formats what `cargo fmt --check` actually reports and records the stale list rather than acting on it.
 - *Review round 1.* See `reviews/ws-hyg-02/r1`.
-- *Checks.* `gofmt -l api-go` empty; `cargo fmt --check` exit 0 on the box; `git diff -w` empty over the three `.rs` files; `BOXALL` on the reviewed head and on the merge commit.
+- *Checks.* `gofmt -l api-go` empty; `cargo fmt --check` exit 0 on the box; the whitespace-stripped character-stream comparison per file (the oracle above, not `git diff -w`); `BOXALL` on the reviewed head, and on the merge commit after the merge.
 - *Follow-ups.* None.
 
 ### WS-16 — Language packs via the provider contract

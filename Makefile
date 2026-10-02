@@ -126,7 +126,8 @@ scan:
 check: check-backend check-frontend
 
 check-backend:
-	@out=$$(gofmt -l api-go); if [ -n "$$out" ]; then \
+	@out=$$(gofmt -l api-go) || { echo "check-backend: gofmt failed"; exit 1; }; \
+	if [ -n "$$out" ]; then \
 		echo "check-backend: gofmt drift in:"; echo "$$out"; exit 1; \
 	fi
 	cd api-go && go test ./...
