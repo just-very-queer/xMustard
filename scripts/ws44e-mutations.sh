@@ -14,14 +14,18 @@ echo "TREE=$ROOT"
 
 SRC=integrations/pi/src/commandwrap.ts
 CFG=integrations/pi/src/config.ts
+DLV=integrations/pi/src/delivery.ts
 PRISTINE="$(mktemp -d)"
 cp "$SRC" "$PRISTINE/commandwrap.ts"
 cp "$CFG" "$PRISTINE/config.ts"
+cp "$DLV" "$PRISTINE/delivery.ts"
 
 restore() {
 	cp "$PRISTINE/commandwrap.ts" "$SRC"
 	cp "$PRISTINE/config.ts" "$CFG"
-	if cmp -s "$PRISTINE/commandwrap.ts" "$SRC" && cmp -s "$PRISTINE/config.ts" "$CFG"; then
+	cp "$PRISTINE/delivery.ts" "$DLV"
+	if cmp -s "$PRISTINE/commandwrap.ts" "$SRC" && cmp -s "$PRISTINE/config.ts" "$CFG" \
+		&& cmp -s "$PRISTINE/delivery.ts" "$DLV"; then
 		echo "RESTORED=$1 clean=yes"
 	else
 		echo "RESTORED=$1 clean=no"
@@ -103,9 +107,28 @@ mutate M11 " -- \${SHELL} \${SHELL_FLAG} " " -- " || true
 # M12: quoting is dropped, so a command with a quote or a space in the id breaks
 mutate M12 '${SHELL} ${SHELL_FLAG} ${shellQuote(command)}' '${SHELL} ${SHELL_FLAG} ${command}' || true
 
+# M13: carriesHandle loses the literal `]`, which is the exact defect this row found:
+# the class then has to span the bracket closing the tag and can never match.
+mutate M13 'search)\][^\n]*xm1\.' 'search)[^\]]*xm1\.' "$DLV" || true
+
+# M14: the wrapper's footer tag is no longer recognised, so a captured result never
+# activates expansion and the model holds a handle with no tool.
+mutate M14 '(?:evidence|masked|page|search)' '(?:page|search)' "$DLV" || true
+
+# M15: the tool-name guard is removed, so every tool's input is offered to the wrap
+# and `read`/`edit`/`write` payloads are rewritten.
+mutate M15 'if (!isRecord(event) || event.toolName !== "bash") return false;' '' "$SRC" || true
+
+# M16: the token gate is removed, so the wrapper is handed an argv with no way to
+# authenticate and every wrapped call fails inside the wrapper instead of running
+# natively.
+mutate M16 'return !(opts.tokenConfigured && !opts.wrapperTokenPresent);' 'return true;' "$SRC" || true
+
 restore ALL
 echo "=== final byte-compare"
-cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" && echo "TREE_CLEAN=yes" || echo "TREE_CLEAN=no"
+cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \
+	&& cmp "$PRISTINE/delivery.ts" "$DLV" \
+	&& echo "TREE_CLEAN=yes" || echo "TREE_CLEAN=no"
 rm -rf "$PRISTINE"
 echo "=== SUMMARY applied=$APPLIED survived=$SURVIVORS not_applied=$NOT_APPLIED"
 # The runner fails when any mutation was skipped or survived, so "all killed" cannot

@@ -31,7 +31,7 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
-import { mutateBashInput, shellQuote } from "../src/commandwrap.ts";
+import { mutateBashInput, shellQuote, shouldWrapBash } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -1412,6 +1412,38 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		assert.deepEqual(wrapInput({ command: once }, "ws-1", true), { command: once });
 		const twice = `xmustard-core run --workspace 'ws-1' -- ${once}`;
 		assert.deepEqual(wrapInput({ command: twice }, "ws-1", true), { command: twice });
+	});
+
+	// The hook's two refusals, before any workspace lookup is paid for.
+	const bash = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: { command: "ls" } };
+	const ON = { enabled: true, tokenConfigured: false, wrapperTokenPresent: false };
+
+	test("the hook wraps a bash call when the knob is on and no token is at stake", () => {
+		assert.equal(shouldWrapBash(bash, ON), true);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperTokenPresent: true }), true, "a wrapper token does not block the wrap");
+	});
+
+	test("the hook refuses when the knob is off", () => {
+		assert.equal(shouldWrapBash(bash, { ...ON, enabled: false }), false);
+	});
+
+	test("the hook refuses every tool that is not bash", () => {
+		for (const toolName of ["read", "grep", "find", "ls", "edit", "write", "powershell", "ground", "search", "impact", "xmustard_expand", "my_custom_tool"]) {
+			assert.equal(shouldWrapBash({ ...bash, toolName }, ON), false, `${toolName} must not be wrapped`);
+		}
+		for (const event of [undefined, null, 7, "bash", [], {}, { toolName: 7 }, { toolName: "Bash" }, { toolName: "bash " }]) {
+			assert.equal(shouldWrapBash(event, ON), false, `must not be wrapped: ${JSON.stringify(event)}`);
+		}
+	});
+
+	test("the hook refuses when the API needs a token the wrapper cannot be handed", () => {
+		// The wrapper reads XMUSTARD_API_TOKEN from its own environment and a
+		// tool_call hook cannot change it, so a token this process cannot pass on
+		// means the wrapped command would fail inside the wrapper. It runs natively
+		// instead and projectBuiltin captures the result.
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperTokenPresent: false }), false);
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperTokenPresent: true }), true, "a wrapper token makes the wrap safe");
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: false, wrapperTokenPresent: false }), true, "no token configured means nothing to pass");
 	});
 });
 

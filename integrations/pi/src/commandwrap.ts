@@ -61,3 +61,24 @@ export function mutateBashInput(event: unknown, workspaceId: string | undefined,
 function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
 }
+
+// shouldWrapBash is the tool_call hook's decision, as a pure function of what the
+// hook can see. It is kept out of the hook body so the two refusals are testable
+// without a running Pi extension host: a tool that is not bash, and a session whose
+// token the wrapper cannot be handed.
+//
+// The second refusal is not a nicety. The wrapper authenticates with
+// XMUSTARD_API_TOKEN from its own environment (rust-core/src/run_wrapper.rs), this
+// adapter reads XMUSTARD_TOKEN, and a tool_call hook cannot change the child
+// environment. Putting the token on the command line instead would write it into
+// Pi's session transcript, the masking walk and every capture body. So when the API
+// needs a token this process cannot pass on, the command runs natively and
+// projectBuiltin captures its result through the adapter, which can authenticate.
+export function shouldWrapBash(
+	event: unknown,
+	opts: { enabled: boolean; tokenConfigured: boolean; wrapperTokenPresent: boolean },
+): boolean {
+	if (!opts.enabled) return false;
+	if (!isRecord(event) || event.toolName !== "bash") return false;
+	return !(opts.tokenConfigured && !opts.wrapperTokenPresent);
+}
