@@ -1798,20 +1798,46 @@ mod tests {
 
     #[test]
     fn a_poisoned_name_is_withheld_from_the_status_answer_the_agent_reads() {
-        // Round 1 (codex-spec medium, category test): every other test here calls
-        // detail_of directly, so none of them would catch a regression between the
-        // degradation and the `detail` field Root::status serialises. This one drives the
-        // same field the status answer carries.
+        // Round 1 (codex-spec medium, category test): every other test here builds a
+        // NativeError and calls detail_of, so none of them would catch a regression
+        // between the watch failing and the `detail` field Root::status serialises. This
+        // one drives degrade with the error `on_error` builds for a watch-stream failure
+        // on a really poisoned directory, and reads the field the answer carries.
+        //
+        // The directory is created for real: a poisoned name does not make the OS refuse
+        // a watch, so the error is built the way on_error builds it rather than asked of
+        // the platform, and the path in it is the real path.
         let dir = tempfile::tempdir().expect("a temp dir");
+        let poisoned = dir.path().join(POISONED_INVISIBLE);
+        std::fs::create_dir(&poisoned).expect("the poisoned directory");
+        let reason = "watching: the watch stream errored".to_string();
+        let err = NativeError::Other {
+            reason: reason.clone(),
+            path: poisoned.display().to_string(),
+        };
         let (root, _rx) = Root::new(dir.path().to_path_buf(), None, MAX_WATCH_DIRS);
-        lock(&root.inner).detail = watch_failed_detail(POISONED_INVISIBLE);
+        {
+            let mut inner = lock(&root.inner);
+            inner.establishing = false;
+            root.degrade(&mut inner, err, Instant::now());
+        }
+        // The watcher's thread calls publish after degrade; the state word in the answer
+        // comes from there, so the test does the same rather than reading a stale word.
+        root.publish();
         let status = root.status();
         let detail = status["detail"].as_str().unwrap_or_default();
+        // The reason survives the redaction: only the path is untrusted.
+        assert!(detail.contains(&reason), "{detail:?}");
+        assert!(detail.contains(REDACTED), "{detail:?}");
         assert!(!detail.contains('\u{200B}'), "{detail:?}");
         assert!(!detail.contains('\u{202E}'), "{detail:?}");
-        assert!(detail.contains(REDACTED), "{detail:?}");
-        // The rest of the status answer is untouched: the redaction is this one field.
-        assert!(status["watcher_state"].is_string());
+        // degrade dropped the native watcher and queued the whole-tree refresh, so the
+        // answer says degraded and has one path pending.
+        assert_eq!(
+            status["watcher_state"], "degraded",
+            "the whole status was {status}"
+        );
+        // The rest of the answer is untouched: the redaction is this one field.
         assert!(status["root"].is_string());
     }
 
