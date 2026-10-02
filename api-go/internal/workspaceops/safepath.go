@@ -184,10 +184,12 @@ func ConfineWorkspacePath(root, rel string) (string, error) {
 // confineAnchorPaths confines memory anchor paths to the workspace root (PAR-SEC-05).
 // The root is the one the tool paths read: resolveWorkspace, which takes the
 // snapshot's own workspace record and falls back to the registry record, and which
-// re-checks a non-admin registration on every use. Confinement and execution
-// therefore cannot disagree about where the workspace is. A workspace that cannot
-// be resolved refuses; only a workspace with nothing to resolve against (no
-// snapshot and no registry record) falls back to the lexical checks.
+// re-checks a non-admin registration on every use. A workspace registered but not
+// yet scanned has no snapshot, so the registry record is its root. Confinement and
+// execution therefore cannot disagree about where the workspace is. A workspace
+// that resolves but is refused fails closed here too; only a workspace with nothing
+// to resolve against (no snapshot and no registry record) falls back to the
+// lexical checks.
 func confineAnchorPaths(dataDir, workspaceID string, paths []string) ([]string, error) {
 	if len(paths) == 0 {
 		return paths, nil
@@ -198,7 +200,16 @@ func confineAnchorPaths(dataDir, workspaceID string, paths []string) ([]string, 
 	case err == nil:
 		root = ws.Root
 	case errors.Is(err, os.ErrNotExist):
-		// nothing to resolve against: the lexical checks below are all that apply.
+		// Not scanned yet: a workspace registered in workspaces.json has no
+		// snapshot, and its registered record is still its root.
+		if rec, rerr := lookupWorkspaceRecord(dataDir, workspaceID); rerr == nil {
+			if verr := verifyRegisteredRoot(rec); verr != nil {
+				return nil, verr
+			}
+			root = rec.RootPath
+		} else if !errors.Is(rerr, os.ErrNotExist) {
+			return nil, rerr
+		}
 	default:
 		return nil, err
 	}

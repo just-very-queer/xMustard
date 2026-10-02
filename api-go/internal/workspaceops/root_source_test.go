@@ -170,6 +170,67 @@ func TestConfineAnchorPathsFallsBackToTheSnapshotRootForAnUnlistedWorkspace(t *t
 	}
 }
 
+// A workspace registered in workspaces.json but not yet scanned has no snapshot.
+// Its registered record is still its root, so a symlink out of it is refused the
+// same way it is for a scanned workspace. This is the case resolveWorkspace cannot
+// answer, and confinement must not fall to the lexical checks because of it.
+func TestConfineAnchorPathsUsesTheRegisteredRootForAnUnscannedWorkspace(t *testing.T) {
+	root, dataDir := confineFixture(t), t.TempDir()
+	if err := writeJSON(workspacesPath(dataDir), []workspaceRecord{{
+		WorkspaceID: "wsUnscanned", Name: "unscanned", RootPath: root,
+	}}); err != nil {
+		t.Fatal(err)
+	}
+
+	if out, err := confineAnchorPaths(dataDir, "wsUnscanned", []string{"src/ok.go"}); err != nil {
+		t.Fatalf("an in-repo anchor for an unscanned workspace: %v %v", out, err)
+	}
+	for _, escape := range []string{"leak.txt", "vendor/secret.txt"} {
+		if out, err := confineAnchorPaths(dataDir, "wsUnscanned", []string{escape}); !errors.Is(err, ErrPathEscapesWorkspace) {
+			t.Fatalf("%q must be refused against the registered root: %v %v", escape, out, err)
+		}
+	}
+}
+
+// The registration re-check also runs on the unscanned-workspace path, where the
+// root comes from workspaces.json rather than a snapshot. A root whose .git leads
+// elsewhere after registration is refused there too.
+func TestConfineAnchorPathsRechecksAnUnscannedNonAdminRoot(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	allowed := filepath.Join(base, "code")
+	repo := fakeRepo(t, filepath.Join(allowed, "repo"))
+	private := filepath.Join(base, "private")
+	if err := os.MkdirAll(private, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(private, "secret.txt"), []byte("TOP SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dataDir := t.TempDir()
+	rec, err := upsertLoadedWorkspace(dataDir, repo, "repo", nowUTC(),
+		&NonAdminRegistration{RegisterRoot: allowed, Principal: "ada"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(repo); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(private, repo); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	out, err := confineAnchorPaths(dataDir, rec.WorkspaceID, []string{"secret.txt"})
+	if err == nil {
+		t.Fatalf("a re-pointed non-admin root must be refused before the first scan, got %v", out)
+	}
+	if !strings.Contains(err.Error(), "no longer resolves to that git work tree") {
+		t.Fatalf("want the registration refusal, got %v", out)
+	}
+}
+
 // Root lookup answers the same before and after the registry cache has been warmed
 // by the readers that share it, so moving lookupWorkspace onto the cache cannot
 // change what an already-read registry says. The four rows are the shapes the API
