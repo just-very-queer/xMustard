@@ -25,9 +25,14 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "")
 	var samples atomic.Int64
+	var pollSamples atomic.Int64
+	var inPoll atomic.Bool
 	prev := budget.Gov
 	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{SoftCeilingBytes: 1 << 40, Sampler: func() (budget.TreeSample, error) {
 		samples.Add(1)
+		if inPoll.Load() {
+			pollSamples.Add(1)
+		}
 		return budget.TreeSample{At: time.Now(), Supported: true, Processes: 1, RSSBytes: 1 << 20, SelfRSSBytes: 1 << 20}, nil
 	}})
 	t.Cleanup(func() { budget.Gov = prev })
@@ -112,9 +117,19 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		t.Setenv("XMUSTARD_AUTH", mode)
 		for who, tok := range tokens {
 			time.Sleep(300 * time.Millisecond) // past the health sample cache
-			before := samples.Load()
+			// The heavy slot is held for the whole test, so the watchdog samples
+			// the tree on its own 250 ms clock for the duration. A restricted poll
+			// must not sample, but only the samples taken *by the poll* say that;
+			// a global counter also moves when the watchdog ticks inside the
+			// window, which is the watchdog doing its job, not a leak. Attribute
+			// the samples instead of racing the ticker.
+			inPoll.Store(true)
+			before := pollSamples.Load()
 			h := health(tok)
-			if got := isFull(t, h); got != want[who] {
+			got := isFull(t, h)
+			after := pollSamples.Load()
+			inPoll.Store(false)
+			if got != want[who] {
 				t.Fatalf("%s mode, %s token: full view %v, want %v (%v)", mode, who, got, want[who], h["budget"])
 			}
 			if !want[who] {
@@ -123,9 +138,11 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				if !strings.Contains(detail, reason) {
 					t.Fatalf("%s token: the detail must say why (%q): %q", who, reason, detail)
 				}
-				if samples.Load() != before {
+				if after != before {
 					t.Fatalf("%s mode, %s token: a restricted poll sampled the process tree", mode, who)
 				}
+			} else if after == before {
+				t.Fatalf("%s mode, %s token: the full view must sample the process tree", mode, who)
 			}
 		}
 		for _, tok := range []string{"", "not-a-token"} {
@@ -137,6 +154,13 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	t.Setenv("XMUSTARD_AUTH", "off")
 	if !isFull(t, health("")) {
 		t.Fatal("auth off shows the full view")
+	}
+	// The attribution above is only meaningful if the watchdog really was
+	// sampling throughout. If the heavy slot's watchdog had not run, every
+	// window would be uncontended and the restricted assertion would hold
+	// trivially, so require that the concurrent sampler was live.
+	if watchdog := samples.Load() - pollSamples.Load(); watchdog == 0 {
+		t.Fatal("the heavy-slot watchdog never sampled, so the restricted-poll assertion was not contended")
 	}
 }
 
