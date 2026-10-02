@@ -28,9 +28,11 @@ const DefaultSearchLimit = 10
 // matches it against every candidate path.
 const maxSearchPathGlobLen = 256
 
-// maxSearchLangLen bounds the `lang` filter. A pack name is short; the bound keeps an
-// over-long value from reaching the core's SQL as a parameter.
-const maxSearchLangLen = 32
+// maxSearchLangLen bounds the `lang` filter at the same 256 bytes as `path_glob`, and the
+// MCP argument advertises the same maxLength, so a schema-valid `lang` is never refused by
+// the route. A pack name is short; the bound keeps an over-long value from reaching the
+// core's SQL as a parameter.
+const maxSearchLangLen = maxSearchPathGlobLen
 
 // The lexical modes of search, the closed set the tool advertises and the route accepts
 // (WS-59b). `pattern` and `symbol` answer from other surfaces and are listed with them.

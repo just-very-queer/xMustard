@@ -16,9 +16,9 @@ var searchTool = &Tool{
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
-		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (chunk text), pattern or symbol"},
-		{Name: "lang", Type: typeString, Desc: "pattern: ast-grep hint; else filter"},
-		{Name: "seed", Type: typeString, Desc: "symbol for the proximity lane"},
+		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "pattern", "symbol"}, Desc: "hybrid (default), text (body), pattern, symbol"},
+		{Name: "lang", Type: typeString, MaxLen: 256, Desc: "pattern: ast-grep hint; else filter"},
+		{Name: "seed", Type: typeString, Desc: "proximity seed symbol"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits (default 10)"},
 	},
 	// Paging and path filters (WS-18), the symbol lookup's options and the output

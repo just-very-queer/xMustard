@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"context"
 	"errors"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -116,6 +117,31 @@ func TestSearchRefusesAnOverLongLang(t *testing.T) {
 	// the bound itself is accepted
 	if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Lang: strings.Repeat("g", maxSearchLangLen)}); err != nil {
 		t.Fatalf("a lang at the bound must be accepted: %v", err)
+	}
+}
+
+// A budget-truncated search continues through SearchCursor, which signs the cursor from
+// the same query values. If it left `lang` or `mode` out of the ranking, the continuation
+// request would carry a cursor the ranking refuses and answer 400 instead of page 2.
+func TestSearchBudgetCursorCarriesLangAndMode(t *testing.T) {
+	q := url.Values{
+		"q": {"retry"}, "lang": {"go"}, "mode": {SearchModeText}, "path_glob": {"**/*.go"},
+	}
+	sign := SearchCursor("ws", q)
+	cursor := sign(10)
+
+	off, err := decodeSearchCursor(cursor, SearchRequest{
+		Query: "retry", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go",
+	}.rankingKey("ws"))
+	if err != nil {
+		t.Fatalf("a budget cursor must continue the search that made it: %v", err)
+	}
+	if off != 10 {
+		t.Fatalf("the budget cursor resumes at its own offset, got %d", off)
+	}
+	// and it does not continue a search without those filters
+	if _, err := decodeSearchCursor(cursor, SearchRequest{Query: "retry"}.rankingKey("ws")); err == nil {
+		t.Error("a budget cursor must not continue a search without its filters")
 	}
 }
 

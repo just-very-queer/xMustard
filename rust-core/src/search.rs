@@ -668,7 +668,10 @@ pub fn search(
                     opts.path_glob,
                     BM25_K,
                     if body_only { 0 } else { DOCS_K },
-                    opts.lang.filter(|l| !l.is_empty()),
+                    // the normalized name, not the caller's spelling: `files.lang` holds
+                    // lowercase pack names, so `lang=Go` would keep the graph hits and lose
+                    // every body hit.
+                    lang.as_deref(),
                     body_only,
                 )
             });
@@ -1563,6 +1566,24 @@ mod tests {
         // declaration chunk's body includes its signature line, so this fixture's own
         // signature is a body match. What the test pins is that nothing beyond the body
         // lane contributed.
+    }
+
+    // `files.lang` holds lowercase pack names. A caller writing `Go` must filter exactly as
+    // `go` does: the graph lanes lowercase the value, so if the SQL lane read the caller's
+    // spelling the two would disagree and the body hits would vanish.
+    #[test]
+    fn lang_filter_is_case_insensitive() {
+        let repo = lang_and_body_repo();
+        let lower = text_search(&repo, "zeppelinprobe", Some("go"));
+        let mixed = text_search(&repo, "zeppelinprobe", Some("Go"));
+        assert_eq!(lower.hits.len(), 1, "{:?}", lower.hits);
+        assert_eq!(
+            mixed.hits.len(),
+            lower.hits.len(),
+            "lang=Go must filter as lang=go: {:?}",
+            mixed.hits
+        );
+        assert_eq!(mixed.hits[0].path, lower.hits[0].path);
     }
 
     // `lang` filters the docs lane too. The docs lane has no `files.lang` to read, so a
