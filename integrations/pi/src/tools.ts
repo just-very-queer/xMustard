@@ -109,6 +109,83 @@ const impactQuery: readonly string[] = [
 	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms",
 ];
 
+// How one member of a JSON request body travels: as the string the argument carries, as a
+// comma-separated list, as a number, or parsed into a structure (claims, relations).
+type BodyKind = "string" | "list" | "number" | "claims" | "relations";
+// A body member is [name, kind]; the list is sorted by name because Go marshals a map, so
+// the keys come out sorted whatever order Go added them in. Both clients then send the
+// same bytes and the same Go argument digest.
+type BodyMember = readonly [string, BodyKind];
+
+// parseClaims and parseRelations in tool_remember.go: claims are "subject|predicate|object"
+// separated by ";", a claim of another shape keeps its text as the subject; a relation is
+// "kind:entry_id", and one with no colon is a kind with an empty target. Go builds both as
+// map[string]string, so their keys marshal sorted too (object, predicate, subject).
+const parseClaims = (s: string): Record<string, string>[] =>
+	s
+		.split(";")
+		.map((c) => c.trim())
+		.filter((c) => c !== "")
+		.map((c) => {
+			const parts = c.split("|");
+			return { object: (parts[2] ?? "").trim(), predicate: (parts[1] ?? "").trim(), subject: (parts[0] ?? "").trim() };
+		});
+const parseRelations = (s: string): Record<string, string>[] =>
+	splitCSV(s).map((r) => {
+		const at = r.indexOf(":");
+		return at < 0 ? { kind: r.trim(), target: "" } : { kind: r.slice(0, at).trim(), target: r.slice(at + 1).trim() };
+	});
+
+// bodyOf renders the request body a Go tool's Build sends from a map[string]any, in
+// sorted key order. A member whose value is empty is omitted, and a structured member
+// that parses to nothing is omitted too, as Go's len() > 0 checks do.
+function bodyOf(a: ToolArgs, members: readonly BodyMember[]): Record<string, unknown> {
+	const payload: Record<string, unknown> = {};
+	for (const [name, kind] of members) {
+		const v = str(a, name);
+		if (!v) continue;
+		switch (kind) {
+			case "list":
+				payload[name] = splitCSV(v);
+				break;
+			case "number":
+				payload[name] = Number(v);
+				break;
+			case "claims": {
+				const claims = parseClaims(v);
+				if (claims.length > 0) payload[name] = claims;
+				break;
+			}
+			case "relations": {
+				const relations = parseRelations(v);
+				if (relations.length > 0) payload[name] = relations;
+				break;
+			}
+			default:
+				payload[name] = v;
+		}
+	}
+	return payload;
+}
+
+// rememberBody is rememberTool.Build's payload in sorted order (tool_remember.go).
+const rememberBody: readonly BodyMember[] = [
+	["base_revision", "number"], ["claims", "claims"], ["content", "string"], ["description", "string"],
+	["entry_id", "string"], ["evidence", "list"], ["expires", "string"], ["kind", "string"],
+	["new_string", "string"], ["old_string", "string"], ["op", "string"], ["paths", "list"],
+	["reason", "string"], ["relations", "relations"], ["run_id", "string"], ["session_id", "string"],
+	["supersedes", "list"], ["tags", "list"], ["tier", "string"], ["title", "string"], ["topic", "string"],
+];
+// verifyBody is verifyTool.Build's payload in sorted order (tool_verify.go).
+const verifyBody: readonly BodyMember[] = [
+	["evidence_handle", "string"], ["note", "string"], ["outcome", "string"], ["revision", "number"], ["target", "string"],
+];
+// whyFailedBody is whyFailedTool.Build's payload in sorted order (tool_why_failed.go).
+const whyFailedBody: readonly BodyMember[] = [
+	["command", "string"], ["cwd", "string"], ["evidence_handle", "string"], ["log", "string"],
+	["run_id", "string"], ["timeout_seconds", "number"],
+];
+
 // GROUND_DEFAULT_MAX_CHARS is groundbudget.DefaultMaxChars in api-go/internal/groundbudget.
 export const GROUND_DEFAULT_MAX_CHARS = 6000;
 
@@ -273,42 +350,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "relations", type: "string", maxLength: 1024 },
 			{ name: "tier", type: "string", enum: ["core", "deferred"], desc: "core needs a human approver" },
 		],
-		build: (a) => {
-			// content travels in the JSON body, never the URL (XM-NEW-018)
-			// Go marshals a map[string]any, so its keys are sorted; the members are set in
-			// that order so both clients send byte-identical bodies (and digests).
-			const payload: Record<string, unknown> = {};
-			for (const k of ["base_revision", "content", "description", "entry_id", "expires", "kind", "new_string", "old_string", "op", "reason", "run_id", "session_id", "tier", "title", "topic"]) {
-				const v = str(a, k);
-				if (!v) continue;
-				payload[k] = k === "base_revision" ? Number(v) : v;
-			}
-			for (const k of ["evidence", "paths", "supersedes", "tags"]) {
-				const v = str(a, k);
-				if (v) payload[k] = splitCSV(v);
-			}
-			const claimsRaw = str(a, "claims");
-			if (claimsRaw) {
-				const claims = claimsRaw
-					.split(";")
-					.map((c) => c.trim())
-					.filter((c) => c !== "")
-					.map((c) => {
-						const parts = c.split("|");
-						return { subject: (parts[0] ?? "").trim(), predicate: (parts[1] ?? "").trim(), object: (parts[2] ?? "").trim() };
-					});
-				if (claims.length > 0) payload.claims = claims;
-			}
-			const relationsRaw = str(a, "relations");
-			if (relationsRaw) {
-				const relations = splitCSV(relationsRaw).map((r) => {
-					const at = r.indexOf(":");
-					return at < 0 ? { kind: r.trim(), target: "" } : { kind: r.slice(0, at).trim(), target: r.slice(at + 1).trim() };
-				});
-				if (relations.length > 0) payload.relations = relations;
-			}
-			return { method: "POST", path: ws(a, "/context"), body: JSON.stringify(payload) };
-		},
+		build: (a) => ({ method: "POST", path: ws(a, "/context"), body: JSON.stringify(bodyOf(a, rememberBody)) }),
 	},
 	{
 		name: "verify",
@@ -338,16 +380,8 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 				method: "POST",
 				path: `${ws(a, `/context/${p(str(a, "entry_id"))}/verify`)}?approve=${a.approve === false ? "false" : "true"}`,
 			};
-			// the note is stored text: body, like memory content (XM-NEW-018). Go marshals a
-			// map, so its keys are sorted; the members are set in that order so both clients
-			// send byte-identical bodies (and digests).
-			const payload: Record<string, unknown> = {};
-			for (const k of ["evidence_handle", "note", "outcome", "target"]) {
-				const v = str(a, k);
-				if (v) payload[k] = v;
-			}
-			const revision = str(a, "revision");
-			if (revision) payload.revision = Number(revision);
+			// the note is stored text: body, like memory content (XM-NEW-018)
+			const payload = bodyOf(a, verifyBody);
 			if (Object.keys(payload).length > 0) call.body = JSON.stringify(payload);
 			return call;
 		},
@@ -488,15 +522,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 				return { method: "GET", path: ws(a, `/runs/${p(str(a, "run_id"))}/why-failed`) };
 			// Anything else is a recording call; the API rejects a missing or mixed source
 			// (run_id travels along so a run_id with a source is refused, not ignored).
-			// Go marshals a map, so its keys are sorted.
-			const payload: Record<string, unknown> = {};
-			for (const k of ["command", "cwd", "evidence_handle", "log", "run_id"]) {
-				const v = str(a, k);
-				if (v) payload[k] = v;
-			}
-			const timeout = str(a, "timeout_seconds");
-			if (timeout) payload.timeout_seconds = Number(timeout);
-			return { method: "POST", path: ws(a, "/why-failed"), body: JSON.stringify(payload) };
+			return { method: "POST", path: ws(a, "/why-failed"), body: JSON.stringify(bodyOf(a, whyFailedBody)) };
 		},
 	},
 ];

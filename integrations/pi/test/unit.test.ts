@@ -283,6 +283,63 @@ describe("tool specs mirror the MCP server", () => {
 		assert.equal(checkRequired(spec("ground"), {}), "no workspace_id for ground");
 		assert.equal(checkRequired(spec("ground"), { workspace_id: "w" }), undefined);
 	});
+	// Go builds remember's and verify's bodies from a map[string]any, so its keys marshal in
+// sorted order. The expected strings below are Go's own output, captured from the three
+// Build functions (see reviews/ws-fix-26/r1/slop-audit.md S13), so a body that differs
+// in a member, a type or the key order fails here.
+	test("body members and their order are Go's, for every advanced argument", () => {
+		assert.equal(
+			spec("verify").build({
+				workspace_id: "w",
+				entry_id: "e",
+				note: "n",
+				outcome: "helpful",
+				target: "ctx_1",
+				evidence_handle: "xm1.H",
+				revision: 3,
+			}).body,
+			'{"evidence_handle":"xm1.H","note":"n","outcome":"helpful","revision":3,"target":"ctx_1"}',
+		);
+		assert.equal(
+			spec("remember").build({
+				workspace_id: "w",
+				content: "c",
+				title: "t",
+				op: "edit",
+				entry_id: "ctx_1",
+				base_revision: 7,
+				reason: "r",
+				old_string: "a",
+				new_string: "b",
+				description: "d",
+				supersedes: "ctx_0",
+				expires: "2030-01-01",
+				evidence: "xm1.E",
+				run_id: "run_1",
+				kind: "gotcha",
+				topic: "a/b",
+				tags: " x,y ",
+				session_id: "s1",
+				claims: "sub|pred|obj",
+				relations: "supports:ctx_2",
+				paths: " a.go , b.go ",
+				tier: "core",
+			}).body,
+			'{"base_revision":7,"claims":[{"object":"obj","predicate":"pred","subject":"sub"}],"content":"c","description":"d","entry_id":"ctx_1","evidence":["xm1.E"],"expires":"2030-01-01","kind":"gotcha","new_string":"b","old_string":"a","op":"edit","paths":["a.go","b.go"],"reason":"r","relations":[{"kind":"supports","target":"ctx_2"}],"run_id":"run_1","session_id":"s1","supersedes":["ctx_0"],"tags":["x","y"],"tier":"core","title":"t","topic":"a/b"}',
+		);
+		assert.equal(
+			spec("why_failed").build({
+				workspace_id: "w",
+				run_id: "run_1",
+				command: "go test ./...",
+				cwd: "api-go",
+				timeout_seconds: 30,
+				evidence_handle: "xm1.H",
+				log: "boom",
+			}).body,
+			'{"command":"go test ./...","cwd":"api-go","evidence_handle":"xm1.H","log":"boom","run_id":"run_1","timeout_seconds":30}',
+		);
+	});
 	test("hook-path args_digest equals the Go middleware's digest", () => {
 		// expected values computed with Go's net/http + the middleware's formula
 		assert.equal(
