@@ -93,24 +93,23 @@ func ListWorkspaces(dataDir string) ([]workspaceRecord, error) {
 		}
 		return nil, err
 	}
-	slices.SortFunc(items, func(a, b workspaceRecord) int {
-		left := strings.ToLower(a.Name)
-		right := strings.ToLower(b.Name)
-		if left == right {
-			if a.WorkspaceID < b.WorkspaceID {
-				return -1
-			}
-			if a.WorkspaceID > b.WorkspaceID {
-				return 1
-			}
-			return 0
-		}
-		if left < right {
-			return -1
-		}
-		return 1
-	})
+	slices.SortFunc(items, compareWorkspaceRecords)
 	return items, nil
+}
+
+// compareWorkspaceRecords orders workspace records by lower-cased name, then by
+// workspace id, so every reader that presents or matches them visits the same
+// order for the same file contents.
+func compareWorkspaceRecords(a, b workspaceRecord) int {
+	left := strings.ToLower(a.Name)
+	right := strings.ToLower(b.Name)
+	if left == right {
+		return strings.Compare(a.WorkspaceID, b.WorkspaceID)
+	}
+	if left < right {
+		return -1
+	}
+	return 1
 }
 
 func LoadWorkspace(dataDir string, request WorkspaceLoadRequest) (*workspaceSnapshot, error) {
@@ -388,23 +387,7 @@ func saveWorkspaceRecordLocked(dataDir string, workspace workspaceRecord) error 
 		}
 	}
 	workspaces = append(filtered, workspace)
-	slices.SortFunc(workspaces, func(a, b workspaceRecord) int {
-		left := strings.ToLower(a.Name)
-		right := strings.ToLower(b.Name)
-		if left == right {
-			if a.WorkspaceID < b.WorkspaceID {
-				return -1
-			}
-			if a.WorkspaceID > b.WorkspaceID {
-				return 1
-			}
-			return 0
-		}
-		if left < right {
-			return -1
-		}
-		return 1
-	})
+	slices.SortFunc(workspaces, compareWorkspaceRecords)
 	return writeJSON(workspacesPath(dataDir), workspaces)
 }
 
