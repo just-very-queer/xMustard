@@ -242,16 +242,21 @@ func TestReadOnlyMode(t *testing.T) {
 	if code, body := call(t, "POST", srv.URL+"/api/auth/tokens", admin, `{"id":"new","role":"agent"}`, nil); code != http.StatusForbidden || body["reason"] != "read_only" {
 		t.Fatalf("minting in read-only mode: want 403 read_only, got %d %v", code, body)
 	}
-	// a leaked token can still be rotated and revoked: both only withdraw access
+	// A leaked token can be revoked without leaving read-only mode: revoke only
+	// withdraws access. Rotate cannot: it re-mints the secret under the caller's
+	// ttl_seconds, so read-only mode must refuse it rather than grant a credential.
 	leaked := mint(t, dir, "leaked", "agent")
-	if code, body := call(t, "POST", srv.URL+"/api/auth/tokens/leaked/rotate", admin, "", nil); code != http.StatusOK {
-		t.Fatalf("rotating in read-only mode: %d %v", code, body)
+	if code, body := call(t, "POST", srv.URL+"/api/auth/tokens/leaked/rotate", admin, "", nil); code != http.StatusForbidden || body["reason"] != "read_only" {
+		t.Fatalf("rotating in read-only mode: want 403 read_only, got %d %v", code, body)
 	}
-	if workspaceops.ResolveToken(dir, leaked) != nil {
-		t.Fatal("the rotated-out secret must stop resolving")
+	if workspaceops.ResolveToken(dir, leaked) == nil {
+		t.Fatal("a refused rotate must leave the existing secret resolving; it re-minted")
 	}
 	if code, body := call(t, "DELETE", srv.URL+"/api/auth/tokens/leaked", admin, "", nil); code != http.StatusOK {
 		t.Fatalf("revoking in read-only mode: %d %v", code, body)
+	}
+	if workspaceops.ResolveToken(dir, leaked) != nil {
+		t.Fatal("the revoked secret must stop resolving")
 	}
 	_, who := call(t, "GET", srv.URL+"/api/auth/whoami", tok, "", nil)
 	tools := who["tools"].([]any)
@@ -568,14 +573,22 @@ func TestReaderWritesNameMissingRole(t *testing.T) {
 }
 
 // With the auth middleware's reader short-circuit gone, the gate table alone keeps
-// reader-only tokens read-only: no non-GET route may grant reader. The MCP endpoint
-// is the one exemption: its messages change nothing themselves, and every tool call
-// re-enters the API through that tool's own gate as the caller (mcp_routes.go).
+// reader-only tokens read-only: no non-GET route may grant reader.
+// methodlessReadOnlyExemptions lists the method-less ServeMux patterns that grant the
+// reader role and only read. A method-less pattern answers every method, so each entry
+// is the whole reason a reader may reach a non-GET method, and
+// TestMethodLessReaderRowsServeOnlyReads measures each one. The MCP endpoint is the one
+// other exemption: its messages change nothing themselves, and every tool call re-enters
+// the API through that tool's own gate as the caller (mcp_routes.go).
+var methodlessReadOnlyExemptions = map[string]bool{"/api/health": true}
+
 func TestNoWriteRouteGrantsReader(t *testing.T) {
 	reentrant := map[string]bool{"POST /mcp": true, "DELETE /mcp": true}
 	for pattern, g := range routeGateTable {
+		// Only GET and HEAD are read routes whatever their gate row says. A method-less
+		// pattern is not one of them.
 		switch patternMethod(pattern) {
-		case "", http.MethodGet, http.MethodHead:
+		case http.MethodGet, http.MethodHead:
 			continue
 		}
 		if reentrant[pattern] {
@@ -584,8 +597,30 @@ func TestNoWriteRouteGrantsReader(t *testing.T) {
 			}
 			continue
 		}
-		if g.Role == roleReader {
+		if g.Role == roleReader && !methodlessReadOnlyExemptions[pattern] {
 			t.Errorf("%s: a non-GET route must need more than reader", pattern)
+		}
+	}
+}
+
+// Each entry of methodlessReadOnlyExemptions must answer a write method the way its
+// read handler answers a read, so the exemption is a measured property of the handler
+// and not a claim about it. A row added there whose handler starts honouring a write
+// method fails here.
+func TestMethodLessReaderRowsServeOnlyReads(t *testing.T) {
+	srv, dir := securityServer(t, exposurePosture{})
+	reader := mint(t, dir, "readerRO", workspaceops.RoleReader)
+	for pattern := range methodlessReadOnlyExemptions {
+		if patternMethod(pattern) != "" {
+			t.Fatalf("%s carries a method, so it needs no method-less exemption", pattern)
+		}
+		readCode, _ := call(t, http.MethodGet, srv.URL+pattern, reader, "", nil)
+		for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodPatch, http.MethodDelete} {
+			code, _ := call(t, method, srv.URL+pattern, reader, "", nil)
+			if code != readCode {
+				t.Errorf("%s %s: got %d, but GET is %d; an exempt row must serve only reads",
+					method, pattern, code, readCode)
+			}
 		}
 	}
 }
