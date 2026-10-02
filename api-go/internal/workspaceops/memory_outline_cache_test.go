@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"xmustard/api-go/internal/budget"
@@ -312,6 +313,130 @@ func TestATruncatedOutlineIsNeverCached(t *testing.T) {
 	}
 	if len(second.Marked) != 0 {
 		t.Fatalf("an unchanged file was marked: %v", second.Marked)
+	}
+}
+
+// One file's entry holds a hash per anchored declaration, and each is served from the same
+// cached entry. Two memories on two symbols of one file therefore cost one hash, and an edit
+// to one of them is still caught while the other stays clean.
+func TestOneFilesEntryHoldsEveryAnchoredDeclaration(t *testing.T) {
+	resetOutlineCache(t)
+	dir, ws, root, git := reviewRepo(t)
+	writeRepoFile(t, root, "srv.go", srvSource)
+	git("add", ".")
+	git("commit", "-q", "-m", "srv")
+	origResolve, origOutline := resolveSymbols, symbolOutline
+	t.Cleanup(func() { resolveSymbols, symbolOutline = origResolve, origOutline })
+	resolveSymbols = func(_ context.Context, _, _ string, names []string) ([]symbolMatch, error) {
+		var out []symbolMatch
+		for _, n := range names {
+			out = append(out, symbolMatch{Name: n, Count: 1, Definitions: []symbolDefinition{{Path: "srv.go", Line: 3}}})
+		}
+		return out, nil
+	}
+	symbolOutline = stubOutline(root)
+	approvedBy(t, dir, ws, "author", "approver", "agent", "`ListenPort` returns the service port 8081.")
+	approvedBy(t, dir, ws, "author", "approver", "agent", "`Other` returns a constant.")
+	clearOutlineHashes()
+	ctx := context.Background()
+
+	rep, err := InvalidateMemory(ctx, dir, ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Two anchors, one file: the pass hashed the file once and checked both.
+	if rep.Checked != 2 || rep.Hashed != 1 {
+		t.Fatalf("two declarations in one file: checked %d, hashed %d, want 2 and 1", rep.Checked, rep.Hashed)
+	}
+	mark, ok := markOutlineFile(root, "srv.go")
+	if !ok {
+		t.Fatal("srv.go has no mark")
+	}
+	if hashes, hit := outlineHashesFor(ws, root, "srv.go", mark); !hit || len(hashes) != 2 {
+		t.Fatalf("the file's entry holds %d hashes (hit=%v), want 2", len(hashes), hit)
+	}
+
+	// An edit to Other marks only Other's memory, and re-hashes the one file.
+	writeRepoFile(t, root, "srv.go", strings.Replace(srvSource, "return 1", "return 2", 1))
+	after, err := InvalidateMemory(ctx, dir, ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Hashed != 1 || len(after.Marked) != 1 || len(rep.Marked) != 0 {
+		t.Fatalf("an edit to Other: hashed %d, marked %v (before %v), want 1 and one memory", after.Hashed, after.Marked, rep.Marked)
+	}
+}
+
+// Concurrent passes over the same file must not race on the entry's map: a reader gets the
+// cached hashes under the lock, and a later store must not write through that same map.
+// Run under -race, this is what proves storeBody copies before it writes.
+func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
+	resetOutlineCache(t)
+	dir, ws, root, git := reviewRepo(t)
+	writeRepoFile(t, root, "srv.go", srvSource)
+	git("add", ".")
+	git("commit", "-q", "-m", "srv")
+	origResolve, origOutline := resolveSymbols, symbolOutline
+	t.Cleanup(func() { resolveSymbols, symbolOutline = origResolve, origOutline })
+	resolveSymbols = func(_ context.Context, _, _ string, names []string) ([]symbolMatch, error) {
+		var out []symbolMatch
+		for _, n := range names {
+			out = append(out, symbolMatch{Name: n, Count: 1, Definitions: []symbolDefinition{{Path: "srv.go", Line: 3}}})
+		}
+		return out, nil
+	}
+	symbolOutline = stubOutline(root)
+	approvedBy(t, dir, ws, "author", "approver", "agent", "`ListenPort` returns the service port 8081.")
+	approvedBy(t, dir, ws, "author", "approver", "agent", "`Other` returns a constant.")
+	clearOutlineHashes()
+
+	// Several readers take the cached entry while a writer adds a third hash to it.
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for range 64 {
+			mark, ok := markOutlineFile(root, "srv.go")
+			if !ok {
+				return
+			}
+			if hashes, hit := outlineHashesFor(ws, root, "srv.go", mark); hit {
+				for k, v := range hashes {
+					_, _ = k, v
+				}
+			}
+		}
+	}()
+	for i := range 8 {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			for range 16 {
+				sess := newRehashSession(context.Background(), root, ws)
+				sess.dataDir = dir
+				sess.storeBody("srv.go", fmt.Sprintf("Extra%02d", i), strings.Repeat("c", 64))
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	// The entry is intact and every writer's key is in it exactly once. The cache was
+	// cleared after the promotion, so the anchored hashes are not among them.
+	mark, ok := markOutlineFile(root, "srv.go")
+	if !ok {
+		t.Fatal("srv.go has no mark")
+	}
+	hashes, hit := outlineHashesFor(ws, root, "srv.go", mark)
+	if !hit {
+		t.Fatal("the entry is gone after concurrent passes")
+	}
+	if len(hashes) != 8 {
+		t.Fatalf("the entry holds %d hashes, want the 8 writers", len(hashes))
+	}
+	for i := range 8 {
+		if _, ok := hashes[fmt.Sprintf("Extra%02d", i)]; !ok {
+			t.Fatalf("writer %d's hash is missing from the entry", i)
+		}
 	}
 }
 

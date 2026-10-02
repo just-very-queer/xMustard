@@ -94,7 +94,8 @@ var anchorRehashers = map[string]struct {
 // each file once per anchor that needs it, which is slower and bounded.
 //
 // hashed counts the files whose symbol bodies this session had to compute, which is the
-// number a pass over a cached tree reports as zero.
+// number a pass over a cached tree reports as zero. hashedFiles is the set behind it, so a
+// file with several anchored declarations counts once.
 type rehashSession struct {
 	ctx               context.Context
 	root, workspaceID string
@@ -103,6 +104,7 @@ type rehashSession struct {
 	held              int
 	outlines          map[string]outlineRead
 	hashed            int
+	hashedFiles       map[string]bool
 }
 
 // maxInvalidationCacheBytes bounds what one invalidation's file cache retains. It is below
@@ -190,7 +192,6 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	// return, so an entry built from a partial outline could answer "missing" wrongly.
 	if !incomplete {
 		s.storeBody(file, want, h)
-		s.hashed++
 	}
 	return anchorState{govstore.BaselineHash, h}, true
 }
@@ -212,17 +213,31 @@ func (s *rehashSession) cachedBody(file, want string) (string, bool) {
 
 // storeBody adds one declaration's hash to the file's cache entry, creating the entry on
 // the first one. A file whose hashes exceed the cache bounds is not cached and the next
-// pass re-hashes it.
+// pass re-hashes it. hashed counts the files, not the stores: a file with two anchored
+// declarations is one file hashed, which is what the report counts, and a file the cache
+// refuses still counts, because its body was computed and thrown away.
 func (s *rehashSession) storeBody(file, want, hash string) {
+	if s.hashedFiles == nil {
+		s.hashedFiles = map[string]bool{}
+	}
+	if !s.hashedFiles[file] {
+		s.hashedFiles[file] = true
+		s.hashed++
+	}
 	mark, ok := markOutlineFile(s.root, file)
 	if !ok {
 		return
 	}
 	hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark)
-	if !hit {
-		hashes = map[string]string{}
-	} else {
+	if hit {
+		if _, known := hashes[want]; known {
+			return
+		}
+		// The cached map is handed out under the lock and read after it, so writing
+		// through it would race every reader: copy before adding.
 		hashes = maps.Clone(hashes)
+	} else {
+		hashes = map[string]string{}
 	}
 	hashes[want] = hash
 	storeOutlineHashes(s.workspaceID, s.root, file, mark, hashes)
