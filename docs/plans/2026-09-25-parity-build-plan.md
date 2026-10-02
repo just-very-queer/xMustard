@@ -2043,6 +2043,22 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 - *Checks.* `gofmt -l api-go/internal/workspaceops api-go/internal/govstore` clean; `go vet ./internal/workspaceops ./internal/govstore` clean; `go test -p 1 -count=1 ./internal/workspaceops ./internal/govstore` green; `xm-box.sh check <wt> all -count=1` green on the reviewed head. Not run: `RET` (no index, no search ranking changed), `BUD` (no resident component changed; the cache bound this row adds is a per-pass ceiling, not a steady-state line), `PI`, `CAPS`, `SECDOC`, `GOLD` (no Pi source, no `tools/list` byte, no route or gate row, no projection), and no `review`-tag build beyond the one the review step needs.
 - *Follow-ups.* A flake candidate, `TestEvidencePagesReuseIdentityUntilTheRepositoryChanges` in `cmd/xmustard-api`, load-driven under concurrent lane gates and not on WS-FLK-01..08; proposed owner WS-FLK (FU). The MCP surface cannot see a parity worktree, which is why the A6 duplicate check used `rg`; sixteenth row, proposed owner WS-FIX-15 (FU).
 
+### WS-28C — A per-file outline-hash cache across ground calls
+
+**Goal.** Every change-driven invalidation re-reads the outline of each file holding a symbol anchor, from the code index, and re-hashes the symbol bodies from the working file. WS-28's own record names this as unbuilt: "a per-file outline-hash cache across ground calls is also not built". `ground` invalidates on each call, so the same unchanged tree pays the same core round-trip per anchored file every time. This row caches the per-file symbol-body hashes, keyed by path and by the file's stat, across calls, so a second `ground` on an unchanged tree re-hashes nothing.
+
+**Requirements.** PAR-PROV-03 (the invalidation stays correct while costing nothing on an unchanged tree); the 95.4 MiB process-tree line is unchanged by design (see *Acceptance*).
+
+**Files.** `api-go/internal/workspaceops/memory_invalidation.go`, `api-go/internal/workspaceops/memory_outline_cache.go` (new), `api-go/internal/workspaceops/memory_outline_cache_test.go` (new)
+
+**Tests required.**
+- A second `ground` on an unchanged tree re-hashes 0 files: a counted pass says `hashed=0` after one that said `hashed=1`
+- An edit that changes the file's content invalidates its cache entry, so the next pass re-hashes that file and the edit still marks the memory
+- The cache is bounded by entries and by held bytes, and past either bound it still reads correctly (a miss, never a wrong answer)
+- A file's cache entry is keyed by path **and** stat, so an edit that keeps size and mtime granularity distinguishable still re-hashes (the key carries inode, size and nanosecond mtime)
+
+**Acceptance.** On an unchanged tree the second invalidation re-hashes 0 files. The cache is process-wide, bounded by entry count and by aggregate held bytes, and dropping an entry costs one re-read, never a stale verdict. It is **not** a steady resident line: the aggregate ceiling is a small fraction of the process-tree budget and the cache is reclaimed on pressure, so it declares a `budget.Component` with a `Reclaim` hook rather than raising any existing line. No `tools/list` byte, route, gate row or projection changes.
+
 ### WS-29 — Memory scopes and shared collections with grants
 
 **Goal.** Add private, dir, run and global scopes derived from the principal, and shared collections with grants: source, target, permission (rw or ro), granted_by, and a per-collection policy. Recall gives per-target applicability (verified_here, foreign_unchecked, stale) and merges scopes with labels. Add xmustard-ops shared list/create/grant/revoke/history.
