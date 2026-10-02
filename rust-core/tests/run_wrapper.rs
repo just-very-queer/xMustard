@@ -253,33 +253,45 @@ fn every_forwarded_signal_reaches_the_child() {
 /// that the signal still ends the wrapper, whether the child is reaped or not.
 #[test]
 fn a_signal_that_arrives_after_the_child_ended_still_ends_the_wrapper() {
-    // A child that writes, then lingers, then ends on its own.
+    // The child ends at once, so the wrapper is inside `present` — the capture — when the
+    // signal lands. A loopback listener that accepts and never answers holds the wrapper in
+    // its reply read; a refused capture would return instantly, the wrapper would finish
+    // before the signal could arrive, and this test would pass on the broken code too
+    // (measured: a first version survived its mutation, reporting the child's code).
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
     let mut wrapper = Command::new(BIN)
         .arg("run")
+        .arg("--api")
+        .arg(&api)
         .arg("--")
-        .args(["sh", "-c", "echo done; sleep 5; exit 4"])
-        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .args(["sh", "-c", "echo done; exit 4"])
+        .env("XMUSTARD_WORKSPACE_ID", "ws-signal-race")
         .env_remove("XMUSTARD_API_TOKEN")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
     let pid = wrapper.id();
-    // Wait until the child is gone, so the signal cannot reach one and the only thing it can
-    // end is the wrapper. `pgrep -P` prints nothing once there is no child.
-    let mut reaped = false;
-    for _ in 0..900 {
-        let out = Command::new("pgrep")
-            .args(["-P", &pid.to_string()])
-            .output()
-            .unwrap();
-        if out.stdout.is_empty() {
-            reaped = true;
-            break;
+    // Wait until the wrapper has actually reached its capture: the listener has accepted the
+    // upload. Polling `pgrep -P` cannot do this — the child is reaped within microseconds of
+    // being spawned, so a poll either misses it or reports "no child" before the spawn
+    // (measured: the first version of this test passed on the broken code for exactly that
+    // reason). Accepting the upload is the one event that means the child ran, was reaped,
+    // and the wrapper is now in `present`.
+    let (uploaded, seen) = mpsc::channel();
+    let _server = thread::spawn(move || {
+        if let Ok((s, _)) = listener.accept() {
+            let _ = uploaded.send(());
+            thread::sleep(Duration::from_secs(30));
+            drop(s);
         }
-        thread::sleep(Duration::from_millis(20));
-    }
-    assert!(reaped, "the wrapper's child never ended");
+    });
+    let _ = seen
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the upload never arrived");
+    // Give the wrapper a moment to finish writing the request body into the stalled socket.
+    thread::sleep(Duration::from_millis(100));
     let _ = Command::new("kill")
         .args(["-TERM", &pid.to_string()])
         .status();
