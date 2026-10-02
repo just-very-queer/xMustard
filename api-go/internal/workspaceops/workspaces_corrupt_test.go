@@ -4,7 +4,6 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 )
@@ -26,8 +25,8 @@ func corruptRegistry(t *testing.T, body string) (string, string) {
 	return dir, path
 }
 
-// assertNamesFileAndOffset asserts that err names path and carries the byte offset
-// wantOffset. wantOffset is computed by the test from the fixture string itself
+// assertNamesFileAndOffset asserts that err names path and carries exactly the byte
+// offset wantOffset. wantOffset is computed by the test from the fixture string itself
 // (strings.Index), never from the decoder under test.
 func assertNamesFileAndOffset(t *testing.T, err error, path string, wantOffset int, context string) {
 	t.Helper()
@@ -38,57 +37,71 @@ func assertNamesFileAndOffset(t *testing.T, err error, path string, wantOffset i
 	if !strings.Contains(msg, path) {
 		t.Fatalf("%s: error does not name the file %q: %v", context, path, err)
 	}
-	if !strings.Contains(msg, "offset") {
-		t.Fatalf("%s: error does not name an offset: %v", context, err)
+	// The offset is compared as a parsed integer, not a substring: "at offset 1" is a
+	// prefix of "at offset 10", so a low expected offset would otherwise accept a
+	// wrong one.
+	got, ok := parseOffset(msg)
+	if !ok {
+		t.Fatalf("%s: error carries no offset: %v", context, err)
 	}
-	// anchored on the phrase, not the bare digits: a low offset such as 1 would
-	// otherwise match any 1 inside a temporary path.
-	if want := "at offset " + strconv.Itoa(wantOffset); !strings.Contains(msg, want) {
-		t.Fatalf("%s: error does not carry %q: %v", context, want, err)
+	if got != wantOffset {
+		t.Fatalf("%s: error reports offset %d, want %d: %v", context, got, wantOffset, err)
 	}
 }
 
+// parseOffset extracts the integer after the last "at offset " in msg.
+func parseOffset(msg string) (int, bool) {
+	const marker = "at offset "
+	i := strings.LastIndex(msg, marker)
+	if i < 0 {
+		return 0, false
+	}
+	rest := msg[i+len(marker):]
+	n, digits := 0, 0
+	for ; digits < len(rest) && rest[digits] >= '0' && rest[digits] <= '9'; digits++ {
+		n = n*10 + int(rest[digits]-'0')
+	}
+	if digits == 0 {
+		return 0, false
+	}
+	return n, true
+}
+
 // TestCorruptWorkspacesRegistryNamesTheFileAndOffset is the row's core assertion. Each
-// fixture is corrupt in a different way and the expected offset is the index of the
-// offending byte in the fixture, read off the string.
+// fixture is corrupt in a different way and the expected offset is read off the fixture
+// string. json's offsets are one-based, so a byte index is raised by one.
 func TestCorruptWorkspacesRegistryNamesTheFileAndOffset(t *testing.T) {
 	cases := []struct {
 		name   string
 		body   string
-		offset int // index of the offending byte, computed with strings.Index
-		at     string
+		offset int // 1-based byte offset, computed with strings.Index or len
 	}{
 		{
 			// valid prefix, then a byte that cannot start a value
 			name:   "bad token after a valid element",
 			body:   `[{"workspace_id":"ws-a","name":"Alpha"},oops]`,
 			offset: strings.Index(`[{"workspace_id":"ws-a","name":"Alpha"},oops]`, "oops") + 1,
-			at:     "the second element's first byte",
 		},
 		{
 			name:   "truncated object",
 			body:   `[{"workspace_id":"ws-a"`,
 			offset: len(`[{"workspace_id":"ws-a"`),
-			at:     "the end of the truncated object",
 		},
 		{
 			name:   "truncated array",
 			body:   `[{"workspace_id":"ws-a","name":"Alpha"},`,
 			offset: len(`[{"workspace_id":"ws-a","name":"Alpha"},`),
-			at:     "the end of the truncated array",
 		},
 		{
 			name:   "well-formed but wrongly typed",
 			body:   `{"workspace_id":"ws-a","name":"Alpha"}`,
 			offset: 1,
-			at:     "the '{' where an array element was expected",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir, path := corruptRegistry(t, tc.body)
 
-			// both readers of the registry must carry the same message
 			_, listErr := ListWorkspaces(dir)
 			assertNamesFileAndOffset(t, listErr, path, tc.offset, "ListWorkspaces")
 
@@ -98,6 +111,12 @@ func TestCorruptWorkspacesRegistryNamesTheFileAndOffset(t *testing.T) {
 			}
 			_, recErr := registryRecords(dir, mark, registryNow())
 			assertNamesFileAndOffset(t, recErr, path, tc.offset, "registryRecords")
+
+			// Both readers go through the one loader, so a message that differed
+			// between them would mean the fix had leaked into a caller.
+			if listErr.Error() != recErr.Error() {
+				t.Fatalf("the two readers disagree:\n ListWorkspaces: %v\n registryRecords: %v", listErr, recErr)
+			}
 		})
 	}
 }
