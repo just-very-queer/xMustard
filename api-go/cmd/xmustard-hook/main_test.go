@@ -83,6 +83,10 @@ func TestPostsTheEventAndPrintsTheAnswer(t *testing.T) {
 func TestCodexEventWithAWorkspacePin(t *testing.T) {
 	var path, ws atomic.Value
 	sock := serveUnix(t, func(w http.ResponseWriter, r *http.Request) {
+		// The body must be read: a handler that leaves the request body unread
+		// closes with data still in the socket's receive queue, and the reset
+		// that follows can discard the answer before the client reads it.
+		io.Copy(io.Discard, r.Body)
 		path.Store(r.URL.Path)
 		ws.Store(r.Header.Get(transport.WorkspaceHeader))
 		io.WriteString(w, `{"decision":"block","reason":"reduced"}`)
