@@ -239,12 +239,12 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=text: chunk text; mode=pattern: ast-grep; mode=symbol: name path.",
+      "description": "Code search: path:line, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e; pattern: ast-grep (`$A \u0026\u0026 $A()`); symbol: name path; text: body.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "lang": {
-            "description": "pattern: ast-grep hint; else a filter",
+            "description": "pattern: ast-grep hint; else filter",
             "type": "string"
           },
           "limit": {

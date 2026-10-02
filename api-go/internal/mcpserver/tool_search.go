@@ -12,7 +12,7 @@ var searchQueryArgs = []string{"q", "mode", "lang", "seed", "limit", "cursor", "
 
 var searchTool = &Tool{
 	Name:        "search",
-	Description: "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: chunk text; mode=pattern: ast-grep; mode=symbol: name path.",
+	Description: "Code search: path:line, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>; pattern: ast-grep (`$A && $A()`); symbol: name path; text: body.",
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
