@@ -51,6 +51,11 @@ const (
 type InvalidationReport struct {
 	Paths   int `json:"paths"`
 	Checked int `json:"anchors_checked"`
+	// Hashed counts the files whose symbol bodies were hashed this pass. A pass over an
+	// unchanged tree answers 0 here because the per-file hashes are cached across calls
+	// (WS-28C); a file whose stat moved, or one past the cache's bound, is a miss and is
+	// counted and hashed again.
+	Hashed int `json:"files_hashed"`
 	// Reanchored counts the quoted-code anchors that followed their code to new lines
 	// (WS-28B). They are not drift and not marked: the memory still points at what it
 	// quoted, one range over.
@@ -87,6 +92,9 @@ var anchorRehashers = map[string]struct {
 // at most maxSymbolFileBytes, and a cache without an aggregate bound could retain all of
 // them for the pass. Past maxInvalidationCacheBytes the session stops caching and reads
 // each file once per anchor that needs it, which is slower and bounded.
+//
+// hashed counts the files whose symbol bodies this session had to compute, which is the
+// number a pass over a cached tree reports as zero.
 type rehashSession struct {
 	ctx               context.Context
 	root, workspaceID string
@@ -94,6 +102,7 @@ type rehashSession struct {
 	files             map[string]fileRead
 	held              int
 	outlines          map[string]outlineRead
+	hashed            int
 }
 
 // maxInvalidationCacheBytes bounds what one invalidation's file cache retains. It is below
@@ -102,7 +111,8 @@ type rehashSession struct {
 const maxInvalidationCacheBytes = 16 << 20
 
 func newRehashSession(ctx context.Context, root, workspaceID string) *rehashSession {
-	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID, files: map[string]fileRead{}, outlines: map[string]outlineRead{}}
+	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID,
+		files: map[string]fileRead{}, outlines: map[string]outlineRead{}}
 }
 
 // path hashes a file's content; a file that is missing or unreadable is missing.
@@ -148,6 +158,11 @@ func (s *rehashSession) text(rel string) fileRead {
 // gives. A symbol that no longer exists in a complete outline, or a file that is gone,
 // is missing; an outline the code index could not give or gave in part, or a file too
 // large or unreadable, is unknown.
+//
+// The body hash is cached per file across calls (WS-28C), keyed by the file's mark, so a
+// pass over an unchanged tree re-hashes nothing. The cache stores hashes of exactly the
+// declarations that were asked for; a symbol not yet in it is hashed from the text this
+// pass read and added, never served from an older version of the file.
 func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	file, _, ok := strings.Cut(a.SymbolUID, "#")
 	if !ok || file == "" {
@@ -157,21 +172,74 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	if !src.ok {
 		return missingState, src.missing
 	}
-	outline, ok := s.outlines[file]
-	if !ok {
-		spans, err := symbolOutline(s.ctx, s.root, s.workspaceID, file)
-		outline = outlineRead{spans: spans, incomplete: errors.Is(err, errOutlineIncomplete)}
-		if err != nil && !outline.incomplete {
-			return anchorState{}, false
-		}
-		s.outlines[file] = outline
+	want := normalizeNamePath(a.Value)
+	if h, hit := s.cachedBody(file, want); hit {
+		return anchorState{govstore.BaselineHash, h}, true
 	}
-	body, found := outline.spans.body(src.text, a.Value)
+	spans, incomplete, ok := s.fileOutline(file)
+	if !ok {
+		return anchorState{}, false
+	}
+	body, found := spans.body(src.text, a.Value)
 	if !found {
-		return missingState, !outline.incomplete
+		return missingState, !incomplete
 	}
 	sum := sha256.Sum256([]byte(body))
-	return anchorState{govstore.BaselineHash, hex.EncodeToString(sum[:])}, true
+	h := hex.EncodeToString(sum[:])
+	// An incomplete outline is not cached: the index may name declarations it did not
+	// return, so an entry built from a partial outline could answer "missing" wrongly.
+	if !incomplete {
+		s.storeBody(file, want, h)
+		s.hashed++
+	}
+	return anchorState{govstore.BaselineHash, h}, true
+}
+
+// cachedBody returns a file's cached hash for one declaration when the file's mark is
+// unchanged since it was cached.
+func (s *rehashSession) cachedBody(file, want string) (string, bool) {
+	mark, ok := markOutlineFile(s.root, file)
+	if !ok {
+		return "", false
+	}
+	if hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark); hit {
+		if h, named := hashes[want]; named {
+			return h, true
+		}
+	}
+	return "", false
+}
+
+// storeBody adds one declaration's hash to the file's cache entry, creating the entry on
+// the first one. A file whose hashes exceed the cache bounds is not cached and the next
+// pass re-hashes it.
+func (s *rehashSession) storeBody(file, want, hash string) {
+	mark, ok := markOutlineFile(s.root, file)
+	if !ok {
+		return
+	}
+	hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark)
+	if !hit {
+		hashes = map[string]string{}
+	} else {
+		hashes = maps.Clone(hashes)
+	}
+	hashes[want] = hash
+	storeOutlineHashes(s.workspaceID, s.root, file, mark, hashes)
+}
+
+// fileOutline reads a file's declarations from the code index once per session.
+func (s *rehashSession) fileOutline(file string) (symbolSpans, bool, bool) {
+	if outline, ok := s.outlines[file]; ok {
+		return outline.spans, outline.incomplete, true
+	}
+	spans, err := symbolOutline(s.ctx, s.root, s.workspaceID, file)
+	incomplete := errors.Is(err, errOutlineIncomplete)
+	if err != nil && !incomplete {
+		return nil, false, false
+	}
+	s.outlines[file] = outlineRead{spans: spans, incomplete: incomplete}
+	return spans, incomplete, true
 }
 
 // outlineRead is a file's outline as read; incomplete when the code index cut it short.
@@ -304,6 +372,7 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 			hit[a.EntryID] = append(hit[a.EntryID], govstore.AnchorRef{Kind: a.Kind, Value: a.Value})
 		}
 	}
+	rep.Hashed = session.hashed
 	// A quoted-code anchor has no baseline: its lines shift with every edit above them,
 	// so it is re-found and either followed or marked (WS-28B). The pass reports the
 	// entries it marked from the store's own commit, so a rolled-back write is returned
