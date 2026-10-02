@@ -48,14 +48,19 @@ export interface ToolSpec {
 	build(args: ToolArgs): HttpCall;
 }
 
-// str is Go's coerce: a boolean argument becomes "true"/"false" and an integer its
-// decimal form, so a boolean argument reaches the API as Go's Build sends it (the API
-// reads these as strings, and `include_pending=` alone would mean false).
+// str is Go's coerce: a boolean becomes "true"/"false", a number its decimal form
+// (strconv.FormatFloat(f, 'f', -1, 64), so impact's min_confidence=0.5 survives), and an
+// integer its whole form. A boolean or number argument therefore reaches the API as Go's
+// Build sends it: `include_pending=` alone would mean false, and a fractional
+// min_confidence dropped here would silently run the walk unfiltered.
 const str = (a: ToolArgs, k: string): string => {
 	const v = a[k];
 	if (typeof v === "string") return v;
 	if (typeof v === "boolean") return v ? "true" : "false";
-	return typeof v === "number" && Number.isInteger(v) ? String(v) : "";
+	// String(0.5) is "0.5" and String(1000) is "1000", which is what
+	// strconv.FormatFloat(f, 'f', -1, 64) produces for both.
+	if (typeof v === "number") return String(v);
+	return "";
 };
 // Byte-identical to Go's url.QueryEscape / url.PathEscape, so the Pi and MCP clients
 // issue the same requests (and the same Go argument digests).
@@ -127,8 +132,11 @@ const parseClaims = (s: string): Record<string, string>[] =>
 		.map((c) => c.trim())
 		.filter((c) => c !== "")
 		.map((c) => {
+			// SplitN(s, "|", 3): a claim with fewer than three parts keeps its whole text as
+			// the subject, and any further "|" stays inside the object.
 			const parts = c.split("|");
-			return { object: (parts[2] ?? "").trim(), predicate: (parts[1] ?? "").trim(), subject: (parts[0] ?? "").trim() };
+			if (parts.length >= 3) return { object: parts.slice(2).join("|").trim(), predicate: parts[1].trim(), subject: parts[0].trim() };
+			return { object: "", predicate: "", subject: c };
 		});
 const parseRelations = (s: string): Record<string, string>[] =>
 	splitCSV(s).map((r) => {
@@ -180,6 +188,11 @@ const rememberBody: readonly BodyMember[] = [
 const verifyBody: readonly BodyMember[] = [
 	["evidence_handle", "string"], ["note", "string"], ["outcome", "string"], ["revision", "number"], ["target", "string"],
 ];
+// whyFailedWriteArgs is whyFailedWriteArgs in tool_why_failed.go: the sources that run a
+// command or record an outcome. Without one, why_failed reads a run or an outcome by id —
+// cwd is not a source, so run_id with a cwd alone still reads.
+const whyFailedWriteArgs: readonly string[] = ["command", "evidence_handle", "log"];
+const isWhyFailedWrite = (a: ToolArgs): boolean => whyFailedWriteArgs.some((k) => str(a, k) !== "");
 // whyFailedBody is whyFailedTool.Build's payload in sorted order (tool_why_failed.go).
 const whyFailedBody: readonly BodyMember[] = [
 	["command", "string"], ["cwd", "string"], ["evidence_handle", "string"], ["log", "string"],
@@ -517,7 +530,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "log", type: "string", maxLength: 1048576, desc: "pasted log to explain from its last MiB; records the outcome" },
 		],
 		build: (a) => {
-			const write = ["command", "cwd", "evidence_handle", "log"].some((k) => str(a, k) !== "");
+			const write = isWhyFailedWrite(a);
 			if (!write && str(a, "run_id"))
 				return { method: "GET", path: ws(a, `/runs/${p(str(a, "run_id"))}/why-failed`) };
 			// Anything else is a recording call; the API rejects a missing or mixed source

@@ -251,10 +251,12 @@ describe("tool specs mirror the MCP server", () => {
 			assert.match(path, /[?&]max_chars=\d+/, `${tool} sends no budget by default`);
 			assert.ok(path.includes(`max_chars=${def}`), `${tool} defaults to ${path.match(/max_chars=[0-9]+/)?.[0]}, want max_chars=${def}`);
 		}
-		// an explicit max_chars overrides the default on every one of them
-		for (const tool of ["search", "explain", "impact", "recall"]) {
-			const path = spec(tool).build({ workspace_id: "w", max_chars: 12345, ...(tool === "search" ? { q: "x" } : {}) }).path;
-			assert.match(path, /[?&]max_chars=12345(&|$)/, `${tool} ignores an explicit max_chars`);
+		// an explicit max_chars overrides the default on every one of them, at a value each tool's
+	// own advertised bound accepts (recall's ceiling is 10000, the others' 65536), so the
+	// assertion is about a call Pi's schema would let through
+		for (const [tool, budget] of [["search", 12345], ["explain", 12345], ["impact", 12345], ["recall", 9000]] as const) {
+			const path = spec(tool).build({ workspace_id: "w", max_chars: budget, ...(tool === "search" ? { q: "x" } : {}) }).path;
+			assert.match(path, new RegExp(`[?&]max_chars=${budget}(&|$)`), `${tool} ignores an explicit max_chars`);
 		}
 		// the shared recall constant no longer stands in for the per-tool defaults
 		assert.equal(RECALL_DEFAULT_MAX_CHARS, 4000);
@@ -339,6 +341,40 @@ describe("tool specs mirror the MCP server", () => {
 			}).body,
 			'{"command":"go test ./...","cwd":"api-go","evidence_handle":"xm1.H","log":"boom","run_id":"run_1","timeout_seconds":30}',
 		);
+	});
+	// Round-1 findings. Each expected value is Go's own answer, captured from the three Build
+	// functions on the box (reviews/ws-fix-26/r1/slop-audit.md S13), so a mirror that drops
+	// or reorders the value fails here.
+	test("a fractional number argument and a claim's extra pipes reach the API as Go sends them", () => {
+		// Go: impact min_confidence=0.5 -> /changes/since-index?min_confidence=0.5&max_chars=8000
+		assert.equal(
+			spec("impact").build({ workspace_id: "w", min_confidence: 0.5 }).path,
+			"/api/workspaces/w/changes/since-index?min_confidence=0.5&max_chars=8000",
+		);
+		assert.match(spec("impact").build({ workspace_id: "w", min_confidence: 1 }).path, /[?&]min_confidence=1(&|$)/);
+		// Go: SplitN(c, "|", 3) keeps the rest of the object
+		assert.equal(
+			spec("remember").build({ workspace_id: "w", content: "c", claims: "a|b|c|d" }).body,
+			'{"claims":[{"object":"c|d","predicate":"b","subject":"a"}],"content":"c"}',
+		);
+		// Go: a claim of another shape keeps its text as the subject
+		assert.equal(
+			spec("remember").build({ workspace_id: "w", content: "c", claims: "solo" }).body,
+			'{"claims":[{"object":"","predicate":"","subject":"solo"}],"content":"c"}',
+		);
+	});
+	test("why_failed reads when only cwd accompanies run_id, as Go does", () => {
+		// cwd is not a write source: Go answers GET /runs/r1/why-failed and drops cwd
+		assert.deepEqual(spec("why_failed").build({ workspace_id: "w", run_id: "r1", cwd: "api-go" }), {
+			method: "GET",
+			path: "/api/workspaces/w/runs/r1/why-failed",
+		});
+		// a real source still records, and cwd travels with it
+		assert.deepEqual(spec("why_failed").build({ workspace_id: "w", run_id: "r1", cwd: "api-go", log: "boom" }), {
+			method: "POST",
+			path: "/api/workspaces/w/why-failed",
+			body: '{"cwd":"api-go","log":"boom","run_id":"r1"}',
+		});
 	});
 	test("hook-path args_digest equals the Go middleware's digest", () => {
 		// expected values computed with Go's net/http + the middleware's formula
