@@ -2372,7 +2372,8 @@ fn a_search_does_not_answer_from_a_writable_index_dir() {
     // permanent loss of the index
     fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
     assert_eq!(
-        search_in(&named)["freshness"]["source"], "index",
+        search_in(&named)["freshness"]["source"],
+        "index",
         "the index did not come back after chmod 700"
     );
 }
