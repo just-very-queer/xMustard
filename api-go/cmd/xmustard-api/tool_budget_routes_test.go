@@ -5,36 +5,17 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
 
 // budgetServer serves the real handler stack over workerWorkspace's repository with
-// the real core (one-shot calls, no resident worker). Its callers keep the production
-// governor; the two explain reads that build the code index take roomyGovernor from
-// budgetServerAdmitHeavy, because that index update is heavy work the test makes this
-// binary do.
+// the real core (one-shot calls, no resident worker). Every caller runs the production
+// governor.
 func budgetServer(t *testing.T) (base string) {
 	t.Helper()
-	return budgetServerAdmitHeavy(t, false)
-}
-
-// budgetServerAdmitHeavy is budgetServer with a choice of governor. admitHeavy gives the
-// index update these reads depend on a governor that admits it whatever this test binary's
-// own tree measures. The two failures it exists for (WS-FLK-06) are not the test's
-// subject: admitMemory compares the measured tree plus the declared 26214400 bytes against
-// the soft ceiling, and by the time these tests run last in the binary this process alone
-// measures about 84 MiB of the 90 MiB DefaultSoftCeilingBytes, so the index update is
-// refused with ErrOverloaded and the read answers kind=unavailable / found=false. Host load
-// only decides how much of that line this process has already grown into, so the tests
-// passed solo and failed in the full suite. The ceiling and HeavyWait are untouched in
-// production; the substitution is test-only and the two tests that do not need it keep the
-// production governor.
-func budgetServerAdmitHeavy(t *testing.T, admitHeavy bool) (base string) {
-	t.Helper()
-	if admitHeavy {
-		roomyGovernor(t)
-	}
 	core := realCoreBinary(t)
 	_, dir, ws := workerWorkspace(t)
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
@@ -43,6 +24,43 @@ func budgetServerAdmitHeavy(t *testing.T, admitHeavy bool) (base string) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { waitRegistrationBaselines(t) })
 	return srv.URL + "/api/workspaces/" + ws
+}
+
+// isolatedRun is set by the child process of isolatedTest, which runs exactly one test
+// under the production governor and re-executes this same binary for it.
+const isolatedRun = "XMUSTARD_TEST_ISOLATED_RUN"
+
+// isolatedTest runs body in a fresh process of this same test binary, which is the
+// isolation §3.3 allows: the index update these reads depend on is heavy work, and
+// admitMemory refuses it once the measured tree plus its 26214400 declared bytes reach
+// SoftCeilingBytes. A long parent binary grows past that line before its last tests run,
+// so the refusal is a property of when the test is reached rather than of the test. A
+// fresh binary has a fresh, small tree, so the production governor admits the update and
+// the assertions below run against it unchanged — no ceiling, wait or bound is touched.
+//
+// The parent builds the child's command from the same flags it received, so `-run`, `-v`,
+// `-count`, `XMUSTARD_CORE_BIN` and every other flag that shapes the run carry over. The
+// child runs only body, and in the parent body does nothing, so each side runs every test
+// exactly once. A child failure fails the parent with the child's own output.
+func isolatedTest(t *testing.T, body func(t *testing.T)) {
+	t.Helper()
+	if os.Getenv(isolatedRun) != "" {
+		body(t)
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("the test binary path: %v", err)
+	}
+	args := append([]string{}, os.Args[1:]...)
+	args = append(args, "-test.run=^"+t.Name()+"$")
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), isolatedRun+"=1")
+	out, err := cmd.CombinedOutput()
+	t.Logf("isolated %s in a fresh process (pid %d):\n%s", t.Name(), cmd.Process.Pid, out)
+	if err != nil {
+		t.Fatalf("isolated %s: %v", t.Name(), err)
+	}
 }
 
 func budgetGet(t *testing.T, u string, hdr map[string]string) (int, map[string]any) {
@@ -99,7 +117,14 @@ func TestToolBudgetIsOptInOverHTTP(t *testing.T) {
 // explain answers a directory with its outline and pages its files; a cursor from
 // another list is refused.
 func TestExplainPagesADirectory(t *testing.T) {
-	base := budgetServerAdmitHeavy(t, true)
+	isolatedTest(t, testExplainPagesADirectory)
+}
+
+// testExplainPagesADirectory is TestExplainPagesADirectory's body. It runs in the fresh
+// process isolatedTest starts, because building the code index it reads is heavy work the
+// governor admits only while this binary's own tree is still under the line (WS-FLK-06).
+func testExplainPagesADirectory(t *testing.T) {
+	base := budgetServer(t)
 	code, out := budgetGet(t, base+"/explain-path?path=src", nil)
 	if code != http.StatusOK || out["kind"] != "directory" || out["files_total"] != float64(2) {
 		t.Fatalf("directory: %d %v", code, out)
@@ -143,7 +168,14 @@ func TestExplainPagesADirectory(t *testing.T) {
 
 // explain symbol= answers a symbol's context; search mode=symbol looks a name path up.
 func TestSymbolNavigationRoutes(t *testing.T) {
-	base := budgetServerAdmitHeavy(t, true)
+	isolatedTest(t, testSymbolNavigationRoutes)
+}
+
+// testSymbolNavigationRoutes is TestSymbolNavigationRoutes's body, isolated for the same
+// reason as testExplainPagesADirectory's: the symbol context it reads needs the same index
+// update, which is heavy work under the same ceiling (WS-FLK-06).
+func testSymbolNavigationRoutes(t *testing.T) {
+	base := budgetServer(t)
 	code, out := budgetGet(t, base+"/explain-path?symbol=ComputeTotal", nil)
 	if code != http.StatusOK || out["found"] != true {
 		t.Fatalf("context: %d %v", code, out)
