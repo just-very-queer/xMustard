@@ -509,7 +509,7 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e; pattern: ast-grep (`$A \u0026\u0026 $A()`); symbol: name path; text: body.",
+      "description": "Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e. mode=pattern: ast-grep (`$A \u0026\u0026 $A()`); mode=symbol: name path.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -538,8 +538,7 @@
             "type": "string"
           },
           "lang": {
-            "description": "pattern: ast-grep hint; else filter, not symbol",
-            "maxLength": 256,
+            "description": "language hint for pattern mode",
             "type": "string"
           },
           "limit": {
@@ -555,10 +554,9 @@
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default), text (body)",
+            "description": "hybrid (default), pattern (ast-grep) or symbol",
             "enum": [
               "hybrid",
-              "text",
               "pattern",
               "symbol"
             ],
@@ -570,15 +568,15 @@
             "type": "string"
           },
           "q": {
-            "description": "the query",
+            "description": "the search query",
             "type": "string"
           },
           "seed": {
-            "description": "proximity seed symbol",
+            "description": "symbol to anchor the graph-proximity lane",
             "type": "string"
           },
           "substring": {
-            "description": "mode=symbol: substring",
+            "description": "mode=symbol: substring match",
             "type": "boolean"
           },
           "workspace_id": {
