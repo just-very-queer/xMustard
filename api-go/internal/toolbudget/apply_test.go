@@ -319,10 +319,13 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 			t.Fatalf("signal_flags dropped a kept member: %v", cov)
 		}
 		// the third kept nested object: whether the source identity was stable
-		si := cov["source_identity"].(map[string]any)
+		si, ok := cov["source_identity"].(map[string]any)
+		if !ok {
+			t.Fatalf("signal_flags dropped coverage.source_identity: %v", cov)
+		}
 		if si["stable"] != true || si["identity_complete"] != true || si["head"] != "452da1e09e2c230b829c1d824bd82f83fa187dec" ||
 			si["key"] != "a156582ef7dd69692cf8bae19d43cd2ba01007676dce6106b1c1f3a1db27afe4" || si["limitations"] != float64(0) {
-			t.Fatalf("signal_flags dropped coverage.source_identity: %v", si)
+			t.Fatalf("signal_flags reduced coverage.source_identity: %v", si)
 		}
 		fr := a.out["freshness"].(map[string]any)
 		if _, ok := fr["refresh"]; ok || fr["status"] != "current" {
