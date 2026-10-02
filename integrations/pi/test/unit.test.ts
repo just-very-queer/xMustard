@@ -1341,9 +1341,10 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		];
 		for (const [command, want] of cases) {
 			const argv = argvFields(command);
-			// `sh -c <field>` is what the wrapper would exec. Running it proves the
-			// command survives the round trip through the wrapper's argv intact.
-			assert.equal(shRuns(`sh -c ${argv[2]}`), `${want}\n`, `must survive: ${command}`);
+			// `sh -c <field>` is what the wrapper would exec. The field is re-quoted
+			// because it is interpolated into a shell string here, and an unquoted
+			// `|` would pipe the outer shell instead of reaching the inner one.
+			assert.equal(shRuns(`sh -c ${shellQuote(argv[2])}`), `${want}\n`, `must survive: ${command}`);
 		}
 	});
 
