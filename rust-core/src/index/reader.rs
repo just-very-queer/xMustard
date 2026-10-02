@@ -921,8 +921,13 @@ pub fn open(root: &Path) -> Option<Opened> {
     }
 }
 
-/// Open the store at `db` (the index of `root`) for one read.
+/// Open the store at `db` (the index of `root`) for one read. Refuses a directory a
+/// reader must not trust, so a store another local user could have replaced is never
+/// opened on the read path either (WS-FIX-11).
 pub fn open_at(root: &Path, db: &Path, storage: GraphStorage) -> Result<Opened, String> {
+    if let Some(dir) = db.parent() {
+        super::check_index_dir(dir, operator_named(root))?;
+    }
     let loc = Location {
         db: db.to_path_buf(),
     };
@@ -933,6 +938,15 @@ pub fn open_at(root: &Path, db: &Path, storage: GraphStorage) -> Result<Opened, 
         meta,
         source: "index",
     })
+}
+
+/// Whether the index directory for `root` is one the operator named. A caller that
+/// already holds an explicit store path still needs the operator's own answer, because
+/// the refusal applies to a directory the operator chose, whatever opened it.
+fn operator_named(root: &Path) -> bool {
+    IndexConfig::load(root)
+        .map(|c| c.index_dir.is_some())
+        .unwrap_or(false)
 }
 
 // ---------------------------------------------------------------------------
@@ -1010,6 +1024,16 @@ impl Snapshots {
         if let Some(e) = state.as_mut()
             && Some(e.stamp) == now_stamp
         {
+            // A cached snapshot is served only while its directory is still one a reader may
+            // trust: the store can sit unchanged inside a directory the operator has since
+            // widened, and an unchanged stamp would otherwise skip the check entirely
+            // (WS-FIX-11).
+            if let Some(dir) = e.loc.db.parent()
+                && super::check_index_dir(dir, operator_named(root)).is_err()
+            {
+                *state = None;
+                return None;
+            }
             if !e.relation.fresh(root) {
                 e.relation = envelope::relate(root, &e.relation.indexed_commit);
             }

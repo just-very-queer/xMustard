@@ -2304,3 +2304,75 @@ fn a_read_refuses_a_writable_operator_named_index_dir() {
         "no index reported after chmod 700: {rep:#}"
     );
 }
+
+/// The refusal reaches the **search** path too, which opens the store through
+/// `reader::locate` rather than `open_read_only`. A search in an untrusted directory
+/// does not answer from the store another local user planted (WS-FIX-11).
+///
+/// The assertion is on the *provenance* of the answer, not on whether a symbol was
+/// found. Search legitimately degrades: it recomputes a graph from the working tree, so
+/// a symbol it finds that way is a correct answer to a different question. What must
+/// not happen is the store being read, which is what `freshness.source` and the
+/// degradation line report: a served index answers `source: "index"`, a refused one
+/// falls back and says so.
+#[test]
+fn a_search_does_not_answer_from_a_writable_index_dir() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[
+        ("a.ts", "export function alphaOnlyName() { return 1; }\n"),
+        ("b.ts", "export function betaOnlyName() { return 2; }\n"),
+    ]);
+    let shared = TempDir::new().unwrap();
+    let named = shared.path().join("shared");
+    fs::create_dir(&named).unwrap();
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    ok_json(&run(&[
+        "index",
+        "build",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]));
+
+    let search_in = |dir: &Path| -> Value {
+        let out = Command::new(BIN)
+            .args(["search", r.path().to_str().unwrap(), "ws", "alphaOnlyName"])
+            .env("XMUSTARD_INDEX_DIR", dir)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "search failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        serde_json::from_slice(&out.stdout).unwrap()
+    };
+
+    // served from the trusted directory: the index itself answers
+    let trusted = search_in(&named);
+    assert_eq!(
+        trusted["freshness"]["source"], "index",
+        "the trusted directory did not serve the index: {trusted:#}"
+    );
+
+    // group-writable: the store is not opened, and the answer says it came from
+    // somewhere else rather than from the planted index
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o770)).unwrap();
+    let untrusted = search_in(&named);
+    assert_ne!(
+        untrusted["freshness"]["source"], "index",
+        "a search answered from a group-writable index directory: {untrusted:#}"
+    );
+    assert_eq!(
+        untrusted["coverage"]["work"]["graph_cache"], "miss",
+        "the untrusted store was still read: {untrusted:#}"
+    );
+
+    // and it serves again once the operator tightens it, so the refusal is not a
+    // permanent loss of the index
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(
+        search_in(&named)["freshness"]["source"], "index",
+        "the index did not come back after chmod 700"
+    );
+}
