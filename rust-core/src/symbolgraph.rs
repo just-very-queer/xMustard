@@ -2634,6 +2634,17 @@ pub fn query_source_for(
             coverage.work.graph_cache_detail
         );
     }
+    // A refusal and an absent index both arrive as None from reader::open, and the
+    // answer must not be silent about which it was: a directory another local user can
+    // write is a different situation from a repository that was never indexed, and the
+    // second one is what an operator seeing missing search lanes will assume (WS-FIX-11).
+    if let Some(refusal) = crate::index::reader::take_last_refusal(root) {
+        coverage.work.graph_cache_detail = format!(
+            "the code index was refused and its store was not read: {refusal}; \
+             the graph for the working tree answered ({})",
+            coverage.work.graph_cache_detail
+        );
+    }
     // the legacy graph is built from the working tree's identity at this call
     let id = &coverage.source_identity;
     let relation = Relation {
