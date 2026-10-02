@@ -227,3 +227,23 @@ func TestAHeldGateIsGivenUpWhenTheContextEnds(t *testing.T) {
 		t.Fatal("a held gate was taken by a caller whose context had ended")
 	}
 }
+
+// A nil context — what the context-free callers pass — must never give up, whatever the
+// holder does, because there is nothing to give up to. This is the property the round-1
+// fix relies on: lockStore passes nil precisely so its wait cannot become cancellable.
+// It is the closest observable statement available, since whether the wait polls or
+// blocks in the kernel changes the syscall pattern and not the answer.
+func TestANilContextWaitsAndIsNeverGivenUp(t *testing.T) {
+	g := make(storeGate, 1)
+	g <- struct{}{} // held
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		<-g
+	}()
+	// The free-slot attempt fails, the nil arm then blocks until the holder releases.
+	// If a nil context were ever treated as a done one, this would return false.
+	if !g.acquire(nil) {
+		t.Fatal("a nil context gave up the wait")
+	}
+	g.release()
+}
