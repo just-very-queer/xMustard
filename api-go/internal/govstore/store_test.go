@@ -2085,6 +2085,48 @@ func TestReanchorCodeMovesAndRefuses(t *testing.T) {
 	}
 }
 
+// A transaction that cannot commit reports its error and leaves nothing behind, so a
+// caller never reports an entry as moved or marked on the strength of a rolled-back write.
+// The second move in the batch is the one that fails, so the first has already run inside
+// the transaction when the rollback happens: that is the case the caller cannot see.
+func TestReanchorCodeRollsBackTheWholeBatch(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "a1", "t", "c", "src/a.go")
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.ReplaceAnchors(ctx, "a1", []string{"src/a.go"}, []AnchorInput{
+			{Kind: AnchorCode, Value: "src/a.go#L4-L5", Extracted: true, SymbolUID: "snippet:aa"},
+			{Kind: AnchorCode, Value: "src/a.go#L9-L9", Extracted: true, SymbolUID: "snippet:bb"},
+			{Kind: AnchorCode, Value: "src/a.go#L14-L14", Extracted: true, SymbolUID: "snippet:cc"},
+		}, alice)
+	})
+	var n int
+	err := s.Update(ctx, func(tx Tx) error {
+		var err error
+		n, err = tx.ReanchorCode(ctx, "a1", []CodeMove{
+			{SnippetID: "snippet:aa", From: "src/a.go#L4-L5", To: "src/a.go#L5-L6"},
+			// onto the range snippet:bb holds, which the store's uniqueness refuses
+			{SnippetID: "snippet:cc", From: "src/a.go#L14-L14", To: "src/a.go#L9-L9"},
+		}, "beef", bob)
+		return err
+	})
+	if err == nil {
+		t.Fatal("a batch whose second move is refused committed")
+	}
+	if n != 0 {
+		t.Fatalf("a rolled-back batch reported %d moves", n)
+	}
+	anchors, _ := s.ListAnchors(ctx, "a1")
+	for i, want := range []string{"src/a.go#L4-L5", "src/a.go#L9-L9", "src/a.go#L14-L14"} {
+		if anchors[i+1].Value != want {
+			t.Fatalf("the rollback left anchor %d at %q, want %q", i, anchors[i+1].Value, want)
+		}
+	}
+	if evs, _ := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", EntryID: "a1", Types: []string{EventAnchorReanchor}}); len(evs) != 0 {
+		t.Fatalf("a rolled-back batch recorded %d events", len(evs))
+	}
+}
+
 // ParseCodeAnchorValue is the one place that turns a code anchor's value back into lines.
 func TestParseCodeAnchorValue(t *testing.T) {
 	got, err := ParseCodeAnchorValue("src/a.go#L4-L7")

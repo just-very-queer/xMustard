@@ -326,11 +326,14 @@ func TestCodeAnchorFollowsItsBlockInTheSecondFile(t *testing.T) {
 	f.rebaselinePathFor(t, e.ID)
 
 	rep, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"retry.go"})
-	// The declared path retry.go carries WS-28's whole-file baseline, so the edit marks the
-	// memory by that path as well. What this test is about is the code anchor, so the
-	// assertion is the move and the anchor's new lines, not the absence of a mark.
+	// The declared path retry.go carries WS-28's whole-file baseline, so the edit reaches
+	// the memory twice: once through that path and once through the quote in the same file.
+	// One change marks a memory once, so the report names it once.
 	if err != nil || rep.Reanchored != 1 {
 		t.Fatalf("a block that moved in the second file: %+v, %v", rep, err)
+	}
+	if n := count(rep.Marked, e.ID); n != 1 {
+		t.Fatalf("one change reported the memory %d times: %+v", n, rep.Marked)
 	}
 	var after []govstore.Anchor
 	if err := memoryView(context.Background(), f.dir, f.ws, func(r govstore.Reader) (err error) {
@@ -479,4 +482,15 @@ func TestCodeAnchorWithoutServedContentIsUnknown(t *testing.T) {
 	if err != nil || len(rep.Marked) != 0 {
 		t.Fatalf("a code anchor with no matching snippet: %+v, %v", rep, err)
 	}
+}
+
+// count is how many times ids holds want.
+func count(ids []string, want string) int {
+	n := 0
+	for _, id := range ids {
+		if id == want {
+			n++
+		}
+	}
+	return n
 }

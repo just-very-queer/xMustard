@@ -596,6 +596,19 @@ func (t *txn) ClearDrift(ctx context.Context, entryID string, actor Actor) error
 // moves nothing rather than overwriting another block's lines. Each move appends one
 // anchor_reanchor event.
 func (t *txn) ReanchorCode(ctx context.Context, entryID string, moves []CodeMove, commit string, actor Actor) (int, error) {
+	moved, err := t.reanchorCode(ctx, entryID, moves, commit, actor)
+	if err != nil {
+		// The transaction this ran in is being rolled back, so no move in it survived and
+		// the count must not say otherwise. Reporting the moves made before the failure
+		// would let a caller record a re-anchor that never happened.
+		return 0, err
+	}
+	return moved, nil
+}
+
+// reanchorCode moves the anchors and returns what it moved; ReanchorCode is the form that
+// zeroes that count when the transaction does not commit.
+func (t *txn) reanchorCode(ctx context.Context, entryID string, moves []CodeMove, commit string, actor Actor) (int, error) {
 	if err := actor.validate(); err != nil {
 		return 0, err
 	}
