@@ -884,7 +884,7 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Requirements.** PAR-SEC-04 (`issue_mutations.go`), PAR-GOV-06 (FU WS-09). No new PAR ids.
 
-**Files.** `api-go/internal/workspaceops/issue_mutations.go`, `api-go/internal/workspaceops/issue_mutations_test.go`, `api-go/cmd/xmustard-api/issue_routes.go`, `api-go/cmd/xmustard-api/issue_id_validation_test.go`, `docs/SECURITY.md` (the wildcard paragraph), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+**Files.** `api-go/internal/workspaceops/issue_mutations.go`, `api-go/internal/workspaceops/issue_id_validation_test.go`, `api-go/cmd/xmustard-api/issue_routes.go`, `api-go/cmd/xmustard-api/issue_id_validation_test.go`, `docs/SECURITY.md` (the wildcard paragraph), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
 
 **Tests required.**
 - A table test over both create paths: a `bug_id` and a view name that hold `../`, a NUL, an over-long value and a bad-charset value are each refused at create with `ErrInvalidInput`, and the refusal happens before any write: `tracker_issues.json`, `saved_views.json` and the snapshot stay as they were.
