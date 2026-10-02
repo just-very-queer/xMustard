@@ -31,9 +31,11 @@ type routeGate struct {
 	Tool string
 	// ReadSafe marks a non-GET route read-only mode still serves: it changes no
 	// shared state (capture or revocation of the caller's own tool output, policy
-	// evaluation), or it only withdraws access (token revoke and rotate, so a leaked
-	// token can be cut off without leaving read-only mode). A route that deletes
-	// shared data is never ReadSafe.
+	// evaluation), or it only withdraws access (token revoke, so a leaked token can
+	// be cut off without leaving read-only mode). A route that deletes shared data
+	// is never ReadSafe, and neither is one that mints: token rotate re-mints the
+	// secret under the caller's ttl_seconds, so it grants a credential rather than
+	// withdrawing one.
 	ReadSafe bool
 	Note     string
 }
@@ -69,7 +71,7 @@ var routeGateTable = map[string]routeGate{
 	"GET /api/auth/whoami":                      coreGate(roleReader, "", "caller principal, roles and usable tools"),
 	"GET /api/auth/principals":                  coreGate(roleAdmin, "", ""),
 	"POST /api/auth/tokens":                     coreGate(roleAdmin, "", "mint"),
-	"POST /api/auth/tokens/{id}/rotate":         {Core: true, Role: roleAdmin, ReadSafe: true, Note: "replaces the secret; the old one stops working"},
+	"POST /api/auth/tokens/{id}/rotate":         coreGate(roleAdmin, "", "re-mints the secret under the caller's ttl_seconds; refused in read-only mode, which never mints"),
 	"DELETE /api/auth/tokens/{id}":              {Core: true, Role: roleAdmin, ReadSafe: true, Note: "revoke; served in read-only mode to cut off a leaked token"},
 	"GET /api/auth/audit":                       coreGate(roleAdmin, "", ""),
 	"GET /api/workspaces":                       coreGate(roleReader, "", "filtered by token scope and workspace allowlist"),
