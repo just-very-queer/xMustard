@@ -83,9 +83,8 @@ func TestACancelledRebaselineLeavesTheBaselineLockFreeForTheNextCaller(t *testin
 	unlock()
 }
 
-// The uncontended path is what every existing caller depends on, and a fix that
-// refuses whenever ctx is already done would break it for a caller that passes a
-// cancelled context down by accident.
+// The uncontended path is what every existing caller depends on, and a fix that broke
+// it would refuse a build nobody cancelled.
 func TestRebaselineIndexOnAFreeLockStillBuilds(t *testing.T) {
 	state := baselineCore(t, "0")
 	dataDir, ws, _ := seedBaselineWorkspace(t)
@@ -104,6 +103,33 @@ func TestRebaselineIndexOnAFreeLockStillBuilds(t *testing.T) {
 	if len(evs) != 1 || evs[0].Principal != "ops-admin" {
 		t.Fatalf("history = %+v", evs)
 	}
+}
+
+// A context that had already ended when the call started is refused as a cancellation,
+// and where it is refused is the point: the lock is free, so it is taken and released,
+// and the refusal comes from the build, which will not spawn a core on a dead context.
+// A test that only checked the error would pass a fix that refused at the lock, so this
+// one also asserts nothing was built, nothing was recorded, and the key is still free.
+func TestRebaselineIndexWithAnAlreadyEndedContextIsRefusedAndLeavesNothing(t *testing.T) {
+	state := baselineCore(t, "0")
+	dataDir, ws, _ := seedBaselineWorkspace(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	if _, err := RebaselineIndex(ctx, dataDir, ws, "ops-admin"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("an already-ended context must be refused as a cancellation, got %v", err)
+	}
+	if evs := baselineHistory(t, dataDir, ws); len(evs) != 0 {
+		t.Fatalf("a refused call recorded history: %+v", evs)
+	}
+	if got := indexCalls(t, state); len(got) != 0 {
+		t.Fatalf("a refused call built: %v", got)
+	}
+	unlock, err := tryLockStore(baselinePath(dataDir, ws))
+	if err != nil {
+		t.Fatalf("a refused call left the lock claimed: %v", err)
+	}
+	unlock()
 }
 
 // Giving up is per caller, not per workspace: one cancelled waiter must not deny the
