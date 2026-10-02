@@ -51,8 +51,11 @@ func TestToolcompatNeverRewritesWriteTools(t *testing.T) {
 		if d["argument"] != c.canonical {
 			t.Errorf("%s: error must name the canonical field %q, got %v", c.tool, c.canonical, d)
 		}
-		// the alias the agent sent is named too, so it knows what to replace
-		if !strings.Contains(msg, `"`+c.canonical+`"`) || !strings.Contains(msg, c.alias) {
+		// The alias the agent sent is named too, so it knows what to replace. It is
+		// matched as its own quoted token: for verify the alias "entry" is a prefix
+		// of the canonical "entry_id", so an unquoted Contains would be satisfied by
+		// the canonical name alone and the assertion would prove nothing.
+		if !strings.Contains(msg, `"`+c.canonical+`"`) || !strings.Contains(msg, `"`+c.alias+`"`) {
 			t.Errorf("%s: error text must name %q and the alias %q, got %q", c.tool, c.canonical, c.alias, msg)
 		}
 		if n := len(api.toolRequests()); n != 0 {

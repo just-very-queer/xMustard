@@ -52,9 +52,14 @@ func TestBuildArgsAnswersTheSameCallTheSameWayEveryTime(t *testing.T) {
 			// 200 iterations, each over a freshly cloned map, so a randomized
 			// order would change the answer well inside this loop.
 			for i := range 200 {
-				_, _, aerr := BuildArgs(c.tool, maps.Clone(c.raw))
+				args, aliased, aerr := BuildArgs(c.tool, maps.Clone(c.raw))
 				if aerr == nil {
 					t.Fatalf("%d: %s: want a rejection, got none", i, c.name)
+				}
+				// A rejected call builds no arguments and records no alias, whatever
+				// the visit order, so a half-applied repair cannot leak through.
+				if args != nil || aliased != nil {
+					t.Fatalf("%d: %s: a rejected call must build nothing, got args %v aliased %v", i, c.name, args, aliased)
 				}
 				if aerr.Argument != c.wantArgument {
 					t.Fatalf("%d: %s: reported argument %q, want %q (reason %q, message %q)",
@@ -71,15 +76,16 @@ func TestBuildArgsAnswersTheSameCallTheSameWayEveryTime(t *testing.T) {
 	}
 
 	// A call that succeeds must build the same arguments every time, so a hidden
-	// alias folds onto its canonical name the same way whatever the visit order:
-	// the canonical spelling wins, the alias is recorded, and the built map holds
-	// the canonical key.
+	// alias folds onto its canonical name the same way whatever the visit order.
+	// This one supplies the alias and its canonical name together with the same
+	// value, so it exercises precedence: the canonical spelling wins, the alias is
+	// recorded, and the built map holds the canonical key once.
 	aliasOK, _ := ToolByName("impact")
 	wantArgs := map[string]string{"workspace_id": "ws", "symbol": "Store/Capture", "from": "A", "to": "B"}
 	wantAliased := map[string]string{"uid": "symbol"}
 	for i := range 200 {
 		args, aliased, aerr := BuildArgs(aliasOK, map[string]any{
-			"workspace_id": "ws", "uid": "Store/Capture", "from": "A", "to": "B",
+			"workspace_id": "ws", "uid": "Store/Capture", "symbol": "Store/Capture", "from": "A", "to": "B",
 		})
 		if aerr != nil {
 			t.Fatalf("%d: a call with only a hidden alias must succeed, got %v", i, aerr)
