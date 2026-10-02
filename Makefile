@@ -126,6 +126,9 @@ scan:
 check: check-backend check-frontend
 
 check-backend:
+	@out=$$(gofmt -l api-go); if [ -n "$$out" ]; then \
+		echo "check-backend: gofmt drift in:"; echo "$$out"; exit 1; \
+	fi
 	cd api-go && go test ./...
 	cd api-go && go build ./...
 	cd api-go && go vet -tags review ./cmd/xmustard-ops/ ./internal/workspaceops/ && \
@@ -133,6 +136,7 @@ check-backend:
 	cd rust-core && cargo test
 	$(MAKE) check-rss-lines
 	cd rust-core && cargo clippy
+	cd rust-core && cargo fmt --check
 
 # The heavy slot's 25 MiB and the index service's 15 MiB RSS lines are the release
 # binary's (tests/memprobe): the debug `cargo test` above holds these guards to their
