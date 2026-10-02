@@ -10,13 +10,31 @@ import (
 )
 
 // budgetServer serves the real handler stack over workerWorkspace's repository with
-// the real core (one-shot calls, no resident worker). roomyGovernor admits the index
-// update these reads depend on whatever this test binary's own tree measures: the
-// governor compares the measured process tree against its soft ceiling, so in a full
-// parallel run sibling test binaries push this one over the line (WS-FLK-06).
+// the real core (one-shot calls, no resident worker). Its callers keep the production
+// governor; the two explain reads that build the code index take roomyGovernor from
+// budgetServerAdmitHeavy, because that index update is heavy work the test makes this
+// binary do.
 func budgetServer(t *testing.T) (base string) {
 	t.Helper()
-	roomyGovernor(t)
+	return budgetServerAdmitHeavy(t, false)
+}
+
+// budgetServerAdmitHeavy is budgetServer with a choice of governor. admitHeavy gives the
+// index update these reads depend on a governor that admits it whatever this test binary's
+// own tree measures. The two failures it exists for (WS-FLK-06) are not the test's
+// subject: admitMemory compares the measured tree plus the declared 26214400 bytes against
+// the soft ceiling, and by the time these tests run last in the binary this process alone
+// measures about 84 MiB of the 90 MiB DefaultSoftCeilingBytes, so the index update is
+// refused with ErrOverloaded and the read answers kind=unavailable / found=false. Host load
+// only decides how much of that line this process has already grown into, so the tests
+// passed solo and failed in the full suite. The ceiling and HeavyWait are untouched in
+// production; the substitution is test-only and the two tests that do not need it keep the
+// production governor.
+func budgetServerAdmitHeavy(t *testing.T, admitHeavy bool) (base string) {
+	t.Helper()
+	if admitHeavy {
+		roomyGovernor(t)
+	}
 	core := realCoreBinary(t)
 	_, dir, ws := workerWorkspace(t)
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
@@ -81,7 +99,7 @@ func TestToolBudgetIsOptInOverHTTP(t *testing.T) {
 // explain answers a directory with its outline and pages its files; a cursor from
 // another list is refused.
 func TestExplainPagesADirectory(t *testing.T) {
-	base := budgetServer(t)
+	base := budgetServerAdmitHeavy(t, true)
 	code, out := budgetGet(t, base+"/explain-path?path=src", nil)
 	if code != http.StatusOK || out["kind"] != "directory" || out["files_total"] != float64(2) {
 		t.Fatalf("directory: %d %v", code, out)
@@ -125,7 +143,7 @@ func TestExplainPagesADirectory(t *testing.T) {
 
 // explain symbol= answers a symbol's context; search mode=symbol looks a name path up.
 func TestSymbolNavigationRoutes(t *testing.T) {
-	base := budgetServer(t)
+	base := budgetServerAdmitHeavy(t, true)
 	code, out := budgetGet(t, base+"/explain-path?symbol=ComputeTotal", nil)
 	if code != http.StatusOK || out["found"] != true {
 		t.Fatalf("context: %d %v", code, out)
