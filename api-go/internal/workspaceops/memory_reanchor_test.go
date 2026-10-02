@@ -482,6 +482,50 @@ func TestCodeAnchorWithoutServedContentIsUnknown(t *testing.T) {
 	if err != nil || len(rep.Marked) != 0 {
 		t.Fatalf("a code anchor with no matching snippet: %+v, %v", rep, err)
 	}
+	// The anchor was passed over, and the report says so: a caller reading an empty answer
+	// needs to tell a clean change from one whose quoted code was never checked.
+	if rep.Unknown != 1 || rep.Reanchored != 0 {
+		t.Fatalf("an unchecked code anchor is not counted as unknown: %+v", rep)
+	}
+}
+
+// One invalidation's file cache is bounded in aggregate, not only per file: past the
+// bound a file is read and handed back rather than retained, so a change touching many
+// large files cannot make the pass hold all of them. Reading still works past the bound,
+// which is what makes the bound a memory bound and not a refusal.
+func TestInvalidationCacheIsBoundedAndStillReads(t *testing.T) {
+	f := newCodeFixture(t)
+	body := "package srv\n" + strings.Repeat("// filler line\n", 2000)
+	writeRepoFile(t, f.root, "big.go", body)
+	big := len(body)
+
+	sess := newRehashSession(context.Background(), f.root, f.ws)
+	sess.dataDir = f.dir
+	if r := sess.text("srv.go"); !r.ok {
+		t.Fatalf("srv.go is not readable: %+v", r)
+	}
+	if sess.held == 0 {
+		t.Fatal("the session retained nothing, so the bound is not being exercised")
+	}
+	// Fill the cache to just under the bound, then cross it with one file.
+	for sess.held+big <= maxInvalidationCacheBytes {
+		sess.held += big
+	}
+	before := sess.held
+	r := sess.text("big.go")
+	if !r.ok || len(r.text) != big {
+		t.Fatalf("big.go is not readable past the bound: ok=%v len=%d", r.ok, len(r.text))
+	}
+	if sess.held != before {
+		t.Fatalf("a read past the bound retained %d bytes", sess.held-before)
+	}
+	if _, cached := sess.files["big.go"]; cached {
+		t.Fatal("a file read past the bound was cached")
+	}
+	// A file that fits is still cached: the bound costs a repeat read, not correctness.
+	if r := sess.text("srv.go"); !r.ok {
+		t.Fatalf("a cached file stopped being readable: %+v", r)
+	}
 }
 
 // count is how many times ids holds want.

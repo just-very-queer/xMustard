@@ -116,13 +116,14 @@ type codeMoveEntry struct {
 }
 
 // reanchorCode moves the quoted-code anchors of every entry whose quote lies in a changed
-// path, marks the entries whose quoted code is no longer in its file, and returns how
-// many anchors it moved, the entries it marked, and the write error if there was one. The
-// marked set comes from the store's own commit: an entry whose transaction rolled back is
-// not reported as marked, so a caller is never told a change was persisted when it was
-// not.
-func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstore.Anchor) (int, map[string]bool, error) {
+// path, marks the entries whose quoted code is no longer in its file, and returns how many
+// anchors it moved, the entries it marked, how many anchors it could not check at all, and
+// the write error if there was one. The marked set comes from the store's own commit: an
+// entry whose transaction rolled back is not reported as marked, so a caller is never told
+// a change was persisted when it was not.
+func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstore.Anchor) (int, map[string]bool, int, error) {
 	marked := map[string]bool{}
+	unknown := 0
 	byEntry := map[string][]govstore.Anchor{}
 	for _, a := range anchors {
 		if a.Kind == govstore.AnchorCode && a.StaleSince == "" {
@@ -130,23 +131,26 @@ func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstor
 		}
 	}
 	if len(byEntry) == 0 {
-		return 0, marked, nil
+		return 0, marked, 0, nil
 	}
 	ids := slices.Sorted(maps.Keys(byEntry))
 	contents, err := entryContents(ctx, session.dataDir, session.workspaceID, ids)
 	if err != nil {
-		return 0, marked, err
+		return 0, marked, len(byEntry), err
 	}
 	var done []codeMoveEntry
 	moved := 0
 	for _, id := range ids {
 		content, ok := contents[id]
 		if !ok {
+			unknown += len(byEntry[id])
 			continue
 		}
 		var entry codeMoveEntry
 		entry.entry = id
-		for _, site := range codeSites(content, byEntry[id]) {
+		sites := codeSites(content, byEntry[id])
+		unknown += len(byEntry[id]) - len(sites)
+		for _, site := range sites {
 			outcome, to := session.reanchorSite(site)
 			switch outcome {
 			case reanchorMoved:
@@ -163,7 +167,7 @@ func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstor
 		}
 	}
 	applied, marked, err := writeCodeMoves(ctx, session, done)
-	return applied, marked, err
+	return applied, marked, unknown, err
 }
 
 // reanchorSite re-finds one code anchor's snippet in its file's current content. An

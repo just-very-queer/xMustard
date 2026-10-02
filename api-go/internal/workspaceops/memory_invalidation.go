@@ -54,8 +54,13 @@ type InvalidationReport struct {
 	// Reanchored counts the quoted-code anchors that followed their code to new lines
 	// (WS-28B). They are not drift and not marked: the memory still points at what it
 	// quoted, one range over.
-	Reanchored int      `json:"anchors_reanchored,omitempty"`
-	Marked     []string `json:"marked"`
+	Reanchored int `json:"anchors_reanchored,omitempty"`
+	// Unknown counts the quoted-code anchors that could not be checked at all: no served
+	// content to search for, a block past the placement bound, or an anchor whose digest
+	// names no block. They are neither moved nor marked, and a caller reading an empty
+	// answer needs to know they were passed over.
+	Unknown int      `json:"anchors_unknown,omitempty"`
+	Marked  []string `json:"marked"`
 	// Truncated: more than maxInvalidationAnchors anchors lay in the paths; the rest were not checked.
 	Truncated bool `json:"truncated,omitempty"`
 }
@@ -77,14 +82,24 @@ var anchorRehashers = map[string]struct {
 	govstore.AnchorSymbol: {baselineSymbolBody, (*rehashSession).symbol, false},
 }
 
-// rehashSession caches the files and outlines one invalidation reads.
+// rehashSession caches the files and outlines one invalidation reads. held is what those
+// files cost together: an invalidation may touch up to maxInvalidationPaths paths, each of
+// at most maxSymbolFileBytes, and a cache without an aggregate bound could retain all of
+// them for the pass. Past maxInvalidationCacheBytes the session stops caching and reads
+// each file once per anchor that needs it, which is slower and bounded.
 type rehashSession struct {
 	ctx               context.Context
 	root, workspaceID string
 	dataDir           string
 	files             map[string]fileRead
+	held              int
 	outlines          map[string]outlineRead
 }
+
+// maxInvalidationCacheBytes bounds what one invalidation's file cache retains. It is below
+// the process-tree line by a wide margin and above the working set of a normal pass, whose
+// files are far smaller than maxSymbolFileBytes.
+const maxInvalidationCacheBytes = 16 << 20
 
 func newRehashSession(ctx context.Context, root, workspaceID string) *rehashSession {
 	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID, files: map[string]fileRead{}, outlines: map[string]outlineRead{}}
@@ -106,7 +121,9 @@ type fileRead struct {
 	missing bool
 }
 
-// text reads a file once.
+// text reads a file once. Past maxInvalidationCacheBytes the file is read and handed back
+// without being retained, so one pass cannot hold every file a large change touches; the
+// cost is one read per anchor that needs the same file.
 func (s *rehashSession) text(rel string) fileRead {
 	if r, ok := s.files[rel]; ok {
 		return r
@@ -119,6 +136,10 @@ func (s *rehashSession) text(rel string) fileRead {
 		}
 		r.missing = errors.Is(err, fs.ErrNotExist)
 	}
+	if s.held+len(r.text) > maxInvalidationCacheBytes {
+		return r
+	}
+	s.held += len(r.text)
 	s.files[rel] = r
 	return r
 }
@@ -289,8 +310,9 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 	// as an error rather than as a marked memory, and its ids are merged with the ones
 	// the baseline pass finds: an entry whose declared path and whose quote both reached
 	// the same change is at risk once, not twice.
-	reanchored, codeMarked, codeErr := reanchorCode(ctx, session, anchors)
+	reanchored, codeMarked, unknown, codeErr := reanchorCode(ctx, session, anchors)
 	rep.Reanchored = reanchored
+	rep.Unknown = unknown
 	for id := range codeMarked {
 		hit[id] = nil
 	}
@@ -570,6 +592,12 @@ func invalidateForGround(ctx context.Context, dataDir, workspaceID string, chang
 	rep, err := InvalidateMemory(ctx, dataDir, workspaceID, changed)
 	if err == nil && rep.Truncated {
 		err = fmt.Errorf("more than %d anchors lie in the changed files; the rest were not checked", maxInvalidationAnchors)
+	}
+	if err == nil && rep.Unknown > 0 {
+		// The same shape as the truncation above and for the same reason: ground lists what
+		// is at risk, and a caller that cannot tell a fully checked change from one whose
+		// quoted-code anchors were left unchecked would read an empty answer as a clean one.
+		err = fmt.Errorf("%d quoted-code anchors in the changed files could not be checked; they are neither moved nor marked", rep.Unknown)
 	}
 	return err
 }
