@@ -1606,7 +1606,10 @@ mod tests {
     #[test]
     fn a_language_filter_asks_for_no_docs_rows() {
         let repo = indexed_repo(&[
-            ("svc/handler.go", "package svc\n\nfunc settle() {\n\tledger()\n}\n"),
+            (
+                "svc/handler.go",
+                "package svc\n\nfunc settle() {\n\tledger()\n}\n",
+            ),
             (
                 "docs/PLAN.md",
                 "# Plan\n\nUnique marker zephyr_quota is documented only here.\n",
@@ -1633,21 +1636,23 @@ mod tests {
         let source = crate::symbolgraph::query_source_for(repo.path(), "ws", None);
         let opened = text_index(&source, &mut Vec::new()).expect("the fixture indexes");
         let terms = vec!["zephyr_quota".to_string()];
-        opened.snapshot.with_text(|conn| {
-            let both = crate::index::fts::lanes(conn, &terms, None, 10, 30, None, false)
-                .expect("the unfiltered lanes read");
-            assert!(!both.docs.is_empty(), "the fixture reaches the docs lane");
-            let filtered =
-                crate::index::fts::lanes(conn, &terms, None, 10, 30, Some("go"), false)
-                    .expect("the filtered lanes read");
-            assert!(
-                filtered.docs.is_empty(),
-                "a language filter reads no docs rows: {:?}",
-                filtered.docs
-            );
-            Ok(())
-        })
-        .expect("the text snapshot closes");
+        opened
+            .snapshot
+            .with_text(|conn| {
+                let both = crate::index::fts::lanes(conn, &terms, None, 10, 30, None, false)
+                    .expect("the unfiltered lanes read");
+                assert!(!both.docs.is_empty(), "the fixture reaches the docs lane");
+                let filtered =
+                    crate::index::fts::lanes(conn, &terms, None, 10, 30, Some("go"), false)
+                        .expect("the filtered lanes read");
+                assert!(
+                    filtered.docs.is_empty(),
+                    "a language filter reads no docs rows: {:?}",
+                    filtered.docs
+                );
+                Ok(())
+            })
+            .expect("the text snapshot closes");
     }
 
     // `lang` filters the docs lane too. The docs lane has no `files.lang` to read, so a
@@ -1656,7 +1661,10 @@ mod tests {
     #[test]
     fn lang_filter_drops_the_docs_lane() {
         let repo = indexed_repo(&[
-            ("svc/handler.go", "package svc\n\nfunc settle() {\n\tledger()\n}\n"),
+            (
+                "svc/handler.go",
+                "package svc\n\nfunc settle() {\n\tledger()\n}\n",
+            ),
             (
                 "docs/PLAN.md",
                 "# Plan\n\nUnique marker zephyr_quota is documented only here.\n",
