@@ -58,25 +58,32 @@ func quotedBlocks(content string) []string {
 	return out
 }
 
-// codeSites pairs each code anchor of an entry with the snippet it placed, in the order
-// quoteAnchors placed them (path anchors and other kinds take the lower ordinals, and
-// the placed code anchors keep their blocks' order among themselves). An entry whose
-// anchors and blocks do not correspond one for one is unknown rather than mis-paired:
-// pointing a memory's quote at another function's body is the one outcome this must
-// not produce, so the surplus on either side is dropped.
+// codeSites pairs each code anchor of an entry with the snippet it placed. An anchor is
+// matched to the block whose digest it carries, wherever that block sits in the served
+// content: AnchorsInPaths returns only the anchors that lie in the changed paths, so a
+// memory quoting blocks in two files hands this one anchor for the changed file, and
+// pairing from block zero would compare it against a block placed in the other file. An
+// anchor whose digest names no block, a block left over with no anchor, and an entry with
+// fewer blocks than anchors are all unknown rather than mis-paired: pointing a memory's
+// quote at another function's body is the one outcome this must not produce, so the
+// surplus on either side is dropped and the rest is left exactly as it was.
 func codeSites(content string, anchors []govstore.Anchor) []codeAnchorSite {
-	blocks := quotedBlocks(content)
+	byDigest := map[string]anchor.Snippet{}
+	for _, code := range quotedBlocks(content) {
+		snippet, err := anchor.NewSnippet(code)
+		if err != nil {
+			continue
+		}
+		byDigest[snippetID(code)] = snippet
+	}
 	var out []codeAnchorSite
 	for _, a := range anchors {
 		if a.Kind != govstore.AnchorCode || a.StaleSince != "" || a.SymbolUID == "" {
 			continue
 		}
-		if a.SymbolUID != snippetID(blocks[len(out)]) {
-			return nil
-		}
-		snippet, err := anchor.NewSnippet(blocks[len(out)])
-		if err != nil {
-			return nil
+		snippet, ok := byDigest[a.SymbolUID]
+		if !ok {
+			continue
 		}
 		out = append(out, codeAnchorSite{anchor: a, snippet: snippet})
 	}
@@ -110,8 +117,11 @@ type codeMoveEntry struct {
 
 // reanchorCode moves the quoted-code anchors of every entry whose quote lies in a changed
 // path, marks the entries whose quoted code is no longer in its file, and returns how
-// many anchors it moved plus the entries it marked.
-func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstore.Anchor) (int, map[string]bool) {
+// many anchors it moved, the entries it marked, and the write error if there was one. The
+// marked set comes from the store's own commit: an entry whose transaction rolled back is
+// not reported as marked, so a caller is never told a change was persisted when it was
+// not.
+func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstore.Anchor) (int, map[string]bool, error) {
 	marked := map[string]bool{}
 	byEntry := map[string][]govstore.Anchor{}
 	for _, a := range anchors {
@@ -120,12 +130,12 @@ func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstor
 		}
 	}
 	if len(byEntry) == 0 {
-		return 0, marked
+		return 0, marked, nil
 	}
 	ids := slices.Sorted(maps.Keys(byEntry))
 	contents, err := entryContents(ctx, session.dataDir, session.workspaceID, ids)
 	if err != nil {
-		return 0, marked
+		return 0, marked, err
 	}
 	var done []codeMoveEntry
 	moved := 0
@@ -152,8 +162,8 @@ func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstor
 			done = append(done, entry)
 		}
 	}
-	applied := writeCodeMoves(ctx, session, done)
-	return applied, marked
+	applied, marked, err := writeCodeMoves(ctx, session, done)
+	return applied, marked, err
 }
 
 // reanchorCode re-finds one code anchor's snippet in its file's current content. An
@@ -182,18 +192,17 @@ func (s *rehashSession) reanchorCode(site codeAnchorSite) (reanchorOutcome, stri
 // writeCodeMoves records each entry's moves and marks its losses, in one transaction.
 // A move is applied only if the anchor still holds the value the move names, so a move
 // computed from a stale read moves nothing rather than overwriting another block's
-// lines; ReanchorCode applies the store's own verdict and returns what it moved, so the
-// report never counts a move the store refused. A failure to write is not fatal to the
-// invalidation that hosts it: the entry it concerns keeps the anchor state it had, and
-// the next pass reads the file again.
-func writeCodeMoves(ctx context.Context, session *rehashSession, done []codeMoveEntry) int {
+// lines. It returns what the store moved, the entries it marked, and the error: a
+// transaction that rolled back marks nothing, so the caller never reports an entry whose
+// change was not persisted.
+func writeCodeMoves(ctx context.Context, session *rehashSession, done []codeMoveEntry) (int, map[string]bool, error) {
+	applied, marked := 0, map[string]bool{}
 	if len(done) == 0 {
-		return 0
+		return 0, marked, nil
 	}
 	actor := invalidationActor(session.root)
-	applied := 0
-	_ = memoryUpdate(ctx, session.dataDir, session.workspaceID, func(tx govstore.Tx) error {
-		applied = 0
+	err := memoryUpdate(ctx, session.dataDir, session.workspaceID, func(tx govstore.Tx) error {
+		applied, marked = 0, map[string]bool{}
 		for _, e := range done {
 			if len(e.moves) > 0 {
 				n, err := tx.ReanchorCode(ctx, e.entry, e.moves, actor.HeadSHA, actor)
@@ -203,14 +212,21 @@ func writeCodeMoves(ctx context.Context, session *rehashSession, done []codeMove
 				applied += n
 			}
 			if len(e.gone) > 0 {
-				if _, err := tx.MarkStale(ctx, e.entry, e.gone, actor.HeadSHA, actor); err != nil {
+				n, err := tx.MarkStale(ctx, e.entry, e.gone, actor.HeadSHA, actor)
+				if err != nil {
 					return err
+				}
+				if n > 0 {
+					marked[e.entry] = true
 				}
 			}
 		}
 		return nil
 	})
-	return applied
+	if err != nil {
+		return 0, map[string]bool{}, err
+	}
+	return applied, marked, nil
 }
 
 // entryContents reads the served content of ids, without the ids whose content was

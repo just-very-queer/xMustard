@@ -604,6 +604,7 @@ func (t *txn) ReanchorCode(ctx context.Context, entryID string, moves []CodeMove
 		return 0, err
 	}
 	moved := 0
+	refresh := false
 	for _, m := range moves {
 		from, err := ParseCodeAnchorValue(m.From)
 		if err != nil {
@@ -621,15 +622,32 @@ func (t *txn) ReanchorCode(ctx context.Context, entryID string, moves []CodeMove
 		if err != nil {
 			return moved, err
 		}
-		if rowsAffected(res) == 0 {
-			continue
+		n := rowsAffected(res)
+		if n == 0 {
+			// The move names no live anchor, or names one that has moved since the caller
+			// read it. Both are refusals rather than silent successes: a caller that cannot
+			// tell them apart would read a lost move as a move that was not needed.
+			var got string
+			if err := t.queryRow(ctx, `SELECT value FROM anchors WHERE entry_id = ? AND kind = ? AND symbol_uid = ?`,
+				entryID, AnchorCode, m.SnippetID).Scan(&got); err != nil {
+				return moved, fmt.Errorf("%w: no code anchor %q on %s", ErrInvalid, m.SnippetID, entryID)
+			}
+			return moved, fmt.Errorf("%w: code anchor %q holds %q, not %q", ErrInvalid, m.SnippetID, got, m.From)
 		}
 		if _, err := t.insertEvent(ctx, actor, eventRow{WorkspaceID: e.WorkspaceID, EntryID: entryID, Type: EventAnchorReanchor,
 			Revision: e.Revision, Data: map[string]any{"commit": commit,
 				"from": []int{from.Start, from.End}, "to": []int{to.Start, to.End}}}); err != nil {
 			return moved, err
 		}
-		moved++
+		moved += int(n)
+		refresh = true
+	}
+	if refresh {
+		// The anchors column of the entry's search row holds these values, so a move that
+		// did not refresh it would keep matching the line range the anchor left.
+		if err := t.refreshFTS(ctx, entryID); err != nil {
+			return moved, err
+		}
 	}
 	return moved, nil
 }

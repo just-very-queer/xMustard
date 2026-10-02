@@ -2027,14 +2027,15 @@ func TestReanchorCodeMovesAndRefuses(t *testing.T) {
 		t.Fatalf("anchor_reanchor events = %d, want 1", len(evs))
 	}
 
-	// the same move a second time matches nothing, because the anchor has moved
-	mustUpdate(t, s, func(tx Tx) error {
-		var err error
-		n, err = tx.ReanchorCode(ctx, "a1", []CodeMove{move}, "beef", bob)
+	// The same move a second time names an anchor that has already moved, which is refused
+	// rather than silently accepted as a no-op: a caller that cannot tell "nothing to do"
+	// from "I addressed the wrong anchor" would read a lost move as a move that was not
+	// needed.
+	if err := mustFail(t, s, func(tx Tx) error {
+		_, err := tx.ReanchorCode(ctx, "a1", []CodeMove{move}, "beef", bob)
 		return err
-	})
-	if n != 0 {
-		t.Fatalf("a repeated move moved %d anchors", n)
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a repeated move: got %v, want ErrInvalid", err)
 	}
 
 	for name, bad := range map[string]CodeMove{
@@ -2042,6 +2043,7 @@ func TestReanchorCodeMovesAndRefuses(t *testing.T) {
 		"another file":               {SnippetID: "snippet:bb", From: "src/a.go#L9-L9", To: "src/b.go#L9-L9"},
 		"no snippet digest":          {From: "src/a.go#L9-L9", To: "src/a.go#L10-L10"},
 		"the range it already holds": {SnippetID: "snippet:bb", From: "src/a.go#L9-L9", To: "src/a.go#L9-L9"},
+		"an unknown snippet digest":  {SnippetID: "snippet:zz", From: "src/a.go#L9-L9", To: "src/a.go#L10-L10"},
 	} {
 		if err := mustFail(t, s, func(tx Tx) error {
 			_, err := tx.ReanchorCode(ctx, "a1", []CodeMove{bad}, "beef", bob)

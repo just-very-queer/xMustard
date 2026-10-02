@@ -284,15 +284,18 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 		}
 	}
 	// A quoted-code anchor has no baseline: its lines shift with every edit above them,
-	// so it is re-found and either followed or marked (WS-28B). The pass marks the
-	// entries whose code is gone, so it reports those entries itself rather than letting
-	// the MarkStale below name them: that one is idempotent and would find them already
-	// flagged, and the report would read empty while ground lists them at risk.
-	reanchored, codeMarked := reanchorCode(ctx, session, anchors)
+	// so it is re-found and either followed or marked (WS-28B). The pass reports the
+	// entries it marked from the store's own commit, so a rolled-back write is returned
+	// as an error rather than as a marked memory, and its ids are merged with the ones
+	// the baseline pass finds: an entry whose declared path and whose quote both reached
+	// the same change is at risk once, not twice.
+	reanchored, codeMarked, codeErr := reanchorCode(ctx, session, anchors)
 	rep.Reanchored = reanchored
-	rep.Marked = append(rep.Marked, slices.Sorted(maps.Keys(codeMarked))...)
+	for id := range codeMarked {
+		hit[id] = nil
+	}
 	if len(hit) == 0 {
-		return rep, nil
+		return rep, codeErr
 	}
 	actor := invalidationActor(root)
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
@@ -307,7 +310,13 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 		}
 		return nil
 	})
-	return rep, err
+	for _, id := range slices.Sorted(maps.Keys(codeMarked)) {
+		if !slices.Contains(rep.Marked, id) {
+			rep.Marked = append(rep.Marked, id)
+		}
+	}
+	slices.Sort(rep.Marked)
+	return rep, errors.Join(codeErr, err)
 }
 
 // changedAnchorPaths cleans a change list into the paths the anchor index is asked
