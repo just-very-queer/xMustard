@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -179,21 +180,32 @@ func TestACancelledWaiterDoesNotDenyTheLockToTheNextOne(t *testing.T) {
 	unlock()
 }
 
-// A gate whose slot is free must be taken even when the caller's ctx has already ended.
-// A select over a ready send and a ready ctx.Done() picks at random, so without a stated
-// preference the uncontended path is a coin flip: measured at 509 taken / 491 refused in
-// 1000 tries before the preference was added. This pins the deterministic answer, and it
-// is the case every context-free caller of the package already depends on.
+// A free gate is taken even when the caller's context has already ended, and that is
+// the whole point of the two-part acquire: a select over a ready send and a ready
+// ctx.Done() picks at random, so the uncontended path would otherwise be a coin flip
+// (measured 509 taken / 491 refused in 1000 tries). The test asks the gate directly
+// because a RebaselineIndex call cannot separate "refused at the lock" from "refused
+// at the build" — both answer context.Canceled — and only the gate's own answer tells
+// the two apart.
 func TestAFreeGateIsTakenEvenWhenTheContextHasAlreadyEnded(t *testing.T) {
 	const tries = 200
 	for i := range tries {
-		g := make(storeGate, 1)
+		dir := t.TempDir()
+		key := filepath.Join(dir, "store.json")
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if !g.acquire(ctx) {
-			t.Fatalf("try %d: a free gate refused a caller whose context had ended", i)
+		unlock, err := lockStoreCtx(ctx, key)
+		if err != nil {
+			t.Fatalf("try %d: a free gate refused a caller whose context had ended: %v", i, err)
 		}
-		g.release()
+		// Taken and released, so the key is free for the next caller and nothing is
+		// left claimed by a caller that never did any work.
+		unlock()
+		next, err := tryLockStore(key)
+		if err != nil {
+			t.Fatalf("try %d: the gate was left claimed: %v", i, err)
+		}
+		next()
 	}
 }
 
