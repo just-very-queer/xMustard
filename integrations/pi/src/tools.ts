@@ -135,12 +135,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path.",
+			"Code search: path:line hits, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>. mode=text: a chunk's own text only. mode=pattern: ast-grep (`$A && $A()`); mode=symbol: name path.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the search query" },
-			{ name: "mode", type: "string", enum: ["hybrid", "pattern", "symbol"], desc: "hybrid (default), pattern (ast-grep) or symbol" },
-			{ name: "lang", type: "string", desc: "language hint for pattern mode" },
+			{ name: "mode", type: "string", enum: ["hybrid", "text", "pattern", "symbol"], desc: "hybrid (default), text (a chunk's own text), pattern (ast-grep) or symbol" },
+			{ name: "lang", type: "string", maxLength: 32, desc: "hybrid|text: only this language; pattern: ast-grep language hint" },
 			{ name: "seed", type: "string", desc: "symbol to anchor the graph-proximity lane" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 10)" },
 		],
