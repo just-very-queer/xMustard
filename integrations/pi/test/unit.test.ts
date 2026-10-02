@@ -1326,25 +1326,27 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		// pipeline needs a shell, `&&` needs a shell, redirection needs a shell, and
 		// an embedded quote must survive being nested inside the wrapper's own
 		// single-quoted argv. The expected values are what POSIX sh must produce,
-		// written out here rather than computed by the code under test; wc pads with
-		// leading spaces, which is part of its documented output.
-		const cases: [string, string][] = [
-			["printf 'a\\nb\\n' | wc -l", "       2"],
-			["cd . && echo yes", "yes"],
-			[`echo "it's here"`, "it's here"],
-			["echo '$HOME'", "$HOME"],
-			["echo a b   c", "a b   c"],
-			["echo x; echo y", "x\ny"],
-			[`printf '%s' "a'b'c"`, "a'b'c"],
-			["echo done > $WS44E_TMP && cat $WS44E_TMP", "done"],
-			["echo one two three | tr ' ' '-'", "one-two-three"],
+		// written out here rather than computed by the code under test. A case whose
+		// output a tool pads for a terminal (`wc`) compares trimmed, because whether
+		// the pipe has a tty decides that and is not what this row is about.
+		const cases: [string, string, boolean][] = [
+			["printf 'a\\nb\\n' | wc -l", "2", true],
+			["cd . && echo yes", "yes", false],
+			[`echo "it's here"`, "it's here", false],
+			["echo '$HOME'", "$HOME", false],
+			["echo a b   c", "a b   c", false],
+			["echo x; echo y", "x\ny", false],
+			[`printf '%s' "a'b'c"`, "a'b'c", false],
+			["echo done > $WS44E_TMP && cat $WS44E_TMP", "done", false],
+			["echo one two three | tr ' ' '-'", "one-two-three", false],
 		];
-		for (const [command, want] of cases) {
+		for (const [command, want, trim] of cases) {
 			const argv = argvFields(command);
 			// `sh -c <field>` is what the wrapper would exec. The field is re-quoted
 			// because it is interpolated into a shell string here, and an unquoted
 			// `|` would pipe the outer shell instead of reaching the inner one.
-			assert.equal(shRuns(`sh -c ${shellQuote(argv[2])}`), `${want}\n`, `must survive: ${command}`);
+			const got = shRuns(`sh -c ${shellQuote(argv[2])}`);
+			assert.equal(trim ? got.trim() : got, trim ? want : `${want}\n`, `must survive: ${command}`);
 		}
 	});
 
