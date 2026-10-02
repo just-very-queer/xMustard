@@ -418,6 +418,15 @@ pub(crate) fn doc_start_line(outer: Node<'_>, too_deep: bool) -> u32 {
     line
 }
 
+/// Nodes that wrap a write target without being written themselves: the thing assigned
+/// is inside them. Go writes `m[k] = v` through an `index_expression`, so a selector under
+/// one is written whenever the index expression is.
+const WRITE_WRAPPERS: &[&str] = &[
+    "index_expression",
+    "parenthesized_expression",
+    "tuple_pattern",
+];
+
 impl<'a> Walker<'a> {
     fn new(lang: Lang, src: &'a [u8]) -> Self {
         Walker {
@@ -493,14 +502,26 @@ impl<'a> Walker<'a> {
 
     /// The ancestor `up - 1` levels above the current node (0: the node itself), held
     /// in slot `field` of the ancestor at `up`, is written by an assignment or increment.
+    /// Wrapper nodes between the two are transparent: `m[k] = v` writes `m`.
     fn is_write_target(&self, up: usize, field: &str) -> bool {
         let at = |k: usize| {
             self.ancestor(k)
                 .map_or(("", ""), |a| (a.kind, a.field.unwrap_or("")))
         };
+        // skip wrapper levels between the node and the assignment, remembering the field the
+        // outermost wrapper is held in
+        let mut up = up;
+        let mut field = field.to_string();
+        while let (kind, pf) = at(up) {
+            if !WRITE_WRAPPERS.contains(&kind) {
+                break;
+            }
+            up += 1;
+            field = pf.to_string();
+        }
         let (pk, pf) = at(up);
         let gk = at(up + 1).0;
-        match (pk, field) {
+        match (pk, field.as_str()) {
             (
                 "assignment_expression"
                 | "augmented_assignment_expression"

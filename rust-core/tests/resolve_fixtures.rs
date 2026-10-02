@@ -369,7 +369,17 @@ fn resolution_tiers_imports_reexports_namespaces_packages_and_receivers() {
     // method receivers: a method on the same type declared in another package file
     let bump = edge(&e, (s, "Store.Put"), "CALLS", "", (x, "Store.bump"));
     assert_eq!((bump.0, bump.2.as_str()), (0.9, "receiver-typed"));
-    let items = edge(&e, (s, "Store.Put"), "ACCESSES", "read", (s, "Store.items"));
+    // `s.items[k] = v` is a WRITE. This assertion read "read" until WS-FIX-19: it pinned
+    // the bug the row was opened for, because the extractor stopped at the
+    // `selector_expression` and never saw the assignment through the `index_expression`
+    // above it.
+    let items = edge(
+        &e,
+        (s, "Store.Put"),
+        "ACCESSES",
+        "write",
+        (s, "Store.items"),
+    );
     assert_eq!(items.0, 0.95);
     edge(&e, (x, "Store.Get"), "ACCESSES", "read", (s, "Store.items"));
     edge(
@@ -801,10 +811,13 @@ fn precision_against_type_checker_ground_truth() {
 // ---------------------------------------------------------------------------
 
 // Item 2, "Go selector writes read as `read`": NOT REPRODUCED. A plain selector write,
-// an index-write through a selector, a package-level var and a cross-file receiver all
-// classify as `write`, and a read of the same symbol stays `read`. The fixture also
-// covers `b.Count = b.Count + 1`, where the LHS and the RHS are one symbol and both
-// access modes must appear.
+// a compound assignment, an index-write through a selector, a package-level var and a
+// cross-file receiver all classify as `write`, and a read of the same symbol stays `read`.
+//
+// Each read assertion sits in a function whose ONLY mention of the symbol is a read, so
+// it cannot be satisfied by a write that was misread: `ReadsOnly` names each symbol once.
+// Without that separation a write classified as `read` would pass the read assertion and
+// the test could not see the finding it is named for.
 #[test]
 fn a_go_selector_write_is_a_write_and_not_a_read() {
     let r = repo(&[
@@ -816,18 +829,28 @@ fn a_go_selector_write_is_a_write_and_not_a_read() {
 type Box struct {
 	Count int
 	Name  string
+	Items map[string]int
 }
 
 var Global int
 
-func Use(b *Box, n int) {
+// WritesOnly names each symbol exactly once, in write position.
+func WritesOnly(b *Box, n int) {
 	b.Count = n
 	b.Name = "x"
+	b.Items["k"] = n
 	Global = n
-	v := b.Count
-	w := Global
-	_, _ = v, w
 }
+
+// ReadsOnly names each symbol exactly once, in read position.
+func ReadsOnly(b *Box) (int, int, int, int) {
+	return b.Count + len(b.Name) + len(b.Items) + Global
+}
+
+// CompoundsOnly: `b.Count += 1` is a WRITE. The RHS is also a read of `b.Count`,
+    // but the extractor emits one reference per name occurrence and the write
+    // classification wins, so only the write edge exists.
+func CompoundsOnly(b *Box) { b.Count += 1 }
 "#,
         ),
         (
@@ -839,15 +862,25 @@ func Use(b *Box, n int) {
     let e = symbol_edges(&conn);
     let s = "pkg/s/s.go";
     let x = "pkg/s/u.go";
-    // plain selector writes
-    edge(&e, (s, "Use"), "ACCESSES", "write", (s, "Box.Count"));
-    edge(&e, (s, "Use"), "ACCESSES", "write", (s, "Box.Name"));
-    // a package-level variable, same file and through a selector
-    edge(&e, (s, "Use"), "ACCESSES", "write", (s, "Global"));
-    // the reads are reads, and stay reads
-    let c = edge(&e, (s, "Use"), "ACCESSES", "read", (s, "Box.Count"));
+    // plain selector writes, an index-write and a package-level var
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Box.Count"));
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Box.Name"));
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Box.Items"));
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Global"));
+    // the reads: only ReadsOnly mentions these symbols, and it reads them
+    let c = edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Box.Count"));
     assert_eq!(c.0, 0.95);
-    edge(&e, (s, "Use"), "ACCESSES", "read", (s, "Global"));
+    edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Box.Name"));
+    edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Box.Items"));
+    edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Global"));
+    // `b.Count += 1`: a compound assignment is a write
+    edge(
+        &e,
+        (s, "CompoundsOnly"),
+        "ACCESSES",
+        "write",
+        (s, "Box.Count"),
+    );
     // a write through a receiver typed in ANOTHER file of the same package
     let far = edge(&e, (x, "Other"), "ACCESSES", "write", (s, "Box.Count"));
     assert_eq!((far.0, far.2.as_str()), (0.9, "receiver-typed"));
@@ -982,26 +1015,49 @@ fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
     );
     assert_eq!((hit.0, hit.2.as_str()), (0.9, "re-export"));
 
-    // (b) an ES module that does not export the name is a boundary. `mod.ts` exports
-    // something else, so `hidden` is not its export and the barrel's claim is refused.
+    // (b) the documented CommonJS boundary, the half this test is named for: a file
+    // with NO ES export syntax exports its top-level declarations without the keyword,
+    // so the barrel's claim IS honoured. `plain.js` is that file and the resolution is
+    // correct -- this pins the rule the fallback implements.
     let r2 = repo(&[
+        ("src/plain.js", "function helper() { return 1; }\n"),
+        ("src/barrel2.js", "export { helper } from './plain';\n"),
+        (
+            "src/use2.js",
+            "import { helper } from './barrel2';\nexport function go2() { return helper(); }\n",
+        ),
+    ]);
+    let e2 = symbol_edges(&db(&index("build", r2.path(), &[])));
+    let cjs = edge(
+        &e2,
+        ("src/use2.js", "go2"),
+        "CALLS",
+        "",
+        ("src/plain.js", "helper"),
+    );
+    assert_eq!((cjs.0, cjs.2.as_str()), (0.9, "re-export"));
+
+    // (c) and the guard really is the boundary: an ES module that exports something ELSE
+    // does NOT export `hidden`, so the barrel's claim is refused even though the
+    // declaration is there. This is the half that regresses if the `!has_es_exports`
+    // guard is dropped.
+    let r3 = repo(&[
         (
             "src/mod.ts",
             "export const shown = 1;\nfunction hidden(): number { return 2; }\n",
         ),
-        ("src/barrel2.ts", "export { hidden } from './mod';\n"),
+        ("src/barrel3.ts", "export { hidden } from './mod';\n"),
         (
-            "src/use2.ts",
-            "import { hidden } from './barrel2';\nexport function go2(): number { return hidden(); }\n",
+            "src/use3.ts",
+            "import { hidden } from './barrel3';\nexport function go3(): number { return hidden(); }\n",
         ),
     ]);
-    let conn2 = db(&index("build", r2.path(), &[]));
-    let e2 = symbol_edges(&conn2);
-    let leaked = e2.iter().any(|((_, _, _, _, dst_path, dst_name), _)| {
+    let e3 = symbol_edges(&db(&index("build", r3.path(), &[])));
+    let leaked = e3.iter().any(|((_, _, _, _, dst_path, dst_name), _)| {
         dst_path == "src/mod.ts" && dst_name == "hidden"
     });
     assert!(
         !leaked,
-        "an unexported declaration resolved through a barrel: {e2:?}"
+        "an unexported declaration resolved through a barrel: {e3:?}"
     );
 }

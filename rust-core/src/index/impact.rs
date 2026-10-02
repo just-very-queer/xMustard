@@ -1030,15 +1030,18 @@ fn run_lookup<G: Graph + ?Sized>(
     affected.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.module.cmp(&b.module)));
     affected.truncate(MAX_MODULES);
 
-    let seeds_truncated = lookup.truncated || seeds.len() > MAX_TARGETS;
-    let epistemic = envelope(g, q, seeds_truncated, &seeds, &w, losses)?;
+    // `lookup.truncated` is the only thing that means seeds were DROPPED: a target that
+    // expands to more than MAX_TARGETS seeds (a file walking with what it declares, a type
+    // with its members) keeps every one of them, so the listed-seed cap below is a display
+    // cap and must not make the answer a lower bound.
+    let epistemic = envelope(g, q, lookup.truncated, &seeds, &w, losses)?;
     let (risk, risk_note) = score(q, &lookup, &counts, &epistemic);
     let import_cycles = cycles_through(g, &seeds)?;
 
     Ok(Impact {
         symbol: q.target.clone(),
         targets,
-        targets_truncated: seeds_truncated,
+        targets_truncated: lookup.truncated || seeds.len() > listed_seeds,
         defined_in: defined_in.into_iter().collect(),
         direction: q.direction,
         max_depth: q.max_depth,
