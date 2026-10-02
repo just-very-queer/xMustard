@@ -95,12 +95,19 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	// Restricted tokens therefore poll with no slot held: without one there is no
 	// watchdog, so the counter moves only if the poll itself sampled, and the
 	// assertion needs no attribution and no window.
+	// The release is registered with t.Cleanup as well as returned, because a
+	// t.Fatal raised inside health or isFull between the acquire and the release
+	// would otherwise leave the slot held and every later test in the package
+	// failing with "transient budget exhausted", which hides the real cause.
+	// AcquireHeavy's release is idempotent (sync.Once), so the explicit call
+	// still releases it at the point the test means to.
 	holdSlot := func(t *testing.T) func() {
 		t.Helper()
 		release, err := budget.AcquireHeavy(t.Context(), "rust:changetrack/index", 1<<20)
 		if err != nil {
 			t.Fatal(err)
 		}
+		t.Cleanup(release)
 		return release
 	}
 	t.Setenv("XMUSTARD_AUTH", "auto")
@@ -154,17 +161,17 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		}
 		// The counter above can only judge a restricted poll while no heavy work
 		// runs, because the watchdog samples for its own reasons. The product
-		// claim is the same either way, so check it the only way a busy slot
-		// allows: a restricted poll taken *during* heavy work must still get the
-		// public view, and must not see the slot's owner in the budget block. A
-		// regression that sampled only under load would pass the counter above
-		// and fail here.
+		// claim is the same either way, so check it here too: a restricted poll
+		// taken *during* heavy work must still get the public view, with no
+		// activity in the budget block.
 		busy := holdSlot(t)
-		t.Cleanup(busy) // released on every path, including a panic in dig or num
+		watchdogFloor := samples.Load()
+		restricted := 0
 		for who, tok := range tokens {
 			if want[who] {
 				continue
 			}
+			restricted++
 			under := health(tok)
 			if isFull(t, under) {
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work got the full view", mode, who)
@@ -172,6 +179,17 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 			if b, _ := dig(t, under, "budget").(map[string]any); len(b) != 4 {
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work leaked activity: %v", mode, who, b)
 			}
+		}
+		// The shape check above cannot see a handler that walks the tree and
+		// still returns the four keys, so bound the sampling too. The watchdog
+		// shares the counter, so the bound is the number of restricted polls: a
+		// restricted handler sampling on demand adds one sample per poll on top
+		// of the watchdog's own cadence, and one interval is waited first so the
+		// watchdog is definitely running and the floor is meaningful.
+		waitFor(t, watchdogDeadline, func() bool { return samples.Load() > watchdogFloor })
+		if over := samples.Load() - watchdogFloor; over > int64(restricted) {
+			busy()
+			t.Fatalf("a restricted poll under heavy work sampled the process tree: %d samples for %d polls", over, restricted)
 		}
 		busy()
 	}
