@@ -2004,8 +2004,8 @@ func splitNULRecords(out []byte) []string {
 // rest of the line. Type "2" (renamed or copied) is followed by a second record
 // holding the origin path.
 var porcelainV2FixedFields = map[string]int{
-	"1": 8, // <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
-	"2": 9, // <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>
+	"1": 8,  // <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+	"2": 9,  // <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>
 	"u": 10, // <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
 }
 
