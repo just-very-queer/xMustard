@@ -119,6 +119,33 @@ func TestSearchRefusesAnOverLongLang(t *testing.T) {
 	}
 }
 
+// An unrecognised mode is refused here too, not only at the route. `WorkspaceSearchPage`
+// is exported and its other callers do not validate, and only `text` is ever sent to the
+// core, so anything else would be answered by the hybrid while the caller believed it had
+// asked for something else.
+func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
+	ws := "wsSearchModeBound"
+	dir := seedFeedbackWorkspace(t, ws)
+	useFeedbackRecorder(t, feedbackMaxPendingPaths)
+	argsFile := fakeSearchCore(t, searchPageBody)
+	ctx := context.Background()
+
+	for _, mode := range []string{"exact", "regex", "semantic", "Text", "TEXT"} {
+		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); !errors.Is(err, ErrInvalidInput) {
+			t.Errorf("mode=%q must be invalid input, got %v", mode, err)
+		}
+	}
+	if _, statErr := os.Stat(argsFile); statErr == nil {
+		t.Error("an unknown mode reached the core")
+	}
+	// the advertised modes and the empty default are accepted
+	for _, mode := range []string{"", SearchModeHybrid, SearchModeText} {
+		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); err != nil {
+			t.Errorf("mode=%q must be accepted: %v", mode, err)
+		}
+	}
+}
+
 // A cursor is bound to the ranking it pages, so a request whose filters differ must not
 // accept each other's cursor: `lang=go` and no `lang` are two rankings. The boundary is
 // the decode, not the key, so the cursor is encoded under one request and offered to the

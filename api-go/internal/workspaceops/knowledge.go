@@ -104,6 +104,14 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if len(req.Lang) > maxSearchLangLen {
 		return nil, fmt.Errorf("lang is longer than %d bytes: %w", maxSearchLangLen, ErrInvalidInput)
 	}
+	// Only `text` is ever sent to the core, which is `hybrid` when the flag is absent, so
+	// an unrecognised mode would be answered by the hybrid. The route validates before it
+	// gets here, but this function is exported and its other callers do not.
+	switch req.Mode {
+	case "", SearchModeHybrid, SearchModeText:
+	default:
+		return nil, fmt.Errorf("mode %q is not a search mode: %w", req.Mode, ErrInvalidInput)
+	}
 	ranking := req.rankingKey(workspaceID)
 	offset, err := decodeSearchCursor(req.Cursor, ranking)
 	if err != nil {
