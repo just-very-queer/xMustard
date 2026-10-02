@@ -3433,6 +3433,16 @@ PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operatio
 
 **Collision risk.** `tool_search.go` and `knowledge.go` (WS-52a and WS-52b/52c also touch `tool_search.go`, and WS-52 is ordered after WS-38). The plan file (every lane appends its section here).
 
+**Implementation record (branch parity/ws-59b, 2026-10-02).**
+
+- *What was built.* `mode=text` (the `body` column of `chunk_fts`, no docs lane, no name or file candidates) and `lang` as a filter for the hybrid and text lanes, across `tool_search.go`, `tool_routes.go`, `knowledge.go`, `navigation.go`, `rust-core/src/index/fts.rs`, `rust-core/src/search.rs`, `xmustard-core.rs`, the Pi mirror and the tools/list goldens.
+- *Measured.* BOXALL on the reviewed head: `remote_exit=0`, `clippy_warnings=6` (the merge base's count), `rss_lines=ok`, 24 Go packages. CAPS: every cap unchanged and no cap rose; the three description edits that paid for `lang`'s new `maxLength` are measured in `tools_list_budget.json`'s `about`. PI: 45/45, including the `mirror matches the generated Go tools/list` conformance test. RET: 21/21, the merge base's score. Commands and raw output are the S13 index in `reviews/ws-59b/r4/slop-audit.md`.
+- *Deviations.* (1) `lang`'s bound is 256 (path_glob's) rather than the 32 the first draft used, so a schema-valid value is never refused; counted in runes, because JSON Schema counts characters. (2) The rerank lane refuses `mode=text` and `lang` with a 400 instead of honouring them, because `WorkspaceSearchReranked` takes neither. (3) `lang`'s description says the filter does not apply to `mode=symbol`, because `ParseSymbolSearch` never reads it.
+- *Review.* Four rounds, `reviews/ws-59b/r{1,2,3,4}`. R1 (2 blockers, 1 major, 3 minors) fixed in `1c4946e`, `3a9da3e`, `45f5a8a`. R2 (3 blockers, 2 minors) in `f045269`. R3 (1 blocker, 2 majors) in `7e4b583`. R4 (3 majors) in `a746889`, `f4db6f1`; `f4db6f1` is the shape correction clippy required. `gate=PASS changed=17 covered=17 channel_findings=5 triaged=3 reviewer=gpt-6-sol` on r4, with `triage-check2.md` AGREE.
+- *Merge recheck.* Recorded in `reviews/ws-59b/r4/merge-recheck.md`.
+- *Checks.* As above. Not run, with reason: `BUD` (no resident-affecting change; the row adds no cache and no in-heap structure), `SECDOC` (no route or gate row changed), `GOLD` (no projection changed beyond the tools/list snapshot this row regenerates deliberately).
+- *Follow-ups.* `search` still returns 12-17 KB for five or six hits and ranks a name match above the code that names it; the workstream is named for that and this row touched the lane set, not the ranker. Proposed owner: WS-59c or WS-52. The mutation runner must be restored between rows or the box serves a mutated tree to the next gate — this row lost two gates and two mutation runs to it. Proposed owner: `$X/bin/xm-box.sh`, which the executor must not edit. The MCP index is pinned to the owner's `feat/product-v1`, so `explain` and `impact` answer for another revision; seventeenth row to report it. Proposed owner: WS-FIX-15.
+
 ### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
 
 Route/DI extractors (Django, FastAPI, Next.js, Nest, Spring, Laravel, tRPC, Expo) seeding flow entry points; Vue, Dart, Objective-C packs; reimplemented from design (GitNexus is PolyForm NC).
