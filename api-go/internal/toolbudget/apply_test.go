@@ -313,28 +313,52 @@ func TestOmittedStandsWhenTheBudgetCutNoHits(t *testing.T) {
 }
 
 // The omitted rewrite is scoped to the hybrid search envelope: only the paged
-// hits list is the ranked list that top-level total and offset describe. Any
-// other result carrying an omitted member keeps the producer's own value
+// hits list is the ranked list that top-level total and offset describe. A cut
+// page of any other list carrying an omitted member keeps the producer's value
 // (WS-FIX-18).
 func TestOmittedRewriteIsScopedToTheHybridHitsEnvelope(t *testing.T) {
-	// explain's file shape is paged on symbols and carries its own omitted member
-	res := map[string]any{"path": "pkg", "total": 40, "offset": 5, "omitted": 77,
-		"files": []any{
-			map[string]any{"path": "pkg/a.go", "lang": "go", "symbols": []any{map[string]any{"name_path": "A", "kind": "Function"}}},
-			map[string]any{"path": "pkg/b.go", "lang": "go", "symbols": []any{map[string]any{"name_path": "B", "kind": "Function"}}},
-		}}
-	raw, _ := json.Marshal(res)
-	spec, _ := For("explain")
-	out, err := spec.Apply(raw, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, nil)
+	// explain's directory shape is paged on files and carries its own omitted
+	// member; the files are long enough that the smallest budget cuts the list.
+	files := make([]any, 6)
+	for i := range files {
+		syms := make([]any, 4)
+		for j := range syms {
+			syms[j] = map[string]any{"name_path": fmt.Sprintf("pkg/Pkg%d.Fn%02d%s", i, j, strings.Repeat("y", 200)),
+				"kind": "Function", "line": 10 + j, "lines": []int{10, 90}, "uid": fmt.Sprintf("Function:pkg/f%d.go:F%d", i, j)}
+		}
+		files[i] = map[string]any{"path": fmt.Sprintf("pkg/dir%02d/file%03d.go", i, i),
+			"lang": "go", "symbols": syms, "summary": strings.Repeat("s", 300)}
+	}
+	res := map[string]any{"path": "pkg", "total": 40, "offset": 5, "omitted": 77, "files_total": 6, "files": files}
+	raw, err := json.Marshal(res)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var got map[string]any
-	if err := json.Unmarshal(out, &got); err != nil {
-		t.Fatal(err)
+	spec, _ := For("explain")
+	cut := false
+	for max := len(raw); max >= MinMaxChars; max -= 25 {
+		out, err := spec.Apply(raw, Request{MaxChars: max}, Page{Cursor: cursorAt}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("output is not JSON: %v", err)
+		}
+		if got["omitted"] != float64(77) {
+			t.Fatalf("max_chars %d: a non-hybrid result's omitted was rewritten: %v", max, got["omitted"])
+		}
+		var kept int
+		if fl, ok := got["files"].([]any); ok {
+			kept = len(fl)
+		}
+		if kept < len(files) {
+			cut = true
+			break
+		}
 	}
-	if got["omitted"] != float64(77) {
-		t.Fatalf("a non-hybrid result's omitted was rewritten: %v", got["omitted"])
+	if !cut {
+		t.Fatal("explain's files list was never cut, so the scoped rewrite was never exercised on a cut page")
 	}
 }
 
