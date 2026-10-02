@@ -600,8 +600,15 @@ export class StallProxy {
 }
 
 // mcpToolsList asks the real stdio MCP server for its tool list (no API needed).
+// It asks for the "full" schema profile because that is the one the Pi adapter
+// mirrors: Pi validates a call against its own closed schema, so it registers
+// every argument tools/call accepts (WS-FIX-26). The default lean profile is the
+// other half of the mirror and is checked against testdata/tools_list.json.
 export async function mcpToolsList(apiBase: string): Promise<{ name: string; description: string; inputSchema: unknown }[]> {
-	const child = spawn(env("XM_MCP_BIN"), [], { env: { PATH: process.env.PATH ?? "", XMUSTARD_API_BASE: apiBase }, stdio: ["pipe", "pipe", "inherit"] });
+	const child = spawn(env("XM_MCP_BIN"), [], {
+		env: { PATH: process.env.PATH ?? "", XMUSTARD_API_BASE: apiBase, XMUSTARD_MCP_SCHEMA: "full" },
+		stdio: ["pipe", "pipe", "inherit"],
+	});
 	sampler.register(child.pid, "xmustard-mcp");
 	let buf = "";
 	const result = new Promise<any>((res, rej) => {
