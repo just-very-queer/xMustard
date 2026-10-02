@@ -75,6 +75,7 @@ Or list this directory as a Pi package (`package.json` declares `pi.extensions`)
 | `XMUSTARD_PI_MASK_EVERY_TURNS` | `5` | The mask advances only on turns divisible by this (the polling window) |
 | `XMUSTARD_PI_MASK_MIN_BYTES` | `2048` | Smaller results are never masked (min 1025) |
 | `XMUSTARD_PI_COMPACTION` | on | `off` keeps Pi's own compaction |
+| `XMUSTARD_PI_WRAP_BASH` | off | `1`/`on`/`true`/`yes` rewrites each `bash` tool call's `command` to `xmustard-core run --workspace <id> -- <command>` before Pi executes it (WS-44e, PAR-ADP-09) |
 
 Loading the extension only registers tools and handlers: it starts no sidecar,
 socket, timer or network call. At `session_start` it asks `GET /api/auth/whoami` (2 s
@@ -298,9 +299,19 @@ concurrency, API restart, expiry, the projection deadline, an activated
 capture. Each needs a multi-page result from `impact` with no arguments, and since the
 automatic registration baseline (WS-22) a fresh fixture has no changes against its
 baseline, so that call returns about 400 bytes and issues no handle. The WS-24 suite
-passes 3 of 3; 9 of the 18 e2e tests pass in all. The fix is a fixture that gives
-`impact` a large result after registration, an open follow-up of WS-24.
+passes 3 of 3; 9 of the 18 e2e tests pass in all.
 
-Not built here: `tool_call` input rewriting to wrap commands (PAR-ADP-09) needs the
-`xmustard-core run --` wrapper (WS-41) and is redundant in Pi, where `tool_result`
-replaces results directly.
+The "large-result fixture" above was assumed to be a missing test input. It is not, and
+the assumption was measured (WS-44e): those nine tests assert `raw_bytes > 3 * 64 KiB`,
+while `toolbudget.MaxMaxChars` is 64 KiB and `impact` does not page, so no fixture and no
+argument value can make one call exceed that. The tests need a decision about what they
+should claim (re-page through `impact`'s own cursor, raise the ceiling, or cover a
+built-in instead); see the followups file. Until then the 9 of 18 stands as recorded.
+
+`tool_call` input rewriting to wrap commands (PAR-ADP-09) is built here, since WS-41
+shipped the `xmustard-core run --` wrapper it needed. Set `XMUSTARD_PI_WRAP_BASH=1` and
+each `bash` tool call's `command` is rewritten in place to
+`xmustard-core run --workspace <id> -- <command>` before Pi runs it, so the output is
+reduced and retained server-side. It is off by default because it changes what Pi
+executes; a command that is blank, already wrapped, or in a session with no resolvable
+workspace is left exactly as the model wrote it.

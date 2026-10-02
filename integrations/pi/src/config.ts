@@ -30,6 +30,10 @@ export interface AdapterConfig {
 	projectionTarget: number;
 	mask: MaskConfig;
 	compaction: boolean; // XMUSTARD_PI_COMPACTION=off keeps Pi's own compaction
+	// XMUSTARD_PI_WRAP_BASH=1 rewrites each bash tool call's command to
+	// `xmustard-core run --` (WS-44e, PAR-ADP-09). Off by default: the wrap
+	// changes what Pi executes, so it is opt-in.
+	wrapBash: boolean;
 }
 
 export const DEFAULT_API_BASE = "http://127.0.0.1:8042";
@@ -90,6 +94,9 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig 
 			minBytes: bounded(env.XMUSTARD_PI_MASK_MIN_BYTES, DEFAULT_MASK.minBytes, MIN_CAPTURE_TARGET + 1, 1 << 20),
 		},
 		compaction: !off(env.XMUSTARD_PI_COMPACTION),
+		// opt-in: only the explicit affirmative spellings turn it on, so an unset,
+		// empty or malformed value leaves bash alone
+		wrapBash: ["1", "on", "true", "yes"].includes((env.XMUSTARD_PI_WRAP_BASH ?? "").trim().toLowerCase()),
 	};
 }
 

@@ -29,6 +29,7 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
+import { mutateBashInput } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -1254,5 +1255,71 @@ describe("session_before_compact snapshot", () => {
 		assert.match(reasons[1], /custom instructions/);
 		assert.equal(srv.seen.length, n, "no request for a focused compaction");
 		assert.equal(await createCompactor({ enabled: false, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {} })({ preparation: prep, branchEntries: b.entries }, ctxOf(b)), undefined);
+	});
+});
+
+describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
+	const WRAPPED = (ws: string, command: string) => `xmustard-core run --workspace ${ws} -- ${command}`;
+	const wrapInput = (input: unknown, ws: string | undefined, enabled: boolean): unknown => {
+		const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: structuredClone(input) as Record<string, unknown> };
+		mutateBashInput(event, ws, enabled);
+		return event.input;
+	};
+
+	test("off by default: a bash command is byte-identical when the knob is unset", () => {
+		const input = { command: "ls -la /tmp" };
+		assert.deepEqual(wrapInput(input, "ws-1", false), input);
+		assert.deepEqual(loadConfig({}).wrapBash, false, "XMUSTARD_PI_WRAP_BASH defaults off");
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "1" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "on" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "0" }).wrapBash, false);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "off" }).wrapBash, false);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "" }).wrapBash, false);
+	});
+
+	test("a bash command is rewritten in place to the run wrapper, keeping timeout", () => {
+		assert.deepEqual(wrapInput({ command: "ls -la /tmp" }, "ws-1", true), { command: WRAPPED("ws-1", "ls -la /tmp") });
+		assert.deepEqual(wrapInput({ command: "go test ./...", timeout: 5000 }, "ws-1", true), { command: WRAPPED("ws-1", "go test ./..."), timeout: 5000 });
+	});
+
+	test("the mutation reaches the caller's object, which is how Pi applies it", () => {
+		const input = { command: "ls" };
+		const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input };
+		mutateBashInput(event, "ws-1", true);
+		assert.equal(event.input.command, WRAPPED("ws-1", "ls"), "the same object Pi executes is rewritten");
+	});
+
+	test("a command that is empty, blank or already wrapped is left byte-identical", () => {
+		for (const command of ["", "   ", "\t\n", WRAPPED("ws-1", "ls"), "xmustard-core run -- ls", "/usr/local/bin/xmustard-core run -- ls"]) {
+			assert.deepEqual(wrapInput({ command }, "ws-1", true), { command }, `must not wrap: ${JSON.stringify(command)}`);
+		}
+	});
+
+	test("no resolved workspace means no wrap: the command runs natively", () => {
+		assert.deepEqual(wrapInput({ command: "ls" }, undefined, true), { command: "ls" });
+		assert.deepEqual(wrapInput({ command: "ls" }, "", true), { command: "ls" });
+	});
+
+	test("only bash is wrapped; every other tool keeps byte-identical input", () => {
+		for (const toolName of ["read", "grep", "find", "ls", "edit", "write", "powershell", "ground", "search", "impact", "xmustard_expand", "my_custom_tool"]) {
+			const input = toolName === "read" || toolName === "edit" || toolName === "write" ? { path: "/a/b.go", command: "x" } : { command: "ls", path: "/a" };
+			const event = { type: "tool_call" as const, toolCallId: "c1", toolName, input: structuredClone(input) as Record<string, unknown> };
+			mutateBashInput(event as never, "ws-1", true);
+			assert.deepEqual(event.input, input, `${toolName} must not be wrapped`);
+		}
+	});
+
+	test("a non-object or commandless input is left alone rather than throwing", () => {
+		for (const input of [undefined, null, {}, { command: 7 }, { command: null }, []]) {
+			const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input } as never;
+			assert.doesNotThrow(() => mutateBashInput(event, "ws-1", true), JSON.stringify(input));
+		}
+	});
+
+	test("wrapping is idempotent through the wrapper's own argv parser", () => {
+		// the wrapped form parses back to the same wrapper invocation, so a model that
+		// repeats a wrapped command does not nest two wrappers
+		const once = WRAPPED("ws-1", "ls -la");
+		assert.deepEqual(wrapInput({ command: once }, "ws-1", true), { command: once });
 	});
 });

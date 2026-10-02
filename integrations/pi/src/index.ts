@@ -17,6 +17,7 @@ import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
+import { mutateBashInput } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
@@ -125,6 +126,19 @@ export default function xmustard(pi: ExtensionAPI): void {
 			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand);
 		}
 		return undefined; // other tools pass through untouched
+	});
+
+	// WS-44e (PAR-ADP-09): a bash call's command is rewritten to the run wrapper
+	// before Pi executes it, so its output is reduced server-side. The workspace is
+	// resolved here, inside the same deadline every other projection uses; a
+	// workspace that cannot resolve leaves the command native.
+	pi.on("tool_call", async (event, ctx) => {
+		if (!cfg.wrapBash) return undefined;
+		await resolveWorkspace(ctx.cwd, ctx.signal).then(
+			(ws) => mutateBashInput(event, ws, true),
+			() => mutateBashInput(event, undefined, true),
+		);
+		return undefined;
 	});
 
 	// masking returns the drafts earlier handlers proposed plus its context edits
