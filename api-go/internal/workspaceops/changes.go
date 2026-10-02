@@ -118,7 +118,7 @@ func RebaselineIndex(ctx context.Context, dataDir, workspaceID, principal string
 	if _, _, err := resolveChangeRootCtx(ctx, dataDir, workspaceID); err != nil {
 		return nil, err
 	}
-	unlock, err := lockStore(baselinePath(dataDir, workspaceID))
+	unlock, err := lockStoreCtx(ctx, baselinePath(dataDir, workspaceID))
 	if err != nil {
 		return nil, err
 	}
