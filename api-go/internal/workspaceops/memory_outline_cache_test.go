@@ -262,6 +262,59 @@ func TestTheOutlineCacheIsAGoverorComponent(t *testing.T) {
 	}
 }
 
+// An outline the index cut short is never cached. The first pass cannot say the symbol is
+// gone, and a cache built from a partial outline would answer "missing" wrongly on the next
+// pass; so the second pass, on a complete outline, must hash and mark like a cold cache.
+func TestATruncatedOutlineIsNeverCached(t *testing.T) {
+	resetOutlineCache(t)
+	f := newInvalidationFixture(t)
+	clearOutlineHashes()
+	ctx := context.Background()
+
+	full := stubOutline(f.root)
+	orig := symbolOutline
+	t.Cleanup(func() { symbolOutline = orig })
+	symbolOutline = func(ctx context.Context, a, b, rel string) (symbolSpans, error) {
+		if _, err := full(ctx, a, b, rel); err != nil {
+			return nil, err
+		}
+		spans, _ := full(ctx, a, b, rel)
+		keep := symbolSpans{}
+		for _, sp := range spans {
+			if sp.Name == "ListenPort" {
+				keep = append(keep, sp)
+			}
+		}
+		return keep, errOutlineIncomplete
+	}
+
+	first, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Marked) != 0 {
+		t.Fatalf("a truncated outline marked the memory: %+v", first)
+	}
+	if n := outlineHashEntries(); n != 0 {
+		t.Fatalf("a truncated outline cached %d entries, want none", n)
+	}
+
+	// A complete outline on the same unchanged file must therefore hash again: nothing
+	// partial was cached to answer the next pass. The body is unchanged, so it is not
+	// drifted and nothing is marked; the count is the proof that the pass really hashed.
+	symbolOutline = full
+	second, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Hashed != 1 {
+		t.Fatalf("after a truncated outline the next pass hashed %d, want 1: a partial outline was cached", second.Hashed)
+	}
+	if len(second.Marked) != 0 {
+		t.Fatalf("an unchanged file was marked: %v", second.Marked)
+	}
+}
+
 // A file that is gone stays missing across a warm cache: the cache holds hashes, never a
 // verdict, so it cannot turn a missing file into an unchanged one.
 func TestACachedHashNeverBecomesAMissingVerdict(t *testing.T) {
