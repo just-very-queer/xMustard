@@ -152,6 +152,29 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				t.Fatalf("%s mode without a valid token must get the public view", mode)
 			}
 		}
+		// The counter above can only judge a restricted poll while no heavy work
+		// runs, because the watchdog samples for its own reasons. The product
+		// claim is the same either way, so check it the only way a busy slot
+		// allows: a restricted poll taken *during* heavy work must still get the
+		// public view, and must not see the slot's owner in the budget block. A
+		// regression that sampled only under load would pass the counter above
+		// and fail here.
+		busy := holdSlot(t)
+		for who, tok := range tokens {
+			if want[who] {
+				continue
+			}
+			under := health(tok)
+			if isFull(t, under) {
+				busy()
+				t.Fatalf("%s mode, %s token: a restricted poll under heavy work got the full view", mode, who)
+			}
+			if b, _ := dig(t, under, "budget").(map[string]any); len(b) != 4 {
+				busy()
+				t.Fatalf("%s mode, %s token: a restricted poll under heavy work leaked activity: %v", mode, who, b)
+			}
+		}
+		busy()
 	}
 	t.Setenv("XMUSTARD_AUTH", "off")
 	off := holdSlot(t)
@@ -164,21 +187,65 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	// them: the counter would otherwise move for the watchdog's reasons. That is
 	// now structural, the slot being released before every restricted poll, so
 	// assert the structure instead of hoping for it. The sampler must be live
-	// while a slot is held, and silent once it is released, because the second
-	// half is what makes the restricted polls' counter meaningful.
+	// while a slot is held and silent once it is released. Both halves wait for
+	// the state they need rather than assuming a sleep is long enough, because a
+	// test goroutine can wake before the watchdog goroutine has been scheduled at
+	// all, and a sleep that is "obviously long enough" is how this row's own
+	// flake was born.
 	held := holdSlot(t)
+	// The admission sample taken by AcquireHeavy is not a watchdog tick, so the
+	// baseline is read after the slot is held and only later samples count.
 	afterAcquire := samples.Load()
-	time.Sleep(2 * budget.DefaultWatchInterval)
-	ticks := samples.Load() - afterAcquire
-	if ticks == 0 {
+	if !waitFor(t, watchdogDeadline, func() bool { return samples.Load() > afterAcquire }) {
 		held()
 		t.Fatal("the heavy-slot watchdog never sampled, so the counter this test relies on proves nothing")
 	}
 	held()
-	quiet := samples.Load()
-	time.Sleep(2 * budget.DefaultWatchInterval)
-	if after := samples.Load(); after != quiet {
-		t.Fatalf("the watchdog kept sampling after the slot was released: %d samples", after-quiet)
+	if !waitQuiet(t, watchdogDeadline, samples.Load) {
+		t.Fatal("the watchdog kept sampling after the slot was released")
+	}
+}
+
+// watchdogDeadline bounds the two watchdog waits below. It is a deadline on
+// waiting for a state, not a bound on production behaviour and not a timeout
+// the code under test has to meet, so it is not the kind of test bound §3.3
+// holds DO NOT DECIDE; a longer wait cannot make a broken watchdog pass, and a
+// shorter one only makes a loaded runner fail sooner.
+const watchdogDeadline = 5 * time.Second
+
+// waitFor polls cond until it holds and reports whether it did within the
+// deadline.
+func waitFor(t *testing.T, within time.Duration, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for !cond() {
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(time.Millisecond)
+	}
+	return true
+}
+
+// waitQuiet reports whether read holds the same value for a whole watch
+// interval, which is the evidence that nothing is sampling any more. It waits
+// for the state rather than asserting on a fixed sleep, and it retries within
+// the deadline because a sample already in flight when the slot was released
+// can land just after it.
+func waitQuiet(t *testing.T, within time.Duration, read func() int64) bool {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	before := read()
+	for {
+		time.Sleep(budget.DefaultWatchInterval)
+		if now := read(); now != before {
+			// the counter moved, so something is still sampling; this is the
+			// failure the caller reports, and no amount of waiting hides it
+			return false
+		}
+		if !time.Now().Before(deadline.Add(-budget.DefaultWatchInterval)) {
+			return true
+		}
 	}
 }
 
