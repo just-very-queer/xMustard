@@ -423,7 +423,8 @@ func maxRequestBodyBytesConfigured() int64 {
 
 // requestBodyCapBytes is the cap a request body is admitted against: the configured
 // cap, which bodyLimitMiddleware applies to a route that streams its body to disk
-// (streamsRequestBody, which capture is). /api/health reports this, so the advertised
+// (streamsRequestBody, which capture is). It is the single read point for both the
+// middleware's streamLimit and /api/health's request_body_cap_bytes, so the advertised
 // limit is the one the server enforces on capture, not the pool-capped limit that
 // applies only to a body reserved in the transient pool.
 func requestBodyCapBytes() int64 { return maxRequestBodyBytesConfigured() }
@@ -455,7 +456,7 @@ func bodyLimitMiddleware(next http.Handler) http.Handler {
 	// A body reserved in the transient pool can never exceed the pool, so its cap is
 	// the pool size (a permanent 413, not a retried 503). A body its handler streams to
 	// disk (streamsRequestBody) is never reserved, so it keeps the configured cap.
-	streamLimit := maxRequestBodyBytesConfigured()
+	streamLimit := requestBodyCapBytes()
 	reservedLimit := budget.CapToPool(streamLimit)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Every request gets a transient-byte ledger held until the handler returns
