@@ -2234,7 +2234,7 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
 
 **Requirements.** PAR-ADP-01, PAR-ADP-02, PAR-HAR-03 (an agent reading an argument error learns what is actually wrong, and the same call always gets the same answer).
 
-**Files.** `api-go/internal/mcpserver/schema.go` (the visiting order in `BuildArgs`), `api-go/internal/mcpserver/server_test.go` (the deterministic-order test and the strengthened assertion), `docs/plans/2026-09-25-parity-build-plan.md` (this record).
+**Files.** `api-go/internal/mcpserver/schema.go` (the visiting order in `BuildArgs`), `api-go/internal/mcpserver/buildargs_order_test.go` (new, the deterministic-order test), `api-go/internal/mcpserver/connection_options_test.go` (the strengthened write-tool test), `api-go/internal/mcpserver/arg_errors_test.go` (the strengthened hint test), `docs/plans/2026-09-25-parity-build-plan.md` (this record).
 
 **Tests required.** A test that builds the same call repeatedly (many iterations, so a randomized order would show) and asserts the reported argument, the message and the resulting `args` map are identical every time, for a call carrying both a repairable alias and a bad argument, and for a call setting a hidden alias and its canonical name to different values. Both existing tests whose comments overstate their checks are strengthened so each stated property fails on its own mutation.
 
