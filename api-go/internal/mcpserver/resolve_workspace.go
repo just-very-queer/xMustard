@@ -361,6 +361,17 @@ func rootsBackoff(cached *rootsState, timedOut bool) time.Duration {
 	return 0
 }
 
+// unsentRootCause reports a roots/list request that was never delivered, so the
+// client's answer says nothing about its roots and nothing about its health. On a
+// Streamable HTTP session a plain JSON exchange has no event stream to ask on, and
+// every such call fails this way; treating that as a client failure would let two
+// streamless calls open a window that suppresses the next stream-capable call, which
+// would then resolve from the server's working directory instead of the client's
+// root. Such a failure is not cached at all.
+func unsentRootCause(err error) bool {
+	return errors.Is(err, errNoStream)
+}
+
 func rootOf(list []registeredWorkspace, id string) string {
 	for _, w := range list {
 		if w.ID == id {
@@ -398,6 +409,12 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 	case err != nil && errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
 		st.err = "the client does not implement roots/list"
 	case err != nil:
+		// The request was never delivered, so the client's roots are unknown for this
+		// call and nothing is kept: caching it would suppress the next request that
+		// could have carried an answer.
+		if unsentRootCause(err) {
+			return nil, "roots/list failed: " + err.Error(), true
+		}
 		// A failure is now kept even without a window, so its text outlives the call
 		// and is held for the session. The client's message can be as large as one
 		// transport message (8 MiB by default), so it is clipped before it is stored
@@ -432,6 +449,17 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			}
 		}
 		if len(st.paths) == 0 && st.err == "" {
+			// An answer with no roots array at all ({} or {"roots":null}) decodes
+			// cleanly but does not carry the field the request asked for, so it is
+			// not a statement about the client's roots; caching it would hide a
+			// client that has them until roots/list_changed.
+			var shape map[string]json.RawMessage
+			if json.Unmarshal(raw, &shape) == nil {
+				if _, ok := shape["roots"]; !ok {
+					st.err, st.transient = "roots/list answer carries no roots field", true
+					break
+				}
+			}
 			st.err = "the client listed no file:// roots"
 		}
 	}

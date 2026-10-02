@@ -361,6 +361,74 @@ func TestMalformedRootsAnswerContributesNoRoots(t *testing.T) {
 	}
 }
 
+// A roots/list request that was never delivered says nothing about the client, so it
+// is not cached and cannot open a window. On a Streamable HTTP session a plain JSON
+// exchange has no event stream to ask on; if that counted as a client failure, two
+// streamless calls would suppress the next stream-capable call and it would resolve
+// from the working directory instead of the client's root.
+func TestUnsentRootsRequestIsNotCached(t *testing.T) {
+	project, other := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}, {ID: "other-ws", Root: other}}}
+	// every request before the last never reaches the client
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){
+		fail(errNoStream), fail(errNoStream), fail(errNoStream), rootsAnswer(project),
+	}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2026-06-18")
+
+	for i := 0; i < 3; i++ {
+		res, _ := call(t, s, "ground", map[string]any{})
+		// the working directory answers while the client's roots are unknown
+		if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD {
+			t.Fatalf("call %d: %+v", i+1, ws)
+		}
+	}
+	// nothing is kept: an undelivered request says nothing about the client
+	s.mu.Lock()
+	cached := s.roots
+	s.mu.Unlock()
+	if cached != nil {
+		t.Fatalf("an undelivered request was cached: %+v", cached)
+	}
+	// the next request is still made, and the client's root is used
+	res, _ := call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || ws.Source != SourceRoots || client.count() != 4 {
+		t.Fatalf("the client's root must be used after unsent requests: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// An answer that carries no roots field is not a statement about the client's roots,
+// so it is asked again; one that carries an empty roots array is.
+func TestRootsAnswerWithoutARootsFieldIsAskedAgain(t *testing.T) {
+	project := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	noField := func() (json.RawMessage, error) { return json.RawMessage(`{"capabilities":{}}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){noField, rootsAnswer(project)}}
+	s := newSession(t, api, Options{}, client, "2026-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "carries no roots field") {
+		t.Fatalf("an answer with no roots field must say so: %v", text(res))
+	}
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
+		t.Fatalf("the client must be asked again: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// An empty roots array is a real answer: the client has no file roots, and that is
+// kept until roots/list_changed.
+func TestEmptyRootsArrayIsDefinitive(t *testing.T) {
+	empty := func() (json.RawMessage, error) { return json.RawMessage(`{"roots":[]}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){empty}}
+	s := newSession(t, &fakeAPI{}, Options{}, client, "2026-06-18")
+	for i := 0; i < 3; i++ {
+		call(t, s, "ground", map[string]any{})
+	}
+	if n := client.count(); n != 1 {
+		t.Fatalf("roots/list asked %d times; an empty roots array is definitive", n)
+	}
+}
+
 // A client that does not implement roots/list says so once; that answer is kept.
 func TestRootsMethodNotFoundIsKept(t *testing.T) {
 	repo := tempRepo(t)
