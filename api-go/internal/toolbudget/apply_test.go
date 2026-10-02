@@ -222,19 +222,22 @@ func TestTrimmedPageContinuesAtTheFirstHitNotReturned(t *testing.T) {
 	t.Fatal("trimmed never reached")
 }
 
-// A trimmed rung cuts hits, so the producer's page `omitted` (hits after the page)
-// understates what the delivered answer left out. `omitted` counts the ranked hits
-// the result does not carry: total - the hits actually delivered, at any offset and
-// at every rung that returns hits (WS-FIX-18).
-func TestOmittedCountsTheHitsTheResultDoesNotCarry(t *testing.T) {
+// A trimmed rung cuts hits, so the producer's page `omitted` (the ranked hits
+// after the page) understates what the delivered answer left out. `omitted` is
+// total - the page's offset - the hits actually delivered, at any offset and at
+// every rung that returns hits; with nothing cut it is the producer's own value
+// (WS-FIX-18).
+func TestOmittedCountsTheHitsAfterThePage(t *testing.T) {
 	for _, offset := range []int{0, 20} {
 		r := searchResult(10, 600)
 		r["offset"] = offset
+		producer := 40 - offset - 10 // hits after this page
+		r["omitted"] = producer
 		full := run(t, "search", r, Request{MaxChars: MaxMaxChars}, Page{Offset: offset, Cursor: cursorAt}, nil)
-		// with nothing cut, the producer's value stands
-		if got := full.out["omitted"]; got != 30.0 {
-			t.Fatalf("offset %d uncut omitted=%v, want the producer's 30", offset, got)
+		if got := full.out["omitted"]; got != float64(producer) {
+			t.Fatalf("offset %d uncut omitted=%v, want the producer's %d", offset, got, producer)
 		}
+		sawTrimmed := false
 		for max := fullSize(t, "search", r); max >= MinMaxChars; max -= 25 {
 			a := run(t, "search", r, Request{MaxChars: max}, Page{Offset: offset, Cursor: cursorAt}, nil)
 			delivered := 0
@@ -244,11 +247,20 @@ func TestOmittedCountsTheHitsTheResultDoesNotCarry(t *testing.T) {
 			if a.out["total"] == nil {
 				continue
 			}
-			want := a.out["total"].(float64) - float64(delivered)
+			want := a.out["total"].(float64) - float64(offset) - float64(delivered)
 			if got := a.out["omitted"]; got != want {
-				t.Fatalf("offset %d stage %s max_chars %d: omitted=%v, want total-len(hits)=%v (delivered %d)",
+				t.Fatalf("offset %d stage %s max_chars %d: omitted=%v, want total-offset-len(hits)=%v (delivered %d)",
 					offset, a.rep.DegradedStage, max, got, want, delivered)
 			}
+			if a.rep.DegradedStage == "trimmed" {
+				sawTrimmed = true
+				if delivered == 0 || delivered == 10 {
+					t.Fatalf("offset %d trimmed delivered %d of 10 page hits", offset, delivered)
+				}
+			}
+		}
+		if !sawTrimmed {
+			t.Fatalf("offset %d never reached the trimmed stage", offset)
 		}
 	}
 }

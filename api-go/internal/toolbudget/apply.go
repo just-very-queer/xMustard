@@ -894,16 +894,17 @@ func (b *budgeter) writeListValue(w *bytes.Buffer, l *listState) {
 	writeList(w, l.items, l.k, l.item)
 }
 
-// writeOmitted writes a hybrid result's omitted member: the ranked hits the delivered
-// answer does not carry, total - the hits the paged list kept. The producer's value
-// counts the hits after its page, so it understates once a rung trims the list;
-// with nothing cut it equals total - kept and stands (WS-FIX-18).
+// writeOmitted writes a hybrid result's omitted member: the ranked hits that come
+// after this page, total - the offset the page starts at - the hits the paged list
+// kept. The producer's value counts the hits after its page, so it understates
+// once a rung trims the list; with nothing cut the two agree and stand
+// (WS-FIX-18).
 func (b *budgeter) writeOmitted(w *bytes.Buffer) {
 	delivered := 0
 	if b.paged != nil {
 		delivered = b.paged.kept()
 	}
-	w.WriteString(strconv.Itoa(max(b.ranked-delivered, 0)))
+	w.WriteString(strconv.Itoa(max(b.ranked-b.page.Offset-delivered, 0)))
 }
 
 // nextCursor continues the paged list at its first item not returned. When the budget
