@@ -187,13 +187,14 @@ func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
 	}
 }
 
-// A registered working directory still answers every call inside the back-off window,
-// and still registers nothing: the client's roots are unknown, not absent.
+// A registered working directory still answers every call while the client's roots
+// are unknown, and still registers nothing. The window is checked by state rather
+// than by wall clock, so the test cannot fail when the host is loaded.
 func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
 	other := tempRepo(t)
 	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "other-ws", Root: other}}}
 	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
-	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy}}
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy, busy}}
 	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
 	for i := 0; i < 4; i++ {
 		res, _ := call(t, s, "ground", map[string]any{})
@@ -204,8 +205,17 @@ func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
 	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
 		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
 	}
-	if n := client.count(); n != 2 {
-		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
+	// The second failure opened the window, so the calls above added no request; the
+	// count is read against the window rather than against a duration.
+	s.mu.Lock()
+	window := time.Until(s.roots.retryAt)
+	asked := client.count()
+	s.mu.Unlock()
+	if window <= 0 {
+		t.Fatalf("the back-off window is not open after two failures (%s)", window)
+	}
+	if asked > 2 {
+		t.Fatalf("roots/list asked %d times; a call reopened the window", asked)
 	}
 }
 
@@ -213,22 +223,21 @@ func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
 // failure backs off once it has followed a cached failure, and a first prompt failure
 // does not back off at all.
 func TestRootsBackoffTable(t *testing.T) {
-	deadline := fmt.Errorf("roots/list: %w", context.DeadlineExceeded)
-	prompt := errors.New("transport closed")
 	cases := []struct {
-		name   string
-		cached *rootsState
-		err    error
-		want   time.Duration
+		name     string
+		cached   *rootsState
+		timedOut bool
+		want     time.Duration
 	}{
-		{"timeout after nothing", nil, deadline, rootsRetryAfter},
-		{"prompt failure after a timeout", &rootsState{transient: true}, prompt, rootsRetryAfterFailure},
-		{"prompt failure after a prompt failure", &rootsState{transient: true}, prompt, rootsRetryAfterFailure},
-		{"prompt failure after nothing", nil, prompt, 0},
-		{"prompt failure after a good answer", &rootsState{}, prompt, 0},
+		{"timeout after nothing", nil, true, rootsRetryAfter},
+		{"timeout after a cached failure", &rootsState{transient: true}, true, rootsRetryAfter},
+		{"prompt failure after a timeout", &rootsState{transient: true}, false, rootsRetryAfterFailure},
+		{"prompt failure after a prompt failure", &rootsState{transient: true}, false, rootsRetryAfterFailure},
+		{"prompt failure after nothing", nil, false, 0},
+		{"prompt failure after a good answer", &rootsState{}, false, 0},
 	}
 	for _, c := range cases {
-		if got := rootsBackoff(c.cached, c.err); got != c.want {
+		if got := rootsBackoff(c.cached, c.timedOut); got != c.want {
 			t.Errorf("%s: rootsBackoff = %s, want %s", c.name, got, c.want)
 		}
 	}
@@ -254,6 +263,17 @@ func TestMalformedRootsAnswerIsAskedAgain(t *testing.T) {
 	}
 	if n := client.count(); n != 2 {
 		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
+	}
+	// calls inside the window are served from the cached failure, so no further
+	// request is sent even when the answer would be malformed again
+	for i := 0; i < 3; i++ {
+		res, _ = call(t, s, "ground", map[string]any{})
+		if !strings.Contains(text(res), "roots/list answer is malformed") {
+			t.Fatalf("call %d inside the window should still report the malformed answer: %v", i+3, text(res))
+		}
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times inside the window", n)
 	}
 	s.mu.Lock()
 	s.roots.retryAt = time.Now().Add(-time.Second)

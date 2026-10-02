@@ -338,21 +338,19 @@ func (s *Session) rootFor(ctx context.Context, id string) string {
 }
 
 // rootsBackoff is how long roots/list is not asked again after a failure, or zero
-// when it is asked again on the next call. cached is the state the failing request
-// started from, so a request that followed a cached failure is the second in a row.
-// A timeout backs off after one attempt because it already cost the caller
-// rootsTimeout; a prompt failure backs off once it has failed twice in a row, so a
-// client that fails once still recovers on the very next call.
+// when it is asked again on the next call. timedOut is a failure that already cost
+// the caller rootsTimeout. followedFailure reports that this failure came after one
+// already cached, so it is the second in a row.
 //
-// A malformed answer is a failure of the client too: the request reached the client
-// and came back unreadable, so it is transient and asked again like any other
-// failure. Treating it as a definitive "the client has no usable roots" cached it
-// until roots/list_changed, which is the opposite of what a parse error means.
-func rootsBackoff(cached *rootsState, err error) time.Duration {
-	if errors.Is(err, context.DeadlineExceeded) {
+// A timeout backs off after one attempt because it already cost the caller
+// rootsTimeout. A prompt failure backs off once it has failed twice in a row, so a
+// client that fails once still recovers on the very next call. Both classes of
+// failure go through here, so they cannot drift apart.
+func rootsBackoff(cached *rootsState, timedOut bool) time.Duration {
+	switch {
+	case timedOut:
 		return rootsRetryAfter
-	}
-	if cached != nil && cached.transient {
+	case cached != nil && cached.transient:
 		return rootsRetryAfterFailure
 	}
 	return 0
@@ -399,11 +397,9 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 		// The first prompt failure gets no window, so a client that fails once is
 		// asked again on the next call; the state is kept either way, so the next
 		// failure is known to be the second in a row and can back off.
-		if after := rootsBackoff(cached, err); after > 0 {
+		if after := rootsBackoff(cached, errors.Is(err, context.DeadlineExceeded)); after > 0 {
 			st.retryAt = time.Now().Add(after)
 			st.err += fmt.Sprintf(" (asked again after %s)", after)
-		} else {
-			st.retryAt = time.Time{}
 		}
 	default:
 		var r struct {
@@ -415,9 +411,9 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			// the client answered, but the answer cannot be read: transient, so it is
 			// asked again rather than cached as "the client has no usable roots"
 			st.err, st.transient = "roots/list answer is malformed: "+err.Error(), true
-			if cached != nil && cached.transient {
-				st.retryAt = time.Now().Add(rootsRetryAfterFailure)
-				st.err += fmt.Sprintf(" (asked again after %s)", rootsRetryAfterFailure)
+			if after := rootsBackoff(cached, false); after > 0 {
+				st.retryAt = time.Now().Add(after)
+				st.err += fmt.Sprintf(" (asked again after %s)", after)
 			}
 		}
 		for _, root := range r.Roots {
