@@ -712,21 +712,25 @@ pub fn search(
     };
 
     // document frequency of each query token across symbol names (idf). Snapshots list
-    // symbols grouped by name, so the per-name work runs once per distinct name.
+    // symbols grouped by name, so the per-name work runs once per distinct name. Text mode
+    // fuses the body lane alone, so no name score reads idf and the traversal is skipped:
+    // it is repository-scale work whose result nothing would consume.
     let n = graph.symbol_count().max(1) as f64;
     let mut df = vec![0usize; qtokens.len()];
-    let mut last: (String, u128) = (String::new(), 0);
-    check(
-        "symbols",
-        graph.for_each_symbol(&mut |s| {
-            if last.0 != s.name {
-                last = (s.name.to_string(), token_bits(&qtokens, s.name));
-            }
-            for (i, d) in df.iter_mut().enumerate() {
-                *d += usize::from(last.1 & (1 << i) != 0);
-            }
-        }),
-    );
+    if !body_only {
+        let mut last: (String, u128) = (String::new(), 0);
+        check(
+            "symbols",
+            graph.for_each_symbol(&mut |s| {
+                if last.0 != s.name {
+                    last = (s.name.to_string(), token_bits(&qtokens, s.name));
+                }
+                for (i, d) in df.iter_mut().enumerate() {
+                    *d += usize::from(last.1 & (1 << i) != 0);
+                }
+            }),
+        );
+    }
     let idf = |i: usize| -> f64 { ((n + 1.0) / (df[i] as f64 + 1.0)).ln() + 1.0 };
     let q_vec = name_vector(query);
 
@@ -820,7 +824,9 @@ pub fn search(
     check(
         "files",
         graph.for_each_file(&mut |f| {
-            if text_paths.contains(f.path) {
+            if text_paths.contains(f.path) && !body_only {
+                // the inbound map feeds the structural lane's score, which text mode does
+                // not run, so the per-file entry is built for nothing there
                 inbound.insert(f.path.to_string(), f.inbound);
             }
             if !admit(f.path) {
@@ -911,12 +917,17 @@ pub fn search(
         Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
         _ => exact.first().map(|(_, _, name)| name.to_string()),
     };
-    let seed_impact = effective_seed.as_ref().and_then(|seed_name| {
-        graph
-            .impact(seed_name, PROXIMITY_DEPTH)
-            .inspect_err(|e| read_errors.push(("seed impact", e.clone())))
-            .ok()
-    });
+    // The proximity lane does not run in text mode, so its blast-radius walk is not read:
+    // the traversal is bounded by the graph depth but scales with the seed's reach.
+    let seed_impact = (!body_only)
+        .then(|| effective_seed.as_ref())
+        .flatten()
+        .and_then(|seed_name| {
+            graph
+                .impact(seed_name, PROXIMITY_DEPTH)
+                .inspect_err(|e| read_errors.push(("seed impact", e.clone())))
+                .ok()
+        });
     if let Some(impact) = seed_impact {
         let mut prox: HashMap<String, f64> = HashMap::new();
         // The proximity map is keyed by path and read straight off the seed's blast
@@ -1584,6 +1595,58 @@ mod tests {
             mixed.hits
         );
         assert_eq!(mixed.hits[0].path, lower.hits[0].path);
+    }
+
+    // A language filter does not merely drop doc hits after the fact: the docs lane is not
+    // asked for at all. `DOCS_K` reads 30 rows plus the OR fallback, and every one of them
+    // is discarded because a docs path has no code language pack. The observable
+    // difference is that a filtered search reads no doc row, which a hit-level assertion
+    // cannot distinguish from a lane that read them and dropped them.
+    #[test]
+    fn a_language_filter_asks_for_no_docs_rows() {
+        let repo = indexed_repo(&[
+            ("svc/handler.go", "package svc\n\nfunc settle() {\n\tledger()\n}\n"),
+            (
+                "docs/PLAN.md",
+                "# Plan\n\nUnique marker zephyr_quota is documented only here.\n",
+            ),
+        ]);
+        let unfiltered = search(
+            repo.path(),
+            "ws",
+            None,
+            "zephyr_quota",
+            &SearchOptions {
+                limit: 20,
+                ..Default::default()
+            },
+        );
+        assert!(
+            unfiltered.hits.iter().any(|h| h.kind == "doc"),
+            "the fixture must reach the docs lane unfiltered: {:?}",
+            unfiltered.hits
+        );
+
+        // Read the lane window directly. `fts::lanes` is the only place the docs k is
+        // decided, so this asserts on it rather than on a hit the search would drop.
+        let source = crate::symbolgraph::query_source_for(repo.path(), "ws", None);
+        let opened = text_index(&source, &mut Vec::new()).expect("the fixture indexes");
+        let terms = vec!["zephyr_quota".to_string()];
+        opened.snapshot.with_text(|conn| {
+            let both = crate::index::fts::lanes(conn, &terms, None, 10, 30, None, false)
+                .expect("the unfiltered lanes read");
+            assert!(!both.docs.is_empty(), "the fixture reaches the docs lane");
+            let filtered =
+                crate::index::fts::lanes(conn, &terms, None, 10, 30, Some("go"), false)
+                    .expect("the filtered lanes read");
+            assert!(
+                filtered.docs.is_empty(),
+                "a language filter reads no docs rows: {:?}",
+                filtered.docs
+            );
+            Ok(())
+        })
+        .expect("the text snapshot closes");
     }
 
     // `lang` filters the docs lane too. The docs lane has no `files.lang` to read, so a

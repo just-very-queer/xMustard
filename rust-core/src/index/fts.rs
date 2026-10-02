@@ -341,9 +341,14 @@ pub fn lanes(
             .and_then(|g| g.parse().ok())
             .unwrap_or(0);
         let code = if body_only { BODY } else { CODE };
+        // A docs path has no code language pack, so a `lang` filter can never admit a doc
+        // row. Asking for the lane spends a bounded FTS query, its OR fallback and a row
+        // allocation per hit on an answer that cannot contain one, so the lane is skipped
+        // here rather than filtered afterwards, for every caller.
+        let docs_k = if lang.is_empty() { doc_k } else { 0 };
         Ok(TextLanes {
             code: lane_hits(conn, code, terms, &glob, code_k, lang)?,
-            docs: lane_hits(conn, DOCS, terms, &glob, doc_k, "")?,
+            docs: lane_hits(conn, DOCS, terms, &glob, docs_k, "")?,
             generation,
         })
     };
