@@ -70,9 +70,10 @@ func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) map[str
 	return TextResult(fmt.Sprintf("%s is served on a read-only connection (mode=%s) only without %s, which write", t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", ")), true)
 }
 
-// refusalText is the message of a refusal tool result, for a resource that reports the
-// refusal in its own error shape.
-func refusalText(res map[string]any) string {
+// refusalResultText is the message of a refusal tool result, for a resource that reports
+// the refusal in its own error shape. (internal/rustcore's refusalText is unrelated: it
+// trims a subprocess's stderr, and the two are in different packages.)
+func refusalResultText(res map[string]any) string {
 	content, _ := res["content"].([]map[string]any)
 	if len(content) == 0 {
 		return ""
