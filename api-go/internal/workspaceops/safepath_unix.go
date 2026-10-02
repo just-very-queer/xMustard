@@ -11,15 +11,16 @@ import (
 )
 
 // openWorkspaceFileBeneath opens rel relative to root WITHOUT following a symlink at
-// ANY path component: it opens the root directory, then walks each component with
+// ANY component of rel: it opens the root directory, then walks each component with
 // openat()+O_NOFOLLOW. Because the returned fd is reached purely through
 // directory-relative opens that refuse to traverse symlinks, the file a caller
 // reads/stats from that fd is exactly the validated in-repo file — a concurrent
 // agent cannot swap a validated regular file for a symlink between check and open
 // (the check-to-open TOCTOU, XM-PRO-007). It rejects absolute paths, "..", NUL, and
-// any symlink component (ELOOP -> errEscape). Symlinks are refused outright (the
-// race-free policy); legitimate in-repo symlinks are rare in source trees and the
-// confinement guarantee is worth more than following them.
+// any symlink component (a final-component ELOOP -> errEscape; an intermediate symlink
+// fails the O_DIRECTORY open, ENOTDIR on darwin, returned as-is). Symlinks are refused
+// outright (the race-free policy); legitimate in-repo symlinks are rare in source trees
+// and the confinement guarantee is worth more than following them.
 func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errNoRoot
@@ -82,13 +83,15 @@ func openWorkspaceFileBeneath(root, rel string) (*os.File, error) {
 }
 
 // createWorkspaceFileBeneath opens rel under root FOR WRITING without following a symlink
-// at ANY component — the write counterpart of openWorkspaceFileBeneath. It walks (and, if
+// at ANY component of rel — the write counterpart of openWorkspaceFileBeneath. It walks (and, if
 // missing, mkdirat-creates) intermediate directories no-follow, then opens the final file
 // O_NOFOLLOW|O_CREAT (plus O_EXCL when overwrite is false). The O_NOFOLLOW on the final
-// open means a symlink an agent planted at the target path is REFUSED (ELOOP) instead of
-// being followed — so generating a starter file can never become an arbitrary host-file
-// write. Returns the fd, whether the file already existed, and an error. When the file
-// exists and overwrite is false, returns (nil, true, nil) — caller skips.
+// open means a symlink an agent planted at the target path is REFUSED (ELOOP; under O_EXCL
+// it is EEXIST and skipped as existing) instead of being followed — so a planted symlink
+// cannot redirect a starter-file write (a planted hard link is not detected: with overwrite
+// it is truncated and written through). Returns the fd, an existed flag (on a successful
+// open this is just `overwrite`, so it is true even when O_CREAT made a new file), and an
+// error. When the file exists and overwrite is false, returns (nil, true, nil) — caller skips.
 func createWorkspaceFileBeneath(root, rel string, overwrite bool) (f *os.File, existed bool, err error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, false, errNoRoot
@@ -148,7 +151,8 @@ func createWorkspaceFileBeneath(root, rel string, overwrite bool) (f *os.File, e
 		}
 		fd, oerr := unix.Openat(cur, part, flags, 0o644)
 		if oerr == nil {
-			// O_EXCL success => newly created; O_TRUNC success => existed (overwrite).
+			// O_EXCL success => newly created; O_TRUNC success is reported as existed
+			// (overwrite), even when O_CREAT just created the file.
 			closeCur2 := cur
 			cur = -1
 			_ = unix.Close(closeCur2)

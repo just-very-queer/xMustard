@@ -1,16 +1,17 @@
 //! Goal runtime: a durable, evidence-gated objective layer for a workspace.
 //!
 //! This is the Rust owner of the `/goal` data contract described in
-//! `docs/GOAL_RUNTIME.md`. It is wire-compatible with the Go shell in
-//! `api-go/internal/workspaceops/goals.go`: it reads and writes the same
-//! `goals.json`, `goal_iterations/<goal_id>.json`, and `goals/<goal_id>.md`
-//! files, so either runtime can own the surface.
+//! `docs/GOAL_RUNTIME.md`. It reads and writes the `goals.json`,
+//! `goal_iterations/<goal_id>.json`, and `goals/<goal_id>.md` files; the Go
+//! shell in `api-go/internal/workspaceops/goals.go` delegates to it through the
+//! `xmustard-core goal` CLI and mirrors these serde structs as its wire types.
 //!
 //! Design guarantees:
-//! * Memory safe: no `unsafe`, no unbounded buffering, atomic file writes.
+//! * Memory safe: no `unsafe`, atomic file writes.
 //! * Type safe: status is a closed enum, every operation returns `Result`.
 //! * Anti-AI-slop guardrails: create/iterate refuse blocking slop, and
-//!   completion is gated on verifiable evidence (see [`slop`]).
+//!   completion is gated on verification evidence or an explicit skip reason
+//!   (see [`slop`]).
 
 use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -53,7 +54,7 @@ pub enum GoalError {
 }
 
 /// Closed set of goal lifecycle states. Serializes to the same lowercase
-/// strings the Go shell writes (`draft`, `active`, ...).
+/// strings as the Go shell's `GoalStatus*` constants (`draft`, `active`, ...).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum GoalStatus {
@@ -75,7 +76,7 @@ impl GoalStatus {
         }
     }
 
-    /// Parse a status string the way the Go shell does: trimmed and lowercased.
+    /// Parse a status string: trimmed and lowercased.
     pub fn parse(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "draft" => Ok(GoalStatus::Draft),
@@ -114,9 +115,9 @@ pub struct GoalEvidence {
 }
 
 impl GoalEvidence {
-    /// True when this evidence is durable proof of a successful check, matching
-    /// `isVerificationEvidence` in the Go shell. Either an explicit verification
-    /// kind, or a command paired with a passing outcome.
+    /// True when this evidence counts as verification for the completion gate.
+    /// Either an explicit verification kind (whatever its outcome), or a
+    /// command paired with a passing outcome.
     pub fn is_verification(&self) -> bool {
         let kind = self.kind.trim().to_ascii_lowercase();
         let outcome = self.outcome.trim().to_ascii_lowercase();
@@ -234,8 +235,9 @@ pub struct GoalIterationAppendRequest {
 // Anti-AI-slop guardrails
 // ---------------------------------------------------------------------------
 
-/// Anti-slop linter: deterministic checks that refuse fabricated, empty, or
-/// unverifiable goal/iteration content. This is the guardrail layer that keeps
+/// Anti-slop linter: deterministic checks that refuse empty, punctuation-only,
+/// or refusal-style goal/iteration content and warn on placeholder or
+/// unverifiable content. This is the guardrail layer that keeps
 /// generated output honest before it becomes durable evidence.
 pub mod slop {
     use super::{GoalEvidence, GoalIterationAppendRequest, GoalRecord, GoalStatus};
@@ -384,8 +386,8 @@ pub mod slop {
         }
     }
 
-    /// Lint a single evidence item: a success claim that nothing can verify is
-    /// the most common form of slop, so flag it.
+    /// Lint a single evidence item: warn on a success claim that nothing can
+    /// verify.
     pub fn lint_evidence(field: &str, evidence: &GoalEvidence) -> Vec<SlopFinding> {
         let mut findings = Vec::new();
         let outcome = evidence.outcome.trim().to_ascii_lowercase();
@@ -472,7 +474,7 @@ pub mod slop {
 
     /// The completion gate, expressed as a lint so the reasons are inspectable.
     /// Marking complete requires at least one verification evidence item across
-    /// the goal record and its iterations.
+    /// the goal record and its iterations, or a non-empty skip reason.
     pub fn lint_completion(
         goal: &GoalRecord,
         iteration_evidence: &[&GoalEvidence],
@@ -499,15 +501,14 @@ pub mod slop {
 }
 
 // ---------------------------------------------------------------------------
-// Time + identity helpers (mirroring the Go shell)
+// Time + identity helpers
 // ---------------------------------------------------------------------------
 
 fn now_utc() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Nanos, true)
 }
 
-/// Strip separators from a timestamp and keep the leading 15 chars, matching
-/// `compactGoalTimestamp` in Go.
+/// Strip separators from a timestamp and keep the leading 15 chars.
 fn compact_timestamp(value: &str) -> String {
     let stripped: String = value
         .chars()
@@ -516,8 +517,11 @@ fn compact_timestamp(value: &str) -> String {
     stripped.chars().take(15).collect()
 }
 
-/// `slugProfileID` clone: lowercase, non-alnum runs to `-`, trimmed. Falls back
-/// to a stable sha1-derived id for non-sluggable titles.
+/// Closely follows Go's `slugProfileID` rules: lowercase, non-alnum runs to `-`,
+/// trimmed. Falls back to a stable sha1-derived `goal-<hex8>` id (Go uses a
+/// `profile-` prefix) for non-sluggable titles. Not byte-identical: Go's
+/// `strings.ToLower` folds Unicode, this folds ASCII only, so a character Go
+/// lowercases into `[a-z0-9]` (U+212A KELVIN SIGN to `k`) is a dash here.
 fn slug_id(value: &str) -> String {
     let lower = value.trim().to_ascii_lowercase();
     let mut slug = String::with_capacity(lower.len());
@@ -721,8 +725,9 @@ pub fn get_goal(data_dir: &Path, workspace_id: &str, goal_id: &str) -> Result<Go
         .ok_or_else(|| GoalError::NotFound(goal_id.to_string()))
 }
 
-/// Create a goal. Blocking anti-slop findings on the title/objective refuse the
-/// create so junk objectives never become durable records.
+/// Create a goal. Blocking anti-slop findings on the title, objective, or
+/// acceptance criteria refuse the create so junk objectives never become
+/// durable records.
 pub fn create_goal(
     data_dir: &Path,
     workspace_id: &str,
@@ -1080,7 +1085,8 @@ pub fn read_ledger(data_dir: &Path, workspace_id: &str, goal_id: &str) -> Result
 }
 
 /// Build the bounded context packet a worker runtime is handed. It carries the
-/// objective surface and recent evidence, never raw source or secrets.
+/// objective surface and recent evidence; it reads no source files and does
+/// not redact stored fields.
 pub fn build_context_packet(data_dir: &Path, workspace_id: &str, goal_id: &str) -> Result<String> {
     let goal = get_goal(data_dir, workspace_id, goal_id)?;
     let iterations = load_iterations(data_dir, workspace_id, goal_id)?;
@@ -1196,7 +1202,7 @@ mod tests {
         assert!(report.ok);
         let fetched = get_goal(dir.path(), "ws1", "build-cli").unwrap();
         assert_eq!(fetched, goal);
-        // goals.json is valid JSON the Go shell can read.
+        // goals.json stores status in the lowercase wire format.
         let raw = fs::read_to_string(goals_path(dir.path(), "ws1")).unwrap();
         assert!(raw.contains("\"status\": \"draft\""));
     }
