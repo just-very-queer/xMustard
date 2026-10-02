@@ -91,22 +91,44 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 	}
 }
 
-// The gate is recall's, not a new rule: a full connection serves both memory
-// resources, each reading exactly the one API call it read before.
+// With recall served, both memory resources return the bytes the API sent,
+// one API call each. The assertion is on the content, not only on the absence of
+// an error: a handler that served an empty or altered body would satisfy "no
+// RPCError" and still break every client that reads these. Each expected body is
+// the literal the fake API serves, so a change to what is served fails the
+// comparison instead of moving both sides at once.
 func TestMemoryResourcesAreServedOnAFullConnection(t *testing.T) {
+	const indexBody = `{"render":"names","entries":[{"id":"e1","title":"t","state":"served"}]}`
+	const coreBody = `{"workspace_id":"bound","text":"[xmustard memory] standing","revision":1}`
 	api := &fakeAPI{handle: func(r Request) *APIResponse {
 		switch {
 		case strings.Contains(r.Path, "/context/active"):
-			return &APIResponse{Status: 200, Body: `{"render":"names","entries":[{"id":"e1","title":"t","state":"served"}]}`}
+			return &APIResponse{Status: 200, Body: indexBody}
 		case strings.Contains(r.Path, "/memory/core"):
-			return &APIResponse{Status: 200, Body: `{"workspace_id":"bound","text":"[xmustard memory] standing","revision":1}`}
+			return &APIResponse{Status: 200, Body: coreBody}
 		}
 		return nil
 	}}
 	s := newSession(t, api, Options{WorkspaceID: "bound"}, nil, LatestProtocolVersion)
-	for _, uri := range []string{MemoryIndexURI, MemoryCoreURI} {
-		if _, rerr := s.Handle(context.Background(), "resources/read", json.RawMessage(`{"uri":"`+uri+`"}`)); rerr != nil {
-			t.Fatalf("%s refused on a full connection: %v", uri, rerr)
+	for _, want := range []struct{ uri, text string }{
+		{MemoryIndexURI, indexBody},
+		{MemoryCoreURI, coreBody},
+	} {
+		res, rerr := s.Handle(context.Background(), "resources/read", json.RawMessage(`{"uri":"`+want.uri+`"}`))
+		if rerr != nil {
+			t.Fatalf("%s refused on a full connection: %v", want.uri, rerr)
+		}
+		contents, _ := res.(map[string]any)["contents"].([]map[string]any)
+		if len(contents) != 1 {
+			t.Fatalf("%s returned %d content blocks, want 1", want.uri, len(contents))
+		}
+		c := contents[0]
+		if c["uri"] != want.uri || c["mimeType"] != "application/json" {
+			t.Fatalf("%s content header: %v", want.uri, c)
+		}
+		text, _ := c["text"].(string)
+		if text != want.text {
+			t.Fatalf("%s body is %q, want the served projection %q", want.uri, text, want.text)
 		}
 	}
 	if n := len(api.toolRequests()); n != 2 {
