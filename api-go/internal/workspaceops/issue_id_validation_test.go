@@ -198,6 +198,9 @@ func assertNoViewsStored(t *testing.T, dataDir, workspaceID string) {
 // byte as they were, so the assertions compare against the pre-call contents rather
 // than searching for the refused id: a write that omitted the id would still slip
 // past a search.
+//
+// An absent file is recorded as a nil map entry, which is distinct from an existing
+// empty one, so a refused create that creates an empty file is caught too.
 func artifactState(t *testing.T, dataDir, workspaceID string) map[string]string {
 	t.Helper()
 	dir := filepath.Join(dataDir, "workspaces", workspaceID)
@@ -207,8 +210,7 @@ func artifactState(t *testing.T, dataDir, workspaceID string) map[string]string 
 	} {
 		content, err := os.ReadFile(filepath.Join(dir, name))
 		if os.IsNotExist(err) {
-			state[name] = "" // absent before, and must still be absent
-			continue
+			continue // absent, and must still be absent
 		}
 		if err != nil {
 			t.Fatalf("read %s: %v", name, err)
@@ -218,17 +220,23 @@ func artifactState(t *testing.T, dataDir, workspaceID string) map[string]string 
 	return state
 }
 
-// assertArtifactsUnchanged fails when a refused create touched any artifact, and
-// treats a file that was absent before and exists now as a write too.
+// assertArtifactsUnchanged fails when a refused create touched any artifact: a file
+// that was absent before and exists now is a write, and so is any change in bytes.
 func assertArtifactsUnchanged(t *testing.T, before map[string]string, dataDir, workspaceID string) {
 	t.Helper()
 	after := artifactState(t, dataDir, workspaceID)
-	for name, want := range before {
+	for name := range after {
+		want, existed := before[name]
+		if !existed {
+			t.Fatalf("a refused create wrote %s (%d bytes)", name, len(after[name]))
+		}
 		if got := after[name]; got != want {
-			if want == "" {
-				t.Fatalf("a refused create wrote %s (%d bytes)", name, len(got))
-			}
 			t.Fatalf("a refused create rewrote %s", name)
+		}
+	}
+	for name := range before {
+		if _, exists := after[name]; !exists {
+			t.Fatalf("a refused create removed %s", name)
 		}
 	}
 }

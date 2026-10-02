@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -83,6 +84,63 @@ func TestCreatedIssueAndViewAreReadableThroughTheirRoutes(t *testing.T) {
 	if code, body := call(t, "DELETE", base+"/views/"+viewID, token, "", nil); code != http.StatusOK {
 		t.Fatalf("delete view %q: want 200, got %d: %v", viewID, code, body)
 	}
+}
+
+// A create must never answer 200 with an id this package's own wildcard validator
+// refuses. The assertion belongs here rather than in workspaceops: safeSegment is
+// the HTTP layer's predicate, so a restated copy of it in the unit test could drift
+// from it while still passing, which is how WS-FIX-12-r1-1 slipped through.
+//
+// Each name is either refused outright or creates an id the validator accepts and
+// the store resolves. Both outcomes are correct; a 200 with an unusable id is not.
+func TestNoCreateReturnsAnIdTheURLLayerWouldRefuse(t *testing.T) {
+	srv, dir := securityServer(t, exposurePosture{Profile: profilePlatform})
+	ws := "wsA"
+	seedIssueWorkspace(t, dir, ws)
+	token := mint(t, dir, "owner", roleAdmin)
+	base := srv.URL + "/api/workspaces/" + ws
+
+	names := []string{
+		"Agent Review", "URGENT: customer", "release-2.0/rc1", "a.b.c",
+		"MiXeD Case", "trailing dot.", "dots...", "1234", "x",
+		"100% done", "wip & done", strings.Repeat("long-", 30),
+		"", "   ", "../../escape",
+	}
+	refused, created := 0, 0
+	for _, name := range names {
+		t.Run(name, func(t *testing.T) {
+			code, body := call(t, "POST", base+"/views", token, mustJSON(t, map[string]string{"name": name}), nil)
+			if code == http.StatusBadRequest {
+				refused++
+				return // the create guard refused it; nothing was stored
+			}
+			if code != http.StatusOK {
+				t.Fatalf("create view %q: %d %v (want 200 or 400)", name, code, body)
+			}
+			created++
+			viewID, _ := body["view_id"].(string)
+			if !wildcardValid("view_id", viewID) {
+				t.Fatalf("create answered 200 with id %q for name %q, which the URL layer refuses", viewID, name)
+			}
+			// And it resolves: an id the validator accepts but the store cannot find
+			// would still be an unreachable object.
+			if code, body := call(t, "DELETE", base+"/views/"+viewID, token, "", nil); code != http.StatusOK {
+				t.Fatalf("delete created view %q: want 200, got %d: %v", viewID, code, body)
+			}
+		})
+	}
+	if created == 0 || refused == 0 {
+		t.Fatalf("the table proved nothing: %d created, %d refused", created, refused)
+	}
+}
+
+func mustJSON(t *testing.T, v any) string {
+	t.Helper()
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(encoded)
 }
 
 // seedIssueWorkspace writes the snapshot CreateIssue and CreateSavedView load.
