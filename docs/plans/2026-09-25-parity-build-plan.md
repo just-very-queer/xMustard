@@ -849,6 +849,25 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *Checks.* `gofmt -l api-go` empty; `cargo fmt --check` exit 0 on the box; the whitespace-stripped character-stream comparison per file (the oracle above, not `git diff -w`); the guard mutation rows; `BOXALL` on the reviewed head, and on the merge commit after the merge. Not run: a GitHub Actions run of the edited workflow, which only GitHub can execute, so the CI finding's evidence is the workflow's own structure.
 - *Follow-ups.* None.
 
+### WS-DOC-03 — Apply the stray code comments the docs branch had to revert
+
+**Goal.** On 2026-09-28 a documentation pass made comment-only edits to two code files that document real behaviour (`createWorkspaceFileBeneath`'s hard-link and existed-flag semantics, and the `goalruntime` module's wire contract with the Go shell). They were correctly reverted from the docs branch, where comment edits do not belong, and saved as `$X/docs-stray-code-comments.patch`. They are documentation, and documentation belongs in a code branch. WS-DOC-03 applies that patch, after checking every claim it makes against the code it describes, because a comment that describes behaviour the code does not have is worse than no comment.
+
+**Requirements.** No new PAR ids. This is comment hygiene: it closes no requirement, changes no behaviour, and asserts nothing new. The comments it corrects had drifted from the code: the Go file's doc comment claimed the `existed` flag means "the file already existed" when a successful open sets it from `overwrite` alone, and the Rust module header described the Go shell as a peer implementation rather than the caller that delegates to this one.
+
+**Files.** `api-go/internal/workspaceops/safepath_unix.go`, `rust-core/src/goalruntime.rs`, `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The patch applies: `git apply --check` on the branch base, saved whole. If it does not check clean, the row records `not applied: <error>` and stops without a code change.
+- Every factual claim the patch adds is verified against the code before it is committed, not after. A comment is only worth more than the stale one it replaces if it is true at the tip, so each rewritten claim is matched to the line that implements it: the `existed` flag to the `O_EXCL`/`O_TRUNC` branch and the named return; the `skip_reason` parameter to `lint_completion`'s signature and its `!has_verification && skip_reason.trim().is_empty()` guard; the Go delegation to `rustcore.RunGoalCommand` in `goals.go` and the `goal` dispatch entry in `xmustard-core.rs`; the lowercase wire format to the `#[serde(rename_all = "lowercase")]` on `GoalStatus` and the test that asserts `"status": "draft"`. A claim that does not hold at the tip is corrected in the commit, not shipped.
+- The diff is comment-only, proven rather than asserted: every added and removed line in `git diff -U0` is classified as a comment, and the non-comment count is 0.
+- S2 holds on the added lines: no narration ("Now we", "First,", "This function", "Added", "Fixed", "per review") and no stub markers.
+- `MAC` on the touched Go package and `BOX1` on the Rust release build, so a comment change that broke a build would be caught by a gate rather than in review.
+
+**Acceptance.** `git apply --check` is clean at the branch base and the patch is applied. The resulting diff touches exactly the two named source files and changes no code: every added and removed line is a comment, the non-comment line count is 0, and the added lines pass S2. Each rewritten claim matches the code it describes at the tip, with the implementing line named in the record. The Go package passes `gofmt -l` (empty), `go vet` and `go test`, and the Rust core builds release. If `git apply --check` fails, the row records `not applied: <error>` in this section and stops; it does not adapt the patch by hand, because a hand-adapted patch is a different patch than the one the owner chose to apply.
+
+**Collision risk.** Two source files plus this section of the plan. `safepath_unix.go` is in WS-FIX-13's and WS-28's neighbourhood (both unstarted or in the queue) and `goalruntime.rs` is not named by any other row in the queue. The patch is comment-only in both files, so a future behaviour change to either function conflicts on hunks this row touches only if it rewrites the same doc comment; §4.8 step 2 re-reads the source diff after merging `feat/parity-v2`. The plan section sits after WS-HYG-02, so it moves every later `### WS-` heading down by its own length.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
