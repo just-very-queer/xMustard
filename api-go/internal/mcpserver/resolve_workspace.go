@@ -53,9 +53,11 @@ func (w Workspace) echo() string {
 const (
 	// rootsTimeout bounds how long a tool call waits for the client's roots/list answer.
 	rootsTimeout = 5 * time.Second
-	// rootsRetryAfter is how long calls skip roots/list after a timed-out one, so a
-	// client that never answers does not cost every call rootsTimeout.
-	rootsRetryAfter = 15 * time.Second
+	// A failed roots/list is not asked again inside these windows, so a client
+	// that never answers does not cost every call a request. A timeout waits
+	// longer than a prompt failure: it already cost the caller rootsTimeout.
+	rootsRetryAfter        = 15 * time.Second
+	rootsRetryAfterFailure = time.Second
 	// listingMissRefresh is how old the cached listing must be before a workspace id
 	// missing from it triggers a re-read (to learn the root of a new workspace).
 	listingMissRefresh = 10 * time.Second
@@ -66,7 +68,8 @@ const (
 
 // rootsState is the session's view of the client's roots. A definitive answer (the
 // roots, an answer with no file roots, or method-not-found) is kept until
-// roots/list_changed; a failed or timed-out request is transient and asked again.
+// roots/list_changed; a failed or timed-out request is transient and asked again,
+// but not before retryAt.
 type rootsState struct {
 	paths     []string
 	err       string    // why the client's roots are unusable, for the resolution error
@@ -334,6 +337,22 @@ func (s *Session) rootFor(ctx context.Context, id string) string {
 	return ""
 }
 
+// rootsBackoff is how long roots/list is not asked again after a failure, or zero
+// when it is asked again on the next call. cached is the state the failing request
+// started from, so a request that followed a cached failure is the second in a row.
+// A timeout backs off after one attempt because it already cost the caller
+// rootsTimeout; a prompt failure backs off once it has failed twice in a row, so a
+// client that fails once still recovers on the very next call.
+func rootsBackoff(cached *rootsState, err error) time.Duration {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return rootsRetryAfter
+	}
+	if cached != nil && cached.transient {
+		return rootsRetryAfterFailure
+	}
+	return 0
+}
+
 func rootOf(list []registeredWorkspace, id string) string {
 	for _, w := range list {
 		if w.ID == id {
@@ -346,7 +365,8 @@ func rootOf(list []registeredWorkspace, id string) string {
 // clientRoots returns the client's filesystem roots (roots/list), or why there are
 // none. unknown reports that the request failed, so the client's roots are unknown
 // rather than absent. Definitive answers are cached until roots/list_changed; a
-// failure is asked again on a later call (after rootsRetryAfter when it timed out).
+// failure is asked again on a later call, after rootsRetryAfterFailure when it has
+// failed twice in a row and after rootsRetryAfter when it timed out.
 func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, unknown bool) {
 	s.mu.Lock()
 	supported, ready, cached, gen := s.rootsCap, s.initialized, s.roots, s.rootsGen
@@ -371,9 +391,14 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 		st.err = "the client does not implement roots/list"
 	case err != nil:
 		st.err, st.transient = "roots/list failed: "+err.Error(), true
-		if errors.Is(err, context.DeadlineExceeded) {
-			st.retryAt = time.Now().Add(rootsRetryAfter)
-			st.err += fmt.Sprintf(" (asked again after %s)", rootsRetryAfter)
+		// The first prompt failure gets no window, so a client that fails once is
+		// asked again on the next call; the state is kept either way, so the next
+		// failure is known to be the second in a row and can back off.
+		if after := rootsBackoff(cached, err); after > 0 {
+			st.retryAt = time.Now().Add(after)
+			st.err += fmt.Sprintf(" (asked again after %s)", after)
+		} else {
+			st.retryAt = time.Time{}
 		}
 	default:
 		var r struct {
@@ -396,7 +421,7 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 	s.mu.Lock()
 	// An answer overtaken by roots/list_changed (or a new initialize) describes roots
 	// the client has since replaced: use it for this call, but do not keep it.
-	if s.rootsGen == gen && (!st.transient || !st.retryAt.IsZero()) {
+	if s.rootsGen == gen {
 		s.roots = st
 	}
 	s.mu.Unlock()

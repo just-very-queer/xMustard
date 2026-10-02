@@ -137,6 +137,75 @@ func TestTimedOutRootsBackOffThenRetry(t *testing.T) {
 	}
 }
 
+// A roots/list that keeps failing backs off: one request inside the window, and a
+// retry once it expires. Today only a deadline sets retryAt, so a client that always
+// answers -32603 is re-asked on every call (FU:10 measured 5 calls, 5 requests).
+// A first fast failure is still asked again on the next call, so a client that fails
+// once recovers immediately.
+func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
+	project := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy, rootsAnswer(project)}}
+	s := newSession(t, api, Options{}, client, "2025-06-18")
+
+	// The first failure is asked again immediately: one-shot recovery is preserved.
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !res["isError"].(bool) || strings.Contains(text(res), "asked again after") {
+		t.Fatalf("a single fast failure must not back off: %v", text(res))
+	}
+	if n := client.count(); n != 1 {
+		t.Fatalf("roots/list asked %d times on the first call", n)
+	}
+
+	// The second failure is the backoff window: no further request until it expires.
+	res, _ = call(t, s, "ground", map[string]any{})
+	if !res["isError"].(bool) || !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
+		t.Fatalf("the second failure must open the back-off window: %v", text(res))
+	}
+	for i := 0; i < 3; i++ {
+		res, _ = call(t, s, "ground", map[string]any{})
+		if !res["isError"].(bool) {
+			t.Fatalf("call %d inside the window should still fail: %v", i+3, text(res))
+		}
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2 (the first failure and the back-off that followed it)", n)
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(-time.Second) // the back-off expires
+	s.mu.Unlock()
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 3 {
+		t.Fatalf("after the back-off: %+v (roots/list asked %d times)", ws, client.count())
+	}
+}
+
+// rootsBackoff is the table behind that: a timeout backs off immediately, a prompt
+// failure backs off once it has followed a cached failure, and a first prompt failure
+// does not back off at all.
+func TestRootsBackoffTable(t *testing.T) {
+	deadline := fmt.Errorf("roots/list: %w", context.DeadlineExceeded)
+	prompt := errors.New("transport closed")
+	cases := []struct {
+		name   string
+		cached *rootsState
+		err    error
+		want   time.Duration
+	}{
+		{"timeout after nothing", nil, deadline, rootsRetryAfter},
+		{"prompt failure after a timeout", &rootsState{transient: true}, prompt, rootsRetryAfterFailure},
+		{"prompt failure after a prompt failure", &rootsState{transient: true}, prompt, rootsRetryAfterFailure},
+		{"prompt failure after nothing", nil, prompt, 0},
+		{"prompt failure after a good answer", &rootsState{}, prompt, 0},
+	}
+	for _, c := range cases {
+		if got := rootsBackoff(c.cached, c.err); got != c.want {
+			t.Errorf("%s: rootsBackoff = %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
 // A client that does not implement roots/list says so once; that answer is kept.
 func TestRootsMethodNotFoundIsKept(t *testing.T) {
 	repo := tempRepo(t)
