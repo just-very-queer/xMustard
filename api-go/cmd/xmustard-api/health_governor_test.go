@@ -160,17 +160,25 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	if !fullOff {
 		t.Fatal("auth off shows the full view")
 	}
-	// The restricted polls are only meaningful if a watchdog really was running
-	// alongside them, which is the contention this row exists to survive. Taking
-	// the slot samples once for admission, so the baseline is read after it is
-	// held; only a sample *after* that baseline is a watchdog tick.
+	// The restricted polls are only sound because no watchdog was running beside
+	// them: the counter would otherwise move for the watchdog's reasons. That is
+	// now structural, the slot being released before every restricted poll, so
+	// assert the structure instead of hoping for it. The sampler must be live
+	// while a slot is held, and silent once it is released, because the second
+	// half is what makes the restricted polls' counter meaningful.
 	held := holdSlot(t)
 	afterAcquire := samples.Load()
 	time.Sleep(2 * budget.DefaultWatchInterval)
 	ticks := samples.Load() - afterAcquire
-	held()
 	if ticks == 0 {
-		t.Fatal("the heavy-slot watchdog never sampled, so the restricted polls were never contended")
+		held()
+		t.Fatal("the heavy-slot watchdog never sampled, so the counter this test relies on proves nothing")
+	}
+	held()
+	quiet := samples.Load()
+	time.Sleep(2 * budget.DefaultWatchInterval)
+	if after := samples.Load(); after != quiet {
+		t.Fatalf("the watchdog kept sampling after the slot was released: %d samples", after-quiet)
 	}
 }
 
