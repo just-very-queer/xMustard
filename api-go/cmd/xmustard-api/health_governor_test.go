@@ -25,22 +25,12 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "")
 	var samples atomic.Int64
-	var pollSamples atomic.Int64
-	var inPoll atomic.Bool
 	prev := budget.Gov
 	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{SoftCeilingBytes: 1 << 40, Sampler: func() (budget.TreeSample, error) {
 		samples.Add(1)
-		if inPoll.Load() {
-			pollSamples.Add(1)
-		}
 		return budget.TreeSample{At: time.Now(), Supported: true, Processes: 1, RSSBytes: 1 << 20, SelfRSSBytes: 1 << 20}, nil
 	}})
 	t.Cleanup(func() { budget.Gov = prev })
-	release, err := budget.AcquireHeavy(t.Context(), "rust:changetrack/index", 1<<20)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(release)
 	srv := httptest.NewServer(bodyLimitMiddleware(authMiddleware(dir, "auto", newAPIHandler())))
 	defer srv.Close()
 	health := func(token string) map[string]any {
@@ -98,8 +88,26 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		return true
 	}
 
+	// The full view must name the heavy slot's owner, so a slot is held whenever
+	// an operator polls. That slot starts the governor's watchdog, a goroutine
+	// that samples the tree every 250 ms for as long as it is held, which would
+	// move a global counter inside a restricted poll's window and read as a leak.
+	// Restricted tokens therefore poll with no slot held: without one there is no
+	// watchdog, so the counter moves only if the poll itself sampled, and the
+	// assertion needs no attribution and no window.
+	holdSlot := func(t *testing.T) func() {
+		t.Helper()
+		release, err := budget.AcquireHeavy(t.Context(), "rust:changetrack/index", 1<<20)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return release
+	}
 	t.Setenv("XMUSTARD_AUTH", "auto")
-	if !isFull(t, health("")) {
+	open := holdSlot(t)
+	full := isFull(t, health(""))
+	open()
+	if !full {
 		t.Fatal("auto mode without credentials (the open loopback default) shows the full view")
 	}
 	tokens := map[string]string{
@@ -117,16 +125,14 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		t.Setenv("XMUSTARD_AUTH", mode)
 		for who, tok := range tokens {
 			time.Sleep(300 * time.Millisecond) // past the health sample cache
-			// The heavy slot is held for the whole test, so the watchdog samples on
-			// its own 250 ms clock throughout. Only a sample taken by the poll shows a
-			// restricted poll sampling; a global counter also moves when the watchdog
-			// ticks, which is the watchdog working, not a leak.
-			inPoll.Store(true)
-			before := pollSamples.Load()
+			release := func() {}
+			if want[who] {
+				release = holdSlot(t)
+			}
+			before := samples.Load()
 			h := health(tok)
 			got := isFull(t, h)
-			after := pollSamples.Load()
-			inPoll.Store(false)
+			release()
 			if got != want[who] {
 				t.Fatalf("%s mode, %s token: full view %v, want %v (%v)", mode, who, got, want[who], h["budget"])
 			}
@@ -136,7 +142,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				if !strings.Contains(detail, reason) {
 					t.Fatalf("%s token: the detail must say why (%q): %q", who, reason, detail)
 				}
-				if after != before {
+				if samples.Load() != before {
 					t.Fatalf("%s mode, %s token: a restricted poll sampled the process tree", mode, who)
 				}
 			}
@@ -148,15 +154,23 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		}
 	}
 	t.Setenv("XMUSTARD_AUTH", "off")
-	if !isFull(t, health("")) {
+	off := holdSlot(t)
+	fullOff := isFull(t, health(""))
+	off()
+	if !fullOff {
 		t.Fatal("auth off shows the full view")
 	}
-	// The attribution above is only meaningful if the watchdog really was
-	// sampling throughout. If the heavy slot's watchdog had not run, every
-	// window would be uncontended and the restricted assertion would hold
-	// trivially, so require that the concurrent sampler was live.
-	if watchdog := samples.Load() - pollSamples.Load(); watchdog == 0 {
-		t.Fatal("the heavy-slot watchdog never sampled, so the restricted-poll assertion was not contended")
+	// The restricted polls are only meaningful if a watchdog really was running
+	// alongside them, which is the contention this row exists to survive. Taking
+	// the slot samples once for admission, so the baseline is read after it is
+	// held; only a sample *after* that baseline is a watchdog tick.
+	held := holdSlot(t)
+	afterAcquire := samples.Load()
+	time.Sleep(2 * budget.DefaultWatchInterval)
+	ticks := samples.Load() - afterAcquire
+	held()
+	if ticks == 0 {
+		t.Fatal("the heavy-slot watchdog never sampled, so the restricted polls were never contended")
 	}
 }
 
