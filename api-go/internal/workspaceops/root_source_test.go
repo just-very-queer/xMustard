@@ -129,12 +129,16 @@ func TestConfineAnchorPathsFallsBackToLexicalChecksForAnUnresolvableWorkspace(t 
 }
 
 // No registry file at all: the snapshot root still confines, an escape is still
-// refused, and the root lookup still answers the derived unregistered id. Neither
-// reader may start refusing because the registry is absent.
+// refused, and the root lookup still answers the derived unregistered id. The
+// snapshot root is in force, not merely present: a symlink out of it is refused,
+// which a rootless lexical-only fallback would admit.
 func TestReadersWithoutARegistryKeepTheSnapshotRoot(t *testing.T) {
 	dataDir := t.TempDir()
 	root := t.TempDir()
 	agedWrite(t, snapshotPath(dataDir, "wsNoReg"), snapshotWithRoot("wsNoReg", root), time.Hour)
+	if err := os.Symlink(t.TempDir(), filepath.Join(root, "link")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
 
 	got, err := confineAnchorPaths(dataDir, "wsNoReg", []string{"inside.txt"})
 	if err != nil || got[0] != "inside.txt" {
@@ -142,6 +146,9 @@ func TestReadersWithoutARegistryKeepTheSnapshotRoot(t *testing.T) {
 	}
 	if _, err := confineAnchorPaths(dataDir, "wsNoReg", []string{"../escape.txt"}); !errors.Is(err, ErrPathEscapesWorkspace) {
 		t.Fatalf("the escape must still be refused: %v", err)
+	}
+	if out, err := confineAnchorPaths(dataDir, "wsNoReg", []string{"link"}); !errors.Is(err, ErrPathEscapesWorkspace) {
+		t.Fatalf("with no registry file the snapshot root must still be in force: %v %v", out, err)
 	}
 	if id, err := WorkspaceIDForRoot(dataDir, root); err != nil || id != workspaceIDForPath(root) {
 		t.Fatalf("an unregistered root still derives its id: %q %v", id, err)
