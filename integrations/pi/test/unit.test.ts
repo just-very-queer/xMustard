@@ -96,7 +96,7 @@ describe("tool specs mirror the MCP server", () => {
 		// url.QueryEscape: space→"+", !'()* escaped; url.PathEscape keeps $&+:=@
 		assert.equal(
 			spec("search").build({ workspace_id: "w s/1", q: "a b&c!*'()", mode: "pattern" }).path,
-			"/api/workspaces/w%20s%2F1/search?q=a+b%26c%21%2A%27%28%29&mode=pattern",
+			"/api/workspaces/w%20s%2F1/search?q=a+b%26c%21%2A%27%28%29&mode=pattern&max_chars=8000",
 		);
 		assert.equal(
 			spec("verify").build({ workspace_id: "w", entry_id: "e:@$&+=;,?", approve: false }).path,
@@ -107,8 +107,8 @@ describe("tool specs mirror the MCP server", () => {
 		assert.equal(rem.method, "POST");
 		assert.deepEqual(JSON.parse(rem.body ?? ""), { content: "c", paths: ["a.go", "b.go"] });
 		// every argument reaches the API, which refuses symbol with from and to
-		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", from: "A", to: "B" }).path, "/api/workspaces/w/changes/since-index?symbol=S&from=A&to=B");
-		assert.equal(spec("impact").build({ workspace_id: "w", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?depth=2");
+		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", from: "A", to: "B" }).path, "/api/workspaces/w/changes/since-index?symbol=S&from=A&to=B&max_chars=8000");
+		assert.equal(spec("impact").build({ workspace_id: "w", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?depth=2&max_chars=8000");
 		// run_id reads (GET); without it the call reaches the recording route, as Go's Build does
 		assert.deepEqual(spec("why_failed").build({ workspace_id: "w", run_id: "oc_1" }), { method: "GET", path: "/api/workspaces/w/runs/oc_1/why-failed" });
 		assert.deepEqual(spec("why_failed").build({ workspace_id: "w" }), { method: "POST", path: "/api/workspaces/w/why-failed", body: "{}" });
@@ -146,6 +146,119 @@ describe("tool specs mirror the MCP server", () => {
 			assert.deepEqual(toJsonSchema(spec(g.name)), g.inputSchema, `${g.name} inputSchema`);
 		}
 	});
+	// Pi validates every call against its own closed schema before build() runs, so an
+	// argument the MCP server accepts on tools/call but the mirror omits can never be
+	// sent from Pi. The full-profile golden is the contract this mirror must satisfy.
+	// Go marshals its maps, so the golden's keys are alphabetical and the two schemas
+	// are compared member by member rather than as parsed JSON.
+	test("mirror matches the generated Go full-profile tools/list", (t) => {
+		const golden = new URL("../../../api-go/internal/mcpserver/testdata/tools_list_full.json", import.meta.url);
+		if (!existsSync(golden)) return t.skip("api-go not present in this checkout");
+		const list = JSON.parse(readFileSync(golden, "utf8")) as {
+			tools: { name: string; description: string; inputSchema: { properties: Record<string, unknown>; required?: string[] } }[];
+		};
+		for (const g of list.tools) {
+			assert.equal(spec(g.name).description, g.description, `${g.name} description`);
+			const got = toJsonSchema(spec(g.name), "full") as { properties: Record<string, unknown>; required?: string[]; additionalProperties: boolean };
+			assert.deepEqual(Object.keys(got.properties).sort(), Object.keys(g.inputSchema.properties).sort(), `${g.name} full argument set`);
+			for (const [name, want] of Object.entries(g.inputSchema.properties)) {
+				assert.deepEqual(got.properties[name], want, `${g.name} ${name}`);
+			}
+			assert.equal(got.additionalProperties, false, `${g.name} is closed`);
+			assert.deepEqual(got.required ?? [], g.inputSchema.required ?? [], `${g.name} required`);
+		}
+	});
+	// The lean schema Pi advertises is byte-identical to the lean golden: adding an
+	// Advanced argument to the mirror must not move what every session's prompt pays for.
+	test("the lean schema is unchanged by the Advanced arguments", (t) => {
+		const lean = new URL("../../../api-go/internal/mcpserver/testdata/tools_list.json", import.meta.url);
+		const full = new URL("../../../api-go/internal/mcpserver/testdata/tools_list_full.json", import.meta.url);
+		if (!existsSync(lean) || !existsSync(full)) return t.skip("api-go not present in this checkout");
+		const leanList = JSON.parse(readFileSync(lean, "utf8")) as { tools: { name: string; inputSchema: unknown }[] };
+		const fullList = JSON.parse(readFileSync(full, "utf8")) as { tools: { name: string; inputSchema: unknown }[] };
+		for (const g of leanList.tools) {
+			assert.deepEqual(toJsonSchema(spec(g.name)), g.inputSchema, `${g.name} lean inputSchema`);
+		}
+		// the full profile is a strict superset: every lean argument survives
+		for (const g of fullList.tools) {
+			const fullProps = (g.inputSchema as { properties: object }).properties;
+			for (const name of Object.keys((leanList.tools.find((l) => l.name === g.name)!.inputSchema as { properties: object }).properties)) {
+				assert.ok(name in fullProps, `${g.name} full profile dropped ${name}`);
+			}
+		}
+	});
+	test("recall's Advanced arguments are sendable and reach build as Go sends them", () => {
+		const full = toJsonSchema(spec("recall"), "full") as { properties: Record<string, Record<string, unknown>> };
+		// every Advanced argument the MCP server accepts is in the closed schema
+		for (const name of [
+			"entry_id", "history", "status", "include_pending", "include_superseded", "show_expired", "include_merged",
+			"subject", "predicate", "as_of", "valid_only", "seed", "kind", "tier", "tags", "topic", "path_prefix",
+			"since", "until", "by", "explain", "names_only", "render", "max_chars", "cursor", "session_id",
+			"source", "agent", "conversation",
+		]) {
+			assert.ok(name in full.properties, `recall is missing Advanced argument ${name}`);
+		}
+		// Go's enum and bounds reach the mirror
+		assert.deepEqual(full.properties.status.enum, ["promoted", "pending", "awaiting_me"]);
+		assert.deepEqual(full.properties.tier.enum, ["core", "deferred"]);
+		assert.deepEqual(full.properties.render.enum, ["full", "compact"]);
+		assert.deepEqual(full.properties.source.enum, ["sessions"]);
+		assert.equal(full.properties.history.type, "boolean");
+		assert.deepEqual([full.properties.max_chars.minimum, full.properties.max_chars.maximum], [1000, 10000]);
+		assert.equal(full.properties.subject.maxLength, 256);
+		assert.equal(full.properties.session_id.maxLength, 128);
+		// and they travel under their own names, as recallQueryArgs orders them
+		const p = spec("recall").build({ workspace_id: "w", status: "pending", include_pending: true, kind: "fact,decision", since: "2026-01-01" }).path;
+		for (const [re, why] of [
+			[/[?&]status=pending(&|$)/, "status"],
+			[/[?&]include_pending=true(&|$)/, "include_pending"],
+			[/[?&]kind=fact%2Cdecision(&|$)/, "kind"],
+			[/[?&]since=2026-01-01(&|$)/, "since"],
+		] as const) {
+			assert.match(p, re, `recall does not send ${why}`);
+		}
+	});
+	test("explain's Advanced arguments are sendable, with its paging", () => {
+		const full = toJsonSchema(spec("explain"), "full") as { properties: Record<string, Record<string, unknown>> };
+		for (const name of ["symbol", "uid", "depth", "chain_depth", "include_content", "max_chars", "limit", "cursor"]) {
+			assert.ok(name in full.properties, `explain is missing Advanced argument ${name}`);
+		}
+		assert.equal(full.properties.symbol.maxLength, 4096);
+		assert.equal(full.properties.uid.maxLength, 4096);
+		assert.equal(full.properties.depth.type, "integer");
+		assert.deepEqual([full.properties.depth.minimum, full.properties.depth.maximum], [0, 3]);
+		assert.deepEqual([full.properties.chain_depth.minimum, full.properties.chain_depth.maximum], [0, 3]);
+		assert.equal(full.properties.include_content.type, "boolean");
+		// symbol=, uid=, depth= and the budget all reach /explain-path under their own names
+		assert.equal(
+			spec("explain").build({ workspace_id: "w", symbol: "Store/Capture", depth: 2, include_content: true }).path,
+			"/api/workspaces/w/explain-path?symbol=Store%2FCapture&depth=2&include_content=true&max_chars=6000",
+		);
+		// the one Paged spec: limit= and cursor= are reachable from Pi, after the budget as Go's budgetQuery appends them
+		assert.equal(
+			spec("explain").build({ workspace_id: "w", path: "a.go", limit: 5, cursor: "c1" }).path,
+			"/api/workspaces/w/explain-path?path=a.go&max_chars=6000&limit=5&cursor=c1",
+		);
+	});
+	test("max_chars is an argument on every budgeted tool, defaulting to Go's own default", () => {
+		// Go's toolbudget.For defaults: search 8000, explain 6000, impact 8000; recall's
+		// own recallDefaultMaxChars is 4000.
+		for (const [tool, def] of [["search", 8000], ["explain", 6000], ["impact", 8000], ["recall", 4000]] as const) {
+			const props = (toJsonSchema(spec(tool), "full") as { properties: Record<string, Record<string, unknown>> }).properties;
+			assert.ok("max_chars" in props, `${tool} cannot set max_chars`);
+			// search requires q=, so the budget is asserted on a call that carries one
+			const path = spec(tool).build(tool === "search" ? { workspace_id: "w", q: "x" } : { workspace_id: "w" }).path;
+			assert.match(path, /[?&]max_chars=\d+/, `${tool} sends no budget by default`);
+			assert.ok(path.includes(`max_chars=${def}`), `${tool} defaults to ${path.match(/max_chars=[0-9]+/)?.[0]}, want max_chars=${def}`);
+		}
+		// an explicit max_chars overrides the default on every one of them
+		for (const tool of ["search", "explain", "impact", "recall"]) {
+			const path = spec(tool).build({ workspace_id: "w", max_chars: 12345, ...(tool === "search" ? { q: "x" } : {}) }).path;
+			assert.match(path, /[?&]max_chars=12345(&|$)/, `${tool} ignores an explicit max_chars`);
+		}
+		// the shared recall constant no longer stands in for the per-tool defaults
+		assert.equal(RECALL_DEFAULT_MAX_CHARS, 4000);
+	});
 	test("recall's default budget is the MCP tool's", (t) => {
 		const src = new URL("../../../api-go/internal/mcpserver/tool_recall.go", import.meta.url);
 		if (!existsSync(src)) return t.skip("api-go not present in this checkout");
@@ -158,10 +271,10 @@ describe("tool specs mirror the MCP server", () => {
 			"/api/workspaces/w/context/active?query=auth+flow&limit=5&max_chars=4000",
 		);
 		assert.equal(spec("recall").build({ workspace_id: "w" }).path, "/api/workspaces/w/context/active?max_chars=4000");
-		assert.equal(spec("search").build({ workspace_id: "w", q: "x", limit: 50 }).path, "/api/workspaces/w/search?q=x&limit=50");
-		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?symbol=S&depth=2");
-		assert.equal(spec("impact").build({ workspace_id: "w", path: "a/b.go", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?path=a%2Fb.go&depth=2");
-		assert.equal(spec("impact").build({ workspace_id: "w", path: "a.go", symbol: "S" }).path, "/api/workspaces/w/changes/since-index?path=a.go&symbol=S");
+		assert.equal(spec("search").build({ workspace_id: "w", q: "x", limit: 50 }).path, "/api/workspaces/w/search?q=x&limit=50&max_chars=8000");
+		assert.equal(spec("impact").build({ workspace_id: "w", symbol: "S", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?symbol=S&depth=2&max_chars=8000");
+		assert.equal(spec("impact").build({ workspace_id: "w", path: "a/b.go", max_depth: 2 }).path, "/api/workspaces/w/changes/since-index?path=a%2Fb.go&depth=2&max_chars=8000");
+		assert.equal(spec("impact").build({ workspace_id: "w", path: "a.go", symbol: "S" }).path, "/api/workspaces/w/changes/since-index?path=a.go&symbol=S&max_chars=8000");
 		const v = spec("verify").build({ workspace_id: "w", entry_id: "e", approve: false, note: "stale: a.go" });
 		assert.equal(v.path, "/api/workspaces/w/context/e/verify?approve=false");
 		assert.equal(v.body, '{"note":"stale: a.go"}');
