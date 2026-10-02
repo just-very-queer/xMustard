@@ -3720,7 +3720,7 @@ The answer is bounded by `max_chars`, not by the fixture: 42, 102 and 242 change
 
 **Requirements.** PAR-ADP-09 (`tool_call` input mutation for command wrapping — the last open clause), PAR-CTX-10 (`xmustard-core run --` as the wrapper, already shipped by WS-41, consumed here), PAR-CTX-01 (the reduced result the wrap exists to produce).
 
-**Files.** `integrations/pi/src/commandwrap.ts` (new: the wrap decision), `integrations/pi/src/index.ts` (the `tool_call` hook), `integrations/pi/src/config.ts` (the env knob), `integrations/pi/test/unit.test.ts` (the unit tests), `integrations/pi/README.md` (the "not built here" line and the env table), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+**Files.** `integrations/pi/src/commandwrap.ts` (new: the wrap decision), `integrations/pi/src/index.ts` (the `tool_call` hook), `integrations/pi/src/config.ts` (the env knob), `integrations/pi/test/unit.test.ts` (the unit tests), `scripts/ws44e-mutations.sh` (new: the mutation runner; §1.7 rule 6 puts every build on the box and the box rsyncs the tree without `.git`, so the runner has to travel with the tree to run there), `integrations/pi/README.md` (the "not built here" line and the env table), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
 
 **Tests required.**
 - **The wrap is a decision with named edges, not a string replace.** A `bash` call whose `command` is empty, only whitespace, or already wrapped (with or without an absolute path to the binary) is left byte-identical: a second wrap is never applied, so the command runs exactly once and `xmustard-core run -- xmustard-core run -- ls` cannot arise.
