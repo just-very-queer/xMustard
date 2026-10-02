@@ -2075,8 +2075,11 @@ fn max_size_ignore_files_keep_the_worker_bounded() {
     );
 }
 
+/// A directory the operator named keeps its mode when it carries no group- or
+/// other-write bit. `0o755` is the read-permissive case the old warning existed
+/// for, and it keeps working: only the write bits are a refusal (WS-FIX-11).
 #[test]
-fn an_operator_named_index_dir_keeps_its_mode() {
+fn an_operator_named_index_dir_keeps_its_read_permissive_mode() {
     use std::os::unix::fs::PermissionsExt;
     let r = repo(&[("a.ts", "export function a() {}\n")]);
     let shared = TempDir::new().unwrap();
@@ -2095,8 +2098,9 @@ fn an_operator_named_index_dir_keeps_its_mode() {
     let rep = ok_json(&out);
     assert_eq!(mode(&named), 0o755, "the operator's directory was chmodded");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("accessible to other users"),
-        "no warning"
+        !String::from_utf8_lossy(&out.stderr).contains("accessible to other users"),
+        "a read-permissive directory should not warn: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(mode(Path::new(rep["index_path"].as_str().unwrap())), 0o600);
     assert_eq!(mode(&named.join("index.lock")), 0o600);
@@ -2108,4 +2112,81 @@ fn an_operator_named_index_dir_keeps_its_mode() {
         &["--index-dir", created.to_str().unwrap()],
     );
     assert_eq!(mode(&created), 0o700);
+}
+
+/// An existing operator-named index directory that another local user can write
+/// is refused: it is a poison channel, since such a user can replace `index.db`
+/// or `index.lock` even though both are created 0o600 (WS-FIX-11). The refusal
+/// names the mode and the remedy.
+#[test]
+fn a_writable_operator_named_index_dir_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    // 0o777: other-writable, 0o775: group-writable only. The group bit is the
+    // same hole, so both are refused.
+    for mode_oct in [0o777u32, 0o775] {
+        let r = repo(&[("a.ts", "export function a() {}\n")]);
+        let shared = TempDir::new().unwrap();
+        let named = shared.path().join("shared");
+        fs::create_dir(&named).unwrap();
+        fs::set_permissions(&named, fs::Permissions::from_mode(mode_oct)).unwrap();
+        let out = run(&[
+            "index",
+            "build",
+            r.path().to_str().unwrap(),
+            "--index-dir",
+            named.to_str().unwrap(),
+        ]);
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert!(
+            !out.status.success(),
+            "0o{mode_oct:o} index dir was accepted: {stderr}"
+        );
+        assert!(
+            stderr.contains("chmod 700"),
+            "0o{mode_oct:o}: no chmod remedy in the refusal: {stderr}"
+        );
+        assert!(
+            stderr.contains(&format!("0o{mode_oct:o}")),
+            "0o{mode_oct:o}: the refusal does not name the offending mode: {stderr}"
+        );
+        assert!(
+            !named.join(xmustard_core::index::DB_FILE).exists(),
+            "0o{mode_oct:o}: refused build still wrote an index"
+        );
+        // the refusal must not have tightened the operator's directory for them
+        let still = fs::metadata(&named).unwrap().permissions().mode() & 0o777;
+        assert_eq!(still, mode_oct, "0o{mode_oct:o}: the refusal chmodded it");
+    }
+}
+
+/// The refusal is on the write bits alone: execute bits for group and other, with no
+/// write bit for either, are accepted. This pins the mask to `0o022` rather than to
+/// `0o077`, which is the bug WS-FIX-11 fixes.
+#[test]
+fn an_execute_only_operator_named_index_dir_is_accepted() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function a() {}\n")]);
+    let shared = TempDir::new().unwrap();
+    let named = shared.path().join("shared");
+    fs::create_dir(&named).unwrap();
+    // 0o710: owner rwx, group and other can traverse but not write. The old 0o077
+    // mask warned on this; the new 0o022 mask must not.
+    fs::set_permissions(&named, fs::Permissions::from_mode(0o710)).unwrap();
+    let out = run(&[
+        "index",
+        "build",
+        r.path().to_str().unwrap(),
+        "--index-dir",
+        named.to_str().unwrap(),
+    ]);
+    let rep = ok_json(&out);
+    let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    assert_eq!(mode(&named), 0o710, "the operator's directory was chmodded");
+    assert_eq!(mode(&named.join(xmustard_core::index::DB_FILE)), 0o600);
+    assert!(
+        rep["index_path"]
+            .as_str()
+            .unwrap()
+            .ends_with(xmustard_core::index::DB_FILE)
+    );
 }

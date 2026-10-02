@@ -219,8 +219,11 @@ pub fn index_dir(root: &Path, git_dir: Option<&Path>, cfg: &IndexConfig) -> Path
 /// directory that is a symlink or belongs to another user: the index holds identifiers
 /// and postings of the source, and with `full` retention the source itself. An existing
 /// directory the operator named (`operator_named`: `--index-dir`, `XMUSTARD_INDEX_DIR`)
-/// keeps its mode, with a warning when others can list it (the index files themselves
-/// are always owner-only); the default per-scope directory is ours and is tightened.
+/// keeps its read and execute bits, because those leak only the directory listing and
+/// the operator chose them; a group- or other-**write** bit is refused outright, since
+/// any other local user could replace `index.db` and poison what the index answers,
+/// and the owner-only mode of the files inside it does not stop that. The default
+/// per-scope directory is ours and is tightened.
 fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", dir.display());
     let existed = fs::symlink_metadata(dir).is_ok();
@@ -248,17 +251,21 @@ fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
                 dir.display()
             ));
         }
-        if meta.mode() & 0o077 != 0 {
-            if existed && operator_named {
-                eprintln!(
-                    "index: warning: {} is accessible to other users (mode {:o}); the \
-                     index files in it are owner-only",
+        let mode = meta.mode() & 0o777;
+        // 0o022, not 0o077: only the write bits are a hole.
+        match (mode & 0o022 != 0, existed && operator_named) {
+            (true, true) => {
+                return Err(format!(
+                    "{}: index directory is writable by other users (mode 0o{mode:03o}); \
+                     another local user could replace {}. Run `chmod 700 {}`",
                     dir.display(),
-                    meta.mode() & 0o777
-                );
-            } else {
-                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
+                    DB_FILE,
+                    dir.display()
+                ));
             }
+            // A read-permissive operator directory is left as chosen.
+            (false, true) => {}
+            _ => fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?,
         }
     }
     Ok(())
