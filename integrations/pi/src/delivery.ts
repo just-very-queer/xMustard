@@ -685,7 +685,10 @@ export function carriesHandle(texts: readonly string[]): boolean {
 
 // projectBuiltin is the tool_result handler for Pi's built-in tools. A text result
 // larger than the projection target is captured and replaced by its projection with
-// a recovery line; isError is never touched and details are kept. Every failure
+// a recovery line; isError is never touched and details are kept. A result that
+// already carries a handle activates expansion before the size check, because the
+// wrapper's own projection (WS-44e) reduces bash output before Pi ever sees it, so
+// it would otherwise leave here having activated nothing. Every failure
 // leaves Pi's result as it is (a reason goes into details.xmustard).
 export async function projectBuiltin(
 	cfg: AdapterConfig,
@@ -698,11 +701,6 @@ export async function projectBuiltin(
 	if (!cfg.builtins.has(ev.toolName)) return undefined;
 	const texts = textBlocks(ev.content);
 	if (!texts) return undefined;
-	// The wrapper's own projection (WS-44e) reduces bash output before Pi ever sees
-	// it, so a wrapped result is already small and would leave here without
-	// activating expansion. Its [xmustard evidence] line still carries a handle the
-	// model is expected to be able to use.
-	if (carriesHandle(texts)) onHandle();
 	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
 	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });

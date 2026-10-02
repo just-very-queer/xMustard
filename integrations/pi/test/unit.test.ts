@@ -29,6 +29,7 @@ import {
 	renderDelivery,
 	renderPage,
 	runTool,
+	textBlocks,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
 import { mutateBashInput, shellQuote, shouldWrapBash } from "../src/commandwrap.ts";
@@ -1261,11 +1262,11 @@ describe("session_before_compact snapshot", () => {
 });
 
 describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
-	// The wrapped form Pi ends up executing. The oracle is POSIX sh itself, not this
-	// file's own template: `sh -c <quoted>` is what makes a pipeline, a redirect or
-	// `cd sub && make` survive, because the wrapper execs argv[0] directly rather
+	// The wrapped form Pi ends up executing. The oracle is bash itself, not this
+	// file's own template: `bash -c <quoted>` is what makes a pipeline, a redirect
+	// or `cd sub && make` survive, because the wrapper execs argv[0] directly rather
 	// than through a shell.
-	const WRAPPED = (ws: string, command: string) => `xmustard-core run --workspace ${shellQuote(ws)} -- sh -c ${shellQuote(command)}`;
+	const WRAPPED = (ws: string, command: string) => `xmustard-core run --workspace ${shellQuote(ws)} -- bash -c ${shellQuote(command)}`;
 	const wrapInput = (input: unknown, ws: string | undefined, enabled: boolean): unknown => {
 		const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: structuredClone(input) as Record<string, unknown> };
 		mutateBashInput(event, ws, enabled);
@@ -1277,7 +1278,7 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 	// same way the wrapper's Command::new(&argv[0]) does. WS44E_TMP points the
 	// redirection cases at a temp path so no case writes into the package directory.
 	let shRunSeq = 0;
-	const shRuns = (argv: string): string => execFileSync("/bin/sh", ["-c", argv], {
+	const shRuns = (argv: string): string => execFileSync("/bin/bash", ["-c", argv], {
 		encoding: "utf8",
 		env: { ...process.env, WS44E_TMP: path.join(os.tmpdir(), `ws44e-${process.pid}-${shRunSeq++}`) },
 	});
@@ -1309,7 +1310,7 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 	const argvFields = (command: string): string[] => {
 		const wrapped = wrapInput({ command }, "ws-1", true) as { command: string };
 		const tail = wrapped.command.slice(wrapped.command.indexOf(" -- ") + 4);
-		assert.ok(tail.startsWith("sh -c "), `the wrapped form addresses a shell: ${tail}`);
+		assert.ok(tail.startsWith("bash -c "), `the wrapped form addresses a shell: ${tail}`);
 		const printed = shRuns(`set -- ${tail}; for f do printf '%s\\n' "$f"; done`);
 		return printed.split("\n").slice(0, -1);
 	};
@@ -1317,20 +1318,20 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 	test("the wrapped argv is exactly shell, -c, and one quoted command string", () => {
 		for (const command of ["ls", "cd sub && make", "a | b > out.txt", "printf 'x y'", "echo a  b"]) {
 			const argv = argvFields(command);
-			assert.deepEqual(argv, ["sh", "-c", command], `argv after -- for ${JSON.stringify(command)}`);
+			assert.deepEqual(argv, ["bash", "-c", command], `argv after -- for ${JSON.stringify(command)}`);
 		}
 	});
 
-	test("the wrapped command still does what the model asked, checked by sh itself", () => {
+	test("the wrapped command still does what the model asked, checked by bash itself", () => {
 		// Each case is one that a bare `Command::new(&argv[0])` would break: a
 		// pipeline needs a shell, `&&` needs a shell, redirection needs a shell, and
 		// an embedded quote must survive being nested inside the wrapper's own
-		// single-quoted argv. The expected values are what POSIX sh must produce,
-		// written out here rather than computed by the code under test. A case compared
-		// trimmed (the flag) has an output whose exact bytes depend on something
-		// outside the row: whether a pipe has a tty decides `wc`'s padding, and
-		// `printf %s` adds no trailing newline. What is asserted is that the command
-		// survives, not how a tool formats its count.
+		// single-quoted argv. The expected values are what bash must produce,
+		// written out here rather than computed by the code under test. A case
+		// compared trimmed (the flag) has an output whose exact bytes depend on
+		// something outside the row: whether a pipe has a tty decides `wc`'s
+		// padding, and `printf %s` adds no trailing newline. What is asserted is
+		// that the command survives, not how a tool formats its count.
 		const cases: [string, string, boolean][] = [
 			["printf 'a\\nb\\n' | wc -l", "2", true],
 			["cd . && echo yes", "yes", false],
@@ -1340,15 +1341,27 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 			[`printf '%s' "a'b'c"`, "a'b'c", true],
 			["echo done > $WS44E_TMP && cat $WS44E_TMP", "done", false],
 			["echo one two three | tr ' ' '-'", "one-two-three", false],
+			// bash-only syntax, which the build box's /bin/sh (dash) refuses with
+			// exit 127 and exit 2 respectively. The interpreter is bash for this reason.
+			["[[ ab == a* ]] && echo match", "match", false],
+			["a=(x y); echo ${a[1]}", "y", false],
 		];
 		for (const [command, want, trim] of cases) {
 			const argv = argvFields(command);
-			// `sh -c <field>` is what the wrapper would exec. The field is re-quoted
-			// because it is interpolated into a shell string here, and an unquoted
-			// `|` would pipe the outer shell instead of reaching the inner one.
-			const got = shRuns(`sh -c ${shellQuote(argv[2])}`);
+			// `bash -c <field>` is what the wrapper would exec. The field is
+			// re-quoted because it is interpolated into a shell string here, and an
+			// unquoted `|` would pipe the outer shell instead of reaching the inner one.
+			const got = shRuns(`bash -c ${shellQuote(argv[2])}`);
 			assert.equal(trim ? got.trim() : got, trim ? want : `${want}\n`, `must survive: ${command}`);
 		}
+	});
+
+	test("the interpreter is bash, because the tool being wrapped is Pi's bash", () => {
+		// Naming the tool `bash` and running it under dash is the round-2 finding:
+		// measured on the build box, /bin/sh -> dash, where `[[ ]]` exits 127.
+		const wrapped = wrapInput({ command: "[[ x == x ]]" }, "ws-1", true) as { command: string };
+		assert.match(wrapped.command, / -- bash -c /, "the argv's program is bash, not sh");
+		assert.doesNotMatch(wrapped.command, / -- sh -c /);
 	});
 
 	test("shellQuote escapes an embedded quote and leaves ordinary text readable", () => {
@@ -1416,11 +1429,11 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 
 	// The hook's two refusals, before any workspace lookup is paid for.
 	const bash = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: { command: "ls" } };
-	const ON = { enabled: true, tokenConfigured: false, wrapperTokenPresent: false };
+	const ON = { enabled: true, tokenConfigured: false, wrapperToken: undefined };
 
 	test("the hook wraps a bash call when the knob is on and no token is at stake", () => {
 		assert.equal(shouldWrapBash(bash, ON), true);
-		assert.equal(shouldWrapBash(bash, { ...ON, wrapperTokenPresent: true }), true, "a wrapper token does not block the wrap");
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "t" }), true, "a wrapper token does not block the wrap");
 	});
 
 	test("the hook refuses when the knob is off", () => {
@@ -1441,9 +1454,10 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		// tool_call hook cannot change it, so a token this process cannot pass on
 		// means the wrapped command would fail inside the wrapper. It runs natively
 		// instead and projectBuiltin captures the result.
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperTokenPresent: false }), false);
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperTokenPresent: true }), true, "a wrapper token makes the wrap safe");
-		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: false, wrapperTokenPresent: false }), true, "no token configured means nothing to pass");
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperToken: undefined }), false, "no wrapper token at all");
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperToken: "" }), false, "an empty wrapper token is no token");
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: true, wrapperToken: "t" }), true, "a wrapper token makes the wrap safe");
+		assert.equal(shouldWrapBash(bash, { enabled: true, tokenConfigured: false, wrapperToken: undefined }), true, "no token configured means nothing to pass");
 	});
 });
 
@@ -1472,28 +1486,22 @@ describe("a wrapper result activates expansion (WS-44e)", () => {
 		assert.equal(carriesHandle(['[xmustard evidence] {"handle":""}']), false, "an empty handle is not a handle");
 	});
 
-	test("a small wrapped bash result still activates expansion, and an ordinary one does not", async () => {
-		// The wrapped result is already reduced, so it never reaches the capture path
-		// that used to call onHandle. Without this, xmustard_expand is never offered
-		// for a command that WAS captured, and the model has the handle but no tool.
-		let handles = 0;
+	test("a small wrapped bash result passes through, and the handle is read off its text", async () => {
+		// The wrapped result is already reduced, so projectBuiltin never reaches the
+		// capture path that used to call onHandle. The handle is read by the
+		// tool_result hook from carriesHandle, before the built-ins guard, so it is
+		// found whether or not this tool is configured for projection.
 		const resolve = async () => "w1";
 		const wrapped = { toolCallId: "w", toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: `projected output\n${footer("xm1.abc123")}` }], details: undefined, isError: false };
-		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, wrapped, {}, () => handles++);
-		assert.equal(handles, 1, "a wrapped result activates expansion");
+		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, wrapped, {}, () => assert.fail("onHandle belongs to the hook now"));
 		assert.equal(out, undefined, "already small: nothing to replace, and it is passed through");
+		assert.equal(carriesHandle(textBlocks(wrapped.content) ?? []), true, "the hook's own check finds the handle");
 
-		handles = 0;
-		await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "n", toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: "total 4\ndrwx" }], details: undefined, isError: false }, {}, () => handles++);
-		assert.equal(handles, 0, "a result with no handle must not activate expansion");
+		const notOurs = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { ...wrapped, toolName: "read" }, {}, () => {});
+		assert.equal(notOurs, undefined, "a tool outside the builtins set is not projected at all");
+		assert.equal(carriesHandle(textBlocks(wrapped.content) ?? []), true, "which is why the hook checks before it calls in here");
 
-		handles = 0;
-		await projectBuiltin(cfg({ builtins: new Set(["read"]) }), new Capturer(cfg()), resolve, { toolCallId: "r", toolName: "read", input: {}, content: [{ type: "text", text: footer("xm1.abc123") }], details: undefined, isError: false }, {}, () => handles++);
-		assert.equal(handles, 1, "the tool must still be a built-in for the handler to see it");
-
-		handles = 0;
-		await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "o", toolName: "read", input: {}, content: [{ type: "text", text: footer("xm1.abc123") }], details: undefined, isError: false }, {}, () => handles++);
-		assert.equal(handles, 0, "a tool outside the builtins set is not ours at all");
+		assert.equal(carriesHandle(textBlocks([{ type: "text", text: "total 4\ndrwx" }]) ?? []), false, "an ordinary result has no handle");
 	});
 });
 

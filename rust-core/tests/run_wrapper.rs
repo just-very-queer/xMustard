@@ -171,9 +171,14 @@ fn a_capture_prints_the_projection_and_handle_and_sends_only_a_command_hint() {
         head.to_lowercase().contains("authorization: bearer tok"),
         "{head}"
     );
-    assert!(head.contains("command=sh"), "{head}");
+    // The hint names the command the shell will run, not the shell: `sh -c "echo
+    // out; ..."` is the `echo` command. Before WS-44e it was `sh`, which is the same
+    // word for every wrapped command and left the reducer registry with nothing to
+    // key on. The rest of the line still must not travel: the token is in argv and
+    // the stderr redirect is not a plain word, so neither appears.
+    assert!(head.contains("command=echo"), "{head}");
     assert!(
-        !head.contains("hunter2") && !head.contains("echo"),
+        !head.contains("hunter2") && !head.contains(">&2"),
         "the command line leaked: {head}"
     );
 }

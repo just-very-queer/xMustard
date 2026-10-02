@@ -397,20 +397,47 @@ fn enc(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
 /// What the server may learn of the command line to pick a reducer: the program's name
 /// and, when it is a plain word, its first argument (`git diff`). The rest of the line
 /// can hold tokens or secrets, so it never leaves the process.
+///
+/// A client that cannot replace a shell result rewrites the command into
+/// `<shell> -c <command>` (the Pi adapter's WS-44e wrap). The program is then the
+/// shell, which every command shares, so the hint has to come from the string the
+/// shell will run. `sh -c "git diff"` must still hint `git diff`, or the whole
+/// command-keyed reducer registry falls through to the generic shell reducer.
 fn command_hint(argv: &[String]) -> String {
-    let name = argv[0].rsplit('/').next().unwrap_or(&argv[0]);
-    let plain = |s: &String| {
+    let name = basename(&argv[0]);
+    let plain = |s: &str| {
         !s.is_empty()
             && s.bytes()
                 .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
             && !s.starts_with('-')
     };
-    match argv.get(1).filter(|a| plain(a)) {
-        Some(sub) => format!("{name} {sub}"),
-        None => name.to_string(),
+    // A shell invocation's words come from the string the shell will run, so the
+    // hint describes the command and not the shell that every command shares.
+    let words: Vec<&str> = if argv.get(1).is_some_and(|f| f == "-c") {
+        argv.get(2)
+            .map(|c| c.split_whitespace().collect())
+            .unwrap_or_default()
+    } else {
+        argv.iter().map(String::as_str).collect()
+    };
+    // The program's name, and its first plain argument: `git diff --stat` is `git
+    // diff`, not `git --stat` and not `git`. A path is reduced to its basename
+    // first, as it was before a shell invocation was recognised. The two words are
+    // taken positionally from the start, because dropping a non-plain word would
+    // pair a later one with an earlier one's role. Nothing past the second word is
+    // read, so a token or secret further along the line never leaves the process.
+    let first = words.first().map(|w| basename(w)).filter(|w| plain(w));
+    match (first, words.get(1).copied().filter(|w| plain(w))) {
+        (Some(one), Some(two)) => format!("{one} {two}"),
+        (Some(one), None) => one.to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -439,6 +466,34 @@ mod tests {
             "curl"
         );
         assert_eq!(command_hint(&a(&["curl", "https://h/?k=secret"])), "curl");
+    }
+
+    #[test]
+    fn command_hint_of_a_shell_invocation_names_the_command_not_the_shell() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(command_hint(&a(&["bash", "-c", "git diff"])), "git diff");
+        assert_eq!(command_hint(&a(&["sh", "-c", "go test ./..."])), "go test");
+        assert_eq!(
+            command_hint(&a(&["/bin/bash", "-c", "cargo clippy --all"])),
+            "cargo clippy"
+        );
+        // A leading cd or env is not the program, and nothing past the second plain
+        // word is taken, so a token later in the line never reaches the hint.
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "cd sub && git diff"])),
+            "cd sub"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "git diff --stat"])),
+            "git diff"
+        );
+        // A word holding a redirect or a substitution is not a program name, and
+        // dropping it to reach a later plain word would mis-pair the two.
+        assert_eq!(command_hint(&a(&["bash", "-c", "git >out diff"])), "git");
+        assert_eq!(command_hint(&a(&["bash", "-c", "ls"])), "ls");
+        assert_eq!(command_hint(&a(&["bash", "-c", ""])), "bash");
+        assert_eq!(command_hint(&a(&["bash", "-c"])), "bash");
+        assert_eq!(command_hint(&a(&["bash"])), "bash");
     }
 
     #[test]

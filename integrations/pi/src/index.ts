@@ -16,7 +16,7 @@ import { type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft, VE
 import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
-import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
+import { Capturer, carriesHandle, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool, textBlocks } from "./delivery.ts";
 import { mutateBashInput, shouldWrapBash } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
@@ -122,6 +122,12 @@ export default function xmustard(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		const meta = { sessionId: sessionIdOf(ctx), signal: ctx.signal };
 		if (TOOL_NAMES.has(event.toolName)) return projectResult(cfg, event, pending, meta, activateExpand);
+		// A wrapper handle activates expansion whatever the built-in projection
+		// setting is. With XMUSTARD_PI_BUILTINS=none (or a subset without bash) the
+		// wrapped call is still captured and still carries a handle, and the model
+		// needs xmustard_expand to use it; the projection itself is skipped, which is
+		// the separate decision the builtins set already makes.
+		if (carriesHandle(textBlocks(event.content) ?? [])) activateExpand();
 		if (cfg.builtins.has(event.toolName)) {
 			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand);
 		}
@@ -131,9 +137,10 @@ export default function xmustard(pi: ExtensionAPI): void {
 	// WS-44e (PAR-ADP-09): a bash call's command is rewritten to the run wrapper
 	// before Pi executes it, so its output is reduced server-side. The decision is
 	// shouldWrapBash's, so no other call pays for a workspace lookup and its deadline,
-	// and a session that cannot hand the wrapper its token keeps running natively.
+	// and a session whose wrapper token is not this process's own token keeps running
+	// natively, captured by the adapter instead.
 	pi.on("tool_call", async (event, ctx) => {
-		if (!shouldWrapBash(event, { enabled: cfg.wrapBash, tokenConfigured: !!cfg.token, wrapperTokenPresent: !!process.env.XMUSTARD_API_TOKEN })) return undefined;
+		if (!shouldWrapBash(event, { enabled: cfg.wrapBash, tokenConfigured: !!cfg.token, wrapperToken: process.env.XMUSTARD_API_TOKEN })) return undefined;
 		await resolveWorkspace(ctx.cwd, ctx.signal).then(
 			(ws) => mutateBashInput(event, ws, true),
 			() => mutateBashInput(event, undefined, true),

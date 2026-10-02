@@ -13,9 +13,9 @@
 // `--` directly (rust-core/src/run_wrapper.rs: `Command::new(&argv[0])`). A command
 // like `cd sub && make` therefore has to be handed to a shell explicitly, or the
 // wrapper would try to exec `cd`. So the wrapped form is
-// `xmustard-core run --workspace <id> -- sh -c <quoted command>`: the shell sees the
-// exact string Pi would have run, inside the wrapper's argv, and every byte it prints
-// is still reduced and retained.
+// `xmustard-core run --workspace <id> -- bash -c <quoted command>`: the shell sees
+// the exact string Pi would have run, inside the wrapper's argv, and every byte it
+// prints is still reduced and retained.
 //
 // Every edge here fails open to the native command. A wrap that cannot be built
 // correctly is worse than no wrap: the wrapper's own promise is that the command
@@ -23,9 +23,12 @@
 // the shell in place of the model's command.
 
 export const WRAPPER = "xmustard-core run";
-// The program the wrapped command runs as. `sh -c` reproduces the shell Pi would
-// have used, so pipelines, `&&`, redirection and quoting behave as before.
-const SHELL = "sh";
+// The program the wrapped command runs as, and the flag that gives it the string.
+// `bash`, not `sh`: the tool being wrapped is Pi's `bash`, whose semantics are
+// bash's, and on a Debian-family host /bin/sh is dash, where `[[ ... ]]`, arrays
+// and process substitution fail. Measured on the build box: /bin/sh -> dash,
+// `[[ 1 == 1 ]]` exits 127 and `a=(x y)` exits 2 there.
+const SHELL = "bash";
 const SHELL_FLAG = "-c";
 
 // A command already addressed to the wrapper, with or without an absolute path
@@ -68,17 +71,22 @@ function isRecord(v: unknown): v is Record<string, unknown> {
 // token the wrapper cannot be handed.
 //
 // The second refusal is not a nicety. The wrapper authenticates with
-// XMUSTARD_API_TOKEN from its own environment (rust-core/src/run_wrapper.rs), this
-// adapter reads XMUSTARD_TOKEN, and a tool_call hook cannot change the child
+// XMUSTARD_API_TOKEN from its own environment (rust-core/src/run_wrapper.rs) and this
+// adapter reads XMUSTARD_TOKEN; a tool_call hook cannot change the child
 // environment. Putting the token on the command line instead would write it into
-// Pi's session transcript, the masking walk and every capture body. So when the API
-// needs a token this process cannot pass on, the command runs natively and
-// projectBuiltin captures its result through the adapter, which can authenticate.
+// Pi's session transcript, the masking walk and every capture body. So the wrap
+// happens only when the wrapper can authenticate with exactly the credential this
+// process holds — the same value, not merely the presence of a variable. Two
+// different tokens would make the wrapper's capture POST a 401 and fall back to
+// unreduced output, which is the very thing the wrap exists to prevent. When the
+// tokens cannot be reconciled the command runs natively and projectBuiltin captures
+// its result through the adapter, which can authenticate.
 export function shouldWrapBash(
 	event: unknown,
-	opts: { enabled: boolean; tokenConfigured: boolean; wrapperTokenPresent: boolean },
+	opts: { enabled: boolean; tokenConfigured: boolean; wrapperToken: string | undefined },
 ): boolean {
 	if (!opts.enabled) return false;
 	if (!isRecord(event) || event.toolName !== "bash") return false;
-	return !(opts.tokenConfigured && !opts.wrapperTokenPresent);
+	if (!opts.tokenConfigured) return true;
+	return !!opts.wrapperToken;
 }
