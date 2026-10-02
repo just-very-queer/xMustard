@@ -384,6 +384,19 @@ pub struct SearchResult {
     pub generated_at: String,
 }
 
+/// Which lanes one search runs (WS-59b: `search mode=hybrid|text`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SearchMode {
+    /// The default fusion: bm25 over path/symbols/body, the docs lane, the name,
+    /// structural, fuzzy and proximity lanes.
+    #[default]
+    Hybrid,
+    /// The body lane alone: BM25 over a chunk's text, not its path, its declared names
+    /// or the doc chunks. Every hit therefore carries a term in code the query asked
+    /// for, which the hybrid's fusion can rank below a name or path match.
+    Text,
+}
+
 /// Search arguments beyond the query.
 #[derive(Debug, Clone, Default)]
 pub struct SearchOptions<'a> {
@@ -393,6 +406,10 @@ pub struct SearchOptions<'a> {
     pub seed: Option<&'a str>,
     /// Only paths matching this glob (gitignore semantics).
     pub path_glob: Option<&'a str>,
+    /// Only files of this language (`files.lang`, the pack's name). Empty admits every
+    /// file; a name no file carries matches nothing.
+    pub lang: Option<&'a str>,
+    pub mode: SearchMode,
 }
 
 /// One candidate of the fused pool. The pool can hold every symbol of a large
@@ -572,7 +589,20 @@ pub fn search(
         .path_glob
         .filter(|g| !g.is_empty())
         .map(|g| Glob::compile(g.as_bytes()));
-    let admit = |p: &str| glob.as_ref().is_none_or(|g| g.matches(p.as_bytes()));
+    // The `lang` filter reads the same `Lang::for_path` the writer stored in
+    // `files.lang`, so a name the index never wrote matches nothing rather than
+    // everything. Every lane goes through `admit`, not just the bm25 lane: a filter that
+    // left the name and file lanes unfiltered would answer with symbols in a language it
+    // was told to exclude.
+    let lang = opts
+        .lang
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_ascii_lowercase());
+    let admits_lang = |p: &str| match &lang {
+        None => true,
+        Some(want) => crate::index::lang::Lang::for_path(p).is_some_and(|l| l.name() == want),
+    };
+    let admit = |p: &str| glob.as_ref().is_none_or(|g| g.matches(p.as_bytes())) && admits_lang(p);
 
     let mut qtokens: Vec<String> = tokens(query);
     qtokens.sort();
@@ -602,12 +632,24 @@ pub fn search(
     }
 
     // ---- text lanes (code index only) ----
+    // `mode=text` reads the body lane alone: the docs lane answers prose the caller did
+    // not ask for, and the name and file lanes are dropped below, so the only candidates
+    // left are the chunks whose body carries a term.
+    let body_only = opts.mode == SearchMode::Text;
     let index = text_index(&source, &mut degradations);
     let text: TextLanes = match index {
         Some(opened) => {
-            let read = opened
-                .snapshot
-                .with_text(|conn| fts::lanes(conn, &q.terms, opts.path_glob, BM25_K, DOCS_K));
+            let read = opened.snapshot.with_text(|conn| {
+                fts::lanes(
+                    conn,
+                    &q.terms,
+                    opts.path_glob,
+                    BM25_K,
+                    if body_only { 0 } else { DOCS_K },
+                    opts.lang.filter(|l| !l.is_empty()),
+                    body_only,
+                )
+            });
             match read {
                 Ok(mut t) => {
                     t.code.retain(|h| admit(&h.loc.path));
@@ -694,6 +736,12 @@ pub fn search(
             }
             let line = sym.line.map(|l| l as u32);
             let code = line.and_then(|l| by_decl.get(&(sym.path, l)).copied());
+            // In text mode a symbol is a candidate only when the body lane put it there:
+            // without `code` it matched on its name or path, which this mode does not
+            // answer from.
+            if body_only && code.is_none() {
+                return;
+            }
             if name_memo.0 != sym.name {
                 // the fuzzy lane compares the symbol NAME only; path tokens dilute it.
                 let fuzzy = cosine(&q_vec, &name_vector(sym.name));
@@ -751,6 +799,10 @@ pub fn search(
                 inbound.insert(f.path.to_string(), f.inbound);
             }
             if !admit(f.path) {
+                return;
+            }
+            // A file candidate is a path match, which text mode does not answer from.
+            if body_only {
                 return;
             }
             let bits = token_bits(&qtokens, f.path);
@@ -918,6 +970,7 @@ pub fn search(
         qtokens: &qtokens,
         text: &text,
         seed: effective_seed.as_deref().unwrap_or(""),
+        body_only,
     };
     let hits: Vec<SearchHit> = order
         .get(opts.offset..page_end)
@@ -1005,6 +1058,9 @@ struct Render<'a> {
     qtokens: &'a [String],
     text: &'a TextLanes,
     seed: &'a str,
+    /// `mode=text`: the bm25 lane read the body column, so a hit names `body` and says
+    /// so, rather than claiming the whole-chunk bm25 it did not run.
+    body_only: bool,
 }
 
 impl Render<'_> {
@@ -1021,12 +1077,16 @@ impl Render<'_> {
         let matched: Vec<&str> = Lane::ALL
             .into_iter()
             .filter(|l| lanes & l.bit() != 0)
-            .map(Lane::name)
+            .map(|l| self.lane_name(l))
             .collect();
         let row = |i: Option<u32>, rows: &[TextHit]| i.map(|i| rows[i as usize].clone());
         let (code_row, doc_row) = (row(c.code, &text.code), row(c.doc, &text.docs));
         for lane in Lane::ALL.into_iter().filter(|l| lanes & l.bit() != 0) {
             let reason = match lane {
+                Lane::Bm25 if self.body_only => code_row.as_ref().map(|h| match h.all_terms {
+                    true => "body: every query term in the chunk body".to_string(),
+                    false => "body: some query terms in the chunk body".to_string(),
+                }),
                 Lane::Bm25 => code_row.as_ref().map(|h| match h.all_terms {
                     true => "bm25: every query term in the chunk".to_string(),
                     false => "bm25: some query terms in the chunk".to_string(),
@@ -1073,7 +1133,7 @@ impl Render<'_> {
         let mut scores: BTreeMap<&'static str, f64> = Lane::ALL
             .into_iter()
             .filter(|l| lanes & l.bit() != 0)
-            .map(|l| (l.name(), round6(c.lane_score(l, text))))
+            .map(|l| (self.lane_name(l), round6(c.lane_score(l, text))))
             .collect();
         scores.insert("rrf", round6(rrf));
         scores.insert("rerank", round6(cx.features.score()));
@@ -1097,6 +1157,15 @@ impl Render<'_> {
             reason: reasons.join(" · "),
             reasons,
             snippet: cx.snippet,
+        }
+    }
+
+    /// The name a lane reports under. In text mode the bm25 lane read only the `body`
+    /// column, so it is named for what it searched.
+    fn lane_name(&self, lane: Lane) -> &'static str {
+        match (lane, self.body_only) {
+            (Lane::Bm25, true) => "body",
+            (l, _) => l.name(),
         }
     }
 }
@@ -1361,6 +1430,169 @@ mod tests {
         assert!(
             (norm - 1.0).abs() < 1e-4,
             "fallback vector must be normalized"
+        );
+    }
+
+    /// A Go and a Rust file for each place a term can sit, with a distinct term per file
+    /// so every hit is attributable to exactly one place: the chunk's own text or the
+    /// `path` column. The one term in a chunk's text appears in a Go *and* a Rust file
+    /// (`zeppelinprobe`), so a single query crosses both languages.
+    ///
+    /// A chunk's `body` column is `tokenize_without_secrets` of the chunk's own bytes, and
+    /// chunks are cut on declarations, so the `body` column of a declaration includes its
+    /// signature line and its leading doc comment. A term only in the `path` column is
+    /// therefore the case the body lane excludes. The two path terms share no token with
+    /// the body term, because the lanes fall back to OR over the query's tokens and a
+    /// shared stem would make a path query match the body files.
+    fn lang_and_body_repo() -> TempDir {
+        indexed_repo(&[
+            // the chunk-text term, in a function body, in Go and in Rust
+            (
+                "svc/handler.go",
+                "package svc\n\n// unrelated prose\nfunc serve() {\n\tzeppelinprobe()\n}\n",
+            ),
+            ("src/lib.rs", "pub fn serve() {\n    zeppelinprobe();\n}\n"),
+            // a term in the `path` column only
+            ("svc/quixoticroute.go", "package svc\n\nfunc other() {}\n"),
+            ("src/quixoticroute.rs", "pub fn other() {}\n"),
+        ])
+    }
+
+    fn text_search(repo: &TempDir, query: &str, lang: Option<&str>) -> SearchResult {
+        search(
+            repo.path(),
+            "ws",
+            None,
+            query,
+            &SearchOptions {
+                limit: 20,
+                mode: SearchMode::Text,
+                lang,
+                ..Default::default()
+            },
+        )
+    }
+
+    // `mode=text` answers from the chunk's own text: a term that exists only in the
+    // `path` column is not a text hit, in either language, and a chunk-text hit names the
+    // `body` lane rather than the whole-chunk bm25 it did not run.
+    #[test]
+    fn text_mode_matches_the_chunk_text_and_not_the_path() {
+        let repo = lang_and_body_repo();
+
+        let res = text_search(&repo, "zeppelinprobe", None);
+        let mut paths: Vec<&str> = res.hits.iter().map(|h| h.path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["src/lib.rs", "svc/handler.go"], "{:?}", res.hits);
+        for h in &res.hits {
+            assert_eq!(h.kind, "symbol", "a body hit names its declaration: {h:?}");
+            assert!(h.lanes_matched.contains(&"body"), "{:?}", h.lanes_matched);
+            assert!(
+                h.reason.contains("body:"),
+                "the reason must name the lane it ran: {}",
+                h.reason
+            );
+        }
+
+        // a term in the `path` column alone is not a body hit
+        for query in ["quixoticroute"] {
+            let res = text_search(&repo, query, None);
+            assert!(
+                res.hits.is_empty(),
+                "{query} is a path match, not a chunk-text match: {:?}",
+                res.hits
+            );
+        }
+    }
+
+    // The same term in a Go chunk and a Rust chunk: `lang` keeps one and drops the
+    // other, an unknown language matches nothing, and an empty one is today's behaviour.
+    #[test]
+    fn lang_filter_keeps_only_that_language_s_body_hits() {
+        let repo = lang_and_body_repo();
+
+        // one term in a Go and a Rust chunk body, so one query is the shared case
+        let both = "zeppelinprobe";
+        let all = text_search(&repo, both, None);
+        assert_eq!(all.hits.len(), 2, "{:?}", all.hits);
+
+        let go_only = text_search(&repo, both, Some("go"));
+        assert_eq!(go_only.hits.len(), 1, "{:?}", go_only.hits);
+        assert_eq!(go_only.hits[0].path, "svc/handler.go");
+
+        let rust_only = text_search(&repo, both, Some("rust"));
+        assert_eq!(rust_only.hits.len(), 1, "{:?}", rust_only.hits);
+        assert_eq!(rust_only.hits[0].path, "src/lib.rs");
+
+        // an unknown language is a filter that matches nothing, not one that is ignored
+        assert!(text_search(&repo, both, Some("cobol")).hits.is_empty());
+        // an empty filter is today's behaviour
+        assert_eq!(text_search(&repo, both, Some("")).hits.len(), 2);
+    }
+
+    // The hybrid's own `lang` filter: it narrows the answer to one language and every
+    // hit it keeps is a hit the unfiltered query also found. The hit's own reason is not
+    // compared, because a smaller lane window can return a different chunk of a long
+    // declaration, and the bm25 row a hit cites is a row of that window.
+    #[test]
+    fn lang_filter_narrows_the_hybrid_without_inventing_hits() {
+        let repo = lang_and_body_repo();
+        let unfiltered = hybrid_search(repo.path(), "ws", "zeppelinprobe", 20, None);
+        let go_only = search(
+            repo.path(),
+            "ws",
+            None,
+            "zeppelinprobe",
+            &SearchOptions {
+                limit: 20,
+                lang: Some("go"),
+                ..Default::default()
+            },
+        );
+        assert!(!go_only.hits.is_empty(), "lang=go must match the Go files");
+        assert!(
+            go_only.hits.iter().all(|h| h.path.ends_with(".go")),
+            "every hit must be a Go file: {:?}",
+            go_only.hits
+        );
+        assert!(
+            unfiltered.hits.len() >= go_only.hits.len(),
+            "the filtered answer must be a subset: {} vs {}",
+            unfiltered.hits.len(),
+            go_only.hits.len()
+        );
+        for h in &go_only.hits {
+            assert!(
+                unfiltered
+                    .hits
+                    .iter()
+                    .any(|u| u.path == h.path && u.name == h.name && u.line == h.line),
+                "{} is not a hit of the unfiltered query",
+                h.name
+            );
+        }
+    }
+
+    // `path_glob` and `lang` compose: each narrows, and together they intersect.
+    #[test]
+    fn lang_filter_composes_with_path_glob() {
+        let repo = lang_and_body_repo();
+        let res = search(
+            repo.path(),
+            "ws",
+            None,
+            "zeppelinprobe",
+            &SearchOptions {
+                limit: 20,
+                lang: Some("go"),
+                path_glob: Some("src/**"),
+                ..Default::default()
+            },
+        );
+        assert!(
+            res.hits.is_empty(),
+            "no file is both Go and under src/: {:?}",
+            res.hits
         );
     }
 }
