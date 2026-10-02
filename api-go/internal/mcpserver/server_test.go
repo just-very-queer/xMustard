@@ -208,11 +208,24 @@ func TestToolsListIsSharpSurface(t *testing.T) {
 }
 
 const goldenPath = "testdata/tools_list.json"
+const goldenFullPath = "testdata/tools_list_full.json"
 
 // goldenToolsList is the tools/list answer to a current (2025-06-18) client, the
 // snapshot that integrations/pi/test/unit.test.ts checks its mirror against.
 func goldenToolsList() []byte {
-	s := New(Options{Backend: &fakeAPI{}}).NewSession(nil)
+	return goldenToolsListFor(SchemaLean)
+}
+
+// goldenToolsListFull is the same answer under SchemaFull: the profile that also
+// advertises each tool's Advanced arguments. integrations/pi/src/tools.ts mirrors it,
+// because the Pi extension validates every call against its own closed schema and so
+// can only send an argument that schema names.
+func goldenToolsListFull() []byte {
+	return goldenToolsListFor(SchemaFull)
+}
+
+func goldenToolsListFor(profile SchemaProfile) []byte {
+	s := New(Options{Backend: &fakeAPI{}, Schema: profile}).NewSession(nil)
 	s.version = LatestProtocolVersion
 	out := s.ToolsList()
 	out["protocolVersion"] = LatestProtocolVersion
@@ -285,6 +298,88 @@ func TestToolsListSnapshot(t *testing.T) {
 	}
 	if a := byName["why_failed"]; a["destructiveHint"] != true || a["idempotentHint"] != false {
 		t.Errorf("why_failed runs commands that can change the tree and records a new outcome each run: %v", a)
+	}
+}
+
+// The full profile advertises each tool's Advanced arguments beside its lean ones.
+// integrations/pi/test/unit.test.ts checks its mirror against this golden, because the
+// Pi extension validates every call against its own closed schema and so can send only
+// an argument that schema names. Regenerated with the same
+// XMUSTARD_UPDATE_GOLDEN=1 switch as the lean golden.
+func TestToolsListFullSnapshot(t *testing.T) {
+	got := goldenToolsListFull()
+	if os.Getenv("XMUSTARD_UPDATE_GOLDEN") == "1" {
+		if err := os.WriteFile(goldenFullPath, got, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	want, err := os.ReadFile(goldenFullPath)
+	if err != nil {
+		t.Fatalf("read %s (regenerate with XMUSTARD_UPDATE_GOLDEN=1): %v", goldenFullPath, err)
+	}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("full-profile tools/list drifted from %s; regenerate with XMUSTARD_UPDATE_GOLDEN=1 and update the Pi mirror.\ngot:\n%s", goldenFullPath, got)
+	}
+	var doc struct {
+		Tools []struct {
+			Name        string         `json:"name"`
+			InputSchema map[string]any `json:"inputSchema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(got, &doc); err != nil {
+		t.Fatal(err)
+	}
+	// Every argument tools/call accepts is advertised here, so the profile is a superset
+	// of the lean one and names each argument once.
+	lean := map[string]map[string]any{}
+	var leanDoc struct {
+		Tools []struct {
+			Name        string         `json:"name"`
+			InputSchema map[string]any `json:"inputSchema"`
+		} `json:"tools"`
+	}
+	if err := json.Unmarshal(goldenToolsList(), &leanDoc); err != nil {
+		t.Fatal(err)
+	}
+	for _, tl := range leanDoc.Tools {
+		lean[tl.Name] = tl.InputSchema["properties"].(map[string]any)
+	}
+	// The Pi mirror must find an Advanced argument for every property the full profile
+	// adds beyond the lean one: recall (filters, disclosure, fetch-by-id, WS-34
+	// transcripts) and explain (symbol context, outline depth, content) are the ones the
+	// H2 gap named, but every tool carries Advanced args and the mirror covers them all.
+	for _, tl := range doc.Tools {
+		in := tl.InputSchema
+		if in["type"] != "object" || in["additionalProperties"] != false {
+			t.Errorf("%s full input schema is not a closed object: %v", tl.Name, in)
+		}
+		props := in["properties"].(map[string]any)
+		for name := range lean[tl.Name] {
+			if _, ok := props[name]; !ok {
+				t.Errorf("%s full profile dropped the lean argument %q", tl.Name, name)
+			}
+		}
+		// An argument the lean schema also advertises must render identically under the
+		// full profile: the two views of one argument cannot drift.
+		for name, wantProp := range lean[tl.Name] {
+			if gotProp, ok := props[name]; ok && !reflect.DeepEqual(gotProp, wantProp) {
+				t.Errorf("%s argument %q differs between lean and full: %v vs %v", tl.Name, name, gotProp, wantProp)
+			}
+		}
+	}
+	// recall and explain are the two the row names; each full profile must actually add
+	// the Advanced arguments it is required to.
+	wantAdvanced := map[string][]string{
+		"recall":  {"entry_id", "status", "include_pending", "max_chars", "cursor", "source", "agent", "conversation", "explain", "names_only", "render", "as_of", "valid_only", "seed"},
+		"explain": {"symbol", "uid", "depth", "chain_depth", "include_content", "max_chars", "limit", "cursor"},
+	}
+	for _, tl := range doc.Tools {
+		props := tl.InputSchema["properties"].(map[string]any)
+		for _, name := range wantAdvanced[tl.Name] {
+			if _, ok := props[name]; !ok {
+				t.Errorf("%s full profile is missing the Advanced argument %q", tl.Name, name)
+			}
+		}
 	}
 }
 
