@@ -105,6 +105,39 @@ func TestMemoryResourcesAreServedOnAFullConnection(t *testing.T) {
 	}
 }
 
+// A resource read that a read-only connection owes a refusal gets the same
+// client-visible shape a named tools/call gets: a tool result with isError, never a
+// JSON-RPC error (MCP 2025-11-25). The shape is asserted on the refusal the resource
+// path builds, since memoryIndex and memoryCore each re-wrap it in their own resource
+// error; what this pins is that neither re-wrap starts from a protocol error, and that
+// the reason travels in the message. No resource is backed by a write tool today, so
+// why_failed stands in for one.
+func TestResourceRefusalIsAToolResultNotAProtocolError(t *testing.T) {
+	refused := resourceToolRefusal(true, whyFailedTool, map[string]string{"command": "go test ./..."})
+	if refused == nil {
+		t.Fatal("a command on a read-only connection must be refused")
+	}
+	if _, isRPC := any(refused).(*RPCError); isRPC {
+		t.Fatal("a refusal is a tool result, never a protocol error")
+	}
+	if refused["isError"] != true {
+		t.Fatalf("a refusal carries isError, got %v", refused)
+	}
+	for _, want := range []string{"why_failed", "mode=" + ModeReadOnly, "command"} {
+		if !strings.Contains(text(refused), want) {
+			t.Errorf("a refusal names %q, got %q", want, text(refused))
+		}
+	}
+	// the unserved-tool arm carries its own reason, not the write-args one
+	unserved := resourceToolRefusal(true, rememberTool, map[string]string{"content": "x"})
+	if unserved == nil || unserved["isError"] != true || !strings.Contains(text(unserved), "changes shared memory") {
+		t.Fatalf("a write tool is refused as changing shared memory, got %v", unserved)
+	}
+	if n := len(unserved["content"].([]map[string]any)); n != 1 {
+		t.Fatalf("a refusal is one text block, got %d", n)
+	}
+}
+
 // With recall served, the index read is exactly what it was: the same request path,
 // the same contents and a _meta carrying the workspace. This is the guard that keeps
 // any gate on this route a refusal of a refused read rather than a new denial of a
