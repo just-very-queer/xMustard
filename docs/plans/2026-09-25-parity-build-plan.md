@@ -3137,6 +3137,40 @@ launchd/systemd unit or socket activation via xmustard-ops setup, health-checked
 
 Read-only rename/delete impact plans (IMP-09) and exact/regex search (RET-09) matching GitNexus rename and grep-class surfaces.
 
+### WS-59a — Sub-task plan and the IMP-03 / CTX-05 / PAR-RET-01-remainder folds
+
+**Goal.** Fix the sub-task split and the one overlap the plan row does not mention, before any code lands, and assign every requirement row WS-59 owns to exactly one sub-task. The goal file's §2.5 lists IMP-03, CTX-05 and the PAR-RET-01 remainder as not yet folded into a workstream; this section is the fold, assigning each to the sub-task that closes it. It ships no behaviour, so it carries no gate.
+
+**Requirements.** PAR-RET-01 (remainder only), PAR-IMP-03, PAR-CTX-05, PAR-RET-09, PAR-IMP-09. Sub-tasks:
+
+| Sub-task | Scope | Rows closed | Gate | Size |
+|---|---|---|---|---|
+| 59a | this section, the folds, the overlap ruling | — (planning) | none (docs) | S |
+| 59b | `search mode=text`; `lang` becomes a filter for hybrid, not a pattern-mode hint | PAR-RET-01 remainder (body search) | `CAPS`, `RET`, `BOXALL` | M |
+| 59c | `search mode=exact\|regex` as a bounded pread lane: line, byte and time caps; linear-time regex | PAR-RET-09 | `CAPS`, `RET`, `BOXALL` | M |
+| 59d | `impact op=refs\|definition\|implementations` with containing symbol, kind, line and a ±1-line snippet | PAR-IMP-03 | `CAPS`, `BOXALL` | M |
+| 59e | `impact` paging: `has_more` / `next_cursor`, reusing search's cursor code | PAR-CTX-05 | `CAPS`, `BOXALL` | S |
+| 59f | read-only `impact op=rename\|delete` plans; a lexical-only plan is labelled unsafe | PAR-IMP-09 | `CAPS`, `BOXALL` | M |
+
+**Files.** `docs/plans/2026-09-25-parity-build-plan.md` only. No source file is read for behaviour and none is changed; the facts quoted below were verified with `rg` on the tree at this branch's base (`e3a6d00`).
+
+**New modules.** none.
+
+**Tests required.** none. §4 step 4 exempts docs, and the exemption is not a test-free pass: every code fact this section asserts is cited to a file and line, each assignment in the table names the requirement row it closes, and the two overlap rulings are stated as one sentence each so a later sub-task cannot silently re-decide them.
+
+**Acceptance.** (1) Every WS-59 sub-task in the goal's §3.5 has exactly one table row here, and every table row names a sub-task in §3.5 (no row without a sub-task, no sub-task without a row). (2) IMP-03, CTX-05 and the PAR-RET-01 remainder each name exactly one owning sub-task, and no requirement row appears in two rows of the table. (3) The `lang` overlap and the cursor-helper overlap each have one ruling with one owner. (4) `grep -c "^### WS-59a "` on this file returns 1.
+
+**Boundary the later sub-tasks inherit.** 59b and 59d both change `api-go/internal/mcpserver/tool_search.go` and `tool_impact.go` argument lists, and 59e reuses search's cursor helper that 52a later unifies, so they merge in the order 59b, 59c, 59d, 59e, 59f and each re-reads §1.7 rule 4 before its gate. `impact path=` is not replaced or renamed (G§5.3).
+
+**Verified facts this section rests on** (`rg` on `e3a6d00`, no behaviour implied):
+
+- `search`'s mode enum is `hybrid|pattern|symbol` at `api-go/internal/mcpserver/tool_search.go:19`; `exact` and `regex` are additions to that enum, and `text` is a fourth member. Every one is an Advanced argument (G§5.1 rule 9): documented at `xmustard://docs/tools` and absent from the lean schema.
+- `lang` exists today as "language hint for pattern mode" (`tool_search.go:20`) and is listed in `searchQueryArgs` (`:10`). PAR-RET-01's surface names `lang` beside `path_glob` as a hybrid filter, so the same argument has to mean one thing in two modes: the ruling is that `lang` becomes a filter for the hybrid and exact/regex lanes, while `mode=pattern` keeps its hint, and both are read from the single argument.
+- `impact` today has no `op` argument (`api-go/internal/mcpserver/tool_impact.go:12-19`). Its form is chosen by `ImpactFormOf` (`api-go/internal/workspaceops/impact_flags.go:152`), a `switch` over five forms — trace, blast, file, changes and since-index — and `CheckImpactRequest` (`:172`) refuses an argument that belongs to another form. `op=` is therefore additive: it refines the blast form (`symbol=`) and must not change which argument selects those five.
+- PAR-IMP-09's `op=rename` returns `{path, range, old, new}` edits with provenance and `op=delete` returns `{safe, blocking_refs}`; both are read-only plans and xMustard never applies an edit. Nothing in the plan row contradicts this, and §5.1 rule 7 (guards fail closed) applies to the plan's own completeness, not to any edit.
+
+**Collision risk.** `tool_search.go` and `tool_impact.go` (WS-52a and WS-52b/52c touch `tool_search.go` too, which is why §3.5 orders WS-52 after WS-38 and why 59e's cursor helper is the one 52a unifies). The plan file (every lane appends its section here).
+
 ### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
 
 Route/DI extractors (Django, FastAPI, Next.js, Nest, Spring, Laravel, tRPC, Expo) seeding flow entry points; Vue, Dart, Objective-C packs; reimplemented from design (GitNexus is PolyForm NC).
