@@ -201,7 +201,7 @@ func assertNoViewsStored(t *testing.T, dataDir, workspaceID string) {
 //
 // An absent file is recorded as a nil map entry, which is distinct from an existing
 // empty one, so a refused create that creates an empty file is caught too.
-func artifactState(t *testing.T, dataDir, workspaceID string) map[string]string {
+func artifactState(t testing.TB, dataDir, workspaceID string) map[string]string {
 	t.Helper()
 	dir := filepath.Join(dataDir, "workspaces", workspaceID)
 	state := map[string]string{}
@@ -238,5 +238,94 @@ func assertArtifactsUnchanged(t *testing.T, before map[string]string, dataDir, w
 		if _, exists := after[name]; !exists {
 			t.Fatalf("a refused create removed %s", name)
 		}
+	}
+}
+
+// readArtifactState is artifactState for a caller that wants a verdict rather than
+// a test failure; the refusal tables use artifactState, this one uses this.
+func readArtifactState(dataDir, workspaceID string) map[string]string {
+	dir := filepath.Join(dataDir, "workspaces", workspaceID)
+	state := map[string]string{}
+	for _, name := range []string{
+		"tracker_issues.json", "saved_views.json", "snapshot.json", "activity.jsonl",
+	} {
+		content, err := os.ReadFile(filepath.Join(dir, name))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			continue
+		}
+		state[name] = string(content)
+	}
+	return state
+}
+
+// artifactsUnchanged reports whether a refused create left every artifact alone,
+// without failing the test. The refusal tables assert on the failure; this test
+// needs the verdict the other way round, to prove the assertion fires at all.
+func artifactsUnchanged(before map[string]string, dataDir, workspaceID string) (bool, string) {
+	after := readArtifactState(dataDir, workspaceID)
+	for name := range after {
+		want, existed := before[name]
+		if !existed {
+			return false, "wrote " + name
+		}
+		if got := after[name]; got != want {
+			return false, "rewrote " + name
+		}
+	}
+	for name := range before {
+		if _, exists := after[name]; !exists {
+			return false, "removed " + name
+		}
+	}
+	return true, ""
+}
+
+// The no-write assertion has to fail on the writes it is meant to catch, including
+// an empty file, which the previous version recorded identically to an absent one.
+// Each case writes an artifact the refusal is supposed to leave alone and requires
+// the check to notice.
+func TestArtifactsUnchangedCatchesAWrite(t *testing.T) {
+	for _, name := range []string{
+		"tracker_issues.json", "saved_views.json", "activity.jsonl",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
+			path := filepath.Join(dataDir, "workspaces", workspaceID, name)
+
+			// An empty file where there was none: the case the old map[string]string
+			// could not see, because it stored absence as the empty string.
+			if err := os.WriteFile(path, nil, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if ok, why := artifactsUnchanged(map[string]string{}, dataDir, workspaceID); ok {
+				t.Fatalf("an empty %s was not caught as a write", name)
+			} else {
+				t.Logf("empty %s caught: %s", name, why)
+			}
+
+			// And a rewrite: same file, different bytes.
+			before := artifactState(t, dataDir, workspaceID)
+			if err := os.WriteFile(path, []byte("[]\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if ok, why := artifactsUnchanged(before, dataDir, workspaceID); ok {
+				t.Fatalf("a rewritten %s was not caught", name)
+			} else {
+				t.Logf("rewritten %s caught: %s", name, why)
+			}
+
+			// And a removal.
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if ok, why := artifactsUnchanged(before, dataDir, workspaceID); ok {
+				t.Fatalf("a removed %s was not caught", name)
+			} else {
+				t.Logf("removed %s caught: %s", name, why)
+			}
+		})
 	}
 }
