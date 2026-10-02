@@ -160,17 +160,16 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		// regression that sampled only under load would pass the counter above
 		// and fail here.
 		busy := holdSlot(t)
+		t.Cleanup(busy) // released on every path, including a panic in dig or num
 		for who, tok := range tokens {
 			if want[who] {
 				continue
 			}
 			under := health(tok)
 			if isFull(t, under) {
-				busy()
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work got the full view", mode, who)
 			}
 			if b, _ := dig(t, under, "budget").(map[string]any); len(b) != 4 {
-				busy()
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work leaked activity: %v", mode, who, b)
 			}
 		}
@@ -185,13 +184,13 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	}
 	// The restricted polls are only sound because no watchdog was running beside
 	// them: the counter would otherwise move for the watchdog's reasons. That is
-	// now structural, the slot being released before every restricted poll, so
-	// assert the structure instead of hoping for it. The sampler must be live
-	// while a slot is held and silent once it is released. Both halves wait for
-	// the state they need rather than assuming a sleep is long enough, because a
-	// test goroutine can wake before the watchdog goroutine has been scheduled at
-	// all, and a sleep that is "obviously long enough" is how this row's own
-	// flake was born.
+	// structural rather than incidental, the slot being released before every
+	// restricted poll, so assert the structure instead of hoping for it. The
+	// sampler must be live while a slot is held and silent once it is released.
+	// Both halves wait for the state they need rather than assuming a sleep is
+	// long enough, because a test goroutine can wake before the watchdog
+	// goroutine has been scheduled at all, and a sleep that is "obviously long
+	// enough" is how this row's own flake was born.
 	held := holdSlot(t)
 	// The admission sample taken by AcquireHeavy is not a watchdog tick, so the
 	// baseline is read after the slot is held and only later samples count.
@@ -227,25 +226,27 @@ func waitFor(t *testing.T, within time.Duration, cond func() bool) bool {
 	return true
 }
 
-// waitQuiet reports whether read holds the same value for a whole watch
-// interval, which is the evidence that nothing is sampling any more. It waits
-// for the state rather than asserting on a fixed sleep, and it retries within
-// the deadline because a sample already in flight when the slot was released
-// can land just after it.
+// waitQuiet reports whether read settles and then holds still for a whole watch
+// interval, which is the evidence that nothing is sampling any more. A sample
+// already in flight when the slot was released lands shortly after it, so a
+// single unchanged read is not yet quiet: the value is allowed to move once and
+// the interval is then re-measured from the new value, within the deadline. A
+// counter that never settles fails, which is the case the caller reports.
 func waitQuiet(t *testing.T, within time.Duration, read func() int64) bool {
 	t.Helper()
 	deadline := time.Now().Add(within)
-	before := read()
+	settled := read()
 	for {
-		time.Sleep(budget.DefaultWatchInterval)
-		if now := read(); now != before {
-			// the counter moved, so something is still sampling; this is the
-			// failure the caller reports, and no amount of waiting hides it
+		if !time.Now().Before(deadline) {
 			return false
 		}
-		if !time.Now().Before(deadline.Add(-budget.DefaultWatchInterval)) {
-			return true
+		time.Sleep(budget.DefaultWatchInterval)
+		now := read()
+		if now != settled {
+			settled = now
+			continue
 		}
+		return true
 	}
 }
 
