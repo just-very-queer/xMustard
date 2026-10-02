@@ -65,7 +65,11 @@ pub struct SyntaxError {
 pub fn check(root: &Path, paths: &[String]) -> SyntaxReport {
     let root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     SyntaxReport {
-        files: paths.iter().take(MAX_FILES).map(|p| check_file(&root, p)).collect(),
+        files: paths
+            .iter()
+            .take(MAX_FILES)
+            .map(|p| check_file(&root, p))
+            .collect(),
     }
 }
 
@@ -222,15 +226,27 @@ mod tests {
     #[test]
     fn reports_missing_and_error_nodes_by_position() {
         let dir = tempfile::tempdir().unwrap();
-        write(dir.path(), "ok.go", "package a\n\nfunc F() int { return 1 }\n");
-        write(dir.path(), "bad.go", "package a\n\nfunc F() int {\n\treturn 1 +\n");
+        write(
+            dir.path(),
+            "ok.go",
+            "package a\n\nfunc F() int { return 1 }\n",
+        );
+        write(
+            dir.path(),
+            "bad.go",
+            "package a\n\nfunc F() int {\n\treturn 1 +\n",
+        );
         let r = check(dir.path(), &["ok.go".into(), "bad.go".into()]);
         assert_eq!(r.files[0].status, "checked");
         assert!(r.files[0].errors.is_empty());
         let bad = &r.files[1];
         assert_eq!(bad.language, Some("go"));
         assert!(!bad.errors.is_empty(), "{bad:?}");
-        assert!(bad.errors.iter().all(|e| e.line >= 3 && e.line_hash.len() == 16));
+        assert!(
+            bad.errors
+                .iter()
+                .all(|e| e.line >= 3 && e.line_hash.len() == 16)
+        );
     }
 
     #[test]
@@ -240,10 +256,25 @@ mod tests {
         write(dir.path(), "notes.txt", "hello\n");
         let r = check(
             dir.path(),
-            &["../x.go".into(), "/etc/passwd".into(), ".env".into(), "notes.txt".into(), "gone.go".into()],
+            &[
+                "../x.go".into(),
+                "/etc/passwd".into(),
+                ".env".into(),
+                "notes.txt".into(),
+                "gone.go".into(),
+            ],
         );
         let statuses: Vec<&str> = r.files.iter().map(|f| f.status).collect();
-        assert_eq!(statuses, ["outside_root", "outside_root", "secret_path", "unsupported", "unreadable"]);
+        assert_eq!(
+            statuses,
+            [
+                "outside_root",
+                "outside_root",
+                "secret_path",
+                "unsupported",
+                "unreadable"
+            ]
+        );
     }
 
     #[test]
@@ -252,7 +283,8 @@ mod tests {
         let outside = tempfile::tempdir().unwrap();
         write(outside.path(), "x.go", "package x\nfunc {\n");
         #[cfg(unix)]
-        std::os::unix::fs::symlink(outside.path().join("x.go"), dir.path().join("link.go")).unwrap();
+        std::os::unix::fs::symlink(outside.path().join("x.go"), dir.path().join("link.go"))
+            .unwrap();
         #[cfg(unix)]
         {
             let r = check(dir.path(), &["link.go".into()]);

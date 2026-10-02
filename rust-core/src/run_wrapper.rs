@@ -28,7 +28,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::time::Duration;
 
-use percent_encoding::{utf8_percent_encode, NON_ALPHANUMERIC};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use sha2::{Digest, Sha256};
 
 use crate::dispatch::{Args, ChildExit, CmdError, CmdResult, Output};
