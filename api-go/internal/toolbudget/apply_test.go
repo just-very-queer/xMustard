@@ -27,6 +27,9 @@ func envelopeMembers(losses, dirty int) map[string]any {
 			"loss_counts": map[string]any{"lexical_fallback": losses}, "losses": lossList,
 			"languages": map[string]any{"go": map[string]int{"supported": 590, "failed": 6}, "rust": map[string]int{"supported": 77, "failed": 5},
 				"python": map[string]int{"supported": 8, "failed": 2}},
+			"source_identity": map[string]any{"head": "452da1e09e2c230b829c1d824bd82f83fa187dec", "identity_complete": true,
+				"key": "a156582ef7dd69692cf8bae19d43cd2ba01007676dce6106b1c1f3a1db27afe4", "limitations": 0,
+				"parser_version": "xm-index-2;ts-abi-15;rust-0.24", "stable": true},
 			"work": map[string]any{"graph_cache": "hit", "files_parsed": 0, "files_reused": 568}},
 		"freshness": map[string]any{"source": "index", "status": "current", "dirty_paths_touching_result": dirtyList,
 			"refresh": map[string]any{"reparsed": 568, "reresolved": 568, "escalated": false}},
@@ -219,6 +222,37 @@ func TestTrimmedPageContinuesAtTheFirstHitNotReturned(t *testing.T) {
 	t.Fatal("trimmed never reached")
 }
 
+// A trimmed rung cuts hits, so the producer's page `omitted` (hits after the page)
+// understates what the delivered answer left out. `omitted` counts the ranked hits
+// the result does not carry: total - the hits actually delivered, at any offset and
+// at every rung that returns hits (WS-FIX-18).
+func TestOmittedCountsTheHitsTheResultDoesNotCarry(t *testing.T) {
+	for _, offset := range []int{0, 20} {
+		r := searchResult(10, 600)
+		r["offset"] = offset
+		full := run(t, "search", r, Request{MaxChars: MaxMaxChars}, Page{Offset: offset, Cursor: cursorAt}, nil)
+		// with nothing cut, the producer's value stands
+		if got := full.out["omitted"]; got != 30.0 {
+			t.Fatalf("offset %d uncut omitted=%v, want the producer's 30", offset, got)
+		}
+		for max := fullSize(t, "search", r); max >= MinMaxChars; max -= 25 {
+			a := run(t, "search", r, Request{MaxChars: max}, Page{Offset: offset, Cursor: cursorAt}, nil)
+			delivered := 0
+			if h, ok := a.out["hits"].([]any); ok {
+				delivered = len(h)
+			}
+			if a.out["total"] == nil {
+				continue
+			}
+			want := a.out["total"].(float64) - float64(delivered)
+			if got := a.out["omitted"]; got != want {
+				t.Fatalf("offset %d stage %s max_chars %d: omitted=%v, want total-len(hits)=%v (delivered %d)",
+					offset, a.rep.DegradedStage, max, got, want, delivered)
+			}
+		}
+	}
+}
+
 func TestCountsRungGroupsByPath(t *testing.T) {
 	r := searchResult(10, 600)
 	for max := 8000; max >= MinMaxChars; max -= 50 {
@@ -284,6 +318,12 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 			cov["work"].(map[string]any)["graph_cache"] != "hit" {
 			t.Fatalf("signal_flags dropped a kept member: %v", cov)
 		}
+		// the third kept nested object: whether the source identity was stable
+		si := cov["source_identity"].(map[string]any)
+		if si["stable"] != true || si["identity_complete"] != true || si["head"] != "452da1e09e2c230b829c1d824bd82f83fa187dec" ||
+			si["key"] != "a156582ef7dd69692cf8bae19d43cd2ba01007676dce6106b1c1f3a1db27afe4" || si["limitations"] != float64(0) {
+			t.Fatalf("signal_flags dropped coverage.source_identity: %v", si)
+		}
 		fr := a.out["freshness"].(map[string]any)
 		if _, ok := fr["refresh"]; ok || fr["status"] != "current" {
 			t.Fatalf("freshness: %v", fr)
@@ -293,6 +333,9 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 		}
 		if _, ok := a.rep.Signals["coverage.loss_counts"]; ok || a.rep.Signals["coverage.work"] != 0 {
 			t.Fatal("a kept member is not reported as removed")
+		}
+		if _, ok := a.rep.Signals["coverage.source_identity"]; ok {
+			t.Fatal("signal_flags reports the kept coverage.source_identity as removed")
 		}
 		return
 	}

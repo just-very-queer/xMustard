@@ -405,6 +405,10 @@ type budgeter struct {
 	applied  []string
 	recovery *Recovery
 	buf      bytes.Buffer
+
+	// ranked is the result's own ranked total; a trimmed paged list rewrites the
+	// omitted member against it (WS-FIX-18).
+	ranked int
 }
 
 // Apply fits a tool result (a JSON object) to req and appends the output_budget
@@ -544,6 +548,11 @@ func (b *budgeter) load(top []kv) {
 			if !b.page.Slice {
 				kept = append(kept, m)
 			}
+		case "total":
+			if err := json.Unmarshal(m.raw, &b.ranked); err != nil {
+				b.ranked = 0
+			}
+			kept = append(kept, m)
 		default:
 			kept = append(kept, m)
 		}
@@ -789,6 +798,10 @@ func (b *budgeter) render(report func(int) []byte) []byte {
 		sep()
 		w.Write(quote(m.key))
 		w.WriteByte(':')
+		if m.key == "omitted" {
+			b.writeOmitted(w)
+			continue
+		}
 		if m.sub == nil {
 			w.Write(m.raw)
 			continue
@@ -879,6 +892,18 @@ func (b *budgeter) writeListValue(w *bytes.Buffer, l *listState) {
 		return
 	}
 	writeList(w, l.items, l.k, l.item)
+}
+
+// writeOmitted writes a hybrid result's omitted member: the ranked hits the delivered
+// answer does not carry, total - the hits the paged list kept. The producer's value
+// counts the hits after its page, so it understates once a rung trims the list;
+// with nothing cut it equals total - kept and stands (WS-FIX-18).
+func (b *budgeter) writeOmitted(w *bytes.Buffer) {
+	delivered := 0
+	if b.paged != nil {
+		delivered = b.paged.kept()
+	}
+	w.WriteString(strconv.Itoa(max(b.ranked-delivered, 0)))
 }
 
 // nextCursor continues the paged list at its first item not returned. When the budget
