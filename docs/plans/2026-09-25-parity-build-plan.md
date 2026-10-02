@@ -912,14 +912,15 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 **Files.** `api-go/internal/workspaceops/safepath.go` (`confineAnchorPaths`), `api-go/internal/workspaceops/exposure.go` (`lookupWorkspace`), `api-go/internal/workspaceops/root_source_test.go` (new: the divergence and refusal tests), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
 
 **Tests required.**
-- After the registry and the snapshot's own workspace record disagree about the root, `confineAnchorPaths` confines against the registry's root, the same one `resolveWorkspace` (the tool path) returns, not the snapshot's.
-- After the same divergence, `WorkspaceIDForRoot` / `LookupWorkspaceRoot` report the registry's root, not the snapshot's.
-- Path confinement stays fail-closed: a workspace whose non-admin registered root fails `verifyRegisteredRoot` is still refused by `confineAnchorPaths`, and a registry parse error still refuses rather than falling back to a rootless lexical-only check.
-- With no `workspaces.json` at all, `confineAnchorPaths` still confines against the snapshot root (the existing fallback) and `LookupWorkspaceRoot` still answers the derived, unregistered id.
-- A workspace absent from the registry but present in the snapshot behaves as before: `confineAnchorPaths` falls back to the snapshot root.
+- After the snapshot's own workspace record and `workspaces.json` disagree about the root, `confineAnchorPaths` confines against the root the tool paths use (`resolveWorkspace`, which takes the snapshot's record first and falls back to the registry) — a symlink that leaves that root is refused.
+- An undecodable `workspaces.json` does not open confinement up: with the snapshot intact, a symlink out of the snapshot root is still refused.
+- Path confinement stays fail-closed: a workspace whose non-admin registered root fails `verifyRegisteredRoot` is still refused by `confineAnchorPaths`, with the registration refusal, not a generic path error.
+- With no `workspaces.json` at all, `confineAnchorPaths` still confines against the snapshot root (the existing fallback) and `WorkspaceIDForRoot` still answers the derived, unregistered id.
+- A workspace the registry file does not list still falls back to the snapshot root.
+- `LookupWorkspaceRoot` / `LookupWorkspaceDir` answer exactly as before after the shared registry cache has been warmed by another reader — an unregistered root, a registered root, its spelling with a trailing separator, and a symlinked root (which matches only under `LookupWorkspaceDir`).
 - One mutation per new test, in `reviews/ws-fix-13/r<N>/slop-audit.md` S5.
 
-**Acceptance.** With the registry and the snapshot diverging, `confineAnchorPaths` and `WorkspaceIDForRoot` both follow the registry — the root tool paths already use — and every existing refusal path in `safepath.go` and `register_roots_test.go` still passes. `MAC` on `internal/workspaceops` is green.
+**Acceptance.** When the snapshot's own record and `workspaces.json` disagree, `confineAnchorPaths` confines against the root `resolveWorkspace` returns — the one every tool path already reads — and the non-admin registration re-check still refuses a re-pointed root; with no registry file the snapshot fallback is unchanged. Every existing refusal path in `safepath.go` and `register_roots_test.go` still passes, and `MAC` on `internal/workspaceops` is green.
 
 ### WS-FIX-14 — A corrupt workspaces.json names the file and the parse offset
 

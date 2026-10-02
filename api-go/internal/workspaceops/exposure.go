@@ -1,8 +1,10 @@
 package workspaceops
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 )
 
@@ -49,14 +51,20 @@ func lookupWorkspace(dataDir, rootPath string, sameDir bool) (WorkspaceRootLooku
 		return WorkspaceRootLookup{}, err
 	}
 	found := WorkspaceRootLookup{ID: workspaceIDForPath(root), RootPath: root}
-	items, err := ListWorkspaces(dataDir)
+	mark, err := statMark(workspacesPath(dataDir))
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return found, nil
+	}
+	byID, err := registryRecords(dataDir, mark, registryNow())
 	if err != nil {
 		return found, nil
 	}
 	registered := func(it workspaceRecord) WorkspaceRootLookup {
 		return WorkspaceRootLookup{ID: it.WorkspaceID, Name: it.Name, RootPath: it.RootPath, Registered: true}
 	}
-	for _, it := range items {
+	// Sorted by the same key ListWorkspaces sorts by, so the records a root can
+	// match are visited in the same order they were when this read the file.
+	for _, it := range sortedWorkspaceRecords(byID) {
 		if filepath.Clean(it.RootPath) == root {
 			return registered(it), nil
 		}
@@ -65,7 +73,7 @@ func lookupWorkspace(dataDir, rootPath string, sameDir bool) (WorkspaceRootLooku
 	if !sameDir || err != nil {
 		return found, nil
 	}
-	for _, it := range items {
+	for _, it := range sortedWorkspaceRecords(byID) {
 		stat := os.Stat
 		if it.RegisterRoot != "" {
 			stat = os.Lstat
@@ -75,4 +83,16 @@ func lookupWorkspace(dataDir, rootPath string, sameDir bool) (WorkspaceRootLooku
 		}
 	}
 	return found, nil
+}
+
+// sortedWorkspaceRecords returns the cached records in the order ListWorkspaces
+// hands out (name case-insensitively, then workspace id), so a reader that used to
+// re-parse the file visits the same record first for the same inputs.
+func sortedWorkspaceRecords(byID map[string]workspaceRecord) []workspaceRecord {
+	items := make([]workspaceRecord, 0, len(byID))
+	for _, it := range byID {
+		items = append(items, it)
+	}
+	slices.SortFunc(items, compareWorkspaceRecords)
+	return items
 }
