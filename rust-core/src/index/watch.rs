@@ -1217,7 +1217,8 @@ impl Registry {
         let n = paths.len();
         let mut ev = Event::new(EventKind::Modify(ModifyKind::Any));
         ev.paths = paths;
-        r.tx.send(Ok(ev)).map_err(|_| "the watcher stopped".to_string())?;
+        r.tx.send(Ok(ev))
+            .map_err(|_| "the watcher stopped".to_string())?;
         Ok(n)
     }
 
