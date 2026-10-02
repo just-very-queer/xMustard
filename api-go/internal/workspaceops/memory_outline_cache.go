@@ -1,8 +1,10 @@
 package workspaceops
 
 import (
+	"maps"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 )
@@ -12,12 +14,22 @@ import (
 // Those hashes depend only on the file's content, so a pass over an unchanged tree
 // recomputes what the previous pass already computed. This cache keeps the per-file
 // hashes across calls, keyed by workspace, root and path, and valid only while the file's
-// fileMark is unchanged, so an edit is always a miss.
+// fileMark is unchanged and old enough to trust.
 //
-// The cache holds hashes, never verdicts: a hit returns the body hash the same file
-// produced last time, and a miss re-reads and re-hashes. An evicted or reclaimed entry
-// costs one re-read, never a wrong answer. It is bounded by entry count and by aggregate
-// held bytes, and it is reclaimable, so memory pressure can hand the bytes back.
+// It holds hashes, never verdicts: a hit returns the body hash the same file produced last
+// time, and a miss re-reads and re-hashes. An evicted or reclaimed entry costs one
+// re-read, never a wrong answer. It is bounded by entry count and by aggregate held bytes,
+// and it is reclaimable, so memory pressure can hand the bytes back.
+//
+// Three rules keep a hit from ever being a stale verdict, and each is a review finding:
+//   - A mark is bound to the version actually read: the caller reads the mark before the
+//     file's text and re-reads it after hashing, and caches only when it did not move.
+//     Reading the mark only afterwards would store one version's hash under another's.
+//   - A mark inside registryRacyWindow is not trusted, exactly as the workspace registry
+//     does: on a filesystem with coarse timestamps a same-size rewrite inside one tick
+//     shares its mark, so such an entry is never served as a hit and never cached.
+//   - Adding a declaration's hash is one operation under the cache lock, so two passes
+//     that both extend one file's entry cannot drop each other's hash.
 
 // Bounds: the entries the cache holds and the bytes it retains in all. The byte ceiling
 // is a small fraction of the process-tree line. Past either bound an entry is simply not
@@ -32,6 +44,12 @@ const (
 	// has to be a ceiling that means something, not an exact accounting.
 	outlineHashEntryOverhead = 64
 )
+
+// outlineHashTrustWindow is the racy window a mark must age past before the cache will
+// serve it: the workspace registry's, because it is the same fileMark and the same reason.
+// It is a var so a test can close the window; a fixture writes its files this instant, and
+// no file can be made to carry an old ctime, so ageing one is not possible from a test.
+var outlineHashTrustWindow = registryRacyWindow
 
 // outlineHashEntry is one file's cached symbol-body hashes, keyed by normalized name path,
 // and the fileMark they were computed under.
@@ -58,8 +76,7 @@ func outlineHashKey(workspaceID, root, rel string) string {
 
 // markOutlineFile reads the mark a cache entry for rel must match to be a hit: the same
 // identity helpers this package's workspace registry keys files with, so one file has one
-// notion of "unchanged" here. A file that cannot be stat'd has no mark and is never a
-// hit.
+// notion of "unchanged" here. A file that cannot be stat'd has no mark and is never a hit.
 func markOutlineFile(root, rel string) (fileMark, bool) {
 	m, err := statMark(filepath.Join(root, filepath.FromSlash(rel)))
 	if err != nil || !m.exists {
@@ -68,9 +85,23 @@ func markOutlineFile(root, rel string) (fileMark, bool) {
 	return m, true
 }
 
-// outlineHashesFor returns a file's cached body hashes when its mark is unchanged. ok is
-// false when the caller must read and hash the file itself.
-func outlineHashesFor(workspaceID, root, rel string, mark fileMark) (hashes map[string]string, ok bool) {
+// trustedOutlineMark is a mark old enough to serve from the cache. A file written inside
+// the racy window has a mark another write inside the same tick can share, so it is read
+// rather than cached until it ages out; that is the registry's rule for the same reason. A
+// zero window closes it, which is what a test needs and production never does.
+func trustedOutlineMark(m fileMark, readAt time.Time) bool {
+	if outlineHashTrustWindow <= 0 {
+		return true
+	}
+	return m.trusted(readAt.Add(-outlineHashTrustWindow))
+}
+
+// outlineHashesFor returns a file's cached body hashes when its mark is unchanged and old
+// enough to trust. ok is false when the caller must read and hash the file itself.
+func outlineHashesFor(workspaceID, root, rel string, mark fileMark, readAt time.Time) (hashes map[string]string, ok bool) {
+	if !trustedOutlineMark(mark, readAt) {
+		return nil, false
+	}
 	outlineHashes.Lock()
 	defer outlineHashes.Unlock()
 	e, cached := outlineHashes.byKey[outlineHashKey(workspaceID, root, rel)]
@@ -80,27 +111,70 @@ func outlineHashesFor(workspaceID, root, rel string, mark fileMark) (hashes map[
 	return e.hashes, true
 }
 
-// storeOutlineHashes records a file's freshly computed hashes under its current mark,
-// when there is room. A file past either bound is not cached and the next pass re-hashes
-// it; a file replacing an older entry for the same key releases the older one's bytes
-// first, so the held total never double-counts a path.
-func storeOutlineHashes(workspaceID, root, rel string, mark fileMark, hashes map[string]string) {
-	held := int64(len(hashes) * outlineHashEntryOverhead)
-	for k, v := range hashes {
-		held += int64(len(k) + len(v))
+// storeOutlineHash adds one declaration's hash to a file's entry, creating the entry when
+// there is none, in one operation under the cache lock so two passes extending the same
+// entry cannot drop each other's hash. mark must be the mark the body was hashed under,
+// and the caller must have re-read it after the read (see trustedOutlineMark); an
+// untrusted entry, an entry past the byte ceiling and a new entry past the entry bound are
+// not stored.
+func storeOutlineHash(workspaceID, root, rel string, mark fileMark, readAt time.Time, want, hash string) {
+	if !trustedOutlineMark(mark, readAt) {
+		return
 	}
 	key := outlineHashKey(workspaceID, root, rel)
 	outlineHashes.Lock()
 	defer outlineHashes.Unlock()
-	if old, ok := outlineHashes.byKey[key]; ok {
-		outlineHashes.held -= old.held
-		delete(outlineHashes.byKey, key)
+	old, cached := outlineHashes.byKey[key]
+	// Adding to the version already cached costs one key; any other case (a new file, or
+	// one whose mark moved) starts the entry over.
+	grow := cached && old.mark == mark
+	hashes := map[string]string{}
+	if grow {
+		if _, known := old.hashes[want]; known {
+			return
+		}
+		hashes = maps.Clone(old.hashes)
 	}
-	if len(outlineHashes.byKey) >= outlineHashMaxEntries || outlineHashes.held+held > outlineHashMaxHeld {
-		return
+	hashes[want] = hash
+	held := outlineHashHeld(hashes)
+	if grow {
+		held = old.held + outlineHashHeldOf(want, hash)
+	} else {
+		if cached {
+			outlineHashes.held -= old.held
+			delete(outlineHashes.byKey, key)
+		}
+		if len(outlineHashes.byKey) >= outlineHashMaxEntries || outlineHashes.held+held > outlineHashMaxHeld {
+			return
+		}
 	}
 	outlineHashes.byKey[key] = &outlineHashEntry{hashes: hashes, mark: mark, held: held}
-	outlineHashes.held += held
+	outlineHashes.held += held - oldHeld(old, cached, grow)
+}
+
+// outlineHashHeld is the bytes one entry's map retains: each key and value, plus a fixed
+// per-entry overhead. The bound only has to be a ceiling that means something, not an
+// exact accounting.
+func outlineHashHeld(hashes map[string]string) int64 {
+	n := int64(len(hashes) * outlineHashEntryOverhead)
+	for k, v := range hashes {
+		n += int64(len(k) + len(v))
+	}
+	return n
+}
+
+// outlineHashHeldOf is what one key adds to an entry that already holds it.
+func outlineHashHeldOf(want, hash string) int64 {
+	return int64(len(want) + len(hash) + outlineHashEntryOverhead)
+}
+
+// oldHeld is the entry's contribution to the total before this store, so the caller can
+// credit the delta exactly once.
+func oldHeld(old *outlineHashEntry, cached, grow bool) int64 {
+	if !cached || grow {
+		return 0
+	}
+	return old.held
 }
 
 // clearOutlineHashes drops every entry: the reclaim hook and tests both use it.

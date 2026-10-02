@@ -170,13 +170,22 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	if !ok || file == "" {
 		return anchorState{}, false
 	}
+	want := normalizeNamePath(a.Value)
+	// The cache is consulted before the file is read, so a warm pass costs a stat rather
+	// than the file's bytes (WS-28C). The mark read here is the one the hit is judged on
+	// and the one the file is read under.
+	mark, hasMark := markOutlineFile(s.root, file)
+	readAt := time.Now()
+	if hasMark {
+		if hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark, readAt); hit {
+			if h, named := hashes[want]; named {
+				return anchorState{govstore.BaselineHash, h}, true
+			}
+		}
+	}
 	src := s.text(file)
 	if !src.ok {
 		return missingState, src.missing
-	}
-	want := normalizeNamePath(a.Value)
-	if h, hit := s.cachedBody(file, want); hit {
-		return anchorState{govstore.BaselineHash, h}, true
 	}
 	spans, incomplete, ok := s.fileOutline(file)
 	if !ok {
@@ -190,33 +199,22 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	h := hex.EncodeToString(sum[:])
 	// An incomplete outline is not cached: the index may name declarations it did not
 	// return, so an entry built from a partial outline could answer "missing" wrongly.
-	if !incomplete {
-		s.storeBody(file, want, h)
+	// The mark is re-read after the hash, so a file that changed while it was read is
+	// never stored under the version its text came from; a moved mark means no entry.
+	if !incomplete && hasMark {
+		if after, still := markOutlineFile(s.root, file); still && after == mark {
+			s.storeBody(file, mark, readAt, want, h)
+		}
 	}
 	return anchorState{govstore.BaselineHash, h}, true
 }
 
-// cachedBody returns a file's cached hash for one declaration when the file's mark is
-// unchanged since it was cached.
-func (s *rehashSession) cachedBody(file, want string) (string, bool) {
-	mark, ok := markOutlineFile(s.root, file)
-	if !ok {
-		return "", false
-	}
-	if hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark); hit {
-		if h, named := hashes[want]; named {
-			return h, true
-		}
-	}
-	return "", false
-}
-
-// storeBody adds one declaration's hash to the file's cache entry, creating the entry on
-// the first one. A file whose hashes exceed the cache bounds is not cached and the next
-// pass re-hashes it. hashed counts the files, not the stores: a file with two anchored
-// declarations is one file hashed, which is what the report counts, and a file the cache
-// refuses still counts, because its body was computed and thrown away.
-func (s *rehashSession) storeBody(file, want, hash string) {
+// storeBody adds one declaration's hash to the file's cache entry and counts the file once
+// per pass. The add itself is atomic under the cache lock (see storeOutlineHash), so two
+// passes extending one entry cannot drop each other's hash; the count is what the report
+// calls files_hashed, and a file the cache refuses still counts, because its body was
+// computed and thrown away.
+func (s *rehashSession) storeBody(file string, mark fileMark, readAt time.Time, want, hash string) {
 	if s.hashedFiles == nil {
 		s.hashedFiles = map[string]bool{}
 	}
@@ -224,23 +222,7 @@ func (s *rehashSession) storeBody(file, want, hash string) {
 		s.hashedFiles[file] = true
 		s.hashed++
 	}
-	mark, ok := markOutlineFile(s.root, file)
-	if !ok {
-		return
-	}
-	hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark)
-	if hit {
-		if _, known := hashes[want]; known {
-			return
-		}
-		// The cached map is handed out under the lock and read after it, so writing
-		// through it would race every reader: copy before adding.
-		hashes = maps.Clone(hashes)
-	} else {
-		hashes = map[string]string{}
-	}
-	hashes[want] = hash
-	storeOutlineHashes(s.workspaceID, s.root, file, mark, hashes)
+	storeOutlineHash(s.workspaceID, s.root, file, mark, readAt, want, hash)
 }
 
 // fileOutline reads a file's declarations from the code index once per session.

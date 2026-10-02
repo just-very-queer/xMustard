@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/govstore"
@@ -25,6 +26,93 @@ func resetOutlineCache(t *testing.T) {
 	t.Cleanup(clearOutlineHashes)
 }
 
+// setOutlineTrustWindow sets the racy window for one test. A fixture cannot be aged the way
+// production ages a file, because ctime is not settable from a test, so the window is the
+// seam: zero closes it (a fixture's marks count), and an hour opens it wide (nothing is
+// trusted). Production never changes it.
+func setOutlineTrustWindow(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := outlineHashTrustWindow
+	outlineHashTrustWindow = d
+	t.Cleanup(func() { outlineHashTrustWindow = old })
+}
+
+// trustOutlineCache closes the racy window, so a fixture's own files count as old enough.
+func trustOutlineCache(t *testing.T) { setOutlineTrustWindow(t, 0) }
+
+// A file that changes between the read and the store must not be cached: the hash came
+// from the old text, so storing it under the new mark would let a later pass serve that
+// stale hash as current and the edit would never be marked. The stub outline rewrites the
+// file, which is the moment the mark moves.
+func TestAFileChangedWhileItWasReadIsNotCached(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	f := newInvalidationFixture(t)
+	clearOutlineHashes()
+	ctx := context.Background()
+
+	full := stubOutline(f.root)
+	orig := symbolOutline
+	t.Cleanup(func() { symbolOutline = orig })
+	edited := strings.Replace(srvSource, "return 8081", "return 9090", 1)
+	rewrite := false
+	symbolOutline = func(ctx context.Context, a, b, rel string) (symbolSpans, error) {
+		if rewrite {
+			writeRepoFile(t, f.root, "srv.go", edited) // the file moves under the pass
+		}
+		return full(ctx, a, b, rel)
+	}
+
+	// The first pass reads the file and, at the outline, the file changes: the hash it
+	// computed belongs to text the file no longer holds.
+	rewrite = true
+	if _, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := outlineHashEntries(); n != 0 {
+		t.Fatalf("a file changed mid-pass cached %d entries, want none", n)
+	}
+
+	// So the next pass reads the new text and still marks the memory.
+	rewrite = false
+	rep, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rep.Hashed != 1 || len(rep.Marked) != 1 {
+		t.Fatalf("after a mid-pass edit: hashed %d, marked %v, want 1 and the one memory", rep.Hashed, rep.Marked)
+	}
+}
+
+// A mark inside the racy window is neither served nor stored, the way the workspace
+// registry treats the same fileMark: on a coarse-timestamp filesystem two same-size writes
+// inside one tick share a mark, so such an entry could outlive the edit it describes.
+func TestAMarkInsideTheRacyWindowIsNeitherServedNorStored(t *testing.T) {
+	resetOutlineCache(t)
+	setOutlineTrustWindow(t, time.Hour) // wide open: nothing a test writes is trusted
+	f := newInvalidationFixture(t)
+	ctx := context.Background()
+
+	first, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Hashed != 1 {
+		t.Fatalf("a cold pass hashed %d files, want the one anchored file", first.Hashed)
+	}
+	if n := outlineHashEntries(); n != 0 {
+		t.Fatalf("a file written inside the racy window cached %d entries, want none", n)
+	}
+	// So the next pass reads it again rather than trusting a mark that cannot identify it.
+	second, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Hashed != 1 || second.Checked != 1 {
+		t.Fatalf("an untrusted mark: hashed %d, checked %d, want 1 and 1", second.Hashed, second.Checked)
+	}
+}
+
 // A second pass over an unchanged tree re-hashes no file, and the first one hashed the
 // anchored file: the counter is the acceptance.
 //
@@ -33,6 +121,7 @@ func resetOutlineCache(t *testing.T) {
 // cleared cache rather than from the first call after promotion.
 func TestSecondPassOnAnUnchangedTreeRehashesNoFile(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
@@ -58,13 +147,28 @@ func TestSecondPassOnAnUnchangedTreeRehashesNoFile(t *testing.T) {
 
 // The promotion that baselines a symbol anchor warms the same entry, so the first
 // invalidation after it already re-hashes nothing. This is the common case and it is what
-// makes a repeated ground free.
+// makes a repeated ground free. The fixture is built here rather than through
+// newInvalidationFixture because the file has to be aged before the promotion reads it.
 func TestThePromotionWarmsTheEntryTheFirstPassWouldHash(t *testing.T) {
 	resetOutlineCache(t)
-	f := newInvalidationFixture(t)
-	ctx := context.Background()
+	trustOutlineCache(t)
+	dir, ws, root, git := reviewRepo(t)
+	writeRepoFile(t, root, "srv.go", srvSource)
+	git("add", ".")
+	git("commit", "-q", "-m", "srv")
+	origResolve, origOutline := resolveSymbols, symbolOutline
+	t.Cleanup(func() { resolveSymbols, symbolOutline = origResolve, origOutline })
+	resolveSymbols = func(_ context.Context, _, _ string, names []string) ([]symbolMatch, error) {
+		var out []symbolMatch
+		for _, n := range names {
+			out = append(out, symbolMatch{Name: n, Count: 1, Definitions: []symbolDefinition{{Path: "srv.go", Line: 3}}})
+		}
+		return out, nil
+	}
+	symbolOutline = stubOutline(root)
+	approvedBy(t, dir, ws, "author", "approver", "agent", "`ListenPort` returns the service port 8081.")
 
-	rep, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	rep, err := InvalidateMemory(context.Background(), dir, ws, []string{"srv.go"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -80,6 +184,7 @@ func TestThePromotionWarmsTheEntryTheFirstPassWouldHash(t *testing.T) {
 // cached entry is never served for a file whose content moved.
 func TestAnEditRehashesItsFileAndStillMarks(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
@@ -105,6 +210,7 @@ func TestAnEditRehashesItsFileAndStillMarks(t *testing.T) {
 // the next pass to re-hash.
 func TestTheCacheKeyCarriesTheFileStatNotThePath(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
@@ -132,6 +238,7 @@ func TestTheCacheKeyCarriesTheFileStatNotThePath(t *testing.T) {
 // correctly: refusing an entry costs a re-read, never a wrong verdict.
 func TestTheOutlineCacheIsBoundedAndStillReads(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
@@ -144,7 +251,7 @@ func TestTheOutlineCacheIsBoundedAndStillReads(t *testing.T) {
 		if !ok {
 			t.Fatalf("%s has no mark", rel)
 		}
-		storeOutlineHashes(f.ws, f.root, rel, mark, map[string]string{"X": strings.Repeat("a", 64)})
+		storeOutlineHash(f.ws, f.root, rel, mark, time.Now(), "X", strings.Repeat("a", 64))
 	}
 	if n := outlineHashEntries(); n != outlineHashMaxEntries {
 		t.Fatalf("the cache holds %d entries, want it full at its bound of %d", n, outlineHashMaxEntries)
@@ -173,30 +280,49 @@ func TestTheOutlineCacheIsBoundedAndStillReads(t *testing.T) {
 	}
 }
 
-// The byte ceiling refuses an entry past it, and a file whose hashes would exceed it is
-// re-hashed rather than retained.
+// The byte ceiling refuses an entry past it, including while other entries occupy the
+// budget, and a file whose hashes would exceed it is re-hashed rather than retained.
 func TestTheOutlineCacheByteCeilingRefusesAndStillReads(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
 
-	// One entry whose hashes alone exceed the ceiling is refused outright. The ceiling is
-	// inclusive (an entry of exactly it is kept), so this one is sized well past it: one
-	// declaration hashing more than the whole ceiling cannot be cached at all.
-	big := map[string]string{"Huge": strings.Repeat("b", outlineHashMaxHeld+1)}
+	// Occupy the budget with entries that leave less than one more free, so the refusal
+	// below is a refusal against a nearly full cache and not against an empty one.
+	const fillEntries = 7
+	for i := range fillEntries {
+		rel := fmt.Sprintf("fill/f%02d/x.go", i)
+		writeRepoFile(t, f.root, rel, "package fill\n\nfunc X() int { return 1 }\n")
+		mark, ok := markOutlineFile(f.root, rel)
+		if !ok {
+			t.Fatalf("%s has no mark", rel)
+		}
+		storeOutlineHash(f.ws, f.root, rel, mark, time.Now(), "X", strings.Repeat("a", outlineHashMaxHeld/(fillEntries+1)))
+	}
+	filled, _ := outlineHashUsed()
+	if filled == 0 || filled+outlineHashMaxHeld/8 < outlineHashMaxHeld {
+		t.Fatalf("the budget stands at %d of %d, want it nearly full", filled, outlineHashMaxHeld)
+	}
+
+	// The next entry does not fit in what is left, so it is refused. Its own bytes are
+	// within the ceiling on their own; what refuses it is the budget already spent.
 	rel := "big/x.go"
 	writeRepoFile(t, f.root, rel, "package big\n\nfunc X() int { return 1 }\n")
 	mark, ok := markOutlineFile(f.root, rel)
 	if !ok {
 		t.Fatal("big/x.go has no mark")
 	}
-	storeOutlineHashes(f.ws, f.root, rel, mark, big)
-	if _, cached := outlineHashesFor(f.ws, f.root, rel, mark); cached {
-		t.Fatalf("an entry of %d bytes was cached past the %d-byte ceiling", outlineHashMaxHeld, outlineHashMaxHeld)
+	storeOutlineHash(f.ws, f.root, rel, mark, time.Now(), "X", strings.Repeat("b", outlineHashMaxHeld/4))
+	if _, cached := outlineHashesFor(f.ws, f.root, rel, mark, time.Now()); cached {
+		t.Fatal("an entry past the byte ceiling was cached")
 	}
-	if used, _ := outlineHashUsed(); used != 0 {
-		t.Fatalf("a refused entry still holds %d bytes", used)
+	if used, _ := outlineHashUsed(); used != filled {
+		t.Fatalf("a refused entry moved the budget from %d to %d", filled, used)
+	}
+	if n := outlineHashEntries(); n != fillEntries {
+		t.Fatalf("a refused entry left %d entries, want the %d that fit", n, fillEntries)
 	}
 
 	// And the invalidation that would have cached it still reads correctly.
@@ -213,6 +339,7 @@ func TestTheOutlineCacheByteCeilingRefusesAndStillReads(t *testing.T) {
 // reclaim, so the count after it is the count of a cold cache.
 func TestReclaimingTheOutlineCacheLeavesNoStaleEntry(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	ctx := context.Background()
 	if _, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"}); err != nil {
@@ -242,6 +369,7 @@ func TestReclaimingTheOutlineCacheLeavesNoStaleEntry(t *testing.T) {
 // back without lowering any other line.
 func TestTheOutlineCacheIsAGoverorComponent(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	if _, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"}); err != nil {
 		t.Fatal(err)
@@ -268,6 +396,7 @@ func TestTheOutlineCacheIsAGoverorComponent(t *testing.T) {
 // pass; so the second pass, on a complete outline, must hash and mark like a cold cache.
 func TestATruncatedOutlineIsNeverCached(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
@@ -321,6 +450,7 @@ func TestATruncatedOutlineIsNeverCached(t *testing.T) {
 // to one of them is still caught while the other stays clean.
 func TestOneFilesEntryHoldsEveryAnchoredDeclaration(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	dir, ws, root, git := reviewRepo(t)
 	writeRepoFile(t, root, "srv.go", srvSource)
 	git("add", ".")
@@ -352,7 +482,7 @@ func TestOneFilesEntryHoldsEveryAnchoredDeclaration(t *testing.T) {
 	if !ok {
 		t.Fatal("srv.go has no mark")
 	}
-	if hashes, hit := outlineHashesFor(ws, root, "srv.go", mark); !hit || len(hashes) != 2 {
+	if hashes, hit := outlineHashesFor(ws, root, "srv.go", mark, time.Now()); !hit || len(hashes) != 2 {
 		t.Fatalf("the file's entry holds %d hashes (hit=%v), want 2", len(hashes), hit)
 	}
 
@@ -372,6 +502,7 @@ func TestOneFilesEntryHoldsEveryAnchoredDeclaration(t *testing.T) {
 // Run under -race, this is what proves storeBody copies before it writes.
 func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	dir, ws, root, git := reviewRepo(t)
 	writeRepoFile(t, root, "srv.go", srvSource)
 	git("add", ".")
@@ -400,7 +531,7 @@ func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
 			if !ok {
 				return
 			}
-			if hashes, hit := outlineHashesFor(ws, root, "srv.go", mark); hit {
+			if hashes, hit := outlineHashesFor(ws, root, "srv.go", mark, time.Now()); hit {
 				for k, v := range hashes {
 					_, _ = k, v
 				}
@@ -411,10 +542,14 @@ func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
+			mark, ok := markOutlineFile(root, "srv.go")
+			if !ok {
+				return
+			}
 			for range 16 {
 				sess := newRehashSession(context.Background(), root, ws)
 				sess.dataDir = dir
-				sess.storeBody("srv.go", fmt.Sprintf("Extra%02d", i), strings.Repeat("c", 64))
+				sess.storeBody("srv.go", mark, time.Now(), fmt.Sprintf("Extra%02d", i), strings.Repeat("c", 64))
 			}
 		}(i)
 	}
@@ -426,7 +561,7 @@ func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
 	if !ok {
 		t.Fatal("srv.go has no mark")
 	}
-	hashes, hit := outlineHashesFor(ws, root, "srv.go", mark)
+	hashes, hit := outlineHashesFor(ws, root, "srv.go", mark, time.Now())
 	if !hit {
 		t.Fatal("the entry is gone after concurrent passes")
 	}
@@ -444,6 +579,7 @@ func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
 // verdict, so it cannot turn a missing file into an unchanged one.
 func TestACachedHashNeverBecomesAMissingVerdict(t *testing.T) {
 	resetOutlineCache(t)
+	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
