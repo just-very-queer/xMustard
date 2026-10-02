@@ -2032,6 +2032,12 @@ func (w *WorktreeStatus) addPorcelainV2Records(records []string) {
 			if len(fields) < porcelainV2FixedFields[kind] {
 				continue
 			}
+			// A rename or copy is followed by a second record holding its origin.
+			// Without one the stream is truncated, so the record is skipped rather
+			// than counted with an origin that was never read.
+			if kind == "2" && i+1 >= len(records) {
+				continue
+			}
 			xy := fields[0]
 			w.DirtyFiles++
 			w.DirtyPaths = append(w.DirtyPaths, fields[len(fields)-1])

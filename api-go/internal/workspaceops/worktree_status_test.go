@@ -157,30 +157,26 @@ func TestPorcelainV2RenameReportsTheNewPath(t *testing.T) {
 	}
 }
 
-// A rename whose origin contains a space. The origin is a whole record like any other,
-// so a fold that reads it as an untracked path counts the file twice and reports a path
-// that is gone; this is the case that pins the origin record being consumed.
-func TestPorcelainV2RenameConsumesASpacedOrigin(t *testing.T) {
+// A rename record as the very last record has no origin after it. The stream is
+// truncated, so the rename is skipped whole rather than counted with a path whose
+// origin was never read. git does not emit this, so the only way to produce it is a
+// truncated read; the guard is that a truncated record is skipped rather than guessed
+// at, which is what WS-FIX-17's acceptance requires.
+func TestPorcelainV2RenameWithNoOriginAtAllIsSkipped(t *testing.T) {
 	st := &WorktreeStatus{}
-	st.addPorcelainV2Records([]string{"2 R. N... 100644 100644 100644 aaa bbb R100 new.go", "old name.go"})
-	want := []string{"new.go"}
-	if !reflect.DeepEqual(st.DirtyPaths, want) {
-		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
-	}
-	if st.DirtyFiles != 1 {
-		t.Fatalf("dirty files %d, want 1", st.DirtyFiles)
-	}
-	if st.UntrackedFiles != 0 {
-		t.Fatalf("untracked files %d, want 0: the origin was read as a record", st.UntrackedFiles)
+	st.addPorcelainV2Records([]string{"2 R. N... 100644 100644 100644 aaa bbb R100 renamed.go"})
+	if st.DirtyFiles != 0 || len(st.DirtyPaths) != 0 {
+		t.Fatalf("truncated rename counted: %+v", st)
 	}
 }
 
-// A rename whose origin begins with a record-type keyword and carries the nine
-// space-separated tokens a type "2" record needs to pass the arity guard. The fold
-// cannot tell an origin record from a status record by shape alone, so only the rename
-// record consuming it keeps a path from being counted twice. Confirmed against git:
-// renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits exactly this
-// pair.
+// A rename whose origin is a record that would pass as a status record on its own
+// shape: it opens with the "2" record keyword and carries the nine space-separated
+// tokens a type "2" record needs to clear the arity guard. Only the rename record
+// consuming it keeps the fold from reading it as a second rename, so this is the
+// fixture that discriminates the consumption. Confirmed against git 2.50.1 and
+// 2.53.0: renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits
+// exactly this pair.
 func TestPorcelainV2RenameConsumesAnOriginThatLooksLikeARecord(t *testing.T) {
 	st := &WorktreeStatus{}
 	// Renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits this
