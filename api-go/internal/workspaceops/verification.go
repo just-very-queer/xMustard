@@ -5,6 +5,7 @@ import (
 	"crypto/sha1"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -387,12 +388,34 @@ func containsCoverageWord(value string) bool {
 	return strings.Contains(lower, "coverage")
 }
 
+// readJSON decodes one JSON file into target. A decode failure names the file and the
+// byte offset json reported, so a corrupt store says which file to repair and where in
+// it. An os.ReadFile failure is returned unwrapped, so callers keep their
+// errors.Is(err, os.ErrNotExist) and errors.Is(err, os.ErrPermission) branches.
 func readJSON(path string, target any) error {
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
-	return json.Unmarshal(content, target)
+	if err := json.Unmarshal(content, target); err != nil {
+		return fmt.Errorf("%s: %w", jsonDecodeSite(path, err), err)
+	}
+	return nil
+}
+
+// jsonDecodeSite names the file and, when encoding/json located the failure, its byte
+// offset. A syntax error and a type error both carry one; any other decode error (a
+// custom Unmarshaler's) has no position to report.
+func jsonDecodeSite(path string, err error) string {
+	var syntaxErr *json.SyntaxError
+	if errors.As(err, &syntaxErr) {
+		return fmt.Sprintf("%s at offset %d", path, syntaxErr.Offset)
+	}
+	var typeErr *json.UnmarshalTypeError
+	if errors.As(err, &typeErr) {
+		return fmt.Sprintf("%s at offset %d", path, typeErr.Offset)
+	}
+	return path
 }
 
 func writeJSON(path string, payload any) error {

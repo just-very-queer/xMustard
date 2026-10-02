@@ -68,7 +68,10 @@ func TestArgumentErrorsAreToolResultsTheAgentCanRead(t *testing.T) {
 }
 
 // Each did-you-mean hint names an argument its tool rejects even after toolcompat's
-// repairs, so a hint never shadows an argument the tool has since accepted.
+// repairs, so a hint never shadows an argument the tool has since accepted. The
+// rejection reason is asserted too: the hinted argument must be one the tool does
+// not take (reason "unknown"), not an argument it takes that merely broke another
+// rule, so a hint can only ever point at a real rejection.
 func TestArgHintsNameArgumentsTheToolRejects(t *testing.T) {
 	s := newSession(t, &fakeAPI{}, Options{}, nil, LatestProtocolVersion)
 	for key, hint := range argHints {
@@ -78,6 +81,9 @@ func TestArgHintsNameArgumentsTheToolRejects(t *testing.T) {
 		_, d := argErr(t, s, key.tool, map[string]any{"workspace_id": "ws", key.token: "x"})
 		if d["hint"] != hint || d["argument"] != key.token {
 			t.Errorf("%s(%s): data %v, want hint %q", key.tool, key.token, d, hint)
+		}
+		if d["reason"] != "unknown" {
+			t.Errorf("%s(%s): a hint must name an argument the tool rejects as unknown, got reason %v", key.tool, key.token, d["reason"])
 		}
 	}
 }
