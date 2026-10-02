@@ -59,21 +59,34 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 // resource read stands for, or nil when the connection serves it. It is the same rule
 // callKnownTool applies before its arguments are read, in the same shape: a tool result
 // with isError, never a JSON-RPC error (MCP 2025-11-25), so a resource read and a named
-// call of the same tool refuse identically.
-func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) map[string]any {
+// call of the same tool refuse identically. The return is any, not map[string]any, so
+// the shape is a property a test can observe rather than a property of the signature.
+func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) any {
 	if !readOnly || t.servesReads() && !t.writes(args) {
 		return nil
 	}
 	if !t.servesReads() {
-		return TextResult(fmt.Sprintf("%s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly), true)
+		return markedRefusal(fmt.Sprintf("%s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly))
 	}
-	return TextResult(fmt.Sprintf("%s is served on a read-only connection (mode=%s) only without %s, which write", t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", ")), true)
+	return markedRefusal(fmt.Sprintf("%s is served on a read-only connection (mode=%s) only without %s, which write", t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", ")))
 }
 
-// refusalResultText is the message of a refusal tool result, for a resource that reports
+// readOnlyRefusalMeta marks a refusal the read-only gate produced, so a resource can
+// tell it from a refused API call and surface it as the tool result it is. Without the
+// marker the two are indistinguishable and one of them has to be mislabelled.
+const readOnlyRefusalMeta = "xmustard/refused_read_only"
+
+// markedRefusal adds the marker to a refusal tool result.
+func markedRefusal(text string) map[string]any {
+	res := TextResult(text, true)
+	res["_meta"] = map[string]any{readOnlyRefusalMeta: true}
+	return res
+}
+
+// refusalMessage is the message of a refusal tool result, for a resource that reports
 // the refusal in its own error shape. (internal/rustcore's refusalText is unrelated: it
 // trims a subprocess's stderr, and the two are in different packages.)
-func refusalResultText(res map[string]any) string {
+func refusalMessage(res map[string]any) string {
 	content, _ := res["content"].([]map[string]any)
 	if len(content) == 0 {
 		return ""
@@ -87,7 +100,8 @@ func refusalResultText(res map[string]any) string {
 // way around the mode.
 func (s *Session) serveResourceTool(ctx context.Context, t *Tool, args map[string]string) (map[string]any, *RPCError) {
 	if refused := resourceToolRefusal(s.srv.opts.ReadOnly, t, args); refused != nil {
-		return refused, nil
+		res, _ := refused.(map[string]any)
+		return res, nil
 	}
 	return s.RunTool(ctx, t, args, nil)
 }

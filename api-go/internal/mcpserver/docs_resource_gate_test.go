@@ -55,9 +55,18 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 			t.Fatalf("%s: resource gate refused=%v, want %v", tc.name, refused != nil, tc.want)
 		}
 		if refused != nil {
-			msg := text(refused)
-			if refused["isError"] != true || !strings.Contains(msg, "mode="+ModeReadOnly) || !strings.Contains(msg, tc.tool.Name) {
-				t.Fatalf("%s: a refusal is a tool result with isError, naming the tool and %s, got %v", tc.name, ModeReadOnly, refused)
+			res, ok := refused.(map[string]any)
+			if !ok {
+				t.Fatalf("%s: a refusal is a tool result map, got %T", tc.name, refused)
+			}
+			msg := refusalMessage(res)
+			if res["isError"] != true || !strings.Contains(msg, "mode="+ModeReadOnly) || !strings.Contains(msg, tc.tool.Name) {
+				t.Fatalf("%s: a refusal is a tool result with isError, naming the tool and %s, got %v", tc.name, ModeReadOnly, res)
+			}
+			// the marker is what tells a resource this refusal is a gate's, not a
+			// refused API call, so it may surface it instead of rewrapping it
+			if meta, _ := res["_meta"].(map[string]any); meta[readOnlyRefusalMeta] != true {
+				t.Fatalf("%s: a gate refusal carries the %s marker, got %v", tc.name, readOnlyRefusalMeta, res["_meta"])
 			}
 		}
 		// a full connection serves both
@@ -107,34 +116,65 @@ func TestMemoryResourcesAreServedOnAFullConnection(t *testing.T) {
 
 // A resource read that a read-only connection owes a refusal gets the same
 // client-visible shape a named tools/call gets: a tool result with isError, never a
-// JSON-RPC error (MCP 2025-11-25). The shape is asserted on the refusal the resource
-// path builds, since memoryIndex and memoryCore each re-wrap it in their own resource
-// error; what this pins is that neither re-wrap starts from a protocol error, and that
-// the reason travels in the message. No resource is backed by a write tool today, so
-// why_failed stands in for one.
+// JSON-RPC error (MCP 2025-11-25). Asserted on the map the gate returns and on the
+// *RPCError it does not, so the check is about the value and not its static type: a
+// bare type assertion on a map is always false and proves nothing.
 func TestResourceRefusalIsAToolResultNotAProtocolError(t *testing.T) {
 	refused := resourceToolRefusal(true, whyFailedTool, map[string]string{"command": "go test ./..."})
 	if refused == nil {
 		t.Fatal("a command on a read-only connection must be refused")
 	}
-	if _, isRPC := any(refused).(*RPCError); isRPC {
-		t.Fatal("a refusal is a tool result, never a protocol error")
+	res, ok := refused.(map[string]any)
+	if !ok {
+		t.Fatalf("a refusal is a tool result map, got %T: %v", refused, refused)
 	}
-	if refused["isError"] != true {
-		t.Fatalf("a refusal carries isError, got %v", refused)
+	if rerr, isRPC := refused.(*RPCError); isRPC {
+		t.Fatalf("a refusal is a tool result, never a protocol error: %+v", rerr)
+	}
+	if res["isError"] != true {
+		t.Fatalf("a refusal carries isError, got %v", res)
 	}
 	for _, want := range []string{"why_failed", "mode=" + ModeReadOnly, "command"} {
-		if !strings.Contains(text(refused), want) {
-			t.Errorf("a refusal names %q, got %q", want, text(refused))
+		if !strings.Contains(refusalMessage(res), want) {
+			t.Errorf("a refusal names %q, got %q", want, refusalMessage(res))
 		}
 	}
 	// the unserved-tool arm carries its own reason, not the write-args one
-	unserved := resourceToolRefusal(true, rememberTool, map[string]string{"content": "x"})
-	if unserved == nil || unserved["isError"] != true || !strings.Contains(text(unserved), "changes shared memory") {
+	unserved, ok := resourceToolRefusal(true, rememberTool, map[string]string{"content": "x"}).(map[string]any)
+	if !ok || unserved["isError"] != true || !strings.Contains(refusalMessage(unserved), "changes shared memory") {
 		t.Fatalf("a write tool is refused as changing shared memory, got %v", unserved)
 	}
 	if n := len(unserved["content"].([]map[string]any)); n != 1 {
 		t.Fatalf("a refusal is one text block, got %d", n)
+	}
+}
+
+// A refused read reaches the client as the tool result it is, through the served path
+// and not only through the gate. recall declares no WriteArgs today, so the test lends
+// it one for the duration (restored by defer), naming the argument the index read
+// actually sets: a read-only connection must then refuse the names_only read, and the
+// client must get the tool result with isError that a named recall of the same shape
+// would give, with no JSON-RPC error standing between it and the reason. This is the
+// served half of the predicate the earlier test asserts directly.
+func TestMemoryIndexServesTheRefusalAsAToolResult(t *testing.T) {
+	api := &fakeAPI{}
+	s := newSession(t, api, Options{WorkspaceID: "bound", ReadOnly: true}, nil, LatestProtocolVersion)
+
+	recallTool.WriteArgs = []string{"names_only"} // the index read sets exactly this
+	defer func() { recallTool.WriteArgs = nil }()
+	res, rerr := s.Handle(context.Background(), "resources/read", json.RawMessage(`{"uri":"`+MemoryIndexURI+`"}`))
+	if rerr != nil {
+		t.Fatalf("a gate refusal reaches the client as a tool result, not a protocol error: %v", rerr)
+	}
+	out, ok := res.(map[string]any)
+	if !ok || out["isError"] != true {
+		t.Fatalf("want an isError tool result, got %v", res)
+	}
+	if !strings.Contains(refusalMessage(out), "mode="+ModeReadOnly) {
+		t.Fatalf("the served refusal names the mode, got %q", refusalMessage(out))
+	}
+	if n := len(api.toolRequests()); n != 0 {
+		t.Fatalf("the refused index read reached the API %d times", n)
 	}
 }
 

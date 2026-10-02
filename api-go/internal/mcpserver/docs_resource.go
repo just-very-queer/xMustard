@@ -124,7 +124,9 @@ func docsList() []map[string]any {
 // memoryIndex reads the promoted-title index: recall with names_only at the largest
 // page and output budget, for the workspace a tool call naming none would use. The
 // API applies the caller's role gates as for the tool, and the connection's read-only
-// mode applies here too: the read goes out through serveResourceTool, not RunTool.
+// mode applies here too: the read goes out through serveResourceTool, not RunTool. A
+// read-only refusal is returned to the client as the tool result it is, the same
+// refusal a named recall gets, and is not rewrapped as a JSON-RPC error.
 func (s *Session) memoryIndex(ctx context.Context) (any, *RPCError) {
 	res, rerr := s.serveResourceTool(ctx, recallTool, map[string]string{
 		"names_only": "true", "limit": strconv.Itoa(maxRecallLimit), "max_chars": strconv.Itoa(recallMaxMaxChars),
@@ -132,12 +134,17 @@ func (s *Session) memoryIndex(ctx context.Context) (any, *RPCError) {
 	if rerr != nil {
 		return nil, rerr
 	}
+	if isErr, _ := res["isError"].(bool); isErr {
+		// a read-only refusal is a tool result the client can act on; a refused API
+		// call is a protocol error. The two are told apart by the gate's own marker.
+		if meta, _ := res["_meta"].(map[string]any); meta[readOnlyRefusalMeta] == true {
+			return res, nil
+		}
+		return nil, &RPCError{Code: CodeInternal, Message: refusalMessage(res), Data: map[string]any{"uri": MemoryIndexURI}}
+	}
 	var text string
 	if content, _ := res["content"].([]map[string]any); len(content) > 0 {
 		text, _ = content[0]["text"].(string)
-	}
-	if isErr, _ := res["isError"].(bool); isErr {
-		return nil, &RPCError{Code: CodeInternal, Message: text, Data: map[string]any{"uri": MemoryIndexURI}}
 	}
 	return map[string]any{"contents": []map[string]any{{"uri": MemoryIndexURI, "mimeType": "application/json", "text": text}},
 		"_meta": res["_meta"]}, nil

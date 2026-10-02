@@ -106,7 +106,10 @@ func instructionsWith(memory string) string {
 // the same promoted memory, so it carries recall's read-only gate rather than none.
 func (s *Session) memoryCore(ctx context.Context) (any, *RPCError) {
 	if refused := resourceToolRefusal(s.srv.opts.ReadOnly, recallTool, map[string]string{}); refused != nil {
-		return nil, &RPCError{Code: CodeInternal, Message: refusalResultText(refused), Data: map[string]any{"uri": MemoryCoreURI}}
+		if res, ok := refused.(map[string]any); ok {
+			return res, nil
+		}
+		return nil, &RPCError{Code: CodeInternal, Message: "refused", Data: map[string]any{"uri": MemoryCoreURI}}
 	}
 	ws, err := s.resolveWorkspace(ctx, &Tool{Name: "memory_core"}, map[string]string{})
 	if err != nil {
