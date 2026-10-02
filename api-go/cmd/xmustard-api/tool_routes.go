@@ -59,6 +59,14 @@ func search(w http.ResponseWriter, r *http.Request) {
 		respondError(w, fmt.Errorf("mode %q is not a search mode: %w", mode, workspaceops.ErrInvalidInput))
 		return
 	case q.Get("rerank") != "":
+		// The neural lane reranks a plain hybrid search and takes neither `mode` nor
+		// `lang`, so honouring one of them here would answer from a search that never
+		// applied it. Refuse rather than drop the filter silently.
+		if q.Get("mode") == workspaceops.SearchModeText || q.Get("lang") != "" {
+			respondError(w, fmt.Errorf("rerank cannot be combined with %w: rerank does not apply the mode or language filter",
+				workspaceops.ErrInvalidInput))
+			return
+		}
 		// optional neural lane: ?rerank=<provider>&embed_model=<model>
 		result, err = workspaceops.WorkspaceSearchReranked(dd, ws, query, q.Get("rerank"), q.Get("embed_model"), limit)
 	default:

@@ -1,7 +1,6 @@
 package workspaceops
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -121,21 +120,31 @@ func TestSearchRefusesAnOverLongLang(t *testing.T) {
 }
 
 // A cursor is bound to the ranking it pages, so a request whose filters differ must not
-// accept each other's cursor: `lang=go` and no `lang` are two rankings.
+// accept each other's cursor: `lang=go` and no `lang` are two rankings. The boundary is
+// the decode, not the key, so the cursor is encoded under one request and offered to the
+// next; comparing key bytes alone restates the construction and proves nothing.
 func TestSearchCursorIsBoundToLangAndMode(t *testing.T) {
 	base := SearchRequest{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go"}
+	same := SearchRequest{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go"}
+	cursor := encodeSearchCursor(10, base.rankingKey("ws"))
+
+	off, err := decodeSearchCursor(cursor, same.rankingKey("ws"))
+	if err != nil {
+		t.Fatalf("the same request must accept its own cursor: %v", err)
+	}
+	if off != 10 {
+		t.Fatalf("the cursor must resume at its own offset, got %d", off)
+	}
+
 	for _, other := range []SearchRequest{
 		{Query: "q", Lang: "rust", Mode: SearchModeText, PathGlob: "**/*.go"},
 		{Query: "q", Lang: "go", Mode: SearchModeHybrid, PathGlob: "**/*.go"},
 		{Query: "q", Mode: SearchModeText, PathGlob: "**/*.go"},
 		{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.rs"},
 	} {
-		if bytes.Equal(base.rankingKey("ws"), other.rankingKey("ws")) {
-			t.Errorf("a filter change must change the ranking key: %+v vs %+v", base, other)
+		got, err := decodeSearchCursor(cursor, other.rankingKey("ws"))
+		if err == nil {
+			t.Errorf("a cursor from another ranking must be refused: %+v resumed at %d", other, got)
 		}
-	}
-	same := SearchRequest{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go"}
-	if !bytes.Equal(base.rankingKey("ws"), same.rankingKey("ws")) {
-		t.Error("the same request must rank identically")
 	}
 }

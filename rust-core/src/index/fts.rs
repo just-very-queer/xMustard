@@ -308,7 +308,8 @@ fn lane_hits(
 }
 
 /// What `mode=text` keeps of the code lane: the same rows read through a body-scoped
-/// match, so a term in a declared name, in a path or in a doc comment is not a hit.
+/// match, so a term only in a declared name or only in a path is not a hit. A doc comment
+/// and a signature line are part of the chunk's own body and still match.
 const BODY: Lane = Lane {
     sql: CODE_SQL,
     weights: CODE_WEIGHTS,

@@ -282,6 +282,12 @@ impl Lane {
         Lane::Docs,
     ];
 
+    /// `mode=text` fuses the body lane alone. The other lanes read declared names,
+    /// paths, inbound edges and graph distance, none of which is chunk text, so letting
+    /// them score would rank a name match above a stronger body match — the hybrid
+    /// dilution this mode exists to avoid.
+    const BODY_ONLY: [Lane; 1] = [Lane::Bm25];
+
     fn name(self) -> &'static str {
         match self {
             Lane::Bm25 => "bm25",
@@ -486,7 +492,14 @@ struct Ctx {
 }
 
 /// Read a candidate's declaration, chunk and text, and compute its rerank features.
-fn context(conn: Option<&Connection>, root: &Path, q: &Query, c: &Cand, text: &TextLanes) -> Ctx {
+fn context(
+    conn: Option<&Connection>,
+    root: &Path,
+    q: &Query,
+    c: &Cand,
+    text: &TextLanes,
+    text_mode: bool,
+) -> Ctx {
     let row = |h: &TextHit| (h.decl.clone(), Some(h.loc.clone()));
     let (decl, loc) = match (c.kind, c.code, c.doc, conn, c.line) {
         (_, Some(i), _, _, _) => row(&text.code[i as usize]),
@@ -511,7 +524,16 @@ fn context(conn: Option<&Connection>, root: &Path, q: &Query, c: &Cand, text: &T
         (Some(Ok(t)), Some(l)) => rerank::text_features(q, t, l.start_line),
         _ => (Features::default(), Vec::new()),
     };
-    features.decl = rerank::decl_match(q, decl_name);
+    // `mode=text` does not answer from a declared name, so the rerank's declaration
+    // feature stays off here: it weighs an exact name match at 1.0 against a body window's
+    // 0.5, which would put a name match above a stronger body match — the dilution this
+    // mode exists to avoid. The window, dense-line and symbol-line features read the
+    // chunk's own text and still apply.
+    if !text_mode {
+        features.decl = rerank::decl_match(q, decl_name);
+    } else {
+        features.decl = rerank::DeclMatch::None;
+    }
     // a declaration with no matching line still shows its own line
     if let (true, Some(d), Some(l)) = (anchors.is_empty(), &decl, &loc)
         && (l.start_line..=l.end_line).contains(&d.name_line)
@@ -918,11 +940,15 @@ pub fn search(
     // ---- Reciprocal Rank Fusion ----
     let mut rrf = vec![0f64; cands.len()];
     let mut in_lanes = vec![0u8; cands.len()];
-    for lane in Lane::ALL {
+    for lane in if body_only {
+        Lane::BODY_ONLY.as_slice()
+    } else {
+        Lane::ALL.as_slice()
+    } {
         let mut ranked: Vec<(f64, u32)> = cands
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| c.lane_key(lane).map(|k| (k, i as u32)))
+            .filter_map(|(i, c)| c.lane_key(*lane).map(|k| (k, i as u32)))
             .collect();
         ranked.sort_by(|a, b| {
             b.0.total_cmp(&a.0)
@@ -943,7 +969,7 @@ pub fn search(
     let mut final_score = rrf.clone();
     let mut read = |conn: Option<&Connection>| {
         for &i in order.iter().take(RERANK_K) {
-            let c = context(conn, root, &q, &cands[i], &text);
+            let c = context(conn, root, &q, &cands[i], &text, body_only);
             final_score[i] = rrf[i] + RERANK_WEIGHT * c.features.score();
             ctx.insert(i, c);
         }
@@ -954,7 +980,7 @@ pub fn search(
         for &i in order.get(opts.offset..page_end).unwrap_or(&[]) {
             ctx.entry(i).or_insert_with(|| Ctx {
                 features: Features::default(),
-                ..context(conn, root, &q, &cands[i], &text)
+                ..context(conn, root, &q, &cands[i], &text, body_only)
             });
         }
     };
@@ -1081,14 +1107,19 @@ impl Render<'_> {
             .map_or_else(|| c.name.to_string(), |d| d.name.clone());
         let mut reasons: Vec<String> = Vec::new();
         cx.features.reasons(&decl_name, &mut reasons);
-        let matched: Vec<&str> = Lane::ALL
-            .into_iter()
+        let lanes_run = if self.body_only {
+            Lane::BODY_ONLY.as_slice()
+        } else {
+            Lane::ALL.as_slice()
+        };
+        let matched: Vec<&str> = lanes_run
+            .iter()
             .filter(|l| lanes & l.bit() != 0)
-            .map(|l| self.lane_name(l))
+            .map(|l| self.lane_name(*l))
             .collect();
         let row = |i: Option<u32>, rows: &[TextHit]| i.map(|i| rows[i as usize].clone());
         let (code_row, doc_row) = (row(c.code, &text.code), row(c.doc, &text.docs));
-        for lane in Lane::ALL.into_iter().filter(|l| lanes & l.bit() != 0) {
+        for lane in lanes_run.iter().copied().filter(|l| lanes & l.bit() != 0) {
             let reason = match lane {
                 Lane::Bm25 if self.body_only => code_row.as_ref().map(|h| match h.all_terms {
                     true => "body: every query term in the chunk body".to_string(),
@@ -1488,6 +1519,97 @@ mod tests {
                 ..Default::default()
             },
         )
+    }
+
+    // Text mode scores the body lane alone. Both chunks below carry the term in their own
+    // text, and one of them also has it in its declared name. The name lane is what would
+    // let a declared name add weight on top of a body match, so a text hit must report
+    // and score `body` and nothing else — a name match is not extra evidence here.
+    #[test]
+    fn text_mode_ranks_on_the_body_lane_alone() {
+        let repo = indexed_repo(&[
+            // the term in this one's body and in its declared name as well
+            (
+                "svc/widget.go",
+                "package svc\n\n// unrelated prose\nfunc zeppelinprobe() { settle() }\n",
+            ),
+            // the term in the body only, with no name or path match anywhere
+            (
+                "svc/other.go",
+                "package svc\n\nfunc settle() {\n\tzeppelinprobe()\n}\n",
+            ),
+        ]);
+
+        let res = text_search(&repo, "zeppelinprobe", None);
+        assert_eq!(res.hits.len(), 2, "{:?}", res.hits);
+        for h in &res.hits {
+            assert_eq!(
+                h.lanes_matched,
+                vec!["body"],
+                "text mode reports only the lane it ran: {h:?}"
+            );
+            assert_eq!(h.scores.get("name"), None, "{h:?}");
+            assert_eq!(h.scores.get("fuzzy"), None, "{h:?}");
+            assert_eq!(h.scores.get("structural"), None, "{h:?}");
+            assert_eq!(h.scores.get("proximity"), None, "{h:?}");
+            assert!(
+                !h.reason.contains("declaration"),
+                "a declared name is not evidence in text mode: {}",
+                h.reason
+            );
+        }
+
+        // A declared name is not extra evidence, but it is not an exclusion either: a
+        // declaration chunk's body includes its signature line, so this fixture's own
+        // signature is a body match. What the test pins is that nothing beyond the body
+        // lane contributed.
+    }
+
+    // `lang` filters the docs lane too. The docs lane has no `files.lang` to read, so a
+    // filtered hybrid used to bind an empty language there and keep serving prose from
+    // documents in every language beside code hits narrowed to one.
+    #[test]
+    fn lang_filter_drops_the_docs_lane() {
+        let repo = indexed_repo(&[
+            ("svc/handler.go", "package svc\n\nfunc settle() {\n\tledger()\n}\n"),
+            (
+                "docs/PLAN.md",
+                "# Plan\n\nUnique marker zephyr_quota is documented only here.\n",
+            ),
+        ]);
+        let unfiltered = search(
+            repo.path(),
+            "ws",
+            None,
+            "zephyr_quota",
+            &SearchOptions {
+                limit: 20,
+                ..Default::default()
+            },
+        );
+        assert!(
+            unfiltered.hits.iter().any(|h| h.kind == "doc"),
+            "the fixture must reach the docs lane unfiltered: {:?}",
+            unfiltered.hits
+        );
+
+        let filtered = search(
+            repo.path(),
+            "ws",
+            None,
+            "zephyr_quota",
+            &SearchOptions {
+                limit: 20,
+                lang: Some("go"),
+                ..Default::default()
+            },
+        );
+        for h in &filtered.hits {
+            assert_ne!(
+                h.kind, "doc",
+                "lang=go must not answer with a doc hit: {h:?}"
+            );
+        }
     }
 
     // `mode=text` answers from the chunk's own text: a term that exists only in the

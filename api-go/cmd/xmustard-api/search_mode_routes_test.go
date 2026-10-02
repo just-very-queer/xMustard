@@ -2,6 +2,8 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -75,13 +77,68 @@ func TestSearchLangKeepsThePatternModeHint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	var out struct {
+		Query struct {
+			Language string `json:"language"`
+		} `json:"query"`
+	}
+	body, readErr := io.ReadAll(resp.Body)
 	resp.Body.Close()
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
 	if resp.StatusCode != 200 {
 		t.Fatalf("mode=pattern: status %d; log:\n%s", resp.StatusCode, p.stderr.String())
 	}
-	// the pattern lane never asked the core's `search`, so no --lang flag was sent
+	// The hint must reach ast-grep, not merely avoid the lexical --lang flag: an absent
+	// language in the recorded query is ast-grep searching every language, which the old
+	// assertion could not see.
+	if err := json.Unmarshal(body, &out); err != nil {
+		t.Fatalf("mode=pattern body: %v (%s)", err, body)
+	}
+	if out.Query.Language != "go" {
+		t.Fatalf("pattern mode keeps lang as the ast-grep hint: got %q, want \"go\"", out.Query.Language)
+	}
+	// the pattern lane never asked the core's `search`, so no --lang flag was sent.
+	// Reading the args file only when it exists passes vacuously when the file was never
+	// written, so the positive assertion above is what makes this one mean something.
 	if raw, err := os.ReadFile(argsFile); err == nil && strings.Contains(string(raw), "--lang=") {
 		t.Fatalf("pattern mode must not send --lang to the core: %q", raw)
+	}
+}
+
+// `rerank` must not be a way around the two filters this row added. The rerank branch
+// sits before the lexical default and calls a search that takes no `mode` or `lang`, so
+// without a guard `mode=text&rerank=...` answers from the unfiltered hybrid: a path-only
+// match, or a file in another language, in a response that says it was asked for neither.
+func TestSearchRerankDoesNotBypassTheLexicalFilters(t *testing.T) {
+	dir := t.TempDir()
+	seedCoreWorkspace(t, dir, "ws")
+	hybrid := `{"workspace_id":"ws","query":"retry","total":1,"hits":[` +
+		`{"kind":"file","name":"notes","path":"a.md","line":null,"score":1,` +
+		`"lanes_matched":["bm25"],"reason":"bm25: every query term in the chunk"}]}`
+	core := writeScript(t, "cat <<'EOF'\n"+hybrid+"\nEOF\n")
+	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core})
+	t.Cleanup(func() { _ = p.cmd.Process.Kill(); _ = p.cmd.Wait() })
+
+	for _, tc := range []struct{ name string; q url.Values }{
+		{"text mode", url.Values{"mode": {"text"}, "q": {"retry"}, "rerank": {"just-mini"}}},
+		{"lang filter", url.Values{"lang": {"go"}, "q": {"retry"}, "rerank": {"just-mini"}}},
+	} {
+		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + tc.q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		// 400 is the fail-closed answer; 200 would hand back an unfiltered hybrid hit.
+		if resp.StatusCode == http.StatusOK {
+			t.Fatalf("%s with rerank must not answer from the unfiltered hybrid: 200 %s",
+				tc.name, body)
+		}
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Fatalf("%s with rerank: status %d; log:\n%s", tc.name, resp.StatusCode, p.stderr.String())
+		}
 	}
 }
 
