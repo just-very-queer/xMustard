@@ -136,6 +136,20 @@ fn edge<'m>(
         .unwrap_or_else(|| panic!("missing edge {key:?}\nhave: {:#?}", m.keys()))
 }
 
+/// (path, path) file pairs holding an edge of the given layer.
+fn layer_edges(conn: &Connection, layer: &str) -> BTreeSet<(String, String)> {
+    let mut st = conn
+        .prepare(
+            "SELECT a.path, b.path FROM edges e JOIN files a ON a.id = e.src_file
+             JOIN files b ON b.id = e.dst_file WHERE e.layer = ?1",
+        )
+        .unwrap();
+    st.query_map([layer], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 /// (path, name, cause) → count
 fn drops(conn: &Connection) -> BTreeMap<(String, String, String), i64> {
     let mut st = conn
@@ -778,4 +792,189 @@ fn precision_against_type_checker_ground_truth() {
         total.2,
         total.0 as f64 / total.2 as f64
     );
+}
+
+// ---------------------------------------------------------------------------
+// WS-FIX-19: the WS-17 minors whose status was unknown. Each test here measures the
+// behaviour the row names. Where the behaviour is already correct the test pins it,
+// so a later change that reintroduces the finding fails instead of passing silently.
+// ---------------------------------------------------------------------------
+
+// Item 2, "Go selector writes read as `read`": NOT REPRODUCED. A plain selector write,
+// an index-write through a selector, a package-level var and a cross-file receiver all
+// classify as `write`, and a read of the same symbol stays `read`. The fixture also
+// covers `b.Count = b.Count + 1`, where the LHS and the RHS are one symbol and both
+// access modes must appear.
+#[test]
+fn a_go_selector_write_is_a_write_and_not_a_read() {
+    let r = repo(&[
+        ("go.mod", GO_MOD),
+        (
+            "pkg/s/s.go",
+            r#"package s
+
+type Box struct {
+	Count int
+	Name  string
+}
+
+var Global int
+
+func Use(b *Box, n int) {
+	b.Count = n
+	b.Name = "x"
+	Global = n
+	v := b.Count
+	w := Global
+	_, _ = v, w
+}
+"#,
+        ),
+        (
+            "pkg/s/u.go",
+            "package s\n\nfunc Other(b *Box) { b.Count = 9 }\n",
+        ),
+    ]);
+    let conn = db(&index("build", r.path(), &[]));
+    let e = symbol_edges(&conn);
+    let s = "pkg/s/s.go";
+    let x = "pkg/s/u.go";
+    // plain selector writes
+    edge(&e, (s, "Use"), "ACCESSES", "write", (s, "Box.Count"));
+    edge(&e, (s, "Use"), "ACCESSES", "write", (s, "Box.Name"));
+    // a package-level variable, same file and through a selector
+    edge(&e, (s, "Use"), "ACCESSES", "write", (s, "Global"));
+    // the reads are reads, and stay reads
+    let c = edge(&e, (s, "Use"), "ACCESSES", "read", (s, "Box.Count"));
+    assert_eq!(c.0, 0.95);
+    edge(&e, (s, "Use"), "ACCESSES", "read", (s, "Global"));
+    // a write through a receiver typed in ANOTHER file of the same package
+    let far = edge(&e, (x, "Other"), "ACCESSES", "write", (s, "Box.Count"));
+    assert_eq!((far.0, far.2.as_str()), (0.9, "receiver-typed"));
+}
+
+// Item 3, "Go/TS lexical file edges": NOT REPRODUCED as a defect. The WS-17 Decision
+// (plan line 1319) keeps the lexical `structure`/`flow` layers beside the resolved
+// `symbol` layer for exactly these two languages, as data for the legacy consumers.
+// This test pins that: a Go package-qualified call and a TS named import BOTH resolve
+// to symbol edges, and both files still keep their file-level edge, so `index impact`
+// on a resolved symbol walks `symbol` while a file-level consumer still has `lexical`.
+#[test]
+fn a_resolved_go_or_ts_edge_keeps_its_lexical_file_edge() {
+    let r = repo(&[
+        ("web/a.ts", "export function alpha(): number { return 1; }\n"),
+        (
+            "web/b.ts",
+            "import { alpha } from './a';\nexport function beta(): number { return alpha(); }\n",
+        ),
+        ("go.mod", GO_MOD),
+        ("pkg/x/x.go", "package x\n\nfunc Alpha() int { return 1 }\n"),
+        (
+            "pkg/y/y.go",
+            "package y\n\nimport \"example.com/app/pkg/x\"\n\nfunc Beta() int { return x.Alpha() }\n",
+        ),
+    ]);
+    let conn = db(&index("build", r.path(), &[]));
+    // the resolved symbol layer
+    let e = symbol_edges(&conn);
+    let ts = edge(&e, ("web/b.ts", "beta"), "CALLS", "", ("web/a.ts", "alpha"));
+    assert_eq!((ts.0, ts.1.as_str(), ts.2.as_str()), (0.9, "scope", "import"));
+    let go = edge(&e, ("pkg/y/y.go", "Beta"), "CALLS", "", ("pkg/x/x.go", "Alpha"));
+    assert_eq!((go.0, go.1.as_str(), go.2.as_str()), (0.9, "scope", "package"));
+    // and the lexical file edges the Decision keeps beside them
+    let lexical = layer_edges(&conn, "structure");
+    assert!(
+        lexical.contains(&("web/b.ts".into(), "web/a.ts".into())),
+        "the TS importer lost its lexical file edge: {lexical:?}"
+    );
+    assert!(
+        lexical.contains(&("pkg/y/y.go".into(), "pkg/x/x.go".into())),
+        "the Go importer lost its lexical file edge: {lexical:?}"
+    );
+}
+
+// Item 4, "the TS global-tier candidate limit": NOT REPRODUCED. The global tier
+// resolves a unique top-level definition for every referencing file, not only the
+// first, so a nine-caller fixture must produce nine edges at 0.5/lexical. The lookup
+// is bounded (`top_level_files(..., 2)` decides uniqueness however many rows one file
+// holds), so the candidate set cannot grow with the number of callers.
+#[test]
+fn a_global_tier_name_resolves_for_every_calling_file() {
+    let mut list: Vec<(String, String)> = vec![(
+        "src/uniq.ts".to_string(),
+        "export function oneAndOnlyUniqueName(): number { return 1; }\n".to_string(),
+    )];
+    // nine caller files, each calling the name with NO import: the global tier, not the
+    // import tier (which would resolve at 0.9 and prove nothing about the candidate set)
+    for i in 1..=9 {
+        list.push((
+            format!("src/c{i}.ts"),
+            format!("export function c{i}(): number {{ return oneAndOnlyUniqueName(); }}\n"),
+        ));
+    }
+    let dir = TempDir::new().unwrap();
+    for (rel, content) in &list {
+        write(dir.path(), rel, content);
+    }
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "c"]);
+    let conn = db(&index("build", dir.path(), &[]));
+    let e = symbol_edges(&conn);
+    let mut callers = 0;
+    for ((_, _, kind, _, dst_path, dst_name), (conf, prov, reason, _)) in &e {
+        if kind == "CALLS" && dst_name == "oneAndOnlyUniqueName" && dst_path == "src/uniq.ts" {
+            assert_eq!((*conf, prov.as_str(), reason.as_str()), (0.5, "lexical", "global-unique-name"));
+            callers += 1;
+        }
+    }
+    assert_eq!(callers, 9, "one global-tier caller is missing: {e:?}");
+}
+
+// Item 5, "`find_export` falling back to a non-exported declaration": NOT REPRODUCED
+// as a defect. `imports_ts::find` falls back to a file's top-level declaration only
+// when the file uses NO ES export syntax at all (`has_es_exports`), which is the
+// documented CommonJS rule: a CommonJS module exports without the keyword. Two tests,
+// both halves: a name a file really re-exports resolves, and a name an ES module does
+// not export is NOT reachable even when a barrel claims it.
+#[test]
+fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
+    // (a) `deep.ts` declares `secret` and re-exports it by name: a true positive.
+    let r = repo(&[
+        (
+            "src/deep.ts",
+            "function secret(): number { return 1; }\nexport { secret };\n",
+        ),
+        ("src/barrel.ts", "export { secret } from './deep';\n"),
+        (
+            "src/use.ts",
+            "import { secret } from './barrel';\nexport function go(): number { return secret(); }\n",
+        ),
+    ]);
+    let conn = db(&index("build", r.path(), &[]));
+    let e = symbol_edges(&conn);
+    let hit = edge(&e, ("src/use.ts", "go"), "CALLS", "", ("src/deep.ts", "secret"));
+    assert_eq!((hit.0, hit.2.as_str()), (0.9, "re-export"));
+
+    // (b) an ES module that does not export the name is a boundary. `mod.ts` exports
+    // something else, so `hidden` is not its export and the barrel's claim is refused.
+    let r2 = repo(&[
+        (
+            "src/mod.ts",
+            "export const shown = 1;\nfunction hidden(): number { return 2; }\n",
+        ),
+        ("src/barrel2.ts", "export { hidden } from './mod';\n"),
+        (
+            "src/use2.ts",
+            "import { hidden } from './barrel2';\nexport function go2(): number { return hidden(); }\n",
+        ),
+    ]);
+    let conn2 = db(&index("build", r2.path(), &[]));
+    let e2 = symbol_edges(&conn2);
+    let leaked = e2
+        .iter()
+        .any(|((_, _, _, _, dst_path, dst_name), _)| dst_path == "src/mod.ts" && dst_name == "hidden");
+    assert!(!leaked, "an unexported declaration resolved through a barrel: {e2:?}");
 }
