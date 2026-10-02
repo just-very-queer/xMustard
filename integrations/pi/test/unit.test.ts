@@ -4,6 +4,7 @@
 
 import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type net from "node:net";
 import os from "node:os";
@@ -14,6 +15,7 @@ import { type AdapterConfig, loadConfig, PI_POLICY_TARGET } from "../src/config.
 import {
 	argsDigest,
 	CAPTURE_PAUSE_MS,
+	carriesHandle,
 	Capturer,
 	DELIVERY_HEADER,
 	expand,
@@ -29,7 +31,7 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
-import { mutateBashInput } from "../src/commandwrap.ts";
+import { mutateBashInput, shellQuote } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -1259,27 +1261,99 @@ describe("session_before_compact snapshot", () => {
 });
 
 describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
-	const WRAPPED = (ws: string, command: string) => `xmustard-core run --workspace ${ws} -- ${command}`;
+	// The wrapped form Pi ends up executing. The oracle is POSIX sh itself, not this
+	// file's own template: `sh -c <quoted>` is what makes a pipeline, a redirect or
+	// `cd sub && make` survive, because the wrapper execs argv[0] directly rather
+	// than through a shell.
+	const WRAPPED = (ws: string, command: string) => `xmustard-core run --workspace ${shellQuote(ws)} -- sh -c ${shellQuote(command)}`;
 	const wrapInput = (input: unknown, ws: string | undefined, enabled: boolean): unknown => {
 		const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: structuredClone(input) as Record<string, unknown> };
 		mutateBashInput(event, ws, enabled);
 		return event.input;
 	};
 
+	// shRuns is the independent check that the wrapped argv still performs the
+	// model's command. It runs the wrapped command field through a real shell, the
+	// same way the wrapper's Command::new(&argv[0]) does.
+	const shRuns = (argv: string): string => execFileSync("/bin/sh", ["-c", argv], { encoding: "utf8" });
+
 	test("off by default: a bash command is byte-identical when the knob is unset", () => {
 		const input = { command: "ls -la /tmp" };
 		assert.deepEqual(wrapInput(input, "ws-1", false), input);
-		assert.deepEqual(loadConfig({}).wrapBash, false, "XMUSTARD_PI_WRAP_BASH defaults off");
+		assert.equal(loadConfig({}).wrapBash, false, "XMUSTARD_PI_WRAP_BASH defaults off");
 		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "1" }).wrapBash, true);
 		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "on" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "true" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "yes" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "ON" }).wrapBash, true, "the knob is case-insensitive");
 		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "0" }).wrapBash, false);
 		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "off" }).wrapBash, false);
 		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "" }).wrapBash, false);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: " 1 " }).wrapBash, true, "surrounding space is trimmed");
 	});
 
 	test("a bash command is rewritten in place to the run wrapper, keeping timeout", () => {
 		assert.deepEqual(wrapInput({ command: "ls -la /tmp" }, "ws-1", true), { command: WRAPPED("ws-1", "ls -la /tmp") });
 		assert.deepEqual(wrapInput({ command: "go test ./...", timeout: 5000 }, "ws-1", true), { command: WRAPPED("ws-1", "go test ./..."), timeout: 5000 });
+	});
+
+	// The argv after `--` is exactly three fields: the shell, its -c flag, and one
+	// quoted string holding the model's command. Splitting on spaces would be wrong
+	// for a command that contains one, so a real shell does the splitting and prints
+	// each field on its own line.
+	const argvFields = (command: string): string[] => {
+		const wrapped = wrapInput({ command }, "ws-1", true) as { command: string };
+		const tail = wrapped.command.slice(wrapped.command.indexOf(" -- ") + 4);
+		assert.ok(tail.startsWith("sh -c "), `the wrapped form addresses a shell: ${tail}`);
+		const printed = shRuns(`set -- ${tail}; for f do printf '%s\\n' "$f"; done`);
+		return printed.split("\n").slice(0, -1);
+	};
+
+	test("the wrapped argv is exactly shell, -c, and one quoted command string", () => {
+		for (const command of ["ls", "cd sub && make", "a | b > out.txt", "printf 'x y'", "echo a  b"]) {
+			const argv = argvFields(command);
+			assert.deepEqual(argv, ["sh", "-c", command], `argv after -- for ${JSON.stringify(command)}`);
+		}
+	});
+
+	test("the wrapped command still does what the model asked, checked by sh itself", () => {
+		// Each case is one that a bare `Command::new(&argv[0])` would break: a
+		// pipeline needs a shell, `&&` needs a shell, and an embedded quote must
+		// survive being nested inside the wrapper's own single-quoted argv. The
+		// expected values are what POSIX sh must produce, written out here rather
+		// than computed by the code under test.
+		const cases: [string, string][] = [
+			["printf 'a\\nb\\n' | wc -l", "2"],
+			["cd . && echo yes", "yes"],
+			[`echo "it's here"`, "it's here"],
+			["echo '$HOME'", "$HOME"],
+			["echo a b   c", "a b   c"],
+			["echo x; echo y", "x\ny"],
+			[`printf '%s' "a'b'c"`, "a'b'c"],
+			["echo done > f && cat f", "done"],
+		];
+		for (const [command, want] of cases) {
+			const argv = argvFields(command);
+			// `sh -c <field>` is what the wrapper would exec. Running it proves the
+			// command survives the round trip through the wrapper's argv intact.
+			assert.equal(shRuns(`sh -c ${argv[2]}`), `${want}\n`, `must survive: ${command}`);
+		}
+	});
+
+	test("shellQuote escapes an embedded quote and leaves ordinary text readable", () => {
+		// The POSIX idiom is close-quote, escaped quote, reopen-quote. The literal is
+		// the shape a reviewer can check by eye; the round trip is the proof.
+		assert.equal(shellQuote("plain"), "'plain'");
+		assert.equal(shellQuote("it's"), `'it'"'"'s'`);
+		for (const raw of ["plain", "it's", "a'b'c", "''", "$(whoami)", "`id`", "a b", "a\nb", "\\", '"', "xm1.abc"]) {
+			assert.equal(shRuns(`printf '%s' ${shellQuote(raw)}`), raw, `must round-trip: ${JSON.stringify(raw)}`);
+		}
+	});
+
+	test("the workspace id is quoted too, so an id with a quote or space cannot break out", () => {
+		for (const ws of ["ws-1", "w s", "a'b", "$(id)"]) {
+			assert.deepEqual(wrapInput({ command: "ls" }, ws, true), { command: WRAPPED(ws, "ls") }, ws);
+		}
 	});
 
 	test("the mutation reaches the caller's object, which is how Pi applies it", () => {
@@ -1298,6 +1372,7 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 	test("no resolved workspace means no wrap: the command runs natively", () => {
 		assert.deepEqual(wrapInput({ command: "ls" }, undefined, true), { command: "ls" });
 		assert.deepEqual(wrapInput({ command: "ls" }, "", true), { command: "ls" });
+		assert.deepEqual(wrapInput({ command: "ls" }, "   ", true), { command: "ls" }, "a whitespace-only id is no id");
 	});
 
 	test("only bash is wrapped; every other tool keeps byte-identical input", () => {
@@ -1314,6 +1389,9 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 			const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input } as never;
 			assert.doesNotThrow(() => mutateBashInput(event, "ws-1", true), JSON.stringify(input));
 		}
+		for (const event of [undefined, null, 7, "bash", [], { toolName: "bash" }, { toolName: 7, input: { command: "ls" } }]) {
+			assert.doesNotThrow(() => mutateBashInput(event, "ws-1", true), JSON.stringify(event));
+		}
 	});
 
 	test("wrapping is idempotent through the wrapper's own argv parser", () => {
@@ -1321,5 +1399,58 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		// repeats a wrapped command does not nest two wrappers
 		const once = WRAPPED("ws-1", "ls -la");
 		assert.deepEqual(wrapInput({ command: once }, "ws-1", true), { command: once });
+		const twice = `xmustard-core run --workspace 'ws-1' -- ${once}`;
+		assert.deepEqual(wrapInput({ command: twice }, "ws-1", true), { command: twice });
 	});
 });
+
+describe("a wrapper result activates expansion (WS-44e)", () => {
+	// The shape is the API's own footer (api-go/internal/evidence/capture_meta.go:
+	// "[xmustard evidence] " + json.Marshal of the footer map), which the Rust run
+	// wrapper appends verbatim (run_wrapper.rs project(): text.push_str(&footer)).
+	// json.Marshal writes no space after a colon, so the fixture does not either;
+	// writing it with JSON.stringify would not be the byte sequence Go emits.
+	const footer = (handle: string) =>
+		`[xmustard evidence] {"handle":"${handle}","workspace_id":"w1","raw_bytes":2000000,"projected_bytes":1200,"omissions":40,"search":"GET /api/workspaces/w1/evidence/search?handle=${handle}"}`;
+
+	test("a result carrying an xm1. handle in its footer counts as a handle", () => {
+		assert.equal(carriesHandle([footer("xm1.abc123")]), true);
+		assert.equal(carriesHandle(["ok", footer("xm1.abc123")]), true, "the handle may be in any block");
+		assert.equal(carriesHandle([`[xmustard masked: secret] ${footer("xm1.zz")}`]), true);
+		assert.equal(carriesHandle([`prefix\n${footer("xm1.zz")}\nsuffix`]), true, "not anchored to line start");
+	});
+
+	test("a result with no handle does not count", () => {
+		assert.equal(carriesHandle([]), false);
+		assert.equal(carriesHandle([""]), false);
+		assert.equal(carriesHandle(["total 40\ndrwxr-xr-x 2 root root 4096 Jan 1 00:00 ."]), false, "an ordinary bash result");
+		assert.equal(carriesHandle(["no handle here"]), false);
+		assert.equal(carriesHandle([footer("other-prefix.abc")]), false, "the handle must be xm1.-prefixed");
+		assert.equal(carriesHandle(['[xmustard evidence] {"handle":""}']), false, "an empty handle is not a handle");
+	});
+
+	test("a small wrapped bash result still activates expansion, and an ordinary one does not", async () => {
+		// The wrapped result is already reduced, so it never reaches the capture path
+		// that used to call onHandle. Without this, xmustard_expand is never offered
+		// for a command that WAS captured, and the model has the handle but no tool.
+		let handles = 0;
+		const resolve = async () => "w1";
+		const wrapped = { toolCallId: "w", toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: `projected output\n${footer("xm1.abc123")}` }], details: undefined, isError: false };
+		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, wrapped, {}, () => handles++);
+		assert.equal(handles, 1, "a wrapped result activates expansion");
+		assert.equal(out, undefined, "already small: nothing to replace, and it is passed through");
+
+		handles = 0;
+		await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "n", toolName: "bash", input: { command: "ls" }, content: [{ type: "text", text: "total 4\ndrwx" }], details: undefined, isError: false }, {}, () => handles++);
+		assert.equal(handles, 0, "a result with no handle must not activate expansion");
+
+		handles = 0;
+		await projectBuiltin(cfg({ builtins: new Set(["read"]) }), new Capturer(cfg()), resolve, { toolCallId: "r", toolName: "read", input: {}, content: [{ type: "text", text: footer("xm1.abc123") }], details: undefined, isError: false }, {}, () => handles++);
+		assert.equal(handles, 1, "the tool must still be a built-in for the handler to see it");
+
+		handles = 0;
+		await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "o", toolName: "read", input: {}, content: [{ type: "text", text: footer("xm1.abc123") }], details: undefined, isError: false }, {}, () => handles++);
+		assert.equal(handles, 0, "a tool outside the builtins set is not ours at all");
+	});
+});
+

@@ -66,6 +66,14 @@ function sessionIdOf(ctx: ExtensionContext | undefined): string | undefined {
 	}
 }
 
+// isBashCall reports whether this event is a bash call the wrap may touch. It is
+// the first check on the tool_call hook, so every other tool returns before the
+// workspace lookup it would never use.
+function isBashCall(event: unknown): boolean {
+	const e = event as { toolName?: unknown } | null;
+	return typeof e === "object" && e !== null && e.toolName === "bash";
+}
+
 export default function xmustard(pi: ExtensionAPI): void {
 	const cfg = loadConfig();
 	const pending = new PendingCalls();
@@ -129,11 +137,18 @@ export default function xmustard(pi: ExtensionAPI): void {
 	});
 
 	// WS-44e (PAR-ADP-09): a bash call's command is rewritten to the run wrapper
-	// before Pi executes it, so its output is reduced server-side. The workspace is
-	// resolved here, inside the same deadline every other projection uses; a
-	// workspace that cannot resolve leaves the command native.
+	// before Pi executes it, so its output is reduced server-side. The tool name is
+	// checked first, so no other call pays for a workspace lookup and its deadline.
 	pi.on("tool_call", async (event, ctx) => {
-		if (!cfg.wrapBash) return undefined;
+		if (!cfg.wrapBash || !isBashCall(event)) return undefined;
+		// The wrapper authenticates with XMUSTARD_API_TOKEN from its own environment
+		// (rust-core/src/run_wrapper.rs) while this adapter reads XMUSTARD_TOKEN, and
+		// a tool_call hook cannot change the child environment. Passing the token on
+		// the command line instead would write it into Pi's session transcript, the
+		// masking walk and every capture body. So the wrap is skipped when the API
+		// needs a token this process cannot hand over; the command then runs natively
+		// and projectBuiltin captures it through the adapter, which can authenticate.
+		if (cfg.token && !process.env.XMUSTARD_API_TOKEN) return undefined;
 		await resolveWorkspace(ctx.cwd, ctx.signal).then(
 			(ws) => mutateBashInput(event, ws, true),
 			() => mutateBashInput(event, undefined, true),

@@ -45,17 +45,32 @@ p.write_text(s.replace(old, new))
 print(f"APPLIED {id_}")
 PY
 	local rc=$?
-	if [[ $rc -ne 0 ]]; then echo "MUTATION $id DID NOT APPLY"; return 1; fi
+	if [[ $rc -ne 0 ]]; then echo "MUTATION $id DID NOT APPLY"; NOT_APPLIED="$((NOT_APPLIED + 1))"; return 1; fi
+	APPLIED="$((APPLIED + 1))"
 	run "$id"
 }
 
 run() {
 	local id="$1"
 	echo "=== MUTATION $id"
-	(cd integrations/pi && node --test test/unit.test.ts 2>&1 | grep -E "^# (tests|pass|fail)|^    not ok"; echo "EXIT=${PIPESTATUS[0]}")
+	local out rc
+	out="$(cd integrations/pi && node --test test/unit.test.ts 2>&1)"
+	rc=$?
+	echo "$out" | grep -E "^# (tests|pass|fail)|^    not ok"
+	echo "EXIT=$rc"
 	restore "$id"
+	# A mutation that did not kill a test is a failed row, not a note: the plan's
+	# Tests-required list and §6 A4 both require one kill per mutation, and a runner
+	# that cannot fail is a runner that reports a survivor as a kill.
+	if [[ $rc -eq 0 ]]; then
+		echo "SURVIVED $id (the test suite passed with the mutation applied)"
+		SURVIVORS="$((SURVIVORS + 1))"
+	fi
 }
 
+SURVIVORS=0
+APPLIED=0
+NOT_APPLIED=0
 TAB=$'\t'
 
 mutate M1 "${TAB}if (!enabled) return;" "" || true
@@ -72,17 +87,31 @@ mutate M6 'const ws = workspaceId?.trim();' 'const ws = "";' || true
 
 # M7: mutateBashInput writes a copy instead of the caller's object. Pi applies the
 # in-place mutation, so a copy leaves the command the model wrote.
-LINE="${TAB}input.command = \`\${WRAPPER} --workspace \${ws} -- \${command}\`;"
-mutate M7 "$LINE" "${TAB}{ const copy = { ...input }; copy.command = \`\${WRAPPER} --workspace \${ws} -- \${command}\`; }" || true
+LINE="${TAB}input.command = \`\${WRAPPER} --workspace \${shellQuote(ws)} -- \${SHELL} \${SHELL_FLAG} \${shellQuote(command)}\`;"
+mutate M7 "$LINE" "${TAB}{ const copy = { ...input }; copy.command = \`\${WRAPPER} --workspace \${shellQuote(ws)} -- \${SHELL} \${SHELL_FLAG} \${shellQuote(command)}\`; }" || true
 
 mutate M8 '!isRecord(input) || typeof input.command !== "string"' '!isRecord(input)' || true
 
 # M9: the rewritten input drops Pi's own timeout, which would silently un-bound it
-mutate M9 "$LINE" "${TAB}input.command = \`\${WRAPPER} --workspace \${ws} -- \${command}\`; delete input.timeout;" || true
+mutate M9 "$LINE" "${TAB}input.command = \`\${WRAPPER} --workspace \${shellQuote(ws)} -- \${SHELL} \${SHELL_FLAG} \${shellQuote(command)}\`; delete input.timeout;" || true
 
 mutate M10 '["1", "on", "true", "yes"].includes((env.XMUSTARD_PI_WRAP_BASH ?? "").trim().toLowerCase())' '(env.XMUSTARD_PI_WRAP_BASH ?? "").trim() !== ""' "$CFG" || true
+
+# M11: the shell is dropped, so `cd sub && make` would be exec'd as a program
+mutate M11 " -- \${SHELL} \${SHELL_FLAG} " " -- " || true
+
+# M12: quoting is dropped, so a command with a quote or a space in the id breaks
+mutate M12 '${SHELL} ${SHELL_FLAG} ${shellQuote(command)}' '${SHELL} ${SHELL_FLAG} ${command}' || true
 
 restore ALL
 echo "=== final byte-compare"
 cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" && echo "TREE_CLEAN=yes" || echo "TREE_CLEAN=no"
 rm -rf "$PRISTINE"
+echo "=== SUMMARY applied=$APPLIED survived=$SURVIVORS not_applied=$NOT_APPLIED"
+# The runner fails when any mutation was skipped or survived, so "all killed" cannot
+# be a claim the script is structurally unable to contradict.
+if [[ $SURVIVORS -ne 0 || $NOT_APPLIED -ne 0 ]]; then
+	echo "MUTATION_PASS=failed"
+	exit 1
+fi
+echo "MUTATION_PASS=ok"

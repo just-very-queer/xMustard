@@ -670,6 +670,19 @@ export function textBlocks(content: unknown[]): string[] | undefined {
 	return out;
 }
 
+// carriesHandle reports whether a result's text already names a recovery handle.
+// knownHandle (masking.ts) reads a handle out of structured details; the run
+// wrapper's projection puts its handle in the [xmustard evidence] footer of the
+// text instead, and that result reaches Pi with no details of our own, so the
+// footer is the only place the handle can come from.
+// The `]` must be matched literally after the tag: the footer is one line, and the
+// handle is inside its JSON, so the class between them cannot span a newline.
+const HANDLE_IN_TEXT = /\[xmustard (?:evidence|masked|page|search)\][^\n]*xm1\./;
+
+export function carriesHandle(texts: readonly string[]): boolean {
+	return texts.some((t) => HANDLE_IN_TEXT.test(t));
+}
+
 // projectBuiltin is the tool_result handler for Pi's built-in tools. A text result
 // larger than the projection target is captured and replaced by its projection with
 // a recovery line; isError is never touched and details are kept. Every failure
@@ -685,6 +698,11 @@ export async function projectBuiltin(
 	if (!cfg.builtins.has(ev.toolName)) return undefined;
 	const texts = textBlocks(ev.content);
 	if (!texts) return undefined;
+	// The wrapper's own projection (WS-44e) reduces bash output before Pi ever sees
+	// it, so a wrapped result is already small and would leave here without
+	// activating expansion. Its [xmustard evidence] line still carries a handle the
+	// model is expected to be able to use.
+	if (carriesHandle(texts)) onHandle();
 	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
 	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });

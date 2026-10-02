@@ -9,19 +9,39 @@
 // ToolCallEvent), which is why this mutates rather than returning a replacement:
 // ToolCallEventResult has no input field, only block/reason/terminate.
 //
+// Pi runs `command` through a shell, but the wrapper execs the argv program after
+// `--` directly (rust-core/src/run_wrapper.rs: `Command::new(&argv[0])`). A command
+// like `cd sub && make` therefore has to be handed to a shell explicitly, or the
+// wrapper would try to exec `cd`. So the wrapped form is
+// `xmustard-core run --workspace <id> -- sh -c <quoted command>`: the shell sees the
+// exact string Pi would have run, inside the wrapper's argv, and every byte it prints
+// is still reduced and retained.
+//
 // Every edge here fails open to the native command. A wrap that cannot be built
 // correctly is worse than no wrap: the wrapper's own promise is that the command
-// always runs and its result is never lost, so a malformed argv must never
-// reach the shell in place of the model's command.
+// always runs and its result is never lost, so a malformed argv must never reach
+// the shell in place of the model's command.
 
 export const WRAPPER = "xmustard-core run";
+// The program the wrapped command runs as. `sh -c` reproduces the shell Pi would
+// have used, so pipelines, `&&`, redirection and quoting behave as before.
+const SHELL = "sh";
+const SHELL_FLAG = "-c";
 
 // A command already addressed to the wrapper, with or without an absolute path
 // to the binary, is not wrapped again: `xmustard-core run -- xmustard-core run --
 // ls` would make the wrapper run the wrapper, and the inner one would reduce the
-// outer's output. The wrapper's own parser accepts `--workspace`, `--api` then
-// `--` then argv, so anything starting with that flag prefix is already wrapped.
+// outer's output.
 const ALREADY_WRAPPED = /^(?:\S*\/)?xmustard-core\s+run(?:\s|$)/;
+
+// shellQuote wraps s in single quotes for POSIX sh, escaping an embedded quote by
+// closing, inserting an escaped quote and reopening: 'a'"'"'b'. The workspace id is
+// quoted the same way even though transport.ValidWorkspaceID would reject anything
+// outside [_.-A-Za-z0-9]: the adapter's resolver never runs that check, so the id
+// arrives here from XMUSTARD_WORKSPACE_ID as the user wrote it.
+export function shellQuote(s: string): string {
+	return `'${s.replaceAll("'", `'"'"'`)}'`;
+}
 
 // mutateBashInput rewrites a bash tool call's command in place. It does nothing
 // unless the knob is on, the tool is `bash`, a workspace resolved and the command
@@ -35,7 +55,7 @@ export function mutateBashInput(event: unknown, workspaceId: string | undefined,
 	if (!ws) return;
 	const command = input.command;
 	if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return;
-	input.command = `${WRAPPER} --workspace ${ws} -- ${command}`;
+	input.command = `${WRAPPER} --workspace ${shellQuote(ws)} -- ${SHELL} ${SHELL_FLAG} ${shellQuote(command)}`;
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {
