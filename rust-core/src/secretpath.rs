@@ -143,4 +143,27 @@ mod tests {
         assert!(paths > 20, "golden paths");
         assert_eq!(match_secret_path("home/.ssh/id_rsa"), Some("**/.ssh/**"));
     }
+
+    /// A template file name exempts the `.env` patterns and nothing else, so a
+    /// template under a secret directory is refused by the directory rule
+    /// itself. The pattern is the evidence: a boolean verdict alone cannot tell
+    /// the directory rule winning from the `.env` rule being applied to the
+    /// same name.
+    #[test]
+    fn a_template_under_a_secret_directory_names_the_directory_rule() {
+        for (path, pattern) in [
+            (".ssh/.env.example", "**/.ssh/**"),
+            (".ssh/.env.sample", "**/.ssh/**"),
+            (".ssh/.env.template", "**/.ssh/**"),
+            ("home/u/.ssh/.env.example", "**/.ssh/**"),
+            (r"C:\Users\u\.ssh\.env.template", "**/.ssh/**"),
+            (".SSH/.ENV.EXAMPLE", "**/.ssh/**"),
+            ("repo/../.ssh/.env.example", "**/.ssh/**"),
+        ] {
+            assert_eq!(match_secret_path(path), Some(pattern), "{path:?}");
+        }
+        for path in [".env.example", "app/.env.sample", "docs/.env.template"] {
+            assert_eq!(match_secret_path(path), None, "{path:?} should be public");
+        }
+    }
 }
