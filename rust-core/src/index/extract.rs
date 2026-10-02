@@ -514,6 +514,13 @@ impl<'a> Walker<'a> {
         let mut field = field.to_string();
         loop {
             let (kind, pf) = at(up);
+            // `items[key] = v` writes the INDEX, not the subscript: in
+            // `items[b.Count] = v` the key `b.Count` is read. Only the base child of an
+            // index expression carries the write, so a reference that arrived through
+            // the subscript stops here.
+            if kind == "index_expression" && field != "operand" && field != "object" {
+                break;
+            }
             if !WRITE_WRAPPERS.contains(&kind) {
                 break;
             }

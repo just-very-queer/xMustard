@@ -810,9 +810,11 @@ fn precision_against_type_checker_ground_truth() {
 // so a later change that reintroduces the finding fails instead of passing silently.
 // ---------------------------------------------------------------------------
 
-// Item 2, "Go selector writes read as `read`": NOT REPRODUCED. A plain selector write,
-// a compound assignment, an index-write through a selector, a package-level var and a
-// cross-file receiver all classify as `write`, and a read of the same symbol stays `read`.
+// Item 2, "Go selector writes read as `read`": REPRODUCED, and fixed here. A plain
+// selector write (`b.Count = n`), a package-level var and a cross-file receiver were
+// already `write`; an index-assignment (`b.Items["k"] = n`) was `read`, because
+// `is_write_target` looked two ancestors up for the assignment and stopped at the
+// `index_expression` above the selector. `WRITE_WRAPPERS` makes that level transparent.
 //
 // Each read assertion sits in a function whose ONLY mention of the symbol is a read, so
 // it cannot be satisfied by a write that was misread: `ReadsOnly` names each symbol once.
@@ -851,6 +853,12 @@ func ReadsOnly(b *Box) (int, int, int, int) {
     // but the extractor emits one reference per name occurrence and the write
     // classification wins, so only the write edge exists.
 func CompoundsOnly(b *Box) { b.Count += 1 }
+
+// SubscriptOnly: `b.Items[b.Name] = 1` writes b.Items and READS b.Name as the key.
+// The key is a subscript, not the base, so a wrapper traversal that ignored which
+// child of the index expression it came through would call this a write (review
+// round 2, finding 1).
+func SubscriptOnly(b *Box) { b.Items[b.Name] = 1 }
 "#,
         ),
         (
@@ -880,6 +888,21 @@ func CompoundsOnly(b *Box) { b.Count += 1 }
         "ACCESSES",
         "write",
         (s, "Box.Count"),
+    );
+    // `b.Items[b.Name] = 1`: the BASE is written, the SUBSCRIPT is read
+    edge(
+        &e,
+        (s, "SubscriptOnly"),
+        "ACCESSES",
+        "write",
+        (s, "Box.Items"),
+    );
+    edge(
+        &e,
+        (s, "SubscriptOnly"),
+        "ACCESSES",
+        "read",
+        (s, "Box.Name"),
     );
     // a write through a receiver typed in ANOTHER file of the same package
     let far = edge(&e, (x, "Other"), "ACCESSES", "write", (s, "Box.Count"));
@@ -985,11 +1008,12 @@ fn a_global_tier_name_resolves_for_every_calling_file() {
 }
 
 // Item 5, "`find_export` falling back to a non-exported declaration": NOT REPRODUCED
-// as a defect. `imports_ts::find` falls back to a file's top-level declaration only
-// when the file uses NO ES export syntax at all (`has_es_exports`), which is the
-// documented CommonJS rule: a CommonJS module exports without the keyword. Two tests,
-// both halves: a name a file really re-exports resolves, and a name an ES module does
-// not export is NOT reachable even when a barrel claims it.
+// as a defect. `imports_ts::find` falls back to a file's top-level declaration when the
+// file uses NO ES export syntax at all (`has_es_exports`), which is the documented rule —
+// "a CommonJS file (no ES export syntax) exports without the keyword" — and the index does
+// not read `module.exports`. So a non-ES-module file's declarations ARE its exports by
+// design, and a barrel naming one is honoured correctly rather than falling back wrongly.
+// Three halves, so the rule's boundary is what is pinned and not just one side of it.
 #[test]
 fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
     // (a) `deep.ts` declares `secret` and re-exports it by name: a true positive.
@@ -1015,13 +1039,20 @@ fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
     );
     assert_eq!((hit.0, hit.2.as_str()), (0.9, "re-export"));
 
-    // (b) the documented CommonJS boundary, the half this test is named for: a file
-    // with NO ES export syntax exports its top-level declarations without the keyword,
-    // so the barrel's claim IS honoured. `plain.js` is that file and the resolution is
-    // correct -- this pins the rule the fallback implements.
+    // (b) the documented non-ES-module rule, and the half the reviewer's finding is
+    // about. `find_export`'s fallback fires when the file uses NO ES export syntax --
+    // `imports_ts.rs` says "a CommonJS file (no ES export syntax) exports without the
+    // keyword" -- and the index does not read `module.exports`, so the rule is exactly
+    // "no ES export syntax", not "has a CommonJS export". `cjs.js` is written as a real
+    // CommonJS module so the fixture matches the rule it exercises; the assertion would
+    // be the same without the `module.exports` line, and that is the limitation, stated
+    // here rather than left for the next reader to assume otherwise.
     let r2 = repo(&[
-        ("src/plain.js", "function helper() { return 1; }\n"),
-        ("src/barrel2.js", "export { helper } from './plain';\n"),
+        (
+            "src/cjs.js",
+            "function helper() { return 1; }\nmodule.exports = { helper };\n",
+        ),
+        ("src/barrel2.js", "export { helper } from './cjs';\n"),
         (
             "src/use2.js",
             "import { helper } from './barrel2';\nexport function go2() { return helper(); }\n",
@@ -1033,7 +1064,7 @@ fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
         ("src/use2.js", "go2"),
         "CALLS",
         "",
-        ("src/plain.js", "helper"),
+        ("src/cjs.js", "helper"),
     );
     assert_eq!((cjs.0, cjs.2.as_str()), (0.9, "re-export"));
 
