@@ -862,7 +862,10 @@ func Use(b *Box, n int) {
 #[test]
 fn a_resolved_go_or_ts_edge_keeps_its_lexical_file_edge() {
     let r = repo(&[
-        ("web/a.ts", "export function alpha(): number { return 1; }\n"),
+        (
+            "web/a.ts",
+            "export function alpha(): number { return 1; }\n",
+        ),
         (
             "web/b.ts",
             "import { alpha } from './a';\nexport function beta(): number { return alpha(); }\n",
@@ -878,9 +881,21 @@ fn a_resolved_go_or_ts_edge_keeps_its_lexical_file_edge() {
     // the resolved symbol layer
     let e = symbol_edges(&conn);
     let ts = edge(&e, ("web/b.ts", "beta"), "CALLS", "", ("web/a.ts", "alpha"));
-    assert_eq!((ts.0, ts.1.as_str(), ts.2.as_str()), (0.9, "scope", "import"));
-    let go = edge(&e, ("pkg/y/y.go", "Beta"), "CALLS", "", ("pkg/x/x.go", "Alpha"));
-    assert_eq!((go.0, go.1.as_str(), go.2.as_str()), (0.9, "scope", "package"));
+    assert_eq!(
+        (ts.0, ts.1.as_str(), ts.2.as_str()),
+        (0.9, "scope", "import")
+    );
+    let go = edge(
+        &e,
+        ("pkg/y/y.go", "Beta"),
+        "CALLS",
+        "",
+        ("pkg/x/x.go", "Alpha"),
+    );
+    assert_eq!(
+        (go.0, go.1.as_str(), go.2.as_str()),
+        (0.9, "scope", "package")
+    );
     // and the lexical file edges the Decision keeps beside them
     let lexical = layer_edges(&conn, "structure");
     assert!(
@@ -926,7 +941,10 @@ fn a_global_tier_name_resolves_for_every_calling_file() {
     let mut callers = 0;
     for ((_, _, kind, _, dst_path, dst_name), (conf, prov, reason, _)) in &e {
         if kind == "CALLS" && dst_name == "oneAndOnlyUniqueName" && dst_path == "src/uniq.ts" {
-            assert_eq!((*conf, prov.as_str(), reason.as_str()), (0.5, "lexical", "global-unique-name"));
+            assert_eq!(
+                (*conf, prov.as_str(), reason.as_str()),
+                (0.5, "lexical", "global-unique-name")
+            );
             callers += 1;
         }
     }
@@ -955,7 +973,13 @@ fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
     ]);
     let conn = db(&index("build", r.path(), &[]));
     let e = symbol_edges(&conn);
-    let hit = edge(&e, ("src/use.ts", "go"), "CALLS", "", ("src/deep.ts", "secret"));
+    let hit = edge(
+        &e,
+        ("src/use.ts", "go"),
+        "CALLS",
+        "",
+        ("src/deep.ts", "secret"),
+    );
     assert_eq!((hit.0, hit.2.as_str()), (0.9, "re-export"));
 
     // (b) an ES module that does not export the name is a boundary. `mod.ts` exports
@@ -973,8 +997,11 @@ fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
     ]);
     let conn2 = db(&index("build", r2.path(), &[]));
     let e2 = symbol_edges(&conn2);
-    let leaked = e2
-        .iter()
-        .any(|((_, _, _, _, dst_path, dst_name), _)| dst_path == "src/mod.ts" && dst_name == "hidden");
-    assert!(!leaked, "an unexported declaration resolved through a barrel: {e2:?}");
+    let leaked = e2.iter().any(|((_, _, _, _, dst_path, dst_name), _)| {
+        dst_path == "src/mod.ts" && dst_name == "hidden"
+    });
+    assert!(
+        !leaked,
+        "an unexported declaration resolved through a barrel: {e2:?}"
+    );
 }
