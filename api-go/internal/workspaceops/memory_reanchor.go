@@ -147,7 +147,7 @@ func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstor
 		var entry codeMoveEntry
 		entry.entry = id
 		for _, site := range codeSites(content, byEntry[id]) {
-			outcome, to := session.reanchorCode(site)
+			outcome, to := session.reanchorSite(site)
 			switch outcome {
 			case reanchorMoved:
 				entry.moves = append(entry.moves, govstore.CodeMove{SnippetID: site.anchor.SymbolUID,
@@ -166,11 +166,11 @@ func reanchorCode(ctx context.Context, session *rehashSession, anchors []govstor
 	return applied, marked, err
 }
 
-// reanchorCode re-finds one code anchor's snippet in its file's current content. An
+// reanchorSite re-finds one code anchor's snippet in its file's current content. An
 // anchor with no snippet digest or an unparsable value, a file that cannot be read, an
 // ambiguous match, and a block still sitting where it did all answer reanchorKept:
 // unknown is not stale, and a match at the anchor's own lines is nothing to do.
-func (s *rehashSession) reanchorCode(site codeAnchorSite) (reanchorOutcome, string) {
+func (s *rehashSession) reanchorSite(site codeAnchorSite) (reanchorOutcome, string) {
 	from, err := govstore.ParseCodeAnchorValue(site.anchor.Value)
 	if err != nil {
 		return reanchorKept, ""
