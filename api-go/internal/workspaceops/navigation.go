@@ -402,9 +402,14 @@ func DecodeExplainCursor(workspaceID string, q url.Values, cursor string) (int, 
 }
 
 // SearchCursor signs the cursors of one search ranking, by mode: a symbol cursor and a
-// hybrid one never continue each other.
+// hybrid one never continue each other. `lang` and `mode` are part of the ranking key, so
+// they must be read here too: a budget-truncated search continues through this function,
+// and a cursor signed without them would be refused by the request that holds them.
 func SearchCursor(workspaceID string, q url.Values) func(offset int) string {
-	ranking := SearchRequest{Query: q.Get("q"), Seed: q.Get("seed"), PathGlob: q.Get("path_glob")}.rankingKey(workspaceID)
+	ranking := SearchRequest{
+		Query: q.Get("q"), Seed: q.Get("seed"), PathGlob: q.Get("path_glob"),
+		Lang: q.Get("lang"), Mode: q.Get("mode"),
+	}.rankingKey(workspaceID)
 	if q.Get("mode") == "symbol" {
 		ranking = symbolSearchRequest(q).rankingKey(workspaceID)
 	}
