@@ -1444,6 +1444,10 @@ mod tests {
     /// therefore the case the body lane excludes. The two path terms share no token with
     /// the body term, because the lanes fall back to OR over the query's tokens and a
     /// shared stem would make a path query match the body files.
+    ///
+    /// `flimflamtarget` exists only as a declared name, in Go and in Rust, and its file's
+    /// body never repeats it. Only the name lane can find it, so it is the case that
+    /// proves a `lang` filter reaches the graph-side lanes and not just the bm25 SQL.
     fn lang_and_body_repo() -> TempDir {
         indexed_repo(&[
             // the chunk-text term, in a function body, in Go and in Rust
@@ -1455,6 +1459,12 @@ mod tests {
             // a term in the `path` column only
             ("svc/quixoticroute.go", "package svc\n\nfunc other() {}\n"),
             ("src/quixoticroute.rs", "pub fn other() {}\n"),
+            // a term in the declared name only, in both languages, with no other match
+            (
+                "svc/flimflam.go",
+                "package svc\n\nfunc flimflamtarget() { work() }\n",
+            ),
+            ("src/flimflam.rs", "pub fn flimflamtarget() { work() }\n"),
         ])
     }
 
@@ -1594,5 +1604,69 @@ mod tests {
             "no file is both Go and under src/: {:?}",
             res.hits
         );
+    }
+
+    // A `lang` filter reaches the graph-side lanes and not only the bm25 SQL.
+    // `flimflamtarget` is a declaration name, so a filter that skipped the name and file
+    // lanes would answer `lang=go` with a Rust symbol and a Rust file row.
+    #[test]
+    fn lang_filter_reaches_the_name_lane_and_not_only_the_bm25_sql() {
+        let repo = lang_and_body_repo();
+
+        let both = search(
+            repo.path(),
+            "ws",
+            None,
+            "flimflamtarget",
+            &SearchOptions {
+                limit: 20,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            both.hits.iter().filter(|h| h.kind == "symbol").count(),
+            2,
+            "one symbol per language: {:?}",
+            both.hits
+        );
+        // the file lane sees it too, so the filter has a subject on that lane as well
+        assert!(
+            both.hits.iter().any(|h| h.kind == "file"),
+            "the fixture must exercise the file lane: {:?}",
+            both.hits
+        );
+
+        for (lang, want) in [("go", ".go"), ("rust", ".rs")] {
+            let filtered = search(
+                repo.path(),
+                "ws",
+                None,
+                "flimflamtarget",
+                &SearchOptions {
+                    limit: 20,
+                    lang: Some(lang),
+                    ..Default::default()
+                },
+            );
+            assert!(
+                !filtered.hits.is_empty(),
+                "lang={lang} must still answer: {:?}",
+                filtered.hits
+            );
+            for h in &filtered.hits {
+                assert!(
+                    h.path.ends_with(want),
+                    "lang={lang} returned {}: {:?}",
+                    h.path,
+                    filtered.hits
+                );
+            }
+            assert_eq!(
+                filtered.hits.iter().filter(|h| h.kind == "symbol").count(),
+                1,
+                "lang={lang}: {:?}",
+                filtered.hits
+            );
+        }
     }
 }
