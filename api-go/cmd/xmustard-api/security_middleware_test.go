@@ -579,23 +579,26 @@ func TestReaderWritesNameMissingRole(t *testing.T) {
 // methodlessReadOnlyExemptions lists the method-less ServeMux patterns that grant the
 // reader role and only read. A method-less pattern answers every method, so each entry
 // is the whole reason a reader may reach a non-GET method, and
-// TestMethodLessReaderRowsServeOnlyReads measures each one. The MCP endpoint is the one
-// other exemption: its messages change nothing themselves, and every tool call re-enters
-// the API through that tool's own gate as the caller (mcp_routes.go).
+// TestMethodLessReaderRowsServeOnlyReads measures each one. mcpReentrantExemptions is the
+// one other exemption a reader-only token has.
 var methodlessReadOnlyExemptions = map[string]bool{"/api/health": true}
+
+// mcpReentrantExemptions are the methodful routes a reader-only token may reach: the
+// MCP endpoint's messages change nothing themselves, and every tool call re-enters the
+// API through that tool's own gate as the caller (mcp_routes.go).
+var mcpReentrantExemptions = map[string]bool{"POST /mcp": true, "DELETE /mcp": true}
 
 // readerWriteRouteViolations returns the rows of table that let a reader-only token
 // reach a non-GET method. GET and HEAD are read routes whatever their gate row says, so
 // only the methodful non-read methods and the method-less patterns are in scope.
 func readerWriteRouteViolations(table map[string]routeGate) []string {
-	reentrant := map[string]bool{"POST /mcp": true, "DELETE /mcp": true}
 	var violations []string
 	for pattern, g := range table {
 		switch patternMethod(pattern) {
 		case http.MethodGet, http.MethodHead:
 			continue
 		}
-		if reentrant[pattern] {
+		if mcpReentrantExemptions[pattern] {
 			continue
 		}
 		if g.Role == roleReader && !methodlessReadOnlyExemptions[pattern] {
@@ -612,7 +615,7 @@ func TestNoWriteRouteGrantsReader(t *testing.T) {
 		case http.MethodGet, http.MethodHead:
 			continue
 		}
-		if reentrantMCP(pattern) && (!g.ReadSafe || !g.Core) {
+		if mcpReentrantExemptions[pattern] && (!g.ReadSafe || !g.Core) {
 			t.Errorf("%s: the MCP endpoint must be core and read-safe", pattern)
 		}
 	}
@@ -620,8 +623,6 @@ func TestNoWriteRouteGrantsReader(t *testing.T) {
 		t.Errorf("a non-GET route must need more than reader: %v", v)
 	}
 }
-
-func reentrantMCP(pattern string) bool { return pattern == "POST /mcp" || pattern == "DELETE /mcp" }
 
 // The real table holds one method-less row and it is exempted, so the guard above would
 // pass whether or not it checks the method-less case. This feeds the guard a method-less
@@ -651,9 +652,11 @@ func TestReaderWriteRouteGuardCatchesAMethodLessRow(t *testing.T) {
 }
 
 // Each entry of methodlessReadOnlyExemptions must answer a write method exactly as it
-// answers a read: the same status and the same body. A handler that starts honouring a
-// write method answers differently, so the exemption stays a measured property of the
-// handler rather than a claim about it. A reader token takes healthResponse's non-full
+// answers a read: the same status and the same body. That holds a handler to its read
+// shape, so an exempt row cannot begin serving a different answer on POST, PUT, PATCH or
+// DELETE without this failing. It does not prove the handler writes nothing: a handler
+// that wrote state and returned the same answer would still pass, and nothing here can
+// see side effects through the wire. A reader token takes healthResponse's non-full
 // branch, which returns static limits and no counters, so a read answer is stable enough
 // to compare against.
 func TestMethodLessReaderRowsServeOnlyReads(t *testing.T) {
