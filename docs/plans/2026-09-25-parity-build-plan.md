@@ -2488,6 +2488,24 @@ rm -rf backend/data && mv "$keep/data" backend/data && rmdir "$keep"
 - **Checks.** `BOXALL` on the reviewed head; `PI` (`npm ci && npm run check`); the e2e with `XM_E2E_ALLOW_NO_POSTGRES=1`, conformance green and the 9 base failures unchanged. Not run: `RET`, `BUD`, `CAPS`, `SECDOC`, `GOLD` — no index, memory store, budget line, route gate or `tools/list` byte changes, so §3.0 names none for this row. The lean golden is byte-unchanged, which is the measurement behind that claim.
 - **Follow-ups.** (a) `xm-review-run.sh` printed `codex_spec=0` and `ocr_review=0` against 4 and 2 findings; eleventh row, proposed owner the review runner. (b) `toolParameters` has no unit test and cannot have one: `src/index.ts` imports Pi's runtime and `typebox`, so the unit suite cannot import it without `npm ci`. The e2e conformance test is its only coverage. Proposed owner WS-44. (c) The nine failing Pi e2e tests need native PostgreSQL; they are WS-44's and unchanged by this row.
 
+### WS-FIX-19 — WS-17 resolver minors: an `exact` impact over a truncated lookup, and four resolver precision items
+
+**Goal.** Five minor findings against the WS-17 scope/import resolver (`rust-core/src/index/resolve/`) and `rust-core/src/index/impact.rs`, status unknown (health §2a). Each is written as a failing test first; an item that does not reproduce is closed with its test and no production change. The `exact`-when-truncated case is done first because it is a correctness claim on an answer an agent reads as proof.
+
+1. **`index impact` reports `exact` while truncated.** `impact::envelope` derives `epistemic.completeness` from the walk's drops, its lexical/truncated/timed-out flags and the index's coverage losses (`impact.rs:1142`). It never reads `Lookup::truncated`, which `LegacyGraph::lookup` sets when more than `MAX_TARGETS` (20) files define the queried name (`impact.rs:1312`). Above that cap the walk seeds only 20 of the definers, so dependents reached only through the 21st file are silently absent, `targets_truncated: true` is reported in the same answer, and `completeness` still reads `exact` — the one value `impactDoc` tells an agent means "no cap could hide a dependent" (`tool_impact.go:76`). A truncated seed set is a lower bound and must say so.
+2. **Go selector writes read as `read`.** To measure.
+3. **Go/TS lexical file edges.** To measure.
+4. **The TS global-tier candidate limit.** To measure.
+5. **`find_export` falling back to a non-exported declaration.** To measure.
+
+**Requirements.** PAR-IMP-01, PAR-IMP-05.
+
+**Files.** `rust-core/src/index/impact.rs` (the envelope), `rust-core/src/index/resolve/` (items 2-5, each only if it reproduces), `rust-core/tests/impact_v2.rs`, `rust-core/tests/resolve_fixtures.rs`, `rust-core/tests/resolve_more_langs.rs`.
+
+**Tests required.** One test per item, each run RED against the unmodified base before any production line changes, and each with one mutation row. Item 1's test builds a fixture where more than 20 files define one symbol and a dependent hangs off a definer past the cap.
+
+**Acceptance.** A truncated seed set is never reported as `exact`. Every item that reproduces is fixed; every item that does not is closed with the test that shows it and the words "not reproduced". No test bound, timeout or cap is raised.
+
 ### WS-37 — Static-embedding semantic lane with binary/int8 vector index
 
 **Goal.** Deliver the following:
