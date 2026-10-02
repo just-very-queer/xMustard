@@ -57,27 +57,36 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 
 // resourceToolRefusal reports the refusal a read-only connection owes a tool a
 // resource read stands for, or nil when the connection serves it. It is the same rule
-// callKnownTool applies before its arguments are read: a tool that never serves reads
-// is refused outright, and one whose write arguments the resource set is refused as a
-// writing call of a reading tool.
-func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) *RPCError {
+// callKnownTool applies before its arguments are read, in the same shape: a tool result
+// with isError, never a JSON-RPC error (MCP 2025-11-25), so a resource read and a named
+// call of the same tool refuse identically.
+func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) map[string]any {
 	if !readOnly || t.servesReads() && !t.writes(args) {
 		return nil
 	}
-	reason := "it changes shared memory"
-	if t.servesReads() {
-		reason = strings.Join(t.WriteArgs, ", ") + " write"
+	if !t.servesReads() {
+		return TextResult(fmt.Sprintf("%s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly), true)
 	}
-	return &RPCError{Code: CodeInvalidRequest, Message: fmt.Sprintf("%s is not served on a read-only connection (mode=%s): %s", t.Name, ModeReadOnly, reason),
-		Data: map[string]any{"tool": t.Name, "reason": "read_only"}}
+	return TextResult(fmt.Sprintf("%s is served on a read-only connection (mode=%s) only without %s, which write", t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", ")), true)
+}
+
+// refusalText is the message of a refusal tool result, for a resource that reports the
+// refusal in its own error shape.
+func refusalText(res map[string]any) string {
+	content, _ := res["content"].([]map[string]any)
+	if len(content) == 0 {
+		return ""
+	}
+	s, _ := content[0]["text"].(string)
+	return s
 }
 
 // serveResourceTool runs a tool a resource read stands for, refusing it on a read-only
 // connection first. RunTool alone would skip that gate, so a resource read would be a
 // way around the mode.
 func (s *Session) serveResourceTool(ctx context.Context, t *Tool, args map[string]string) (map[string]any, *RPCError) {
-	if rerr := resourceToolRefusal(s.srv.opts.ReadOnly, t, args); rerr != nil {
-		return nil, rerr
+	if refused := resourceToolRefusal(s.srv.opts.ReadOnly, t, args); refused != nil {
+		return refused, nil
 	}
 	return s.RunTool(ctx, t, args, nil)
 }

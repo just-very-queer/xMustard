@@ -33,10 +33,10 @@ func TestMemoryIndexResourceIsRefusedWhenRecallIsRefused(t *testing.T) {
 }
 
 // A resource read is a tool call the client did not name, so the read-only mode's gate
-// applies to it through the same predicate callKnownTool applies: a call that would be
-// refused by name is refused as a resource. recall serves reads and is served here, as
-// it is by name; what the test pins is that the resource path shares the predicate, so
-// it cannot serve a call the named call refuses.
+// applies to it through the same predicate, and refuses in the same shape: a tool result
+// with isError, never a JSON-RPC error. recall serves reads and is served here, as it is
+// by name; what this pins is that a resource cannot serve a call the named call refuses,
+// and that it refuses the way the named call does.
 func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 	// the predicate, as the named call applies it
 	cases := []struct {
@@ -50,17 +50,20 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 		{"read args only", whyFailedTool, map[string]string{"run_id": "oc_1"}, false},
 	}
 	for _, tc := range cases {
-		refused := resourceToolRefusal(true, tc.tool, tc.args) != nil
-		if refused != tc.want {
-			t.Fatalf("%s: resource gate refused=%v, want %v", tc.name, refused, tc.want)
+		refused := resourceToolRefusal(true, tc.tool, tc.args)
+		if (refused != nil) != tc.want {
+			t.Fatalf("%s: resource gate refused=%v, want %v", tc.name, refused != nil, tc.want)
+		}
+		if refused != nil && (refused["isError"] != true || !strings.Contains(text(refused), "read-only")) {
+			t.Fatalf("%s: a refusal is a tool result with isError and the mode named, got %v", tc.name, refused)
 		}
 		// a full connection serves both
 		if resourceToolRefusal(false, tc.tool, tc.args) != nil {
 			t.Fatalf("%s refused on a full connection", tc.name)
 		}
 	}
-	// memory/core reads the same promoted memory through a direct projection, so it
-	// carries the same gate rather than being exempt from one
+	// the served surface: a read-only connection serves memory/core, because recall
+	// serves reads, and it costs exactly the one projection read it always cost
 	api := &fakeAPI{handle: func(r Request) *APIResponse {
 		if strings.Contains(r.Path, "/memory/core") {
 			return &APIResponse{Status: 200, Body: `{"workspace_id":"bound","text":"[xmustard memory] standing","revision":1}`}
@@ -69,8 +72,6 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 	}}
 	s := newSession(t, api, Options{WorkspaceID: "bound", ReadOnly: true}, nil, LatestProtocolVersion)
 	if _, rerr := s.Handle(context.Background(), "resources/read", json.RawMessage(`{"uri":"`+MemoryCoreURI+`"}`)); rerr != nil {
-		// recall serves reads, so this connection must be served; the gate is present
-		// and inapplicable, which is what makes the resource and the tool agree.
 		t.Fatalf("memory/core refused on a read-only connection that serves recall: %v", rerr)
 	}
 	if n := len(api.toolRequests()); n != 1 {
