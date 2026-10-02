@@ -995,6 +995,24 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *Review round 1* (`reviews/ws-flk-05/r1`): one `codex-spec` finding, medium, correct — this section required the measured distribution and the record to exist and the diff supplied neither, so a reader could not tell the drain fixed anything. That is what this record is; fixed in `84a567e`. `codex-review`: no actionable regression ("the test change drains the request body before responding and leaves the workspace-pin assertions intact"); it could not run the test itself, its sandbox refusing the Go build directory. OCR: 0 comments across 2 files. OpenCode: unavailable, recorded. `gate=PASS` at that round.
 - *Follow-ups.* (1) The `xm-review-run.sh` summary printed `codex_spec=0` while `codex-spec.findings.json` held one finding, the same undercount WS-DOC-03 recorded; the count was read from the channel file. Proposed owner: whoever maintains the review runner. (2) `ocr` warned that `background.md` is 2,689 characters against a recommended 2,000. Proposed owner: whoever maintains the review runner; the warning names review quality, not this row's diff. (3) `cmd/xmustard-hook` is absent from the owner's code index, so `explain` and `search` return nothing for it; proposed owner WS-FIX-15, as in the three preceding rows.
 
+### WS-FLK-03 — Deflake `TestCancellationServiceableUnderPoolSaturation` (cmd/xmustard-mcp)
+
+**Goal.** `TestCancellationServiceableUnderPoolSaturation` (`cmd/xmustard-mcp/ingress_test.go`) sends one large `remember` frame, waits 300 ms, sends a second identical frame, then cancels the first and asserts the second is refused with `-32000` while the first is answered. It has failed intermittently (FU:59), 1-2 in 6 on macOS and never on Linux, with call 1 itself answered `-32000 transient budget exhausted`. This row measures the failure, finds the cause, and fixes the cause.
+
+**Requirements.** No new PAR ids. Test hygiene: the product contract is unchanged. The test still pins the same behaviour — a second large frame is refused with the retryable overload `-32000` under a held pool, and the cancellation of call 1 is still serviced and answered.
+
+**Files.** `api-go/cmd/xmustard-mcp/ingress_test.go`, `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The failure is measured before it is fixed, on the build box, with the command and log path recorded, together with the platform and load. A distribution is recorded either way.
+- The fix is one of the three §3.3 allows: isolate the test from parallel load, add synchronisation, or change a bound. A bound change needs the owner's approval and is DO NOT DECIDE, so this row will not make one; synchronisation is the work.
+- Whatever the fix, the test still fails when the behaviour it pins breaks. One mutation row, with the FAIL line and the restored `git status`.
+- The sibling in-process saturation proof `TestControlFramesReadUnderExhaustedPool` keeps its own bounds and is not changed.
+
+**Acceptance.** The row states a measured cause with a log path, and the fix is synchronisation rather than a bound. The test is green on the build box at `-count=20` and in the full `BOXALL` suite. Its assertions are unchanged in meaning: frame 2 is refused with `-32000`, and call 1 is answered after cancellation. `gofmt -l` is empty and `go vet` and the package tests pass.
+
+**Collision risk.** `api-go/cmd/xmustard-mcp/ingress_test.go` is named by no other row in the queue. Per §3.0, `cmd/*` gates carry `-run '<names>'` and never `./...` on the 8 GB Mac. No production file, route, tool schema or Rust file is touched, so `RET`, `BUD`, `PI`, `CAPS`, `SECDOC` and `GOLD` are not named by §3.0 for this row.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
