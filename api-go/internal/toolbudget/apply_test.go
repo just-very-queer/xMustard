@@ -265,6 +265,53 @@ func TestOmittedCountsTheHitsAfterThePage(t *testing.T) {
 	}
 }
 
+// A producer need not describe its page by total - offset - delivered.
+// WorkspaceSearchReranked re-ranks a fused page, sets total to the hits it
+// returned and keeps the core's omitted count for the hits it never fetched, so
+// here total - offset - delivered is 0 while omitted is the producer's real 27.
+// The rewrite is the budget's own arithmetic about a list it cut, so it runs only
+// when the paged list was cut, and the producer's value stands otherwise
+// (WS-FIX-18).
+func TestOmittedStandsWhenTheBudgetCutNoHits(t *testing.T) {
+	// The largest budget fits the whole page, so no rung cut anything and the
+	// producer's 27 must survive the render.
+	r := searchResult(10, 600)
+	r["total"] = 10 // the rerank producer reports the hits it returned
+	r["omitted"] = 27
+	uncut := run(t, "search", r, Request{MaxChars: MaxMaxChars}, Page{Offset: 0, Cursor: cursorAt}, nil)
+	if len(uncut.out["hits"].([]any)) != 10 {
+		t.Fatalf("the uncut page delivered %d hits, want all 10", len(uncut.out["hits"].([]any)))
+	}
+	if uncut.rep.DegradedStage != "full" {
+		t.Fatalf("the uncut page reached stage %q, want full", uncut.rep.DegradedStage)
+	}
+	if got := uncut.out["omitted"]; got != float64(27) {
+		t.Fatalf("an uncut rerank page's omitted=%v, want the producer's 27", got)
+	}
+	// A budget small enough to cut the list is the budget's own arithmetic, and
+	// it counts from the delivered hits.
+	sawCut := false
+	for max := fullSize(t, "search", r); max >= MinMaxChars; max -= 25 {
+		a := run(t, "search", r, Request{MaxChars: max}, Page{Offset: 0, Cursor: cursorAt}, nil)
+		hits, ok := a.out["hits"].([]any)
+		if !ok {
+			continue
+		}
+		delivered := len(hits)
+		if delivered == 10 {
+			continue
+		}
+		sawCut = true
+		if want := 10 - delivered; a.out["omitted"] != float64(want) {
+			t.Fatalf("cut page delivered %d hits: omitted=%v, want %v", delivered, a.out["omitted"], want)
+		}
+		break
+	}
+	if !sawCut {
+		t.Fatal("the ladder never cut the page, so the cut case was never asserted")
+	}
+}
+
 // The omitted rewrite is scoped to the hybrid search envelope: only the paged
 // hits list is the ranked list that top-level total and offset describe. Any
 // other result carrying an omitted member keeps the producer's own value

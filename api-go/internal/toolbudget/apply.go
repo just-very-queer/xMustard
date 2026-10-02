@@ -798,7 +798,7 @@ func (b *budgeter) render(report func(int) []byte) []byte {
 		sep()
 		w.Write(quote(m.key))
 		w.WriteByte(':')
-		if m.key == "omitted" && b.paged != nil && b.paged.spec.Member == "hits" {
+		if m.key == "omitted" && b.recountsOmitted() {
 			b.writeOmitted(w)
 			continue
 		}
@@ -894,17 +894,26 @@ func (b *budgeter) writeListValue(w *bytes.Buffer, l *listState) {
 	writeList(w, l.items, l.k, l.item)
 }
 
-// writeOmitted writes a hybrid result's omitted member: the ranked hits that come
-// after this page, total - the offset the page starts at - the hits the paged list
-// kept. The producer's value counts the hits after its page, so it understates
-// once a rung trims the list; with nothing cut the two agree and stand
-// (WS-FIX-18).
+// recountsOmitted reports whether the budget is the one that made this result's
+// omitted count untrue, so writeOmitted may replace the producer's value. It
+// did when the budget cut the paged hybrid hits list: the producer counted the
+// ranked hits after its own page, and the delivered answer carries fewer. Two
+// guards keep the arithmetic to the one list it describes. `hits` is the only
+// list in the three ladder files whose top-level total and offset describe the
+// ranking it is a page of, so any other result's omitted keeps its own value.
+// And a list the budget did not cut still carries the producer's count: a
+// producer need not describe its page as total - offset - delivered, since
+// WorkspaceSearchReranked sets total to the hits it returned while keeping the
+// core's omitted for the hits it never fetched (WS-FIX-18).
+func (b *budgeter) recountsOmitted() bool {
+	return b.paged != nil && b.paged.spec.Member == "hits" && b.paged.cut()
+}
+
+// writeOmitted writes a hybrid result's omitted member after the budget cut its
+// hits: the ranked hits that come after this page, total - the offset the page
+// starts at - the hits the paged list kept (WS-FIX-18).
 func (b *budgeter) writeOmitted(w *bytes.Buffer) {
-	delivered := 0
-	if b.paged != nil {
-		delivered = b.paged.kept()
-	}
-	w.WriteString(strconv.Itoa(max(b.ranked-b.page.Offset-delivered, 0)))
+	w.WriteString(strconv.Itoa(max(b.ranked-b.page.Offset-b.paged.kept(), 0)))
 }
 
 // nextCursor continues the paged list at its first item not returned. When the budget
