@@ -27,6 +27,9 @@ func envelopeMembers(losses, dirty int) map[string]any {
 			"loss_counts": map[string]any{"lexical_fallback": losses}, "losses": lossList,
 			"languages": map[string]any{"go": map[string]int{"supported": 590, "failed": 6}, "rust": map[string]int{"supported": 77, "failed": 5},
 				"python": map[string]int{"supported": 8, "failed": 2}},
+			"source_identity": map[string]any{"head": "452da1e09e2c230b829c1d824bd82f83fa187dec", "identity_complete": true,
+				"key": "a156582ef7dd69692cf8bae19d43cd2ba01007676dce6106b1c1f3a1db27afe4", "limitations": 0,
+				"parser_version": "xm-index-2;ts-abi-15;rust-0.24", "stable": true},
 			"work": map[string]any{"graph_cache": "hit", "files_parsed": 0, "files_reused": 568}},
 		"freshness": map[string]any{"source": "index", "status": "current", "dirty_paths_touching_result": dirtyList,
 			"refresh": map[string]any{"reparsed": 568, "reresolved": 568, "escalated": false}},
@@ -219,6 +222,146 @@ func TestTrimmedPageContinuesAtTheFirstHitNotReturned(t *testing.T) {
 	t.Fatal("trimmed never reached")
 }
 
+// A trimmed rung cuts hits, so the producer's page `omitted` (the ranked hits
+// after the page) understates what the delivered answer left out. `omitted` is
+// total - the page's offset - the hits actually delivered, at any offset and at
+// every rung that returns hits; with nothing cut it is the producer's own value
+// (WS-FIX-18).
+func TestOmittedCountsTheHitsAfterThePage(t *testing.T) {
+	for _, offset := range []int{0, 20} {
+		r := searchResult(10, 600)
+		r["offset"] = offset
+		producer := 40 - offset - 10 // hits after this page
+		r["omitted"] = producer
+		full := run(t, "search", r, Request{MaxChars: MaxMaxChars}, Page{Offset: offset, Cursor: cursorAt}, nil)
+		if got := full.out["omitted"]; got != float64(producer) {
+			t.Fatalf("offset %d uncut omitted=%v, want the producer's %d", offset, got, producer)
+		}
+		sawTrimmed := false
+		for max := fullSize(t, "search", r); max >= MinMaxChars; max -= 25 {
+			a := run(t, "search", r, Request{MaxChars: max}, Page{Offset: offset, Cursor: cursorAt}, nil)
+			delivered := 0
+			if h, ok := a.out["hits"].([]any); ok {
+				delivered = len(h)
+			}
+			if a.out["total"] == nil {
+				continue
+			}
+			want := a.out["total"].(float64) - float64(offset) - float64(delivered)
+			if got := a.out["omitted"]; got != want {
+				t.Fatalf("offset %d stage %s max_chars %d: omitted=%v, want total-offset-len(hits)=%v (delivered %d)",
+					offset, a.rep.DegradedStage, max, got, want, delivered)
+			}
+			if a.rep.DegradedStage == "trimmed" {
+				sawTrimmed = true
+				if delivered == 0 || delivered == 10 {
+					t.Fatalf("offset %d trimmed delivered %d of 10 page hits", offset, delivered)
+				}
+			}
+		}
+		if !sawTrimmed {
+			t.Fatalf("offset %d never reached the trimmed stage", offset)
+		}
+	}
+}
+
+// A producer need not describe its page by total - offset - delivered.
+// WorkspaceSearchReranked re-ranks a fused page, sets total to the hits it
+// returned and keeps the core's omitted count for the hits it never fetched, so
+// here total - offset - delivered is 0 while omitted is the producer's real 27.
+// The rewrite is the budget's own arithmetic about a list it cut, so it runs only
+// when the paged list was cut, and the producer's value stands otherwise
+// (WS-FIX-18).
+func TestOmittedStandsWhenTheBudgetCutNoHits(t *testing.T) {
+	// The largest budget fits the whole page, so no rung cut anything and the
+	// producer's 27 must survive the render.
+	r := searchResult(10, 600)
+	r["total"] = 10 // the rerank producer reports the hits it returned
+	r["omitted"] = 27
+	uncut := run(t, "search", r, Request{MaxChars: MaxMaxChars}, Page{Offset: 0, Cursor: cursorAt}, nil)
+	if len(uncut.out["hits"].([]any)) != 10 {
+		t.Fatalf("the uncut page delivered %d hits, want all 10", len(uncut.out["hits"].([]any)))
+	}
+	if uncut.rep.DegradedStage != "full" {
+		t.Fatalf("the uncut page reached stage %q, want full", uncut.rep.DegradedStage)
+	}
+	if got := uncut.out["omitted"]; got != float64(27) {
+		t.Fatalf("an uncut rerank page's omitted=%v, want the producer's 27", got)
+	}
+	// A budget small enough to cut the list is the budget's own arithmetic, and
+	// it counts from the delivered hits.
+	sawCut := false
+	for max := fullSize(t, "search", r); max >= MinMaxChars; max -= 25 {
+		a := run(t, "search", r, Request{MaxChars: max}, Page{Offset: 0, Cursor: cursorAt}, nil)
+		hits, ok := a.out["hits"].([]any)
+		if !ok {
+			continue
+		}
+		delivered := len(hits)
+		if delivered == 10 {
+			continue
+		}
+		sawCut = true
+		if want := 10 - delivered; a.out["omitted"] != float64(want) {
+			t.Fatalf("cut page delivered %d hits: omitted=%v, want %v", delivered, a.out["omitted"], want)
+		}
+		break
+	}
+	if !sawCut {
+		t.Fatal("the ladder never cut the page, so the cut case was never asserted")
+	}
+}
+
+// The omitted rewrite is scoped to the hybrid search envelope: only the paged
+// hits list is the ranked list that top-level total and offset describe. A cut
+// page of any other list carrying an omitted member keeps the producer's value
+// (WS-FIX-18).
+func TestOmittedRewriteIsScopedToTheHybridHitsEnvelope(t *testing.T) {
+	// explain's directory shape is paged on files and carries its own omitted
+	// member; the files are long enough that the smallest budget cuts the list.
+	files := make([]any, 6)
+	for i := range files {
+		syms := make([]any, 4)
+		for j := range syms {
+			syms[j] = map[string]any{"name_path": fmt.Sprintf("pkg/Pkg%d.Fn%02d%s", i, j, strings.Repeat("y", 200)),
+				"kind": "Function", "line": 10 + j, "lines": []int{10, 90}, "uid": fmt.Sprintf("Function:pkg/f%d.go:F%d", i, j)}
+		}
+		files[i] = map[string]any{"path": fmt.Sprintf("pkg/dir%02d/file%03d.go", i, i),
+			"lang": "go", "symbols": syms, "summary": strings.Repeat("s", 300)}
+	}
+	res := map[string]any{"path": "pkg", "total": 40, "offset": 5, "omitted": 77, "files_total": 6, "files": files}
+	raw, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, _ := For("explain")
+	cut := false
+	for max := len(raw); max >= MinMaxChars; max -= 25 {
+		out, err := spec.Apply(raw, Request{MaxChars: max}, Page{Cursor: cursorAt}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(out, &got); err != nil {
+			t.Fatalf("output is not JSON: %v", err)
+		}
+		if got["omitted"] != float64(77) {
+			t.Fatalf("max_chars %d: a non-hybrid result's omitted was rewritten: %v", max, got["omitted"])
+		}
+		var kept int
+		if fl, ok := got["files"].([]any); ok {
+			kept = len(fl)
+		}
+		if kept < len(files) {
+			cut = true
+			break
+		}
+	}
+	if !cut {
+		t.Fatal("explain's files list was never cut, so the scoped rewrite was never exercised on a cut page")
+	}
+}
+
 func TestCountsRungGroupsByPath(t *testing.T) {
 	r := searchResult(10, 600)
 	for max := 8000; max >= MinMaxChars; max -= 50 {
@@ -284,6 +427,15 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 			cov["work"].(map[string]any)["graph_cache"] != "hit" {
 			t.Fatalf("signal_flags dropped a kept member: %v", cov)
 		}
+		// the third kept nested object: whether the source identity was stable
+		si, ok := cov["source_identity"].(map[string]any)
+		if !ok {
+			t.Fatalf("signal_flags dropped coverage.source_identity: %v", cov)
+		}
+		if si["stable"] != true || si["identity_complete"] != true || si["head"] != "452da1e09e2c230b829c1d824bd82f83fa187dec" ||
+			si["key"] != "a156582ef7dd69692cf8bae19d43cd2ba01007676dce6106b1c1f3a1db27afe4" || si["limitations"] != float64(0) {
+			t.Fatalf("signal_flags reduced coverage.source_identity: %v", si)
+		}
 		fr := a.out["freshness"].(map[string]any)
 		if _, ok := fr["refresh"]; ok || fr["status"] != "current" {
 			t.Fatalf("freshness: %v", fr)
@@ -293,6 +445,9 @@ func TestSignalFlagsKeepScalarsAndLossCounts(t *testing.T) {
 		}
 		if _, ok := a.rep.Signals["coverage.loss_counts"]; ok || a.rep.Signals["coverage.work"] != 0 {
 			t.Fatal("a kept member is not reported as removed")
+		}
+		if _, ok := a.rep.Signals["coverage.source_identity"]; ok {
+			t.Fatal("signal_flags reports the kept coverage.source_identity as removed")
 		}
 		return
 	}
