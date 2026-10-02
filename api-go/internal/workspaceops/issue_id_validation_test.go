@@ -40,7 +40,7 @@ func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
-			before := artifactState(t, dataDir, workspaceID)
+			before := artifactState(dataDir, workspaceID)
 
 			_, err := CreateIssue(dataDir, workspaceID, IssueCreateRequest{
 				BugID:    stringPtr(c.bugID),
@@ -76,7 +76,7 @@ func TestCreateSavedViewRefusesANameThatWouldMintAnUnusableId(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
-			before := artifactState(t, dataDir, workspaceID)
+			before := artifactState(dataDir, workspaceID)
 
 			_, err := CreateSavedView(dataDir, workspaceID, SavedIssueViewRequest{
 				Name:  c.view,
@@ -135,9 +135,13 @@ func TestCreateSavedViewKeepsANameThatSlugsCleanly(t *testing.T) {
 }
 
 // The minted id is bounded at create, so a stored view id is always short enough to
-// be carried by a path and hashed into an activity id. The length is asserted
-// together with the charset and the ".." rule, because a ceiling that only checks
-// length would still let an id the read layer refuses through.
+// be carried by a path and hashed into an activity id.
+//
+// Only the length is asserted here. The charset and the ".." rule belong to the
+// read layer, whose predicate is safeSegment in package main and cannot be called
+// from workspaceops; restating it inline produced a copy that could drift, which is
+// what review rounds 2 and 3 flagged. The rule is asserted against the real predicate
+// in api-go/cmd/xmustard-api by TestNoCreateReturnsAnIdTheURLLayerWouldRefuse.
 func TestMintedViewIdStaysWithinTheLengthCeiling(t *testing.T) {
 	dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
 
@@ -149,14 +153,6 @@ func TestMintedViewIdStaysWithinTheLengthCeiling(t *testing.T) {
 	}
 	if len(view.ViewID) > idLenCeiling {
 		t.Fatalf("view id is %d bytes, over the %d ceiling", len(view.ViewID), idLenCeiling)
-	}
-	for _, r := range view.ViewID {
-		if !('0' <= r && r <= '9' || 'a' <= r && r <= 'z' || 'A' <= r && r <= 'Z' || r == '_' || r == '.' || r == '-') {
-			t.Fatalf("minted view id %q holds %q, which the read layer refuses", view.ViewID, r)
-		}
-	}
-	if strings.Contains(view.ViewID, "..") {
-		t.Fatalf("minted view id %q holds a parent segment", view.ViewID)
 	}
 }
 
@@ -193,94 +189,63 @@ func assertNoViewsStored(t *testing.T, dataDir, workspaceID string) {
 	}
 }
 
-// artifactState is every file a create can write: the tracker, the views, the
+// artifactFiles is every file a create can write: the tracker, the views, the
 // workspace snapshot and the activity log. A refusal must leave all four byte for
 // byte as they were, so the assertions compare against the pre-call contents rather
 // than searching for the refused id: a write that omitted the id would still slip
 // past a search.
-//
-// An absent file is recorded as a nil map entry, which is distinct from an existing
-// empty one, so a refused create that creates an empty file is caught too.
-func artifactState(t testing.TB, dataDir, workspaceID string) map[string]string {
-	t.Helper()
+var artifactFiles = []string{
+	"tracker_issues.json", "saved_views.json", "snapshot.json", "activity.jsonl",
+}
+
+// artifactState reads the four artifacts. An absent file is recorded by its absence
+// from the map, which is distinct from an existing empty one, so a refused create
+// that creates an empty file is caught too.
+func artifactState(dataDir, workspaceID string) map[string]string {
 	dir := filepath.Join(dataDir, "workspaces", workspaceID)
 	state := map[string]string{}
-	for _, name := range []string{
-		"tracker_issues.json", "saved_views.json", "snapshot.json", "activity.jsonl",
-	} {
+	for _, name := range artifactFiles {
 		content, err := os.ReadFile(filepath.Join(dir, name))
-		if os.IsNotExist(err) {
+		if err != nil {
 			continue // absent, and must still be absent
 		}
-		if err != nil {
-			t.Fatalf("read %s: %v", name, err)
-		}
 		state[name] = string(content)
 	}
 	return state
 }
 
-// assertArtifactsUnchanged fails when a refused create touched any artifact: a file
-// that was absent before and exists now is a write, and so is any change in bytes.
+// assertArtifactsUnchanged fails when a refused create touched any artifact. The
+// verdict comes from artifactsUnchanged, which is also what
+// TestArtifactsUnchangedCatchesAWrite calls, so there is one copy of the rule and
+// that test proves the copy the refusal tables use.
 func assertArtifactsUnchanged(t *testing.T, before map[string]string, dataDir, workspaceID string) {
 	t.Helper()
-	after := artifactState(t, dataDir, workspaceID)
+	if why := artifactsUnchanged(before, dataDir, workspaceID); why != "" {
+		t.Fatalf("a refused create %s", why)
+	}
+}
+
+// artifactsUnchanged reports the first artifact a refused create touched, or the
+// empty string when it touched none: a file that was absent before and exists now is
+// a write, one whose bytes changed is a rewrite, and one that disappeared is a
+// removal.
+func artifactsUnchanged(before map[string]string, dataDir, workspaceID string) string {
+	after := artifactState(dataDir, workspaceID)
 	for name := range after {
 		want, existed := before[name]
 		if !existed {
-			t.Fatalf("a refused create wrote %s (%d bytes)", name, len(after[name]))
+			return "wrote " + name
 		}
 		if got := after[name]; got != want {
-			t.Fatalf("a refused create rewrote %s", name)
+			return "rewrote " + name
 		}
 	}
 	for name := range before {
 		if _, exists := after[name]; !exists {
-			t.Fatalf("a refused create removed %s", name)
+			return "removed " + name
 		}
 	}
-}
-
-// readArtifactState is artifactState for a caller that wants a verdict rather than
-// a test failure; the refusal tables use artifactState, this one uses this.
-func readArtifactState(dataDir, workspaceID string) map[string]string {
-	dir := filepath.Join(dataDir, "workspaces", workspaceID)
-	state := map[string]string{}
-	for _, name := range []string{
-		"tracker_issues.json", "saved_views.json", "snapshot.json", "activity.jsonl",
-	} {
-		content, err := os.ReadFile(filepath.Join(dir, name))
-		if os.IsNotExist(err) {
-			continue
-		}
-		if err != nil {
-			continue
-		}
-		state[name] = string(content)
-	}
-	return state
-}
-
-// artifactsUnchanged reports whether a refused create left every artifact alone,
-// without failing the test. The refusal tables assert on the failure; this test
-// needs the verdict the other way round, to prove the assertion fires at all.
-func artifactsUnchanged(before map[string]string, dataDir, workspaceID string) (bool, string) {
-	after := readArtifactState(dataDir, workspaceID)
-	for name := range after {
-		want, existed := before[name]
-		if !existed {
-			return false, "wrote " + name
-		}
-		if got := after[name]; got != want {
-			return false, "rewrote " + name
-		}
-	}
-	for name := range before {
-		if _, exists := after[name]; !exists {
-			return false, "removed " + name
-		}
-	}
-	return true, ""
+	return ""
 }
 
 // The no-write assertion has to fail on the writes it is meant to catch, including
@@ -300,18 +265,18 @@ func TestArtifactsUnchangedCatchesAWrite(t *testing.T) {
 			if err := os.WriteFile(path, nil, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if ok, why := artifactsUnchanged(map[string]string{}, dataDir, workspaceID); ok {
+			if why := artifactsUnchanged(map[string]string{}, dataDir, workspaceID); why == "" {
 				t.Fatalf("an empty %s was not caught as a write", name)
 			} else {
 				t.Logf("empty %s caught: %s", name, why)
 			}
 
 			// And a rewrite: same file, different bytes.
-			before := artifactState(t, dataDir, workspaceID)
+			before := artifactState(dataDir, workspaceID)
 			if err := os.WriteFile(path, []byte("[]\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if ok, why := artifactsUnchanged(before, dataDir, workspaceID); ok {
+			if why := artifactsUnchanged(before, dataDir, workspaceID); why == "" {
 				t.Fatalf("a rewritten %s was not caught", name)
 			} else {
 				t.Logf("rewritten %s caught: %s", name, why)
@@ -321,7 +286,7 @@ func TestArtifactsUnchangedCatchesAWrite(t *testing.T) {
 			if err := os.Remove(path); err != nil {
 				t.Fatal(err)
 			}
-			if ok, why := artifactsUnchanged(before, dataDir, workspaceID); ok {
+			if why := artifactsUnchanged(before, dataDir, workspaceID); why == "" {
 				t.Fatalf("a removed %s was not caught", name)
 			} else {
 				t.Logf("removed %s caught: %s", name, why)
