@@ -450,7 +450,7 @@ func TestGroundNeverWaitsForTheHeavySlot(t *testing.T) {
 func TestGroundNeverWaitsForAnotherBaselineBuild(t *testing.T) {
 	for name, hold := range map[string]func(key string) (func(), error){
 		"in process":    lockStore,
-		"other process": func(key string) (func(), error) { return lockFile(key+".lock", true) },
+		"other process": func(key string) (func(), error) { return lockFile(nil, key+".lock", true) },
 	} {
 		t.Run(name, func(t *testing.T) {
 			state := baselineCore(t, "0")
