@@ -143,22 +143,28 @@ func TestTimedOutRootsBackOffThenRetry(t *testing.T) {
 // A first fast failure is still asked again on the next call, so a client that fails
 // once recovers immediately.
 func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
-	project := tempRepo(t)
+	project, other := tempRepo(t), tempRepo(t)
 	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
 	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
 	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy, rootsAnswer(project)}}
-	s := newSession(t, api, Options{}, client, "2025-06-18")
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
 
 	// The first failure is asked again immediately: one-shot recovery is preserved.
+	// other is an unregistered git repository, so resolution falls through to it and
+	// fails there: the working directory never registers while the roots are unknown.
 	res, _ := call(t, s, "ground", map[string]any{})
 	if !res["isError"].(bool) || strings.Contains(text(res), "asked again after") {
 		t.Fatalf("a single fast failure must not back off: %v", text(res))
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
 	}
 	if n := client.count(); n != 1 {
 		t.Fatalf("roots/list asked %d times on the first call", n)
 	}
 
-	// The second failure is the backoff window: no further request until it expires.
+	// The second failure opens the back-off window, and calls inside it keep failing
+	// from the cached answer without sending another request.
 	res, _ = call(t, s, "ground", map[string]any{})
 	if !res["isError"].(bool) || !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
 		t.Fatalf("the second failure must open the back-off window: %v", text(res))
@@ -178,6 +184,28 @@ func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
 	res, _ = call(t, s, "ground", map[string]any{})
 	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 3 {
 		t.Fatalf("after the back-off: %+v (roots/list asked %d times)", ws, client.count())
+	}
+}
+
+// A registered working directory still answers every call inside the back-off window,
+// and still registers nothing: the client's roots are unknown, not absent.
+func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
+	other := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "other-ws", Root: other}}}
+	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+	for i := 0; i < 4; i++ {
+		res, _ := call(t, s, "ground", map[string]any{})
+		if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD || ws.Registered {
+			t.Fatalf("call %d: a registered working directory must answer: %+v", i+1, ws)
+		}
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
 	}
 }
 
@@ -203,6 +231,36 @@ func TestRootsBackoffTable(t *testing.T) {
 		if got := rootsBackoff(c.cached, c.err); got != c.want {
 			t.Errorf("%s: rootsBackoff = %s, want %s", c.name, got, c.want)
 		}
+	}
+}
+
+// A roots/list answer that cannot be parsed is a client failure, not a definitive
+// "the client has no usable roots": it is asked again once it has failed twice, the
+// same as any other failure.
+func TestMalformedRootsAnswerIsAskedAgain(t *testing.T) {
+	project, other := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	garbage := func() (json.RawMessage, error) { return json.RawMessage(`{"roots": [`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){garbage, garbage, rootsAnswer(project)}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "roots/list answer is malformed") {
+		t.Fatalf("a malformed answer must be reported as one: %v", text(res))
+	}
+	res, _ = call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
+		t.Fatalf("a repeated malformed answer must back off: %v", text(res))
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 3 {
+		t.Fatalf("after the back-off a malformed answer must be asked again: %+v (asked %d)", ws, client.count())
 	}
 }
 

@@ -343,6 +343,11 @@ func (s *Session) rootFor(ctx context.Context, id string) string {
 // A timeout backs off after one attempt because it already cost the caller
 // rootsTimeout; a prompt failure backs off once it has failed twice in a row, so a
 // client that fails once still recovers on the very next call.
+//
+// A malformed answer is a failure of the client too: the request reached the client
+// and came back unreadable, so it is transient and asked again like any other
+// failure. Treating it as a definitive "the client has no usable roots" cached it
+// until roots/list_changed, which is the opposite of what a parse error means.
 func rootsBackoff(cached *rootsState, err error) time.Duration {
 	if errors.Is(err, context.DeadlineExceeded) {
 		return rootsRetryAfter
@@ -407,7 +412,13 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			} `json:"roots"`
 		}
 		if err := json.Unmarshal(raw, &r); err != nil {
-			st.err = "roots/list answer is malformed: " + err.Error()
+			// the client answered, but the answer cannot be read: transient, so it is
+			// asked again rather than cached as "the client has no usable roots"
+			st.err, st.transient = "roots/list answer is malformed: "+err.Error(), true
+			if cached != nil && cached.transient {
+				st.retryAt = time.Now().Add(rootsRetryAfterFailure)
+				st.err += fmt.Sprintf(" (asked again after %s)", rootsRetryAfterFailure)
+			}
 		}
 		for _, root := range r.Roots {
 			if u, err := url.Parse(root.URI); err == nil && u.Scheme == "file" && filepath.IsAbs(u.Path) {
