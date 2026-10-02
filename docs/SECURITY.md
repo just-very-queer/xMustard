@@ -377,6 +377,15 @@ must be one path segment: no `/`, `\`, control character or `..`, and not `.`.
 Anything else answers `400 invalid_id`. The run store also refuses a run id that is
 not a plain identifier.
 
+Issue and view ids are also checked when they are created, so a create cannot mint an
+id the read layer would refuse. `POST /api/workspaces/{workspace_id}/issues` and
+`POST /api/workspaces/{workspace_id}/views` refuse a `bug_id` or view name that is
+not a plain identifier (letters, digits, `_`, `.`, `-`, at most 128, no `..`, no `/`,
+`\`, NUL or control character) with `400`. The rule is the same one a hook's
+`XMUSTARD_WORKSPACE_ID` pin gets. The ids other producers mint are unaffected: the
+GitHub import's `GH-<n>`, the generated `TRK_%04d`, and the ledger's `P0_25M03_001`
+all pass.
+
 If the mux matches a route that has no gate row, the request answers
 `500 unclassified_route` instead of reaching the handler. `gatedMux` does not expose
 the underlying `ServeMux`, so routes can only be registered through the table.

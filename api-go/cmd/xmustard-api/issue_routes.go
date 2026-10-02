@@ -18,7 +18,7 @@ var issueRoutes = []routeSpec{
 	{"PATCH /api/workspaces/{workspace_id}/issues/{issue_id}", itemBodyCall("issue_id", workspaceops.UpdateIssue, notFoundResource)},
 	{"GET /api/workspaces/{workspace_id}/issues/{issue_id}/drift", itemCall("issue_id", workspaceops.ReadIssueDrift, notFoundResource)},
 	{"GET /api/workspaces/{workspace_id}/views", wsCall(workspaceops.ListSavedViews, notFoundWorkspace)},
-	{"POST /api/workspaces/{workspace_id}/views", wsBodyCall(workspaceops.CreateSavedView, notFoundWorkspace)},
+	{"POST /api/workspaces/{workspace_id}/views", wsBodyCall(workspaceops.CreateSavedView, respondError)},
 	{"PUT /api/workspaces/{workspace_id}/views/{view_id}", itemBodyCall("view_id", workspaceops.UpdateSavedView, notFoundResource)},
 	{"DELETE /api/workspaces/{workspace_id}/views/{view_id}", deleteSavedView},
 	{"GET /api/workspaces/{workspace_id}/signals", listSignals},

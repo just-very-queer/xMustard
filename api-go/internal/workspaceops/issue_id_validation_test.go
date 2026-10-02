@@ -18,7 +18,9 @@ const (
 
 // A create must not mint an id the read layer then refuses. The read layer accepts a
 // platform wildcard that is one safe segment, so each id below is one this API would
-// answer 400 invalid_id for on the next read of the object it just wrote.
+// answer 400 invalid_id for on the next read of the object it just wrote. The control
+// character is embedded: CreateIssue trims a leading or trailing space, so a
+// trailing newline is normalized away before any id rule sees it.
 func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 	cases := []struct {
 		name  string
@@ -28,7 +30,7 @@ func TestCreateIssueRefusesAnIdTheReadLayerWouldRefuse(t *testing.T) {
 		{"embedded traversal", "TRK_0001/../x"},
 		{"nul byte", "TRK_0001\x00"},
 		{"backslash", `TRK_0001\x`},
-		{"control character", "TRK_0001\n"},
+		{"embedded control character", "TRK_0001\n0002"},
 		{"over long", strings.Repeat("a", overLongID)},
 	}
 	for _, c := range cases {

@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"xmustard/api-go/internal/hooks/transport"
 )
 
 type IssueUpdateRequest struct {
@@ -65,6 +67,23 @@ type SavedIssueViewRequest struct {
 	ReviewReadyOnly bool     `json:"review_ready_only"`
 }
 
+// checkPlatformID refuses an issue or view id that could not be carried back in a
+// path. The API validates every path wildcard before the handler runs and answers
+// 400 invalid_id for one that is not a safe segment, so an id stored here that fails
+// the check would make the object unreadable for the rest of its life.
+//
+// The rule is transport.ValidWorkspaceID, the same predicate the hook socket applies
+// to a workspace pin: 1-128 ASCII letters, digits, '_', '.' and '-', with "..",
+// "/", "\", a NUL and a control character all refused. It is not workspaceops's own
+// validateSafeID because that one has no length ceiling, and an unbounded id grows a
+// file name and an activity line with no bound.
+func checkPlatformID(kind, id string) error {
+	if !transport.ValidWorkspaceID(id) {
+		return fmt.Errorf("invalid %s id: %w", kind, ErrInvalidInput)
+	}
+	return nil
+}
+
 func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest) (*issueRecord, error) {
 	if _, err := loadSnapshot(dataDir, workspaceID); err != nil {
 		return nil, err
@@ -80,6 +99,9 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 	bugID := strings.TrimSpace(firstNonEmptyPtr(request.BugID))
 	if bugID == "" {
 		bugID = nextTrackerIssueID(tracked)
+	}
+	if err := checkPlatformID("issue", bugID); err != nil {
+		return nil, err
 	}
 	for _, item := range tracked {
 		if item.BugID == bugID {
@@ -283,6 +305,9 @@ func CreateSavedView(dataDir string, workspaceID string, request SavedIssueViewR
 	digest := sha1.Sum([]byte(seed))
 	slug := url.QueryEscape(strings.ReplaceAll(strings.ToLower(base), " ", "-"))
 	viewID := slug + "-" + hex.EncodeToString(digest[:])[:8]
+	if err := checkPlatformID("view", viewID); err != nil {
+		return nil, err
+	}
 	view := SavedIssueView{
 		ViewID:          viewID,
 		WorkspaceID:     workspaceID,
