@@ -889,7 +889,7 @@ func CompoundsOnly(b *Box) { b.Count += 1 }
 // Item 3, "Go/TS lexical file edges": NOT REPRODUCED as a defect. The WS-17 Decision
 // (plan line 1319) keeps the lexical `structure`/`flow` layers beside the resolved
 // `symbol` layer for exactly these two languages, as data for the legacy consumers.
-// This test pins that: a Go package-qualified call and a TS named import BOTH resolve
+// A Go package-qualified call and a TS named import BOTH resolve
 // to symbol edges, and both files still keep their file-level edge, so `index impact`
 // on a resolved symbol walks `symbol` while a file-level consumer still has `lexical`.
 #[test]
