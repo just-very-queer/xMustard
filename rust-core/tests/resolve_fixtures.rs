@@ -942,8 +942,8 @@ fn a_resolved_go_or_ts_edge_keeps_its_lexical_file_edge() {
 }
 
 // Item 4, "the TS global-tier candidate limit": NOT REPRODUCED. The global tier
-// resolves a unique top-level definition for every referencing file, not only the
-// first, so a nine-caller fixture must produce nine edges at 0.5/lexical. The lookup
+// resolves a unique top-level definition for every referencing file, not only for
+// one, so a nine-caller fixture must produce nine edges at 0.5/lexical. The lookup
 // is bounded (`top_level_files(..., 2)` decides uniqueness however many rows one file
 // holds), so the candidate set cannot grow with the number of callers.
 #[test]
