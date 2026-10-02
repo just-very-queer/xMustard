@@ -3295,7 +3295,7 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 
 **Requirements.** No new PAR ids. It closes WS-41 deviation (2) and the WS-41 "Tests required" line "the wrapper preserves the exit code, signals and stdout/stderr ordering", which today covers only a signal the *child* receives (`kill -TERM $$` inside the shell), never one the *wrapper* receives. The wrapper's other contract is unchanged: the same exit code, the same signal for a signalled child, the same bounded memory, and fail-open passthrough.
 
-**Files.** `rust-core/src/run_wrapper.rs` (the forwarding, the child-reap, and `child_pid` recorded on `Drained`), `rust-core/tests/run_wrapper.rs` (the new tests), `rust-core/Cargo.toml` and `rust-core/Cargo.lock` (the one new dependency; licence and reason in its commit message), `NOTICE` (the dependency's licence), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+**Files.** `rust-core/src/run_wrapper.rs` (the forwarding and the reap boundary), `rust-core/tests/run_wrapper.rs` (the new tests), `rust-core/Cargo.toml` and `rust-core/Cargo.lock` (the one new dependency; licence and reason in its commit message), `NOTICE` (the dependency's licence), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
 
 **Tests required.**
 - The refusal path first, against the base, and the FAIL line saved: a SIGTERM sent to the wrapper's own pid reaches a child that ignores SIGTERM at start and records what it saw. Today the wrapper dies on the default disposition and the child is never signalled, so the test fails with the child still alive.
