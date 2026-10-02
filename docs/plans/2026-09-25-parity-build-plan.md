@@ -878,6 +878,24 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *Checks.* `git apply --check` (log above); the comment-only line classification and the S1/S2 greps (same log); `MAC`; `BOX1`; `BOXALL` on the reviewed head plus the WS-FLK-01 rerun, both logs above. No new test: the change has no behaviour to test, so §6 A4's mutation requirement has no subject, and `slop-audit.md` S5 is empty for that reason. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no index, no memory, no Pi source, no route gate, no projection and no `tools/list` byte, so §3.0 names none of them for it.
 - *Follow-ups.* (1) `createWorkspaceFileBeneath`'s `existed` flag means different things in the two build variants: the non-unix `safepath_other.go` computes true prior existence with `os.Lstat` and returns `existed && overwrite`, while the unix build returns `overwrite` alone because `openat(O_TRUNC)` reports no prior-existence bit. A caller reading the flag as "prior existence" is correct on Windows and subtly wrong on unix. The comment patch removes the false claim but not the divergence. Proposed owner: WS-FIX-13 or a sibling safepath row. (2) `explain`'s `line_count` carries no freshness marker and was already stale for a file this row edited. Proposed owner: WS-FIX-15, as in WS-HYG-01 and WS-DOC-02. (3) `xmustard-core goal`'s `slug_id` and Go's `slugProfileID` disagree on any character Unicode lowercases into `[a-z0-9]`; whether that matters depends on callers comparing slugs across the two runtimes. Proposed owner: the same safepath-adjacent goal-surface review that owns GOAL_RUNTIME.md.
 
+### WS-FLK-05 — Deflake `TestCodexEventWithAWorkspacePin` (cmd/xmustard-hook)
+
+**Goal.** `TestCodexEventWithAWorkspacePin` (`cmd/xmustard-hook/main_test.go`) posts a real event over a real Unix socket through the production code path and asserts on the daemon's answer. It has failed intermittently and was recorded as a timing flake (FU:344) with no measured cause. This row measures the failure, finds the cause, and fixes the cause.
+
+**Requirements.** No new PAR ids. The row is test hygiene: it closes no requirement and adds no behaviour. The product contract the test pins is unchanged — the `--workspace` flag still pins the workspace over `XMUSTARD_WORKSPACE_ID`, and a flag that is not exactly `--workspace` with a safe id still sends nothing.
+
+**Files.** `api-go/cmd/xmustard-hook/main_test.go`, `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The failure is measured before it is fixed, on the build box, with the command and log path recorded: the test run `-count=20` on its own, and again under the load of the full suite, with the load stated. A distribution is recorded either way, including when no cause is found, in which case the test is left unchanged.
+- The fix is one of the three §3.3 allows: isolate the test from parallel load, add synchronisation, or change a bound. A bound change needs the owner's approval and is DO NOT DECIDE, so this row will not make one; the first two are the work.
+- Whatever the fix, the test still fails when the behaviour it pins breaks. One mutation row per changed assertion, with the FAIL line and the restored `git status`.
+- The sibling tests in the same file keep their own bounds. `TestFailsOpenWithinTheBudget` deliberately exercises the 200 ms default timeout and its 600 ms assertion is not in scope here.
+
+**Acceptance.** The row states a measured cause with a log path, or records the distribution and leaves the test unchanged. If a cause is fixed, the fix is isolation or synchronisation rather than a bound, and the test is green on the box at `-count=20` on its own and in the full `BOXALL` suite. The test's assertions about `--workspace` are unchanged in meaning: the flag pins over the env, and every malformed-argument case still sends nothing. `gofmt -l` is empty and `go vet` and the package tests pass.
+
+**Collision risk.** `api-go/cmd/xmustard-hook/main_test.go` is named by no other row in the queue. `cmd/xmustard-hook` is the smallest `cmd/*` package, so a gate on it is cheap; per §3.0, `cmd/*` gates always carry `-run '<names>'` and never `./...` on the 8 GB Mac. No Rust file is touched, so `cargo` and clippy are unaffected by the source diff.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
