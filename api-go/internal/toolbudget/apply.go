@@ -798,7 +798,7 @@ func (b *budgeter) render(report func(int) []byte) []byte {
 		sep()
 		w.Write(quote(m.key))
 		w.WriteByte(':')
-		if m.key == "omitted" {
+		if m.key == "omitted" && b.paged != nil && b.paged.spec.Member == "hits" {
 			b.writeOmitted(w)
 			continue
 		}

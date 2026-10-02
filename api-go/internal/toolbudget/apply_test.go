@@ -265,6 +265,32 @@ func TestOmittedCountsTheHitsAfterThePage(t *testing.T) {
 	}
 }
 
+// The omitted rewrite is scoped to the hybrid search envelope: only the paged
+// hits list is the ranked list that top-level total and offset describe. Any
+// other result carrying an omitted member keeps the producer's own value
+// (WS-FIX-18).
+func TestOmittedRewriteIsScopedToTheHybridHitsEnvelope(t *testing.T) {
+	// explain's file shape is paged on symbols and carries its own omitted member
+	res := map[string]any{"path": "pkg", "total": 40, "offset": 5, "omitted": 77,
+		"files": []any{
+			map[string]any{"path": "pkg/a.go", "lang": "go", "symbols": []any{map[string]any{"name_path": "A", "kind": "Function"}}},
+			map[string]any{"path": "pkg/b.go", "lang": "go", "symbols": []any{map[string]any{"name_path": "B", "kind": "Function"}}},
+		}}
+	raw, _ := json.Marshal(res)
+	spec, _ := For("explain")
+	out, err := spec.Apply(raw, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["omitted"] != float64(77) {
+		t.Fatalf("a non-hybrid result's omitted was rewritten: %v", got["omitted"])
+	}
+}
+
 func TestCountsRungGroupsByPath(t *testing.T) {
 	r := searchResult(10, 600)
 	for max := 8000; max >= MinMaxChars; max -= 50 {
