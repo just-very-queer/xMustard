@@ -31,6 +31,8 @@ use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::Duration;
 
@@ -108,10 +110,16 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
     drop(child); // the parent's copies of the write end must close for EOF
     let drained = drain(File::from(read_end), limits);
     let status = spawned.wait().map_err(io_failed("wait"))?;
-    forwarder.stop();
+    // From here a forwarded signal has nobody left to reach, so it ends the wrapper itself.
+    forwarder.mark_reaped();
+    // The forwarder stays armed through `present`: the capture below can take seconds, and
+    // a client that timed out must still be able to stop the wrapper during it.
     let exit = exit_of(status);
     let mut drained = drained.map_err(io_failed("read child output"))?;
     let text = present(&target, &argv, exit, &mut drained, limits);
+    // Disarms only after the outcome is known, and `end_like` (which re-raises the child's
+    // signal) runs after this, once no handler can swallow the re-raise.
+    forwarder.stop();
     Ok(Output::Exit(text, exit))
 }
 
@@ -172,29 +180,43 @@ const FORWARDED: &[i32] = &[
 struct Forwarder {
     handle: Option<signal_hook::iterator::Handle>,
     watcher: Option<thread::JoinHandle<()>>,
+    /// Set once `wait` has reaped the child. From that point there is nobody left to forward
+    /// to, so a forwarded signal ends the WRAPPER instead — see `install`.
+    reaped: Arc<AtomicBool>,
 }
 
 impl Forwarder {
-    /// Starts forwarding to `pid`. A failure to install is not fatal: the wrapper then
+    /// Starts forwarding to the child. A failure to install is not fatal: the wrapper then
     /// behaves as it did before, which is worse for the child but never worse than not
-    /// running the command at all, so the refusal is a note rather than an error.
+    /// running the command at all, so the refusal is a note, not an error.
     fn start(pid: u32) -> Self {
-        let Some((handle, watcher)) = Self::install(pid) else {
+        let reaped = Arc::new(AtomicBool::new(false));
+        let Some((handle, watcher)) = Self::install(pid, Arc::clone(&reaped)) else {
             return Self {
                 handle: None,
                 watcher: None,
+                reaped,
             };
         };
         Self {
             handle: Some(handle),
             watcher: Some(watcher),
+            reaped,
         }
     }
 
-    /// Registers the forwarded signals and starts the thread that relays them to `pid`.
-    /// `None` when the platform refuses the registration.
-    fn install(pid: u32) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
-        let child = rustix::process::Pid::from_raw(pid as i32).expect("a spawned child has a pid");
+    /// Records that the child is gone, so a signal arriving from now on ends the wrapper.
+    fn mark_reaped(&self) {
+        self.reaped.store(true, Ordering::SeqCst);
+    }
+
+    /// Registers the forwarded signals and starts the thread that relays them to the
+    /// child. `None` when the platform refuses the registration.
+    fn install(
+        pid: u32,
+        reaped: Arc<AtomicBool>,
+    ) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
+        let child = rustix::process::Pid::from_raw(pid as i32);
         let mut signals = signal_hook::iterator::Signals::new(FORWARDED)
             .map_err(|e| io::Error::other(e.to_string()))
             .inspect_err(|e| {
@@ -203,20 +225,36 @@ impl Forwarder {
             .ok()?;
         let handle = signals.handle();
         let watcher = thread::spawn(move || {
-            for sig in signals.forever() {
-                let Some(sig) = rustix::process::Signal::from_named_raw(sig) else {
+            for raw in signals.forever() {
+                let (Some(sig), Some(child)) =
+                    (rustix::process::Signal::from_named_raw(raw), child)
+                else {
                     continue;
                 };
-                // ESRCH: the child is already gone, which is the normal race at exit
+                if reaped.load(Ordering::SeqCst) {
+                    // The child is reaped and there is nothing left to tell it, so the
+                    // signal means what it would have meant without any forwarding at all:
+                    // end this process the same way. Without this the handler would consume
+                    // the signal and do nothing, leaving a client that timed out unable to
+                    // stop the wrapper for as long as the capture takes.
+                    let _ = signal_hook::low_level::emulate_default_handler(raw);
+                    return;
+                }
+                // ESRCH: the child is already gone, which is the normal race at exit.
+                // Signalling the PROCESS GROUP instead would need the child to lead its
+                // own group (`CommandExt::process_group(0)`), which changes where an
+                // interactive child sits relative to the terminal: that is WS-21B's
+                // isolation policy, an owner decision (G§5.11), not this row's to take.
                 let _ = rustix::process::kill_process(child, sig);
             }
         });
         Some((handle, watcher))
     }
 
-    /// Stops forwarding and joins the watcher, so the handler is unregistered and the
-    /// default disposition restored before the wrapper ends: `end_like` re-raises the
-    /// child's signal against the default, and a handler still installed would swallow it.
+    /// Stops forwarding and joins the watcher. `signal-hook-registry` does NOT restore the
+    /// previous disposition when its last handler is dropped, so this only removes the
+    /// watcher's actions; `end_like` restores SIG_DFL itself before re-raising the child's
+    /// signal, and no forwarded signal can reach the wrapper after this point.
     fn stop(&mut self) {
         if let Some(handle) = self.handle.take() {
             handle.close();

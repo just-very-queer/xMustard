@@ -160,11 +160,15 @@ fn a_term_sent_to_the_wrapper_reaches_the_child() {
     assert!(log.contains("TERM"), "the child was never told: {log:?}");
     release(dir.path());
     let status = wrapper.wait().unwrap();
+    // The child exits 0 on release, so a wrapper that ends on its own reports 0. Asserting
+    // the number rather than discarding it is what separates "the wrapper waited for the
+    // child" from "the wrapper died and left the child running" — on the base this status
+    // is a signal death, never a code.
+    assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
     assert!(
-        !seen(dir.path()).contains("outlived"),
-        "the wrapper ended before the child did"
+        !seen(dir.path()).contains("timeout"),
+        "the child outlived the test"
     );
-    let _ = status;
 }
 
 #[test]
@@ -215,11 +219,79 @@ fn the_wrapper_does_not_swallow_a_signal_it_does_not_forward() {
         .status()
         .unwrap();
     let status = wrapper.wait().unwrap();
-    assert_eq!(status.signal(), Some(10), "wrapper status {status:?}");
+    // The platform's own SIGUSR1 number: 10 on Linux, 30 on macOS. Both are checked
+    // locally per AGENTS.md, so a hard-coded 10 reddens every macOS run.
+    assert_eq!(
+        status.signal(),
+        Some(signal_hook::consts::signal::SIGUSR1),
+        "wrapper status {status:?}"
+    );
     release(dir.path());
     let _ = std::process::Command::new("kill")
         .args(["-TERM", &child])
         .status();
+}
+
+/// Every signal in `FORWARDED` reaches the child, so the table is not one entry wide.
+#[test]
+fn every_forwarded_signal_reaches_the_child() {
+    for sig in ["INT", "QUIT", "HUP"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut wrapper = watchdog(dir.path());
+        signal_wrapper(dir.path(), sig);
+        let log = await_seen(dir.path(), sig);
+        assert!(log.contains(sig), "{sig} never reached the child: {log:?}");
+        release(dir.path());
+        let _ = wrapper.wait().unwrap();
+    }
+}
+
+/// A signal that arrives when the child has already exited is not a crash and does not leave
+/// the wrapper unkillable. Round 1 called `Forwarder::stop` immediately after `wait`, so a
+/// signal sent while the wrapper was still uploading the child's output found a handler with
+/// no action behind it and was swallowed; the wrapper then ran on regardless. The contract is
+/// that the signal still ends the wrapper, whether the child is reaped or not.
+#[test]
+fn a_signal_that_arrives_after_the_child_ended_still_ends_the_wrapper() {
+    // A child that writes, then lingers, then ends on its own.
+    let mut wrapper = Command::new(BIN)
+        .arg("run")
+        .arg("--")
+        .args(["sh", "-c", "echo done; sleep 5; exit 4"])
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = wrapper.id();
+    // Wait until the child is gone, so the signal cannot reach one and the only thing it can
+    // end is the wrapper. `pgrep -P` prints nothing once there is no child.
+    let mut reaped = false;
+    for _ in 0..900 {
+        let out = Command::new("pgrep")
+            .args(["-P", &pid.to_string()])
+            .output()
+            .unwrap();
+        if out.stdout.is_empty() {
+            reaped = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(reaped, "the wrapper's child never ended");
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+    let out = wrapper.wait_with_output().unwrap();
+    // The signal ended the wrapper. Under round 1's code the handler was still installed with
+    // its action removed, so this signal was swallowed and the wrapper outlived the wait.
+    assert_eq!(
+        out.status.signal(),
+        Some(15),
+        "a signal after the reap must still end the wrapper, got {:?}",
+        out.status
+    );
 }
 
 #[test]
