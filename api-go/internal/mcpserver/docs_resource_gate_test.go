@@ -54,8 +54,11 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 		if (refused != nil) != tc.want {
 			t.Fatalf("%s: resource gate refused=%v, want %v", tc.name, refused != nil, tc.want)
 		}
-		if refused != nil && (refused["isError"] != true || !strings.Contains(text(refused), "read-only")) {
-			t.Fatalf("%s: a refusal is a tool result with isError and the mode named, got %v", tc.name, refused)
+		if refused != nil {
+			msg := text(refused)
+			if refused["isError"] != true || !strings.Contains(msg, "mode="+ModeReadOnly) || !strings.Contains(msg, tc.tool.Name) {
+				t.Fatalf("%s: a refusal is a tool result with isError, naming the tool and %s, got %v", tc.name, ModeReadOnly, refused)
+			}
 		}
 		// a full connection serves both
 		if resourceToolRefusal(false, tc.tool, tc.args) != nil {
