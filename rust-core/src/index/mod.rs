@@ -298,7 +298,6 @@ pub(super) fn check_index_dir(dir: &Path, operator_named: bool) -> Result<(), St
 /// retention the source itself.
 fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", dir.display());
-    let existed = fs::symlink_metadata(dir).is_ok();
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -315,8 +314,11 @@ fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
         ));
     }
     let trust = classify_dir(dir, &meta, operator_named)?;
+    // Tighten every directory we manage, created or not: the default per-scope directory
+    // is ours at any mode, and narrowing this to freshly created ones left an existing
+    // permissive one exactly as wide as it was (WS-FIX-11).
     #[cfg(unix)]
-    if trust == DirTrust::Managed && !existed {
+    if trust == DirTrust::Managed {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
     }

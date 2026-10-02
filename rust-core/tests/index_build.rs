@@ -2369,6 +2369,17 @@ fn a_search_does_not_answer_from_a_writable_index_dir() {
         untrusted["coverage"]["work"]["graph_cache"], "miss",
         "the untrusted store was still read: {untrusted:#}"
     );
+    // a refusal and a repository that was never indexed both reach the caller as no
+    // index, so the answer has to say which it was: a silent degradation reads as
+    // "never indexed" and sends the operator looking in the wrong place.
+    let detail = untrusted["coverage"]["work"]["graph_cache_detail"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        detail.contains("refused") && detail.contains("chmod 700"),
+        "the degradation does not name the refusal: {detail}"
+    );
 
     // and it serves again once the operator tightens it, so the refusal is not a
     // permanent loss of the index
@@ -2377,5 +2388,51 @@ fn a_search_does_not_answer_from_a_writable_index_dir() {
         search_in(&named)["freshness"]["source"].as_str(),
         Some("index"),
         "the index did not come back after chmod 700"
+    );
+}
+
+/// A **default** per-scope index directory that already exists and is permissive is
+/// tightened to `0700`, not left as it is (WS-FIX-11). The operator named nothing
+/// here, so the directory is ours at any mode; round 2 found that restricting the
+/// tightening to freshly created directories left an existing one exactly as wide,
+/// which is a regression against the behaviour before this row.
+#[test]
+fn an_existing_permissive_default_index_dir_is_tightened() {
+    use std::os::unix::fs::PermissionsExt;
+    let r = repo(&[("a.ts", "export function a() {}\n")]);
+    // no --index-dir and no XMUSTARD_INDEX_DIR: the default per-scope directory, which
+    // the build reports so the test does not have to re-derive it
+    let out = run(&["index", "build", r.path().to_str().unwrap()]);
+    let rep = ok_json(&out);
+    let scope = PathBuf::from(rep["index_path"].as_str().unwrap())
+        .parent()
+        .expect("an index path has a directory")
+        .to_path_buf();
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "a directory the core created is not private"
+    );
+
+    // widened behind the build, the way another local user or a careless umask would
+    fs::set_permissions(&scope, fs::Permissions::from_mode(0o777)).unwrap();
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    ok_json(&run(&["index", "build", r.path().to_str().unwrap()]));
+    assert_eq!(
+        fs::metadata(&scope).unwrap().permissions().mode() & 0o777,
+        0o700,
+        "an existing default index directory was left world-writable"
+    );
+    // the store inside it is owner-only too, which is where the facts live
+    assert_eq!(
+        fs::metadata(scope.join(xmustard_core::index::DB_FILE))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
 }

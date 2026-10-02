@@ -60,9 +60,36 @@ fn locate(root: &Path) -> Option<Location> {
         return None;
     }
     super::check_index_dir(&dir, cfg.index_dir.is_some())
-        .inspect_err(|e| eprintln!("index: {e}"))
+        .inspect_err(|e| {
+            record_refusal(root, e);
+            eprintln!("index: {e}")
+        })
         .ok()?;
     Some(Location { db })
+}
+
+/// Why the index directory was refused, per root, for the call that follows.
+///
+/// A refusal and a repository that was never indexed both reach the caller as `None`,
+/// and the two need different answers: the first is a security decision the operator
+/// must be told about, the second is ordinary. One slot per root, overwritten by the
+/// next read of that root and cleared by [`take_last_refusal`], which the caller
+/// drains on the same call that saw the `None`. Bounded by the number of roots a
+/// process serves, which the resident snapshot table already bounds.
+static REFUSALS: OnceLock<Mutex<HashMap<PathBuf, String>>> = OnceLock::new();
+
+fn refusals() -> &'static Mutex<HashMap<PathBuf, String>> {
+    REFUSALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn record_refusal(root: &Path, why: &str) {
+    lock(refusals()).insert(root.to_path_buf(), why.to_string());
+}
+
+/// The refusal recorded for `root` by the read that just failed, if any. Taking it
+/// clears it, so a later successful read reports nothing.
+pub fn take_last_refusal(root: &Path) -> Option<String> {
+    lock(refusals()).remove(root)
 }
 
 /// Stat of the store and its WAL: a commit or a swap changes it.
@@ -1028,8 +1055,9 @@ impl Snapshots {
             // returns before reaching it: a cached snapshot outlives a directory the
             // operator has since widened (WS-FIX-11).
             if let Some(dir) = e.loc.db.parent()
-                && super::check_index_dir(dir, operator_named(root)).is_err()
+                && let Err(why) = super::check_index_dir(dir, operator_named(root))
             {
+                record_refusal(root, &why);
                 *state = None;
                 return None;
             }
@@ -1057,8 +1085,9 @@ impl Snapshots {
         // unchanged store. The check therefore runs on the way into the reload too, not
         // only on a cache hit (WS-FIX-11).
         if let Some(dir) = loc.db.parent()
-            && super::check_index_dir(dir, operator_named(root)).is_err()
+            && let Err(why) = super::check_index_dir(dir, operator_named(root))
         {
+            record_refusal(root, &why);
             *state = None;
             return None;
         }
