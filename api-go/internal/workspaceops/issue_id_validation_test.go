@@ -251,7 +251,9 @@ func artifactsUnchanged(before map[string]string, dataDir, workspaceID string) s
 // The no-write assertion has to fail on the writes it is meant to catch, including
 // an empty file, which the previous version recorded identically to an absent one.
 // Each case writes an artifact the refusal is supposed to leave alone and requires
-// the check to notice.
+// the check to notice, naming that artifact: the fixture already holds snapshot.json,
+// so a check that passed an empty "before" would report a write whatever the test
+// did, and the reason is asserted so it cannot.
 func TestArtifactsUnchangedCatchesAWrite(t *testing.T) {
 	for _, name := range []string{
 		"tracker_issues.json", "saved_views.json", "activity.jsonl",
@@ -260,36 +262,44 @@ func TestArtifactsUnchangedCatchesAWrite(t *testing.T) {
 			dataDir, workspaceID, _, _ := writeIssueContextFixture(t, false)
 			path := filepath.Join(dataDir, "workspaces", workspaceID, name)
 
-			// An empty file where there was none: the case the old map[string]string
-			// could not see, because it stored absence as the empty string.
+			// An empty file where there was none, or emptied where there were
+			// bytes: both must be caught, and the reason names the artifact
+			// under test, so a check that tripped on snapshot.json or on the
+			// fixture's own activity log cannot pass in its place.
+			before := artifactState(dataDir, workspaceID)
+			_, existed := before[name]
 			if err := os.WriteFile(path, nil, 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if why := artifactsUnchanged(map[string]string{}, dataDir, workspaceID); why == "" {
-				t.Fatalf("an empty %s was not caught as a write", name)
-			} else {
-				t.Logf("empty %s caught: %s", name, why)
+			want := "wrote " + name
+			if existed {
+				want = "rewrote " + name
+			}
+			if why := artifactsUnchanged(before, dataDir, workspaceID); why != want {
+				t.Fatalf("an empty %s: want %q, got %q", name, want, why)
 			}
 
 			// And a rewrite: same file, different bytes.
-			before := artifactState(dataDir, workspaceID)
+			before = artifactState(dataDir, workspaceID)
 			if err := os.WriteFile(path, []byte("[]\n"), 0o644); err != nil {
 				t.Fatal(err)
 			}
-			if why := artifactsUnchanged(before, dataDir, workspaceID); why == "" {
-				t.Fatalf("a rewritten %s was not caught", name)
-			} else {
-				t.Logf("rewritten %s caught: %s", name, why)
+			if why := artifactsUnchanged(before, dataDir, workspaceID); why != "rewrote "+name {
+				t.Fatalf("a rewritten %s: want %q, got %q", name, "rewrote "+name, why)
 			}
 
-			// And a removal.
+			// And a removal: the file is absent again, so the before-state that
+			// held it no longer matches.
 			if err := os.Remove(path); err != nil {
 				t.Fatal(err)
 			}
-			if why := artifactsUnchanged(before, dataDir, workspaceID); why == "" {
-				t.Fatalf("a removed %s was not caught", name)
-			} else {
-				t.Logf("removed %s caught: %s", name, why)
+			if why := artifactsUnchanged(before, dataDir, workspaceID); why != "removed "+name {
+				t.Fatalf("a removed %s: want %q, got %q", name, "removed "+name, why)
+			}
+
+			// The unchanged case, so the check is not simply always-failing.
+			if why := artifactsUnchanged(artifactState(dataDir, workspaceID), dataDir, workspaceID); why != "" {
+				t.Fatalf("an untouched tree was reported as %q", why)
 			}
 		})
 	}
