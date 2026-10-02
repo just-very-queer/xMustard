@@ -88,6 +88,7 @@ type recordsEntry struct {
 	mark    fileMark
 	trusted bool
 	byID    map[string]workspaceRecord
+	list    []workspaceRecord // the file's records in file order; byID keeps one per id
 }
 
 type workspaceRegistry struct {
@@ -212,22 +213,32 @@ func registryRecord(dataDir, workspaceID string, mark fileMark, now time.Time) (
 // registryRecords returns every workspaces.json record by id, parsed once per file
 // change; nil when the file is missing. Callers must not modify the map.
 func registryRecords(dataDir string, mark fileMark, now time.Time) (map[string]workspaceRecord, error) {
+	byID, _, err := registryRecordsAndList(dataDir, mark, now)
+	return byID, err
+}
+
+// registryRecordsAndList is registryRecords plus the file's records in file order.
+// The map is keyed by workspace id and so keeps one record per id; a hand-edited
+// registry with two records sharing an id would lose one, and a reader that
+// matches a *root* rather than an id has to see both. The list is the same slice
+// the decode produced, so it costs one pointer, and callers must not modify it.
+func registryRecordsAndList(dataDir string, mark fileMark, now time.Time) (map[string]workspaceRecord, []workspaceRecord, error) {
 	if !mark.exists {
-		return nil, nil
+		return nil, nil, nil
 	}
 	registry.mu.Lock()
 	if e := registry.records[dataDir]; e != nil && e.trusted && e.mark == mark {
-		byID := e.byID
+		byID, list := e.byID, e.list
 		registry.mu.Unlock()
-		return byID, nil
+		return byID, list, nil
 	}
 	registry.mu.Unlock()
 	var items []workspaceRecord
 	if err := readJSON(filepath.Join(dataDir, "workspaces.json"), &items); err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return nil, nil
+			return nil, nil, nil
 		}
-		return nil, err
+		return nil, nil, err
 	}
 	byID := make(map[string]workspaceRecord, len(items))
 	for _, it := range items {
@@ -237,9 +248,9 @@ func registryRecords(dataDir string, mark fileMark, now time.Time) (map[string]w
 	if len(registry.records) >= registryMaxEntries {
 		clear(registry.records)
 	}
-	registry.records[dataDir] = &recordsEntry{mark: mark, trusted: mark.trusted(now), byID: byID}
+	registry.records[dataDir] = &recordsEntry{mark: mark, trusted: mark.trusted(now), byID: byID, list: items}
 	registry.mu.Unlock()
-	return byID, nil
+	return byID, items, nil
 }
 
 // lookupWorkspaceRecord is getWorkspaceRecord without a snapshot parse: the
