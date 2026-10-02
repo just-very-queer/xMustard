@@ -2026,6 +2026,16 @@ func TestReanchorCodeMovesAndRefuses(t *testing.T) {
 	if evs, _ := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", EntryID: "a1", Types: []string{EventAnchorReanchor}}); len(evs) != 1 {
 		t.Fatalf("anchor_reanchor events = %d, want 1", len(evs))
 	}
+	// The entry's search row carries its anchors, so a move that did not refresh it would
+	// keep matching the range the anchor left and stop matching the one it took. The
+	// query's terms are the line numbers alone: ftsQuery keeps runs of letters and digits,
+	// so "src/a.go#L4-L5" would match on the file name whatever range is indexed.
+	if hits, _ := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "l4 l5"}); len(hits) != 0 {
+		t.Fatalf("the moved range is still searchable: %+v", hits)
+	}
+	if hits, _ := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "l6 l7"}); len(hits) != 1 || hits[0].EntryID != "a1" {
+		t.Fatalf("the new range is not searchable: %+v", hits)
+	}
 
 	// The same move a second time names an anchor that has already moved, which is refused
 	// rather than silently accepted as a no-op: a caller that cannot tell "nothing to do"

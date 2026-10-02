@@ -406,6 +406,60 @@ func TestCodeAnchorBeyondThePlacementBoundIsUnknown(t *testing.T) {
 	}
 }
 
+// A served content holding fewer fenced blocks than the entry has code anchors is
+// unknown, and the anchors past the last block are left alone rather than crashing the
+// invalidation. This is the direction the positional pairing could not survive: it
+// indexed the Nth block for the Nth anchor, so the second anchor of a one-block content
+// read past the end. Both channels that raised it saw the index, not the behaviour, so
+// the case is asserted here through the call that would have panicked.
+func TestCodeAnchorBeyondTheContentBlocksIsUnknown(t *testing.T) {
+	f := newCodeFixture(t)
+	const retrySource = "\nconst (\n\tReadTimeout = 1\n\tWriteTimeout = 2\n)\n"
+	const retry = "and the retry bounds:\n\n```go\nReadTimeout = 1\nWriteTimeout = 2\n```\n"
+	writeRepoFile(t, f.root, "srv.go", strings.Replace(quoteSource, "func Serve() {}", retrySource+"func Serve() {}", 1))
+	e, err := Remember(f.dir, f.ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{
+		Title: "timeouts", Content: quoteMemory + retry, Permission: "readwrite", Paths: []string{"srv.go"}}},
+		ContextActor{ID: "author"})
+	if err != nil {
+		t.Fatalf("propose: %v", err)
+	}
+	e, err = VerifyContext(f.dir, f.ws, e.ID, "peer-1", true, "")
+	if err != nil {
+		t.Fatalf("verify: %v", err)
+	}
+	if e, err = VerifyContextOutcome(f.dir, f.ws, e.ID, ContextActor{ID: "approver2", Kind: "agent", Verifier: true},
+		VerifyRequest{}); err != nil || !e.Promoted {
+		t.Fatalf("not promoted: %+v, %v", e, err)
+	}
+	var anchors []govstore.Anchor
+	if err := memoryView(context.Background(), f.dir, f.ws, func(r govstore.Reader) (err error) {
+		anchors, err = r.ListAnchors(context.Background(), e.ID)
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+	code := 0
+	for _, a := range anchors {
+		if a.Kind == govstore.AnchorCode {
+			code++
+		}
+	}
+	if code != 2 {
+		t.Fatalf("want two code anchors, got %d of %+v", code, anchors)
+	}
+	// The memory's served content keeps one block while both anchors stand, as it would if
+	// an accepted edit dropped a fenced block without replacing the anchor set.
+	sites := codeSites(quoteMemory, anchors)
+	if len(sites) != 1 {
+		t.Fatalf("one block in the content should pair one anchor, got %d", len(sites))
+	}
+
+	rep, err := InvalidateMemory(context.Background(), f.dir, f.ws, []string{"srv.go"})
+	if err != nil {
+		t.Fatalf("the invalidation panicked or failed on fewer blocks than anchors: %+v, %v", rep, err)
+	}
+}
+
 // A code anchor whose snippet digest names no block of the memory's served content is
 // unknown and marks nothing: the digest is the whole identity of the anchor, so a block
 // that is not there cannot be re-found, and a block that is there under a different
