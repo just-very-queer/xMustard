@@ -73,16 +73,16 @@ func TestReadWorktreeStatusFromGit(t *testing.T) {
 // path nor the spaced path can survive.
 func TestReadWorktreeStatusReportsARenameAndASpacedPath(t *testing.T) {
 	repo := initGitRepo(t)
-	writeFile(t, filepath.Join(repo, "old.go"), "package p\n")
+	writeFile(t, filepath.Join(repo, "old name.go"), "package p\n")
 	writeFile(t, filepath.Join(repo, "sp ace.txt"), "x\n")
 	runGit(t, repo, "add", "-A")
 	runGit(t, repo, "commit", "-q", "-m", "init")
-	runGit(t, repo, "mv", "old.go", "new.go")
+	runGit(t, repo, "mv", "old name.go", "new.go")
 	writeFile(t, filepath.Join(repo, "sp ace.txt"), "y\n")
 
 	st := readWorktreeStatus(repo)
-	if st.DirtyFiles != 2 || st.StagedFiles != 1 {
-		t.Fatalf("counts: staged %d dirty %d", st.StagedFiles, st.DirtyFiles)
+	if st.DirtyFiles != 2 || st.StagedFiles != 1 || st.UntrackedFiles != 0 {
+		t.Fatalf("counts: staged %d dirty %d untracked %d", st.StagedFiles, st.DirtyFiles, st.UntrackedFiles)
 	}
 	// git orders worktree entries as the rename first; assert membership, not order,
 	// so the test does not pin git's ordering.
@@ -95,7 +95,7 @@ func TestReadWorktreeStatusReportsARenameAndASpacedPath(t *testing.T) {
 			t.Fatalf("dirty paths %q missing %q", st.DirtyPaths, want)
 		}
 	}
-	if seen["old.go"] {
+	if seen["old name.go"] {
 		t.Fatalf("dirty paths %q still names the rename origin", st.DirtyPaths)
 	}
 }
@@ -154,6 +154,49 @@ func TestPorcelainV2RenameReportsTheNewPath(t *testing.T) {
 	}
 	if st.DirtyFiles != 1 {
 		t.Fatalf("dirty files %d, want 1", st.DirtyFiles)
+	}
+}
+
+// A rename whose origin contains a space. The origin is a whole record like any other,
+// so a fold that reads it as an untracked path counts the file twice and reports a path
+// that is gone; this is the case that pins the origin record being consumed.
+func TestPorcelainV2RenameConsumesASpacedOrigin(t *testing.T) {
+	st := &WorktreeStatus{}
+	st.addPorcelainV2Records([]string{"2 R. N... 100644 100644 100644 aaa bbb R100 new.go", "old name.go"})
+	want := []string{"new.go"}
+	if !reflect.DeepEqual(st.DirtyPaths, want) {
+		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
+	}
+	if st.DirtyFiles != 1 {
+		t.Fatalf("dirty files %d, want 1", st.DirtyFiles)
+	}
+	if st.UntrackedFiles != 0 {
+		t.Fatalf("untracked files %d, want 0: the origin was read as a record", st.UntrackedFiles)
+	}
+}
+
+// A rename whose origin begins with a record-type keyword and carries the nine
+// space-separated tokens a type "2" record needs to pass the arity guard. The fold
+// cannot tell an origin record from a status record by shape alone, so only the rename
+// record consuming it keeps a path from being counted twice. Confirmed against git:
+// renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits exactly this
+// pair.
+func TestPorcelainV2RenameConsumesAnOriginThatLooksLikeARecord(t *testing.T) {
+	st := &WorktreeStatus{}
+	// Renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits this
+	// origin. It opens with the "2" record keyword and, after that keyword, carries the
+	// nine space-separated tokens a type "2" record needs to pass the arity guard, so it
+	// is indistinguishable from a second rename by shape alone.
+	st.addPorcelainV2Records([]string{
+		"2 R. N... 100644 100644 100644 aaa bbb R100 renamed/deep.go",
+		"2 3 4 5 6 7 8 9 10 x/deep.go",
+	})
+	want := []string{"renamed/deep.go"}
+	if !reflect.DeepEqual(st.DirtyPaths, want) {
+		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
+	}
+	if st.DirtyFiles != 1 {
+		t.Fatalf("dirty files %d, want 1: the origin was read as a rename record", st.DirtyFiles)
 	}
 }
 
