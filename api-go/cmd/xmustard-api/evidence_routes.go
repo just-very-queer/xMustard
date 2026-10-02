@@ -37,7 +37,15 @@ func newAPIHandler() http.Handler { return newAPIHandlerFor(postureFromEnv()) }
 func newAPIHandlerFor(p exposurePosture) http.Handler {
 	mux := newGatedMux()
 	registerRoutes(mux)
-	store := evidence.NewStore(dataDir(), evidence.LimitsFromEnv())
+	limits := evidence.LimitsFromEnv()
+	// The store fixes its limits here, and bodyLimitMiddleware fixes its own, so
+	// /api/health must report these same values rather than re-reading the
+	// environment: an operator who changes an override on a running process would
+	// otherwise see caps the server does not enforce.
+	streamLimit := maxRequestBodyBytesConfigured()
+	ordinaryBodyCap = budget.CapToPool(streamLimit)
+	captureBodyCap = min(streamLimit, limits.MaxOriginal)
+	store := evidence.NewStore(dataDir(), limits)
 	registerEvidenceRoutes(mux, store)
 	registerEvidenceCaptureRoutes(mux, store)
 	registerOutcomeRoutes(mux, store)
