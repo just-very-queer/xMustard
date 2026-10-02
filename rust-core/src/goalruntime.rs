@@ -517,9 +517,11 @@ fn compact_timestamp(value: &str) -> String {
     stripped.chars().take(15).collect()
 }
 
-/// Follows Go's `slugProfileID` rules: lowercase, non-alnum runs to `-`,
+/// Closely follows Go's `slugProfileID` rules: lowercase, non-alnum runs to `-`,
 /// trimmed. Falls back to a stable sha1-derived `goal-<hex8>` id (Go uses a
-/// `profile-` prefix) for non-sluggable titles.
+/// `profile-` prefix) for non-sluggable titles. Not byte-identical: Go's
+/// `strings.ToLower` folds Unicode, this folds ASCII only, so a character Go
+/// lowercases into `[a-z0-9]` (U+212A KELVIN SIGN to `k`) is a dash here.
 fn slug_id(value: &str) -> String {
     let lower = value.trim().to_ascii_lowercase();
     let mut slug = String::with_capacity(lower.len());
