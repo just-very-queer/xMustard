@@ -79,7 +79,7 @@ var routeGateTable = map[string]routeGate{
 	// --- core: the nine MCP tools ---
 	"GET /api/workspaces/{workspace_id}/session-grounding":           coreGate(roleReader, "ground", "session state of the workspace's recent sessions (WS-33)"),
 	"GET /api/workspaces/{workspace_id}/context/active":              coreGate(roleReader, "recall", "scope=all needs admin; unverified text and history need verifier or human-approver"),
-	"GET /api/workspaces/{workspace_id}/memory/core":                 coreGate(roleReader, "", "standing-memory projection: human-approved core tier and the deferred index"),
+	"GET /api/workspaces/{workspace_id}/memory/core":                 coreGate(roleReader, "recall", "standing-memory projection: human-approved core tier and the deferred index; recall's gate row, so a deployment that disables recall serves neither"),
 	"POST /api/workspaces/{workspace_id}/context":                    coreGate(roleProposer, "remember", "author is the principal; kind=handoff appends a capsule to the principal's own session"),
 	"POST /api/workspaces/{workspace_id}/context/{entry_id}/verify":  coreGate(roleVerifier, "verify", "verifier is the principal"),
 	"GET /api/workspaces/{workspace_id}/search":                      coreGate(roleReader, "search", ""),

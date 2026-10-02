@@ -123,11 +123,12 @@ func docsList() []map[string]any {
 
 // memoryIndex reads the promoted-title index: recall with names_only at the largest
 // page and output budget, for the workspace a tool call naming none would use. The
-// API applies the caller's role gates as for the tool.
+// API applies the caller's role gates as for the tool, and the connection's read-only
+// mode applies here too: the read goes out through serveResourceTool, not RunTool.
 func (s *Session) memoryIndex(ctx context.Context) (any, *RPCError) {
-	res, rerr := s.RunTool(ctx, recallTool, map[string]string{
+	res, rerr := s.serveResourceTool(ctx, recallTool, map[string]string{
 		"names_only": "true", "limit": strconv.Itoa(maxRecallLimit), "max_chars": strconv.Itoa(recallMaxMaxChars),
-	}, nil)
+	})
 	if rerr != nil {
 		return nil, rerr
 	}

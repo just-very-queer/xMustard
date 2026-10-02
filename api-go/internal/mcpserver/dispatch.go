@@ -55,6 +55,33 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 	return res, nil
 }
 
+// resourceToolRefusal reports the refusal a read-only connection owes a tool a
+// resource read stands for, or nil when the connection serves it. It is the same rule
+// callKnownTool applies before its arguments are read: a tool that never serves reads
+// is refused outright, and one whose write arguments the resource set is refused as a
+// writing call of a reading tool.
+func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) *RPCError {
+	if !readOnly || t.servesReads() && !t.writes(args) {
+		return nil
+	}
+	reason := "it changes shared memory"
+	if t.servesReads() {
+		reason = strings.Join(t.WriteArgs, ", ") + " write"
+	}
+	return &RPCError{Code: CodeInvalidRequest, Message: fmt.Sprintf("%s is not served on a read-only connection (mode=%s): %s", t.Name, ModeReadOnly, reason),
+		Data: map[string]any{"tool": t.Name, "reason": "read_only"}}
+}
+
+// serveResourceTool runs a tool a resource read stands for, refusing it on a read-only
+// connection first. RunTool alone would skip that gate, so a resource read would be a
+// way around the mode.
+func (s *Session) serveResourceTool(ctx context.Context, t *Tool, args map[string]string) (map[string]any, *RPCError) {
+	if rerr := resourceToolRefusal(s.srv.opts.ReadOnly, t, args); rerr != nil {
+		return nil, rerr
+	}
+	return s.RunTool(ctx, t, args, nil)
+}
+
 // callKnownTool refuses a write on a read-only connection (a write tool before its
 // arguments are read, a writing call of a reading tool after), validates (with the
 // toolcompat repair fallback) and runs the call. It returns how many arguments were

@@ -366,6 +366,41 @@ func TestDisabledToolIsRefused(t *testing.T) {
 	}
 }
 
+// Every route that serves memory carries a tool, so a deployment that disables recall
+// serves no memory on any route. The MCP resource xmustard://memory/core reads
+// /memory/core without naming a tool, which is how a deployment's memory outlives
+// XMUSTARD_DISABLED_TOOLS=recall.
+func TestDisabledRecallRefusesTheStandingMemoryProjection(t *testing.T) {
+	srv, _ := securityServer(t, exposurePosture{DisabledTools: map[string]bool{"recall": true}})
+	if code, body := call(t, "GET", srv.URL+"/api/workspaces/ws1/memory/core", "", "", nil); code != http.StatusForbidden || body["reason"] != "tool_disabled" {
+		t.Fatalf("standing memory with recall disabled: want 403 tool_disabled, got %d %v", code, body)
+	}
+	if code, _ := call(t, "GET", srv.URL+"/api/workspaces/ws1/context/active", "", "", nil); code != http.StatusForbidden {
+		t.Fatalf("the recall route itself must stay refused, got %d", code)
+	}
+	// with recall served, the projection answers: the gate row is a refusal switch,
+	// not a denial of a route the deployment serves
+	open, _ := securityServer(t, exposurePosture{})
+	if code, _ := call(t, "GET", open.URL+"/api/workspaces/ws1/memory/core", "", "", nil); code != http.StatusOK {
+		t.Fatalf("standing memory with recall served: want 200, got %d", code)
+	}
+}
+
+// Every route that reads memory names the tool that reaches it, so no memory read can
+// outlive XMUSTARD_DISABLED_TOOLS. A read row with an empty tool is served whatever
+// the deployment disabled. Writes are not covered here: they are reached by the write
+// tool that owns them, not by a read.
+func TestEveryMemoryReadRouteNamesItsTool(t *testing.T) {
+	for _, pattern := range sortedGatePatterns() {
+		if patternMethod(pattern) != http.MethodGet || !strings.Contains(pattern, "/memory/") {
+			continue
+		}
+		if routeGateTable[pattern].Tool == "" {
+			t.Errorf("%s reads memory without naming the tool that reaches it", pattern)
+		}
+	}
+}
+
 // whoami and ground report the caller's principal and roles.
 func TestCallerPrincipalReported(t *testing.T) {
 	srv, dir := securityServer(t, exposurePosture{})
