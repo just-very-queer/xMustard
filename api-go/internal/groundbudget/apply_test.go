@@ -12,19 +12,26 @@ import (
 )
 
 // groundResult builds a ground result shaped like the API's: failed runs, broken
-// contracts, drift reasons and unknown fields scale with the arguments.
-func groundResult(runs, breaks, reasons, unknown int) map[string]any {
+// contracts, drift reasons and unknown fields scale with the arguments. pad widens
+// every list element without adding one, so a caller can grow the result in bytes
+// while its element count, and what Apply has to budget, stay the same.
+func groundResult(runs, breaks, reasons, unknown int, pad ...int) map[string]any {
+	width := 0
+	if len(pad) > 0 {
+		width = pad[0]
+	}
+	fat := strings.Repeat("x", width)
 	failed := make([]string, runs)
 	for i := range failed {
-		failed[i] = fmt.Sprintf("run_%04d_newest_first", i)
+		failed[i] = fmt.Sprintf("run_%04d_newest_first", i) + fat
 	}
 	broken := make([]string, breaks)
 	for i := range broken {
-		broken[i] = fmt.Sprintf("pkg.Func%04d in internal/pkg/file_%04d.go (fn(a int) -> fn(a, b int))", i, i)
+		broken[i] = fmt.Sprintf("pkg.Func%04d in internal/pkg/file_%04d.go (fn(a int) -> fn(a, b int))", i, i) + fat
 	}
 	why := make([]string, reasons)
 	for i := range why {
-		why[i] = fmt.Sprintf("tracked file %04d changed since the baseline", i)
+		why[i] = fmt.Sprintf("tracked file %04d changed since the baseline", i) + fat
 	}
 	g := map[string]any{
 		"workspace_id": "ws1",
@@ -512,22 +519,31 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 // Budgeting does not copy the result: Apply allocates its element tables and the
 // output, and WorkingSet (what the API admits) covers that plus the result itself.
 //
-// The figure is the marginal cost of one Apply call, measured over several
-// identical calls. runtime.MemStats.TotalAlloc is a process-wide counter, so a
-// single-call window also counts whatever the runtime and the test process
-// allocate inside it; on a loaded box that noise reached 40 KiB against a
-// 402,909-byte line and turned this into a flake. Averaging the same call over
-// allocProbeRuns divides that noise by the number of calls and leaves the signal
-// (the element tables, about 23% of the result) unchanged, so the line below
-// still bounds one call and is read off a stable measurement.
-const allocProbeRuns = 16
+// The guard is a difference of two measurements, not a reading of a counter. Apply is
+// asked to budget the same result twice, once with every list element narrow and once
+// with each element widened by allocPadBytes: the second result is about six times
+// the bytes but holds exactly the same 40,050 list elements, so the tables Apply
+// builds and the output it writes are the same size. Anything proportional to the
+// result's bytes — a copy — shows up as the difference; anything the runtime or the
+// test process allocates inside a window is common to both measurements and cancels.
+//
+// That matters because runtime.MemStats.TotalAlloc is process-wide. Read across one
+// call on a loaded build box it ranged 381,792-398,888 bytes over 20 runs of one
+// unchanged tree, and reached 410,824-423,592 under WS-32a's load against a
+// 402,909-byte line: the flake this test is. Subtracting two windows of the same
+// shape removes that term instead of diluting it.
+const (
+	allocPadBytes  = 400
+	allocProbeRuns = 8
+)
 
-func TestApplyDoesNotCopyTheResult(t *testing.T) {
-	raw := mustJSON(groundResult(2000, 20000, 50, 5)) // about 2 MB, most of it list elements
-	req := Request{MaxChars: DefaultMaxChars}
-	// One untimed call first, so the runs below measure steady-state allocation and
-	// not the heap's first growth into this working set.
-	if _, err := Apply(raw, req); err != nil {
+// allocPerCall is the bytes one Apply call allocates, as the mean over runs identical
+// calls. It still reads a process-wide counter, so it carries the same noise the
+// difference below is there to cancel; use it only against a line it cannot straddle,
+// and never as the copy guard on its own.
+func allocPerCall(t *testing.T, raw []byte, req Request) int64 {
+	t.Helper()
+	if _, err := Apply(raw, req); err != nil { // warm-up: the heap's first growth into this working set
 		t.Fatal(err)
 	}
 	var before, after runtime.MemStats
@@ -539,15 +555,40 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 		}
 	}
 	runtime.ReadMemStats(&after)
-	perCall := int64(after.TotalAlloc-before.TotalAlloc) / allocProbeRuns
-	if perCall > int64(len(raw))/4 {
-		t.Fatalf("Apply allocated %d bytes per call for a %d-byte result; it must not copy the result", perCall, len(raw))
+	return int64(after.TotalAlloc-before.TotalAlloc) / allocProbeRuns
+}
+
+func TestApplyDoesNotCopyTheResult(t *testing.T) {
+	req := Request{MaxChars: DefaultMaxChars}
+	narrow := mustJSON(groundResult(2000, 20000, 50, 5))
+	wide := mustJSON(groundResult(2000, 20000, 50, 5, allocPadBytes))
+	if len(wide) < 3*len(narrow) {
+		t.Fatalf("the wide result is %d bytes against %d; allocPadBytes must at least triple it for the difference to mean anything",
+			len(wide), len(narrow))
 	}
-	if ws := WorkingSet(raw, req); ws < int64(len(raw))+perCall {
-		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(raw), perCall)
+
+	// A copy is bytes; the element tables and the output are not. Everything the wide
+	// result adds is padding inside elements Apply never copies, so its allocation must
+	// stay within the same small allowance as the narrow one's.
+	const copyAllowance = 8 << 10
+	copied := allocPerCall(t, wide, req) - allocPerCall(t, narrow, req)
+	if copied > copyAllowance {
+		t.Fatalf("Apply allocated %d more bytes for a %d-byte result than for a %d-byte one with the same %d list elements;"+
+			" it must not copy the result", copied, len(wide), len(narrow), 40050)
 	}
-	t.Logf("result %d bytes: Apply allocated %d bytes per call over %d calls; WorkingSet %d",
-		len(raw), perCall, allocProbeRuns, WorkingSet(raw, req))
+
+	// The narrow result still has to fit its own line: its allocation is the element
+	// tables (160,200 bytes for 40,050 elements) plus the output, well under a quarter.
+	narrowAlloc := allocPerCall(t, narrow, req)
+	if narrowAlloc > int64(len(narrow))/4 {
+		t.Fatalf("Apply allocated %d bytes for a %d-byte result; it must not copy the result", narrowAlloc, len(narrow))
+	}
+	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+narrowAlloc {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(narrow), narrowAlloc)
+	}
+	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: %d bytes per call apart (allowance %d);"+
+		" narrow call %d bytes against its %d-byte line; WorkingSet %d",
+		len(narrow), len(wide), copied, copyAllowance, narrowAlloc, len(narrow)/4, WorkingSet(narrow, req))
 }
 
 // Result bytes are copied through exactly, whitespace and escapes included.
