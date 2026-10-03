@@ -38,6 +38,7 @@
 //! `refresh_queue`, whose debounced batches the orchestrator turns into `index update
 //! --paths ...` runs (WS-15, PAR-FRESH-03).
 
+pub mod areas;
 pub mod chunks;
 pub mod config;
 pub mod context;
@@ -1613,6 +1614,32 @@ pub fn impact(
     Ok(v)
 }
 
+/// `index areas`: the functional areas of one stored generation (WS-38b, PAR-SYM-08) —
+/// seeded deterministic communities at symbol granularity over the resolved
+/// CALLS/EXTENDS/IMPLEMENTS projection. Read-only, like `impact`.
+pub fn areas(root: &Path, cfg: &IndexConfig, seed: u64) -> Result<serde_json::Value, String> {
+    let (root, path, conn) = open_read_only(root, cfg)?;
+    if conn.is_none() {
+        return Err(format!(
+            "no index at {} (run `index build` first)",
+            path.display()
+        ));
+    }
+    drop(conn);
+    let opened = reader::open_at(&root, &path, csr::GraphStorage::from_env())?;
+    let result = areas::areas_for(&opened.snapshot, seed)?;
+    let paths: Vec<String> = result
+        .areas
+        .iter()
+        .flat_map(|a| a.members.iter().map(|m| m.path.clone()))
+        .collect();
+    let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
+    v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
+        .map_err(|e| e.to_string())?;
+    v["root"] = root.to_string_lossy().into();
+    Ok(v)
+}
+
 /// `index stats`: the stored index's identity, freshness inputs and coverage; with
 /// `digest`, its content digest. Read-only: it never takes the writer lock and never
 /// opens the store for writing.
@@ -1666,13 +1693,13 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-const USAGE: &str = "xmustard-core index <build|update|stats|impact> <root> \
+const USAGE: &str = "xmustard-core index <build|update|stats|impact|areas> <root> \
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
     [--identity-key KEY] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
     [--relation-types=A,B] [--min-confidence=C] [--include-tests=B] [--limit=N] [--offset=N] \
-    [--summary-only=B] [--timeout-ms=N]";
+    [--summary-only=B] [--timeout-ms=N] [--seed=N]";
 
 /// Record the repository identity key a build or update was run for (`meta::IDENTITY_KEY`),
 /// under the writer lock; written only when it changed.
@@ -1709,6 +1736,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut identity: Option<String> = None;
     let mut symbol: Option<String> = None;
     let mut impact_flags: Vec<String> = Vec::new();
+    let mut seed: u64 = areas::DEFAULT_SEED;
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1741,6 +1769,14 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                     .ok_or_else(|| CmdError::new(2, "index: --depth needs a number"))?;
                 impact_flags.push(format!("--max-depth={d}"));
                 2
+            }
+            // areas' seed: the one arbitrary choice in the propagation, so a caller can
+            // vary it; parsed here so a non-numeric value is refused before any work.
+            a if sub.as_str() == "areas" && a.starts_with("--seed=") => {
+                seed = a["--seed=".len()..].parse().map_err(|_| {
+                    CmdError::new(2, "index areas: --seed needs a number")
+                })?;
+                1
             }
             // impact v2's `--name=value` flags (validated by impact::Query)
             _ if sub.as_str() == "impact" && a.starts_with("--") && a.contains('=') => {
@@ -1780,6 +1816,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                 .map_err(|e| CmdError::new(2, format!("index impact: {e}")))?;
             impact(&root, &cfg, &q)
         }
+        "areas" => areas(&root, &cfg, seed),
         _ => return Err(CmdError::usage(USAGE)),
     };
     out.map(|v| Output::Json(v.to_string()))
