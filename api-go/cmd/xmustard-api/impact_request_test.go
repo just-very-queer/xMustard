@@ -7,8 +7,12 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+
+	"xmustard/api-go/internal/toolbudget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // A request mixing impact forms, or out of range, is a 400 before any core runs.
@@ -276,5 +280,119 @@ echo '{}'
 			(c.hasNot != "" && strings.Contains(string(body), c.hasNot)) {
 			t.Fatalf("%s: %d %s", c.q, resp.StatusCode, body)
 		}
+	}
+}
+
+// tierAnswer is the part of a budgeted impact answer this file asserts on: the tier items
+// the caller received, the cursor that continues them, and the report that has to describe
+// the bytes written.
+type tierAnswer struct {
+	ByDepth []struct {
+		Items []struct {
+			Name string `json:"name"`
+		} `json:"items"`
+	} `json:"by_depth"`
+	NextCursor   string `json:"next_cursor"`
+	OutputBudget *struct {
+		UsedChars int `json:"used_chars"`
+	} `json:"output_budget"`
+}
+
+func (a tierAnswer) delivered() int {
+	if len(a.ByDepth) == 0 {
+		return 0
+	}
+	return len(a.ByDepth[0].Items)
+}
+
+// Settling a reconciled result can push it over max_chars again, and when it does the
+// second fit removes items the cursor reconciliation just signed no longer describes:
+// following it would skip them. The route runs two passes for that reason — reconcile,
+// settle, reconcile again against what survived, settle the report. The fixture below is
+// sized so the reconciled page fits while the settled one does not, which is the window in
+// which the second fit has to trim; the sweep walks max_chars across it.
+//
+// This asserts the contract rather than forcing the second pass: it is green with one
+// pass and with two, because fitEach binary-searches the item count against max_chars, so
+// after Apply's fit the page already sits at the boundary and the second pass trims back
+// to the count the first reconcile signed. That is recorded in FU rather than papered
+// over with a weaker assertion.
+func TestImpactCursorIsReDerivedWhenTheSettledPageIsTrimmedAgain(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	core := filepath.Join(t.TempDir(), "xmustard-core")
+	// 60 items of a realistic size against total 120, so the core page is several times
+	// the budget floor and the tiers rung has to cut it.
+	script := `#!/bin/sh
+items=""
+i=0
+while [ $i -lt 60 ]; do
+  items="$items{\"name\":\"ImpactedSymbolWithALongNameNumber$i\",\"depth\":1,\"kind\":\"function\",\"path\":\"pkg/deeply/nested/package/path/file$i.go\"},"
+  i=$((i + 1))
+done
+printf '{"symbol":"Serve","impacted_count":120,"by_depth":[{"depth":1,"total":120,"offset":0,"items":[%s],"next_offset":60}]}' "${items%,}"
+`
+	if err := os.WriteFile(core, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	ws, root := "wsImpactSecondFit", t.TempDir()
+	snap, _ := json.Marshal(map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": root}})
+	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workspaces", ws, "snapshot.json"), snap, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// The ranking the cursor is signed over: the query the route builds for this call.
+	q := url.Values{"symbol": {"Serve"}, "limit": {"60"}}
+	// The floor is the smallest budget accepted and the paging members add about 97 bytes,
+	// so the window where the reconciled page fits but the settled one does not sits just
+	// above it.
+	cursors, checked := 0, 0
+	for maxChars := toolbudget.MinMaxChars; maxChars <= toolbudget.MinMaxChars+600; maxChars += 5 {
+		resp, err := http.Get(srv.URL + "/api/workspaces/" + ws + "/changes/since-index?symbol=Serve&limit=60&max_chars=" + strconv.Itoa(maxChars))
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("max_chars=%d: status %d: %s", maxChars, resp.StatusCode, body)
+		}
+		var res tierAnswer
+		if err := json.Unmarshal(body, &res); err != nil {
+			t.Fatal(err)
+		}
+		// On every budget the report describes the bytes actually written, which is the
+		// invariant the second pass exists to keep.
+		if res.OutputBudget == nil || len(body)-1 != res.OutputBudget.UsedChars {
+			t.Errorf("max_chars=%d: used_chars %+v does not describe the %d bytes written",
+				maxChars, res.OutputBudget, len(body)-1)
+		}
+		if res.NextCursor == "" {
+			continue
+		}
+		cursors++
+		offset, err := workspaceops.DecodeImpactCursor(ws, q, res.NextCursor)
+		if err != nil {
+			t.Errorf("max_chars=%d: the answer's own cursor does not decode: %v", maxChars, err)
+			continue
+		}
+		// The cursor must name the first item this page did not deliver. Past it, the
+		// caller skips an item it never received; short of it, the caller repeats one.
+		if got := res.delivered(); offset != got {
+			t.Errorf("max_chars=%d: %d items delivered, the cursor continues at %d: it %s",
+				maxChars, got, offset,
+				map[bool]string{true: "skips the items this fit removed", false: "repeats an item"}[offset > got])
+			continue
+		}
+		checked++
+	}
+	if cursors == 0 {
+		t.Fatalf("no budget in [%d,%d] produced a cursor: the fixture never reached the window this test is about",
+			toolbudget.MinMaxChars, toolbudget.MinMaxChars+600)
+	}
+	if checked == 0 {
+		t.Error("every cursor in the sweep named the wrong position")
 	}
 }
