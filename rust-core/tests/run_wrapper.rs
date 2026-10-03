@@ -272,6 +272,7 @@ fn one_hundred_megabytes_stream_through_in_bounded_memory() {
         printed.len()
     );
     let dirty = memprobe::mib(peaks.dirty);
+    peaks.assert_sampled_dirty("wrapper on 100 MB");
     eprintln!(
         "wrapper dirty peak on 100 MB: {dirty:.1} MiB (rss {:.1} MiB)",
         memprobe::mib(peaks.rss)

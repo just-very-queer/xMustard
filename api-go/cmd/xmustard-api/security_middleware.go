@@ -536,20 +536,32 @@ func (c callerView) has(role string) bool {
 	return false
 }
 
+// toolDisabledFor reports whether the caller cannot use tool on this deployment: it is
+// disabled by XMUSTARD_DISABLED_TOOLS, or its route is not in the core profile, or the
+// caller does not hold that route's role. It is the one place the predicates that decide
+// whether a tool may be used are collected, so a surface that reaches a tool without
+// naming it in its gate row (a hook answer, see hooks_routes.go) asks here instead of
+// re-deriving the rule and reaching a different answer than tools/list and whoami do.
+// A tool with no gate row has no route to refuse, so it is not disabled by this.
+func toolDisabledFor(p *exposurePosture, c callerView, tool string) bool {
+	pattern, ok := toolGates()[tool]
+	if !ok {
+		return false
+	}
+	g := routeGateTable[pattern]
+	if p.toolDisabled(tool) || (!g.Core && !p.platform()) || (p.readOnly() && g.mutating(pattern)) {
+		return true
+	}
+	return !c.has(g.Role)
+}
+
 // usableTools lists the MCP tools this caller can call on this deployment.
 func usableTools(p *exposurePosture, c callerView) []string {
-	gates := toolGates()
 	out := []string{}
 	for _, tool := range mcpToolOrder {
-		pattern, ok := gates[tool]
-		if !ok {
-			continue
+		if !toolDisabledFor(p, c, tool) {
+			out = append(out, tool)
 		}
-		g := routeGateTable[pattern]
-		if (!g.Core && !p.platform()) || p.toolDisabled(tool) || (p.readOnly() && g.mutating(pattern)) || !c.has(g.Role) {
-			continue
-		}
-		out = append(out, tool)
 	}
 	return out
 }

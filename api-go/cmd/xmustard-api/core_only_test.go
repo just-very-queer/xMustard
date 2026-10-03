@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -178,8 +179,10 @@ func TestUnclassifiedRoutePanicsAtRegistration(t *testing.T) {
 	newGatedMux().HandleFunc("GET /api/workspaces/{workspace_id}/brand-new", func(http.ResponseWriter, *http.Request) {})
 }
 
-// The nine tools map to core routes, and evidence delivery's route->tool mapping
-// agrees with the gate table.
+// The nine tools map to core routes, and every gate row that names a tool has an
+// evidence-delivery mapping for the tool it names. The mapping is many routes to one
+// tool, not one to one: /memory/core serves recall's memory without being recall's own
+// route, so it is absent from coreToolRoutes and present here only as the tool's gate.
 func TestToolGatesAreTheNineCoreTools(t *testing.T) {
 	gates := toolGates()
 	if len(gates) != len(mcpToolOrder) || len(coreTools) != len(mcpToolOrder) {
@@ -197,5 +200,32 @@ func TestToolGatesAreTheNineCoreTools(t *testing.T) {
 		if got := coreToolFor(patternMethod(pattern), path); got != tool {
 			t.Fatalf("evidence delivery maps %s to %q, gate table says %q", pattern, got, tool)
 		}
+	}
+	// every gate row naming a tool names one the delivery layer maps, so a row can
+	// gate a call on a tool nothing serves
+	delivered := map[string]bool{}
+	for _, t := range coreToolRoutes {
+		delivered[t] = true
+	}
+	for _, pattern := range sortedGatePatterns() {
+		if tool := routeGateTable[pattern].Tool; tool != "" && coreTools[tool] && !delivered[tool] {
+			t.Errorf("gate %s names tool %s, which evidence delivery does not map", pattern, tool)
+		}
+	}
+}
+
+// A tool served by several alike routes resolves to the same one every time. Map
+// iteration order is randomized per range, so a tool with two non-mutating routes
+// would otherwise pick a different primary route per call, and whoami's tool list
+// would flap.
+func TestToolGatesAreStableAcrossCalls(t *testing.T) {
+	first := toolGates()
+	for i := 0; i < 50; i++ {
+		if got := toolGates(); !maps.Equal(got, first) {
+			t.Fatalf("toolGates changed between calls: %v then %v", first, got)
+		}
+	}
+	if first["recall"] != "GET /api/workspaces/{workspace_id}/context/active" {
+		t.Fatalf("recall's primary route is %q, want its read route", first["recall"])
 	}
 }
