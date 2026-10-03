@@ -2063,6 +2063,43 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 
 **Collision risk.** main.go gets one line. xmustard-ops main.go is shared with WS-32, WS-34 and WS-44 (add subcommand files, not inline code). The per-tool mcpserver files are shared.
 
+### WS-29b — Principal-derived scopes: private, dir, run and global
+
+**Goal.** A memory's scope is derived from the writing principal and the request, never
+from a payload field or entry metadata. This sub-task adds the derivation and the
+visibility rule that reads it, and nothing else: WS-29c adds grant-driven visibility and
+the applicability labels, WS-29d the routes, WS-29e the ops subcommands, WS-29f the
+scope-leak fixture suite.
+
+**Requirements.** PAR-SHARE-01
+
+**Files.** `api-go/internal/workspaceops/memory_scopes.go`,
+`api-go/internal/workspaceops/memory_propose.go`,
+`api-go/internal/workspaceops/memory_recall.go`,
+`api-go/internal/workspaceops/memory_scopes_test.go`
+
+**Tests required.**
+- The derivation is a table: every principal kind and run/session/dir input maps to one
+  scope, and an unknown combination is refused rather than defaulted
+- A request cannot choose its own scope: a `scope` field on the payload, in the entry
+  metadata or on a caller-supplied `ContextActor` is ignored, and the stored entry
+  carries the derived scope (the identity smuggling test)
+- `private` scope: served to its own author and to nobody else, whatever another
+  principal's roles are; an admin is not an exception
+- `run` and `session` scope: served only inside the matching run or session key, and
+  invisible to a later one
+- `dir` scope: served inside the directory prefix it was derived from and refused
+  outside it
+- An entry whose derivation is refused is not written at all (no partial row)
+
+**Acceptance.** Every stored entry's scope equals `DeriveScope(principal, request)`,
+which no caller-supplied field can influence, and `private` is invisible to every
+principal but the author. The scope-leak metric over this sub-task's fixture suite is
+0; the full suite is WS-29f.
+
+**Collision risk.** `memory_propose.go` and `memory_recall.go` are shared with WS-28C
+(the outline cache), WS-32 and WS-FIX-13.
+
 ### WS-30 — Cross-workspace code query, residency LRU, worktree identity and path rewriting
 
 **Goal.** search, explain and impact accept workspaces or a group. The resident service holds at most K hot indexes (default 1) with LRU and idle eviction; cold repos are served by pread or loaded on demand in the heavy slot. Detect linked worktrees and record branch/worktree identity. Store anchors repo-relative, with a longest-prefix path rewrite map for foreign absolute paths.
