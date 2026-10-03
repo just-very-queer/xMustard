@@ -3017,9 +3017,10 @@ entry" holds. The read path is read-only like `impact`, so the row adds no write
 migration and no `go-calls.txt` line (there is no Go caller; 38e/38f add the caller).
 
 **Collision risk.** `rust-core/src/index/mod.rs` is also 38b's and WS-45a's file; 38b is
-parked and not merged, so this row's `mod.rs` diff is against a tree without `areas.rs`. Both
-`index areas` and `index flows` take a `--seed` flag and both may merge before either merges
-again; §1.7 rule 4 governs that case and plan-file conflicts keep both sections.
+parked and not merged, so this row's `mod.rs` diff was originally cut against a tree without
+`areas.rs`. Both subcommands are now merged and their flag arms sit side by side: `index
+areas` takes `--seed` and `index flows` takes `--limit`, and neither takes the other's.
+§1.7 rule 4 governs a future re-merge and plan-file conflicts keep both sections.
 
 ### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
 

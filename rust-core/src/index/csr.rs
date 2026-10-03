@@ -877,7 +877,11 @@ fn sql(e: rusqlite::Error) -> String {
     format!("index store: {e}")
 }
 
-fn indexed_status_list() -> String {
+/// The `parse_status` values a segment covers, as a SQL IN-list. `pub(crate)` because
+/// `Snapshot::exported_by_symbol` reads the store's exported flags through the SAME
+/// predicate, so the two cannot drift: a positional read of `symbols` would put another
+/// symbol's flag in a segment slot as soon as one file were skipped.
+pub(crate) fn indexed_status_list() -> String {
     meta::INDEXED_STATUSES
         .iter()
         .map(|s| format!("'{s}'"))

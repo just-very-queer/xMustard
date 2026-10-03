@@ -1536,3 +1536,119 @@ fn a_missing_index_is_refused_rather_than_answered_from_nothing() {
         "the refusal must name the missing index: {err}"
     );
 }
+
+/// A flow is classified against the FULL area membership, not the 200 rows the answer
+/// lists.
+///
+/// `areas.rs` caps an area's listed members at `MAX_MEMBERS` and reports `members_truncated`
+/// when it does. A partition read from the listed rows therefore leaves every symbol past
+/// the cap with no area, and `build_graph` gave those the `UNCLASSIFIED` sentinel, which
+/// used to count as a community of its own: a flow whose real areas were all one was
+/// reported `cross` because one of its steps sat outside the cap.
+///
+/// The fixture needs an area with more than 200 members, so it is 240 symbols wide and the
+/// cap is crossed inside it. Every symbol here is in one ring, so every flow is `intra`, and
+/// the answer says how many symbols the partition did not cover — which must be 0 for a
+/// graph the areas projection places.
+#[test]
+fn a_flow_is_classified_over_every_area_member_not_the_capped_list() {
+    // One hub and 240 spokes, all in one folder, so label propagation keeps them in ONE
+    // area (the hub is adjacent to every spoke) and the area's membership crosses
+    // MAX_MEMBERS. A ring does not work for this: propagation fragments a long ring into
+    // many small areas, measured at 61 for a 240-symbol ring, so no single one is capped.
+    let mut src = String::from("package pkg\n\n");
+    let mut spokes = Vec::new();
+    for i in 0..240 {
+        spokes.push(format!("Hub{i:03}"));
+        src.push_str(&format!("func Hub{i:03}() {{}}\n"));
+    }
+    let body: String = spokes.iter().map(|s| format!("\t{s}()\n")).collect();
+    src.push_str(&format!("func WideHub() {{\n{body}}}\n"));
+    let d = repo(&[GO_MOD, ("pkg/wide.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    // The areas answer really did cross its cap, so the fixture exercises the case.
+    let areas = ok_json(&["index", "areas", d.path().to_str().unwrap()]);
+    let capped: Vec<u64> = areas["areas"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|a| a["members_truncated"] == serde_json::json!(true))
+        .map(|a| a["total_size"].as_u64().unwrap())
+        .collect();
+    assert!(
+        !capped.is_empty(),
+        "the fixture must produce an area over MAX_MEMBERS: {areas:#}"
+    );
+    assert!(
+        capped.iter().any(|t| *t > 200),
+        "the capped area holds more than 200 members: {capped:?}"
+    );
+    assert_eq!(
+        v["unclassified_symbols"].as_u64().unwrap(),
+        0,
+        "every admitted symbol has an area: {v:#}"
+    );
+    // And with every step classified, no flow claims to cross an area it stayed inside.
+    for f in read_flows(&v) {
+        assert_eq!(
+            f.class, "intra",
+            "one folder is one area, so no flow crosses one: {f:?}"
+        );
+        assert_eq!(f.communities, 1, "{f:?}");
+    }
+}
+
+/// The `exported` flag reaches the right symbol.
+///
+/// `exported_by_symbol` used to consume `SELECT exported FROM symbols ORDER BY id`
+/// positionally into a vector sized by the SEGMENT's symbol count. The segment covers only
+/// the files whose `parse_status` is indexed, so the first skipped file shifted every later
+/// flag onto the wrong symbol — and PAR-SYM-09's ×2 doubling then applied to symbols that
+/// are not exported and withheld from ones that are.
+///
+/// The fixture forces the gap: a file the extractor cannot parse sits between two files that
+/// it can, so the store holds symbols the segment does not, and the flag read has to skip
+/// them rather than slide. The entry point after the gap is exported and the one before it
+/// is not, so a shifted read gets both wrong.
+#[test]
+fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
+    let d = repo(&[
+        GO_MOD,
+        // Before the gap: an UNEXPORTED entry point, so its expected score has no ×2.
+        ("aaa/first.go", "package aaa\n\nfunc alphaOne() { alphaTwo(); alphaThree() }\nfunc alphaTwo() {}\nfunc alphaThree() {}\n"),
+        // The gap: a file the index cannot parse, so its symbols are in the store and not
+        // in the segment.
+        ("bbb/broken.go", "\u{feff}package bbb\n\nfunc ???Broken( {\n"),
+        // After the gap: an EXPORTED entry point, which must keep its ×2.
+        ("ccc/last.go", "package ccc\n\nfunc DeltaOne() { DeltaTwo(); DeltaThree() }\nfunc DeltaTwo() {}\nfunc DeltaThree() {}\n"),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let seeds = read_seeds(&v);
+    let by_name = |n: &str| -> Seed {
+        seeds
+            .iter()
+            .find(|s| s.name == n)
+            .cloned()
+            .unwrap_or_else(|| panic!("{n} is a seed in {v:#}"))
+    };
+    let alpha = by_name("alphaOne");
+    let delta = by_name("DeltaOne");
+    // Two callees each, no callers, so the ratio is 2.0 and the name multiplier is 1.0
+    // (`plain`): the whole score is the exported doubling, and nothing else.
+    assert_eq!(
+        alpha.ratio, 2.0,
+        "the unexported twin's ratio: {alpha:?}"
+    );
+    assert!(
+        !alpha.exported,
+        "alphaOne is unexported: {alpha:?}"
+    );
+    assert_eq!(alpha.score, 2.0, "no doubling for an unexported seed: {alpha:?}");
+    assert!(
+        delta.exported,
+        "DeltaOne is exported and the flag must survive the skipped file: {delta:?}"
+    );
+    assert_eq!(delta.score, 4.0, "the exported doubling applies: {delta:?}");
+}

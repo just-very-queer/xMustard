@@ -41,6 +41,11 @@ pub const MAX_FLOWS: usize = 200;
 pub const MAX_STEPS_LISTED: usize = 50;
 /// Steps that must share a name prefix before it is a flow's label.
 pub const LABEL_MIN_MEMBERS: usize = 2;
+/// The area of a symbol the community projection did not place: below the degree floor in
+/// large-graph mode, or reachable only by edges under the confidence floor. It is a
+/// sentinel rather than an area, so it is excluded from every flow's community count
+/// instead of being reported as a community of its own.
+pub const UNCLASSIFIED: u32 = u32::MAX;
 
 /// How a flow's label was produced.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -208,6 +213,11 @@ pub struct Flow {
     pub seeds: Vec<Seed>,
     /// The symbols the walk visited, seed first, capped at [`MAX_STEPS_LISTED`].
     pub steps: Vec<Step>,
+    /// Every symbol the walk visited, listed or not. Not serialized: the label and the
+    /// class are computed over it and the freshness envelope is built from its paths, so
+    /// the listed rows are not the whole answer.
+    #[serde(skip)]
+    pub all_steps: Vec<Step>,
     /// The steps the walk visited beyond the listed ones.
     pub steps_omitted: u64,
     /// The graph distance from a seed to the furthest visited step.
@@ -252,8 +262,20 @@ pub struct Flows {
     pub command: &'static str,
     pub entry_points: Vec<Seed>,
     pub flows: Vec<Flow>,
+    /// Every path that contributed to this answer: each entry point's file, and every step
+    /// of every flow built — including the steps past the listing cap and the flows
+    /// dropped by the MAX_FLOWS cut. Not serialized: the dispatch computes freshness from
+    /// it rather than from the listed rows, which would leave the answer claiming `current`
+    /// while its scores came from a file the walk never listed. `areas()` does the same
+    /// with `total_paths` for the same reason.
+    #[serde(skip)]
+    pub total_paths: Vec<String>,
     /// Admitted symbols: not local to a function body, in a file with a resolver.
     pub symbols_considered: u64,
+    /// Admitted symbols the community projection did not place, so a reader can tell an
+    /// `intra` flow whose steps were all classified from one that also had steps the
+    /// partition declined to place. Excluded from every flow's `communities` count.
+    pub unclassified_symbols: u64,
     /// Admitted symbols whose `exported` flag was true, so a caller can see how much of
     /// the index the ×2 doubling could reach.
     pub exported_symbols: u64,
@@ -357,14 +379,16 @@ pub fn flows_for(snapshot: &super::reader::Snapshot, limits: Limits) -> Result<F
 /// Every flow would therefore be `intra` and the classification would carry no information.
 /// Areas are communities over resolved symbol edges, so a call from one subsystem into
 /// another really does cross one.
-fn area_by_symbol(
-    snapshot: &super::reader::Snapshot,
-) -> Result<BTreeMap<u32, u32>, String> {
+fn area_by_symbol(snapshot: &super::reader::Snapshot) -> Result<BTreeMap<u32, u32>, String> {
     let areas = super::areas::areas_for(snapshot, super::areas::DEFAULT_SEED)?;
     let mut out = BTreeMap::new();
+    // `member_nodes`, not `members`: the listed rows are capped at MAX_MEMBERS, and a
+    // partition read from them leaves every symbol past the cap with no area at all — which
+    // on a large repository is most of them, and turns `cross` into an artefact of the cap.
+    // `member_nodes` is every member the propagation found, listed or not.
     for (rank, area) in areas.areas.iter().enumerate() {
-        for member in &area.members {
-            out.insert(member.node, rank as u32);
+        for node in &area.member_nodes {
+            out.insert(*node, rank as u32);
         }
     }
     Ok(out)
@@ -429,6 +453,22 @@ pub fn flows_of(
             flow(&graph, flow_seeds, walk, limits)
         })
         .collect();
+    // Summed over EVERY flow built, before the MAX_FLOWS cut: the counter means steps the
+    // run did not list, and a flow the run did not list at all still had steps it did not
+    // list. Summing after the cut would understate exactly the run that did the most work.
+    truncation.truncated_step_lists = flows.iter().map(|f| f.steps_omitted).sum();
+    // The freshness set is built from the same pre-cut answer: every entry point's file and
+    // every flow's every step, so a file that only contributed to a dropped flow or to a
+    // step past the listing cap still marks the answer stale when it changes.
+    let total_paths: Vec<String> = seeds
+        .iter()
+        .map(|s| s.path.clone())
+        .chain(
+            flows
+                .iter()
+                .flat_map(|f| f.all_steps.iter().map(|s| s.path.clone())),
+        )
+        .collect();
     flows.sort_by(|a, b| {
         b.seeds[0]
             .score
@@ -440,13 +480,18 @@ pub fn flows_of(
         truncation.dropped_flows = (flows.len() - limits.max_flows) as u64;
         flows.truncate(limits.max_flows);
     }
-    truncation.truncated_step_lists = flows.iter().map(|f| f.steps_omitted).sum();
 
     Ok(Flows {
         command: "flows",
         entry_points: seeds,
         flows,
+        total_paths,
         symbols_considered: graph.nodes.len() as u64,
+        unclassified_symbols: graph
+            .nodes
+            .iter()
+            .filter(|n| n.area == UNCLASSIFIED)
+            .count() as u64,
         exported_symbols: graph.nodes.iter().filter(|n| n.exported).count() as u64,
         candidates: pool,
         call_edges: graph.dst.len() as u64,
@@ -511,10 +556,15 @@ fn build_graph(
             path: seg.file_path(row.file).unwrap_or_default(),
             line: row.line,
             kind: seg.symbol_kind(row.kind).to_string(),
-            area: areas_of
-                .get(&seg.symbol_node(s))
-                .copied()
-                .unwrap_or(u32::MAX),
+            // The areas projection is the community layer, and it does not cover every admitted
+            // symbol: in large-graph mode a node of degree below MIN_DEGREE is dropped, and
+            // an edge below the confidence floor never enters the CSR. A symbol with no area
+            // is UNCLASSIFIED, and giving it a sentinel that then counts as a community
+            // would report a flow as `cross` because the propagation declined to place one
+            // of its steps — an artefact of the admission rule dressed up as a finding. So
+            // the sentinel is dropped from the count, and the answer reports how many
+            // symbols the partition did not cover.
+            area: areas_of.get(&seg.symbol_node(s)).copied().unwrap_or(UNCLASSIFIED),
             exported: exported.and_then(|f| f(s)).unwrap_or(false),
         });
     }
@@ -533,7 +583,13 @@ fn build_graph(
             let Some(other) = edge.node.checked_sub(files) else {
                 continue;
             };
-            let j = slot[other as usize];
+            // `other` is a graph node id, not a symbol-row index, and the slot map is sized
+            // by the segment's symbol count — so a node past it is not an admitted symbol
+            // and must be skipped rather than indexed. `areas.rs` guards the same lookup
+            // for the same reason.
+            let Some(&j) = slot.get(other as usize) else {
+                continue;
+            };
             if j == u32::MAX || j == i as u32 {
                 continue;
             }
@@ -647,37 +703,60 @@ struct Walk {
 /// `visited` doubles as the cycle guard, which is what makes the walk terminate on a cycle
 /// in the call graph. The stack is explicit rather than recursive: the depth is bounded at
 /// ten, but this index does not want a call stack that grows with a repository.
+///
+/// A symbol is marked EXPANDED, not queued, and a symbol reached again by a SHORTER route
+/// is expanded a second time. Marking it on the queue instead makes the reachability set
+/// depend on the order the CSR happens to hold: depth-first means the first route found
+/// wins, so a long chain into a subtree would block the short path beside it and the walk
+/// would report steps that are reachable within depth ten but absent from the answer. The
+/// second expansion is bounded by `max_depth` — a symbol can only be re-expanded on a
+/// strictly shorter route, and there are at most `max_depth` distinct route lengths — so
+/// this terminates on a cycle for the same reason the guard does.
 fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) -> Walk {
-    let mut seen = vec![false; graph.nodes.len()];
+    let mut expanded_at: Vec<u32> = vec![u32::MAX; graph.nodes.len()];
+    let mut visited_set = vec![false; graph.nodes.len()];
     let mut visited = Vec::with_capacity(limits.min_steps);
     let mut stack: Vec<(usize, u32)> = Vec::new();
-    seen[seed as usize] = true;
+    visited_set[seed as usize] = true;
     stack.push((seed as usize, 0));
     let mut deepest = 0u32;
 
     while let Some((node, depth)) = stack.pop() {
+        // A re-expansion only happens on a strictly shorter route, so a symbol's subtree
+        // is walked once per distinct shorter depth at most.
+        if expanded_at[node] <= depth {
+            continue;
+        }
+        expanded_at[node] = depth;
         // `taken` counts the callees actually descended into, not the position in the
         // neighbour list: the branching cap is about how much of the fan a walk explores,
         // and a callee already visited is not exploration.
         let mut taken = 0usize;
+        let mut stopped_branching = 0u64;
+        let mut stopped_depth = 0u64;
         for &callee in graph.callee_slice(node as u32) {
-            if seen[callee as usize] {
+            if visited_set[callee as usize] {
                 continue;
             }
+            // Both counters count every callee the bound stopped, not the node it stopped
+            // at: the walk keeps scanning so a six-way fan under a cap of four reports the
+            // two it did not take rather than one per node.
             if taken >= limits.max_branching {
-                truncation.truncated_at_branching += 1;
-                break;
+                stopped_branching += 1;
+                continue;
             }
             if depth + 1 > limits.max_depth {
-                truncation.truncated_at_depth += 1;
-                break;
+                stopped_depth += 1;
+                continue;
             }
-            seen[callee as usize] = true;
+            visited_set[callee as usize] = true;
             visited.push(callee as usize);
             taken += 1;
             deepest = deepest.max(depth + 1);
             stack.push((callee as usize, depth + 1));
         }
+        truncation.truncated_at_branching += stopped_branching;
+        truncation.truncated_at_depth += stopped_depth;
     }
     Walk {
         visited,
@@ -700,25 +779,46 @@ fn flow(graph: &Graph, seeds: Vec<Seed>, walk: Walk, limits: Limits) -> Flow {
             }
         })
         .collect();
-    // The class is computed over every visited step, not the listed ones, so a listed
-    // subset can never disagree with the count beside it.
+    // The class and the label are computed over every VISITED step, not the listed ones, so
+    // a listed subset can neither disagree with the count beside it nor produce a label
+    // that no complete step set would. The steps a walk reached past the listing cap are
+    // still steps the flow has.
+    let all_steps: Vec<Step> = walk
+        .visited
+        .iter()
+        .map(|&i| {
+            let node = &graph.nodes[i];
+            Step {
+                node: node.graph_node,
+                name: node.name.clone(),
+                path: node.path.clone(),
+                line: node.line,
+            }
+        })
+        .collect();
     let communities: BTreeSet<u32> = walk
         .visited
         .iter()
         .map(|&i| graph.nodes[i].area)
+        .filter(|a| *a != UNCLASSIFIED)
         .collect();
+    // `cross` means the steps sit in two or more REAL communities. A flow whose steps are
+    // all in one community plus some the partition does not cover is still `intra`, because
+    // the unclassified ones are the propagation declining to place them, not a second
+    // community the flow crossed.
     let class = if communities.len() > 1 {
         FlowClass::Cross
     } else {
         FlowClass::Intra
     };
-    let (label, rule) = label_of(&steps, &seeds);
+    let (label, rule) = label_of(&all_steps, &seeds);
     Flow {
         label,
         label_rule: rule,
         class,
         seeds,
         steps,
+        all_steps,
         steps_omitted: (walk.visited.len() - listed) as u64,
         depth: walk.depth,
         communities: communities.len() as u64,

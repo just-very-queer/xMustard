@@ -320,14 +320,31 @@ impl Snapshot {
         self.exported
             .get_or_init(|| {
                 self.with_text(|conn| {
+                    // The segment holds a SUBSET of the store's symbols — a file the
+                    // retention envelope skipped has no segment row — so a symbol's
+                    // position in a plain `SELECT ... ORDER BY id` is NOT its dense segment
+                    // index: the first gap shifts every later flag onto the wrong symbol,
+                    // which changes PAR-SYM-09's ×2 exported doubling and with it every
+                    // score. The segment's dense order is the store's symbols over the
+                    // segment's ADMITTED files, ordered by id (see `csr::load`, which fills
+                    // `seg_syms` with exactly that ORDER BY), so the flags are read with the
+                    // same restriction and the same ordering rather than consumed positionally.
+                    let statuses = super::csr::indexed_status_list();
                     let mut out = vec![false; self.seg.counts().symbols as usize];
-                    let mut st = conn.prepare("SELECT exported FROM symbols ORDER BY id")?;
+                    // The same predicate and the same ordering the loader used for
+                    // `seg_files`/`seg_syms` (`csr::load_dense_tables`): the files whose
+                    // `parse_status` is indexed, and their symbols in id order. Reading the
+                    // flags through that restriction is what keeps a segment slot and a
+                    // store row in step.
+                    let mut st = conn.prepare(&format!(
+                        "SELECT s.exported FROM symbols s
+                         JOIN files f ON f.id = s.file_id
+                         WHERE f.parse_status IN ({statuses})
+                         ORDER BY s.id"
+                    ))?;
                     let mut rows = st.query([])?;
                     let mut i = 0usize;
                     while let Some(row) = rows.next()? {
-                        // The segment covers a subset of the store's symbols (a file the
-                        // retention envelope skipped has no row), so the walk stops at the
-                        // segment's count rather than overrunning the vector.
                         let Some(slot) = out.get_mut(i) else { break };
                         *slot = row.get(0)?;
                         i += 1;

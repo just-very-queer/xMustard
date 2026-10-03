@@ -126,6 +126,14 @@ pub struct Area {
     /// member rows, and the answer's shape must not grow a field for it.
     #[serde(skip)]
     pub total_paths: Vec<String>,
+    /// Every member's graph node, whether or not the member is listed. Not serialized,
+    /// and for the same reason: it exists so a caller that needs the PARTITION — WS-38c
+    /// classifies flows against it — reads the full membership rather than the capped
+    /// `members` list. A consumer that built its partition from `members` would give every
+    /// symbol past `MAX_MEMBERS` a missing area, and on a large repository that is most of
+    /// them.
+    #[serde(skip)]
+    pub member_nodes: Vec<u32>,
 }
 
 /// The areas of one index generation.
@@ -648,6 +656,7 @@ fn areas(p: &Projection, community: &[u32]) -> Vec<Area> {
                 .iter()
                 .map(|r| seg.file_path(p.rows[r.3 as usize].file).unwrap_or_default())
                 .collect(),
+            member_nodes: rows.iter().map(|r| p.nodes[r.3 as usize]).collect(),
         });
     }
     out
