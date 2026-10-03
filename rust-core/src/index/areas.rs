@@ -210,7 +210,7 @@ fn shared_prefix(names: &[String]) -> Option<String> {
         })
         .collect();
     let mut candidates: Vec<String> = leading.iter().flatten().cloned().collect();
-    // Longest first, so the longest shared leading stem wins; duplicates collapse.
+    // The longest shared leading stem wins; duplicates collapse.
     candidates.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     candidates.dedup();
     for candidate in candidates {

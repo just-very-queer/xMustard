@@ -218,7 +218,7 @@ fn the_same_seed_gives_the_same_areas_after_a_full_rebuild() {
     build(d.path());
     let after = areas(d.path(), &["--seed=7"]);
     // The whole answer, not just the membership: a rebuild that kept the area ids but
-    // changed a label, a cohesion figure, the keyword list, the member order, the
+    // moved a label, a cohesion figure, the keyword list, the member order, the
     // truncation flag or the mode would pass a membership comparison.
     assert_eq!(
         without_freshness(&before),
