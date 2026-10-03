@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -361,6 +362,15 @@ func rootsBackoff(cached *rootsState, timedOut bool) time.Duration {
 	return 0
 }
 
+// backOff opens the retry window rootsBackoff names, if any, and states it in the
+// error, so every failure class shares one window rule and one wording.
+func (st *rootsState) backOff(cached *rootsState, timedOut bool) {
+	if after := rootsBackoff(cached, timedOut); after > 0 {
+		st.retryAt = time.Now().Add(after)
+		st.err += fmt.Sprintf(" (asked again after %s)", after)
+	}
+}
+
 // unsentRootCause reports a roots/list request that was never delivered, so the
 // client's answer says nothing about its roots and nothing about its health. On a
 // Streamable HTTP session a plain JSON exchange has no event stream to ask on, and
@@ -370,6 +380,12 @@ func rootsBackoff(cached *rootsState, timedOut bool) time.Duration {
 // root. Such a failure is not cached at all.
 func unsentRootCause(err error) bool {
 	return errors.Is(err, errNoStream)
+}
+
+// isJSONArray reports whether raw is a JSON array (leading whitespace allowed).
+func isJSONArray(raw json.RawMessage) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '['
 }
 
 func rootOf(list []registeredWorkspace, id string) string {
@@ -420,10 +436,7 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 		// transport message (8 MiB by default), so it is clipped before it is stored
 		// rather than after it is reported.
 		st.err, st.transient = "roots/list failed: "+clip(err.Error(), rootsErrClip), true
-		if after := rootsBackoff(cached, errors.Is(err, context.DeadlineExceeded)); after > 0 {
-			st.retryAt = time.Now().Add(after)
-			st.err += fmt.Sprintf(" (asked again after %s)", after)
-		}
+		st.backOff(cached, errors.Is(err, context.DeadlineExceeded))
 	default:
 		var r struct {
 			Roots []struct {
@@ -437,10 +450,7 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			// rejected answer can still hold usable roots; r is not walked, which drops
 			// them.
 			st.err, st.transient = "roots/list answer is malformed: "+clip(err.Error(), rootsErrClip), true
-			if after := rootsBackoff(cached, false); after > 0 {
-				st.retryAt = time.Now().Add(after)
-				st.err += fmt.Sprintf(" (asked again after %s)", after)
-			}
+			st.backOff(cached, false)
 			break
 		}
 		for _, root := range r.Roots {
@@ -453,12 +463,15 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			// cleanly but does not carry the field the request asked for, so it is
 			// not a statement about the client's roots; caching it would hide a
 			// client that has them until roots/list_changed.
-			var shape map[string]json.RawMessage
-			if json.Unmarshal(raw, &shape) == nil {
-				if _, ok := shape["roots"]; !ok {
-					st.err, st.transient = "roots/list answer carries no roots field", true
-					break
-				}
+			// Only a JSON array is a statement; a missing field and null are failures,
+			// and a repeated one backs off like any other client failure.
+			var shape struct {
+				Roots json.RawMessage `json:"roots"`
+			}
+			if json.Unmarshal(raw, &shape) != nil || !isJSONArray(shape.Roots) {
+				st.err, st.transient = "roots/list answer carries no roots array", true
+				st.backOff(cached, false)
+				break
 			}
 			st.err = "the client listed no file:// roots"
 		}
