@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -87,14 +88,23 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 		// continue at the first item the caller did not receive, so the caller pages
 		// without computing an offset (WS-59e).
 		//
-		// Each of the two passes reconciles the cursor against the page the budget
-		// actually wrote and then settles the report over it. Settling can trim again, so
-		// the second pass re-derives the cursor from what survived; the second reconcile
-		// cannot grow the result, so it does not re-trim. Two passes, not a loop with a
-		// convergence test: each pass either leaves the page alone or removes items, and a
-		// third pass would only re-derive the same cursor.
+		// Each pass reconciles the cursor against the page the budget actually wrote and
+		// then settles the report over it. Settling can trim again, so the next pass
+		// re-derives the cursor from what survived.
+		//
+		// The loop stops when a pass leaves the bytes unchanged, which is the condition
+		// that matters: the answer is emitted only after a pass that re-settled it. A fixed
+		// count would be a claim that two passes always suffice, and M22 showed that claim
+		// is not provable through this route -- fitEach binary-searches the item count
+		// against max_chars, so a page cut in the first pass is already at the boundary and
+		// the second pass usually trims back to the count the first reconcile signed. What
+		// bounds the loop is that a pass either removes items or changes none, so each
+		// pass strictly shrinks the tier list and the fixed point is reached; the cap is a
+		// backstop, not the exit condition (WS-59e-r5-6).
 		if spec.Tool == "impact" {
-			for pass := 0; pass < 2; pass++ {
+			const maxImpactSettlePasses = 4
+			for pass := 0; pass < maxImpactSettlePasses; pass++ {
+				before := out
 				out = workspaceops.ReconcileImpactPaging(ws, q, out)
 				settled, serr := spec.Settle(out, req, page)
 				if serr != nil {
@@ -105,6 +115,9 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 					return
 				}
 				out = settled
+				if bytes.Equal(before, out) {
+					break
+				}
 			}
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
