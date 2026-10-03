@@ -1794,6 +1794,12 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                 identity = args.get(i + 1).cloned();
                 2
             }
+            "--identity-limitations" if identity.is_none() => {
+                return Err(CmdError::new(
+                    2,
+                    "index: --identity-limitations needs --identity-key before it",
+                ));
+            }
             "--identity-limitations" => {
                 let n = args
                     .get(i + 1)

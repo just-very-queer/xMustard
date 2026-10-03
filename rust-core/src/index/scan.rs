@@ -741,8 +741,12 @@ fn scan_git(
             }
             return;
         };
-        // a gitlink, or the `sub/` an untracked listing gives a nested repository
-        if mode == Mode::Gitlink || path.ends_with('/') {
+        // a gitlink, or the `sub/` an untracked listing gives a nested repository (a
+        // directory without its own `.git` is not one: its files are listed one by one)
+        if mode == Mode::Gitlink
+            || (path.ends_with('/')
+                && crate::indexcache::has_own_git(&root.join(path.trim_end_matches('/'))))
+        {
             let rel = path.trim_end_matches('/');
             let modules =
                 modules.get_or_insert_with(|| crate::indexcache::submodule_paths(toplevel));

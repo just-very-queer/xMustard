@@ -511,7 +511,8 @@ pub fn explain_path(
 /// worktree that is Git's own listing of tracked and untracked, not ignored files, so
 /// files inside a nested repository (listed by Git as `sub/`) and ignored files are not
 /// counted, as the index does not count them (WS-RT2). Outside Git, or when the
-/// listing fails, the tree is walked.
+/// listing fails, the tree is walked; the walk still does not enter a directory with
+/// its own `.git`.
 fn for_each_repo_map_file(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) {
     let listing = crate::indexcache::run_git_bounded(
         root_path,
@@ -528,7 +529,12 @@ fn for_each_repo_map_file(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) 
     let Ok(out) = listing else {
         for entry in WalkDir::new(root_path)
             .into_iter()
-            .filter_entry(|entry| !should_skip_entry(root_path, entry))
+            .filter_entry(|entry| {
+                let nested = entry.depth() > 0
+                    && entry.file_type().is_dir()
+                    && crate::indexcache::has_own_git(entry.path());
+                !nested && !should_skip_entry(root_path, entry)
+            })
             .filter_map(Result::ok)
             .filter(|entry| entry.file_type().is_file())
         {

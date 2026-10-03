@@ -406,6 +406,18 @@ fn readers_report_the_stamped_identity_completeness() {
         "{s}"
     );
 
+    // a count without the key it belongs to is refused
+    let out = Command::new(BIN)
+        .args(["index", "update", root, "--identity-limitations", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
     // a key stamped without a count is not known to be complete
     run_json(&["index", "update", root, "--identity-key", "k2"]);
     assert_eq!(identity("k2")["identity_complete"], false);
@@ -426,4 +438,18 @@ fn the_repo_map_counts_the_files_git_lists() {
     let map = build_repo_map(r.path(), "ws").unwrap();
     // a.go, b.go, c.go and the untracked new.go; not sub/x.go, sub/y.go or gen/out.go
     assert_eq!(map.source_files, 4, "{map:?}");
+}
+
+// Outside Git the map walks the tree, and still does not enter a nested repository.
+#[test]
+fn the_repo_map_walk_skips_nested_repositories() {
+    let r = TempDir::new().unwrap();
+    write(
+        r.path(),
+        "a.go",
+        "package p\n\nfunc Alpha() int { return 1 }\n",
+    );
+    sub_repo(&r.path().join("sub"));
+    let map = build_repo_map(r.path(), "ws").unwrap();
+    assert_eq!(map.source_files, 1, "{map:?}");
 }
