@@ -392,7 +392,20 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	title := strings.TrimSpace(req.Title)
 	// read outside the transaction: resolving identifiers asks the core worker
 	extracted, warnings := proposalAnchors(ctx, root, workspaceID, title+"\n"+req.Content, declared)
-	review := reviewInput{workspaceID: workspaceID, scope: "workspace", content: req.Content, declared: declared, anchors: extracted,
+	// The scope is DERIVED here, before the review, and it is the only place it is
+	// derived (WS-29b): Scope, ScopeKey and Metadata on the request are declared and
+	// ignored, so they reach no field below. Deriving it first also means an invalid
+	// visibility is refused before anything is written, and the review compares this
+	// proposal against entries of ITS OWN scope rather than the workspace's, so a
+	// private restatement corroborates a private entry instead of a workspace one.
+	scoped, err := DeriveScoped(ScopeRequest{
+		Visibility: req.Visibility, Dir: req.Dir, RunID: req.RunID, SessionID: req.SessionID,
+	}, caller)
+	if err != nil {
+		return nil, err
+	}
+	review := reviewInput{workspaceID: workspaceID, scope: scoped.Scope, scopeKey: scoped.Key,
+		content: req.Content, declared: declared, anchors: extracted,
 		claims: claims, intent: len(supersedes)+len(claims)+len(relations) > 0, quarantine: caller.Quarantine,
 		kind: req.Kind, topic: normalizeTopic(req.Topic), tags: cleanPaths(req.Tags), expires: strings.TrimSpace(req.Expires),
 		tier: tier, reviewer: caller.Verifier || caller.Approver}
@@ -438,14 +451,6 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		required := max(threshold, supersededGate)
 		if selfNote != "" {
 			required = 1
-		}
-		// The scope is DERIVED here and nowhere else (WS-29b): Scope, ScopeKey, Metadata
-		// and Visibility are caller-supplied and reach no field below.
-		scoped, err := DeriveScoped(ScopeRequest{
-			Visibility: req.Visibility, Dir: req.Dir, RunID: req.RunID, SessionID: req.SessionID,
-		}, caller)
-		if err != nil {
-			return err
 		}
 		e, err := tx.InsertEntry(ctx, govstore.NewEntry{
 			ID:          "ctx_" + hashID(workspaceID, req.Title, req.Content+nowUTC())[:12],
@@ -756,19 +761,15 @@ var rememberOps = map[string]func(dataDir, workspaceID string, req RememberReque
 }
 
 // proposal is the proposal a propose or supersede op makes: the request with its
-// one-line description. RunID and SessionID are declared on both RememberRequest and
-// ProposeContextRequest and the outer ones shadow the embedded ones, so the keys a
-// remember call supplies are carried across explicitly: without this the derivation
-// would see empty keys and store a workspace-scoped memory (WS-29b).
+// one-line description. The outer RunID and SessionID are PROVENANCE: they name the
+// run or session a write came from and are recorded on the entry either way. They are
+// deliberately not carried across as the scope keys, because remember's run_id is
+// optional and an MCP client that cites its run would then get a memory it cannot
+// read back (the MCP recall tool has no run key; review round 2, P2). A caller that
+// wants run scope asks for it with visibility=run.
 func (req RememberRequest) proposal() ProposeContextRequest {
 	p := req.ProposeContextRequest
 	p.Description = derefStr(req.Description)
-	if p.RunID == "" {
-		p.RunID = req.RunID
-	}
-	if p.SessionID == "" {
-		p.SessionID = req.SessionID
-	}
 	return p
 }
 

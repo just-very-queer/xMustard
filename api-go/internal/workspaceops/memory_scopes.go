@@ -87,7 +87,16 @@ func DeriveScoped(req ScopeRequest, actor ContextActor) (Scoped, error) {
 		return Scoped{Scope: ScopeWorkspace}, nil
 	}
 	if visibility == ScopePrivate {
-		return Scoped{Scope: ScopePrivate, Key: strings.TrimSpace(actor.ID)}, nil
+		// A private memory is served to its author and to nobody else, so it needs an
+		// author to be readable by. Open mode has no principal, and samePrincipal
+		// rejects that identity for every reader, so accepting the write would store a
+		// memory its own writer can never read back: the derivation refuses it, as it
+		// refuses global for the same reason.
+		who := strings.TrimSpace(actor.ID)
+		if who == "" || IsOpenModeIdentity(who) {
+			return Scoped{}, fmt.Errorf("%w: scope %q needs a named principal", ErrInvalidInput, visibility)
+		}
+		return Scoped{Scope: ScopePrivate, Key: who}, nil
 	}
 	if visibility == ScopeGlobal {
 		// User-level and derived from the principal, exactly like private: the key is

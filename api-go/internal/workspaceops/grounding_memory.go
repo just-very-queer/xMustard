@@ -72,6 +72,10 @@ type groundMemoryOptions struct {
 	// result the index section already read, so the invalidation does not read it again.
 	ctx     context.Context
 	changes json.RawMessage
+	// The caller's own scope keys (WS-29b): a private, run, session or directory
+	// memory the caller may not read is not counted in ground's totals or at-risk
+	// details either. Empty means the caller named none, so none is served.
+	scopeDir, scopeRunID, scopeSessionID string
 }
 
 // noSince is the since value of a ground call that names no revision.
@@ -156,8 +160,13 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 		if scan.revision, err = r.MemoryRevision(ctx, workspaceID); err != nil {
 			return err
 		}
+		// The caller's own keys narrow this scan as they narrow recall (WS-29b): a
+		// private, run, session or directory memory the caller may not read is not
+		// counted here either, so ground's totals and at-risk details cannot disclose
+		// it. A caller naming no key sees no confined entry.
 		view, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, Caller: caller,
-			States: []string{govstore.RankServed, govstore.RankPending}})
+			States:   []string{govstore.RankServed, govstore.RankPending},
+			ScopeDir: opts.scopeDir, ScopeRunID: opts.scopeRunID, ScopeSessionID: opts.scopeSessionID})
 		if err != nil {
 			return err
 		}

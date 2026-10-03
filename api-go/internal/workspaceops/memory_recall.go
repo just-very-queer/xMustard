@@ -579,7 +579,8 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	var claimed map[string]bool
 	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
-		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller}); err != nil {
+		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller,
+			ScopeDir: req.Dir, ScopeRunID: req.RunID, ScopeSessionID: req.SessionID}); err != nil {
 			return err
 		}
 		if len(qtokens) > 0 {

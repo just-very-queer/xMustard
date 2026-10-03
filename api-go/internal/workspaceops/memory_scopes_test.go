@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"context"
 	"fmt"
 	"slices"
 	"strings"
@@ -36,7 +37,8 @@ func TestDeriveScopeCoversEveryPrincipalAndRunInput(t *testing.T) {
 			actor: ContextActor{ID: "owner-a", Kind: PrincipalHuman, Approver: true},
 			want:  ScopePrivate,
 		},
-		{name: "an agent may ask for private", req: ScopeRequest{Visibility: ScopePrivate}, want: ScopePrivate},
+		{name: "an agent may ask for private", req: ScopeRequest{Visibility: ScopePrivate},
+			actor: ContextActor{ID: "author-a"}, want: ScopePrivate},
 		{
 			name:   "a run id with no run is refused",
 			req:    ScopeRequest{Visibility: ScopeRun},
@@ -564,33 +566,38 @@ func TestAnImplicitDirectoryKeyIsValidatedLikeAnExplicitOne(t *testing.T) {
 	}
 }
 
-// A remember call supplies run and session keys on the outer request, which shadows
-// the embedded fields: the derivation must still see them. A run id is additionally
-// checked against the workspace's runs by bindProvenance, so the stored case uses the
-// session key and the derivation case covers the run key.
-func TestARememberCallCarriesItsRunAndSessionKeysIntoTheDerivation(t *testing.T) {
+// remember's run_id and session_id are PROVENANCE, not scope keys: they name where a
+// write came from and are recorded either way, but they do not make the memory
+// confined, because the MCP recall tool has no run or session key to read it back
+// with (review round 2, P2). A caller that wants run scope asks for it explicitly.
+func TestARememberCallKeepsItsRunAndSessionKeysAsProvenanceNotScope(t *testing.T) {
 	dir := singleAgentDir(t)
-	t.Run("session_id on the outer request", func(t *testing.T) {
-		req := RememberRequest{SessionID: "claude:s9",
-			ProposeContextRequest: ProposeContextRequest{Title: "outer session", Content: "the key must survive",
-				Permission: "readwrite"}}
-		e, err := Remember(dir, "ws-1", req, ContextActor{ID: "author-a"})
-		if err != nil {
-			t.Fatalf("propose: %v", err)
-		}
-		if e.Scope != ScopeSession || e.ScopeKey != "claude:s9" {
-			t.Fatalf("stored scope %q/%q, want session/claude:s9", e.Scope, e.ScopeKey)
-		}
-	})
-	t.Run("run_id on the outer request reaches the derivation", func(t *testing.T) {
-		// bindProvenance checks a run id against the workspace's runs before the write,
-		// so the stored run case needs a real run; what this asserts is that the key
-		// survives proposal() and reaches the derivation at all.
-		p := RememberRequest{RunID: "run-9"}.proposal()
-		if p.RunID != "run-9" {
-			t.Fatalf("proposal() dropped the outer run id: %q", p.RunID)
-		}
-		scoped, err := DeriveScoped(ScopeRequest{RunID: p.RunID}, ContextActor{ID: "author-a"})
+	for _, c := range []struct {
+		name string
+		req  RememberRequest
+	}{
+		{"run_id", RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "provenance run",
+			Content: "the run is recorded, not the scope", Permission: "readwrite"}}},
+		{"session_id", RememberRequest{SessionID: "claude:s9",
+			ProposeContextRequest: ProposeContextRequest{Title: "provenance session",
+				Content: "the session is recorded, not the scope", Permission: "readwrite"}}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			e, err := Remember(dir, "ws-1", c.req, ContextActor{ID: "author-a"})
+			if err != nil {
+				t.Fatalf("propose: %v", err)
+			}
+			if e.Scope != ScopeWorkspace {
+				t.Fatalf("provenance %s made the memory %q scoped, want %q", c.name, e.Scope, ScopeWorkspace)
+			}
+		})
+	}
+	// The keys are recorded as provenance, which is where they were before this row.
+	if p := (RememberRequest{RunID: "run-9", SessionID: "claude:s9"}).proposal(); p.RunID != "" || p.SessionID != "" {
+		t.Fatalf("proposal() leaked the provenance keys into the scope request: run=%q session=%q", p.RunID, p.SessionID)
+	}
+	t.Run("visibility=run still confines", func(t *testing.T) {
+		scoped, err := DeriveScoped(ScopeRequest{Visibility: ScopeRun, RunID: "run-9"}, ContextActor{ID: "author-a"})
 		if err != nil {
 			t.Fatalf("derive: %v", err)
 		}
@@ -621,6 +628,61 @@ func TestGlobalIsDerivedFromThePrincipalAndServedToNobodyYet(t *testing.T) {
 	}
 	if _, err := DeriveScope(ScopeRequest{Visibility: ScopeGlobal}, ContextActor{}); err == nil {
 		t.Fatal("an anonymous caller must not derive a global scope")
+	}
+}
+
+// The standing-memory projection is pushed into every session and cached per
+// workspace with no reader identity, so a confined memory must not be in it at all:
+// its author cannot be told apart from anybody else there (WS-29b, review round 2).
+func TestTheStandingMemoryProjectionCarriesOnlyWorkspaceScopedEntries(t *testing.T) {
+	dir := singleAgentDir(t)
+	workspace := propose(t, dir, "ws-1", "author-a", "projected", "the budget line is per build profile omega")
+	private := propose(t, dir, "ws-1", "author-a", "not projected", "the staging credentials live in vault omega",
+		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate })
+	run := propose(t, dir, "ws-1", "author-a", "not projected either", "the run holds an open migration omega",
+		func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" })
+
+	proj, err := CoreProjection(context.Background(), dir, "ws-1", ProjectionDefaultChars)
+	if err != nil {
+		t.Fatalf("projection: %v", err)
+	}
+	// The index lists served entries by title and description, so a confined memory
+	// would show up here rather than in Core; both the rendered text and the count are
+	// checked, because a count alone could pass with the right number and the wrong
+	// entries.
+	for _, confined := range []struct {
+		id    string
+		title string
+		what  string
+	}{
+		{private.ID, "not projected", "a private memory"},
+		{run.ID, "not projected either", "a run-scoped memory"},
+	} {
+		if strings.Contains(proj.Text, confined.id) || strings.Contains(proj.Text, confined.title) {
+			t.Errorf("%s reached the projection text:\n%s", confined.what, proj.Text)
+		}
+	}
+	if proj.Deferred.Entries != 1 {
+		t.Errorf("the deferred index counted %d served entries, want only the workspace-scoped one",
+			proj.Deferred.Entries)
+	}
+	if !strings.Contains(proj.Text, workspace.ID) && proj.Deferred.Entries != 1 {
+		t.Errorf("the workspace-scoped memory must still be projected:\n%s", proj.Text)
+	}
+}
+
+// open mode has no principal, so a private or global memory would be one its writer
+// can never read back; the derivation refuses both rather than storing a dead entry.
+func TestAScopeThatNeedsAPrincipalIsRefusedInOpenMode(t *testing.T) {
+	for _, scope := range []string{ScopePrivate, ScopeGlobal} {
+		t.Run(scope, func(t *testing.T) {
+			if _, err := DeriveScope(ScopeRequest{Visibility: scope}, ContextActor{ID: OpenModeIdentity}); err == nil {
+				t.Fatalf("%s must be refused for the open-mode identity", scope)
+			}
+			if _, err := DeriveScope(ScopeRequest{Visibility: scope}, ContextActor{}); err == nil {
+				t.Fatalf("%s must be refused for an anonymous caller", scope)
+			}
+		})
 	}
 }
 

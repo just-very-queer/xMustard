@@ -186,17 +186,20 @@ func TestAPrivateMemoryIsNotDisclosedOnAnyHTTPReadPath(t *testing.T) {
 	}
 	// The same key has to reach RANKED recall, not only the by-id path: a parser that
 	// read dir for one route and not the other would leave a dir-scoped memory
-	// unreachable from the tool an agent actually calls.
+	// unreachable from the tool an agent actually calls. include_pending is needed
+	// because these proposals are still pending in single-agent-free mode, and the
+	// route requires a reviewer for it, which alice holds as an agent.
 	for _, c := range []struct {
 		query string
-		want  int
+		want  bool
 	}{
-		{"?query=omega&dir=api-go/internal", http.StatusOK},
-		{"?query=omega&dir=api-go/cmd", http.StatusOK},
+		{"?query=omega&dir=api-go/internal&include_pending=true", true},
+		{"?query=omega&dir=api-go/cmd&include_pending=true", false},
 	} {
 		code, got := call("alice", "GET", "/context/active"+c.query, "")
-		if code != c.want {
-			t.Errorf("ranked recall %q: want %d, got %d %v", c.query, c.want, code, got)
+		if code != http.StatusOK {
+			t.Errorf("ranked recall %q: want 200, got %d %v", c.query, code, got)
+			continue
 		}
 		served := false
 		for _, e := range entryList(t, got) {
@@ -204,8 +207,8 @@ func TestAPrivateMemoryIsNotDisclosedOnAnyHTTPReadPath(t *testing.T) {
 				served = true
 			}
 		}
-		if want := c.query == "?query=omega&dir=api-go/internal"; served != want {
-			t.Errorf("ranked recall %q served the dir-scoped entry: %v, want %v", c.query, served, want)
+		if served != c.want {
+			t.Errorf("ranked recall %q served the dir-scoped entry: %v, want %v", c.query, served, c.want)
 		}
 	}
 }
