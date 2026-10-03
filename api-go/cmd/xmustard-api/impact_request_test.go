@@ -161,6 +161,75 @@ printf '{"symbol":"Serve","impacted_count":%s,"by_depth":[{"depth":1,"total":%s,
 	}
 }
 
+// The paging members reconciliation adds are counted by the budget report. A result
+// the budget trimmed carries has_more (and often a cursor), and those bytes are written
+// after the report was fitted, so a report settled before reconciliation names a length
+// the response does not have. Here the stub core emits a tier large enough that the
+// budget trims it, and the answer's own bytes must match what output_budget reports.
+func TestImpactBudgetReportCountsTheReconciledPagingMembers(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	core := filepath.Join(t.TempDir(), "xmustard-core")
+	// A tier of 400 items with a successor: the budget cuts it, so reconciliation
+	// re-signs the cursor and sets has_more after the report is fitted.
+	script := `#!/bin/sh
+items=""
+i=0
+while [ $i -lt 400 ]; do
+  items="$items{\"name\":\"SymbolWithAFairlyLongName$i\",\"depth\":1,\"kind\":\"function\",\"path\":\"pkg/deep/nested/path/to/file$i.go\"},"
+  i=$((i + 1))
+done
+printf '{"symbol":"Serve","impacted_count":400,"by_depth":[{"depth":1,"total":400,"offset":0,"items":[%s],"next_offset":400}]}' "${items%,}"
+`
+	if err := os.WriteFile(core, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	ws, root := "wsImpactBudget", t.TempDir()
+	snap, _ := json.Marshal(map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": root}})
+	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workspaces", ws, "snapshot.json"), snap, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// max_chars above the ladder's floor leaves room for part of the tier, so the
+	// tiers rung cuts it and reconciliation adds the paging members.
+	resp, err := http.Get(srv.URL + "/api/workspaces/" + ws + "/changes/since-index?symbol=Serve&limit=50&max_chars=2000")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var res struct {
+		HasMore      *bool `json:"has_more"`
+		OutputBudget *struct {
+			MaxChars  int  `json:"max_chars"`
+			UsedChars int  `json:"used_chars"`
+			OverBudget bool `json:"over_budget"`
+		} `json:"output_budget"`
+	}
+	if err := json.Unmarshal(body, &res); err != nil {
+		t.Fatal(err)
+	}
+	if res.OutputBudget == nil {
+		t.Fatalf("no output_budget report: %s", body)
+	}
+	if res.OutputBudget.UsedChars != len(body) {
+		t.Errorf("used_chars %d, the response is %d bytes: the report was settled before the paging members were added",
+			res.OutputBudget.UsedChars, len(body))
+	}
+	if res.HasMore == nil {
+		t.Fatalf("a trimmed tier reported neither has_more nor a cursor: %s", body)
+	}
+	if res.OutputBudget.OverBudget || len(body) > res.OutputBudget.MaxChars {
+		t.Errorf("a reconciled answer of %d bytes over max_chars %d (over_budget=%v)",
+			len(body), res.OutputBudget.MaxChars, res.OutputBudget.OverBudget)
+	}
+}
+
 // The core's refusal of a scope= request (a revision that names no commit) is a 400
 // that names it; any other core failure stays a sanitized 500.
 func TestImpactScopeRefusedByTheCoreIsABadRequest(t *testing.T) {
