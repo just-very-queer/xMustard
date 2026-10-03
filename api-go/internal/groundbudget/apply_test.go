@@ -532,30 +532,49 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 // unchanged tree, and reached 410,824-423,592 under WS-32a's load against a
 // 402,909-byte line: the flake this test is. Subtracting two windows of the same
 // shape removes that term instead of diluting it.
+//
+// The copy guard's two windows are steady-state, and that is measured rather than
+// assumed: the very first Apply into a fresh heap also pays for the heap's growth into
+// this working set, and that cost lands on whichever fixture is measured first. Cold,
+// over 12 runs, the difference spans -14,688 to +2,456 bytes
+// (logs/ws-flk-09-run-20261003T213617Z.log); warmed, over 6 runs it spans -1,323 to +551
+// (logs/ws-flk-09-run-20261003T211132Z.log). The first call is not left unasserted: the
+// guard reads it separately and holds WorkingSet to it, because WorkingSet is what a
+// caller admits before that first call.
 const (
 	allocPadBytes  = 400
 	allocProbeRuns = 8
 )
 
-// allocPerCall is the bytes one Apply call allocates, as the mean over runs identical
-// calls. It still reads a process-wide counter, so it carries the same noise the
-// difference below is there to cancel; use it only against a line it cannot straddle,
-// and never as the copy guard on its own.
-func allocPerCall(t *testing.T, raw []byte, req Request) int64 {
+// allocOf returns the bytes Apply allocates for raw in one call, after an untimed warm-up
+// call when warm is set. It reads a process-wide counter, so it carries the same noise the
+// difference the caller takes is there to cancel; never read it alone as a copy guard.
+func allocOf(t *testing.T, raw []byte, req Request, warm bool) int64 {
 	t.Helper()
-	if _, err := Apply(raw, req); err != nil { // warm-up: the heap's first growth into this working set
-		t.Fatal(err)
-	}
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
-	for i := 0; i < allocProbeRuns; i++ {
+	if warm {
 		if _, err := Apply(raw, req); err != nil {
 			t.Fatal(err)
 		}
 	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	if _, err := Apply(raw, req); err != nil {
+		t.Fatal(err)
+	}
 	runtime.ReadMemStats(&after)
-	return int64(after.TotalAlloc-before.TotalAlloc) / allocProbeRuns
+	return int64(after.TotalAlloc - before.TotalAlloc)
+}
+
+// steadyOf is allocOf averaged over allocProbeRuns warm calls, which is the figure the
+// copy guard's difference is read off.
+func steadyOf(t *testing.T, raw []byte, req Request) int64 {
+	t.Helper()
+	var sum int64
+	for i := 0; i < allocProbeRuns; i++ {
+		sum += allocOf(t, raw, req, true)
+	}
+	return sum / allocProbeRuns
 }
 
 func TestApplyDoesNotCopyTheResult(t *testing.T) {
@@ -569,26 +588,32 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 
 	// A copy is bytes; the element tables and the output are not. Everything the wide
 	// result adds is padding inside elements Apply never copies, so its allocation must
-	// stay within the same small allowance as the narrow one's.
+	// stay within the same small allowance as the narrow one's. The allowance covers the
+	// measurement noise the two windows do not cancel, not the copy: a copy of either
+	// result is about 8.8 MB (the slop audit's S5 rows).
 	const copyAllowance = 8 << 10
-	copied := allocPerCall(t, wide, req) - allocPerCall(t, narrow, req)
+	copied := steadyOf(t, wide, req) - steadyOf(t, narrow, req)
 	if copied > copyAllowance {
 		t.Fatalf("Apply allocated %d more bytes for a %d-byte result than for a %d-byte one with the same %d list elements;"+
 			" it must not copy the result", copied, len(wide), len(narrow), 40050)
 	}
 
-	// The narrow result still has to fit its own line: its allocation is the element
-	// tables (160,200 bytes for 40,050 elements) plus the output, well under a quarter.
-	narrowAlloc := allocPerCall(t, narrow, req)
-	if narrowAlloc > int64(len(narrow))/4 {
-		t.Fatalf("Apply allocated %d bytes for a %d-byte result; it must not copy the result", narrowAlloc, len(narrow))
+	// The first call a caller makes is the one WorkingSet has to cover, so it is read
+	// cold and asserted on its own: the result plus that call's allocations must fit in
+	// what the API admits. Its line is the one Apply has always had to meet for a single
+	// call, len(raw)/4, unchanged by this row.
+	coldAlloc := allocOf(t, narrow, req, false)
+	if coldAlloc > int64(len(narrow))/4 {
+		t.Fatalf("the first Apply call allocated %d bytes for a %d-byte result; it must not copy the result",
+			coldAlloc, len(narrow))
 	}
-	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+narrowAlloc {
-		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(narrow), narrowAlloc)
+	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+coldAlloc {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d)",
+			ws, len(narrow), coldAlloc)
 	}
-	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: %d bytes per call apart (allowance %d);"+
-		" narrow call %d bytes against its %d-byte line; WorkingSet %d",
-		len(narrow), len(wide), copied, copyAllowance, narrowAlloc, len(narrow)/4, WorkingSet(narrow, req))
+	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: %d bytes apart steady-state (allowance %d);"+
+		" first call %d bytes against its %d-byte line; WorkingSet %d",
+		len(narrow), len(wide), copied, copyAllowance, coldAlloc, len(narrow)/4, WorkingSet(narrow, req))
 }
 
 // Result bytes are copied through exactly, whitespace and escapes included.
