@@ -349,8 +349,9 @@ func TestImpactPagesTiersOfDifferentLengthsWithoutAGap(t *testing.T) {
 
 // A page the output budget cut is re-signed: the cursor continues at the first item the
 // caller did not receive, so following it skips nothing and needs no hand-computed
-// offset. When a rung removed the tiers outright there is nothing to sign, so the cursor
-// goes and has_more stands.
+// offset. When a rung removed the tiers outright there is nothing to sign, so the answer
+// closes the paging contract instead of leaving it open: has_more goes false and the cut
+// is named.
 func TestABudgetTrimmedPageIsResignedToWhatWasDelivered(t *testing.T) {
 	q := url.Values{"symbol": {"Serve"}}
 	// The core returned items 0-1 of 5 at offset 0 and the budget delivered one.
@@ -375,17 +376,24 @@ func TestABudgetTrimmedPageIsResignedToWhatWasDelivered(t *testing.T) {
 		t.Error("the budget report is dropped, so the trim becomes silent")
 	}
 
-	// A rung that removed the tiers leaves nothing to count or sign: has_more stands and
-	// no cursor is issued, which is the codex-spec:3 case.
+	// A rung that removed the tiers leaves nothing to count and nothing to sign. The
+	// caller cannot continue from here, so the answer must not invite it to try: this
+	// is the codex-spec:2 case, and the row's own acceptance criterion puts
+	// has_more and next_cursor together.
 	removed := []byte(`{"symbol":"Serve","by_depth":[{"depth":1,"total":5,"offset":2,"items":[{"name":"i2"}]}],` +
 		`"output_budget":{"max_chars":2000,"used_chars":900,"degraded_stage":"tiers_total","stages":["tiers_total"]}}`)
 	removed = stripMember(t, removed, "by_depth")
 	res = decodeMembers(t, ReconcileImpactPaging("ws", q, removed))
-	if got := string(res["has_more"]); got != "true" {
-		t.Errorf("a result whose tiers were removed reports has_more = %s, want true", got)
+	if got := string(res["has_more"]); got != "false" {
+		t.Errorf("a result whose tiers were removed reports has_more = %s, want false: a client that follows it repeats the same page", got)
 	}
 	if _, ok := res["next_cursor"]; ok {
 		t.Error("a result with no tiers left signs no cursor")
+	}
+	// The literal, not the production constant: a test that reads its expected value
+	// from the code under test passes when the code changes its mind about it.
+	if got := string(res["truncated"]); got != `"tiers_removed"` {
+		t.Errorf("truncated = %s, want %q: the cut has to be named, or the caller reads a counts-only page as the whole answer", got, "tiers_removed")
 	}
 
 	// An untrimmed result is untouched: the route calls this on every impact answer,
