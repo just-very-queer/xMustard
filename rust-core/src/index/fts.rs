@@ -70,12 +70,19 @@ pub fn terms_dropped(query: &str) -> usize {
     all_terms(query).len().saturating_sub(MAX_TERMS)
 }
 
-/// An FTS5 query joining quoted `terms` with `op` (` AND ` or ` OR `). Terms are
-/// alphanumeric, so quoting only keeps words like `and` from reading as operators.
-fn match_expr(terms: &[String], op: &str) -> String {
+/// An FTS5 query joining quoted `terms` with `op` (` AND ` or ` OR `), each scoped to
+/// `column` when it is not empty. Terms are alphanumeric, so quoting only keeps words
+/// like `and` from reading as operators. An empty `column` spans every column; `body`
+/// matches a chunk's text and not its path or its declared names.
+fn match_expr_in(column: &str, terms: &[String], op: &str) -> String {
+    let prefix = if column.is_empty() {
+        String::new()
+    } else {
+        format!("{column}:")
+    };
     terms
         .iter()
-        .map(|t| format!("\"{t}\""))
+        .map(|t| format!("{prefix}\"{t}\""))
         .collect::<Vec<_>>()
         .join(op)
 }
@@ -178,6 +185,7 @@ JOIN files f ON f.id = c.file_id
 LEFT JOIN symbols s ON s.id = c.symbol_id
 LEFT JOIN names n ON n.id = s.name_id
 WHERE chunk_fts MATCH ?1 AND chunk_fts.rank MATCH ?2 AND f.path GLOB ?3
+  AND (?5 = '' OR f.lang = ?5)
 ORDER BY chunk_fts.rank, c.id LIMIT ?4";
 
 const DOC_SQL: &str = "
@@ -186,26 +194,30 @@ SELECT c.id, d.path, d.role, 'doc', c.start_line, c.end_line, c.start_byte, c.en
 FROM doc_fts
 JOIN doc_chunks c ON c.id = doc_fts.rowid
 JOIN docs d ON d.id = c.doc_id
-WHERE doc_fts MATCH ?1 AND doc_fts.rank MATCH ?2 AND d.path GLOB ?3
+WHERE doc_fts MATCH ?1 AND doc_fts.rank MATCH ?2 AND d.path GLOB ?3 AND ?5 = ''
 ORDER BY doc_fts.rank, c.id LIMIT ?4";
 
-/// Which lane a statement serves.
+/// Which lane a statement serves. `column` scopes the match expression to one FTS5
+/// column; empty spans every column.
 #[derive(Clone, Copy)]
 struct Lane {
     sql: &'static str,
     weights: &'static str,
     doc: bool,
+    column: &'static str,
 }
 
 const CODE: Lane = Lane {
     sql: CODE_SQL,
     weights: CODE_WEIGHTS,
     doc: false,
+    column: "",
 };
 const DOCS: Lane = Lane {
     sql: DOC_SQL,
     weights: DOC_WEIGHTS,
     doc: true,
+    column: "",
 };
 
 fn run(
@@ -215,9 +227,10 @@ fn run(
     glob: &str,
     k: usize,
     all_terms: bool,
+    lang: &str,
 ) -> rusqlite::Result<Vec<TextHit>> {
     let mut st = conn.prepare_cached(lane.sql)?;
-    let rows = st.query_map(params![expr, lane.weights, glob, k as i64], |r| {
+    let rows = st.query_map(params![expr, lane.weights, glob, k as i64, lang], |r| {
         let uid: Option<String> = r.get(9)?;
         let decl = match uid {
             Some(uid) => Some(Decl {
@@ -253,36 +266,71 @@ fn run(
     rows.collect()
 }
 
-/// The best `k` chunks of a lane: AND over every term, then OR for the rest.
+/// The best `k` chunks of a lane: AND over every term, then OR for the rest. The
+/// expression is scoped to `lane.column`, so a lane that names a column matches that
+/// column's text only. `lang` filters the lane to one file language; empty admits every
+/// file, and a name no file carries matches nothing.
 fn lane_hits(
     conn: &Connection,
     lane: Lane,
     terms: &[String],
     glob: &str,
     k: usize,
+    lang: &str,
 ) -> rusqlite::Result<Vec<TextHit>> {
     if terms.is_empty() || k == 0 {
         return Ok(Vec::new());
     }
-    let mut hits = run(conn, lane, &match_expr(terms, " AND "), glob, k, true)?;
+    let mut hits = run(
+        conn,
+        lane,
+        &match_expr_in(lane.column, terms, " AND "),
+        glob,
+        k,
+        true,
+        lang,
+    )?;
     if hits.len() < k && terms.len() > 1 {
         let seen: std::collections::HashSet<i64> = hits.iter().map(|h| h.loc.id).collect();
-        let more = run(conn, lane, &match_expr(terms, " OR "), glob, k, false)?;
+        let more = run(
+            conn,
+            lane,
+            &match_expr_in(lane.column, terms, " OR "),
+            glob,
+            k,
+            false,
+            lang,
+        )?;
         hits.extend(more.into_iter().filter(|h| !seen.contains(&h.loc.id)));
         hits.truncate(k);
     }
     Ok(hits)
 }
 
-/// Both text lanes of one query, read in one transaction.
+/// What `mode=text` keeps of the code lane: the same rows read through a body-scoped
+/// match, so a term only in a declared name or only in a path is not a hit. A doc comment
+/// and a signature line are part of the chunk's own body and still match.
+const BODY: Lane = Lane {
+    sql: CODE_SQL,
+    weights: CODE_WEIGHTS,
+    doc: false,
+    column: "body",
+};
+
+/// The text lanes of one query, read in one transaction. `lang` filters the code lanes
+/// to one file language; the docs lane has no `files.lang` to read, so a text-mode
+/// caller passes an empty one and keeps the docs lane empty instead.
 pub fn lanes(
     conn: &Connection,
     terms: &[String],
     path_glob: Option<&str>,
     code_k: usize,
     doc_k: usize,
+    lang: Option<&str>,
+    body_only: bool,
 ) -> rusqlite::Result<TextLanes> {
     let glob = path_glob.map_or_else(|| "*".to_string(), sqlite_glob_superset);
+    let lang = lang.unwrap_or("");
     conn.execute_batch("BEGIN")?;
     let read = || -> rusqlite::Result<TextLanes> {
         let generation: i64 = conn
@@ -292,9 +340,15 @@ pub fn lanes(
             .optional()?
             .and_then(|g| g.parse().ok())
             .unwrap_or(0);
+        let code = if body_only { BODY } else { CODE };
+        // A docs path has no code language pack, so a `lang` filter can never admit a doc
+        // row. Asking for the lane spends a bounded FTS query, its OR fallback and a row
+        // allocation per hit on an answer that cannot contain one, so the lane is skipped
+        // here rather than filtered afterwards, for every caller.
+        let docs_k = if lang.is_empty() { doc_k } else { 0 };
         Ok(TextLanes {
-            code: lane_hits(conn, CODE, terms, &glob, code_k)?,
-            docs: lane_hits(conn, DOCS, terms, &glob, doc_k)?,
+            code: lane_hits(conn, code, terms, &glob, code_k, lang)?,
+            docs: lane_hits(conn, DOCS, terms, &glob, docs_k, "")?,
             generation,
         })
     };
@@ -464,8 +518,14 @@ mod tests {
         );
         assert_eq!(query_terms("a b"), Vec::<String>::new());
         assert_eq!(
-            match_expr(&query_terms("and or"), " AND "),
+            match_expr_in("", &query_terms("and or"), " AND "),
             "\"and\" AND \"or\""
+        );
+        // a column-scoped expression prefixes every term, so the body lane cannot match a
+        // path or a declared name.
+        assert_eq!(
+            match_expr_in("body", &query_terms("retry timeout"), " AND "),
+            "body:\"retry\" AND body:\"timeout\""
         );
         let long: String = (b'a'..=b't')
             .map(|c| format!("x{0}{0} ", c as char))

@@ -23,9 +23,9 @@
 //!   never fire.
 //! - Completeness: `exact` only when nothing could hide a dependent (upstream: no
 //!   resolver drop on the name of any symbol in the result; downstream: none in the
-//!   files walked), the graph is resolved, the index lost no file and the walk was not
-//!   cut short. Otherwise `lower_bound`, with machine-readable `causes` and the first
-//!   `boundaries`.
+//!   files walked), the graph is resolved, the index lost no file, the seed set was
+//!   not cut short by [`MAX_TARGETS`] and the walk was not cut short. Otherwise
+//!   `lower_bound`, with machine-readable `causes` and the first `boundaries`.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -1030,7 +1030,11 @@ fn run_lookup<G: Graph + ?Sized>(
     affected.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.module.cmp(&b.module)));
     affected.truncate(MAX_MODULES);
 
-    let epistemic = envelope(g, q, &seeds, &w, losses)?;
+    // `lookup.truncated` is the only thing that means seeds were DROPPED: a target that
+    // expands to more than MAX_TARGETS seeds (a file walking with what it declares, a type
+    // with its members) keeps every one of them, so the listed-seed cap below is a display
+    // cap and must not make the answer a lower bound.
+    let epistemic = envelope(g, q, lookup.truncated, &seeds, &w, losses)?;
     let (risk, risk_note) = score(q, &lookup, &counts, &epistemic);
     let import_cycles = cycles_through(g, &seeds)?;
 
@@ -1110,6 +1114,7 @@ fn score(q: &Query, lookup: &Lookup, c: &Counts, e: &Epistemic) -> (Option<Risk>
 fn envelope<G: Graph + ?Sized>(
     g: &G,
     q: &Query,
+    seeds_truncated: bool,
     seeds: &[Seed],
     w: &Walk,
     losses: &BTreeMap<String, usize>,
@@ -1129,6 +1134,9 @@ fn envelope<G: Graph + ?Sized>(
         }
     }
     let flags = [
+        // A seed set the target cap cut short is a lower bound: the definers it dropped
+        // were never walked, so a dependent behind one is invisible here.
+        (seeds_truncated, "targets_truncated"),
         (w.lexical, "lexical_graph"),
         (w.truncated, "truncated"),
         (w.timed_out, "timeout"),
