@@ -134,16 +134,17 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 		return res, startErr
 	}
 
-	// The cursor is where the pass resumes in the entry table, but a workspace that is fully
-	// consolidated must still be revisited: a new memory lands at a cursor past the one the
-	// last pass reached, so a pass that only ever walked forward would never see it. The
-	// scan therefore starts at the beginning when the source has caught up, and the cursor
-	// only matters while entries remain.
+	// A pass reads from the cursor the last one stopped at, then, when that reach holds
+	// nothing the queue has not already, from the start again. The cursor is a bound on how
+	// much one pass walks, not a promise to walk forward for ever: a workspace whose entries
+	// all sit before the cursor would otherwise never be looked at again, which is exactly
+	// the case after a signature is cancelled and freed. Two reads, the second only when the
+	// first found no unqueued work, so a caught-up pass costs one scan rather than two.
 	candidates, seen, skipped, cursor, complete, err := consolidationCandidates(ctx, dataDir, workspaceID, startCursor)
 	if err != nil {
 		return res, err
 	}
-	if complete {
+	if complete && len(candidates) == 0 {
 		candidates, seen, skipped, cursor, complete, err = consolidationCandidates(ctx, dataDir, workspaceID, 0)
 		if err != nil {
 			return res, err
