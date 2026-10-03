@@ -40,6 +40,7 @@ const (
 	EventRelation          = "relation"
 	EventFeedback          = "feedback"
 	EventCollection        = "collection"
+	EventCollectionMember  = "collection_member"
 	EventGrant             = "grant"
 	EventRevoke            = "revoke"
 	EventApplicability     = "applicability"
@@ -79,7 +80,7 @@ var validEventTypes = set(EventPropose, EventImport, EventVote, EventReject, Eve
 	EventRevisionRejected, EventRevisionWithdrawn, EventPromote, EventDemote, EventStatus, EventSupersede,
 	EventMerge, EventRetract, EventArchive, EventRestore, EventPurge, EventExpiry, EventTierChange, EventClassify,
 	EventAnchors, EventBaseline, EventStaleObserved, EventDriftCleared, EventClaim, EventRelation, EventFeedback,
-	EventCollection, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
+	EventCollection, EventCollectionMember, EventGrant, EventRevoke, EventApplicability, EventNote, EventGate, EventIndexBaseline,
 	EventMergeApproval, EventMergeApprovalRevoked, EventReviewRecord, EventReviewFinding, EventReviewTriage,
 	EventReviewReanchor, EventMemoryPolicy, EventCorroborate, EventAnchorReanchor)
 
