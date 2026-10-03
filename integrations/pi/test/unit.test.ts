@@ -3,7 +3,7 @@
 // delivery state machine; the real Pi + Go behavior is covered by test/e2e.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type net from "node:net";
@@ -31,7 +31,7 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
-import { mutateBashInput, shellQuote, shouldActivateExpand, shouldWrapBash } from "../src/commandwrap.ts";
+import { mutateBashInput, shellQuote, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -1429,11 +1429,10 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 	// The hook's refusals, before any workspace lookup is paid for.
 	const bash = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: { command: "ls" } };
 	const BASE = "http://127.0.0.1:8077";
-	const ON = { enabled: true, tokenConfigured: false, token: undefined, wrapperToken: undefined, wrapperApiBase: undefined, apiBase: BASE };
+	const ON = { enabled: true, wrapperAvailable: true, token: undefined, wrapperToken: undefined, wrapperApiBase: undefined, apiBase: BASE };
 
 	test("the hook wraps a bash call when the knob is on and no token is at stake", () => {
 		assert.equal(shouldWrapBash(bash, ON), true);
-		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "t" }), true, "a wrapper token does not block the wrap");
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: BASE }), true, "the same base is not a conflict");
 	});
 
@@ -1455,7 +1454,7 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		// tool_call hook cannot change it, so a token this process cannot pass on
 		// means the wrapped command would fail inside the wrapper. It runs natively
 		// instead and projectBuiltin captures the result.
-		const authed = { ...ON, tokenConfigured: true, token: "secret" };
+		const authed = { ...ON, token: "secret" };
 		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: undefined }), false, "no wrapper token at all");
 		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "" }), false, "an empty wrapper token is no token");
 		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "   " }), false, "whitespace is not a token; the wrapper's nonblank() ignores it");
@@ -1463,6 +1462,31 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "secret" }), true, "the same token wraps");
 		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: " secret " }), true, "padding is the same credential, since the adapter trims its own");
 		assert.equal(shouldWrapBash(bash, ON), true, "no token configured means nothing to pass");
+	});
+
+	test("the hook refuses a wrapper token the adapter does not hold (r4-2)", () => {
+		// The wrapper would capture with its token and xmustard_expand would then call
+		// with none and get a 401: the handle the model holds would be unusable.
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "t" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, token: "", wrapperToken: "t" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "  " }), true, "a blank wrapper token is no token");
+	});
+
+	test("the hook refuses when no executable wrapper is on PATH (r4-1)", () => {
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperAvailable: false }), false);
+		const dir = mkdtempSync(path.join(os.tmpdir(), "xm-wrap-"));
+		try {
+			assert.equal(wrapperOnPath(dir), false, "an empty directory holds no wrapper");
+			assert.equal(wrapperOnPath(undefined), false);
+			assert.equal(wrapperOnPath(""), false, "an empty PATH holds no wrapper");
+			const bin = path.join(dir, "xmustard-core");
+			writeFileSync(bin, "#!/bin/sh\n", { mode: 0o644 });
+			assert.equal(wrapperOnPath(dir), false, "a non-executable file is not a wrapper");
+			chmodSync(bin, 0o755);
+			assert.equal(wrapperOnPath(`/nonexistent${path.delimiter}${dir}`), true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
 	});
 
 	test("the hook refuses when the wrapper would reach a different API than this adapter", () => {
@@ -1473,6 +1497,7 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "" }), false, "an empty base is not the adapter's");
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: BASE }), true);
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: undefined }), true, "unset means the wrapper's own default");
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: ` ${BASE}// ` }), true, "a trailing slash is the same server (r4-3)");
 	});
 });
 

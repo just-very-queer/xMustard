@@ -73,11 +73,18 @@ function builtinSet(raw: string | undefined): ReadonlySet<string> {
 	);
 }
 
+// normalizeApiBase is the one rule for spelling an API base: trimmed, without
+// trailing slashes. The run wrapper's base is compared to the adapter's through
+// it, so a trailing slash alone is not a different server.
+export function normalizeApiBase(raw: string): string {
+	return raw.trim().replace(/\/+$/, "");
+}
+
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): AdapterConfig {
 	const token = env.XMUSTARD_TOKEN?.trim();
 	const workspaceId = env.XMUSTARD_WORKSPACE_ID?.trim();
 	return {
-		apiBase: (env.XMUSTARD_API_BASE?.trim() || DEFAULT_API_BASE).replace(/\/+$/, ""),
+		apiBase: normalizeApiBase(env.XMUSTARD_API_BASE ?? "") || DEFAULT_API_BASE,
 		token: token ? token : undefined,
 		workspaceId: workspaceId ? workspaceId : undefined,
 		delivery: env.XMUSTARD_PI_DELIVERY?.trim() === "hook" ? "hook" : "source",

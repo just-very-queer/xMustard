@@ -17,7 +17,7 @@ import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
-import { mutateBashInput, shouldActivateExpand, shouldWrapBash } from "./commandwrap.ts";
+import { mutateBashInput, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
@@ -143,7 +143,7 @@ export default function xmustard(pi: ExtensionAPI): void {
 	pi.on("tool_call", async (event, ctx) => {
 		if (!shouldWrapBash(event, {
 			enabled: cfg.wrapBash,
-			tokenConfigured: !!cfg.token,
+			wrapperAvailable: wrapperOnPath(process.env.PATH),
 			token: cfg.token,
 			wrapperToken: process.env.XMUSTARD_API_TOKEN,
 			wrapperApiBase: process.env.XMUSTARD_API_BASE,

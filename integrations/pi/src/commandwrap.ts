@@ -22,6 +22,9 @@
 // always runs and its result is never lost, so a malformed argv must never reach
 // the shell in place of the model's command.
 
+import { accessSync, constants } from "node:fs";
+import { delimiter, join } from "node:path";
+import { normalizeApiBase } from "./config.ts";
 import { resultCarriesHandle } from "./delivery.ts";
 
 export const WRAPPER = "xmustard-core run";
@@ -86,7 +89,7 @@ export function shouldWrapBash(
 	event: unknown,
 	opts: {
 		enabled: boolean;
-		tokenConfigured: boolean;
+		wrapperAvailable: boolean;
 		token: string | undefined;
 		wrapperToken: string | undefined;
 		wrapperApiBase: string | undefined;
@@ -95,14 +98,35 @@ export function shouldWrapBash(
 ): boolean {
 	if (!opts.enabled) return false;
 	if (!isRecord(event) || event.toolName !== "bash") return false;
+	// No executable wrapper means the rewritten command would exit 127 and the
+	// model's own command would never run, so the call stays native.
+	if (!opts.wrapperAvailable) return false;
 	// A default base is what the wrapper uses when nothing is passed, so only a base
 	// that differs from the adapter's own needs reconciling.
-	if (opts.wrapperApiBase !== undefined && opts.wrapperApiBase !== opts.apiBase) return false;
-	if (!opts.tokenConfigured) return true;
-	// Compared as trimmed values, because the adapter trims XMUSTARD_TOKEN and the
-	// wrapper's nonblank() ignores whitespace only: a token that differs by padding
-	// is the same credential, and one that differs in substance is not usable.
-	return !!opts.wrapperToken && opts.wrapperToken.trim() === opts.token?.trim();
+	if (opts.wrapperApiBase !== undefined && normalizeApiBase(opts.wrapperApiBase) !== opts.apiBase) return false;
+	// The handle the wrapper issues is spent through this adapter, so both sides must
+	// hold the same effective credential, including both holding none: a wrapper
+	// token with no adapter token captures fine and then fails xmustard_expand.
+	// Trimmed, because the adapter trims XMUSTARD_TOKEN and the wrapper's nonblank()
+	// ignores whitespace only.
+	return effectiveToken(opts.token) === effectiveToken(opts.wrapperToken);
+}
+
+function effectiveToken(t: string | undefined): string | undefined {
+	return t?.trim() || undefined;
+}
+
+// wrapperOnPath reports whether `xmustard-core` resolves to an executable file in
+// one of the PATH entries, the same lookup the shell will do for the wrapped argv.
+export function wrapperOnPath(path: string | undefined): boolean {
+	return (path ?? "").split(delimiter).filter(Boolean).some((dir) => {
+		try {
+			accessSync(join(dir, "xmustard-core"), constants.X_OK);
+			return true;
+		} catch {
+			return false;
+		}
+	});
 }
 
 // shouldActivateExpand reports whether a finished tool result must offer
