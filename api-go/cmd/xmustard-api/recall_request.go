@@ -23,9 +23,11 @@ func recallRequest(r *http.Request) (workspaceops.RecallRequest, error) {
 		SessionID: q.Get("session_id"), Tier: q.Get("tier"), Subject: q.Get("subject"), Predicate: q.Get("predicate"),
 		AsOf: q.Get("as_of"), Seed: q.Get("seed"),
 		// The reader's own narrowing keys (WS-29b): a dir, run or session scoped
-		// memory is served only inside the key the read names. They are HTTP query
-		// parameters only; the MCP recall tool does not carry them, because
-		// tools/list has no byte headroom for a ninth argument (FU, §5.1 rule 9).
+		// memory is served only inside the key the read names. The MCP recall tool
+		// carries none of them because tools/list has no byte headroom for a ninth
+		// argument (5.1 rule 9); path_prefix is deliberately NOT reused as the
+		// directory key, because it filters by declared path anchors and a
+		// dir-scoped memory need not declare one.
 		Dir: q.Get("dir"), RunID: q.Get("run_id"),
 		Caller: callerOf(r).ID,
 	}

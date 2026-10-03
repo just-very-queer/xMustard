@@ -157,14 +157,12 @@ func validScopeDir(dir string) error {
 //   - private: the author only, whatever roles the reader holds (admin included)
 //   - run, session: the author inside the matching key, and nobody else
 //   - dir: the author, inside the directory or one below it
-//   - global: nobody, until a cross-workspace read can scope to one principal's key
+//   - global: the author, in whichever workspace the read reaches (WS-30e merges
+//     them; nothing here reaches across workspaces yet)
 //   - shared: WS-29c decides from grants; this sub-task never serves it
 func ScopesVisible(scope, key, author, reader string, req ScopeRequest) bool {
 	if scope == ScopeShared {
 		return false // no grant can reach an entry whose scope was never shared
-	}
-	if scope == ScopeGlobal {
-		return false // derived and stored, served once WS-30e can scope across workspaces
 	}
 	if scope == ScopeWorkspace || scope == "" {
 		return true
@@ -177,6 +175,11 @@ func ScopesVisible(scope, key, author, reader string, req ScopeRequest) bool {
 	switch scope {
 	case ScopePrivate:
 		return true
+	case ScopeGlobal:
+		// User-level: the author, in any workspace this read reaches. Merging it across
+		// workspaces is WS-30e's job; until a cross-workspace read exists this rule
+		// simply never fires for another workspace, which is the fail-closed direction.
+		return samePrincipal(author, reader)
 	case ScopeRun:
 		return strings.TrimSpace(req.RunID) != "" && req.RunID == key
 	case ScopeSession:

@@ -400,8 +400,10 @@ func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 		{func(r *ProposeContextRequest) { r.Visibility = ScopeDir; r.Dir = "api-go/internal" }, map[string]bool{
 			"author-a|run-1|api-go/internal": true, "author-a||api-go/internal": true,
 			"author-a|run-1|docs": false}},
-		// global: nobody, until a cross-workspace read can scope to one principal
-		{func(r *ProposeContextRequest) { r.Visibility = ScopeGlobal }, map[string]bool{}},
+		// global: the author, in whatever workspace the read reaches (this one)
+		{func(r *ProposeContextRequest) { r.Visibility = ScopeGlobal }, map[string]bool{
+			"author-a|run-1|api-go/internal": true, "author-a||api-go/internal": true,
+			"author-a|run-1|docs": true}},
 		// another author's private memory
 		{func(r *ProposeContextRequest) { r.Visibility = ScopePrivate }, nil}, // author-b, fixed below
 	} {
@@ -608,19 +610,30 @@ func TestARememberCallKeepsItsRunAndSessionKeysAsProvenanceNotScope(t *testing.T
 }
 
 // global is derived from the principal like private, so it can never be widened to
-// another user, and it is stored but served to nobody until a cross-workspace read
-// exists.
-func TestGlobalIsDerivedFromThePrincipalAndServedToNobodyYet(t *testing.T) {
+// another user. Its author reads it in whichever workspace the read reaches, which
+// today means its own: nothing in this row reaches across workspaces (WS-30e).
+func TestGlobalIsDerivedFromThePrincipalAndReadOnlyByItsAuthor(t *testing.T) {
 	dir := singleAgentDir(t)
 	e := propose(t, dir, "ws-1", "author-a", "global", "the toolchain lives in the home image",
 		func(r *ProposeContextRequest) { r.Visibility = ScopeGlobal })
 	if e.Scope != ScopeGlobal || e.ScopeKey != "author-a" {
 		t.Fatalf("stored scope %q/%q, want global keyed by the author", e.Scope, e.ScopeKey)
 	}
-	for _, reader := range []string{"author-a", "admin-a", "verifier-a", OpenModeIdentity, ""} {
+	if !ScopesVisible(ScopeGlobal, "author-a", "author-a", "author-a", ScopeRequest{}) {
+		t.Fatal("the author must read its own global memory")
+	}
+	for _, reader := range []string{"admin-a", "verifier-a", "author-b", OpenModeIdentity, ""} {
 		if ScopesVisible(ScopeGlobal, "author-a", "author-a", reader, ScopeRequest{}) {
-			t.Fatalf("global must not be served to %q before the cross-workspace read exists", reader)
+			t.Fatalf("global must not be served to %q", reader)
 		}
+	}
+	res := recallWith(t, dir, "ws-1", RecallRequest{Query: "toolchain home image", Caller: "author-a"})
+	if !slices.Contains(ids(res), e.ID) {
+		t.Fatalf("the author must find its global memory by recall, got %v", ids(res))
+	}
+	res = recallWith(t, dir, "ws-1", RecallRequest{Query: "toolchain home image", Caller: "admin-a"})
+	if slices.Contains(ids(res), e.ID) {
+		t.Fatalf("another principal must not find a global memory, got %v", ids(res))
 	}
 	// Open mode has no principal, so it owns no user-level namespace.
 	if _, err := DeriveScope(ScopeRequest{Visibility: ScopeGlobal}, ContextActor{ID: OpenModeIdentity}); err == nil {

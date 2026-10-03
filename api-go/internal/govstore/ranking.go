@@ -108,11 +108,14 @@ type RankQuery struct {
 // scopeWhere is the SQL predicate that keeps a scoped entry out of a ranking the caller's
 // scope does not admit (WS-29b). It mirrors ScopesVisible: workspace (and an empty
 // scope, for rows written before scopes existed) is always admitted; private, run,
-// session and dir are the author's own and need the matching key; global and shared
-// are never admitted, because nothing derives or grants them yet.
+// session and dir are the author's own and need the matching key; global is the
+// author's in whatever workspace this read reaches, which until WS-30e's
+// cross-workspace read means this workspace only; shared is never admitted, because
+// nothing derives or grants it yet.
 const scopeWhere = `(
 	e.scope IN ('', 'workspace')
 	OR (e.scope = 'private' AND ?3 <> '' AND lower(e.scope_key) = ?3)
+	OR (e.scope = 'global' AND ?3 <> '' AND lower(e.scope_key) = ?3)
 	OR (e.scope = 'run' AND ?5 <> '' AND e.scope_key = ?5)
 	OR (e.scope = 'session' AND ?6 <> '' AND e.scope_key = ?6)
 	OR (e.scope = 'dir' AND ?7 <> '' AND (?7 = e.scope_key OR ?7 LIKE e.scope_key || '/%'))

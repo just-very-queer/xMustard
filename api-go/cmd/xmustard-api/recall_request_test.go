@@ -211,6 +211,35 @@ func TestAPrivateMemoryIsNotDisclosedOnAnyHTTPReadPath(t *testing.T) {
 			t.Errorf("ranked recall %q served the dir-scoped entry: %v, want %v", c.query, served, c.want)
 		}
 	}
+	// path_prefix must NOT narrow the scope: it filters by declared path anchors, and a
+	// dir-scoped memory need not declare one, so deriving the directory key from it
+	// would silently exclude exactly the memories it was meant to reach.
+	for _, c := range []struct {
+		query string
+		want  bool
+	}{
+		{"?query=omega&path_prefix=api-go/cmd&include_pending=true", false},
+	} {
+		code, got := call("alice", "GET", "/context/active"+c.query, "")
+		if code != http.StatusOK {
+			t.Errorf("ranked recall by path_prefix %q: want 200, got %d %v", c.query, code, got)
+			continue
+		}
+		served := false
+		for _, e := range entryList(t, got) {
+			if e["id"] == dirID {
+				served = true
+			}
+		}
+		if served != c.want {
+			t.Errorf("ranked recall by path_prefix %q served the dir-scoped entry: %v, want %v",
+				c.query, served, c.want)
+		}
+	}
+	// the directory key still works on its own parameter
+	if code, got := call("alice", "GET", "/context/active?query=omega&dir=api-go/internal&include_pending=true", ""); code != http.StatusOK {
+		t.Errorf("ranked recall by dir: %d %v", code, got)
+	}
 }
 
 // include_superseded serves a superseded entry only if it was once promoted: a pending
