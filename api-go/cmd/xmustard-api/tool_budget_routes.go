@@ -89,7 +89,7 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 		// without computing an offset (WS-59e).
 		//
 		// Each pass reconciles the cursor against the page the budget actually wrote and
-		// then settles the report over it. Settling can trim again, so the next pass
+		// settles the report over it. Settling can trim again, so the next pass
 		// re-derives the cursor from what survived.
 		//
 		// The loop stops when a pass leaves the bytes unchanged, which is the condition
