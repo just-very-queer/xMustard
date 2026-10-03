@@ -4553,3 +4553,30 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 - **Review round 1** (`reviews/ws-rt1/r1`, `gate=PASS changed=31 covered=31 channel_findings=5 triaged=5`). OCR's review aborted on its 8,000-character background limit, so the delegate file stands in for it. Five minors: r1-1 (failed calls now count), r1-2 (`attach` edits in place), r1-4 (CLI stat assertion; the spec's "equal to the tracked files" was wrong, a build stats each file twice) and r1-5 (spec names `counted`) fixed in `599d2e50`; r1-3 (a Git spawn is counted before `spawn` succeeds, at every pre-existing call site) deferred to FU for WS-RT5.
 - **Checks.** Red `logs/ws-rt1-run-20261003T190625Z.log`; 22 mutations, all killed (`logs/ws-rt1-run-20261003T201053Z.log`); `BOXALL` on `599d2e50` `remote_exit=0`, clippy 6, `rss_lines=ok` (`logs/ws-rt1-check-20261003T201330Z.log`). Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — no retrieval ranking, resident structure, Pi source, route, gate row, projection or `tools/list` byte changes (whether MCP tools copy `pass_counters` into their output was not checked; the golden and `tools/list` tests inside `BOXALL` passed unchanged).
 - **Follow-ups.** WS-RT1-r1-3 (owner WS-RT5); the box mutation-artifact hazard (owner: the goal's §6 A4 recipe); RT2/RT3/RT6 take this baseline as their before numbers.
+
+### WS-RT2 — Nested repositories handled explicitly
+
+**Goal.** A directory with its own Git dir inside the workspace (STREAMING_RUNTIME §2.3, §3.4; EVIDENCE n1-n5, g1, s1-s3) is classified and reported, never read as a file and never a reason for an incomplete identity. Items:
+1. `source_identity` (`repo-key`): a status entry that is a directory holding `.git` (a directory or a `gitdir:` file) is a nested repository of kind `submodule` (tracked, in `.gitmodules`), `gitlink_unregistered` (tracked, no module entry) or `nested_repo` (untracked). Its key token is the nested HEAD, its ref and its Git index stat key, read without a Git child. It is listed in a new `nested_repos` field, not in `limitations`, so `identity_complete` stays true. Any other directory entry is a `not_regular` limitation found by `lstat`; no directory reaches `read_source_beneath` or the stat-cache hasher.
+2. The index scan counts tracked gitlinks (any extension) and, with untracked files included, `ls-files -o` directory entries in coverage `nested_repos` (`total` plus the first 200 by path); it is not a loss and leaves `complete` alone.
+3. The API label: `index update --identity-limitations N` stamps the limitation count with the key, and readers report `identity_complete` only for a stamped count of 0 (`reader.rs` reported true for any key). The Go refresh passes the count of the identity it ran for.
+4. `build-repo-map` counts files from `git ls-files -z --cached --others --exclude-standard` in a Git worktree, so files inside nested repositories and ignored files are not counted; outside Git it walks as before.
+5. The watcher skips events under any `.git` path component, so activity inside a nested repository's Git dir queues no refresh path for the outer root.
+6. `changetrack` passes `--ignore-submodules=none` like `source_identity`, so a dirty `ignore = all` submodule counts as dirty in both.
+7. A ground that finds a registration baseline build running for its workspace waits for it (at most `codeIndexWait`, never past its request) before it reads drift; if the build is still running it says so instead of "no index baseline exists".
+
+**Requirements.** PAR-FRESH-01 (one identity scheme), PAR-FRESH-03 (watcher), PAR-FRESH-05 (freshness labels), PAR-FRESH-06 (registration baseline).
+
+**Files.** `rust-core/src/indexcache.rs`, `rust-core/src/index/scan.rs`, `rust-core/src/index/meta.rs`, `rust-core/src/index/mod.rs`, `rust-core/src/index/reader.rs`, `rust-core/src/repomap.rs`, `rust-core/src/index/watch.rs`, `rust-core/src/changetrack.rs`, `rust-core/tests/nested_repos.rs` (new), `api-go/internal/workspaceops/code_index.go`, `api-go/internal/workspaceops/grounding_index.go`, `api-go/internal/workspaceops/changes.go`, their tests, `docs/ARCHITECTURE.md` (identity row), this plan section.
+
+**Tests required.**
+- Fixtures written by the tests (n1 nested, n2 two levels, n3 inside an ignored folder, n4 bare, n5 `.git` file plus a broken pointer, g1 gitlink without `.gitmodules`, s1 dirty submodule, s2 uninitialised, s3 dirty `ignore = all`): `identity_complete`, `limitations`, `nested_repos` and the key's stability per case; a commit inside a nested repository changes the key, an untracked edit inside it does not.
+- Index coverage lists the gitlink (and, with untracked files, the nested repository) under `nested_repos` and stays `complete`.
+- A store stamped with `--identity-limitations 1` reads `identity_complete=false`, with 0 true, without the flag false.
+- `build-repo-map` on n1 counts the outer files only.
+- The watcher classifies `sub/.git/...` and `a/b/.git` as skipped.
+- `changetrack` fingerprint on s3 reports one dirty path.
+- Go: refresh arguments carry the count; with the real core, a nested repository leaves `CurrentRepoIdentity` complete and an evidence key derivable; a ground started while a registration build runs reports the baseline it built.
+- Each new test fails before the change (saved FAIL line) and has one mutation row.
+
+**Acceptance.** As above, with `BOXALL` `remote_exit=0`, clippy at or under the merge base, `rss_lines=ok`; the RT1 nested baseline rerun before and after is recorded. No cap, bound or timeout changes. Out of scope: the bare repository (Git lists its files as untracked content; kept and tested as such), changetrack's `sub/:added` change row, and the legacy symbol graph's gitlink loss.
