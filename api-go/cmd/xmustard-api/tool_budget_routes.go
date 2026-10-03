@@ -85,20 +85,27 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 		// impact's cursor continues at the core's next_offset, which describes the
 		// core's page; when the budget cut that page the cursor is re-signed to
 		// continue at the first item the caller did not receive, so the caller pages
-		// without computing an offset (WS-59e). The paging members land after Apply
-		// settled the report, so the result is settled again to keep used_chars and
-		// over_budget true of what is actually written.
+		// without computing an offset (WS-59e).
+		//
+		// Each of the two passes reconciles the cursor against the page the budget
+		// actually wrote and then settles the report over it. Settling can trim again, so
+		// the second pass re-derives the cursor from what survived; the second reconcile
+		// cannot grow the result, so it does not re-trim. Two passes, not a loop with a
+		// convergence test: each pass either leaves the page alone or removes items, and a
+		// third pass would only re-derive the same cursor.
 		if spec.Tool == "impact" {
-			out = workspaceops.ReconcileImpactPaging(ws, q, out)
-			settled, serr := spec.Settle(out, req, page)
-			if serr != nil {
-				// Settle fails only on a result that is no longer valid JSON, which
-				// reconciliation cannot produce. Refuse rather than write an answer
-				// whose report would describe something other than the body.
-				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "impact result is too large to budget; narrow the call"})
-				return
+			for pass := 0; pass < 2; pass++ {
+				out = workspaceops.ReconcileImpactPaging(ws, q, out)
+				settled, serr := spec.Settle(out, req, page)
+				if serr != nil {
+					// Settle fails only on a result that is not valid JSON, which the
+					// handler's own output cannot be. Refuse rather than write an answer
+					// whose report would describe something other than the body.
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "impact result is too large to budget; narrow the call"})
+					return
+				}
+				out = settled
 			}
-			out = settled
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})

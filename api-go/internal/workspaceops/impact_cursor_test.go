@@ -540,6 +540,17 @@ func TestTierItemCountsAreReadWithoutDecodingTheItems(t *testing.T) {
 			tiers: `[{"items":5,"total":1}]`,
 			want:  []int{0},
 		},
+		// A tier carries user-controlled text, and that text can hold the member's own
+		// name and an array. Counting the first match instead of the top-level one would
+		// count what a symbol name or a label said.
+		"a name holding the member name and an array": {
+			tiers: `[{"label":"\"items\":[99,98,97,96]","depth":1,"total":4,"offset":0,"items":[{"name":"a"},{"name":"b"}],"next_offset":2}]`,
+			want:  []int{2},
+		},
+		"a nested object holding the member name": {
+			tiers: `[{"meta":{"items":[1,2,3,4,5]},"depth":1,"total":2,"offset":0,"items":[{"name":"a"}]}]`,
+			want:  []int{1},
+		},
 	} {
 		var page []tierReading
 		if err := json.Unmarshal([]byte(tc.tiers), &page); err != nil {

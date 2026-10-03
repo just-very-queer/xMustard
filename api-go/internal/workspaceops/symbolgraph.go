@@ -235,46 +235,82 @@ func (t *tierReading) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// countArray returns how many elements the named top-level array holds, or 0 when the
-// member is absent or not an array. It walks the raw bytes tracking string and nesting
-// state and counting the commas that separate elements at the array's own depth, so
-// nothing proportional to the array's size is allocated.
+// countArray returns how many elements the named top-level member's array holds, or 0
+// when the member is absent or not an array. It walks the raw bytes tracking string and
+// nesting state and counting the commas that separate elements at the array's own level,
+// so nothing proportional to the array's size is allocated.
+//
+// Only a member at the object's top level counts. A tier carries user-controlled text —
+// a symbol name, a file path, a label — and that text can hold the bytes `"items":[`. A
+// plain byte search would find that first and count an array the caller put in a string,
+// so the walk starts after the opening brace and each match must sit at depth 1.
 func countArray(b []byte, name string) int {
 	key := []byte(`"` + name + `"`)
-	i := bytes.Index(b, key)
-	if i < 0 {
-		return 0
+	depth := 0
+	inStr, esc := false, false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case esc:
+			esc = false
+			continue
+		case inStr && c == '\\':
+			esc = true
+			continue
+		case c == '"':
+			// A key at the object's own level is the only match; text inside a string is
+			// skipped wholesale, so a name holding `"items":[ cannot be read as the member.
+			if !inStr && depth == 1 && bytes.HasPrefix(b[i:], key) {
+				if n := arrayLen(b, i+len(key)); n >= 0 {
+					return n
+				}
+			}
+			inStr = !inStr
+			continue
+		case inStr:
+			continue
+		case c == '{' || c == '[':
+			depth++
+			continue
+		case c == '}' || c == ']':
+			depth--
+			continue
+		}
 	}
-	j := i + len(key)
-	for j < len(b) && isJSONSpace(b[j]) {
-		j++
+	return 0
+}
+
+// arrayLen counts the elements of the array that follows the member key at i, or -1 when
+// what follows the key is not an array.
+func arrayLen(b []byte, i int) int {
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
 	}
-	if j >= len(b) || b[j] != ':' {
-		return 0
+	if i >= len(b) || b[i] != ':' {
+		return -1
 	}
-	j++
-	for j < len(b) && isJSONSpace(b[j]) {
-		j++
+	i++
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
 	}
-	if j >= len(b) || b[j] != '[' {
-		return 0
+	if i >= len(b) || b[i] != '[' {
+		return -1
 	}
-	j++
-	for j < len(b) && isJSONSpace(b[j]) {
-		j++
+	i++
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
 	}
-	if j < len(b) && b[j] == ']' {
+	if i < len(b) && b[i] == ']' {
 		return 0 // an empty array has no elements
 	}
-	// depth is the array's own nesting level plus any container open inside an element.
-	// An element starts at depth 1 (the array itself counts as 1), so the commas that
-	// separate elements are the ones at depth 1 and the array's closing ] is the ] seen
-	// at depth 1. Strings are skipped wholesale so a bracket or comma inside one is not
-	// counted, and an escape holds the next byte so an escaped quote does not end it.
+	// depth is the array's own level plus any container open inside an element, so an
+	// element starts at depth 1, the commas between elements are the ones at depth 1, and
+	// the array's closing ] is the ] seen at depth 1. Strings are skipped wholesale so a
+	// bracket or comma inside one is not counted.
 	elements, depth := 1, 1
 	inStr, esc := false, false
-	for ; j < len(b); j++ {
-		c := b[j]
+	for ; i < len(b); i++ {
+		c := b[i]
 		switch {
 		case esc:
 			esc = false
@@ -294,7 +330,7 @@ func countArray(b []byte, name string) int {
 			elements++
 		}
 	}
-	return 0
+	return -1
 }
 
 func isJSONSpace(c byte) bool {
