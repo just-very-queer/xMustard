@@ -9,6 +9,7 @@ scratch repositories and data roots. None of them talks to a model provider.
 | Budget v1 (frozen at `6411f391`) | `rss.sh` | sampled tree peak ≤ 100,000,000 bytes on the 501-file workload |
 | Budget v2 | `make bench-gate` (CI suite), `make bench-parity` (parity-scale suite) | ps-RSS of the xMustard-owned tree ≤ 95.4 MiB on a valid, complete workload |
 | Gate v2 unit tests | `make bench-test` | stdlib `unittest`, no binaries needed |
+| Streaming-runtime baseline (WS-RT1, box only) | `rt_fixtures.sh <dir> nested t100k t1m u200k`, then `rt_baseline.sh <dir> <out> <case>...` | not a gate: records wall time, peak RSS and the core's `pass_counters` per call, and the API's `core_passes` growth per API call |
 
 ## Budget gate v2 (`rss_bench_v2.py`)
 
