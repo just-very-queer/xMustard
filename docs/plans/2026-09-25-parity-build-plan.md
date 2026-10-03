@@ -878,6 +878,38 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 - *Checks.* `git apply --check` (log above); the comment-only line classification and the S1/S2 greps (same log); `MAC`; `BOX1`; `BOXALL` on the reviewed head plus the WS-FLK-01 rerun, both logs above. No new test: the change has no behaviour to test, so §6 A4's mutation requirement has no subject, and `slop-audit.md` S5 is empty for that reason. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no index, no memory, no Pi source, no route gate, no projection and no `tools/list` byte, so §3.0 names none of them for it.
 - *Follow-ups.* (1) `createWorkspaceFileBeneath`'s `existed` flag means different things in the two build variants: the non-unix `safepath_other.go` computes true prior existence with `os.Lstat` and returns `existed && overwrite`, while the unix build returns `overwrite` alone because `openat(O_TRUNC)` reports no prior-existence bit. A caller reading the flag as "prior existence" is correct on Windows and subtly wrong on unix. The comment patch removes the false claim but not the divergence. Proposed owner: WS-FIX-13 or a sibling safepath row. (2) `explain`'s `line_count` carries no freshness marker and was already stale for a file this row edited. Proposed owner: WS-FIX-15, as in WS-HYG-01 and WS-DOC-02. (3) `xmustard-core goal`'s `slug_id` and Go's `slugProfileID` disagree on any character Unicode lowercases into `[a-z0-9]`; whether that matters depends on callers comparing slugs across the two runtimes. Proposed owner: the same safepath-adjacent goal-surface review that owns GOAL_RUNTIME.md.
 
+### WS-FIX-08 — Resource reads pass the same gates a tool call passes
+
+**Goal.** Two surfaces reach memory without naming the tool that serves it, and `XMUSTARD_DISABLED_TOOLS` must reach both. The MCP resource `xmustard://memory/index` is served by calling `recall` through `Session.RunTool`, skipping the gates every `tools/call` passes, and `GET /memory/core` carried no tool, so a disabled `recall` was served a 200 with the standing memory while `GET /context/active` answered 403. A hook route names no tool either and cannot (naming one makes the middleware refuse the whole route), so its handler applies the switch where memory is injected.
+
+**Requirements.** No new PAR ids. This closes a gap in PAR-RCL-05's serving surface and in WS-09's exposure posture: `XMUSTARD_DISABLED_TOOLS` is a refusal switch, and a memory read naming no tool outlives it. It is a security guard, so §5.1 rule 7 applies: the refusal path is tested, and the guard stays a guard, not a table entry.
+
+**What read-only does *not* owe.** `recall` declares `ReadOnly: true` with no `WriteArgs`, so a read-only connection is contracted to serve both memory resources and this row keeps that contract.
+
+**Files.** `api-go/internal/mcpserver/docs_resource.go`, `api-go/internal/mcpserver/dispatch.go`, `api-go/cmd/xmustard-api/route_gates.go`, `api-go/internal/mcpserver/standing_memory.go`, their tests in `api-go/cmd/xmustard-api/` and `api-go/internal/mcpserver/`, `docs/SECURITY.md` (`SECDOC`) and this plan.
+
+**Tests required.**
+- The disabled-tool refusal, written first and run against the unmodified base: with `XMUSTARD_DISABLED_TOOLS=recall`, `GET /api/workspaces/{id}/memory/core` is 403 `tool_disabled`, and the gate-table test names any memory row with no tool.
+- A table test asserting every `GET .../memory/` gate row names a tool, so the gap cannot reopen for a route added later.
+- A read-only predicate test: the rule `callKnownTool` applies, asserting refusal for a tool whose `WriteArgs` the call set, service for a reading call of it, and service for `recall`. The refusal is a tool result with `isError`, not a JSON-RPC error.
+- The unchanged-when-served oracle: with recall served, both resources return what they returned before, each at one API call.
+- A determinism test: `toolGates()` returns the same primary route for a tool on every call.
+- A hook refusal test, one per memory-injecting event, each with a positive control on the same fixture: `SessionStart`, `SubagentStart`, `UserPromptSubmit` and `PreToolUse` inject memory with recall served and inject none with it disabled, and `SessionStart` still carries `watchPaths` and the ground line.
+
+**Acceptance.** A deployment that disables `recall` serves no memory on the two MCP resource routes: `GET /memory/core` answers 403 `tool_disabled`, as `GET /context/active` already did. With recall served, both resources are byte-identical to what they returned before, each at one API call. A resource read passes the read-only predicate a named call passes, and a refusal is a tool result with `isError`. The same switch now governs a hook's memory: no projection, no ground-line memory section and no pushed frame reaches an agent, and no withheld note names what was withheld, while the hook still answers. Two limits are stated rather than papered over: no resource is backed by a tool with `WriteArgs`, so that arm of the predicate is asserted at the predicate, not through a URI; and the role and profile arms of the predicate are already true on today's table, so they widen the guard without changing any answer.
+
+**Collision risk.** `route_gates.go` and the `cmd/xmustard-api` tests are WS-FIX-09's and WS-48's (`*_routes.go` is that row's). `dispatch.go` and `docs_resource.go` are WS-38f's and WS-FIX-13's. `standing_memory.go` is unclaimed.
+
+**Implementation record (branch parity/ws-fix-08, 2026-10-02, first pass).** The MCP-resource half: `/memory/core` names `recall` in its gate row, `toolGates()` ranges over `sortedGatePatterns()`, and both memory resources pass the read-only predicate `callKnownTool` applies. On the base `GET /memory/core` answered 200 with `recall` disabled while `GET /context/active` answered 403; `BOXALL` green. Rounds 1-2 fixed eight findings. Detail: `reviews/ws-fix-08/r<N>/` and FU.
+
+**Implementation record (branch parity/ws-fix-08, 2026-10-03 continuation; the one above is 2026-10-02's).** Review history is in `reviews/ws-fix-08/r<N>/`; the open finding was `WS-FIX-08-r3-1`.
+- *What was built.* `hooks_routes.go`: `hookCall.recallRefused`, set at the one call site from `toolDisabledFor(postureFrom(r), callerOf(r), "recall")`; `grounding` takes `HookGroundingNoMemory` and pushes no projection, and `userPrompt`, `memoryContext` and `push` each return before their store read. `hook_reads.go`: `HookGroundingNoMemory` and the `HookMemoryRanks` test seam. `security_middleware.go`: `toolDisabledFor`, the one predicate `usableTools` now calls. `dispatch.go`: `readOnlyRefusal`, the read-only rule both surfaces apply.
+- *Measured* (build box, Linux, release profile; no load figure is quoted because the helper reports none). Red on the unmodified base, `logs/ws-fix-08-run-20261003T134204Z.log`: nine injections across four events with recall disabled. Green after the fix, `...134658Z.log` and `...141032Z.log`: gofmt clean, go vet clean. Two mutation attempts are build failures rather than kills, having deleted a closing brace with the block (`...135918Z.log`, `...140401Z.log`).
+- *A mutation that survived, and what it changed.* M3 survived the HTTP test first (`...140756Z.log`, green): the hook fixture has no stale and no pending memory, so a grounding that read the store answered 0 where the skipped one answered nil, and both render "0". A test that cannot separate the two arms tests the fixture, so the assertion moved to the subject and the guarantee is fail-closed by shape: unset, never zero.
+- *Deviations.* (1) The refusal is per-section, not per-route: that is the owner's decision, not a choice this row made. The row also wires the role and profile arms of the predicate, which are free and already true on today's table, so a hook cannot reach memory a `recall` call would be refused under them either. (2) `HookGroundingNoMemory` is a new exported name in `workspaceops`, outside this row's Files list: a guard that skipped the store read in the handler would leave `HookGrounding` reading it anyway, and the ground line is part of the answer.
+- *Review.* Round 4 (`reviews/ws-fix-08/r4`, `gate=PASS changed=14 covered=14 channel_findings=5 triaged=4`) ran all five channels: four `codex-spec` findings and one `codex-review` `[P2]`, OCR 0 comments, OpenCode unavailable. All four are fixed: r4-1 this row's plan text written into WS-00's section (3399352), r4-2 the refusal placed after the store read, named independently by two channels (16c6582, proven by 2b5110a4), r4-3 and r4-4 the read-only rule duplicated across two surfaces and the test that could not see the drift (c5773303). Nothing deferred. `triage-check` DISAGREE'd three times: the first two found a real missing test, the third is procedural (`triage-notes.md`).
+- *Checks.* `BOXALL` on the reviewed head: `logs/ws-fix-08-check-20261003T141200Z.log`, remote_exit=0, clippy_warnings=6 (the merge-base count), rss_lines=ok, 24 Go packages ok, 18 Rust binaries, 0 FAILED, 46 untruncated lines. `SECDOC` regenerated the gate table with no diff (`...141130Z.log`), correct because no gate row changed. Mutated=8 across four rounds, 7 killed; M3 survives and is recorded, M6 survived until `HookMemoryRanks` existed and then died to it. Not run: `RET`, `BUD`, `PI`, `CAPS`, `GOLD` — this row changes no index, no resident component, no Pi source, no `tools/list` byte and no projection.
+- *Follow-ups.* FU holds the dogfood gaps (stale index — **WS-FIX-15**; a mis-ranked `gate` — **WS-59b**) and `TestToolGatesAreTheNineCoreTools`'s restatement.
 ### WS-FIX-12 — Validate issue and view ids when they are created, not when they are read
 
 **Goal.** `CreateIssue` stores a caller-supplied `bug_id` verbatim: it is written to `tracker_issues.json`, to the workspace snapshot, into the issue fingerprint and into the activity log, with no check of any kind. `CreateSavedView` derives a `view_id` from the caller's view name through `url.QueryEscape`, which escapes `/` and `\` but leaves `.` and an unbounded length alone, so a name of `..` yields an id no path segment can carry. The id is then unusable: the URL layer refuses it with `400 invalid_id` before any handler runs, so the create answers 200 and the object it just wrote can never be read, updated or deleted again. Validation at the read edge is fail-closed and stays, but a create must not mint a value the server itself will refuse. This row moves the check to create, where the value is still the caller's to fix.
@@ -2741,6 +2773,157 @@ before the row is claimed resident-affecting, as recorded in the follow-ups belo
 - *Checks (2026-09-29, local, box down).* `cargo build --release --locked`: builds. `cargo test --release`: every suite `ok`, 0 failed (navigation.rs's 5 tests included). `cargo clippy`: 6 warnings, unchanged from the `2ad3315` baseline (`--all-targets` shows 2 more from test code; the Makefile's plain `cargo clippy` is the comparable count). `gofmt -l` clean on every changed file. `go build ./...` and `XMUSTARD_CORE_BIN=<local release core> go vet ./...`: clean. `go test -p 2 -count=1 ./...` and a repeat at `-p 1`: `TestExplainPagesADirectory`, `TestSymbolNavigationRoutes` (both in `cmd/xmustard-api`), `TestHealthFullViewIsForOperatorsOnly` and `xmustard-mcp`'s `TestShimNegotiatesBeforePipelinedRequests` failed intermittently, every failure logging `xmustard overloaded: transient budget exhausted` or `heavy slot refused` against the soft memory ceiling — this 8 GB Mac running the real resident rust-core workers for the full suite at once, not a code defect. Isolated (`-run`, one test file's worth at a time) and at `-count=5`, all four passed every time, matching this branch's own earlier note about `TestCodexEventWithAWorkspacePin` under the same constraint. Pi `node --test test/unit.test.ts`: 45/45.
 - *Deviations.* None beyond the route-file mechanics above; no requirement or interface changed.
 
+### WS-FIX-27 — the index fixtures in `index_query.rs` create index directories under the process umask
+
+**Goal.** WS-FIX-11 (merged `932106d`) turned the group- and world-writable index-directory
+warning into a refusal. `classify_dir` (`rust-core/src/index/mod.rs:249`) refuses an
+operator-named directory carrying any group- or other-**write** bit, and its error names
+`chmod 700 <dir>`. **Four** fixtures in `rust-core/tests/index_query.rs` hand a `TempDir`
+straight to the index as an operator-named `--index-dir`, so their outcome depends on the
+**process umask** rather than on anything the test says. `TempDir::new` creates through
+`std::fs::create_dir`, which takes the umask's permissions: under a login umask of `0002` the
+directory lands at `0775`, the guard refuses it, and a test fails on a host that changed
+nothing.
+
+Measured on the build box, `umask 0002`, pre-fix tree: the suite is **green, 9 passed**
+(`logs/ws-fix-27-run-20261003T144047Z.log`). Three of the four sites were
+already saved by the `tighten()` chmod that WS-FIX-11 and WS-FLK-01 added, so the umask
+never reached them. The one site with no `tighten` is
+`legacy_equality_holds_on_parity_fixtures` (`index_query.rs:556`), and it **skips itself**
+unless `XMUSTARD_PARITY_FIXTURES` is set, which is why no gate run reached it. The defect
+is therefore latent at three sites rather than active, and the fix is creation-time for all
+four instead of a chmod after the fact at three.
+
+This row makes each fixture create its index directory with an **explicit `0700`** at creation
+time — `tempfile::Builder::permissions`, which `tempfile` passes to `mkdir`
+(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`). A umask can only **narrow** the requested mode and
+never widen it, so no umask can give a fixture's index directory a group- or other-**write** bit,
+which is the property `classify_dir` refuses (`mode & 0o022`). The umask is therefore no longer a
+source of a fixture's result: the `0002` case that opened this row, and every other umask that
+keeps the owner's bits, all land on `0o700`. Two bounds on that claim, both stated so they are not
+mistaken for more: a umask clearing owner bits narrows `0700` to the complement — `0o700 & ~0o177`
+is `0o600`, and `0o700 & ~0o777` is `0o000` — so the owner cannot traverse the directory and a
+fixture using it would fail, which is the operator's own setting and is left alone; and `0700` is
+*stronger* than the guard requires, since `classify_dir` accepts group- or other-read and execute
+bits and refuses only the write ones. It replaces the `tighten()`
+after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
+at every site, and it extends the fix to the one site that never had it
+(`legacy_equality_holds_on_parity_fixtures`, which builds into a `TempDir` with no `tighten` and
+would fail the same way). **No product source changes**: `ensure_private_dir` already creates
+`0700` on the path where the core owns the directory; this row fixes the fixtures, which is where
+the operator is the test.
+
+**Requirements.** No new PAR ids. It is test hygiene on a guard §5.1 rule 7 lists, and it changes
+no product behaviour, no bound, no timeout and no gate threshold. §5.1 rule 11 forbids the
+alternative repair, which would be to loosen `classify_dir`'s mask back to a warning: the refusal
+is the merged, reviewed, correct behaviour and a fixture that cannot satisfy it is the fixture
+that is wrong. The owner's box prelude already sets `umask 022` for gates, which hides this class
+of failure rather than closing it, so the acceptance condition is stated against `umask 0002`
+explicitly.
+
+**Files.** `rust-core/tests/index_query.rs` (one index-directory constructor used by every
+fixture that hands a directory to the index, replacing `tighten`),
+`docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+`rust-core/tests/index_build.rs` was checked and is **not** in scope, so it is named here only to
+record the answer: its `--index-dir` sites (`index_build.rs:786`, `:817`, `:1075`, `:1683`) all pass
+a `join("idx")` **subdirectory** of a `TempDir`, so the core creates that directory itself and
+`ensure_private_dir`'s `DirBuilder.mode(0o700)` already makes it umask-independent. The defect
+needs the `TempDir` itself to be the index directory, which only `index_query.rs` does — through
+`cfg_at(dir)` (`index_query.rs:130`) for the build sites and through `dir.path().join(DB_FILE)`
+(`index_query.rs:1381`) for `ensure_graph_segment`.
+
+**Tests required.**
+- One new test asserts the property directly, without depending on which tests happen to fail:
+  under a deliberately permissive `0002` umask it asserts `index_dir()` creates `0o700` **and**
+  that a plain `TempDir` creates `0o775` under the same umask. Both expected values are
+  literals, not results of calling the code under test, and the pair is what makes the first
+  meaningful: under a `0077` umask a plain `TempDir` is already `0700`, so a one-sided
+  assertion would pass with the explicit mode removed. The umask is set in a **child process**
+  (this same test binary re-invoked), because a process-global `umask` is not safe to set in a
+  binary whose tests run in parallel threads.
+- A mutation row for the constructor: removing `b.permissions(perm(0o700))` turns the test
+  **red** with `left: 509` (`0o775`) against `right: 448` (`0o700`), measured under `umask 0002`
+  on the box. Restored from a tree `git status --short` showed clean.
+- A mutation row for the assertion: narrowing the mode mask must fail, so the test cannot be
+  satisfied by a mask that cannot see a group-write bit. This one **survived its first form**
+  (the negative half read the mode through a second mask rather than the predicate the
+  positive half used) and the test was strengthened until it was killed.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines and `BUILD_5000_*` are
+  byte-identical to the merge base.
+- `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
+
+**Acceptance.** Every fixture in `rust-core/tests/index_query.rs` that hands a directory to the
+index creates it with an explicit `0700` at creation time, so no group- or other-**write** bit can
+appear under any umask and the suite's result is the same under `umask 0002` and `0022`; no
+fixture calls `tighten` any more; and the new test fails if the explicit mode is removed.
+`BOXALL` is green on the box with clippy's warning count unchanged and `cargo fmt --check` clean.
+
+**Collision risk.** `rust-core/tests/index_query.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which added `tighten` and the memprobe assertions, and by WS-FLK-08's row (merged
+`246e0b5`), which touched the same file's guard call sites. Both are merged, so neither is in
+flight. WS-FIX-11 (merged `932106d`) owns the `classify_dir` guard this row does not touch.
+Lane C is the only lane in this build that edits `rust-core`. `rust-core/tests/index_build.rs` is
+named by WS-FLK-02's row (merged `799d8c8`), also merged; this row does not change that file's
+bounds or its expected values.
+
+**Implementation record (branch parity/ws-fix-27, 2026-10-03).** Two files, all test code and this
+plan; `git diff --numstat 246e0b5 HEAD` gives the plan +94/-0 and `index_query.rs` +139/-15. No
+product source, no bound, no timeout, no retry, no dependency, no route or dispatch entry.
+- *What was built.* `rust-core/tests/index_query.rs`: one `index_dir()` built from
+  `tempfile::Builder::permissions(0o700)`, replacing `TempDir::new()` plus `tighten` at all four
+  sites that hand a directory to the index; `perm(mode)` and `mode_of_dir(dir)` keep the mode
+  literals in one place; `under_umask(mask, body)` re-invokes this test binary with
+  `--exact <child>` and reads a `UMASK_MODE=` line from it; two child tests print the mode for
+  `index_dir` and for a plain `TempDir`; `an_index_fixture_dir_is_owner_only_whatever_the_process_umask`
+  asserts `0o700` and `0o775` under umask `0002` and `0o600` under `0177`. `tighten` is gone, and
+  `TempDir::new` survives only in `repo()`, where the directory is a source tree rather than an
+  index directory.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64, debug profile unless `--release` is
+  named). Pre-fix under `umask 0002`: **9 passed**, the suite is green (`…T144047Z.log`), because
+  three of the four sites already had `tighten`. M3 (drop the explicit mode) fails with `left:
+  509` / `right: 448` under the same umask (`…T165838Z.log`); M1 also fails
+  `csr_equals_the_edges_table_and_reverse_edges_mirror_it` with `classify_dir`'s own refusal
+  naming `chmod 700` (`…T155850Z.log`); M2 **survived** (`…T160114Z.log`) and was killed only
+  after the test was strengthened (`…T161443Z.log`). Child arms green: 3 passed (`…T165817Z.log`,
+  and with the `0177` arm `…T174650Z.log`). `BOXALL` on `8d9358f0`: `remote_exit=0`,
+  `clippy_warnings=6`, `rss_lines=ok`, 24 Go packages and 18 Rust binaries, `…T184240Z.log`.
+  `cargo fmt --check` exit 0 locally.
+- *Deviations.* (1) The row's own text said three tests fail under `umask 0002`; that was wrong
+  on my own measurement and is corrected above and in the Goal — the defect was latent at three
+  sites and live at one that skips by default. (2) The umask half runs in a child process rather
+  than in-process, because a process-global `umask` is not safe in a binary whose tests run in
+  parallel threads; this was round 1's finding from all three channels. (3) Three further
+  low-severity rounds narrowed prose claims about the umask (rounds 2-4); no behaviour changed
+  after `da7c17ab`.
+- *Review.* Round 1 (`reviews/ws-fix-27/r1`): 2 codex-spec (1 medium, 1 low) + 1 OCR medium + 1
+  `codex-review` `[P2]`, all one defect — the test never set the permissive umask; fixed in
+  `da7c17ab`. Round 2 (`r2`): 1 low, the `0700`-under-any-umask overclaim; fixed in `e190522f`.
+  Round 3 (`r3`): 2 lows, the guard's mask is `mode & 0o022` so `0700` is stronger than required;
+  fixed in `f851838c`. Round 4 (`r4`): 2 lows, the `0777` figure is `0o000` not `0o600` and the
+  `0177` case is not result-independent; fixed in `8d9358f0`, the gate's head. `gate=PASS
+  changed=2 covered=2 channel_findings=2 triaged=2 reviewer=gpt-6-sol` on r4; the five earlier
+  rounds' entries are in `r4/triage-all-rounds.json` because the gate reviews one sealed round.
+  `triage-check.md` returns DISAGREE on the standing behaviour-free objection (prose findings owe
+  no test); answered in `r4/triage-notes.md`. OCR's channel contributed nothing structural
+  (`ocr_review=0`) and the OpenCode channel reads `unavailable`.
+- *Merge recheck.* Recorded in `reviews/ws-fix-27/r4/merge-recheck.md`.
+- *Checks.* `xm-box.sh check <wt> all -count=1` (BOXALL) as cited; `cargo test --locked --test
+  index_query` under `umask 0002` and via the in-test children; `cargo fmt --check`. **not run:**
+  RET, BUD, PI, CAPS, SECDOC, GOLD — §3.0 names none of them for a row that changes no index
+  behaviour, no memory store, no Pi source, no route gate, no projection and no `tools/list`
+  byte; BUD is explicitly not owed, as no resident component or in-heap structure was added.
+- *Follow-ups.* (1) **`xm-box.sh run` can gate a stale binary and a stale red reads exactly like
+  a real one**: `…T161604Z.log` reported `remote_exit=1` for a test that passes on every later run
+  of a clean tree, and the log's tell is the absence of a `Compiling` line. Proposed owner:
+  whoever maintains `xm-box.sh`. (2) `xm-review-run.sh` refuses a pre-existing `r<N>`, so the
+  hand-written `slop-audit.md` and `dogfood.md` had to be staged outside the round directory and
+  copied in; proposed owner the review runner. (3) The gate reads S12/S13 only as `##` headings
+  and wants each S5 test named on a line carrying `FAIL`, which is narrower than §4.6's prose;
+  proposed owner the gate. (4) Three `dogfood:` lines in `reviews/ws-fix-27/r4/dogfood.md` — MCP
+  `search` ranked a Go reducer and a React prop above the Rust `fn classify_dir` the query named,
+  `explain` returned not-found for a tracked test file, and `impact symbol=index_dir` returned
+  `defined_in: []` with no reason; proposed owner WS-FIX-15, as in every prior row.
 ### WS-FIX-18 — WS-36 deferred minors: an accurate hybrid `omitted` and a `source_identity` fixture case
 
 **Goal.** Close the two minors WS-36 deferred as "not cheap" (this file's WS-36 *Deferred (minor, not cheap)* bullet). (1) A hybrid search page's `omitted` member goes stale after the ladder's `trimmed` rung cuts `hits`: the member keeps the producer's page value (hits after the page) while the delivered result carries fewer hits, so `omitted + returned != total` and an agent reading it undercounts what the answer left out. (2) The `signal_flags` fixture carries no `coverage.source_identity` member, so the rung's promise to keep it is never exercised by a test.
