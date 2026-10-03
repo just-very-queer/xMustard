@@ -184,6 +184,30 @@ func TestAPrivateMemoryIsNotDisclosedOnAnyHTTPReadPath(t *testing.T) {
 			t.Errorf("author reading its dir-scoped entry %q: want %d, got %d %v", c.query, c.want, code, got)
 		}
 	}
+	// The same key has to reach RANKED recall, not only the by-id path: a parser that
+	// read dir for one route and not the other would leave a dir-scoped memory
+	// unreachable from the tool an agent actually calls.
+	for _, c := range []struct {
+		query string
+		want  int
+	}{
+		{"?query=omega&dir=api-go/internal", http.StatusOK},
+		{"?query=omega&dir=api-go/cmd", http.StatusOK},
+	} {
+		code, got := call("alice", "GET", "/context/active"+c.query, "")
+		if code != c.want {
+			t.Errorf("ranked recall %q: want %d, got %d %v", c.query, c.want, code, got)
+		}
+		served := false
+		for _, e := range entryList(t, got) {
+			if e["id"] == dirID {
+				served = true
+			}
+		}
+		if want := c.query == "?query=omega&dir=api-go/internal"; served != want {
+			t.Errorf("ranked recall %q served the dir-scoped entry: %v, want %v", c.query, served, want)
+		}
+	}
 }
 
 // include_superseded serves a superseded entry only if it was once promoted: a pending
