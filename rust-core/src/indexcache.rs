@@ -6,8 +6,12 @@
 //! file's bytes, read through the bounded no-follow reader. Files that cannot be hashed
 //! in full (oversized, unreadable, not regular, over the identity byte budget) add a
 //! metadata token and an explicit limitation, so `identity_complete` is false: a
-//! bounded read never claims identity for bytes it did not read. The same key drives
-//! graph-cache invalidation and `xmustard-core repo-key`.
+//! bounded read never claims identity for bytes it did not read. A status entry that
+//! is a nested repository (a directory with its own `.git`: an untracked `sub/`, a
+//! submodule, a gitlink without a module entry) is not read: its token is the nested
+//! HEAD, ref and Git index stat key, it is listed in `nested_repos`, and it leaves the
+//! identity complete (WS-RT2). The same key drives graph-cache invalidation and
+//! `xmustard-core repo-key`.
 //!
 //! Dirty and untracked files are hashed through a stat cache of their own
 //! (`hashcache::identity_cache_file_for`, PAR-FRESH-01), so an unchanged dirty file is
@@ -29,7 +33,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::symbolgraph::{
@@ -384,7 +388,29 @@ pub enum DirtyContent {
     Incomplete(SourceReadFailure),
     /// Skipped because the identity byte budget was spent.
     Unhashed,
+    /// A nested repository (see [`NestedRepo`]) of `kind`: not read; `token` covers
+    /// its HEAD, its ref and its Git index stat key, so it is complete for this
+    /// repository's identity.
+    NestedRepo { kind: &'static str, token: String },
 }
+
+/// A directory inside the worktree with a Git dir of its own (`.git` as a directory
+/// or a `gitdir:` file). It is a repository of its own: never read as a file, outside
+/// this repository's identity and index, and reported instead of being dropped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NestedRepo {
+    /// Top-level relative, without a trailing `/`.
+    pub path: String,
+    /// [`NESTED_SUBMODULE`], [`NESTED_GITLINK_UNREGISTERED`] or [`NESTED_UNTRACKED`].
+    pub kind: String,
+}
+
+/// A tracked gitlink with a `.gitmodules` entry.
+pub const NESTED_SUBMODULE: &str = "submodule";
+/// A tracked gitlink with no `.gitmodules` entry (Git cannot clone it).
+pub const NESTED_GITLINK_UNREGISTERED: &str = "gitlink_unregistered";
+/// An untracked directory Git reports as a repository of its own (`?? sub/`).
+pub const NESTED_UNTRACKED: &str = "nested_repo";
 
 /// The repository source identity. Serialized as the `repo-key` JSON contract.
 #[derive(Debug, Clone, Serialize)]
@@ -411,6 +437,10 @@ pub struct SourceIdentity {
     pub bytes_hashed: u64,
     /// Dirty or untracked files whose hash the stat cache vouched for (not read).
     pub files_reused: usize,
+    /// Status entries that are nested repositories, by path; omitted when none. They
+    /// are covered by their own token, so they never make the identity incomplete.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nested_repos: Vec<NestedRepo>,
     #[serde(skip)]
     pub dirty: BTreeMap<Vec<u8>, DirtyContent>,
     #[serde(skip)]
@@ -495,6 +525,142 @@ pub const MAX_IGNORED_DIR_BYTES: usize = 256 << 10;
 fn push_field(h: &mut Sha256, bytes: &[u8]) {
     h.update((bytes.len() as u64).to_le_bytes());
     h.update(bytes);
+}
+
+/// Bytes read from a Git dir's small files (`HEAD`, a loose ref, a `gitdir:` pointer).
+const GIT_POINTER_BYTES: u64 = 4 << 10;
+/// Bytes of `.gitmodules` read to tell a submodule from an unregistered gitlink.
+const MAX_GITMODULES_BYTES: u64 = 256 << 10;
+
+fn read_small(path: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(cap)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
+/// The stat key of `path` for a key token, `absent` when it cannot be stat'ed.
+fn stat_token(path: &Path) -> String {
+    fs::symlink_metadata(path).map_or_else(|_| "absent".into(), |m| change_token(&m))
+}
+
+/// Whether the directory `dir` holds a `.git` of its own (a directory or a file).
+pub(crate) fn has_own_git(dir: &Path) -> bool {
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
+    fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir() || m.is_file())
+}
+
+/// The Git dir of the repository whose worktree is `dir`: `dir/.git`, or the target of
+/// a `gitdir:` file there (relative to `dir`). None when neither leads to a directory.
+fn nested_git_dir(dir: &Path) -> Option<PathBuf> {
+    let dot = dir.join(".git");
+    let meta = fs::symlink_metadata(&dot).ok()?;
+    if meta.is_dir() {
+        return Some(dot);
+    }
+    let text = read_small(&dot, GIT_POINTER_BYTES)?;
+    let target = text.strip_prefix(b"gitdir:")?.trim_ascii();
+    let git_dir = dir.join(path_from_bytes(target));
+    git_dir.is_dir().then_some(git_dir)
+}
+
+/// The token of a nested repository at `dir`, read without a Git child: its HEAD, the
+/// ref HEAD names (the loose ref, else the stat key of `packed-refs`) and the stat key
+/// of its Git index. A commit, a checkout or staging inside it changes the token; an
+/// unstaged edit in its worktree belongs to that repository and does not.
+fn nested_repo_token(dir: &Path) -> String {
+    let mut h = Sha256::new();
+    match nested_git_dir(dir) {
+        None => push_field(&mut h, b"no-git-dir"),
+        Some(git_dir) => {
+            let head = read_small(&git_dir.join("HEAD"), GIT_POINTER_BYTES).unwrap_or_default();
+            push_field(&mut h, &head);
+            let common = read_small(&git_dir.join("commondir"), GIT_POINTER_BYTES).map_or_else(
+                || git_dir.clone(),
+                |c| git_dir.join(path_from_bytes(c.trim_ascii())),
+            );
+            let named = head
+                .strip_prefix(b"ref: ")
+                .map(<[u8]>::trim_ascii)
+                .filter(|r| {
+                    r.starts_with(b"refs/") && !r.split(|b| *b == b'/').any(|c| c == b"..")
+                });
+            if let Some(name) = named {
+                let rel = path_from_bytes(name);
+                match read_small(&git_dir.join(&rel), GIT_POINTER_BYTES)
+                    .or_else(|| read_small(&common.join(&rel), GIT_POINTER_BYTES))
+                {
+                    Some(oid) => push_field(&mut h, &oid),
+                    None => push_field(&mut h, stat_token(&common.join("packed-refs")).as_bytes()),
+                }
+            }
+            push_field(&mut h, stat_token(&git_dir.join("index")).as_bytes());
+        }
+    }
+    format!("nested_repo:{:x}", h.finalize())
+}
+
+/// The `path = ...` entries of `<toplevel>/.gitmodules` (bounded read; empty when
+/// absent). A path Git quotes is unquoted; one with escapes is kept as written.
+pub(crate) fn submodule_paths(toplevel: &Path) -> std::collections::BTreeSet<String> {
+    let text = read_small(&toplevel.join(".gitmodules"), MAX_GITMODULES_BYTES).unwrap_or_default();
+    String::from_utf8_lossy(&text)
+        .lines()
+        .filter_map(|line| {
+            let (key, value) = line.split_once('=')?;
+            key.trim().eq_ignore_ascii_case("path").then(|| {
+                let v = value.trim();
+                v.strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(v)
+                    .to_string()
+            })
+        })
+        .collect()
+}
+
+/// The kind of the nested repository at top-level relative `rel`: an untracked one,
+/// or a tracked gitlink with or without its `.gitmodules` entry.
+pub(crate) fn nested_kind(
+    tracked: bool,
+    rel: &str,
+    modules: &std::collections::BTreeSet<String>,
+) -> &'static str {
+    match (tracked, modules.contains(rel)) {
+        (false, _) => NESTED_UNTRACKED,
+        (true, true) => NESTED_SUBMODULE,
+        (true, false) => NESTED_GITLINK_UNREGISTERED,
+    }
+}
+
+/// A status entry that is a directory, classified without reading it: a nested
+/// repository, or `not_regular`. None for anything else (a file, a symlink, a path
+/// gone from the worktree).
+fn directory_entry(
+    toplevel: &Path,
+    e: &StatusEntry,
+    modules: &mut Option<std::collections::BTreeSet<String>>,
+) -> Option<DirtyContent> {
+    let trimmed = e.path.strip_suffix(b"/").unwrap_or(&e.path);
+    let dir = toplevel.join(path_from_bytes(trimmed));
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
+    if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    if !has_own_git(&dir) {
+        return Some(DirtyContent::Incomplete(SourceReadFailure::NotRegular));
+    }
+    let rel = String::from_utf8_lossy(trimmed);
+    let modules = modules.get_or_insert_with(|| submodule_paths(toplevel));
+    let kind = nested_kind(!e.is_untracked(), &rel, modules);
+    Some(DirtyContent::NestedRepo {
+        kind,
+        token: nested_repo_token(&dir),
+    })
 }
 
 /// Compute the source identity of the working tree at `root` (see module docs).
@@ -589,6 +755,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         files_hashed: 0,
         bytes_hashed: 0,
         files_reused: 0,
+        nested_repos: Vec::new(),
         dirty: BTreeMap::new(),
         layout: None,
         tracked_unhashed: Vec::new(),
@@ -685,8 +852,11 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
     // Regular files come from the identity's stat cache: only new, changed or racy ones
     // are read. Tracked entries claim the byte budget first (the entries' order), and
     // reused files are charged too, so the key does not depend on the cache.
+    // `sub/` (Git's form for an untracked nested repository) is a directory: it never
+    // reaches the hasher.
     let rels: Vec<String> = entries
         .iter()
+        .filter(|e| e.path.last() != Some(&b'/'))
         .filter_map(|e| std::str::from_utf8(&e.path).ok().map(str::to_string))
         .collect();
     let cache = crate::hashcache::identity_cache_file_for(&layout);
@@ -700,6 +870,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
     id.bytes_hashed = pass.bytes_hashed;
     id.files_reused = pass.reused;
     let mut budget = MAX_IDENTITY_BYTES.saturating_sub(pass.bytes_hashed + pass.bytes_reused);
+    let mut modules = None;
     for e in &entries {
         if e.is_untracked() {
             id.untracked_entries += 1;
@@ -714,6 +885,8 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
             .and_then(|p| cached.get(p));
         let content = if let Some(hex) = from_cache {
             DirtyContent::Sha256(hex.clone())
+        } else if let Some(dir) = directory_entry(&layout.toplevel, e, &mut modules) {
+            dir
         } else if budget == 0 {
             DirtyContent::Unhashed
         } else {
@@ -750,6 +923,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
             DirtyContent::Sha256(x) => format!("sha256:{x}"),
             DirtyContent::Deleted => "deleted".into(),
             DirtyContent::Symlink(x) => format!("symlink:{x}"),
+            DirtyContent::NestedRepo { kind, token } => format!("{kind}:{token}"),
             DirtyContent::Incomplete(_) | DirtyContent::Unhashed => {
                 // metadata only: changes on most edits, but never claimed as identity.
                 let what = match &content {
@@ -783,11 +957,19 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
                     ),
                 })
             }
+            DirtyContent::NestedRepo { kind, .. } => {
+                let trimmed = e.path.strip_suffix(b"/").unwrap_or(&e.path);
+                id.nested_repos.push(NestedRepo {
+                    path: String::from_utf8_lossy(trimmed).into_owned(),
+                    kind: (*kind).to_string(),
+                })
+            }
             _ => {}
         }
         id.dirty.insert(e.path.clone(), content);
     }
     id.identity_complete = id.limitations.is_empty();
+    id.nested_repos.sort();
     id.key = format!("{:x}", h.finalize());
     id.layout = Some(layout);
     (id, entries)
@@ -1253,9 +1435,10 @@ mod tests {
     }
 
     // A submodule configured `ignore = all` is hidden from plain `git status`; its dirty
-    // worktree must still surface (as an explicit `not_regular` limitation).
+    // worktree must still surface, as a nested repository that changes the key and
+    // leaves the identity complete (WS-RT2; before it, a `not_regular` limitation).
     #[test]
-    fn ignored_dirty_submodule_is_not_complete() {
+    fn ignored_dirty_submodule_is_a_nested_repository() {
         let inner = repo_with(&[("lib.rs", b"fn inner() {}\n")]);
         let outer = repo_with(&[("a.rs", b"fn a() {}\n")]);
         let url = inner.path().to_str().unwrap();
@@ -1273,18 +1456,19 @@ mod tests {
         );
         git(outer.path(), &["commit", "-qm", "sub"]);
         git(outer.path(), &["config", "submodule.sub.ignore", "all"]);
-        assert!(source_identity(outer.path()).identity_complete);
+        let clean = source_identity(outer.path());
+        assert!(clean.identity_complete && clean.nested_repos.is_empty());
         fs::write(outer.path().join("sub/lib.rs"), b"fn inner_edited() {}\n").unwrap();
         let id = source_identity(outer.path());
-        assert!(
-            !id.identity_complete,
-            "ignored dirty submodule reported complete"
+        assert!(id.identity_complete, "{:?}", id.limitations);
+        assert_eq!(
+            id.nested_repos,
+            vec![NestedRepo {
+                path: "sub".into(),
+                kind: NESTED_SUBMODULE.into()
+            }]
         );
-        assert!(
-            id.limitations
-                .iter()
-                .any(|l| l.path.as_deref() == Some("sub"))
-        );
+        assert_ne!(id.key, clean.key, "the dirty submodule is part of the key");
     }
 
     #[test]
