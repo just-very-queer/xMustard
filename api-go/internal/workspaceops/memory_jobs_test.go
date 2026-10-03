@@ -385,9 +385,9 @@ func countAllJobs(t *testing.T, dir, ws string) int {
 func TestClusterSpansAPageBoundary(t *testing.T) {
 	dir := singleAgentDir(t)
 	ws := "wsJobs11"
-	// More entries than one page holds, then the pair on one anchor, so the two members sit
-	// either side of a page boundary rather than inside one page.
-	filler := consolidationPage + 10
+	// More entries than one pass reads, then the pair on one anchor, so the two members sit
+	// either side of the point where one pass stops and the next resumes.
+	filler := consolidationPage*consolidationPages + 10
 	for i := 0; i < filler; i++ {
 		proposeOn(t, dir, ws, "a", fmt.Sprintf("filler %d", i), "an unrelated thing",
 			fmt.Sprintf("src/filler%04d.go", i))
@@ -395,15 +395,29 @@ func TestClusterSpansAPageBoundary(t *testing.T) {
 	proposeOn(t, dir, ws, "a", "left of the boundary", "left thing", "src/boundary.go")
 	proposeOn(t, dir, ws, "b", "right of the boundary", "right thing", "src/boundary.go")
 
-	got := preparedOrder(t, dir, ws)
+	// The pair must be joined by a pass, not merely present in the store: prepare repeatedly,
+	// as a workspace larger than one pass is consolidated over several, and require the pair
+	// in some pass's candidates. A window that only bounds memory would never join them.
+	// The pair must be joined by a pass, not merely present in the store. PrepareConsolidationJobs
+	// always starts at the beginning of the table, so it cannot show the cross-pass case; the
+	// pass results can, because a pass reads from the cursor the last one stopped at.
 	joined := false
-	for _, c := range got {
-		if strings.Count(c, ",") == 1 && strings.Contains(c, "dedupe_cluster") {
-			joined = true
+	var attempts []ConsolidationPass
+	for i := 0; i < 3 && !joined; i++ {
+		res := runConsolidation(t, dir, ws, "worker-1")
+		attempts = append(attempts, res)
+		for _, j := range res.Jobs {
+			if j.Kind == govstore.JobDedupeCluster && len(j.CandidateIDs) == 2 {
+				joined = true
+			}
 		}
 	}
 	if !joined {
-		t.Fatalf("two memories on one anchor across a page boundary produced no cluster: %v", got)
+		var seen []int
+		for _, a := range attempts {
+			seen = append(seen, a.Seen)
+		}
+		t.Fatalf("two memories on one anchor either side of the cursor were never joined; passes saw %v entries", seen)
 	}
 	if consolidationClusterWindow <= consolidationPage*consolidationPages {
 		t.Fatalf("the cluster window (%d) must exceed one pass (%d) or a pair either side of a page is never a candidate",

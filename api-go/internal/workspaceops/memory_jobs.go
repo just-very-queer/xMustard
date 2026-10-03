@@ -56,11 +56,10 @@ const (
 	consolidationPage  = 500
 	consolidationPages = 4
 	// consolidationClusterWindow bounds how far back a pass keeps entries when deciding which
-	// memories share an anchor, and it is deliberately larger than one pass reads
-	// (consolidationPage * consolidationPages). A window equal to a pass would leave two
-	// memories sharing an anchor candidates for each other only when both fall inside the same
-	// pass, which is the cross-boundary defect this bound was added to close. Overlapping the
-	// window past the pass boundary is what makes a pair either side of a page join.
+	// memories share an anchor. It is larger than one pass reads, because a window equal to a
+	// pass would leave a pair sharing an anchor candidates only when both fall inside the same
+	// pass: the cursor resumes where the last pass stopped, so a pair either side of that point
+	// is met by neither pass on its own.
 	consolidationClusterWindow = consolidationPage * consolidationPages * 2
 	// consolidationJobsPerRun bounds the jobs one pass enqueues. It matches the candidate
 	// bound, so a pass that took candidates queues all of them.
@@ -168,6 +167,17 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 	free, err := unqueuedCandidates(ctx, dataDir, workspaceID, candidates)
 	if err != nil {
 		return res, err
+	}
+	// A pair either side of the cursor is met by neither pass alone, so the snapshot keeps the
+	// entries the previous pass reached: the pass reads from the cursor back through the
+	// window, which is what makes two memories sharing an anchor candidates for each other
+	// however the boundary fell. Without this the window only bounds memory and buys nothing.
+	if startCursor > 0 {
+		back, _, _, _, _, err := consolidationCandidates(ctx, dataDir, workspaceID, max(startCursor-consolidationClusterWindow, 0))
+		if err != nil {
+			return res, err
+		}
+		candidates = mergeCandidates(back, candidates)
 	}
 	if complete && len(free) == 0 {
 		fromStart, s2, k2, c2, comp2, err2 := consolidationCandidates(ctx, dataDir, workspaceID, 0)
@@ -284,6 +294,24 @@ func unqueuedCandidates(ctx context.Context, dataDir, workspaceID string, candid
 		return nil, err
 	}
 	return out, nil
+}
+
+// mergeCandidates joins two derived lists, keeping the first occurrence of a signature and
+// sorting the result, so a candidate found in both reaches is prepared once.
+func mergeCandidates(first, second []govstore.JobInput) []govstore.JobInput {
+	seen := make(map[string]bool, len(first)+len(second))
+	out := make([]govstore.JobInput, 0, len(first)+len(second))
+	for _, list := range [][]govstore.JobInput{first, second} {
+		for _, c := range list {
+			if seen[c.ConflictSignature] {
+				continue
+			}
+			seen[c.ConflictSignature] = true
+			out = append(out, c)
+		}
+	}
+	slices.SortFunc(out, func(a, b govstore.JobInput) int { return strings.Compare(a.ConflictSignature, b.ConflictSignature) })
+	return out
 }
 
 // lastCursorOf is the largest insertion cursor on a page, which is the position after it.
