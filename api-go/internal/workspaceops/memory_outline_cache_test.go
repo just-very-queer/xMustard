@@ -42,8 +42,8 @@ func trustOutlineCache(t *testing.T) { setOutlineTrustWindow(t, 0) }
 
 // A file that changes between the read and the store must not be cached: the hash came
 // from the old text, so storing it under the new mark would let a later pass serve that
-// stale hash as current and the edit would never be marked. The outline stub rewrites
-// the file, which is when the mark moves.
+// stale hash as current and the edit would never be marked. The outline rewrite is
+// what moves the file while the pass is hashing it.
 func TestAFileChangedWhileItWasReadIsNotCached(t *testing.T) {
 	resetOutlineCache(t)
 	trustOutlineCache(t)
