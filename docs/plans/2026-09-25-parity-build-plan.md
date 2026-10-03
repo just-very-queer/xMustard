@@ -4025,27 +4025,38 @@ list is in the round-1 record under `reviews/ws-59e/`):
 `navigation.go` (WS-52a unifies the codec), the plan file (every lane appends here).
 
 **Implementation record (branch parity/ws-59e, 2026-10-03).** Detail in
-`reviews/ws-59e/`; state in the PARKED note below.
+`reviews/ws-59e/`.
 
-- **Built.** `cursor.go` the `i2` codec kind; `navigation.go` `ImpactCursor`/`DecodeImpactCursor` and `impactRanking`, signed over the wire's names (`depth`, not `max_depth`); `symbolgraph.go` `has_more`/`next_cursor`, a trimmed page's cursor re-signed to the first undelivered item, and a tier decoder that counts items from raw bytes without materialising them; `impact_flags.go` refuses a cursor on the trace and path forms, an empty cursor, and `cursor` with `offset`; `tool_impact.go` declares `cursor` and the members; the Pi mirror forwards them.
-- **Measured** (Linux box, `a7bb1d0`). `BOXALL` `remote_exit=0`, 24 Go packages, 18 Rust binaries, `clippy_warnings=6` (base count), `rss_lines=ok`. `CAPS` PASS, all 16 changed caps **fell** (−76/−64/−14/−2). `PI` `remote_exit=0`.
-- **Deviations.** 1. Eleven files outside the row's `Files`, each with a reason in `reviews/ws-59e/r4/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members it wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same ladder and carries the earlier stages and recovery forward. 3. `countArray` reads the member at its own level, so a symbol name holding `"items":[` cannot steer a paging decision.
-- **Review.** r1-r4; twelve findings, ten fixed, one rejected on an AGREE adjudication (`WS-59e-r2-5`), one open (`WS-59e-r4-3`). Three mutations survived honestly (M16, M17, M22).
+- **Built.** `cursor.go` the `i2` codec kind; `navigation.go` `ImpactCursor`/`DecodeImpactCursor` and
+  `impactRanking`, signed over the wire's names (`depth`, not `max_depth`); `symbolgraph.go`
+  `has_more`/`next_cursor`, a trimmed page's cursor re-signed to the first undelivered item, and a tier
+  decoder that counts items from raw bytes without materialising them; `impact_flags.go` refuses a cursor
+  on the trace and path forms, an empty cursor, and `cursor` with `offset`; `tool_impact.go` declares
+  `cursor` and the members; the Pi mirror forwards them.
+- **Round 5 (the owner exception of 2026-10-03, one round, `WS-59e-r4-3`).** When the `tiers_total`
+  rung removed the tier list, the answer kept `has_more` while dropping `next_cursor`, so a client that
+  followed it got the same page and nothing named a position to continue from. Both fallbacks
+  `adjudication-WS-59e-r4-3.md` names are worse than the present shape (the core's old `next_offset`
+  skips undelivered items; the unchanged offset repeats the page), so the owner's second option was
+  taken: `has_more=false` plus an explicit `truncated:"tiers_removed"` marker naming the cut. The
+  `next == 0` arm had the same hole and is folded into the same branch, so the rule is one predicate —
+  a cursor exists exactly when `has_more` is true. `truncated` is a result member, not an `Output` entry,
+  so it costs no `tools/list` byte.
+- **Measured** (Linux box, `1d7f0961`). `BOXALL` `remote_exit=0`, 24 Go packages, 19 Rust binaries,
+  `clippy_warnings=6` (base count), `rss_lines=ok`. `CAPS` PASS, all 16 changed caps **fell**
+  (−76/−14 lean, −64/−2 full). `PI` `remote_exit=0`.
+- **Deviations.** 1. Eleven files outside the row's `Files`, each with a reason in
+  `reviews/ws-59e/r4/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members it
+  wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same
+  ladder and carries the earlier stages and recovery forward. 3. `countArray` reads the member at its own
+  level, so a symbol name holding `"items":[` cannot steer a paging decision.
+- **Review.** r1-r5; r5 is the owner's single extra round. Twelve findings across r1-r4, ten fixed, one
+  rejected on an AGREE adjudication (`WS-59e-r2-5`), one (r4-3) closed here. Three mutations survived
+  honestly in the earlier rounds (M16, M17, M22); r5 adds M23 and M24, both killed.
 - **Checks.** `BOXALL`, `CAPS`, `PI`. Not run: `RET`, `BUD`, `SECDOC`, `GOLD`.
-- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`; next row that mutates a budgeted result: call `spec.Settle`. Four FU notes on `fitEach`'s boundary-seeking, OCR's background limit, the `git checkout --` hazard, and a case that passed against its own mutation.
-
-**PARKED (2026-10-03).** Not merged. Four review rounds are spent (§4.6's cap for a code
-task) and round 4 leaves one open major, `WS-59e-r4-3`: when the `tiers_total` rung removes
-the tier list, the answer carries `has_more` with no `next_cursor`, so a client that follows
-it repeats the same page. `adjudication-WS-59e-r4-3.md` answers DISAGREE, so the rejection
-does not stand. Branch `parity/ws-59e`; `BOXALL`, `CAPS` and `PI` green and `gate=PASS` on
-r4, so the row is one fix from mergeable. What works: the cursor and its ranking binding, the
-trimmed-page re-signing, the tier decoder, and a budget report that describes the bytes
-shipped with it. Open: `WS-59e-r4-3` only. Next step: fix it before any round 5 — both
-fallbacks Codex names are worse than the present shape (the core's old `next_offset` skips
-undelivered items; the unchanged offset repeats the page), so the fix has to carry the
-tier's `offset` and `total` through the rung, or deliver enough tier data to advance without
-a gap. That wants its own row rather than a fifth round of this one.
+- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`; next row that mutates a
+  budgeted result: call `spec.Settle`. Four FU notes on `fitEach`'s boundary-seeking, OCR's background
+  limit, the `git checkout --` hazard, and a case that passed against its own mutation.
 
 
 ### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
