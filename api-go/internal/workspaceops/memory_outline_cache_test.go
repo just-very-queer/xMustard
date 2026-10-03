@@ -204,6 +204,43 @@ func TestTheHeldTotalIsExactAcrossAReplacement(t *testing.T) {
 	}
 }
 
+// The mark carries a real inode and ctime, not only size and mtime: os.FileInfo.Sys()
+// returns *syscall.Stat_t, so an assertion to another stat type silently degrades the
+// mark and an atomic same-size replacement with a preserved mtime keeps its identity.
+// This test is the one that would have caught that, so it asserts the fields themselves.
+func TestAMarkCarriesItsInodeAndCtime(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, ok := markOutlineFile(root, "a.go")
+	if !ok {
+		t.Fatal("a.go has no mark")
+	}
+	if m.ino == 0 || m.dev == 0 {
+		t.Fatalf("the mark has no inode (%d) or device (%d): the stat assertion is not matching", m.ino, m.dev)
+	}
+	if m.ctimeNs == 0 {
+		t.Fatal("the mark has no ctime: an atomic same-size replacement with a preserved mtime would keep its identity")
+	}
+	if m.mtimeNs == 0 {
+		t.Fatal("the mark has no mtime")
+	}
+
+	// A second file in the same directory has a different inode, which is what lets two
+	// files' entries stay apart.
+	if err := os.WriteFile(filepath.Join(root, "b.go"), []byte("package b\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	other, ok := markOutlineFile(root, "b.go")
+	if !ok {
+		t.Fatal("b.go has no mark")
+	}
+	if other.ino == m.ino {
+		t.Fatalf("two files share inode %d, so the marks cannot tell them apart", m.ino)
+	}
+}
+
 // A mark inside the racy window is neither served nor stored, the way the workspace
 // registry treats the same fileMark: on a coarse-timestamp filesystem two same-size writes
 // inside one tick share a mark, so such an entry could outlive the edit it describes.

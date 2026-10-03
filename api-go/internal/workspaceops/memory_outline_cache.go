@@ -4,6 +4,7 @@ import (
 	"io"
 	"maps"
 	"os"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -188,7 +189,7 @@ func storeOutlineHash(workspaceID, root, rel string, mark fileMark, readAt time.
 		hashes = maps.Clone(old.hashes)
 	}
 	hashes[want] = hash
-	held := outlineHashHeld(hashes)
+	held := outlineHashHeld(hashes, key)
 	// The total this store moves the cache to. Both cases release what was counted: a
 	// grown entry is re-counted at its new size, and a replaced one stops counting. Only
 	// a genuinely new entry adds to the total.
@@ -209,11 +210,11 @@ func storeOutlineHash(workspaceID, root, rel string, mark fileMark, readAt time.
 	outlineHashes.held = moved
 }
 
-// outlineHashHeld is the bytes one entry's map retains: each key and value, plus a fixed
-// per-entry overhead. The bound only has to be a ceiling that means something, not an
-// exact accounting.
-func outlineHashHeld(hashes map[string]string) int64 {
-	n := int64(len(hashes) * outlineHashEntryOverhead)
+// outlineHashHeld is the bytes one entry retains: each key and value, the entry's own
+// struct and map header, and the cache key it is filed under (workspace, root and path).
+// The key counts because 512 of them are what the aggregate ceiling has to cover.
+func outlineHashHeld(hashes map[string]string, key string) int64 {
+	n := int64(len(hashes)*outlineHashEntryOverhead + len(key) + outlineHashEntryOverhead)
 	for k, v := range hashes {
 		n += int64(len(k) + len(v))
 	}
@@ -250,11 +251,13 @@ func outlineHashesEnabled() bool {
 
 // reclaimOutlineHashes is the component's reclaim hook. It drops the cache and reports
 // when the bytes are back; dropping an entry only costs the next pass a re-read, so there
-// is nothing here worth holding on to.
+// is nothing here worth holding on to. The channel closes after a GC cycle, because the
+// governor resamples RSS when it closes and a collection has not run by then.
 func reclaimOutlineHashes(budget.Pressure) <-chan struct{} {
 	done := make(chan struct{})
 	go func() {
 		clearOutlineHashes()
+		runtime.GC()
 		close(done)
 	}()
 	return done
