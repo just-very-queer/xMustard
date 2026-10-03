@@ -152,11 +152,12 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 		tried = append(tried, rootsWhy)
 	}
 	// While the client's roots are unknown (its roots/list failed), the working
-	// directory may still select a registered workspace, but it never registers one:
-	// the roots the client declared may name a different repository.
+	// directory may still select a registered workspace, but it registers one only when
+	// the operator opted in: the roots the client declared may name a different
+	// repository.
 	cwdRegister := ""
-	if rootsUnknown {
-		cwdRegister = "not auto-registered while the client's roots are unavailable"
+	if rootsUnknown && !s.srv.opts.RegisterCwdWhenRootsUnknown {
+		cwdRegister = "not auto-registered while the client's roots are unavailable (XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=0)"
 	}
 	if cwd := s.srv.opts.Cwd; cwd != "" {
 		ws, err := s.byPathSignal(ctx, cwd, SourceCWD, cwdRegister)

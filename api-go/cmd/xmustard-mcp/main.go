@@ -59,8 +59,11 @@ var (
 		Resources:    evidence,
 		Cwd:          workingDir(),
 		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
-		HomeDir:      homeDir(),
-		Schema:       schemaProfile,
+		// the operator's opt-in: register the cwd while the client's roots are
+		// unknown (WS-FIX-15b, off by default)
+		RegisterCwdWhenRootsUnknown: strings.TrimSpace(os.Getenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN")) != "0",
+		HomeDir:                     homeDir(),
+		Schema:                      schemaProfile,
 		// initialize appends the workspace's standing memory (WS-31)
 		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
 	}).NewSession(client)

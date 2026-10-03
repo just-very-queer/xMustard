@@ -367,6 +367,7 @@ gate and registers any directory.
 | why_failed command mode | `XMUSTARD_WHY_FAILED_COMMANDS=1` (default `0`: off on every bind, loopback included) | Read at startup. On, `why_failed` with `command` runs a test, build or lint command for an authenticated `admin` only; off, every command answers `403 commands_disabled`. Enabled command mode is trusted execution of the repository's code on the server host by admin credentials; the program allow-list is not a sandbox ([Commands why_failed runs](#commands-why_failed-runs-ws-21)). Logs and evidence handles are explained either way. Anything but `0` or `1` stops startup. |
 | Registration roots | `XMUSTARD_REGISTER_ROOTS=/srv/checkouts:/home/ci/src` (OS path list: `:` on Unix, `;` on Windows) | Where a non-admin token may register a git work tree. Empty (the default) means only `admin` registers. Each entry must be an absolute path and not a filesystem root, or the API stops at startup. See [Workspace registration](#workspace-registration). |
 | Registration limit | `XMUSTARD_REGISTER_LIMIT=50` (the default) | How many workspaces one non-admin principal may register. A load over the limit answers `403 registration_not_allowed`, refusal `register_limit`. Anything but a positive integer stops startup. |
+| cwd registration while the client's roots are unknown | `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1` (default off) | Read by the MCP server on each call, not the API. While the client's `roots/list` is unknown (it failed, backed off, or was never delivered) the server's working directory selects a registered workspace but does not register one, because the roots the client declared may name a different repository. On, the working directory's own enclosing git repository is registered and indexed through `POST /api/workspaces/load` like any other auto-registration, and the caller is still bound by its role, `XMUSTARD_REGISTER_ROOTS` and `XMUSTARD_REGISTER_LIMIT`. Off is the default, and `XMUSTARD_MCP_AUTO_REGISTER=0` refuses the registration whichever way this is set. Anything but `0` or `1` registers. See [Workspace registration](#workspace-registration). |
 
 Every `{wildcard}` in a route is checked before the handler runs. Values are read
 from the escaped path and decoded per segment, as `ServeMux` reads them, so an
@@ -409,6 +410,16 @@ unregistered git repository, on the `/mcp` endpoint and in the stdio shim alike
 `XMUSTARD_MCP_AUTO_REGISTER=0` turns it off), with the agent's own token. The code is
 `api-go/cmd/xmustard-api/workspace_register.go` (the HTTP policy) and
 `api-go/internal/workspaceops/register_roots.go` (the path checks).
+
+One case is narrower by default. While the client's `roots/list` is unknown (it
+failed, backed off, or was never delivered) the working directory still selects a
+registered workspace, but it does not register one: the roots the client declared
+may name a different repository. `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1`
+registers the working directory's own enclosing git repository in exactly that case,
+and the table above still decides whether the caller's token may do it. The
+registration is the same `POST /api/workspaces/load` as any other, so it is the same
+scan and the same accounting; turning it on means trusting the server's working
+directory.
 
 | Caller | May register |
 |---|---|
