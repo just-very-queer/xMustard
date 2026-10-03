@@ -378,6 +378,86 @@ func countAllJobs(t *testing.T, dir, ws string) int {
 	return n
 }
 
+// Two memories sharing an anchor are candidates for each other whenever both are inside the
+// pass's window, even when a page boundary falls between them. The window is deliberately
+// larger than one pass reads; a window equal to a pass would make this pair depend on where
+// the boundary happened to land.
+func TestClusterSpansAPageBoundary(t *testing.T) {
+	dir := singleAgentDir(t)
+	ws := "wsJobs11"
+	// More entries than one page holds, then the pair on one anchor, so the two members sit
+	// either side of a page boundary rather than inside one page.
+	filler := consolidationPage + 10
+	for i := 0; i < filler; i++ {
+		proposeOn(t, dir, ws, "a", fmt.Sprintf("filler %d", i), "an unrelated thing",
+			fmt.Sprintf("src/filler%04d.go", i))
+	}
+	proposeOn(t, dir, ws, "a", "left of the boundary", "left thing", "src/boundary.go")
+	proposeOn(t, dir, ws, "b", "right of the boundary", "right thing", "src/boundary.go")
+
+	got := preparedOrder(t, dir, ws)
+	joined := false
+	for _, c := range got {
+		if strings.Count(c, ",") == 1 && strings.Contains(c, "dedupe_cluster") {
+			joined = true
+		}
+	}
+	if !joined {
+		t.Fatalf("two memories on one anchor across a page boundary produced no cluster: %v", got)
+	}
+	if consolidationClusterWindow <= consolidationPage*consolidationPages {
+		t.Fatalf("the cluster window (%d) must exceed one pass (%d) or a pair either side of a page is never a candidate",
+			consolidationClusterWindow, consolidationPage*consolidationPages)
+	}
+}
+
+// The cursor is insertion order, not id order: a page whose highest id holds the lowest
+// cursor must still advance past every entry it read.
+func TestCursorFollowsInsertionOrderNotIdOrder(t *testing.T) {
+	dir := singleAgentDir(t)
+	ws := "wsJobs12"
+	// Ids minted by the store ascend with insertion, so the page's last id is also its last
+	// cursor here. The property is asserted on the helper, whose whole job is the maximum.
+	entries := []govstore.Entry{
+		{ID: "ctx_zzz", Cursor: 5, Lifecycle: govstore.LifecycleActive},
+		{ID: "ctx_aaa", Cursor: 9, Lifecycle: govstore.LifecycleActive},
+		{ID: "ctx_mmm", Cursor: 7, Lifecycle: govstore.LifecycleActive},
+	}
+	if got := lastCursorOf(entries); got != 9 {
+		t.Fatalf("lastCursorOf = %d, want the largest cursor 9, not the last entry's 5", got)
+	}
+	// And a pass over a store with more entries than one page records the cursor it reached,
+	// so the next pass resumes rather than re-reading the first page.
+	for i := 0; i < consolidationPage+5; i++ {
+		proposeOn(t, dir, ws, "a", fmt.Sprintf("entry %d", i), "a thing", fmt.Sprintf("src/e%04d.go", i))
+	}
+	runConsolidation(t, dir, ws, "worker-1")
+	w := readWatermark(t, dir, ws, "entries")
+	if cursorOf(w.ReflectedThrough) <= 0 {
+		t.Fatalf("a pass over %d entries recorded no cursor: %+v", consolidationPage+5, w)
+	}
+}
+
+// A fully consolidated workspace reports nothing left out: an already-queued candidate past
+// the bound is not remaining work.
+func TestAConsolidatedWorkspaceReportsNothingSkipped(t *testing.T) {
+	dir := singleAgentDir(t)
+	ws := "wsJobs13"
+	proposeOn(t, dir, ws, "a", "one", "one thing", "src/shared.go")
+	proposeOn(t, dir, ws, "b", "two", "two things", "src/shared.go")
+	first := runConsolidation(t, dir, ws, "worker-1")
+	if len(first.Jobs) == 0 {
+		t.Fatal("the first pass queued nothing")
+	}
+	second := runConsolidation(t, dir, ws, "worker-1")
+	if len(second.Jobs) != 0 {
+		t.Fatalf("the second pass queued %d jobs it already had", len(second.Jobs))
+	}
+	if second.Skipped != 0 {
+		t.Fatalf("a fully consolidated workspace reports %d left out", second.Skipped)
+	}
+}
+
 // Every kind the loop emits is one govstore names, so a claim of any emitted kind works.
 func TestPreparedJobKindsAreKnownToTheStore(t *testing.T) {
 	ctx := context.Background()
@@ -516,6 +596,17 @@ func mustViewMemory(t *testing.T, dir, ws string, fn func(govstore.Reader) error
 // queuePass returns the jobs one pass queued, in the order it queued them. It does not
 // sort: the order is part of what this row claims is deterministic, and sorting here would
 // hide exactly that.
+// runConsolidation runs one pass and returns its result.
+func runConsolidation(t *testing.T, dir, ws, owner string) ConsolidationPass {
+	t.Helper()
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries",
+		Actor: govstore.Actor{Principal: owner}})
+	if err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	return res
+}
+
 func queuePass(t *testing.T, dir, ws, owner string) []string {
 	t.Helper()
 	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: owner}})

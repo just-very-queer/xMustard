@@ -56,12 +56,12 @@ const (
 	consolidationPage  = 500
 	consolidationPages = 4
 	// consolidationClusterWindow bounds how far back a pass keeps entries when deciding which
-	// memories share an anchor. Two memories on one anchor separated by more entries than
-	// this are not candidates for each other in one pass; the watermark walks the rest of the
-	// table, and the signature is the same either way, so the pair is joined across passes
-	// rather than never. It is a whole multiple of the page so the two bounds cannot disagree
-	// about what a pass read.
-	consolidationClusterWindow = consolidationPage * consolidationPages
+	// memories share an anchor, and it is deliberately larger than one pass reads
+	// (consolidationPage * consolidationPages). A window equal to a pass would leave two
+	// memories sharing an anchor candidates for each other only when both fall inside the same
+	// pass, which is the cross-boundary defect this bound was added to close. Overlapping the
+	// window past the pass boundary is what makes a pair either side of a page join.
+	consolidationClusterWindow = consolidationPage * consolidationPages * 2
 	// consolidationJobsPerRun bounds the jobs one pass enqueues. It matches the candidate
 	// bound, so a pass that took candidates queues all of them.
 	consolidationJobsPerRun = consolidationCandidatesPerPass
