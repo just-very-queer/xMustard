@@ -136,6 +136,8 @@ struct Flow {
     depth: u64,
     /// Communities the steps span, as the answer reports the count beside the class.
     communities: u64,
+    /// Steps the walk reached but the listing cap left out.
+    steps_omitted: u64,
 }
 
 fn read_flows(v: &Value) -> Vec<Flow> {
@@ -166,6 +168,7 @@ fn read_flows(v: &Value) -> Vec<Flow> {
                 .collect(),
             depth: f["depth"].as_u64().unwrap(),
             communities: f["communities"].as_u64().unwrap(),
+            steps_omitted: f["steps_omitted"].as_u64().unwrap(),
         })
         .collect()
 }
@@ -495,6 +498,75 @@ fn at_most_the_top_two_hundred_candidates_are_seeds() {
     assert_eq!(scores, desc, "seeds must be listed highest score first");
 }
 
+/// The seed list is in RANK order, not merely sorted by score.
+///
+/// The 240-candidate fixture above gives every seed the same score, so it cannot tell a
+/// correctly ranked list from a reversed one: both are non-increasing. This fixture spreads
+/// the scores instead — each entry point calls a different number of leaves — so the ranks
+/// are all distinct and a reversed list fails immediately.
+///
+/// The tie-break is asserted separately in the next test; this one only fixes the order.
+#[test]
+fn seeds_are_listed_from_the_highest_score_to_the_lowest() {
+    let mut src = String::from("package pkg\n\n");
+    // Rungs of 1..=8 callees, so the scores are 1, 2, ... 8 (each entry point is exported,
+    // so each score is doubled, and none is called, so the ratio is callees/1).
+    for rung in 1..=8u32 {
+        src.push_str(&format!("func Rung{rung}() {{\n"));
+        for leaf in 0..rung {
+            src.push_str(&format!("\tRung{rung}Leaf{leaf}()\n"));
+        }
+        src.push_str("}\n");
+        for leaf in 0..rung {
+            src.push_str(&format!("func Rung{rung}Leaf{leaf}() {{}}\n"));
+        }
+    }
+    let d = repo(&[GO_MOD, ("pkg/rungs.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let seeds = read_seeds(&v);
+    // Every rung is present, and the scores fall strictly rung by rung, so the order is
+    // forced: Rung8 first, Rung1 last.
+    let names: Vec<&str> = seeds.iter().map(|s| s.name.as_str()).collect();
+    let rungs: Vec<u32> = names
+        .iter()
+        .filter_map(|n| n.strip_prefix("Rung").and_then(|r| r.parse().ok()))
+        .collect();
+    let mut desc = rungs.clone();
+    desc.sort_unstable_by(|a, b| b.cmp(a));
+    assert_eq!(rungs, desc, "the rungs must fall from widest to narrowest: {names:?}");
+    assert!(seeds.len() >= 8, "the fixture must reach every rung: {names:?}");
+}
+
+/// Two seeds with identical scores are ordered by (path, line, name), so the list is the
+/// same on every run and does not depend on the order the index happened to store them.
+///
+/// The 240-candidate fixture pins the cap and this one pins the tie-break: same score for
+/// every entry point, all in one file, so path is equal and the order must fall to line and
+/// then to name. `Entry0`..`Entry9` are declared in source order, so line order and name
+/// order agree here; the point is that a rule reading only one of the two would still pass
+/// on this fixture, so the assertion checks that the emitted order is the declared one
+/// rather than that some particular comparator produced it.
+#[test]
+fn seeds_with_equal_scores_keep_a_stable_declared_order() {
+    let mut src = String::from("package pkg\n\n");
+    for i in 0..12 {
+        src.push_str(&format!("func Entry{i}() {{ Leaf{i}() }}\n"));
+        src.push_str(&format!("func Leaf{i}() {{}}\n"));
+    }
+    let d = repo(&[GO_MOD, ("pkg/equals.go", &src)]);
+    build(d.path());
+    let first = flows(d.path(), &[]);
+    let second = flows(d.path(), &[]);
+    let seeds = read_seeds(&first);
+    let names: Vec<&str> = seeds.iter().map(|s| s.name.as_str()).collect();
+    let expected: Vec<String> = (0..12).map(|i| format!("Entry{i}")).collect();
+    assert_eq!(names, expected, "equal scores fall to declared order: {names:?}");
+    // Two runs over one index are byte-identical, which is the property the tie-break
+    // exists to provide.
+    assert_eq!(first, second, "the answer must not vary between runs");
+}
+
 #[test]
 fn the_limit_flag_lowers_the_seed_cap_and_is_refused_when_it_is_not_a_number() {
     let mut src = String::from("package pkg\n\n");
@@ -550,6 +622,105 @@ fn a_flow_stops_at_depth_ten() {
     assert!(
         truncation(&v)["truncated_at_depth"] > 0,
         "a chain past the cap must report the depth truncation: {:?}",
+        truncation(&v)
+    );
+}
+
+/// `depth` is the distance to the FURTHEST step reached, not the number of steps taken.
+///
+/// A chain cannot tell the two apart: from `Step0` the tenth step is also the tenth step
+/// taken, so a walk whose `depth` field was wired to `steps.len()` would answer identically
+/// and every assertion in the chain test above would still pass. The two differ as soon as
+/// a branch exists — a walk that reaches a node three hops away through one path and a
+/// different node two hops away through another has five steps but a depth of three.
+///
+/// So this fixture is a fan: one trunk three deep, with a shorter sibling hanging off the
+/// second node, so the listed steps and the reported depth are different numbers and a
+/// mutation that swaps them is visible.
+#[test]
+fn a_flows_depth_is_its_deepest_step_and_not_its_step_count() {
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/fan.go",
+            gofuncs_ref(&[
+                go_func("FanRoot", &["FanLong", "FanShort"]),
+                go_func("FanLong", &["FanMid"]),
+                go_func("FanMid", &["FanLeaf"]),
+                go_func("FanLeaf", &[]),
+                go_func("FanShort", &[]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let flows = read_flows(&v);
+    let f = flows
+        .iter()
+        .find(|f| f.seeds.iter().any(|s| s == "FanRoot"))
+        .unwrap_or_else(|| panic!("FanRoot's flow in {flows:?}"));
+    // Four steps are listed (FanLong, FanMid, FanLeaf and FanShort), and the furthest is
+    // three hops out. A depth reported as the step count would say four.
+    assert_eq!(
+        f.steps.len(),
+        4,
+        "the walk reaches four symbols: {f:?}"
+    );
+    assert_eq!(f.depth, 3, "the furthest step is three hops out: {f:?}");
+    assert_ne!(
+        f.depth as usize, f.steps.len(),
+        "the fixture must separate the two figures: {f:?}"
+    );
+}
+
+/// A flow lists at most 50 steps and reports how many it left out.
+///
+/// The other bounds do not make this reachable on their own: depth 10 and branching 4 cap
+/// one walk at 4^10 nodes, but a WIDE tree reaches that breadth long before the depth cap
+/// bites, so a walk really does collect more than 50 steps and really does have some to
+/// omit. Each level here branches four times, so by depth four the walk holds 1+4+16+64
+/// nodes — well past 50 — and the answer must cap the list and count the rest.
+#[test]
+fn a_flow_lists_at_most_fifty_steps_and_counts_the_rest() {
+    // A 4-ary tree, four levels deep: the leaves are the last level's children, so one
+    // walk from the root collects 1 + 4 + 16 + 64 + 256 nodes.
+    let mut src = String::from("package pkg\n\n");
+    let mut level = vec!["Branch0".to_string()];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for name in &level {
+            let kids: Vec<String> = (0..4).map(|k| format!("{name}To{k}")).collect();
+            next.extend(kids.clone());
+            let body: String = kids.iter().map(|k| format!("\t{k}()\n")).collect();
+            src.push_str(&format!("func {name}() {{\n{body}}}\n"));
+        }
+        level = next;
+    }
+    for leaf in &level {
+        src.push_str(&format!("func {leaf}() {{}}\n"));
+    }
+    let d = repo(&[GO_MOD, ("pkg/tree.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let flows = read_flows(&v);
+    let root = flows
+        .iter()
+        .find(|f| f.seeds.iter().any(|s| s == "Branch0"))
+        .unwrap_or_else(|| panic!("Branch0's flow in {flows:?}"));
+    assert_eq!(
+        root.steps.len(),
+        50,
+        "the step list is capped at fifty: {root:?}"
+    );
+    assert!(
+        root.steps_omitted > 0,
+        "a capped list must say how many steps it left out: {root:?}"
+    );
+    // The cap is a listing bound, not a walk bound: the truncation counter beside it is
+    // what records the difference between what was walked and what was listed.
+    assert!(
+        truncation(&v)["truncated_step_lists"] > 0,
+        "the step-list truncation must be counted: {:?}",
         truncation(&v)
     );
 }
@@ -702,6 +873,54 @@ fn a_flow_takes_its_shared_name_stem_and_says_so() {
     assert_eq!(f.rule, "name_stem", "{f:?}");
 }
 
+/// The stem is cut back to a WHOLE word, not left as the longest shared character prefix.
+///
+/// `HarvestOne` and `HarvestTwo` share ten characters, so a rule that stopped at the common
+/// prefix would also answer `Harvest` — this fixture is chosen so the two rules differ.
+/// The names here share the five characters `Batch` and then diverge inside the next word
+/// (`BatchOne`/`BatchTwo` against `BatchList`), so the character prefix is `BatchO`/`BatchL`
+/// depending on the pair while the whole-word stem is `Batch`.
+#[test]
+fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/stem.go",
+            gofuncs_ref(&[
+                go_func("BatchOne", &["BatchTwo", "BatchThree"]),
+                go_func("BatchTwo", &["BatchThree"]),
+                go_func("BatchThree", &["BatchFour"]),
+                go_func("BatchFour", &[]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let flows = read_flows(&v);
+    let f = flows
+        .iter()
+        .find(|f| f.rule == "name_stem")
+        .unwrap_or_else(|| panic!("a name_stem flow in {flows:?}"));
+    assert_eq!(
+        f.label, "Batch",
+        "the stem is the shared whole word: {f:?}"
+    );
+    assert!(
+        f.steps.iter().all(|(n, _)| n.starts_with("Batch")),
+        "every step leads with the label: {f:?}"
+    );
+    // Not the character prefix: no listed step may be cut in half by the label.
+    for (name, _) in &f.steps {
+        let after = name.strip_prefix("Batch").unwrap_or_else(|| {
+            panic!("step {name} does not start with the label Batch: {f:?}")
+        });
+        assert!(
+            after.starts_with(|c: char| c.is_uppercase()) || after.is_empty(),
+            "the label must end at a word boundary, not mid-word ({name}): {f:?}"
+        );
+    }
+}
+
 #[test]
 fn a_flow_with_no_shared_name_stem_falls_back_to_its_seed_and_says_so() {
     // Four unrelated names: no stem qualifies, so the label is the seed's own name.
@@ -766,27 +985,84 @@ fn a_flow_is_classified_against_the_communities_its_steps_land_in() {
         assert_eq!(f.class, want, "{f:?} spans {} communities", f.communities);
     }
 
-    // The flow that stays inside alpha/ is intra, and the one inside island/ is intra
-    // too: with no edge between the two trees they are two communities of their own.
-    let alpha = flows
-        .iter()
-        .find(|f| f.seeds.iter().any(|s| s == "AlphaOne"))
-        .unwrap_or_else(|| panic!("AlphaOne's flow in {flows:?}"));
-    assert_eq!(alpha.class, "intra", "{alpha:?}");
-    let island = flows
-        .iter()
-        .find(|f| f.seeds.iter().any(|s| s == "IslandOne"))
-        .unwrap_or_else(|| panic!("IslandOne's flow in {flows:?}"));
-    assert_eq!(island.class, "intra", "{island:?}");
+    // The partition here is symbol-granularity (WS-38b's areas), so the class depends on
+    // where the propagation put each symbol and not on the folder a file sits in. Every
+    // flow's class therefore has to agree with the community count beside it, which is the
+    // invariant this test pins; which specific flows are cross is the next test's job,
+    // because producing one needs a fixture built for it.
+    // Both subsystems are reached, so the fixture is not answering from one corner of it.
+    for name in ["AlphaOne", "IslandOne"] {
+        assert!(
+            flows.iter().any(|f| f.seeds.iter().any(|s| s == name)),
+            "{name} has a flow in {flows:?}"
+        );
+    }
+}
 
-    // And the partition really is two: a cross flow is unreachable from this fixture, so
-    // the answer must not manufacture one. It is built by the file-level communities, and
-    // a resolved CALL inside one community can never leave it, which is the property this
-    // row's plan section records.
-    assert!(
-        !flows.iter().any(|f| f.class == "cross"),
-        "a resolved call cannot cross a file community: {flows:?}"
+/// The other half of the classification, and the half that pins it: a flow whose steps
+/// really do land in two areas must be reported `cross`.
+///
+/// The fixture above cannot produce one — its two subsystems share no edge — so it does not
+/// carry this assertion on its own. Two areas joined by exactly one call is the shape that
+/// does, and it is the only way a resolved CALL can cross a boundary under label
+/// propagation: the joining call's two ends end up in different communities while every
+/// other edge stays inside one.
+///
+/// Without this test the `class` line survives a mutation that pins it to `intra` forever,
+/// because every other fixture in the file reports `intra` either way.
+#[test]
+fn a_flow_that_really_spans_two_communities_is_reported_cross() {
+    // Two subsystems that are separate areas but call across: `alpha` has its own internal
+    // ring and `beta` has its own, and a single call joins them. Label propagation over the
+    // resolved symbol edges keeps the two rings apart and puts the joining call across the
+    // boundary, which is the case the `cross` class exists to report.
+    let d = repo(&[
+        GO_MOD,
+        (
+            "alpha/alpha.go",
+            "package alpha\n\nimport \"example/beta\"\n\nfunc AlphaOne() { AlphaTwo(); beta.BetaOne() }\nfunc AlphaTwo() { AlphaThree() }\nfunc AlphaThree() { AlphaOne() }\n",
+        ),
+        (
+            "beta/beta.go",
+            "package beta\n\nfunc BetaOne() { BetaTwo() }\nfunc BetaTwo() { BetaThree() }\nfunc BetaThree() { BetaOne() }\n",
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    // The cross-area call must resolve or the fixture proves nothing: AlphaOne's callee
+    // count is two only when `beta.BetaOne` binds, and it drops to one when it does not.
+    let seeds = read_seeds(&v);
+    let alpha_one = seeds
+        .iter()
+        .find(|s| s.name == "AlphaOne")
+        .unwrap_or_else(|| panic!("AlphaOne is a seed in {v:#}"));
+    assert_eq!(
+        alpha_one.callees, 2,
+        "both of AlphaOne's calls resolve, one of them across the package boundary: {v:#}"
     );
+    let flows = read_flows(&v);
+    assert!(
+        !flows.is_empty(),
+        "the fixture must produce flows: {v:#}"
+    );
+    let crossing = flows
+        .iter()
+        .find(|f| f.class == "cross")
+        .unwrap_or_else(|| panic!("no cross flow among {flows:?} in {v:#}"));
+    assert_eq!(
+        crossing.communities, 2,
+        "the fixture must span exactly two communities: {crossing:?}"
+    );
+    assert_eq!(
+        crossing.class, "cross",
+        "a flow over two communities is cross: {crossing:?}"
+    );
+    // The class and the count beside it are the same claim read twice, so both move
+    // together: a count above one with the class reading intra would be a contradiction.
+    for f in &flows {
+        let want = if f.communities > 1 { "cross" } else { "intra" };
+        assert_eq!(f.class, want, "{f:?} spans {} communities", f.communities);
+    }
 }
 
 // --- truncation stats and refusals ------------------------------------------
@@ -838,6 +1114,58 @@ fn a_small_repository_answers_with_every_cap_reported_and_nothing_but_min_steps_
     assert_eq!(caps["max_branching"].as_u64().unwrap(), 4);
     assert_eq!(caps["min_steps"].as_u64().unwrap(), 3);
     assert_eq!(caps["max_candidates"].as_u64().unwrap(), 200);
+    // The roll-up beside the counters is asserted on its own because this fixture is the
+    // one case where the five counters above are all zero and the flag is still true:
+    // `dropped_under_min_steps` is non-zero here by construction. A flag pinned to false
+    // would pass every counter assertion in this test, which is mutation row M19.
+    assert_eq!(
+        v["truncated"],
+        serde_json::json!(true),
+        "a short-set drop is a truncation and the roll-up must say so: {v:#}"
+    );
+}
+
+/// The other direction of the same flag: a repository whose walks hit no bound at all
+/// reports `truncated: false`. Every candidate in this fixture reaches more than three
+/// steps and nothing runs past a cap, so no counter moves.
+///
+/// The shape that makes it true is a cycle: in a finite acyclic graph the deepest node of
+/// every branch is a candidate that reaches fewer than three steps, so
+/// `dropped_under_min_steps` is non-zero however small the fixture is (which is what the
+/// previous test records). A cycle gives every candidate a successor forever, so the
+/// min-steps drop cannot fire and the flag has a case where it is genuinely false.
+#[test]
+fn a_repository_that_hits_no_bound_reports_no_truncation() {
+    // A ring of six, so every node has a callee and a successor forever. With no tails
+    // anywhere, no node can reach fewer than three steps, so the min-steps drop — the one
+    // counter a small acyclic fixture can never avoid — cannot fire either.
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/rings.go",
+            gofuncs_ref(&[
+                go_func("RingOne", &["RingTwo"]),
+                go_func("RingTwo", &["RingThree"]),
+                go_func("RingThree", &["RingFour"]),
+                go_func("RingFour", &["RingFive"]),
+                go_func("RingFive", &["RingSix"]),
+                go_func("RingSix", &["RingOne"]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let t = truncation(&v);
+    assert_eq!(
+        t.values().sum::<u64>(),
+        0,
+        "this fixture must move no truncation counter: {v:#}"
+    );
+    assert_eq!(
+        v["truncated"],
+        serde_json::json!(false),
+        "no counter moved, so the roll-up is false: {v:#}"
+    );
 }
 
 #[test]
@@ -924,6 +1252,112 @@ fn only_resolved_call_edges_become_steps() {
         "no resolved calls: {v:#}"
     );
     assert_eq!(read_flows(&v).len(), 0, "{v:#}");
+}
+
+/// The admission filters are asserted with a fixture that actually contains something for
+/// them to reject, which the count-equals-declared assertion above cannot do.
+///
+/// PAR-SYM-09 says flows are built on resolved CALLS and nothing else, so `build_graph`
+/// admits an edge only when its layer is `symbol` AND its kind is `CALLS`. Dropping either
+/// half admits edges the walk must never follow, and neither drop is visible to a fixture
+/// whose every symbol-layer edge already is a CALL. This one has both: a type that
+/// `IMPLEMENTS` another is a symbol-layer edge that is NOT a CALL, so a build that admits
+/// any symbol-layer edge reports it inside the flow's step set, and a build that admits any
+/// CALL edge admits the same one here.
+#[test]
+fn a_non_call_symbol_edge_never_becomes_a_step() {
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/shape.go",
+            gofuncs_ref(&[
+                go_func("ShapeBase", &[]),
+                go_func("ShapeImpl", &["ShapeOther", "ShapeThird"]),
+                go_func("ShapeOther", &["ShapeThird"]),
+                go_func("ShapeThird", &[]),
+            ]),
+        ),
+        // `Derived` IMPLEMENTS `ShapeBase`: a symbol-layer edge whose kind is not CALLS.
+        // `UseCall` is the only CALL, so a walk from it must reach exactly its callees and
+        // never the type relationship.
+        (
+            "pkg/impl.go",
+            "package pkg\n\ntype Derived struct{}\n\nfunc (d Derived) ShapeBase() {}\n\nfunc UseCall() { ShapeImpl() }\n",
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let f = read_flows(&v);
+    let use_call = f
+        .iter()
+        .find(|f| f.seeds.iter().any(|s| s == "UseCall"))
+        .unwrap_or_else(|| panic!("UseCall's flow in {f:?}"));
+    let names: BTreeSet<&str> = use_call.steps.iter().map(|(n, _)| n.as_str()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from(["ShapeImpl", "ShapeOther", "ShapeThird"]),
+        "the CALL walk reaches its callees and nothing else: {use_call:?}"
+    );
+    // The method the IMPLEMENTS edge points at is a symbol, but it is not a callee: it is
+    // the base of a type relationship, and no CALL reaches it.
+    assert!(
+        !names.contains("ShapeBase"),
+        "an IMPLEMENTS edge must not become a step: {names:?}"
+    );
+    // And the resolver really did record that edge, or the fixture would prove nothing.
+    // `symbols_considered` counts the admitted non-local symbols, which includes the base
+    // and the method, so the filter under test is removing an edge from a graph that has it.
+    assert!(
+        v["symbols_considered"].as_u64().unwrap() >= 6,
+        "the fixture's symbols must all be indexed: {v:#}"
+    );
+}
+
+/// A symbol declared INSIDE a function body is not an entry point and not a step.
+///
+/// `local` is the index's flag for a name bound in a callable's body rather than declared at
+/// file scope. Such a symbol cannot be called from another file and has no place in a call
+/// flow, so `build_graph` skips it. Admitting locals would pull every closure variable and
+/// every local helper into the graph, and the score of the function declaring it would rise
+/// on edges no caller can follow.
+#[test]
+fn a_symbol_local_to_a_function_body_is_neither_a_seed_nor_a_step() {
+    // `Outer` declares a local function and calls it three times deep, so a build that
+    // admits locals would both score `Outer` on the local edge and list the local in the
+    // walk's steps.
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/local.go",
+            gofuncs_ref(&[
+                go_func("Outer", &["LocalHelper", "GlobalOne"]),
+                go_func("GlobalOne", &["GlobalTwo"]),
+                go_func("GlobalTwo", &[]),
+            ]),
+        ),
+        (
+            "pkg/helper.go",
+            "package pkg\n\nfunc Outer() {\n\tinner := func() {}\n\tinner()\n}\n",
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let f = read_flows(&v);
+    let all: BTreeSet<&str> = f
+        .iter()
+        .flat_map(|f| f.steps.iter().map(|(n, _)| n.as_str()))
+        .chain(f.iter().flat_map(|f| f.seeds.iter().map(String::as_str)))
+        .collect();
+    assert!(
+        !all.contains("inner"),
+        "a local binding is not a flow member: {all:?}"
+    );
+    // The seed the walk does report carries only its file-scope callees, and the edge count
+    // covers the resolved calls alone — a local edge would inflate both.
+    assert!(
+        v["call_edges"].as_u64().unwrap() <= 3,
+        "only the three declared calls are resolved edges: {v:#}"
+    );
 }
 
 #[test]

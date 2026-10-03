@@ -282,6 +282,12 @@ impl Snapshot {
         &self.root
     }
 
+    /// Which files have a scope resolver, so their symbols have resolved symbol edges
+    /// (WS-38b's `areas` projects over exactly those).
+    pub fn resolved_files(&self) -> &[bool] {
+        &self.files.resolved
+    }
+
     /// The import-cycle report of this generation, computed once.
     pub fn cycles(&self) -> Result<&super::cycles::CycleReport, String> {
         self.cycles
@@ -290,17 +296,12 @@ impl Snapshot {
             .map_err(Clone::clone)
     }
 
-    /// Which files have a scope resolver, so their symbols carry resolved symbol edges
-    /// (`flows.rs` projects over exactly those).
-    pub fn resolved_files(&self) -> &[bool] {
-        &self.files.resolved
-    }
-
     /// The community rank of each file, from the file-level label propagation.
     ///
-    /// A reader that only needs the partition — WS-38c's intra/cross classification —
-    /// reads the rank rather than the membership list `communities()` builds, so the
-    /// shared computation is the same and only the projection differs.
+    /// A reader that only needs the partition reads the rank rather than the membership
+    /// list `communities()` builds, so the shared computation is the same and only the
+    /// projection differs. WS-38c classified flows against this partition and stopped:
+    /// see `flows.rs`'s `area_by_symbol`, which says why a resolved call cannot cross one.
     pub fn community_ranks(&self) -> Result<&[u32], String> {
         self.community_ranks
             .get_or_init(|| Communities::compute(&self.seg).map(|c| c.rank_of))

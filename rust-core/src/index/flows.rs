@@ -20,7 +20,7 @@
 //! reachability set are one flow, so the answer's shape does not depend on the order the
 //! seeds were visited in.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::Serialize;
 
@@ -159,8 +159,9 @@ struct Node {
     path: String,
     line: u32,
     kind: String,
-    /// The community rank of this symbol's file.
-    community: u32,
+    /// The symbol-granularity area this symbol belongs to, which is the partition the
+    /// intra/cross classification reads.
+    area: u32,
     /// PAR-SYM-09's exported doubling, read from the store rather than the segment.
     exported: bool,
 }
@@ -341,29 +342,51 @@ pub fn flows_for(snapshot: &super::reader::Snapshot, limits: Limits) -> Result<F
     flows_of(
         &snapshot.seg,
         snapshot.resolved_files(),
-        snapshot.community_ranks()?,
+        &area_by_symbol(snapshot)?,
         limits,
         Some(&|s| exported.get(s as usize).copied()),
     )
 }
 
+/// Each admitted symbol's area id, keyed by the index's node id.
+///
+/// PAR-SYM-09 classifies a flow against the *community* layer, and WS-38b's areas are that
+/// layer at symbol granularity. The file-level communities the reader computes cannot serve
+/// here: they are the connected components of the file-level `structure` graph, and a
+/// resolved CALL needs an import to exist, so its two ends are always in the SAME component.
+/// Every flow would therefore be `intra` and the classification would carry no information.
+/// Areas are communities over resolved symbol edges, so a call from one subsystem into
+/// another really does cross one.
+fn area_by_symbol(
+    snapshot: &super::reader::Snapshot,
+) -> Result<BTreeMap<u32, u32>, String> {
+    let areas = super::areas::areas_for(snapshot, super::areas::DEFAULT_SEED)?;
+    let mut out = BTreeMap::new();
+    for (rank, area) in areas.areas.iter().enumerate() {
+        for member in &area.members {
+            out.insert(member.node, rank as u32);
+        }
+    }
+    Ok(out)
+}
+
 /// The flows of one stored generation's graph segment.
 ///
 /// `resolved` is the snapshot's per-file table of which files have a scope resolver, so a
-/// symbol whose file cannot resolve a call is not admitted at all. `communities` is the
-/// file-level community rank per file, the partition the intra/cross classification reads;
-/// it comes from the reader's existing `Communities` and not from the symbol-granularity
-/// areas WS-38b builds, because this row's Files list does not include `areas.rs`.
-/// `exported` is read from the store, keyed by symbol id, because the CSR segment does not
-/// carry the flag and PAR-SYM-09's ×2 needs it.
+/// symbol whose file cannot resolve a call is not admitted at all. `areas_of` maps an index
+/// node id to the symbol-granularity area that holds it, which is the partition the
+/// intra/cross classification reads; it comes from WS-38b's `areas.rs` and not from the
+/// file-level communities in the reader, which cannot separate the two ends of a resolved
+/// call. `exported` is read from the store, keyed by symbol id, because the CSR segment
+/// does not carry the flag and PAR-SYM-09's ×2 needs it.
 pub fn flows_of(
     seg: &Segment,
     resolved: &[bool],
-    communities: &[u32],
+    areas_of: &BTreeMap<u32, u32>,
     limits: Limits,
     exported: Option<&dyn Fn(u32) -> Option<bool>>,
 ) -> Result<Flows, String> {
-    let graph = build_graph(seg, resolved, communities, exported)?;
+    let graph = build_graph(seg, resolved, areas_of, exported)?;
     let (ranked, pool, mut truncation) = rank_seeds(&graph, limits);
     let mut seeds: Vec<Seed> = ranked.iter().map(|&i| seed_of(&graph, i)).collect();
     seeds.sort_by(|a, b| {
@@ -469,7 +492,7 @@ fn publish_name_classes() -> Vec<NameClass> {
 fn build_graph(
     seg: &Segment,
     resolved: &[bool],
-    communities: &[u32],
+    areas_of: &BTreeMap<u32, u32>,
     exported: Option<&dyn Fn(u32) -> Option<bool>>,
 ) -> Result<Graph, String> {
     let symbols = seg.counts().symbols;
@@ -488,8 +511,8 @@ fn build_graph(
             path: seg.file_path(row.file).unwrap_or_default(),
             line: row.line,
             kind: seg.symbol_kind(row.kind).to_string(),
-            community: communities
-                .get(row.file as usize)
+            area: areas_of
+                .get(&seg.symbol_node(s))
                 .copied()
                 .unwrap_or(u32::MAX),
             exported: exported.and_then(|f| f(s)).unwrap_or(false),
@@ -682,7 +705,7 @@ fn flow(graph: &Graph, seeds: Vec<Seed>, walk: Walk, limits: Limits) -> Flow {
     let communities: BTreeSet<u32> = walk
         .visited
         .iter()
-        .map(|&i| graph.nodes[i].community)
+        .map(|&i| graph.nodes[i].area)
         .collect();
     let class = if communities.len() > 1 {
         FlowClass::Cross
