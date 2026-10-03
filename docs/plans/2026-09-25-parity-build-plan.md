@@ -1508,8 +1508,9 @@ never widen it, so no umask can give a fixture's index directory a group- or oth
 which is the property `classify_dir` refuses (`mode & 0o022`). The umask is therefore no longer a
 source of a fixture's result: the `0002` case that opened this row, and every other umask that
 keeps the owner's bits, all land on `0o700`. Two bounds on that claim, both stated so they are not
-mistaken for more: a umask clearing owner bits (`0177`, `0777`) narrows `0700` to `0600`, which no
-index call can traverse — that is the operator's own setting and is left alone; and `0700` is
+mistaken for more: a umask clearing owner bits narrows `0700` to the complement — `0o700 & ~0o177`
+is `0o600`, and `0o700 & ~0o777` is `0o000` — so the owner cannot traverse the directory and a
+fixture using it would fail, which is the operator's own setting and is left alone; and `0700` is
 *stronger* than the guard requires, since `classify_dir` accepts group- or other-read and execute
 bits and refuses only the write ones. It replaces the `tighten()`
 after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
@@ -1560,8 +1561,8 @@ needs the `TempDir` itself to be the index directory, which only `index_query.rs
 - `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
 
 **Acceptance.** Every fixture in `rust-core/tests/index_query.rs` that hands a directory to the
-index creates it with an explicit `0700` at creation time, so no group- or other-accessible bit
-can appear under any umask and the suite's result is the same under `umask 0002` and `0022`; no
+index creates it with an explicit `0700` at creation time, so no group- or other-**write** bit can
+appear under any umask and the suite's result is the same under `umask 0002` and `0022`; no
 fixture calls `tighten` any more; and the new test fails if the explicit mode is removed.
 `BOXALL` is green on the box with clippy's warning count unchanged and `cargo fmt --check` clean.
 

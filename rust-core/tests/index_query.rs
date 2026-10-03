@@ -83,9 +83,10 @@ fn commit(root: &Path, msg: &str) {
 ///
 /// `0700` is stronger than the guard needs — `classify_dir` accepts group- and other-read
 /// and execute bits — and it is not the only mode the umask can produce: one clearing owner
-/// bits (`0177`) narrows it to `0600`, which no index call can traverse. That is the
-/// operator's own setting and is left as it is; the claim is that the umask is no longer a
-/// source of the mode, not that the mode is always `0700`.
+/// bits narrows it to the complement (`0o700 & ~0o177` is `0o600`), which the owner cannot
+/// traverse and which `classify_dir` does not notice, since it reads `mode & 0o022` and finds
+/// nothing. That is the operator's own setting and is left as it is; the claim is that the
+/// umask is no longer a source of a group- or other-write bit, not that the mode is `0o700`.
 fn index_dir() -> TempDir {
     let mut b = tempfile::Builder::new();
     b.permissions(perm(0o700)).tempdir().unwrap()
@@ -187,10 +188,10 @@ fn an_index_fixture_dir_is_owner_only_whatever_the_process_umask() {
         "a plain TempDir must land at 0775 under umask 0002, otherwise this test cannot \
          tell the explicit mode from the umask and proves nothing"
     );
-    // A umask that clears owner bits narrows the request too, so the mode is 0600 rather
-    // than 0700. It stays traversable-by-no-one, which is the property the guard tests, so
-    // the suite's result does not depend on the umask here either — but the figure is not
-    // 0700 and an assertion written as `== 0o700` would be claiming more than mkdir gives.
+    // A umask that clears owner bits narrows the request too: `0o700 & ~0o177` is `0o600`,
+    // and the owner can no longer traverse the directory, so a fixture using it would fail.
+    // `classify_dir` does not notice — it reads `mode & 0o022` and finds nothing — so this is
+    // NOT a result-independent case, and the test says so rather than implying otherwise.
     assert_eq!(
         mode_of_dir_under(0o177, "index_dir"),
         0o600,
