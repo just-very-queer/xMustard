@@ -111,7 +111,8 @@ const explainQueryArgs: readonly string[] = ["path", "symbol", "uid", "depth", "
 // API receives it.
 const impactQuery: readonly string[] = [
 	"path", "symbol", "from", "to", "direction", "scope", "base", "head", "worktree",
-	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms",
+	"op", "relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only",
+	"timeout_ms", "cursor",
 ];
 
 // How one member of a JSON request body travels: as the string the argument carries, as a
@@ -479,6 +480,12 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		// from/to; max_depth alone) instead of it being dropped.
 		advanced: [
 			maxCharsArg(IMPACT_DEFAULT_MAX_CHARS),
+			{
+				name: "op",
+				type: "string",
+				enum: ["refs", "definition", "implementations"],
+				desc: "symbol-level occurrences instead of the depth tiers: refs (every use), definition (what declares it), implementations (types implementing it)",
+			},
 			{ name: "direction", type: "string", enum: ["upstream", "downstream"], desc: "dependents (default) or dependencies" },
 			{
 				name: "scope",
@@ -492,8 +499,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "relation_types", type: "string", maxLength: 128, desc: "edge kinds to walk (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)" },
 			{ name: "min_confidence", type: "number", minimum: 0, maximum: 1, desc: "skip edges below this confidence" },
 			{ name: "include_tests", type: "boolean", desc: "walk test files (default false)" },
-			{ name: "limit", type: "integer", minimum: 1, maximum: BUDGET_MAX_LIMIT, desc: "items per depth tier (default 50)" },
+			{ name: "limit", type: "integer", minimum: 1, maximum: BUDGET_MAX_LIMIT, desc: "items per depth tier (default 50), or per page with op=" },
 			{ name: "offset", type: "integer", minimum: 0, maximum: 50000, desc: "items skipped per depth tier" },
+			{ name: "cursor", type: "string", maxLength: MAX_CURSOR_LEN, desc: "next_cursor of the previous op= page" },
 			{ name: "summary_only", type: "boolean", desc: "counts, risk and envelope without items" },
 			{ name: "timeout_ms", type: "integer", minimum: 1, maximum: 60000, desc: "walk budget (default 10000)" },
 		],

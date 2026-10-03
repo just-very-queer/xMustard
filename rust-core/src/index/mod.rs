@@ -57,6 +57,7 @@ pub mod lexical;
 pub mod meta;
 pub mod namepath;
 pub mod names;
+pub mod occurrences;
 pub mod overview;
 pub mod reader;
 pub mod refresh_queue;

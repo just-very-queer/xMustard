@@ -130,9 +130,15 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	case workspaceops.ImpactTrace:
 		result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
 	case workspaceops.ImpactBlast:
-		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
-		if err == nil {
-			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+		switch rest["op"] {
+		case "":
+			result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+			if err == nil {
+				result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+			}
+		default:
+			// op= is an occurrence read (WS-59d), not the tier walk
+			result, err = workspaceops.SymbolOccurrencesCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
 		}
 	case workspaceops.ImpactFile:
 		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)

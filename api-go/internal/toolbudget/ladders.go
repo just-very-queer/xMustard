@@ -219,6 +219,29 @@ var explainLadders = []*Ladder{
 
 var impactLadders = []*Ladder{
 	{
+		// impact op= (WS-59d, PAR-IMP-03): the symbol-level occurrences. Staged as the
+		// requirement names it: snippets go, then the rows become per-file counts, then
+		// only the total remains; next_cursor continues either way.
+		Shape: "occurrences (op)", Match: "occurrences",
+		Lists:   []List{{Member: "occurrences", GroupBy: "path", Paged: true}},
+		Signals: append([]string{"epistemic"}, envelope...),
+		Keep:    envelopeKeep,
+		Rungs: []Rung{
+			signalCounts,
+			signalFlags,
+			{Name: "no_snippets", List: "occurrences", Drop: []string{"snippet"},
+				Doc: "occurrences lose their snippet; line says where to read"},
+			{Name: "no_lines", List: "occurrences", Drop: []string{"line", "snippet"},
+				Doc: "occurrences lose their line and snippet; path and name say what to read"},
+			{Name: "trimmed", Op: opFit, List: "occurrences",
+				Doc: "fewer occurrences, in index order; next_cursor continues at the first occurrence not returned"},
+			{Name: "counts", Op: opCount, List: "occurrences",
+				Doc: "occurrences become occurrences_by_path"},
+			{Name: "total", Op: opTotal, List: "occurrences", Doc: "only total remains"},
+		},
+		More: "next_cursor continues the list; a smaller max_chars keeps fewer rows, each in full; max_chars up to 65536",
+	},
+	{
 		// impact v2 (WS-35) scope=: the symbols a diff touches and their dependents
 		Shape: "diff scope (changed_symbols)", Match: "changed_symbols",
 		Lists: []List{
