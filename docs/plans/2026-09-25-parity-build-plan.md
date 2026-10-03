@@ -1338,6 +1338,148 @@ The fix is to stop parsing the text form. `git status --porcelain=v2 -z` emits N
 - *Checks.* `BOXALL` on the reviewed head; the three measurement runs above; `make check-rss-lines`; `cargo fmt --check` is not run locally (the `macshim` allows `cargo fmt` but this row changes no Rust file, so there is nothing to format). Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no Rust source at all, no index behaviour, no memory store, no Pi source, no route gate row, no projection and no `tools/list` byte, and touches no Go file, no route, no gate table, no `main.go`, no dispatch entry, no `go-calls.txt` line and no heavy-table row, so §3.0 names none of them. `BUD` in particular is not owed: no resident component, cache or in-heap structure was added to the product.
 - *Follow-ups.* (1) The goal's §3.3 note for this row quotes a figure that belongs to a different benchmark, and the same §2.3 table carries 24.7-25.2 MiB for a different subject; anyone reading the row as "this test is near its line" will draw the wrong conclusion. Owner: the goal's author, for the queue text. (2) `cargo test --workspace` captures a test binary's `eprintln!`, so an RSS fixture that reports its peak by `eprintln!` cannot be measured inside a whole-suite run — the suite has to be run alongside a separate `--nocapture` invocation of the same binary. That cost this row two whole-suite box calls and it will cost the next row that measures a peak the same way; `make check-rss-lines` would print every peak if it passed `--nocapture`, which is a one-flag change to the target WS-HYG-02 owns. Owner: the next row that needs a peak figure under full-suite load. (3) `memprobe`'s `Peaks.tree_rss` and `Peaks.rss` never diverged by more than 0.3 MiB in 33 readings on this fixture, so `tree_rss`'s "covers the child's own children" doc comment is accurate but the extra `git ls-files` child cost nothing measurable here — worth knowing before anyone treats it as the loose reading in another row. Owner: whoever next reads these probes.
 
+### WS-FLK-08 — memprobe is all-or-nothing: a memory guard that never sampled passes
+
+**Goal.** `memprobe::child_peaks` (`rust-core/tests/memprobe/mod.rs:113`) accumulates a child's
+peak `dirty` and `rss` by sampling `sample(pid)` in a 1 ms loop, and initialises both to `0`.
+`sample` returns `None` whenever `/proc/<pid>/status` cannot be read, so a loop whose every
+iteration reads `None` returns `Peaks { dirty: 0, rss: 0, .. }`. **Four of the six
+`child_peaks` guards then asserted an upper bound against a reading of zero and passed
+vacuously: `mib <= 25.0` is `0.0 <= 25.0`.** The other two were already narrower than that
+claim, and the row does not widen it: the 5,000-file build guard and the language-pack guard
+each asserted `dirty > 0` before their dirty bound, so they failed loudly when the *dirty*
+sample was missing, and every guard that bounds `tree_rss` reads `wait4(2)` rusage, which the
+kernel fills whether or not this loop sampled. What no guard checked was the **RSS** figure,
+which is the one every bound in the suite is stated against. The row closes that hole by
+asserting `peaks.rss > 0` (and `peaks.dirty > 0` where a dirty bound is asserted) **before**
+the bound is checked, so a guard that never sampled fails loudly instead of passing. The
+source of the hole is named in the
+goal's own §3.3 note as "memprobe all-or-nothing (WS-FIX-06/H6)" with the instruction "Add
+`peaks.rss>0` asserts"; that is the whole of this row's scope.
+
+**Requirements.** No new PAR ids. This is test hygiene: it closes no requirement and adds no
+product behaviour. §6 A1's "a skipped test is not a pass" is the rule at stake — a guard that
+reads zero is the same defect wearing a different hat — and §5.1 rule 11 forbids the alternative
+repair, which would be to loosen or delete the bound. Nothing about what the product does
+changes: the same index builds still run, the same 25 MiB release line still holds, and the
+same numbers are still reported.
+
+**Files.** `rust-core/tests/memprobe/mod.rs` (a `Peaks` precondition helper, so one place
+carries the assertion rather than five call sites each re-deriving it), `rust-core/tests/index_build.rs`,
+`rust-core/tests/lang_fixtures.rs`, `rust-core/tests/run_wrapper.rs`, `rust-core/tests/index_query.rs`
+(the guard call sites), `docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+**Tests required.**
+- The hole is demonstrated before it is closed: a mutation that forces `sample` to return
+  `None` on every iteration must turn each guarded test **red** with the new assertion's
+  message, not green. This is the row's TDD step and it is the whole reason the row exists —
+  the defect is invisible while every guard is green.
+- Each mutation row is one call site, restored from a tree `git status --short` showed clean,
+  with its FAIL line and the tree state after the restore recorded.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines are byte-identical to the
+  merge base, and `BUILD_5000_DIRTY_MIB` (6 MiB) and `rss_line(25.0, 32.0)` are unchanged.
+- `BOXALL` green on the box, so every guard in the suite runs with the assertion present.
+
+**Acceptance.** Every `child_peaks` consumer asserts a sampled reading before it asserts a bound,
+so `peaks.rss == 0` (or `peaks.dirty == 0` on a dirty bound) fails with a message naming the
+probe and the fix rather than passing as `0.0 <= line`. `make check-rss-lines` stays green on
+the box in the release profile, clippy's warning count does not rise, and `cargo fmt --check` is
+clean.
+
+**Collision risk.** `rust-core/tests/memprobe/mod.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which is the last row to have edited it; its `Serve::mem_settled` reader lives in
+`tests/index_query.rs`, not in `memprobe`, so this row does not touch that reader. Lane C is the
+only lane in this build that edits `rust-core` sources. WS-FLK-02 (merged `799d8c8`) owns the
+*distribution* of `build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib` and closed as not
+reproduced; this row does not change that test's bounds or its expected values — it adds the
+precondition that makes the bound it already asserts meaningful, and WS-FLK-02's record is
+untouched.
+
+**Implementation record (branch parity/ws-flk-08, 2026-10-03).** Six files, all test code and this
+plan. The code diff against merge base `799d8c8` is **+49/-2 across the five Rust test files**
+(`git diff --numstat`: `memprobe/mod.rs` +33/-0, `index_query.rs` +10/-0, `index_build.rs`
++4/-1, `lang_fixtures.rs` +1/-1, `run_wrapper.rs` +1/-0); this record adds the rest of the plan
+diff. No product source, no bound, no timeout, no retry, no dependency.
+- *What was built.* `rust-core/tests/memprobe/mod.rs`: an `impl Peaks` block with `assert_sampled`
+  (RSS precondition) and `assert_sampled_dirty` (RSS plus dirty), so the rule lives in one place
+  rather than in five call sites. `rust-core/tests/index_build.rs`, `lang_fixtures.rs`,
+  `run_wrapper.rs`: all six `child_peaks` consumers call one of the two before their bound
+  (`rg -c` gives 4/1/1 for each, a 1:1 match with the `child_peaks` call sites).
+  `rust-core/tests/index_query.rs`: the same defect at its own source, where the `swap_peak`
+  sampler thread's `Mem::default()` becomes a 0.0 MiB delta through `above`'s `saturating_sub`
+  (`index_query.rs:1463`). Two pre-existing inline `dirty > 0` asserts are removed as
+  subsumed: one sat inside `if let Some(line) = BUILD_5000_DIRTY_MIB`, so it was skipped when
+  that bound was `None`, and neither checked RSS.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64, `uptime` on line 1 of each log; debug
+  profile for `BOXALL`, `--release` named explicitly on every focused run). **The defect, before
+  the fix:** with `sample` forced to return `None` on every call, `max_size_ignore_files_keep_
+  the_worker_bounded` printed `worker peak RSS 0.0 MiB, dirty peak 0.0 MiB` and returned
+  `remote_exit=0` / `test result: ok. 1 passed` (`logs/ws-flk-08-run-20261003T133349Z.log`) — a
+  guard that measured nothing, reported success. **After the fix**, four mutations, all killed:
+  `XMUSTARD_MEMPROBE_BLANK=1 … --test index_build` gives `FAILED. 0 passed; 2 failed` with
+  `memprobe sampled no RSS (rss 0, tree_rss 10850304)` and `tree_rss 13553664`
+  (`…134126Z.log`); the same forcing on `--test lang_fixtures` gives `1 failed` with
+  `tree_rss 42610688` (`…134147Z.log`) and on `--test run_wrapper` `1 failed` (`…134201Z.log`);
+  and a fifth mutation that keeps `rss` live but zeroes only `dirty` is caught by the second
+  clause alone — `sampled no dirty memory (rss 5521408)` (`…134227Z.log`). `BOXALL` on the
+  fixed head: `remote_exit=0`, `clippy_warnings=6` (the merge-base count), `rss_lines=ok`, 24 Go
+  packages and 18 Rust binaries ok, 0 FAILED, 46 untruncated lines
+  (`logs/ws-flk-08-check-20261003T135335Z.log` at `c46b692`, and the merge-recheck gate on
+  `b0b450f`). `cargo fmt --check` clean. Nine of the thirteen S13 evidence rows were re-checked
+  with `rg -F` after the fact and each returned exactly 1.
+- *The two `tree_rss` figures are the proof the guards were blind, not idle.* 10.8, 13.5 and
+  42.6 MiB are what `wait4` reported for children that were demonstrably running, while the
+  sampled RSS read 0. That is the distinction the section's Goal draws and it is worth keeping:
+  a guard bounding `tree_rss` could never have had this bug, which is why the fix asserts on the
+  sampled fields only and leaves `tree_rss` unchecked (S5's baseline and M1 rows).
+- *Review.* Round 1 (`reviews/ws-flk-08/r1`, reviewed `c46b692`): `gate=PASS`'s round summary
+  read `ocr_preview=0 ocr_rules=0 ocr_review=0 codex_review=0 codex_spec=0 opencode=unavailable`.
+  OCR reviewed all five files and returned **0 comments**; `codex-review.md` found "no actionable
+  regression in the diff". `codex-spec.findings.json` held three: one medium (the section's own
+  Tests-required bullet had no mutation record in the diff) and two low. All three fixed in
+  `b0b450f`; one was raised to major per §4.6's rule that an unmet spec is major, and the two
+  low ones stayed minor per the goal's own map. `triage-check.md` returned DISAGREE on the
+  standing no-committed-test clause; `r1/triage-notes.md` answers it — this is the nineteenth
+  lane-C row to meet it, and §6 A4 forbids the test it asks for here because the oracle for
+  "did the probe sample anything" is `/proc`, which is the code under test. OCR's anchor step
+  returned empty for both findings files (`anchor_codex-spec.findings=1`), so anchors were written
+  by hand against the cited code.
+- *Deviations.* (1) No new test function, for the §6 A4 reason above; the mutation pass in
+  `r1/slop-audit.md` S5 is the substitute evidence and is what decided whether the assertions do
+  anything. (2) The section's Goal overstated the defect's blast radius and round 1 corrected it:
+  four of the six guards, not all six, are stated as passing vacuously. Verified against the
+  base with `git show 799d8c8` on both files rather than argued — the two exceptions are
+  `index_build.rs:1265` and `lang_fixtures.rs:311`, both `no dirty-memory sample`. (3) The first
+  `BOXALL` was cut off at the tool's 600 s ceiling and wrote no log at all; it was rerun in the
+  background and is the cited one. That is the WS-28c shape, not a red gate. (4) `XM_OPS_REVIEW`
+  had to point at a review-tagged binary built for an earlier row: this machine's Go cannot
+  build `cmd/xmustard-ops` (the `Mtim`/`Ctim` syscall fields are Linux-only), so the binary was
+  built on the box and the anchor step was skipped rather than mis-anchored.
+- *Merge recheck.* See `reviews/ws-flk-08/r1/merge-recheck.md`. No dispatch entry, route, gate
+  table, heavy-table row, `go-calls.txt` line or budget ledger line is in the diff: the class
+  grep over `799d8c8..HEAD` names no `main.go`, `*_routes.go`, `route_gates.go`, `heavy.go`,
+  `budget_ledger.json` or `xmustard-core.rs`, so none can be lost. §3.0's `SEQUENTIAL`/
+  `OVERLAPPING` lines, `BUILD_5000_DIRTY_MIB` (6 MiB) and `rss_line(25.0, 32.0)` are
+  byte-identical to the merge base.
+- *Checks.* `BOXALL` twice (pre-fix head and merge-recheck head), four focused `BOX1` mutation
+  arms, `cargo fmt --check` locally, `rg -c` for the 1:1 wiring, and the leak check over every log
+  this row wrote. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — the row changes no Rust
+  *source* (every changed file is under `rust-core/tests/`), no index behaviour, no memory store,
+  no Pi source, no route gate row, no projection and no `tools/list` byte, and touches no Go
+  file, so §3.0 names none of them. `BUD` in particular is not owed: no resident component, cache
+  or in-heap structure was added to the product.
+- *Follow-ups.* (1) Three `dogfood:` lines, all in `reviews/ws-flk-08/r1/dogfood.md`: the search
+  corpus has no Rust *test* coverage (204 hits, zero in `rust-core/`, for a query naming three
+  literals from the file), `explain` returns not-found for a file the index lists as covered, and
+  `impact symbol=child_peaks` returns `defined_in=[]` with no "unknown symbol" reason, so an
+  empty list reads as "no callers". Proposed owner: the rows owning each resolver. (2)
+  `scripts/bench/rss_bench.py`'s `sample_once` already does the right thing — it records a failed
+  `ps` into `self.errors` and a vanished root into `self.lost_roots` instead of folding either
+  into a silent zero — which makes this fix the repository's existing pattern rather than a new
+  convention. Owner: nobody; recorded so the next row does not re-derive it. (3) The same
+  all-or-nothing shape may exist in any future `Peaks` field; `assert_sampled` names the two it
+  guards, so a third field would need its own clause. Proposed owner: whoever next adds a field.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
