@@ -355,35 +355,59 @@ func TestPreparedJobKindsAreKnownToTheStore(t *testing.T) {
 	})
 }
 
-// A cancelled job frees its signature: preparing again enqueues a fresh job.
+// A cancelled job frees its signature: the next pass enqueues a fresh job for it. The
+// assertion names the cancelled signature rather than a count, because one pass may queue
+// more than one kind of candidate and a count would break when another kind fires.
 func TestPreparationReusesAFreedSignature(t *testing.T) {
 	ctx := context.Background()
 	dir := singleAgentDir(t)
 	ws := "wsJobs6"
 	proposeOn(t, dir, ws, "a", "cluster one", "one thing", "src/shared.go")
 	proposeOn(t, dir, ws, "b", "cluster two", "two things", "src/shared.go")
-	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
-	if len(res.Jobs) != 1 {
-		t.Fatalf("want one job, got %d", len(res.Jobs))
+	if len(res.Jobs) == 0 {
+		t.Fatal("two memories on one path queued no job")
 	}
-	first := res.Jobs[0].ID
+	cancelled := res.Jobs[0]
+	sig := cancelled.ConflictSignature
 	mustUpdateMemory(t, dir, ws, func(tx govstore.Tx) error {
-		_, err := tx.CancelJob(ctx, first, govstore.Actor{Principal: "worker-1"})
+		_, err := tx.CancelJob(ctx, cancelled.ID, govstore.Actor{Principal: "worker-1"})
 		return err
 	})
-	again, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	again, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
-	if len(again.Jobs) != 1 || again.Jobs[0].ID == first {
-		t.Fatalf("a cancelled signature was not freed: %+v", again.Jobs)
+	// The freed signature has a job again, and it is a new one: the cancelled row is kept.
+	var fresh *govstore.Job
+	for i := range again.Jobs {
+		if again.Jobs[i].ConflictSignature == sig {
+			fresh = &again.Jobs[i]
+			break
+		}
 	}
-}
-
-// The instructions name the decision the agent has to make, not a verdict.
+	if fresh == nil {
+		t.Fatalf("the cancelled signature %q was not re-queued: %+v", sig, again.Jobs)
+	}
+	if fresh.ID == cancelled.ID {
+		t.Fatalf("the cancelled job %s was reused instead of a fresh one", fresh.ID)
+	}
+	// The cancelled row is still there, readable: cancelling frees the signature, it does
+	// not erase the record of what was offered.
+	mustViewMemory(t, dir, ws, func(r govstore.Reader) error {
+		got, err := r.GetJob(ctx, cancelled.ID)
+		if err != nil {
+			return err
+		}
+		if got.State != govstore.JobCancelled {
+			t.Fatalf("the cancelled job is %s, want %s", got.State, govstore.JobCancelled)
+		}
+		return nil
+	})
+} // The instructions name the decision the agent has to make, not a verdict.
 func TestPreparedInstructionsAskTheAgentToJudge(t *testing.T) {
 	dir := singleAgentDir(t)
 	ws := "wsJobs7"

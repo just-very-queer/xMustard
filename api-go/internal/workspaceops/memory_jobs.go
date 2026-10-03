@@ -150,6 +150,19 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 			return res, err
 		}
 	}
+	// Reading from the cursor can find candidates whose signatures the queue already holds:
+	// they are work, so the read did not return empty, but the pass has nothing new to
+	// queue. When that happens and the read reached the end of the table, the entries the
+	// cursor sits past may hold the freed work, so the pass starts again from the beginning.
+	if complete && len(unqueuedCandidates(ctx, dataDir, workspaceID, candidates)) == 0 {
+		fromStart, s2, k2, c2, comp2, err2 := consolidationCandidates(ctx, dataDir, workspaceID, 0)
+		if err2 != nil {
+			return res, err2
+		}
+		if len(unqueuedCandidates(ctx, dataDir, workspaceID, fromStart)) > 0 {
+			candidates, seen, skipped, cursor, complete = fromStart, s2, k2, c2, comp2
+		}
+	}
 	res.Seen = seen
 	res.Cursor = cursor
 	res.Complete = complete
@@ -206,6 +219,35 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 		return res, err
 	}
 	return res, nil
+}
+
+// unqueuedCandidates is the candidates whose signature the queue does not hold, which is what
+// a pass can actually add. It reads the queue, so it is the test for "this pass has work".
+func unqueuedCandidates(ctx context.Context, dataDir, workspaceID string, candidates []govstore.JobInput) []govstore.JobInput {
+	if len(candidates) == 0 {
+		return nil
+	}
+	var out []govstore.JobInput
+	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		jobs, err := r.ListJobs(ctx, govstore.JobFilter{WorkspaceID: workspaceID, States: []string{
+			govstore.JobQueued, govstore.JobLeased, govstore.JobDone, govstore.JobFailed}, Limit: consolidationJobsPerRun})
+		if err != nil {
+			return err
+		}
+		held := make(map[string]bool, len(jobs))
+		for _, j := range jobs {
+			held[j.ConflictSignature] = true
+		}
+		for _, c := range candidates {
+			if !held[c.ConflictSignature] {
+				out = append(out, c)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil
+	}
+	return out
 }
 
 // queuedSignatures is every signature that already has a job the agent has not cancelled, so
@@ -337,6 +379,11 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string, f
 				return err
 			}
 			if len(entries) == 0 {
+				// An empty page is the end of the table. Without this the pass could not tell
+				// "the cursor is past everything" from "there is nothing here", and a
+				// workspace whose entries all sit before the cursor would never be looked at
+				// again.
+				complete = true
 				return nil
 			}
 			seen += len(entries)
