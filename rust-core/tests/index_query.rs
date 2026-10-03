@@ -89,36 +89,104 @@ fn perm(mode: u32) -> fs::Permissions {
     fs::Permissions::from_mode(mode)
 }
 
-/// The mode `index_dir` creates at, read back off a real directory it made. The
-/// expected value is the literal `0o700`, never the result of calling `index_dir`.
-/// The second half asserts the same mask against the group-writable mode this row
-/// exists for, so narrowing the mask to the owner bits fails here instead of passing
-/// every mode — an `0o700` mask maps both `0o700` and `0o775` to `0o700`.
+/// Run `body` in a child process whose umask is `mask`, and return its stdout.
+///
+/// A process-wide `umask` is not safe to set in a test binary that runs tests in
+/// parallel threads, so the umask-dependent half of this row runs in a child. The child is
+/// this same test binary re-invoked with `XMUSTARD_UMASK_CHILD`, so it needs no second
+/// binary and no shell: the umask is set before the body runs, inside the child only.
+fn under_umask(mask: u32, body: &str) -> String {
+    let child = format!("umask_child_reports_the_mode_of_a_{body}");
+    let out = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(&child)
+        .arg("--nocapture")
+        .env("XMUSTARD_UMASK_CHILD", &child)
+        .env("XMUSTARD_UMASK_OCTAL", format!("{mask:o}"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "umask child {child} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Set this process's umask to `XMUSTARD_UMASK_OCTAL`, or leave it alone when that variable
+/// is unset, which is how the parent run of this binary reaches this code: as a no-op.
+fn adopt_umask_from_env() {
+    if let Ok(octal) = std::env::var("XMUSTARD_UMASK_OCTAL") {
+        let mask = u32::from_str_radix(&octal, 8).unwrap();
+        // SAFETY: a single-threaded child of this test binary, before any other test thread
+        // exists, so the process-global umask has no concurrent reader.
+        unsafe {
+            libc::umask(mask);
+        }
+    }
+}
+
+fn mode_of_dir(d: &TempDir) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(d.path()).unwrap().permissions().mode() & 0o777
+}
+
+/// Child of `under_umask`: the mode `index_dir` creates under the given umask.
+#[test]
+fn umask_child_reports_the_mode_of_a_index_dir() {
+    if std::env::var("XMUSTARD_UMASK_CHILD").as_deref()
+        != Ok("umask_child_reports_the_mode_of_a_index_dir")
+    {
+        return;
+    }
+    adopt_umask_from_env();
+    println!("UMASK_MODE={:04o}", mode_of_dir(&index_dir()));
+}
+
+/// Child of `under_umask`: the mode a plain `TempDir` creates under the same umask. This is
+/// the control: if it does not come out group-writable, the pair cannot tell an explicit
+/// mode from the umask and the parent assertion proves nothing.
+#[test]
+fn umask_child_reports_the_mode_of_a_plain_tempdir() {
+    if std::env::var("XMUSTARD_UMASK_CHILD").as_deref()
+        != Ok("umask_child_reports_the_mode_of_a_plain_tempdir")
+    {
+        return;
+    }
+    adopt_umask_from_env();
+    println!("UMASK_MODE={:04o}", mode_of_dir(&TempDir::new().unwrap()));
+}
+
+/// The mode `index_dir` creates at, under the umask that exposed the defect.
+///
+/// Both children run under the same `0o002`, the login umask that produced the failure this
+/// row exists for: a plain `TempDir` lands at `0775` there and only the explicit mode keeps
+/// `index_dir` at `0700`. Expected values are literals, never the result of calling the code
+/// under test. Running both under one umask is what makes the pair meaningful — under `0077` a
+/// plain `TempDir` is already `0700`, so `index_dir` could be a no-op without this noticing.
 #[test]
 fn an_index_fixture_dir_is_owner_only_whatever_the_process_umask() {
-    use std::os::unix::fs::PermissionsExt;
-    let mode_of = |d: &TempDir| fs::symlink_metadata(d.path()).unwrap().permissions().mode();
-    let is_private = |d: &TempDir| mode_of(d) & 0o777 == 0o700;
-    let dir = index_dir();
-    assert!(
-        is_private(&dir),
-        "an index fixture directory is {mode:04o}, not 0700, so WS-FIX-11's refusal depends \
-         on the umask of whoever logged in",
-        mode = mode_of(&dir) & 0o777
-    );
-    // 0o775 is what `TempDir::new` yields under umask 0002 and what `classify_dir`
-    // refuses. Under the mask above this is the value that must NOT read as private.
-    let wide = TempDir::new().unwrap();
-    fs::set_permissions(wide.path(), perm(0o775)).unwrap();
+    let mode_in = |body: &str| -> u32 {
+        let out = under_umask(0o002, body);
+        let line = out
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("UMASK_MODE="))
+            .unwrap_or_else(|| panic!("no UMASK_MODE line in child output: {out:?}"));
+        u32::from_str_radix(line.trim(), 8).unwrap()
+    };
     assert_eq!(
-        mode_of(&wide) & 0o777,
-        0o775,
-        "set_permissions must plant 0o775 verbatim"
+        mode_in("index_dir"),
+        0o700,
+        "index_dir did not create 0700 under umask 0002, so a fixture's mode comes from \
+         whoever logged in and WS-FIX-11's refusal is umask-dependent"
     );
-    assert!(
-        !is_private(&wide),
-        "a group-writable index directory read as private, so the mask above cannot see the \
-         group bit and would accept every mode"
+    assert_eq!(
+        mode_in("plain_tempdir"),
+        0o775,
+        "a plain TempDir must land at 0775 under umask 0002, otherwise this test cannot \
+         tell the explicit mode from the umask and proves nothing"
     );
 }
 
