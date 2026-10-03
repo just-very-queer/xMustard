@@ -1773,9 +1773,9 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
             // areas' seed: the one arbitrary choice in the propagation, so a caller can
             // vary it; parsed here so a non-numeric value is refused before any work.
             a if sub.as_str() == "areas" && a.starts_with("--seed=") => {
-                seed = a["--seed=".len()..].parse().map_err(|_| {
-                    CmdError::new(2, "index areas: --seed needs a number")
-                })?;
+                seed = a["--seed=".len()..]
+                    .parse()
+                    .map_err(|_| CmdError::new(2, "index areas: --seed needs a number"))?;
                 1
             }
             // impact v2's `--name=value` flags (validated by impact::Query)

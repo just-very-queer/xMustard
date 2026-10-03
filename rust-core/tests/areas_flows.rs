@@ -173,7 +173,11 @@ fn the_same_seed_over_the_same_index_is_byte_identical_across_runs() {
     build(d.path());
     let first = run(&["index", "areas", d.path().to_str().unwrap(), "--seed=7"]);
     let second = run(&["index", "areas", d.path().to_str().unwrap(), "--seed=7"]);
-    assert!(first.status.success(), "{}", String::from_utf8_lossy(&first.stderr));
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
     assert!(second.status.success());
     assert_eq!(
         first.stdout, second.stdout,
@@ -190,12 +194,7 @@ fn the_same_seed_gives_the_same_areas_after_a_full_rebuild() {
     build(d.path());
     let before = areas(d.path(), &["--seed=7"]);
     // a second build from scratch: the same bytes, a new generation on disk
-    std::fs::remove_dir_all(
-        d.path()
-            .join(".git/xmustard-cache")
-            .join("index-v3"),
-    )
-    .unwrap();
+    std::fs::remove_dir_all(d.path().join(".git/xmustard-cache").join("index-v3")).unwrap();
     build(d.path());
     let after = areas(d.path(), &["--seed=7"]);
     assert_eq!(
@@ -239,7 +238,10 @@ fn the_default_mode_agrees_with_the_base_of_a_large_graph() {
     build(d.path());
     let v = areas(d.path(), &[]);
     assert_eq!(v["mode"], "standard", "{v:#}");
-    assert_eq!(v["resolution"], 1.0, "standard mode uses resolution 1.0: {v:#}");
+    assert_eq!(
+        v["resolution"], 1.0,
+        "standard mode uses resolution 1.0: {v:#}"
+    );
     assert_eq!(v["seed"], 0, "the default seed is 0: {v:#}");
 }
 
@@ -274,7 +276,10 @@ fn large_graph_mode_triggers_above_ten_thousand_symbols() {
         "the fixture must exceed the 10k threshold: {v:#}"
     );
     assert_eq!(v["mode"], "large", "the mode did not switch: {v:#}");
-    assert_eq!(v["resolution"], 2.0, "large mode uses resolution 2.0: {v:#}");
+    assert_eq!(
+        v["resolution"], 2.0,
+        "large mode uses resolution 2.0: {v:#}"
+    );
     assert!(v["iterations"].as_u64().unwrap() <= 3, "{v:#}");
     assert!(
         v["dropped_low_degree"].as_u64().unwrap() > 0,
@@ -282,9 +287,7 @@ fn large_graph_mode_triggers_above_ten_thousand_symbols() {
     );
     assert_eq!(
         v["dropped_low_confidence_edges"].as_u64().unwrap(),
-        v["dropped_low_confidence_edges"]
-            .as_u64()
-            .unwrap(),
+        v["dropped_low_confidence_edges"].as_u64().unwrap(),
         "the drop count is a number: {v:#}"
     );
 }
@@ -294,10 +297,7 @@ fn a_label_is_a_member_folder_when_it_is_not_generic() {
     let d = two_subsystems();
     build(d.path());
     let v = areas(d.path(), &["--seed=7"]);
-    let labels: BTreeSet<String> = read_areas(&v)
-        .into_iter()
-        .map(|a| a.label)
-        .collect();
+    let labels: BTreeSet<String> = read_areas(&v).into_iter().map(|a| a.label).collect();
     assert!(
         labels.contains("billing") || labels.contains("shipping"),
         "no folder label among {labels:?}"
@@ -312,7 +312,9 @@ fn a_label_falls_back_to_a_name_prefix_and_then_to_cluster_n() {
     for a in read_areas(&v) {
         assert!(!a.label.is_empty(), "an area has no label: {v:#}");
         assert!(
-            a.label.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)),
+            a.label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)),
             "label {:?} is not a plain name",
             a.label
         );
@@ -381,8 +383,7 @@ fn two_files_that_never_reference_each_other_land_in_different_areas() {
         "the fixture's symbols are missing from the areas: {m:?}"
     );
     assert_ne!(
-        billing,
-        shipping,
+        billing, shipping,
         "the symbol projection merged two disconnected subsystems: {v:#}"
     );
 }
@@ -420,10 +421,7 @@ fn areas_are_reported_at_symbol_granularity_with_their_paths() {
     let d = two_subsystems();
     build(d.path());
     let v = areas(d.path(), &["--seed=7"]);
-    let paths: BTreeSet<String> = read_areas(&v)
-        .into_iter()
-        .flat_map(|a| a.paths)
-        .collect();
+    let paths: BTreeSet<String> = read_areas(&v).into_iter().flat_map(|a| a.paths).collect();
     assert!(
         paths.contains("billing/invoice.go") && paths.contains("shipping/parcel.go"),
         "member paths are missing: {paths:?}"
@@ -443,7 +441,11 @@ fn areas_are_reported_at_symbol_granularity_with_their_paths() {
 fn a_missing_index_is_refused_rather_than_answered_from_nothing() {
     let d = repo(&[("a/a.go", "package a\n\nfunc A() int { return 1 }\n")]);
     let out = run(&["index", "areas", d.path().to_str().unwrap()]);
-    assert!(!out.status.success(), "{:?}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        !out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(
         err.contains("no index at"),
@@ -456,7 +458,14 @@ fn a_non_numeric_seed_is_refused() {
     let d = two_subsystems();
     build(d.path());
     let out = run(&["index", "areas", d.path().to_str().unwrap(), "--seed=nope"]);
-    assert!(!out.status.success(), "{:?}", String::from_utf8_lossy(&out.stdout));
+    assert!(
+        !out.status.success(),
+        "{:?}",
+        String::from_utf8_lossy(&out.stdout)
+    );
     let err = String::from_utf8_lossy(&out.stderr);
-    assert!(err.contains("--seed"), "the refusal does not name the flag: {err}");
+    assert!(
+        err.contains("--seed"),
+        "the refusal does not name the flag: {err}"
+    );
 }

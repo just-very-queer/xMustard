@@ -79,27 +79,8 @@ pub const LABEL_RULES: [&str; 3] = ["folder", "name_prefix", "cluster_n"];
 /// table, not a ladder: the label is the most common non-generic folder shared by enough
 /// of the members.
 pub const GENERIC_FOLDERS: [&str; 21] = [
-    "api",
-    "app",
-    "bin",
-    "build",
-    "cmd",
-    "core",
-    "dist",
-    "examples",
-    "gen",
-    "internal",
-    "lib",
-    "main",
-    "pkg",
-    "public",
-    "src",
-    "test",
-    "testdata",
-    "tests",
-    "tools",
-    "util",
-    "utils",
+    "api", "app", "bin", "build", "cmd", "core", "dist", "examples", "gen", "internal", "lib",
+    "main", "pkg", "public", "src", "test", "testdata", "tests", "tools", "util", "utils",
 ];
 
 // ---------------------------------------------------------------------------
@@ -202,12 +183,7 @@ fn name_prefix(name: &str) -> Option<String> {
     if word.chars().count() <= 1 || word == tail {
         return None;
     }
-    Some(
-        word.split('_')
-            .next()
-            .unwrap_or(&word)
-            .to_ascii_lowercase(),
-    )
+    Some(word.split('_').next().unwrap_or(&word).to_ascii_lowercase())
 }
 
 // ---------------------------------------------------------------------------
@@ -358,16 +334,13 @@ fn project<'a>(
     // undirected edge per pair rather than two.
     let mut pairs: BTreeMap<(u32, u32), (u32, u8)> = BTreeMap::new();
     let mut dropped_low_confidence = 0u64;
-    for i in 0..nodes.len() {
+    for (i, &node) in nodes.iter().enumerate() {
         for dir in [Direction::Downstream, Direction::Upstream] {
-            for edge in seg.neighbours::<csr::Edge>(dir.adjacency(), nodes[i])? {
+            for edge in seg.neighbours::<csr::Edge>(dir.adjacency(), node)? {
                 if seg.layer(edge.layer) != "symbol" {
                     continue;
                 }
-                if !matches!(
-                    seg.edge_kind(edge.kind),
-                    "CALLS" | "EXTENDS" | "IMPLEMENTS"
-                ) {
+                if !matches!(seg.edge_kind(edge.kind), "CALLS" | "EXTENDS" | "IMPLEMENTS") {
                     continue;
                 }
                 let Some(other) = edge.node.checked_sub(files) else {
@@ -434,7 +407,9 @@ fn propagate(p: &Projection, resolution: f64, max_iterations: u32) -> (Vec<u32>,
             by_comm.clear();
             let (dst, wgt) = p.neighbours(i);
             for (&d, &w) in dst.iter().zip(wgt) {
-                let e = by_comm.entry(community[d as usize]).or_insert((0, u32::MAX));
+                let e = by_comm
+                    .entry(community[d as usize])
+                    .or_insert((0, u32::MAX));
                 e.0 += w as u64;
                 e.1 = e.1.min(d);
             }
@@ -541,7 +516,11 @@ fn label_for(seg: &Segment, rows: &[(String, u32, u32, u32)], rank: usize) -> (S
     let mut folders: BTreeMap<String, usize> = BTreeMap::new();
     let mut prefixes: BTreeMap<String, usize> = BTreeMap::new();
     for (path, _, name, _) in rows {
-        let folder = path.split('/').rev().skip(1).find(|p| !GENERIC_FOLDERS.contains(p));
+        let folder = path
+            .split('/')
+            .rev()
+            .skip(1)
+            .find(|p| !GENERIC_FOLDERS.contains(p));
         if let Some(f) = folder {
             *folders.entry(f.to_string()).or_default() += 1;
         }
@@ -632,7 +611,11 @@ pub fn areas_of(seg: &Segment, resolved: &[bool], seed: u64) -> Result<Areas, St
         ("standard", 1.0, STANDARD_MAX_ITERATIONS)
     };
     let (community, iterations) = propagate(&p, resolution, cap);
-    let dropped_low_degree = p.degree.iter().filter(|&&d| large && d < MIN_DEGREE).count() as u64;
+    let dropped_low_degree = p
+        .degree
+        .iter()
+        .filter(|&&d| large && d < MIN_DEGREE)
+        .count() as u64;
     let singleton_symbols = p.degree.iter().filter(|&&d| d == 0).count() as u64;
     Ok(Areas {
         command: "areas",
@@ -655,9 +638,7 @@ pub fn areas_of(seg: &Segment, resolved: &[bool], seed: u64) -> Result<Areas, St
 fn global_symbols(seg: &Segment, resolved: &[bool]) -> u64 {
     (0..seg.counts().symbols)
         .filter_map(|s| seg.symbol(s).ok())
-        .filter(|row| {
-            !row.local && resolved.get(row.file as usize).copied().unwrap_or(false)
-        })
+        .filter(|row| !row.local && resolved.get(row.file as usize).copied().unwrap_or(false))
         .count() as u64
 }
 
