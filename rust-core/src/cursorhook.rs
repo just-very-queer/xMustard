@@ -250,10 +250,7 @@ fn key_is_here(body: &str, at: usize) -> bool {
     // The character before the opening quote decides: a key follows `{` or `,`
     // (ignoring whitespace); text inside a string value is preceded by anything else.
     let before = body[..at].trim_end();
-    match before.chars().next_back() {
-        Some('{') | Some(',') => true,
-        _ => false,
-    }
+    matches!(before.chars().next_back(), Some('{') | Some(','))
 }
 
 /// The index just past a JSON string value's closing quote, honouring escapes.
