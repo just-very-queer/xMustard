@@ -567,9 +567,18 @@ fn wait_within(child: &mut std::process::Child, secs: u64) -> Option<std::proces
 #[test]
 fn a_term_while_a_grandchild_holds_the_pipe_ends_the_wrapper() {
     let dir = tempfile::tempdir().unwrap();
-    let script = r#"sleep 20 & printf '%s' "$!" > "$1/grandchild"; printf '%s' "$$" > "$1/pid"; exit 0"#;
+    let script =
+        r#"sleep 20 & printf '%s' "$!" > "$1/grandchild"; printf '%s' "$$" > "$1/pid"; exit 0"#;
     let mut wrapper = Command::new(BIN)
-        .args(["run", "--", "sh", "-c", script, "sh", dir.path().to_str().unwrap()])
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            dir.path().to_str().unwrap(),
+        ])
         .env_remove("XMUSTARD_WORKSPACE_ID")
         .env_remove("XMUSTARD_API_TOKEN")
         .stdout(Stdio::null())
@@ -579,8 +588,14 @@ fn a_term_while_a_grandchild_holds_the_pipe_ends_the_wrapper() {
     let pid = child_pid(dir.path());
     // the child is a zombie (exited, not yet reaped) once ps reports state Z
     for _ in 0..500 {
-        let st = Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
-        if String::from_utf8_lossy(&st.stdout).trim_start().starts_with('Z') {
+        let st = Command::new("ps")
+            .args(["-o", "stat=", "-p", &pid])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&st.stdout)
+            .trim_start()
+            .starts_with('Z')
+        {
             break;
         }
         thread::sleep(Duration::from_millis(20));
@@ -603,7 +618,13 @@ fn a_term_while_a_grandchild_holds_the_pipe_ends_the_wrapper() {
 #[test]
 fn a_term_while_the_wrapper_prints_ends_it() {
     let mut wrapper = Command::new(BIN)
-        .args(["run", "--", "sh", "-c", "head -c 200000 /dev/zero | tr '\\0' a"])
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            "head -c 200000 /dev/zero | tr '\\0' a",
+        ])
         .env_remove("XMUSTARD_WORKSPACE_ID")
         .env_remove("XMUSTARD_API_TOKEN")
         .stdout(Stdio::piped())
@@ -631,7 +652,15 @@ fn a_child_that_exits_zero_on_term_makes_the_wrapper_exit_zero() {
     let dir = tempfile::tempdir().unwrap();
     let script = r#"trap 'echo trapped; exit 0' TERM; echo started; printf '%s' "$$" > "$1/pid"; printf 'ready\n' > "$1/ready"; i=0; while [ "$i" -lt 600 ]; do i=$((i+1)); sleep 0.05; done; exit 9"#;
     let mut wrapper = Command::new(BIN)
-        .args(["run", "--", "sh", "-c", script, "sh", dir.path().to_str().unwrap()])
+        .args([
+            "run",
+            "--",
+            "sh",
+            "-c",
+            script,
+            "sh",
+            dir.path().to_str().unwrap(),
+        ])
         .env_remove("XMUSTARD_WORKSPACE_ID")
         .env_remove("XMUSTARD_API_TOKEN")
         .stdout(Stdio::piped())
@@ -640,11 +669,46 @@ fn a_child_that_exits_zero_on_term_makes_the_wrapper_exit_zero() {
     await_file(&dir.path().join("ready"));
     signal_wrapper(dir.path(), "TERM");
     let mut out = String::new();
-    wrapper.stdout.take().unwrap().read_to_string(&mut out).unwrap();
+    wrapper
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
     let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
     assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
     assert!(
         out.contains("started") && out.contains("trapped"),
         "the child's output was not kept: {out:?}"
+    );
+}
+
+/// WS-FIX-20-r4-2: when the signal handlers cannot be registered (here `ulimit -n 4` leaves
+/// only fd 3, and signal-hook's self-pipe needs two), the wrapper must not run the child
+/// behind a wrapper that cannot forward a timeout. It becomes the command instead, so the
+/// child's `$$` is the very pid the caller started, and its output is native.
+#[test]
+fn without_forwarding_the_wrapper_becomes_the_command() {
+    let run = format!("ulimit -n 4 && exec '{BIN}' run -- sh -c 'echo \"pid=$$\"'");
+    let mut wrapper = Command::new("sh")
+        .args(["-c", &run])
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = String::new();
+    wrapper
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut out)
+        .unwrap();
+    let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(status.code(), Some(0), "status {status:?}, output {out:?}");
+    assert_eq!(
+        out.trim(),
+        format!("pid={}", wrapper.id()),
+        "not exec'd in place: {out:?}"
     );
 }

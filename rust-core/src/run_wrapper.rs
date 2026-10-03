@@ -29,7 +29,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, TcpStream, ToSocketAddrs};
 use std::os::unix::fs::OpenOptionsExt;
-use std::os::unix::process::ExitStatusExt;
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -87,6 +87,17 @@ pub fn run(args: Args) -> CmdResult {
 /// `run` with an injectable environment and limits.
 pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits) -> CmdResult {
     let (target, argv) = parse(args, env)?;
+    // Armed BEFORE the spawn, so no signal can reach the wrapper while it still has the
+    // default disposition and a child it could orphan; one that lands before `arm` waits for
+    // the pid instead (WS-FIX-20-r1-10).
+    let mut forwarder = Forwarder::start();
+    if !forwarder.is_armed() {
+        // Without forwarding, a wrapper over the child could die on a timeout and orphan it.
+        // Fail open without that risk: become the command, so every signal reaches it
+        // directly and its output is native (WS-FIX-20-r4-2).
+        eprintln!("xmustard run: running {} directly, unreduced", argv[0]);
+        return not_started(&argv, Command::new(&argv[0]).args(&argv[1..]).exec());
+    }
     let mut child = Command::new(&argv[0]);
     child.args(&argv[1..]);
     let (read_end, write_end) = rustix::pipe::pipe().map_err(|e| io_failed("pipe")(e.into()))?;
@@ -94,22 +105,9 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
     child
         .stdout(Stdio::from(write_end))
         .stderr(Stdio::from(dup));
-    // Armed BEFORE the spawn, so no signal can reach the wrapper while it still has the
-    // default disposition and a child it could orphan; one that lands before `arm` waits for
-    // the pid instead (WS-FIX-20-r1-10).
-    let mut forwarder = Forwarder::start();
     let mut spawned = match child.spawn() {
         Ok(c) => c,
-        // the shell's own answers: 127 not found, 126 not executable
-        Err(e) => {
-            let code = if e.kind() == io::ErrorKind::NotFound {
-                127
-            } else {
-                126
-            };
-            let text = format!("xmustard run: {}: {e}\n", argv[0]);
-            return Ok(Output::Exit(text, ChildExit::Code(code)));
-        }
+        Err(e) => return not_started(&argv, e),
     };
     forwarder.arm(spawned.id());
     drop(child); // the parent's copies of the write end must close for EOF
@@ -128,6 +126,18 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
     // `end_like` re-raises through `emulate_default_handler`, which no handler can swallow.
     forwarder.hold_until_exit();
     Ok(Output::Exit(text, exit))
+}
+
+/// A command that could not be started answers as a shell would: 127 not found, 126 not
+/// executable.
+fn not_started(argv: &[String], e: io::Error) -> CmdResult {
+    let code = if e.kind() == io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    };
+    let text = format!("xmustard run: {}: {e}\n", argv[0]);
+    Ok(Output::Exit(text, ChildExit::Code(code)))
 }
 
 fn parse(
@@ -209,6 +219,11 @@ impl Forwarder {
             reaped,
             pid: Some(tx),
         }
+    }
+
+    /// Whether the signals are registered, so a signal to the wrapper reaches the child.
+    fn is_armed(&self) -> bool {
+        self.handle.is_some()
     }
 
     /// Names the child the watcher forwards to; a signal held since `start` goes now.
