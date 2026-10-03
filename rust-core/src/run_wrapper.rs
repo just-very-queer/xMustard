@@ -308,9 +308,9 @@ impl Drop for Forwarder {
 /// error (ECHILD once `wait` reaped it) also means the child is gone, so this fails toward
 /// ending the wrapper rather than toward swallowing the signal.
 fn has_ended(child: rustix::process::Pid) -> bool {
-    use rustix::process::{WaitIdOptions, waitid};
+    use rustix::process::{WaitId, WaitIdOptions, waitid};
     let probe = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
-    !matches!(waitid(child, probe), Ok(None))
+    !matches!(waitid(WaitId::Pid(child), probe), Ok(None))
 }
 
 /// What the child printed: the spool (`None` once dropped, with `lost` saying why),
