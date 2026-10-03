@@ -835,3 +835,74 @@ func BenchmarkApplyImpactLarge(b *testing.B) {
 		}
 	}
 }
+
+// Settle re-fits a result a producer changed after Apply, and the report the earlier
+// pass recorded has to survive it: load drops the incoming report because this pass
+// rebuilds it, so a result that Apply already reduced would otherwise settle to a report
+// naming no stage, no recovery handle and degraded_stage "full".
+func TestSettleCarriesThePriorStagesAndRecoveryForward(t *testing.T) {
+	var tiers []map[string]any
+	for i := 0; i < 300; i++ {
+		tiers = append(tiers, map[string]any{"depth": 1, "label": "first order", "total": 300,
+			"items": []map[string]any{{"name": fmt.Sprintf("LongishSymbolName%d", i), "kind": "function"}}})
+	}
+	raw, _ := json.Marshal(map[string]any{"by_depth": tiers, "impacted_count": 300})
+	spec, _ := For("impact")
+	req := Request{MaxChars: 2000}
+	out, err := spec.Apply(raw, req, Page{}, func() Recovery {
+		return Recovery{URI: "xmustard://evidence/run-1", Handle: "run-1", Unavailable: ""}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first struct {
+		Report struct {
+			Stages        []string `json:"stages"`
+			DegradedStage string   `json:"degraded_stage"`
+			RecoverURI    string   `json:"recover_uri"`
+			RecoverHandle string   `json:"recover_handle"`
+		} `json:"output_budget"`
+	}
+	if err := json.Unmarshal(out, &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Report.Stages) == 0 {
+		t.Fatalf("Apply reduced nothing, so there is nothing to carry: %s", out)
+	}
+
+	// A producer adds its paging members, as impact's reconciliation does.
+	var res map[string]json.RawMessage
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatal(err)
+	}
+	res["has_more"] = json.RawMessage("true")
+	res["next_cursor"] = json.RawMessage(`"i2.7.deadbeef"`)
+	mutated, _ := json.Marshal(res)
+
+	settled, err := spec.Settle(mutated, req, Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after struct {
+		Report struct {
+			Stages        []string `json:"stages"`
+			DegradedStage string   `json:"degraded_stage"`
+			RecoverURI    string   `json:"recover_uri"`
+			RecoverHandle string   `json:"recover_handle"`
+		} `json:"output_budget"`
+	}
+	if err := json.Unmarshal(settled, &after); err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Report.Stages) != len(first.Report.Stages) {
+		t.Errorf("stages %v after settling, %v before: the earlier pass's report was dropped",
+			after.Report.Stages, first.Report.Stages)
+	}
+	if after.Report.DegradedStage != first.Report.DegradedStage {
+		t.Errorf("degraded_stage %q after settling, %q before",
+			after.Report.DegradedStage, first.Report.DegradedStage)
+	}
+	if after.Report.RecoverHandle != "run-1" || after.Report.RecoverURI != "xmustard://evidence/run-1" {
+		t.Errorf("the recovery handle did not survive settling: %+v", after.Report)
+	}
+}

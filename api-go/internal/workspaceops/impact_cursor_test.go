@@ -502,3 +502,80 @@ func TestImpactTraceAndFileFormsRefuseACursor(t *testing.T) {
 		}
 	}
 }
+
+// countArray counts elements without materialising them, so its edge cases are the
+// counts it must get right: an empty array, brackets and commas inside strings and
+// inside nested arrays (an item holds both), a missing or non-array member, and several
+// tiers in one page.
+func TestTierItemCountsAreReadWithoutDecodingTheItems(t *testing.T) {
+	for name, tc := range map[string]struct {
+		tiers string
+		want  []int
+	}{
+		"one tier": {
+			tiers: `[{"depth":1,"total":3,"offset":0,"items":[{"name":"a"},{"name":"b"}],"next_offset":2}]`,
+			want:  []int{2},
+		},
+		"empty items": {
+			tiers: `[{"depth":1,"total":0,"offset":0,"items":[]}]`,
+			want:  []int{0},
+		},
+		"absent items": {
+			tiers: `[{"depth":1,"total":3,"offset":0,"next_offset":3}]`,
+			want:  []int{0},
+		},
+		"brackets and commas inside an item's strings": {
+			tiers: `[{"items":[{"path":"a[0],b"},{"name":"x, y"},{"name":"q\"quoted\""},{"name":"esc\\\\"}],"total":4}]`,
+			want:  []int{4},
+		},
+		"nested arrays inside an item": {
+			tiers: `[{"items":[{"refs":[1,2,3],"total":3},{"refs":[]}],"total":2}]`,
+			want:  []int{2},
+		},
+		"several tiers": {
+			tiers: `[{"items":[{"n":1},{"n":2}],"total":2},{"items":[{"n":1}],"total":1}]`,
+			want:  []int{2, 1},
+		},
+		"items is not an array": {
+			tiers: `[{"items":5,"total":1}]`,
+			want:  []int{0},
+		},
+	} {
+		var page []tierReading
+		if err := json.Unmarshal([]byte(tc.tiers), &page); err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if len(page) != len(tc.want) {
+			t.Errorf("%s: %d tiers, want %d", name, len(page), len(tc.want))
+			continue
+		}
+		for i, tier := range page {
+			if tier.items != tc.want[i] {
+				t.Errorf("%s: tier %d counted %d items, want %d", name, i, tier.items, tc.want[i])
+			}
+		}
+	}
+}
+
+// A tier at a non-zero offset can have delivered everything it holds even though the
+// page carried fewer items than the tier's total. Such a tier is finished and must not
+// bind the cursor: if it did, its stale position would hold the cursor behind a tier
+// that still has items, and the next page would repeat what this one already sent.
+func TestAFinishedTierAtANonZeroOffsetDoesNotBindTheCursor(t *testing.T) {
+	// Tier one is finished: offset 3 plus two items is its whole total of 5. Tier two
+	// delivered through position 6 and still holds more.
+	res := map[string]json.RawMessage{"by_depth": json.RawMessage(`[{"depth":1,"offset":3,"total":5,"items":[{"n":4},{"n":5}]},{"depth":2,"offset":4,"total":9,"items":[{"n":5},{"n":6}],"next_offset":6}]`)}
+	next, ok := deliveredTierOffset(res)
+	if !ok {
+		t.Fatal("a tier list survived, so the offset is readable")
+	}
+	// Tier two binds at 6; the finished tier must not pull the cursor back to 5.
+	if next != 6 {
+		t.Errorf("cursor continues at %d, want 6: a finished tier bound it", next)
+	}
+	// The same result read through the core's own next_offset path.
+	if got := nextTierOffset(res["by_depth"]); got != 6 {
+		t.Errorf("nextTierOffset %d, want 6", got)
+	}
+}

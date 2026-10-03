@@ -453,6 +453,11 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 // over budget; the ladder that trims it is named in stages as usual. It never adds
 // items, and an unbudgeted result (MaxChars 0) carries no report to settle and is
 // returned unchanged.
+//
+// The stages and the recovery handle the earlier pass recorded are carried forward:
+// load drops the incoming report (it is rebuilt here), so without this a result that
+// Apply already reduced would settle to a report naming no stage and no recovery,
+// which would read as unreduced.
 func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 	if req.MaxChars <= 0 {
 		return result, nil
@@ -461,12 +466,41 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 	if !ok {
 		return result, nil
 	}
+	prev := prior(top)
 	b := &budgeter{req: req, page: page, lists: map[string]*listState{}}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
+	b.applied = append(b.applied, prev.stages...)
+	b.recovery = prev.recovery
 	b.fit()
 	return b.render(b.report), nil
+}
+
+// priorReport is what an earlier pass recorded in the result's own output_budget: the
+// rungs it ran and the recovery it kept.
+type priorReport struct {
+	stages   []string
+	recovery *Recovery
+}
+
+func prior(top []kv) priorReport {
+	var out priorReport
+	for _, m := range top {
+		if m.key != ReportMember {
+			continue
+		}
+		var rep report
+		if json.Unmarshal(m.raw, &rep) != nil {
+			return out
+		}
+		out.stages = rep.Stages
+		if rep.RecoverURI != "" || rep.RecoverHandle != "" || rep.RecoverUnavailable != "" {
+			out.recovery = &Recovery{URI: rep.RecoverURI, Handle: rep.RecoverHandle, Unavailable: rep.RecoverUnavailable}
+		}
+		return out
+	}
+	return out
 }
 
 func (s *Spec) ladderFor(top []kv) *Ladder {

@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
@@ -191,16 +192,13 @@ func tiersOf(body json.RawMessage) json.RawMessage {
 // summary_only drops every tier's items while keeping next_offset, and a cursor over a
 // ranking the caller cannot read would advance through pages that say nothing.
 func nextTierOffset(tiers json.RawMessage) int {
-	var page []struct {
-		Items      []json.RawMessage `json:"items"`
-		NextOffset *int              `json:"next_offset"`
-	}
+	var page []tierReading
 	if json.Unmarshal(tiers, &page) != nil {
 		return 0
 	}
 	next := 0
 	for _, tier := range page {
-		if len(tier.Items) == 0 {
+		if tier.items == 0 {
 			continue
 		}
 		if tier.NextOffset != nil && *tier.NextOffset > next {
@@ -208,6 +206,99 @@ func nextTierOffset(tiers json.RawMessage) int {
 		}
 	}
 	return next
+}
+
+// tierReading is the part of a tier this file reads: how many items it carried, where the
+// page started and what the core said comes next. The items themselves are counted, not
+// kept: a result may be megabytes and decoding each item into a json.RawMessage would
+// copy every one of them, which is an allocation proportional to the response on a path
+// that runs before the output budget fits anything.
+type tierReading struct {
+	Offset     int  `json:"offset"`
+	Total      int  `json:"total"`
+	NextOffset *int `json:"next_offset"`
+	items      int
+}
+
+// UnmarshalJSON counts the items array without materialising it.
+func (t *tierReading) UnmarshalJSON(b []byte) error {
+	t.items = countArray(b, "items")
+	var v struct {
+		Offset     int  `json:"offset"`
+		Total      int  `json:"total"`
+		NextOffset *int `json:"next_offset"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	t.Offset, t.Total, t.NextOffset = v.Offset, v.Total, v.NextOffset
+	return nil
+}
+
+// countArray returns how many elements the named top-level array holds, or 0 when the
+// member is absent or not an array. It walks the raw bytes tracking string and nesting
+// state and counting the commas that separate elements at the array's own depth, so
+// nothing proportional to the array's size is allocated.
+func countArray(b []byte, name string) int {
+	key := []byte(`"` + name + `"`)
+	i := bytes.Index(b, key)
+	if i < 0 {
+		return 0
+	}
+	j := i + len(key)
+	for j < len(b) && isJSONSpace(b[j]) {
+		j++
+	}
+	if j >= len(b) || b[j] != ':' {
+		return 0
+	}
+	j++
+	for j < len(b) && isJSONSpace(b[j]) {
+		j++
+	}
+	if j >= len(b) || b[j] != '[' {
+		return 0
+	}
+	j++
+	for j < len(b) && isJSONSpace(b[j]) {
+		j++
+	}
+	if j < len(b) && b[j] == ']' {
+		return 0 // an empty array has no elements
+	}
+	// depth is the array's own nesting level plus any container open inside an element.
+	// An element starts at depth 1 (the array itself counts as 1), so the commas that
+	// separate elements are the ones at depth 1 and the array's closing ] is the ] seen
+	// at depth 1. Strings are skipped wholesale so a bracket or comma inside one is not
+	// counted, and an escape holds the next byte so an escaped quote does not end it.
+	elements, depth := 1, 1
+	inStr, esc := false, false
+	for ; j < len(b); j++ {
+		c := b[j]
+		switch {
+		case esc:
+			esc = false
+		case inStr && c == '\\':
+			esc = true
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+		case c == '{' || c == '[':
+			depth++
+		case c == '}' || c == ']':
+			if c == ']' && depth == 1 {
+				return elements
+			}
+			depth--
+		case c == ',' && depth == 1:
+			elements++
+		}
+	}
+	return 0
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
 }
 
 // ImpactBudgetTrimmed reports whether the output budget cut a tier page. A cursor
@@ -284,21 +375,22 @@ func deliveredTierOffset(res map[string]json.RawMessage) (int, bool) {
 		if len(body) == 0 {
 			continue
 		}
-		var page []struct {
-			Offset int               `json:"offset"`
-			Total  int               `json:"total"`
-			Items  []json.RawMessage `json:"items"`
-		}
+		var page []tierReading
 		if json.Unmarshal(body, &page) != nil {
 			return 0, false
 		}
 		for _, tier := range page {
 			sawTiers = true
-			// A tier that delivered its total is finished and does not bind the cursor.
-			if len(tier.Items) >= tier.Total {
+			// A tier that has delivered everything it holds is finished and does not
+			// bind the cursor. "Everything" is offset+items against total, not the
+			// page's item count: a tier at offset 3 with two items of five has
+			// delivered all five, and counting only the page would let a finished
+			// tier's stale position constrain the tiers that still have items.
+			at := tier.Offset + tier.items
+			if at >= tier.Total {
 				continue
 			}
-			if at := tier.Offset + len(tier.Items); next == 0 || at < next {
+			if next == 0 || at < next {
 				next = at
 			}
 		}
