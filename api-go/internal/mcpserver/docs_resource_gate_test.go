@@ -37,22 +37,33 @@ func TestMemoryIndexResourceIsRefusedWhenRecallIsRefused(t *testing.T) {
 // with isError, never a JSON-RPC error. recall serves reads and is served here, as it is
 // by name; what this pins is that a resource cannot serve a call the named call refuses,
 // and that it refuses the way the named call does.
+//
+// The oracle is the named call itself, not a boolean written here: each case drives
+// tools/call through callKnownTool on a read-only session and compares the refusal, so the
+// two guards cannot drift apart while this test still passes. The messages must match too,
+// because the refusal a client reads is the message.
 func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
-	// the predicate, as the named call applies it
 	cases := []struct {
 		name string
 		tool *Tool
 		args map[string]string
-		want bool // a named tools/call is refused
+		raw  map[string]any // what tools/call is given; nil for none
 	}{
-		{"read only", recallTool, map[string]string{}, false},
-		{"write args set", whyFailedTool, map[string]string{"command": "go test ./..."}, true},
-		{"read args only", whyFailedTool, map[string]string{"run_id": "oc_1"}, false},
+		{"read only", recallTool, map[string]string{}, nil},
+		{"write args set", whyFailedTool, map[string]string{"command": "go test ./..."}, map[string]any{"command": "go test ./..."}},
+		{"read args only", whyFailedTool, map[string]string{"run_id": "oc_1"}, map[string]any{"run_id": "oc_1"}},
 	}
 	for _, tc := range cases {
+		named := newSession(t, &fakeAPI{}, Options{WorkspaceID: "bound", ReadOnly: true}, nil, LatestProtocolVersion)
+		namedRes, _, namedErr := named.callKnownTool(context.Background(), tc.tool, tc.raw)
+		if namedErr != nil {
+			t.Fatalf("%s: the named call answered an RPC error, want a tool result: %v", tc.name, namedErr)
+		}
+		wantRefusal := namedRes["isError"] == true
+
 		refused := resourceToolRefusal(true, tc.tool, tc.args)
-		if (refused != nil) != tc.want {
-			t.Fatalf("%s: resource gate refused=%v, want %v", tc.name, refused != nil, tc.want)
+		if (refused != nil) != wantRefusal {
+			t.Fatalf("%s: resource gate refused=%v, the named call refused=%v", tc.name, refused != nil, wantRefusal)
 		}
 		if refused != nil {
 			res, ok := refused.(map[string]any)
@@ -62,6 +73,9 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 			msg := refusalMessage(res)
 			if res["isError"] != true || !strings.Contains(msg, "mode="+ModeReadOnly) || !strings.Contains(msg, tc.tool.Name) {
 				t.Fatalf("%s: a refusal is a tool result with isError, naming the tool and %s, got %v", tc.name, ModeReadOnly, res)
+			}
+			if namedRes != nil && msg != refusalMessage(namedRes) {
+				t.Errorf("%s: the resource says %q, the named call says %q; a client must not read two different refusals for one tool", tc.name, msg, refusalMessage(namedRes))
 			}
 			// the marker is what tells a resource this refusal is a gate's, not a
 			// refused API call, so it may surface it instead of rewrapping it
