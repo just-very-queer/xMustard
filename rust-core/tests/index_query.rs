@@ -1442,6 +1442,16 @@ fn measure(storage: &str, load: Load) -> Measured {
     let (mut s, seen) = clients.join().unwrap();
     gens.extend(seen);
     let peak = sampler.join().unwrap();
+    // `peak` starts at `Mem::default()` and only moves when `sample` returns `Some`, so
+    // a sampler that observed nothing leaves both fields at 0 and `above`'s
+    // `saturating_sub` turns that into a 0.0 MiB delta that passes every bound below.
+    assert!(
+        peak.rss > 0 && peak.dirty > 0,
+        "{load:?}: the sampler observed no reading of the service (rss {}, dirty {}), so \
+         `swap peak` below would bound a figure that was never taken",
+        peak.rss,
+        peak.dirty
+    );
     for i in 0..4 {
         for v in client_rounds(&mut s, &root, load, i + 500) {
             gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
