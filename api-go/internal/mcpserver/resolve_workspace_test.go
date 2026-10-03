@@ -717,24 +717,28 @@ func TestTheOptInRefusesNothingElse(t *testing.T) {
 			t.Fatalf("registered %d times with a registered root", n)
 		}
 	})
-	t.Run("several client roots none containing the cwd still register it", func(t *testing.T) {
-		project, other := tempRepo(t), tempRepo(t)
-		api := &fakeAPI{}
-		// Several roots and none contains the working directory, so resolution falls
-		// through to the cwd signal. That signal has never refused registration when the
-		// client's roots are KNOWN, so it registers here too; this row changes only the
-		// unknown-roots case. Pinned so the opt-in cannot be read as having widened this.
-		client := &rootsClient{roots: []string{project, filepath.Join(project, "src")}}
-		s := newSession(t, api, Options{Cwd: other, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, client, "2025-06-18")
-		res, _ := call(t, s, "ground", map[string]any{})
-		if res["isError"] != false {
-			t.Fatalf("known roots that do not contain the cwd have always fallen back to it: %s", text(res))
-		}
-		ws := wsOf(t, res)
-		if ws.Source != SourceCWD || !ws.Registered || ws.Root != other {
-			t.Fatalf("resolved %+v, want the cwd registered as it always was", ws)
-		}
-	})
+	for _, optedIn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("several client roots none containing the cwd register it (opt-in %v)", optedIn), func(t *testing.T) {
+			project, other := tempRepo(t), tempRepo(t)
+			api := &fakeAPI{}
+			// Several roots and none contains the working directory, so resolution falls
+			// through to the cwd signal. That signal has never refused registration when the
+			// client's roots are KNOWN, so it registers here too; this row changes only the
+			// unknown-roots case. Both settings of the opt-in are run, so the case pins that
+			// it is the successful answer and not this row's flag that allows the
+			// registration.
+			client := &rootsClient{roots: []string{project, filepath.Join(project, "src")}}
+			s := newSession(t, api, Options{Cwd: other, AutoRegister: true, RegisterCwdWhenRootsUnknown: optedIn}, client, "2025-06-18")
+			res, _ := call(t, s, "ground", map[string]any{})
+			if res["isError"] != false {
+				t.Fatalf("known roots that do not contain the cwd have always fallen back to it: %s", text(res))
+			}
+			ws := wsOf(t, res)
+			if ws.Source != SourceCWD || !ws.Registered || ws.Root != other {
+				t.Fatalf("resolved %+v, want the cwd registered as it always was", ws)
+			}
+		})
+	}
 	t.Run("a path argument still never registers", func(t *testing.T) {
 		repo := tempRepo(t)
 		// the working directory is outside every git repository, so the path argument

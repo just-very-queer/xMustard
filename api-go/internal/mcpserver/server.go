@@ -171,7 +171,7 @@ type Options struct {
 	// RegisterCwdWhenRootsUnknown lets the cwd signal register its own git repository
 	// while the client's roots are unknown (its roots/list failed, backed off, or was
 	// never delivered), which the default refuses because the roots the client declared
-	// may name a different repository. XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN!=0 sets
+	// may name a different repository. XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1 sets
 	// it in the shims; AutoRegister above still applies.
 	RegisterCwdWhenRootsUnknown bool
 	// HomeDir is never auto-registered, even when it is a git repository.
