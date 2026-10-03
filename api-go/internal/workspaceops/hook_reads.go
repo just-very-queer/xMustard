@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/rustcore"
@@ -188,6 +189,17 @@ type HookMemory struct {
 	StalePaths []string
 }
 
+// hookMemoryRanks counts the store rankings a hook asked for — a test hook, in the shape
+// stalenessChecks uses, for asserting that a hook whose caller may not use recall reads no
+// memory store at all. Without it, a guard placed after the read and one placed before it
+// produce identical answers, so no test can tell them apart.
+var hookMemoryRanks atomic.Int64
+
+// HookMemoryRanks is how many store rankings hooks have asked for since the process
+// started. A hook test reads it to assert that a refused hook read no memory store, which
+// is otherwise indistinguishable from a hook that read one and withheld the answer.
+func HookMemoryRanks() int64 { return hookMemoryRanks.Load() }
+
 // HookMemories ranks served memory for a hook the way recall does, by the paths a tool
 // reads or edits or by a search pattern, relevance-gated, at most limit. Without a
 // query or a path it returns nothing: recall would then fall back to the working
@@ -196,6 +208,7 @@ func HookMemories(ctx context.Context, dataDir, workspaceID, caller, query strin
 	if strings.TrimSpace(query) == "" && len(cleanPaths(paths)) == 0 {
 		return nil, nil
 	}
+	hookMemoryRanks.Add(1)
 	res, err := RecallWith(ctx, dataDir, workspaceID, RecallRequest{Query: query, Paths: paths, Limit: limit, Caller: caller})
 	if err != nil {
 		return nil, err

@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"xmustard/api-go/internal/hooks"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // hookMemoryFixture is newHookFixture behind an exposure posture, so a hook answer can
@@ -142,5 +143,36 @@ func TestDisabledRecallKeepsTheNonMemoryContextOfAPreToolUse(t *testing.T) {
 	}
 	if f.searches.Load() == 0 {
 		t.Error("the index search did not run, so the answer did not come from it")
+	}
+}
+
+// The refusal has to come before the store read, not after the ranking is discarded. A guard
+// on push's output alone produces a byte-identical answer, so this row first shipped that
+// guard alone and the mutation that removed the pre-read guard SURVIVED (M6 in S5): nothing
+// could tell the two placements apart. The counter is what tells them apart — it is the same
+// shape stalenessChecks already uses, and the same reason.
+func TestDisabledRecallRanksNoMemoryForAHook(t *testing.T) {
+	f := hookMemoryFixture(t, exposurePosture{DisabledTools: map[string]bool{"recall": true}})
+	for _, step := range []struct{ session, event string }{{"a", "PreToolUse"}, {"b", "PreToolUse"}} {
+		fields := map[string]any{"session_id": step.session, "cwd": f.root, "hook_event_name": step.event,
+			"tool_name": "Read", "tool_input": map[string]any{"file_path": filepath.Join(f.root, "src", "billing.go")}}
+		if step.session != "a" {
+			fields["agent_id"], fields["agent_type"] = "a1", "Explore" // a second context, so the "already seen" path cannot answer
+		}
+		f.post(t, f.agent, step.event, hookEvent(fields))
+	}
+	if n := workspaceops.HookMemoryRanks(); n != 0 {
+		t.Errorf("a hook ranked the memory store %d times with recall disabled; the refusal must come before the read", n)
+	}
+
+	served := hookMemoryFixture(t, exposurePosture{})
+	_, body := served.post(t, served.agent, "PreToolUse", hookEvent(map[string]any{
+		"session_id": "c", "cwd": served.root, "hook_event_name": "PreToolUse", "tool_name": "Grep",
+		"tool_input": map[string]any{"pattern": "total"}}))
+	if !strings.Contains(hookContext(t, body), "billing rounding") {
+		t.Fatalf("with recall served the hook pushed no memory, so the counter cannot see the refused case either: %s", body)
+	}
+	if workspaceops.HookMemoryRanks() == 0 {
+		t.Error("with recall served the hook ranked nothing, so the counter cannot see the refused case either")
 	}
 }
