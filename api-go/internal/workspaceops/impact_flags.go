@@ -108,6 +108,12 @@ func checkoutPath(v string) error {
 // names); the flag name here is only the parameter's identity in a refusal message.
 var cursorParam = impactParam{"cursor", "cursor", func(string) error { return nil }}
 
+// MaxImpactOffset is the last page position the impact forms accept. The cursor signer
+// refuses to name one beyond it (ImpactCursor), because a cursor the next request
+// cannot follow is worse than none: the validator and the signer read this one
+// constant, so the two can never disagree (WS-59e-r5-2).
+const MaxImpactOffset = 50_000
+
 var (
 	walkParams = []impactParam{
 		{"relation_types", "relation-types", listOf(RelationTypes...)},
@@ -116,7 +122,7 @@ var (
 	}
 	pageParams = []impactParam{
 		{"limit", "limit", intIn(1, 500)},
-		{"offset", "offset", intIn(0, 50_000)},
+		{"offset", "offset", intIn(0, MaxImpactOffset)},
 		{"summary_only", "summary-only", boolean},
 		{"timeout_ms", "timeout-ms", intIn(1, 60_000)},
 	}
