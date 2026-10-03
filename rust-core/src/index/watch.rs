@@ -177,9 +177,11 @@ impl Layout {
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let name = rel.rsplit('/').next().unwrap_or_default();
-        // Git never reads an ignore file inside a directory it ignores
+        // Git never reads an ignore file inside a directory it ignores. A `.git` at any
+        // depth is a Git dir (this root's, or a nested repository's: its commits,
+        // fetches and GC are not source changes of this root).
         match () {
-            _ if rel.is_empty() || rel == ".git" || rel.starts_with(".git/") => Class::Skip,
+            _ if rel.is_empty() || rel.split('/').any(|c| c == ".git") => Class::Skip,
             _ if self.ignored(&rel) => Class::Skip,
             _ if IGNORE_FILES.contains(&name) => Class::IgnoreFile,
             _ => Class::Path(rel),
