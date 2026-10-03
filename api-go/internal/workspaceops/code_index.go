@@ -107,8 +107,8 @@ type refreshFlight struct {
 }
 
 type codeIndexRoot struct {
-	indexed string // identity key of the last successful refresh
-	failed  string // identity key whose refresh failed (not retried)
+	indexed identityStamp // identity of the last successful refresh
+	failed  identityStamp // identity whose refresh failed (not retried)
 	flight  *refreshFlight
 	used    time.Time
 }
@@ -163,6 +163,12 @@ func refreshArgs(id identityStamp, b *rustcore.RefreshBatch, forced bool) []stri
 		return args
 	}
 	return append(append(args, "--paths"), b.Paths...)
+}
+
+// settled reports whether the index was brought to id, or failed for it: both key and
+// limitation count, so the completeness the index was stamped with stays current.
+func (st *codeIndexRoot) settled(id identityStamp) bool {
+	return st.indexed == id || st.failed == id
 }
 
 func codeIndexState(root string) *codeIndexRoot {
@@ -234,7 +240,7 @@ func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 	}
 	codeIndex.Lock()
 	st := codeIndexState(root)
-	if st.indexed == id.Key || st.failed == id.Key {
+	if st.settled(stampOf(id)) {
 		codeIndex.Unlock()
 		return read
 	}
@@ -250,7 +256,7 @@ func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 		go runCodeIndexRefresh(root, f)
 	}
 	wait := codeIndexWait
-	if st.indexed == "" {
+	if st.indexed.key == "" {
 		wait = codeIndexFirstWait
 	}
 	codeIndex.Unlock()
@@ -297,9 +303,9 @@ func runCodeIndexRefresh(root string, f *refreshFlight) {
 		st.flight = nil
 		switch outcome {
 		case refreshDone:
-			st.indexed, st.failed = f.key, ""
+			st.indexed, st.failed = f.identityStamp, identityStamp{}
 		case refreshFailed:
-			st.failed = f.key
+			st.failed = f.identityStamp
 		}
 		codeIndex.Unlock()
 	}()

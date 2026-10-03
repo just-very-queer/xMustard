@@ -58,19 +58,19 @@ func TestCodeIndexRefreshRecordsOutcomePerIdentityKey(t *testing.T) {
 	if f := run(root, "k1", "", errors.New("index update failed")); f.report != nil {
 		t.Fatal("a failed update has no report")
 	}
-	if st := state(root); st.failed != "k1" || st.indexed != "" || st.flight != nil {
+	if st := state(root); st.failed.key != "k1" || st.indexed.key != "" || st.flight != nil {
 		t.Fatalf("failed key not recorded: %+v", st)
 	}
 	if f := run(root, "k2", `{"mode":"full","reason":"no_index"}`, nil); f.report == nil || f.report.Mode != "full" {
 		t.Fatalf("report not decoded: %+v", f.report)
 	}
-	if st := state(root); st.indexed != "k2" || st.failed != "" {
+	if st := state(root); st.indexed.key != "k2" || st.failed.key != "" {
 		t.Fatalf("successful key not recorded: %+v", st)
 	}
 	if f := run(root, "k3", `{}`, nil); f.report != nil {
 		t.Fatal("an undecodable report counts as a failure")
 	}
-	if st := state(root); st.indexed != "k2" || st.failed != "k3" {
+	if st := state(root); st.indexed.key != "k2" || st.failed.key != "k3" {
 		t.Fatalf("an undecodable report must not replace the indexed key: %+v", st)
 	}
 }
@@ -145,6 +145,26 @@ func TestRefreshStampsTheIdentityLimitationCount(t *testing.T) {
 	for _, c := range cases {
 		if got := refreshArgs(stampOf(c.id), nil, false); !slices.Equal(got, c.want) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// A root is settled for an identity only at the same key and limitation count, so an
+// identity whose completeness changed under the same key is stamped again.
+func TestARootIsSettledOnlyForTheSameStamp(t *testing.T) {
+	st := codeIndexRoot{indexed: identityStamp{key: "k"}, failed: identityStamp{key: "f", limitations: 1}}
+	cases := []struct {
+		id   identityStamp
+		want bool
+	}{
+		{identityStamp{key: "k"}, true},
+		{identityStamp{key: "k", limitations: 1}, false},
+		{identityStamp{key: "f", limitations: 1}, true},
+		{identityStamp{key: "f"}, false},
+	}
+	for _, c := range cases {
+		if got := st.settled(c.id); got != c.want {
+			t.Errorf("settled(%+v) = %v, want %v", c.id, got, c.want)
 		}
 	}
 }

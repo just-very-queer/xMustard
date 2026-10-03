@@ -253,7 +253,7 @@ func TestHookSearchRunsOnlyOnAResidentIndex(t *testing.T) {
 		t.Fatalf("no index: %v", err)
 	}
 	codeIndex.Lock()
-	codeIndexState(root).indexed = "key-1"
+	codeIndexState(root).indexed = identityStamp{key: "key-1"}
 	codeIndex.Unlock()
 	t.Cleanup(func() {
 		codeIndex.Lock()

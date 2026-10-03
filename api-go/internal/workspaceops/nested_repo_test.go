@@ -12,9 +12,9 @@ import (
 	"xmustard/api-go/internal/evidence"
 )
 
-// WS-RT2: a repository nested in the workspace is outside its identity, so it neither
-// makes the identity incomplete nor stops evidence from being current and results
-// from being cached.
+// WS-RT2: a repository nested in the workspace is outside its identity, so it does not
+// make the identity incomplete, and the evidence key that labels results current and
+// keys the result cache (evidence.NewKey refuses an incomplete identity) is derivable.
 func TestANestedRepositoryLeavesTheIdentityCompleteWithTheRealCore(t *testing.T) {
 	t.Setenv("XMUSTARD_CORE_BIN", rustCoreBin(t))
 	t.Setenv("XMUSTARD_CORE_WORKER", "")
