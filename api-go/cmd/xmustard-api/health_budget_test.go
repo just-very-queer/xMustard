@@ -149,10 +149,67 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	}
 	num(t, b, "transient_pool", "max")
 	num(t, b, "children", "cap")
-	if num(t, b, "request_body_cap_bytes") > num(t, b, "transient_pool", "max") {
-		t.Fatalf("request body cap must not exceed the pool: %v", b)
-	}
+	// the two body caps are asserted against the enforced limits in
+	// TestHealthBodyCapsMatchTheLimitsTheServerEnforces; this block's former
+	// "must not exceed the pool" check pinned the pool-capped capture value and is gone.
 	num(t, b, "in_flight_bodies", "cap")
+}
+
+// The health block reports two body caps and both are read from a real HTTP response:
+// request_body_cap_bytes for an ordinary (pool-reserved) body, and
+// capture_body_cap_bytes for a capture. capture_body_cap_bytes is new; before it, one
+// number stood for both and matched neither.
+//
+// Each case builds a fresh fixture after the overrides are set, so the server the
+// response comes from is the server those overrides built: the middleware and the
+// evidence store each fix their limits at construction, and health reports those values
+// rather than re-reading the environment.
+func TestHealthBodyCapsMatchTheLimitsTheServerEnforces(t *testing.T) {
+	defaultPoolCapped := budget.CapToPool(maxRequestBodyBytes)
+	cases := []struct {
+		name     string
+		bodyCap  string
+		storeCap string
+		wantOrd  int64
+		// storeBinds names which of the two limits binds the capture cap; the value
+		// itself comes from the limits the fixture was built with, never from a literal
+		storeBinds bool
+	}{
+		{name: "defaults", storeBinds: true, wantOrd: defaultPoolCapped},
+		{name: "store override", storeCap: "5000000", storeBinds: true, wantOrd: defaultPoolCapped},
+		{name: "body override below the store limit", bodyCap: "5000000", wantOrd: 5000000},
+		// the store still binds, and this case separates the capture cap from the
+		// pool-capped ordinary cap, which is what keeps the original defect reachable
+		{name: "body override above the store limit", bodyCap: "67108864", storeBinds: true, wantOrd: defaultPoolCapped},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Setenv("XMUSTARD_MAX_BODY_BYTES", c.bodyCap)
+			t.Setenv("XMUSTARD_EVIDENCE_MAX_ORIGINAL_BYTES", c.storeCap)
+			f := newEvidenceFixture(t, true) // built with these overrides in place
+			b := dig(t, getHealth(t, f.srv.URL), "budget")
+
+			streamLimit := maxRequestBodyBytesConfigured()
+			storeLimit := evidence.LimitsFromEnv().MaxOriginal
+			wantCap := streamLimit
+			if c.storeBinds {
+				wantCap = storeLimit
+			}
+
+			if got := num(t, b, "request_body_cap_bytes"); int64(got) != c.wantOrd {
+				t.Fatalf("request_body_cap_bytes: want %d, got %d", c.wantOrd, int64(got))
+			}
+			if got := num(t, b, "capture_body_cap_bytes"); int64(got) != wantCap {
+				t.Fatalf("capture_body_cap_bytes: want %d, got %d", wantCap, int64(got))
+			}
+			// the advertised cap must be one the running server enforces: the value
+			// captured when this server was built, not one recomputed from the
+			// environment now, which is what round 4 found the helpers doing
+			if captureBodyCap != wantCap {
+				t.Fatalf("cap captured at construction %d is not the advertised %d", captureBodyCap, wantCap)
+			}
+		})
+	}
 }
 
 // Correction to PAR-RT-04: no capture path waits on the heavy slot. With the slot held

@@ -87,16 +87,58 @@ type Applicability struct {
 	CheckedAt       string `json:"checked_at"`
 }
 
-// GrantReader reads collections, grants and applicability.
+// CollectionMember is one entry a collection holds (migration 5). Seq is the
+// membership's own order within the collection, so a re-add moves the entry to the end
+// rather than leaving it where it first appeared.
+type CollectionMember struct {
+	CollectionID string `json:"collection_id"`
+	EntryID      string `json:"entry_id"`
+	AddedBy      string `json:"added_by"`
+	AddedAt      string `json:"added_at"`
+	Seq          int64  `json:"seq"`
+}
+
+// CollectionMemberFilter pages through a collection's members, oldest membership first.
+// AfterSeq is the seq of the last member of the previous call, so every member stays
+// reachable while each read stays bounded.
+type CollectionMemberFilter struct {
+	CollectionID string
+	AfterSeq     int64
+	Limit        int
+}
+
+// CollectionFilter pages through the collections holding an entry. AfterID is the last
+// collection id of the previous call.
+type CollectionFilter struct {
+	AfterID string
+	Limit   int
+}
+
+// CollectionMemberResult reports whether an Add or Remove inserted or deleted the row.
+// A re-add reports Created false but is not a no-op: it moves the membership to the end
+// of the collection's order and writes an event, so Created answers "did this row
+// exist", not "did anything change".
+type CollectionMemberResult struct {
+	CollectionID string `json:"collection_id"`
+	EntryID      string `json:"entry_id"`
+	Created      bool   `json:"created,omitempty"`
+	Removed      bool   `json:"removed,omitempty"`
+}
+
+// GrantReader reads collections, grants, membership and applicability.
 type GrantReader interface {
 	GetCollection(ctx context.Context, id string) (Collection, error)
 	ListGrants(ctx context.Context, f GrantFilter) ([]Grant, error)
+	ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error)
+	ListEntryCollections(ctx context.Context, entryID string, f CollectionFilter) ([]string, error)
 	ListApplicability(ctx context.Context, entryID string) ([]Applicability, error)
 }
 
-// GrantWriter writes collections, grants and applicability.
+// GrantWriter writes collections, grants, membership and applicability.
 type GrantWriter interface {
 	CreateCollection(ctx context.Context, in CollectionInput, actor Actor) (Collection, error)
+	AddToCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error)
+	RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error)
 	Grant(ctx context.Context, in GrantInput, actor Actor) (Grant, error)
 	Revoke(ctx context.Context, grantID string, actor Actor) (Grant, error)
 	SetApplicability(ctx context.Context, entryID, targetWorkspace, state string, actor Actor) (Applicability, error)
@@ -228,6 +270,182 @@ func (t *txn) CreateCollection(ctx context.Context, in CollectionInput, actor Ac
 		return Collection{}, err
 	}
 	return t.GetCollection(ctx, id)
+}
+
+// AddToCollection puts an entry in a collection. Both names are checked first, so a
+// membership never names a collection or an entry that is not there. Re-adding an
+// entry already in the collection is not an error: it moves the membership to the end
+// and reports Created false, so a caller replaying a collection converges.
+func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
+	if err := actor.validate(); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	col, err := t.GetCollection(ctx, collectionID)
+	if err != nil {
+		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
+	}
+	entry, err := t.liveEntry(ctx, entryID)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	// A collection holds its owner's memories, and the memories of any workspace that
+	// has granted this collection to it: sharing is the point of a collection, so the
+	// cross-workspace case is the normal one and not a leak. The grant must name this
+	// collection and be addressed to this collection's owner (or to nobody in
+	// particular); a grant from the same workspace to some other target says nothing
+	// about this collection and must not satisfy the check.
+	if entry.WorkspaceID != col.OwnerWorkspace && !t.grantReachesCollection(ctx, collectionID, col.OwnerWorkspace, entry.WorkspaceID) {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, which has no grant to %s naming collection %s",
+			ErrInvalid, entryID, entry.WorkspaceID, col.OwnerWorkspace, collectionID)
+	}
+	// rowsAffected counts an upsert's update as a write too, so whether the membership
+	// was already there is read rather than inferred from the write.
+	var n int
+	if err := t.queryRow(ctx, "SELECT count(*) FROM collection_members WHERE collection_id = ? AND entry_id = ?",
+		collectionID, entryID).Scan(&n); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	created := n == 0
+	principal := strings.TrimSpace(actor.Principal)
+	// The membership's order is the history's seq, which the append below allocates and
+	// which never repeats even when the member holding the highest seq is removed: a
+	// per-collection max(seq) over the live rows would reuse the number and a caller
+	// paging with AfterSeq would never reach the entry added next.
+	seq, err := t.insertEvent(ctx, actor, eventRow{
+		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember, Revision: entry.Revision,
+		Data: map[string]any{"collection_id": collectionID, "op": "add", "created": created},
+	})
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	if _, err := t.exec(ctx, `INSERT INTO collection_members (collection_id, entry_id, added_by, added_at, seq)
+		VALUES (?, ?, ?, ?, ?) ON CONFLICT (collection_id, entry_id) DO UPDATE SET
+		added_by = excluded.added_by, added_at = excluded.added_at, seq = excluded.seq`,
+		collectionID, entryID, principal, t.nowText(), seq); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID, Created: created}, nil
+}
+
+// RemoveFromCollection takes an entry out of a collection. Removing an entry that is
+// not in it is not an error and reports Removed false.
+//
+// A purged entry's membership cannot be removed, and the store refuses it one layer
+// down as well: the removal event carries data, and events_purged_no_text
+// (schema.sql:264) aborts any insert naming a purged entry that carries a note or data.
+// The guard here exists because the trigger does not: it leaves the caller a clear
+// ErrInvalid instead of a SQL constraint message, and it makes the refusal independent
+// of whether the caller passed a note. Without it the membership row of a purged entry
+// would have no successful removal path at all.
+func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
+	if err := actor.validate(); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	col, err := t.GetCollection(ctx, collectionID)
+	if err != nil {
+		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
+	}
+	entry, err := t.GetEntry(ctx, entryID)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	if entry.Lifecycle == LifecyclePurged {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is purged; its membership is not written to", ErrInvalid, entryID)
+	}
+	res, err := t.exec(ctx, "DELETE FROM collection_members WHERE collection_id = ? AND entry_id = ?",
+		collectionID, entryID)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	removed := rowsAffected(res) > 0
+	if !removed {
+		return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID}, nil
+	}
+	if err := t.appendEvent(ctx, actor, eventRow{
+		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember,
+		Data: map[string]any{"collection_id": collectionID, "op": "remove", "created": false},
+	}); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID, Removed: true}, nil
+}
+
+// grantReachesCollection reports whether sourceWorkspace has an active grant that names
+// collectionID and is addressed to the collection's owner workspace, or to nobody in
+// particular. Both the write and the read use it, so a membership cannot be created
+// through a grant that is revoked or aimed elsewhere and then still be readable.
+func (r *reader) grantReachesCollection(ctx context.Context, collectionID, ownerWorkspace, sourceWorkspace string) bool {
+	var n int
+	if err := r.queryRow(ctx, `SELECT count(*) FROM grants
+		WHERE collection_id = ? AND source_workspace = ? AND revoked_at IS NULL
+		AND (target_workspace = '' OR target_workspace = ?)`,
+		collectionID, sourceWorkspace, ownerWorkspace).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
+// ListCollectionMembers returns a collection's members, oldest membership first. The
+// collection must exist, so a name that is not one is ErrNotFound rather than an empty
+// list. A member is listed only while it is reachable: a purged entry is not a member
+// (purge leaves a tombstone and the writer refuses it), and a member from another
+// workspace is listed only while an active grant to this collection's owner still
+// names it, so revoking a grant hides the membership as well as closing future writes.
+// AfterSeq pages: the seq of the last member of the previous call.
+func (r *reader) ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error) {
+	col, err := r.GetCollection(ctx, f.CollectionID)
+	if err != nil {
+		return nil, fmt.Errorf("collection %s: %w", f.CollectionID, err)
+	}
+	rows, err := r.query(ctx, `SELECT m.collection_id, m.entry_id, m.added_by, m.added_at, m.seq
+		FROM collection_members m JOIN entries e ON e.id = m.entry_id
+		WHERE m.collection_id = ? AND e.lifecycle <> ? AND m.seq > ?
+		AND (e.workspace_id = ? OR EXISTS (SELECT 1 FROM grants g
+			WHERE g.collection_id = m.collection_id AND g.source_workspace = e.workspace_id
+			AND g.revoked_at IS NULL AND (g.target_workspace = '' OR g.target_workspace = ?)))
+		ORDER BY m.seq LIMIT ?`,
+		f.CollectionID, LifecyclePurged, f.AfterSeq, col.OwnerWorkspace, col.OwnerWorkspace, clampLimit(f.Limit))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CollectionMember
+	for rows.Next() {
+		var m CollectionMember
+		if err := rows.Scan(&m.CollectionID, &m.EntryID, &m.AddedBy, &m.AddedAt, &m.Seq); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ListEntryCollections returns the ids of the collections holding a live entry, paging
+// with AfterID from the last collection of the previous call. A purged entry holds
+// nothing, and a collection whose grant has been revoked no longer holds it: see
+// ListCollectionMembers for both conditions, which this read repeats rather than
+// re-derives.
+func (r *reader) ListEntryCollections(ctx context.Context, entryID string, f CollectionFilter) ([]string, error) {
+	rows, err := r.query(ctx, `SELECT m.collection_id FROM collection_members m
+		JOIN entries e ON e.id = m.entry_id JOIN collections c ON c.id = m.collection_id
+		WHERE m.entry_id = ? AND e.lifecycle <> ? AND m.collection_id > ?
+		AND (e.workspace_id = c.owner_workspace OR EXISTS (SELECT 1 FROM grants g
+			WHERE g.collection_id = m.collection_id AND g.source_workspace = e.workspace_id
+			AND g.revoked_at IS NULL AND (g.target_workspace = '' OR g.target_workspace = c.owner_workspace)))
+		ORDER BY m.collection_id LIMIT ?`, entryID, LifecyclePurged, f.AfterID, clampLimit(f.Limit))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // Grant creates an active grant, or returns the identical active one.

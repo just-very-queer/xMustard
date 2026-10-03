@@ -1,16 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"strings"
 	"testing"
 )
 
 // budgetServer serves the real handler stack over workerWorkspace's repository with
-// the real core (one-shot calls, no resident worker).
+// the real core (one-shot calls, no resident worker). Every caller runs the production
+// governor.
 func budgetServer(t *testing.T) (base string) {
 	t.Helper()
 	core := realCoreBinary(t)
@@ -21,6 +25,105 @@ func budgetServer(t *testing.T) (base string) {
 	t.Cleanup(srv.Close)
 	t.Cleanup(func() { waitRegistrationBaselines(t) })
 	return srv.URL + "/api/workspaces/" + ws
+}
+
+// isolatedRun is set by the child process of isolatedTest, which runs exactly one test
+// under the production governor and re-executes this same binary for it.
+const isolatedRun = "XMUSTARD_TEST_ISOLATED_RUN"
+
+// isolatedTest runs body in a fresh process of this same test binary, which is the
+// isolation §3.3 allows: the index update these reads depend on is heavy work, and
+// admitMemory refuses it once the measured tree plus its 26214400 declared bytes reach
+// SoftCeilingBytes. A long parent binary grows past that line before its last tests run,
+// so the refusal is a property of when the test is reached rather than of the test. A
+// fresh binary has a fresh, small tree, so the production governor admits the update and
+// the assertions run against it unchanged — no ceiling, wait or bound is touched.
+//
+// The parent's command is built from the flags it received, so `-run`, `-v`,
+// `XMUSTARD_CORE_BIN` and every other flag that shapes the run carry over. Three do not:
+// -test.count, -test.run and -test.cpu, which isolatedArgs sets itself. Each would put
+// repeats back inside one child process, growing it back over the line this helper exists
+// to keep it under.
+//
+// Each side runs every test exactly once, and a child that skipped or failed is not a
+// pass: the child's own verdict decides, so a build without the core binary reports the
+// test as skipped instead of quietly passing.
+func isolatedTest(t *testing.T, body func(t *testing.T)) {
+	t.Helper()
+	if os.Getenv(isolatedRun) != "" {
+		body(t)
+		return
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("the test binary path: %v", err)
+	}
+	args := isolatedArgs(t.Name())
+	cmd := exec.Command(exe, args...)
+	cmd.Env = append(os.Environ(), isolatedRun+"=1")
+	out, err := cmd.CombinedOutput()
+	t.Logf("isolated %s in a fresh process (pid %d):\n%s", t.Name(), cmd.Process.Pid, out)
+	switch {
+	case err != nil:
+		t.Fatalf("isolated %s: %v", t.Name(), err)
+	case bytes.Contains(out, []byte("--- SKIP: "+t.Name())):
+		t.Skipf("isolated %s skipped: %s", t.Name(), isolatedSummary(out))
+	}
+}
+
+// isolatedArgs is the child's argument list: the parent's flags, minus the three that
+// decide how many times, or in how many configurations, one process runs a test, plus
+// -test.v so the child's own --- SKIP line is always in the output the parent reads.
+//
+// -test.count and -test.cpu would put the repeats back inside a single child, growing it
+// over the line this helper isolates against. -test.v is not dropped but forced: Go prints
+// --- SKIP only under it, so without it a child that skipped exits zero and the parent
+// reports a pass over assertions it never ran.
+//
+// The dropped flags go in both spellings. `-test.run TestX -test.count 2` leaves each
+// value as a positional argument, which stops the flag parser before the appended
+// -test.run and lets the child run the whole package, so a dropped flag without "=" also
+// drops the argument after it — but only when that argument is not itself a flag, since
+// `-test.count -test.v` gives -test.count no value.
+func isolatedArgs(name string) []string {
+	args := make([]string, 0, len(os.Args)+4)
+	dropValue := false
+	for _, a := range os.Args[1:] {
+		if dropValue && !strings.HasPrefix(a, "-") {
+			dropValue = false
+			continue
+		}
+		dropValue = false
+		if flag, value, split := strings.Cut(a, "="); isolatedArgsDrop(flag) {
+			dropValue = !split || value != ""
+			continue
+		}
+		if isolatedArgsDrop(a) {
+			dropValue = true
+			continue
+		}
+		args = append(args, a)
+	}
+	return append(args, "-test.count=1", "-test.cpu=1", "-test.v=true", "-test.run=^"+name+"$")
+}
+
+// isolatedArgsDrop reports whether a flag changes how many times, or in how many
+// configurations, one process runs a test. Each would put the repeats back inside a single
+// child, which is the growth this helper isolates against.
+func isolatedArgsDrop(flag string) bool {
+	switch flag {
+	case "-test.count", "-test.run", "-test.cpu":
+		return true
+	}
+	return false
+}
+
+// isolatedSummary is the child's own summary, which names what it skipped for.
+func isolatedSummary(out []byte) string {
+	if i := bytes.LastIndexByte(out, '\n'); i >= 0 {
+		return strings.TrimSpace(string(out[i+1:]))
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func budgetGet(t *testing.T, u string, hdr map[string]string) (int, map[string]any) {
@@ -77,6 +180,13 @@ func TestToolBudgetIsOptInOverHTTP(t *testing.T) {
 // explain answers a directory with its outline and pages its files; a cursor from
 // another list is refused.
 func TestExplainPagesADirectory(t *testing.T) {
+	isolatedTest(t, testExplainPagesADirectory)
+}
+
+// testExplainPagesADirectory is TestExplainPagesADirectory's body. It runs in the fresh
+// process isolatedTest starts, because building the code index it reads is heavy work the
+// governor admits only while this binary's own tree is still under the line (WS-FLK-06).
+func testExplainPagesADirectory(t *testing.T) {
 	base := budgetServer(t)
 	code, out := budgetGet(t, base+"/explain-path?path=src", nil)
 	if code != http.StatusOK || out["kind"] != "directory" || out["files_total"] != float64(2) {
@@ -121,6 +231,13 @@ func TestExplainPagesADirectory(t *testing.T) {
 
 // explain symbol= answers a symbol's context; search mode=symbol looks a name path up.
 func TestSymbolNavigationRoutes(t *testing.T) {
+	isolatedTest(t, testSymbolNavigationRoutes)
+}
+
+// testSymbolNavigationRoutes is TestSymbolNavigationRoutes's body, isolated for the same
+// reason as testExplainPagesADirectory's: the symbol context it reads needs the same index
+// update, which is heavy work under the same ceiling (WS-FLK-06).
+func testSymbolNavigationRoutes(t *testing.T) {
 	base := budgetServer(t)
 	code, out := budgetGet(t, base+"/explain-path?symbol=ComputeTotal", nil)
 	if code != http.StatusOK || out["found"] != true {

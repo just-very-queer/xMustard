@@ -3,7 +3,9 @@ package mcpserver
 import (
 	"encoding/json"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -249,10 +251,15 @@ func (e *ArgError) data() map[string]any {
 // wrong types, non-scalar values, out-of-enum values, strings over their length cap
 // and integers outside their bounds (never clamping), and folds hidden aliases onto
 // their canonical names. The returned map records each alias that was used.
+//
+// raw is visited in sorted key order, so which argument a rejection names, and
+// which spelling of an aliased argument wins a duplicate, are a function of the
+// arguments alone and not of Go's randomized map iteration order.
 func BuildArgs(t *Tool, raw map[string]any) (args map[string]string, aliased map[string]string, aerr *ArgError) {
 	args = map[string]string{}
 	from := map[string]string{} // canonical name -> the key that supplied it
-	for k, v := range raw {
+	for _, k := range slices.Sorted(maps.Keys(raw)) {
+		v := raw[k]
 		name := k
 		spec, ok := t.arg(k)
 		if !ok {

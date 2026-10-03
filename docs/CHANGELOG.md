@@ -103,6 +103,11 @@ review are listed in [Status](STATUS.md#in-progress).
 - `api-go/internal/anchor` (Apache-2.0) is now linked into every build for memory
   anchors, beside the new Apache-2.0 Graphiti port `api-go/internal/dedupe/minhash.go`
   ([NOTICE](../NOTICE)).
+- An index directory (`--index-dir`, `XMUSTARD_INDEX_DIR`) that another local user can
+  write is refused instead of warned about, and the error names `chmod 700 <dir>`. Any
+  such user could replace `index.db` even though the files in it are owner-only. Read
+  and execute bits are still left as the operator chose them; only the group- and
+  other-write bits (WS-FIX-11).
 
 ## [0.1.1] - 2026-09-28
 

@@ -242,6 +242,9 @@ func TestCaptureRouteRedactsSecrets(t *testing.T) {
 // 100,000 content blocks through the real route: a 200 with a projection within the
 // client target, transient memory admitted by the fixed window, and a small reply.
 func TestCaptureRouteManyContentBlocks(t *testing.T) {
+	if raceEnabled {
+		t.Skip("allocation bound is not meaningful under -race")
+	}
 	withCaptureRedactor(t, nil)
 	prev := budget.TransientBytes
 	pool := budget.NewByteBudget(16 << 20)

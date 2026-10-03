@@ -38,6 +38,7 @@
 //! `refresh_queue`, whose debounced batches the orchestrator turns into `index update
 //! --paths ...` runs (WS-15, PAR-FRESH-03).
 
+pub mod areas;
 pub mod chunks;
 pub mod config;
 pub mod context;
@@ -215,15 +216,89 @@ pub fn index_dir(root: &Path, git_dir: Option<&Path>, cfg: &IndexConfig) -> Path
     }
 }
 
+/// Classify an existing index directory: is it a plain directory ours to use, and does
+/// it carry a group- or other-write bit?
+///
+/// An existing directory the operator named (`operator_named`: `--index-dir`,
+/// `XMUSTARD_INDEX_DIR`) keeps its read and execute bits, because those leak only the
+/// directory listing and the operator chose them; a group- or other-**write** bit is a
+/// hole, since any other local user could replace `index.db` and poison what the index
+/// answers, and the owner-only mode of the files inside it does not stop that. The
+/// default per-scope directory is ours and is tightened instead.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DirTrust {
+    /// Ours to tighten to `0o700`: created by us, or the default per-scope directory.
+    Managed,
+    /// The operator's own directory, safe to use as it stands.
+    OperatorKept,
+}
+
+#[cfg(unix)]
+fn classify_dir(dir: &Path, meta: &fs::Metadata, operator_named: bool) -> Result<DirTrust, String> {
+    use std::os::unix::fs::MetadataExt;
+    if meta.uid() != rustix::process::geteuid().as_raw() {
+        return Err(format!(
+            "{}: index directory belongs to another user",
+            dir.display()
+        ));
+    }
+    let mode = meta.mode() & 0o777;
+    // 0o022, not 0o077: only the write bits are a hole.
+    if !operator_named {
+        return Ok(DirTrust::Managed);
+    }
+    if mode & 0o022 != 0 {
+        return Err(format!(
+            "{}: index directory is writable by other users (mode 0o{mode:03o}); another \
+             local user could replace {DB_FILE}. Run `chmod 700 {}`",
+            dir.display(),
+            dir.display()
+        ));
+    }
+    Ok(DirTrust::OperatorKept)
+}
+
+#[cfg(not(unix))]
+fn classify_dir(
+    dir: &Path,
+    _meta: &fs::Metadata,
+    operator_named: bool,
+) -> Result<DirTrust, String> {
+    Ok(if operator_named {
+        DirTrust::OperatorKept
+    } else {
+        DirTrust::Managed
+    })
+}
+
+/// Refuse an index directory a reader must not trust, without creating or tightening
+/// anything: a reader that found the directory unacceptable has to say so rather than
+/// fall back to an unindexed answer, because the alternative is answering from a store
+/// another local user planted. Ok when `dir` does not exist, since there is then nothing
+/// to read.
+pub(super) fn check_index_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
+    let err = |e: std::io::Error| format!("{}: {e}", dir.display());
+    let meta = match fs::symlink_metadata(dir) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(err(e)),
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return Err(format!(
+            "{}: index directory is not a plain directory",
+            dir.display()
+        ));
+    }
+    let _ = classify_dir(dir, &meta, operator_named)?;
+    Ok(())
+}
+
 /// Create `dir` (and missing parents) readable by its owner only, and refuse a
-/// directory that is a symlink or belongs to another user: the index holds identifiers
-/// and postings of the source, and with `full` retention the source itself. An existing
-/// directory the operator named (`operator_named`: `--index-dir`, `XMUSTARD_INDEX_DIR`)
-/// keeps its mode, with a warning when others can list it (the index files themselves
-/// are always owner-only); the default per-scope directory is ours and is tightened.
+/// directory that is a symlink, belongs to another user, or that another local user can
+/// write: the index holds identifiers and postings of the source, and with `full`
+/// retention the source itself.
 fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
     let err = |e: std::io::Error| format!("{}: {e}", dir.display());
-    let existed = fs::symlink_metadata(dir).is_ok();
     let mut b = fs::DirBuilder::new();
     b.recursive(true);
     #[cfg(unix)]
@@ -239,27 +314,14 @@ fn ensure_private_dir(dir: &Path, operator_named: bool) -> Result<(), String> {
             dir.display()
         ));
     }
+    let trust = classify_dir(dir, &meta, operator_named)?;
+    // Tighten every directory we manage, created or not: the default per-scope directory
+    // is ours at any mode, and narrowing this to freshly created ones left an existing
+    // permissive one exactly as wide as it was (WS-FIX-11).
     #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if meta.uid() != rustix::process::geteuid().as_raw() {
-            return Err(format!(
-                "{}: index directory belongs to another user",
-                dir.display()
-            ));
-        }
-        if meta.mode() & 0o077 != 0 {
-            if existed && operator_named {
-                eprintln!(
-                    "index: warning: {} is accessible to other users (mode {:o}); the \
-                     index files in it are owner-only",
-                    dir.display(),
-                    meta.mode() & 0o777
-                );
-            } else {
-                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
-            }
-        }
+    if trust == DirTrust::Managed {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(err)?;
     }
     Ok(())
 }
@@ -1507,6 +1569,9 @@ fn open_read_only(
     if !path.exists() {
         return Ok((root, path, None));
     }
+    // A reader that found the directory unacceptable must refuse rather than answer
+    // from a store another local user could have replaced (WS-FIX-11).
+    check_index_dir(path.parent().unwrap_or(&root), cfg.index_dir.is_some())?;
     let conn =
         Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(sql_err)?;
     schema::configure(&conn).map_err(sql_err)?;
@@ -1545,6 +1610,41 @@ pub fn impact(
     v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
         .map_err(|e| e.to_string())?;
     v["command"] = "impact".into();
+    v["root"] = root.to_string_lossy().into();
+    Ok(v)
+}
+
+/// `index areas`: the functional areas of one stored generation (WS-38b, PAR-SYM-08) —
+/// seeded deterministic communities at symbol granularity over the resolved
+/// CALLS/EXTENDS/IMPLEMENTS projection. Read-only, like `impact`.
+pub fn areas(root: &Path, cfg: &IndexConfig, seed: u64) -> Result<serde_json::Value, String> {
+    let (root, path, conn) = open_read_only(root, cfg)?;
+    if conn.is_none() {
+        return Err(format!(
+            "no index at {} (run `index build` first)",
+            path.display()
+        ));
+    }
+    drop(conn);
+    let opened = reader::open_at(&root, &path, csr::GraphStorage::from_env())?;
+    let result = areas::areas_for(&opened.snapshot, seed)?;
+    // Every contributing path, not just the listed members: an area caps its member list at
+    // MAX_MEMBERS, so freshness computed from the listed rows alone would miss a change in
+    // a file that only omitted members live in, and `dirty_paths_touching_result` would
+    // understate the staleness of the answer.
+    let paths: Vec<String> = result
+        .areas
+        .iter()
+        .flat_map(|a| {
+            a.total_paths
+                .iter()
+                .cloned()
+                .chain(a.members.iter().map(|m| m.path.clone()))
+        })
+        .collect();
+    let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
+    v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
+        .map_err(|e| e.to_string())?;
     v["root"] = root.to_string_lossy().into();
     Ok(v)
 }
@@ -1602,13 +1702,13 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-const USAGE: &str = "xmustard-core index <build|update|stats|impact> <root> \
+const USAGE: &str = "xmustard-core index <build|update|stats|impact|areas> <root> \
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
     [--identity-key KEY] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
     [--relation-types=A,B] [--min-confidence=C] [--include-tests=B] [--limit=N] [--offset=N] \
-    [--summary-only=B] [--timeout-ms=N]";
+    [--summary-only=B] [--timeout-ms=N] [--seed=N]";
 
 /// Record the repository identity key a build or update was run for (`meta::IDENTITY_KEY`),
 /// under the writer lock; written only when it changed.
@@ -1645,6 +1745,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut identity: Option<String> = None;
     let mut symbol: Option<String> = None;
     let mut impact_flags: Vec<String> = Vec::new();
+    let mut seed: u64 = areas::DEFAULT_SEED;
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1677,6 +1778,14 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                     .ok_or_else(|| CmdError::new(2, "index: --depth needs a number"))?;
                 impact_flags.push(format!("--max-depth={d}"));
                 2
+            }
+            // areas' seed: the one arbitrary choice in the propagation, so a caller can
+            // vary it; parsed here so a non-numeric value is refused before any work.
+            a if sub.as_str() == "areas" && a.starts_with("--seed=") => {
+                seed = a["--seed=".len()..]
+                    .parse()
+                    .map_err(|_| CmdError::new(2, "index areas: --seed needs a number"))?;
+                1
             }
             // impact v2's `--name=value` flags (validated by impact::Query)
             _ if sub.as_str() == "impact" && a.starts_with("--") && a.contains('=') => {
@@ -1716,6 +1825,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                 .map_err(|e| CmdError::new(2, format!("index impact: {e}")))?;
             impact(&root, &cfg, &q)
         }
+        "areas" => areas(&root, &cfg, seed),
         _ => return Err(CmdError::usage(USAGE)),
     };
     out.map(|v| Output::Json(v.to_string()))

@@ -49,8 +49,22 @@ const (
 
 // InvalidationReport is what one invalidation looked at and marked.
 type InvalidationReport struct {
-	Paths   int      `json:"paths"`
-	Checked int      `json:"anchors_checked"`
+	Paths   int `json:"paths"`
+	Checked int `json:"anchors_checked"`
+	// Hashed counts the files whose symbol bodies were hashed this pass. A pass over an
+	// unchanged tree answers 0 here because the per-file hashes are cached across calls
+	// (WS-28C); a file whose stat moved, or one past the cache's bound, is a miss and is
+	// counted and hashed again.
+	Hashed int `json:"files_hashed"`
+	// Reanchored counts the quoted-code anchors that followed their code to new lines
+	// (WS-28B). They are not drift and not marked: the memory still points at what it
+	// quoted, one range over.
+	Reanchored int `json:"anchors_reanchored,omitempty"`
+	// Unknown counts the quoted-code anchors that could not be checked at all: no served
+	// content to search for, a block past the placement bound, or an anchor whose digest
+	// names no block. They are neither moved nor marked, and a caller reading an empty
+	// answer needs to know they were passed over.
+	Unknown int      `json:"anchors_unknown,omitempty"`
 	Marked  []string `json:"marked"`
 	// Truncated: more than maxInvalidationAnchors anchors lay in the paths; the rest were not checked.
 	Truncated bool `json:"truncated,omitempty"`
@@ -73,16 +87,34 @@ var anchorRehashers = map[string]struct {
 	govstore.AnchorSymbol: {baselineSymbolBody, (*rehashSession).symbol, false},
 }
 
-// rehashSession caches the files and outlines one invalidation reads.
+// rehashSession caches the files and outlines one invalidation reads. held is what those
+// files cost together: an invalidation may touch up to maxInvalidationPaths paths, each of
+// at most maxSymbolFileBytes, and a cache without an aggregate bound could retain all of
+// them for the pass. Past maxInvalidationCacheBytes the session stops caching and reads
+// each file once per anchor that needs it, which is slower and bounded.
+//
+// hashed counts the files whose symbol bodies this session had to compute, which is the
+// number a pass over a cached tree reports as zero. hashedFiles is the set behind it, so a
+// file with several anchored declarations counts once.
 type rehashSession struct {
 	ctx               context.Context
 	root, workspaceID string
+	dataDir           string
 	files             map[string]fileRead
+	held              int
 	outlines          map[string]outlineRead
+	hashed            int
+	hashedFiles       map[string]bool
 }
 
+// maxInvalidationCacheBytes bounds what one invalidation's file cache retains. It is below
+// the process-tree line by a wide margin and above the working set of a normal pass, whose
+// files are far smaller than maxSymbolFileBytes.
+const maxInvalidationCacheBytes = 16 << 20
+
 func newRehashSession(ctx context.Context, root, workspaceID string) *rehashSession {
-	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID, files: map[string]fileRead{}, outlines: map[string]outlineRead{}}
+	return &rehashSession{ctx: ctx, root: root, workspaceID: workspaceID,
+		files: map[string]fileRead{}, outlines: map[string]outlineRead{}}
 }
 
 // path hashes a file's content; a file that is missing or unreadable is missing.
@@ -94,26 +126,37 @@ func (s *rehashSession) path(a govstore.Anchor) (anchorState, bool) {
 }
 
 // fileRead is one read of a file: its text, or why there is none. A file that is absent
-// is missing; one too large or unreadable is unknown, not missing.
+// is missing; one too large or unreadable is unknown, not missing. mark is the identity
+// the text was read under, taken from the same descriptor, so a caller storing a hash of
+// this text is storing it under the version it came from.
 type fileRead struct {
 	text    string
 	ok      bool
 	missing bool
+	mark    fileMark
 }
 
-// text reads a file once.
+// text reads a file once. Past maxInvalidationCacheBytes the file is read and handed back
+// without being retained, so one pass cannot hold every file a large change touches; the
+// cost is one read per anchor that needs the same file.
 func (s *rehashSession) text(rel string) fileRead {
 	if r, ok := s.files[rel]; ok {
 		return r
 	}
 	r := fileRead{}
-	if r.text, r.ok = readWorkspaceText(s.root, rel, maxSymbolFileBytes); !r.ok {
+	mark, text, ok := readOutlineFile(s.root, rel, maxSymbolFileBytes)
+	r.mark, r.text, r.ok = mark, text, ok
+	if !r.ok {
 		f, err := openWorkspaceFileBeneath(s.root, rel)
 		if err == nil {
 			f.Close()
 		}
 		r.missing = errors.Is(err, fs.ErrNotExist)
 	}
+	if s.held+len(r.text) > maxInvalidationCacheBytes {
+		return r
+	}
+	s.held += len(r.text)
 	s.files[rel] = r
 	return r
 }
@@ -122,30 +165,93 @@ func (s *rehashSession) text(rel string) fileRead {
 // gives. A symbol that no longer exists in a complete outline, or a file that is gone,
 // is missing; an outline the code index could not give or gave in part, or a file too
 // large or unreadable, is unknown.
+//
+// The body hash is cached per file across calls (WS-28C), keyed by the file's mark, so a
+// pass over an unchanged tree re-hashes nothing. The cache stores hashes of exactly the
+// declarations that were asked for; a symbol not yet in it is hashed from the text this
+// pass read and added, never served from an older version of the file.
 func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	file, _, ok := strings.Cut(a.SymbolUID, "#")
 	if !ok || file == "" {
 		return anchorState{}, false
 	}
+	want := normalizeNamePath(a.Value)
+	// The cache is consulted before the file is read, so a warm pass costs a stat rather
+	// than the file's bytes (WS-28C).
+	mark, hasMark := markOutlineFile(s.root, file)
+	readAt := time.Now()
+	if hasMark {
+		if hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark, readAt); hit {
+			if h, named := hashes[want]; named {
+				// The mark is re-read before the hit is served, and a file that cannot be
+				// marked now is a miss, not a hit: a file removed between the two reads
+				// must read as missing, not as the hash it used to have.
+				if after, still := markOutlineFile(s.root, file); still && after == mark {
+					return anchorState{govstore.BaselineHash, h}, true
+				}
+			}
+		}
+	}
 	src := s.text(file)
 	if !src.ok {
 		return missingState, src.missing
 	}
-	outline, ok := s.outlines[file]
+	spans, incomplete, ok := s.fileOutline(file)
 	if !ok {
-		spans, err := symbolOutline(s.ctx, s.root, s.workspaceID, file)
-		outline = outlineRead{spans: spans, incomplete: errors.Is(err, errOutlineIncomplete)}
-		if err != nil && !outline.incomplete {
-			return anchorState{}, false
-		}
-		s.outlines[file] = outline
+		return anchorState{}, false
 	}
-	body, found := outline.spans.body(src.text, a.Value)
+	body, found := spans.body(src.text, a.Value)
 	if !found {
-		return missingState, !outline.incomplete
+		return missingState, !incomplete
 	}
 	sum := sha256.Sum256([]byte(body))
-	return anchorState{govstore.BaselineHash, hex.EncodeToString(sum[:])}, true
+	h := hex.EncodeToString(sum[:])
+	// The file was hashed, whatever happens to the cache below: files_hashed counts files
+	// whose body a pass computed, not files whose hash it kept.
+	s.countHashedFile(file)
+	// An incomplete outline is not cached: the index may name declarations it did not
+	// return, so an entry built from a partial outline could answer "missing" wrongly.
+	// src.mark is the identity of the very text that was hashed (one open), so the hash
+	// is stored under the mark the text came from; a file that has since moved has a
+	// different mark now and is not stored.
+	if !incomplete && src.mark.exists {
+		if after, still := markOutlineFile(s.root, file); still && after == src.mark {
+			s.storeBody(file, src.mark, readAt, want, h)
+		}
+	}
+	return anchorState{govstore.BaselineHash, h}, true
+}
+
+// countHashedFile counts a file once per pass, whatever the cache did with its hash.
+func (s *rehashSession) countHashedFile(file string) {
+	if s.hashedFiles == nil {
+		s.hashedFiles = map[string]bool{}
+	}
+	if !s.hashedFiles[file] {
+		s.hashedFiles[file] = true
+		s.hashed++
+	}
+}
+
+// storeBody adds one declaration's hash to the file's cache entry. The add is one
+// operation under the cache lock (see storeOutlineHash), so two passes extending one entry
+// cannot drop each other's hash.
+func (s *rehashSession) storeBody(file string, mark fileMark, readAt time.Time, want, hash string) {
+	storeOutlineHash(s.workspaceID, s.root, file, mark, readAt, want, hash)
+}
+
+// fileOutline reads a file's declarations from the code index once per session.
+func (s *rehashSession) fileOutline(file string) (symbolSpans, bool, bool) {
+	if outline, ok := s.outlines[file]; ok {
+		return outline.spans, outline.incomplete, true
+	}
+	spans, err := symbolOutline(s.ctx, s.root, s.workspaceID, file)
+	incomplete := errors.Is(err, errOutlineIncomplete)
+	if err != nil && !incomplete {
+		return nil, false, false
+	}
+	s.outlines[file] = outlineRead{spans: spans, incomplete: incomplete}
+	return spans, incomplete, true
 }
 
 // outlineRead is a file's outline as read; incomplete when the code index cut it short.
@@ -266,6 +372,7 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 		anchors = anchors[:maxInvalidationAnchors]
 	}
 	session := newRehashSession(ctx, root, workspaceID)
+	session.dataDir = dataDir
 	hit := map[string][]govstore.AnchorRef{}
 	for _, a := range anchors {
 		rehash, ok := anchorRehashers[a.Kind]
@@ -277,8 +384,21 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 			hit[a.EntryID] = append(hit[a.EntryID], govstore.AnchorRef{Kind: a.Kind, Value: a.Value})
 		}
 	}
+	rep.Hashed = session.hashed
+	// A quoted-code anchor has no baseline: its lines shift with every edit above them,
+	// so it is re-found and either followed or marked (WS-28B). The pass reports the
+	// entries it marked from the store's own commit, so a rolled-back write is returned
+	// as an error rather than as a marked memory, and its ids are merged with the ones
+	// the baseline pass finds: an entry whose declared path and whose quote both reached
+	// the same change is at risk once, not twice.
+	reanchored, codeMarked, unknown, codeErr := reanchorCode(ctx, session, anchors)
+	rep.Reanchored = reanchored
+	rep.Unknown = unknown
+	for id := range codeMarked {
+		hit[id] = nil
+	}
 	if len(hit) == 0 {
-		return rep, nil
+		return rep, codeErr
 	}
 	actor := invalidationActor(root)
 	err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
@@ -293,7 +413,13 @@ func InvalidateMemory(ctx context.Context, dataDir, workspaceID string, changed 
 		}
 		return nil
 	})
-	return rep, err
+	for _, id := range slices.Sorted(maps.Keys(codeMarked)) {
+		if !slices.Contains(rep.Marked, id) {
+			rep.Marked = append(rep.Marked, id)
+		}
+	}
+	slices.Sort(rep.Marked)
+	return rep, errors.Join(codeErr, err)
 }
 
 // changedAnchorPaths cleans a change list into the paths the anchor index is asked
@@ -547,6 +673,12 @@ func invalidateForGround(ctx context.Context, dataDir, workspaceID string, chang
 	rep, err := InvalidateMemory(ctx, dataDir, workspaceID, changed)
 	if err == nil && rep.Truncated {
 		err = fmt.Errorf("more than %d anchors lie in the changed files; the rest were not checked", maxInvalidationAnchors)
+	}
+	if err == nil && rep.Unknown > 0 {
+		// The same shape as the truncation above and for the same reason: ground lists what
+		// is at risk, and a caller that cannot tell a fully checked change from one whose
+		// quoted-code anchors were left unchecked would read an empty answer as a clean one.
+		err = fmt.Errorf("%d quoted-code anchors in the changed files could not be checked; they are neither moved nor marked", rep.Unknown)
 	}
 	return err
 }
