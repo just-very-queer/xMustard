@@ -237,6 +237,11 @@ pub struct Snapshot {
     files: Files,
     root: PathBuf,
     clusters: OnceLock<Result<Communities, String>>,
+    /// The file community ranks alone, shared by `community_ranks()` with every reader that
+    /// only needs the partition and not the membership.
+    community_ranks: OnceLock<Result<Vec<u32>, String>>,
+    /// The `exported` flag of every symbol, in dense symbol order (WS-38c).
+    exported: OnceLock<Result<Vec<bool>, String>>,
     /// The import-cycle report (PAR-IMP-08), computed on first use.
     cycles: OnceLock<Result<super::cycles::CycleReport, String>>,
     /// The store this generation was read from.
@@ -263,6 +268,8 @@ impl Snapshot {
                 root: root.to_path_buf(),
                 seg,
                 clusters: OnceLock::new(),
+                community_ranks: OnceLock::new(),
+                exported: OnceLock::new(),
                 cycles: OnceLock::new(),
                 db: loc.db.clone(),
                 text: Mutex::new(None),
@@ -280,6 +287,54 @@ impl Snapshot {
         self.cycles
             .get_or_init(|| super::cycles::compute(self))
             .as_ref()
+            .map_err(Clone::clone)
+    }
+
+    /// Which files have a scope resolver, so their symbols carry resolved symbol edges
+    /// (`flows.rs` projects over exactly those).
+    pub fn resolved_files(&self) -> &[bool] {
+        &self.files.resolved
+    }
+
+    /// The community rank of each file, from the file-level label propagation.
+    ///
+    /// A reader that only needs the partition — WS-38c's intra/cross classification —
+    /// reads the rank rather than the membership list `communities()` builds, so the
+    /// shared computation is the same and only the projection differs.
+    pub fn community_ranks(&self) -> Result<&[u32], String> {
+        self.community_ranks
+            .get_or_init(|| Communities::compute(&self.seg).map(|c| c.rank_of))
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
+    /// The `exported` flag of every symbol, in dense symbol order.
+    ///
+    /// The segment does not carry the flag — [`super::csr::SymRow`] holds name, file,
+    /// line, kind and local only — so a reader that needs it (WS-38c's entry-point
+    /// doubling) reads the one column out of `symbols`. The dense order is `symbols.id`
+    /// order, which is how the segment numbers symbols, so the row lines up with
+    /// `SymRow` indices. Read once and cached beside the other lazily computed views.
+    pub fn exported_by_symbol(&self) -> Result<&[bool], String> {
+        self.exported
+            .get_or_init(|| {
+                self.with_text(|conn| {
+                    let mut out = vec![false; self.seg.counts().symbols as usize];
+                    let mut st = conn.prepare("SELECT exported FROM symbols ORDER BY id")?;
+                    let mut rows = st.query([])?;
+                    let mut i = 0usize;
+                    while let Some(row) = rows.next()? {
+                        // The segment covers a subset of the store's symbols (a file the
+                        // retention envelope skipped has no row), so the walk stops at the
+                        // segment's count rather than overrunning the vector.
+                        let Some(slot) = out.get_mut(i) else { break };
+                        *slot = row.get(0)?;
+                        i += 1;
+                    }
+                    Ok(out)
+                })
+            })
+            .as_deref()
             .map_err(Clone::clone)
     }
 

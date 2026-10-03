@@ -49,6 +49,7 @@ pub mod edges;
 pub mod envelope;
 pub mod extract;
 pub mod facts;
+pub mod flows;
 pub mod fts;
 pub mod ignore;
 pub mod impact;
@@ -1577,6 +1578,40 @@ fn open_read_only(
     Ok((root, path, Some(conn)))
 }
 
+/// `index flows`: execution flows of one stored generation (WS-38c, PAR-SYM-09) — the
+/// scored entry points and the bounded reachability sets seeded from them, over the
+/// resolved CALLS projection. Read-only, like `impact`.
+pub fn flows(
+    root: &Path,
+    cfg: &IndexConfig,
+    max_candidates: usize,
+) -> Result<serde_json::Value, String> {
+    let (root, path, conn) = open_read_only(root, cfg)?;
+    if conn.is_none() {
+        return Err(format!(
+            "no index at {} (run `index build` first)",
+            path.display()
+        ));
+    }
+    drop(conn);
+    let opened = reader::open_at(&root, &path, csr::GraphStorage::from_env())?;
+    let limits = flows::Limits {
+        max_candidates,
+        ..Default::default()
+    };
+    let result = flows::flows_for(&opened.snapshot, limits)?;
+    let paths: Vec<String> = result
+        .flows
+        .iter()
+        .flat_map(|f| f.steps.iter().map(|s| s.path.clone()))
+        .collect();
+    let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
+    v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
+        .map_err(|e| e.to_string())?;
+    v["root"] = root.to_string_lossy().into();
+    Ok(v)
+}
+
 /// `index impact`: impact v2 (WS-35) on the stored generation's graph segment, opened
 /// for this call, with its freshness. Read-only.
 pub fn impact(
@@ -1666,7 +1701,7 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-const USAGE: &str = "xmustard-core index <build|update|stats|impact> <root> \
+const USAGE: &str = "xmustard-core index <build|update|stats|impact|flows> <root> \
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
@@ -1709,6 +1744,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut identity: Option<String> = None;
     let mut symbol: Option<String> = None;
     let mut impact_flags: Vec<String> = Vec::new();
+    let mut flow_limit = flows::MAX_CANDIDATES;
     let mut i = 2;
     while i < args.len() {
         let a = args[i].as_str();
@@ -1741,6 +1777,15 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                     .ok_or_else(|| CmdError::new(2, "index: --depth needs a number"))?;
                 impact_flags.push(format!("--max-depth={d}"));
                 2
+            }
+            // flows' seed cap: PAR-SYM-09's top 200, lowered by a caller that wants a
+            // shorter answer. Parsed here so a non-numeric value is refused before any
+            // work, and bounded so `--limit=0` cannot turn the answer into nothing.
+            a if sub.as_str() == "flows" && a.starts_with("--limit=") => {
+                let n = impact::bounded(&a["--limit=".len()..], 1, flows::MAX_CANDIDATES as u64)
+                    .map_err(|e| CmdError::new(2, format!("index flows: --limit {e}")))?;
+                flow_limit = n as usize;
+                1
             }
             // impact v2's `--name=value` flags (validated by impact::Query)
             _ if sub.as_str() == "impact" && a.starts_with("--") && a.contains('=') => {
@@ -1780,6 +1825,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
                 .map_err(|e| CmdError::new(2, format!("index impact: {e}")))?;
             impact(&root, &cfg, &q)
         }
+        "flows" => flows(&root, &cfg, flow_limit),
         _ => return Err(CmdError::usage(USAGE)),
     };
     out.map(|v| Output::Json(v.to_string()))
