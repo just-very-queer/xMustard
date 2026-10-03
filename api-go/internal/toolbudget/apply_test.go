@@ -595,6 +595,53 @@ func TestByDepthTiersKeepTheirFirstItems(t *testing.T) {
 	}
 }
 
+// A producer that adds members after Apply (WS-59e adds impact's has_more and
+// next_cursor) settles the result through here. Settling must not lose the earlier
+// pass's per-list accounting: a report that still names tiers_trimmed while dropping
+// each_kept describes a cut the caller cannot size (WS-59e-r5-7). The expected value
+// is read from the delivered page rather than from the code, so the test cannot pass by
+// agreeing with it.
+func TestSettleKeepsThePerListAccountingOfThePageItSettled(t *testing.T) {
+	var tiers []map[string]any
+	for d := 1; d <= 3; d++ {
+		items := make([]map[string]any, 40)
+		for i := range items {
+			items[i] = map[string]any{"name": fmt.Sprintf("caller_%d_%02d", d, i), "path": fmt.Sprintf("pkg/f%02d.go", i), "line": i, "edge": "CALLS", "confidence": 0.9}
+		}
+		tiers = append(tiers, map[string]any{"depth": d, "label": "WILL BREAK", "items": items, "offset": 0, "total": 40})
+	}
+	res := map[string]any{"symbol": "Add", "by_depth": tiers, "counts": map[string]any{"total": 120, "by_depth": []int{40, 40, 40}},
+		"epistemic": map[string]any{"completeness": "exact"}, "risk": "HIGH"}
+	a := run(t, "impact", res, Request{MaxChars: 4000}, Page{}, nil)
+	if a.rep.DegradedStage != "tiers_trimmed" {
+		t.Fatalf("the fixture did not reach tiers_trimmed: %s", a.rep.DegradedStage)
+	}
+
+	spec, _ := For("impact")
+	settled, err := spec.Settle(a.raw, Request{MaxChars: 4000}, Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		ByDepth []struct {
+			Items []any `json:"items"`
+		} `json:"by_depth"`
+		OutputBudget report `json:"output_budget"`
+	}
+	if err := json.Unmarshal(settled, &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, settled)
+	}
+	lr := got.OutputBudget.Lists["by_depth"]
+	if lr.State != "tiers_trimmed" {
+		t.Fatalf("settling lost the stage: %+v", lr)
+	}
+	// The accounting has to describe the page the caller received, so each_kept is
+	// checked against the delivered tier and not against anything the budget reports.
+	if n := len(got.ByDepth[0].Items); lr.EachKept != n {
+		t.Errorf("each_kept %d does not describe the %d items delivered", lr.EachKept, n)
+	}
+}
+
 // The WS-35 scope shape: its dependents live in affected.by_depth, a nested list of
 // tiers, which keeps the same leading items per tier.
 func TestImpactScopeTrimsNestedTiers(t *testing.T) {
@@ -833,5 +880,76 @@ func BenchmarkApplyImpactLarge(b *testing.B) {
 		if _, err := spec.Apply(raw, Request{MaxChars: 8000}, Page{}, nil); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+// Settle re-fits a result a producer changed after Apply, and the report the earlier
+// pass recorded has to survive it: load drops the incoming report because this pass
+// rebuilds it, so a result that Apply already reduced would otherwise settle to a report
+// naming no stage, no recovery handle and degraded_stage "full".
+func TestSettleCarriesThePriorStagesAndRecoveryForward(t *testing.T) {
+	var tiers []map[string]any
+	for i := 0; i < 300; i++ {
+		tiers = append(tiers, map[string]any{"depth": 1, "label": "first order", "total": 300,
+			"items": []map[string]any{{"name": fmt.Sprintf("LongishSymbolName%d", i), "kind": "function"}}})
+	}
+	raw, _ := json.Marshal(map[string]any{"by_depth": tiers, "impacted_count": 300})
+	spec, _ := For("impact")
+	req := Request{MaxChars: 2000}
+	out, err := spec.Apply(raw, req, Page{}, func() Recovery {
+		return Recovery{URI: "xmustard://evidence/run-1", Handle: "run-1", Unavailable: ""}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var first struct {
+		Report struct {
+			Stages        []string `json:"stages"`
+			DegradedStage string   `json:"degraded_stage"`
+			RecoverURI    string   `json:"recover_uri"`
+			RecoverHandle string   `json:"recover_handle"`
+		} `json:"output_budget"`
+	}
+	if err := json.Unmarshal(out, &first); err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Report.Stages) == 0 {
+		t.Fatalf("Apply reduced nothing, so there is nothing to carry: %s", out)
+	}
+
+	// A producer adds its paging members, as impact's reconciliation does.
+	var res map[string]json.RawMessage
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatal(err)
+	}
+	res["has_more"] = json.RawMessage("true")
+	res["next_cursor"] = json.RawMessage(`"i2.7.deadbeef"`)
+	mutated, _ := json.Marshal(res)
+
+	settled, err := spec.Settle(mutated, req, Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var after struct {
+		Report struct {
+			Stages        []string `json:"stages"`
+			DegradedStage string   `json:"degraded_stage"`
+			RecoverURI    string   `json:"recover_uri"`
+			RecoverHandle string   `json:"recover_handle"`
+		} `json:"output_budget"`
+	}
+	if err := json.Unmarshal(settled, &after); err != nil {
+		t.Fatal(err)
+	}
+	if len(after.Report.Stages) != len(first.Report.Stages) {
+		t.Errorf("stages %v after settling, %v before: the earlier pass's report was dropped",
+			after.Report.Stages, first.Report.Stages)
+	}
+	if after.Report.DegradedStage != first.Report.DegradedStage {
+		t.Errorf("degraded_stage %q after settling, %q before",
+			after.Report.DegradedStage, first.Report.DegradedStage)
+	}
+	if after.Report.RecoverHandle != "run-1" || after.Report.RecoverURI != "xmustard://evidence/run-1" {
+		t.Errorf("the recovery handle did not survive settling: %+v", after.Report)
 	}
 }

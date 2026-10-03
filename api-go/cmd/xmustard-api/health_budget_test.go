@@ -147,6 +147,9 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	for _, k := range []string{"spawns_total", "bytes_hashed", "captures", "capture_bytes"} {
 		num(t, b, "counters", k)
 	}
+	for _, k := range []string{"calls", "counted", "files_listed", "files_statted", "files_hashed", "bytes_hashed", "git_spawns", "rows_loaded"} {
+		num(t, b, "counters", "core_passes", k)
+	}
 	num(t, b, "transient_pool", "max")
 	num(t, b, "children", "cap")
 	// the two body caps are asserted against the enforced limits in

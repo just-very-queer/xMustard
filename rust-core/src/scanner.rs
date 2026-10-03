@@ -50,6 +50,7 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, s
         if !entry.file_type().is_file() {
             continue;
         }
+        crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
         let relative = match relative_path(root_path, entry.path()) {
             Some(value) => value,
             None => continue,
