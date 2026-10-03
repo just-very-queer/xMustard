@@ -24,9 +24,21 @@ import (
 // clusters it derives and the jobs it enqueues are all bounded, so a large store costs a
 // bounded pass rather than an unbounded one.
 const (
-	consolidationEntries    = 2000
-	consolidationClusters   = 500
-	consolidationJobsPerRun = 500
+	// consolidationEntries is how many entries one pass reflects over. The store's own
+	// ListEntries clamps a limit to its maxListLimit of 1,000, so a bound above that would
+	// be a number this pass cannot reach: the watermark would record the clamp, not the
+	// store. The ceiling is named here so the two cannot drift apart silently.
+	consolidationEntries = 1000
+	// consolidationCandidatesPerPass bounds the candidates one pass derives, and
+	// consolidationClusters bounds the dedupe clusters among them. Both are below the entry
+	// bound divided by the smallest cluster (two entries), so a store can hold more work
+	// than one pass takes and the cut is reachable: what it leaves out is counted (Skipped)
+	// rather than dropped.
+	consolidationCandidatesPerPass = 400
+	consolidationClusters          = 400
+	// consolidationJobsPerRun bounds the jobs one pass enqueues. It matches the candidate
+	// bound, so a pass that took candidates queues all of them.
+	consolidationJobsPerRun = consolidationCandidatesPerPass
 	// consolidationMinCluster is the smallest cluster worth a job: two memories on one
 	// anchor is a question, one memory is not.
 	consolidationMinCluster = 2
@@ -91,7 +103,7 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 		return res, startErr
 	}
 
-	candidates, seen, err := consolidationCandidates(ctx, dataDir, workspaceID)
+	candidates, seen, skipped, err := consolidationCandidates(ctx, dataDir, workspaceID)
 	if err != nil {
 		return res, err
 	}
@@ -113,6 +125,7 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 	}); err != nil {
 		return res, err
 	}
+	res.Skipped += skipped
 
 	// The watermark advances only here, once every candidate is queued, and it records how
 	// far this pass reflected. ExpectVersion is re-read inside the transaction, so two
@@ -136,7 +149,7 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 // PrepareConsolidationJobs derives the candidates without queueing them, for a caller that
 // wants the work before it is queued. RunConsolidationPass is what the loop calls.
 func PrepareConsolidationJobs(ctx context.Context, dataDir, workspaceID string) ([]govstore.JobInput, error) {
-	candidates, _, err := consolidationCandidates(ctx, dataDir, workspaceID)
+	candidates, _, _, err := consolidationCandidates(ctx, dataDir, workspaceID)
 	return candidates, err
 }
 
@@ -187,7 +200,9 @@ var consolidationNow = time.Now
 // consolidationCandidates derives the candidate jobs from the store in a deterministic
 // order: kinds run in jobKindOrder and each kind's candidates are sorted by signature, so
 // two passes over one snapshot produce the same sequence.
-func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) ([]govstore.JobInput, int, error) {
+// The second return is how many entries the pass reflected over; the third is how many
+// candidates the per-run bound left out, so a caller can see that work remains.
+func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) ([]govstore.JobInput, int, int, error) {
 	var snap consolidationSnapshot
 	seen := 0
 	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
@@ -208,22 +223,30 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) (
 		snap = consolidationSnapshot{Entries: entries, Anchors: anchors}
 		return nil
 	}); err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 
 	var out []govstore.JobInput
+	skipped := 0
 	for _, kind := range jobKindOrder {
 		gen, ok := jobGenerators[kind]
 		if !ok {
 			// Unreachable while jobKindOrder and jobGenerators are edited together; a
 			// missing generator is a programming error, not a silently skipped kind.
-			return nil, 0, fmt.Errorf("consolidation: no generator for kind %q", kind)
+			return nil, 0, 0, fmt.Errorf("consolidation: no generator for kind %q", kind)
 		}
 		candidates := gen(snap)
+		// Kinds run in order and each kind's candidates are sorted by signature, so the
+		// prepared sequence is a function of the snapshot alone. The bound is applied after
+		// the sort, which is what makes the cut deterministic: the same store always leaves
+		// the same tail for a later pass.
 		slices.SortFunc(candidates, func(a, b consolidationCandidate) int { return strings.Compare(a.Signature, b.Signature) })
 		for _, c := range candidates {
-			if len(out) >= consolidationClusters {
-				return out, seen, nil
+			if len(out) >= consolidationCandidatesPerPass {
+				// Counted, not dropped in silence: a pass that quietly left work out would
+				// read as a pass that found nothing more to do.
+				skipped++
+				continue
 			}
 			out = append(out, govstore.JobInput{
 				WorkspaceID:       workspaceID,
@@ -234,7 +257,7 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) (
 			})
 		}
 	}
-	return out, seen, nil
+	return out, seen, skipped, nil
 }
 
 // dedupeClusterCandidates asks whether two or more memories on one anchor restate each
@@ -260,9 +283,8 @@ func dedupeClusterCandidates(snap consolidationSnapshot) []consolidationCandidat
 		}
 		clusters = append(clusters, members)
 	}
-	if len(clusters) > consolidationClusters {
-		clusters = clusters[:consolidationClusters]
-	}
+	// The per-kind bound is consolidationCandidates', which counts what it leaves out.
+	// Clamping here as well would make the drop invisible twice over.
 	slices.SortFunc(clusters, func(a, b []string) int { return strings.Compare(a[0], b[0]) })
 	out := make([]consolidationCandidate, 0, len(clusters))
 	for _, members := range clusters {

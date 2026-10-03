@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
@@ -34,7 +35,12 @@ func TestPrepareConsolidationJobsIsIdempotentAndOrdered(t *testing.T) {
 		t.Fatal("a store with a shared path and a stale anchor prepared no jobs")
 	}
 	if !slices.Equal(first, second) {
-		t.Fatalf("preparation is not deterministic:\nfirst  %v\nsecond %v", first, second)
+		t.Fatalf("preparation is not deterministic, in order or in membership:\nfirst  %v\nsecond %v", first, second)
+	}
+	// The prepared sequence itself is stable, kind then signature, so two passes over one
+	// store ask the agent the same questions in the same order.
+	if o1, o2 := preparedOrder(t, dir, ws), preparedOrder(t, dir, ws); !slices.Equal(o1, o2) {
+		t.Fatalf("prepared order is not stable:\nfirst  %v\nsecond %v", o1, o2)
 	}
 	// Every candidate is enqueued exactly once across the two passes.
 	for _, id := range first {
@@ -195,6 +201,83 @@ func TestRetiredEntriesAreNotConsolidationCandidates(t *testing.T) {
 	}
 }
 
+// The per-run bound drops the candidates it cannot take this pass and counts them, so an
+// operator can see that work is left rather than believing the pass covered everything.
+func TestCandidatesBeyondThePerPassBoundAreCounted(t *testing.T) {
+	ctx := context.Background()
+	dir := singleAgentDir(t)
+	ws := "wsJobs9"
+	// Each pair shares its own anchor, so the store holds more clusters than one pass takes.
+	// The figure comes from the pass's own candidate bound, so the fixture cannot drift from
+	// it: one cluster more than a pass derives is the smallest store that exercises the cut.
+	clusters := consolidationCandidatesPerPass + 1
+	if clusters*2 > consolidationEntries {
+		t.Fatalf("the fixture needs %d entries but a pass reads %d", clusters*2, consolidationEntries)
+	}
+	for i := 0; i < clusters; i++ {
+		path := fmt.Sprintf("src/cluster%03d.go", i)
+		proposeOn(t, dir, ws, "a", "left "+path, "left thing", path)
+		proposeOn(t, dir, ws, "b", "right "+path, "right thing", path)
+	}
+	res, err := RunConsolidationPass(ctx, dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	if err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	if len(res.Jobs) > consolidationJobsPerRun {
+		t.Fatalf("the pass queued %d jobs, past its own bound of %d", len(res.Jobs), consolidationJobsPerRun)
+	}
+	// Every cluster the store holds is accounted for: queued or counted as left out. A pass
+	// that quietly dropped work would read as a pass that found nothing more to do.
+	if res.Skipped != clusters-len(res.Jobs) {
+		t.Fatalf("Skipped=%d does not account for the %d clusters the pass did not queue (it queued %d)", res.Skipped, clusters, len(res.Jobs))
+	}
+	// The watermark records what the pass really reflected over, not the store's read clamp.
+	w := readWatermark(t, dir, ws, "entries")
+	if w.ReflectedCount != int64(clusters*2) || w.TotalCount != int64(clusters*2) {
+		t.Fatalf("the watermark recorded %d of %d entries", w.ReflectedCount, clusters*2)
+	}
+	// The dropped candidate is not lost: the second pass reaches it. A second pass re-derives
+	// every cluster, so it queues its whole bound again and the figure that matters is that
+	// the one the first pass skipped now has a job.
+	next, err := RunConsolidationPass(ctx, dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	if err != nil {
+		t.Fatalf("second pass: %v", err)
+	}
+	if next.Skipped != 1 {
+		t.Fatalf("the second pass left %d candidates out, want the 1 the first pass cut", next.Skipped)
+	}
+	skipped := signaturesOf(t, dir, ws, res.Skipped, len(res.Jobs))
+	seenSecond := signaturesOf(t, dir, ws, 0, len(next.Jobs))
+	for _, sig := range skipped {
+		if !slices.Contains(seenSecond, sig) {
+			t.Fatalf("candidate %q the first pass cut has no job after the second pass", sig)
+		}
+	}
+}
+
+// signaturesOf reads n job signatures from the store, skipping the first skip of them, so a
+// test can name which candidates a pass cut without depending on the id order.
+func signaturesOf(t *testing.T, dir, ws string, skip, n int) []string {
+	t.Helper()
+	var out []string
+	mustViewMemory(t, dir, ws, func(r govstore.Reader) error {
+		jobs, err := r.ListJobs(context.Background(), govstore.JobFilter{WorkspaceID: ws, Limit: 1000})
+		if err != nil {
+			return err
+		}
+		for _, j := range jobs {
+			if len(out) >= skip+n {
+				break
+			}
+			if len(out) >= skip {
+				out = append(out, j.ConflictSignature)
+			}
+		}
+		return nil
+	})
+	return out
+}
+
 // Every kind the loop emits is one govstore names, so a claim of any emitted kind works.
 func TestPreparedJobKindsAreKnownToTheStore(t *testing.T) {
 	ctx := context.Background()
@@ -306,6 +389,9 @@ func mustViewMemory(t *testing.T, dir, ws string, fn func(govstore.Reader) error
 	}
 }
 
+// prepareJobs returns the jobs of one pass in the order the pass queued them. It does not
+// sort: the prepared order is part of what this row claims is deterministic, and sorting
+// here would hide exactly that.
 func prepareJobs(t *testing.T, dir, ws, owner string) []string {
 	t.Helper()
 	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: owner}})
@@ -316,7 +402,21 @@ func prepareJobs(t *testing.T, dir, ws, owner string) []string {
 	for _, j := range res.Jobs {
 		out = append(out, j.ID)
 	}
-	slices.Sort(out)
+	return out
+}
+
+// preparedOrder returns the prepared signatures in preparation order, so a test can assert
+// the order itself rather than a set of ids.
+func preparedOrder(t *testing.T, dir, ws string) []string {
+	t.Helper()
+	cands, err := PrepareConsolidationJobs(context.Background(), dir, ws)
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	out := make([]string, 0, len(cands))
+	for _, c := range cands {
+		out = append(out, c.Kind+"|"+c.ConflictSignature)
+	}
 	return out
 }
 
