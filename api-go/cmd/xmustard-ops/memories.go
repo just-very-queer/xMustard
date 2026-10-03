@@ -16,6 +16,12 @@ import (
 // memory: the queue is work for an agent, and claiming and completing a job is the agent's
 // through the store's own compare-and-set lease.
 //
+// This is the operator side of the loop only. The agent side, ground's consolidation_jobs
+// block and remember(job_id), is not built here: both are new MCP surface, and 5.1 rule 9
+// makes every new argument an Advanced one with a tools/list byte cost, which is an owner
+// decision for the WS-32 row rather than something this sub-task may take on its own. The
+// gap is recorded in FU with the two arguments it needs.
+//
 // These join the memoryCommands table in policy.go as three entries beside tier and tokens,
 // so `memory <tier|tokens|jobs-run|jobs-list|jobs-plan>` is one closed set and each command is
 // one line, which is the shape the rest of the ops surface uses.
@@ -52,7 +58,7 @@ func jobsFlagSet(e opsEnv, name string) (*flag.FlagSet, *string) {
 func jobsRunFlagSet(e opsEnv) (*flag.FlagSet, *string, *string, *string) {
 	fs, dataDir := jobsFlagSet(e, "jobs-run")
 	return fs, dataDir,
-		fs.String("source", "entries", "watermark source the pass reflects over"),
+		fs.String("source", "entries", "watermark source the pass records its position against; the entries read are the workspace's either way, so a second source repeats the work under a second name"),
 		fs.String("principal", "xmustard-ops", "principal recorded as the pass's actor")
 }
 
@@ -60,7 +66,7 @@ func jobsRunFlagSet(e opsEnv) (*flag.FlagSet, *string, *string, *string) {
 // operator looking for a flag their command does not have.
 const (
 	jobsPlanUsage = "usage: xmustard-ops memory jobs-plan <workspace_id> [--data-dir DIR]"
-	jobsRunUsage  = "usage: xmustard-ops memory jobs-run <workspace_id> [--source NAME] [--principal ID] [--data-dir DIR]"
+	jobsRunUsage  = "usage: xmustard-ops memory jobs-run <workspace_id> [--principal ID] [--data-dir DIR] [--source NAME: the watermark the pass reflects over; the candidates are the workspace's entries either way]"
 	jobsListUsage = "usage: xmustard-ops memory jobs-list <workspace_id> [--limit N] [--data-dir DIR]"
 )
 
