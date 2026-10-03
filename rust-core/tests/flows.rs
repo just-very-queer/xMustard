@@ -966,18 +966,25 @@ fn a_flow_takes_its_shared_name_stem_and_says_so() {
 /// The stem is cut back to a WHOLE word, and the cut is what separates this rule from
 /// "take the longest shared character prefix".
 ///
-/// Two previous fixtures for this row failed to bite, for two different reasons worth
-/// naming. Names like `BatchOne`/`BatchTwo` share six characters with no separator, so the
-/// whole-word cut has nothing to cut and the mutation is a no-op. `Harvest*` shares ten
-/// characters with no separator either, for the same reason. So the names here carry a
-/// separator INSIDE the shared region: `Batch_One` and `Batch_Two` share `Batch_`, and the
-/// character prefix of all four is `Batch_` while the whole-word stem is `Batch`. Dropping
-/// the `rfind`/`map_or` step therefore changes the label the answer reports, which is what
-/// the row needs.
+/// The names here carry a separator inside the shared region — `Batch_One`..`Batch_Four`
+/// share `Batch_` — so the character prefix and the whole-word stem are different strings
+/// and only one of them can be the answer.
 ///
-/// The earlier version of this row also mutated the `trim_end_matches` on `word`, which is
-/// a no-op because the line above already cut `common` at the same boundary. The mutation
-/// that bites is the `word` step, and the previous one was worth nothing.
+/// Two mutations of this rule both survive, and the reason is worth recording because it is
+/// not a coverage gap. The label is cut in TWO steps: `word` is `common` truncated at the
+/// last non-alphanumeric character, and `stem` is `word` with trailing non-alphanumerics
+/// trimmed. Removing either step alone leaves the other to do the same job, so the label is
+/// unchanged and no test can fail. `Batch_One` and friends exercise both steps at once:
+/// dropping the `word` step leaves `common` = `Batch_`, whose trailing `_` the next line
+/// then trims. Removing BOTH is the only mutation that changes the label, and it is
+/// equivalent too — the result is `Batch` either way, because `common` never contains a
+/// trailing separator after the pairwise prefix reduction.
+///
+/// So what this test pins is the RESULT: the label is the shared word, never a prefix that
+/// includes its separator and never a fragment of it. The earlier version of this row
+/// mutated `trim_end_matches` alone and read as a coverage gap for several rounds; it was
+/// an equivalent mutation, and the fix was to find out why rather than to add a fixture
+/// that would also have survived.
 #[test]
 fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
     let d = repo(&[
@@ -999,8 +1006,9 @@ fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
         .iter()
         .find(|f| f.rule == "name_stem")
         .unwrap_or_else(|| panic!("a name_stem flow in {flows:?}"));
-    // The separator is inside the shared region, so the character prefix would carry a
-    // trailing underscore and the whole-word cut drops it.
+    // The separator is inside the shared region, so a label that kept it would read
+    // `Batch_`. The cut produces the word the names share, which is what a reader uses
+    // the label for.
     assert_eq!(
         f.label, "Batch",
         "the stem is the shared whole word, without the separator: {f:?}"
