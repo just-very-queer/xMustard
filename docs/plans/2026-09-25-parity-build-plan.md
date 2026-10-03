@@ -4022,26 +4022,30 @@ list is in the round-1 record under `reviews/ws-59e/`):
   decoder that counts items from raw bytes without materialising them; `impact_flags.go` refuses a cursor
   on the trace and path forms, an empty cursor, and `cursor` with `offset`; `tool_impact.go` declares
   `cursor` and the members; the Pi mirror forwards them.
-- **Round 5 (the owner exception of 2026-10-03, one round, `WS-59e-r4-3`).** When the `tiers_total`
-  rung removed the tier list, the answer kept `has_more` while dropping `next_cursor`, so a client that
-  followed it got the same page and nothing named a position to continue from. Both fallbacks
-  `adjudication-WS-59e-r4-3.md` names are worse than the present shape (the core's old `next_offset`
-  skips undelivered items; the unchanged offset repeats the page), so the owner's second option was
-  taken: `has_more=false` plus an explicit `truncated:"tiers_removed"` marker naming the cut. The
-  `next == 0` arm had the same hole and is folded into the same branch, so the rule is one predicate —
-  a cursor exists exactly when `has_more` is true. `truncated` is a result member, not an `Output` entry,
-  so it costs no `tools/list` byte.
-- **Measured** (Linux box, `1d7f0961`). `BOXALL` `remote_exit=0`, 24 Go packages, 19 Rust binaries,
+- **Round 5 (the owner's single extra round, 2026-10-03).** Seven findings, all fixed; fix, commit
+  and evidence for each in `reviews/ws-59e/r5/triage.json`. 1. `WS-59e-r4-3`: the `tiers_total` rung
+  removed the tier list while the answer kept `has_more`, so a client that followed it got the same
+  page; both fallbacks `adjudication-WS-59e-r4-3.md` names are worse, so `has_more=false` plus
+  `truncated:"tiers_removed"` -- one predicate: a cursor exists exactly when `has_more` is.
+  2. The ranking key omitted `symbols=`. 3. `ImpactCursor` could sign an offset past the 50,000 the
+  validator accepts (`MaxImpactOffset`, read by both). 4. The published tool text still described the
+  old contract. 5. This section's Design paragraph sat inside WS-59b's (from `1aac8070`); it is gone.
+  6. The route settled exactly twice on an unprovable claim; it settles until a pass changes nothing.
+  7. `Settle` rebuilt the report with every list entry empty; it carries the prior accounting forward.
+- **Measured** (Linux box, `e708fcd7`). `BOXALL` `remote_exit=0`, 24 Go packages, 19 Rust binaries,
   `clippy_warnings=6` (base count), `rss_lines=ok`. `CAPS` PASS, all 16 changed caps **fell**
   (−76/−14 lean, −64/−2 full). `PI` `remote_exit=0`.
 - **Deviations.** 1. Eleven files outside the row's `Files`, each with a reason in
-  `reviews/ws-59e/r4/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members it
-  wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same
-  ladder and carries the earlier stages and recovery forward. 3. `countArray` reads the member at its own
-  level, so a symbol name holding `"items":[` cannot steer a paging decision.
-- **Review.** r1-r5; r5 is the owner's single extra round. Twelve findings across r1-r4, ten fixed, one
-  rejected on an AGREE adjudication (`WS-59e-r2-5`), one (r4-3) closed here. Three mutations survived
-  honestly in the earlier rounds (M16, M17, M22); r5 adds M23 and M24, both killed.
+  `reviews/ws-59e/r5/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members
+  it wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same
+  ladder and carries the earlier stages, recovery and list accounting forward. 3. `countArray` reads
+  the member at its own level, so a symbol name holding `"items":[` cannot steer a paging decision.
+  4. `truncated` is in `impactDoc`, deliberately **not** in the `Output` map: it costs 30 rendered wire
+  bytes and the cap rule forbids raising a cap to fit one.
+- **Review.** r1-r5, gate `PASS` at r5. Twenty-one mutations; M22 survives honestly (the settle fixed
+  point is reached in one or two passes at every budget the route produces, so none distinguishes the
+  forms). `triage-check.md` DISAGREE'd twice and was right twice: `fix_commit` must name the commit
+  that adds the test, not only the one that changes the code.
 - **Checks.** `BOXALL`, `CAPS`, `PI`. Not run: `RET`, `BUD`, `SECDOC`, `GOLD`.
 - **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`; next row that mutates a
   budgeted result: call `spec.Settle`. Four FU notes on `fitEach`'s boundary-seeking, OCR's background
