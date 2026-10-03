@@ -2564,8 +2564,8 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 
 **Requirements.** PAR-SYM-08, PAR-SYM-09, PAR-SYM-10, PAR-RET-06, PAR-HAR-11, PAR-GOV-20
 
-**Files.** `rust-core/src/index/areas.rs`, `rust-core/src/index/flows.rs`, `rust-core/src/index/orientation.rs`, `rust-core/src/serve.rs`, `api-go/internal/mcpserver/resources.go`, `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/workspaceops/grounding_index.go`, `rust-core/tests/areas_flows.rs`  
-**New modules.** `rust-core/src/index/areas.rs`, `rust-core/src/index/flows.rs`, `rust-core/src/index/orientation.rs`, `api-go/internal/mcpserver/resources.go`
+**Files.** `rust-core/src/index/areas.rs`, `rust-core/src/index/flows.rs`, `rust-core/src/index/orientation.rs`, `rust-core/src/serve.rs`, ~~`api-go/internal/mcpserver/resources.go`~~ (struck by WS-38a: the file does not exist and must not be created; MCP resources are served from `api-go/internal/mcpserver/docs_resource.go` and `api-go/internal/mcpserver/evidence.go`), `api-go/internal/mcpserver/tool_explain.go`, `api-go/internal/mcpserver/tool_search.go`, `api-go/internal/workspaceops/grounding_index.go`, `rust-core/tests/areas_flows.rs`  
+**New modules.** `rust-core/src/index/areas.rs`, `rust-core/src/index/flows.rs`, `rust-core/src/index/orientation.rs` (struck by WS-38a: `api-go/internal/mcpserver/resources.go`)
 
 **Tests required.**
 - Deterministic output across runs (seeded RNG); incremental results equal a full rebuild
@@ -2577,6 +2577,31 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 **Acceptance.** Orientation and flow context are available through explain, ground and resources, with worker transients inside the heavy slot.
 
 **Collision risk.** The per-tool mcpserver files explain and search, and grounding_index.go (WS-03, WS-22).
+
+### WS-38a — Spec deviation: where WS-38's files and its orientation text actually go
+
+**Goal.** Record, before any of 38b..38e is built, the three places the WS-38 row above is wrong about the tree at `642106b`, so the later sub-tasks build on measured ground instead of on the row's file list:
+
+1. `api-go/internal/mcpserver/resources.go` does not exist and must not be created. Resources are served from `api-go/internal/mcpserver/docs_resource.go` (`docsList`, `readResource`) and `api-go/internal/mcpserver/evidence.go` (the paged originals). WS-38f adds its entries there, and `resources.go` is struck from the Files list of the row above.
+2. The `instructions` text is 1,398 bytes against a hard 1,400-byte budget, so WS-38f's area and flow URIs cannot be added by appending. Two bytes of headroom is not a budget for two new resource lines; the sub-task must replace existing words or serve the URIs from `xmustard://docs/tools`, and a new per-resource instruction sentence is a `tools/list` and `instructions` change this row does not authorise.
+3. Areas are substantially built already, so 38b is narrower than the row above states. See "Measured state" below.
+
+**Requirements.** PAR-SYM-08, PAR-SYM-09, PAR-SYM-10, PAR-RET-06, PAR-HAR-11, PAR-GOV-20 (carried unchanged from the row above; this sub-task changes no requirement and closes none of them)
+
+**Files.** `docs/plans/2026-09-25-parity-build-plan.md` (this section, and the three corrections it applies to the WS-38 Files and Goal lists)
+
+**Tests required.** None. This row writes no source file, so §4 step 4's TDD loop does not apply and no test is claimed. The substitute is the measured evidence below, each row reproducible from a command quoted in the implementation record: the `instructions` byte count against the 1,400-byte assertion in `api-go/internal/mcpserver/server_test.go` and `standing_memory_test.go`, the existence or absence of each named file, and the symbol names each claimed-existing capability is dispatched under.
+
+**Acceptance.** Each of the seven later sub-tasks can be started from this section without re-reading the tree: 38b and 38c cite what already exists and what is genuinely absent, and 38e and 38f name the file they edit and the byte budget they must fit inside.
+
+**Measured state at `642106b`.** Read from the tree, not from the row above:
+
+- *Areas/communities exist and are index-native.* `rust-core/src/index/reader.rs` holds a private `Communities` computed by label propagation over the undirected weighted file projection, with a `Vec<u32>` label per file and adjacency re-read from the segment on every pass rather than held. It is deterministic with no seeded RNG: files are processed in path order and ties go to the smallest community id. It is cached in a `OnceLock` and **not persisted in `index.db`**, so it is recomputed per process. `rust-core/src/symbolgraph.rs` keeps the older whole-graph `compute_clusters` behind the same rules. Both are already dispatched: `xmustard-core symbolgraph clusters|cluster-of`, already in `go-calls.txt`, and served to `explain` today — `api-go/internal/workspaceops/navigation.go` puts `out["cluster"]` next to the explanation, and `FileCluster`/`WorkspaceClustersCtx` sit in `api-go/internal/workspaceops/symbolgraph.go`. What 38b's row says is new ("seeded deterministic communities") is already true by a different route, so the determinism test it asks for should assert equality against the already-shipped reader rather than introduce a second algorithm, and what it does add is large-graph mode above 10k symbols and sampled cohesion.
+- *Flows are genuinely absent.* No entry-point scoring or bounded DFS over resolved edges exists: `rg -n 'entry.?point|EntryPoint'` over `rust-core/src/index/` returns one unrelated match in `impact.rs` prose and one in `repomap.rs`. `flows.rs` is new work and its size stands.
+- *`search group_by=flow` is genuinely absent.* `rg -n 'group_by|groupBy' api-go/internal/mcpserver/tool_search.go` returns nothing.
+- *`orientation.rs` and `grounding_index.go` need confirming when 38d starts.* 38d names `api-go/internal/workspaceops/grounding_index.go`; whether that file exists is 38d's first check, not this row's claim.
+
+**Collision risk.** The plan file only; every other lane appends its own section here.
 
 ### WS-39 — Resolvers for Rust, Python and Java
 
