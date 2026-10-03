@@ -148,16 +148,23 @@ pub fn within<T>(h: Handle, f: impl FnOnce() -> T) -> T {
 }
 
 /// `body` with `"pass_counters":<counts>` appended as its last field when it is a JSON
-/// object; any other document is returned unchanged.
-pub fn attach(body: String, counts: &Counts) -> String {
+/// object; any other document is returned unchanged. The object is edited in place, so
+/// a large result is not copied.
+pub fn attach(mut body: String, counts: &Counts) -> String {
     let doc = body.trim_end();
     if !(doc.starts_with('{') && doc.ends_with('}')) {
         return body;
     }
     let fields = doc[..doc.len() - 1].trim_end();
-    let sep = if fields.ends_with('{') { "" } else { "," };
-    let counts = serde_json::to_string(counts).expect("counts serialize");
-    format!("{fields}{sep}\"pass_counters\":{counts}}}")
+    let (keep, empty) = (fields.len(), fields.ends_with('{'));
+    body.truncate(keep);
+    if !empty {
+        body.push(',');
+    }
+    body.push_str("\"pass_counters\":");
+    body.push_str(&serde_json::to_string(counts).expect("counts serialize"));
+    body.push('}');
+    body
 }
 
 #[cfg(test)]
@@ -229,6 +236,14 @@ mod tests {
         for v in ["[1,{}]", "\"x\"", "3"] {
             assert_eq!(attach(v.into(), &c), v);
         }
+        let mut roomy = String::with_capacity(4096);
+        roomy.push_str("{\"a\":1}");
+        let at = roomy.as_ptr();
+        assert_eq!(
+            attach(roomy, &c).as_ptr(),
+            at,
+            "the result is edited in place"
+        );
         let parsed: serde_json::Value =
             serde_json::from_str(&attach("{\"a\":[1]}".into(), &c)).unwrap();
         assert_eq!(parsed["pass_counters"]["rows_loaded"], 6);

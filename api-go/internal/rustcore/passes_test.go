@@ -64,3 +64,23 @@ func TestCoreResultsWithoutPassCountersCountOnlyTheCall(t *testing.T) {
 		}
 	}
 }
+
+// WS-RT1: a failed core call (here a nonzero exit) still counts as a call, with
+// nothing reported, so an expensive failure is visible in core_passes.calls.
+func TestAFailedCoreCallCountsAsACallWithNothingReported(t *testing.T) {
+	withPool(t, 64<<20)
+	t.Setenv("XMUSTARD_CORE_WORKER", "")
+	core := filepath.Join(t.TempDir(), "xmustard-core")
+	script := "#!/bin/sh\necho '{\"pass_counters\":{\"files_listed\":9}}'\nexit 1\n"
+	if err := os.WriteFile(core, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	before := budget.Counters().CorePasses
+	if _, err := runCoreCtx(context.Background(), "search", "x"); err == nil {
+		t.Fatal("a nonzero exit must fail the call")
+	}
+	if got, want := budget.Counters().CorePasses.Minus(before), (budget.CorePasses{Calls: 1}); got != want {
+		t.Fatalf("core_passes grew by %+v, want %+v", got, want)
+	}
+}

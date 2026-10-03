@@ -161,6 +161,8 @@ fn the_cli_reports_the_calls_counters_last() {
     let v: Value = serde_json::from_str(&text).unwrap();
     let pc = counters_of(&v);
     assert_eq!(pc["files_listed"], 3);
+    // each source file is stat'ed twice: the scan's lstat and the read's fstat
+    assert_eq!(pc["files_statted"], 6);
     assert_eq!(pc["files_hashed"], 3);
     assert!(pc["git_spawns"].as_u64().unwrap() >= 2, "{v}");
     let tail = text.trim_end();
