@@ -525,7 +525,7 @@ func TestTierItemCountsAreReadWithoutDecodingTheItems(t *testing.T) {
 			want:  []int{0},
 		},
 		"brackets and commas inside an item's strings": {
-			tiers: `[{"items":[{"path":"a[0],b"},{"name":"x, y"},{"name":"q\"quoted\""},{"name":"esc\\\\"}],"total":4}]`,
+			tiers: `[{"items":[{"path":"a[0],b"},{"name":"x, y"},{"name":"q\"quoted, and [bracketed]"},{"name":"esc\\\\"}],"total":4}]`,
 			want:  []int{4},
 		},
 		"nested arrays inside an item": {
