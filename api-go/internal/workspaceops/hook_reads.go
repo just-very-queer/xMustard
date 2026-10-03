@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/rustcore"
@@ -145,6 +146,23 @@ var hookUnsampled = []string{"drift", "baseline", "changed_files", "dirty_symbol
 // failed runs and open failures, and the memory section. The change and index fields
 // are listed unknown with the reason, never guessed; the ground tool samples them.
 func HookGrounding(ctx context.Context, dataDir, workspaceID, caller string) *SessionGrounding {
+	return hookGrounding(ctx, dataDir, workspaceID, func(g *SessionGrounding) {
+		g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller, groundMemoryOptions{since: noSince})...)
+	})
+}
+
+// HookGroundingNoMemory is HookGrounding without its memory section, for a deployment
+// that serves this caller no recall: a hook must not reach memory through the ground line
+// either, and a ground line whose memory fields read "unknown" says so rather than
+// guessing counts from a store the caller may not read. The run fields stay, because a
+// failed run is a run outcome and not memory. It reads no memory store at all.
+func HookGroundingNoMemory(ctx context.Context, dataDir, workspaceID string) *SessionGrounding {
+	return hookGrounding(ctx, dataDir, workspaceID, nil)
+}
+
+// hookGrounding is HookGrounding's shape: the unsampled fields, the run failures, and
+// whatever memory section the caller asked for (none means no store read).
+func hookGrounding(ctx context.Context, dataDir, workspaceID string, memory func(*SessionGrounding)) *SessionGrounding {
 	g := &SessionGrounding{WorkspaceID: workspaceID}
 	for _, f := range hookUnsampled {
 		g.Unknown = append(g.Unknown, GroundingUnknown{Field: f, Reason: "not sampled by a hook (hooks start no Rust or git process); call ground"})
@@ -155,7 +173,9 @@ func HookGrounding(ctx context.Context, dataDir, workspaceID, caller string) *Se
 		g.BlockedByFailingVerification = &failing
 	}
 	g.stampGenerated()
-	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller, groundMemoryOptions{since: noSince})...)
+	if memory != nil {
+		memory(g)
+	}
 	g.summarize()
 	return g
 }
@@ -169,6 +189,21 @@ type HookMemory struct {
 	StalePaths []string
 }
 
+// hookMemoryRanks counts the store rankings a hook asked for — a test hook, in the shape
+// stalenessChecks uses, for asserting that a hook whose caller may not use recall reads no
+// memory store at all. Without it, a guard placed after the read and one placed before it
+// produce identical answers, so no test can tell them apart.
+//
+// It is process-wide, so a test asserting zero must compare against a value read before the
+// calls it makes, not against zero: another test in the same binary ranking memory is not a
+// failure of this one.
+var hookMemoryRanks atomic.Int64
+
+// HookMemoryRanks is how many store rankings hooks have asked for since the process
+// started. A hook test reads it to assert that a refused hook read no memory store, which
+// is otherwise indistinguishable from a hook that read one and withheld the answer.
+func HookMemoryRanks() int64 { return hookMemoryRanks.Load() }
+
 // HookMemories ranks served memory for a hook the way recall does, by the paths a tool
 // reads or edits or by a search pattern, relevance-gated, at most limit. Without a
 // query or a path it returns nothing: recall would then fall back to the working
@@ -177,6 +212,7 @@ func HookMemories(ctx context.Context, dataDir, workspaceID, caller, query strin
 	if strings.TrimSpace(query) == "" && len(cleanPaths(paths)) == 0 {
 		return nil, nil
 	}
+	hookMemoryRanks.Add(1)
 	res, err := RecallWith(ctx, dataDir, workspaceID, RecallRequest{Query: query, Paths: paths, Limit: limit, Caller: caller})
 	if err != nil {
 		return nil, err

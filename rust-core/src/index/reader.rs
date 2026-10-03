@@ -275,6 +275,12 @@ impl Snapshot {
         &self.root
     }
 
+    /// Which files have a scope resolver, so their symbols have resolved symbol edges
+    /// (WS-38b's `areas` projects over exactly those).
+    pub fn resolved_files(&self) -> &[bool] {
+        &self.files.resolved
+    }
+
     /// The import-cycle report of this generation, computed once.
     pub fn cycles(&self) -> Result<&super::cycles::CycleReport, String> {
         self.cycles
