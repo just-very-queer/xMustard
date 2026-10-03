@@ -4634,6 +4634,26 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 
 **Owner-delegate run (2026-10-03).** Parked at five rounds (`505492e`); the owner allowed two more. Round 6 on the merged head found `{"roots":null}` cached as definitive and a repeated array-less answer never backing off; both now go through the shape check (`roots` must be an array) and `rootsBackoff`, with `TestNullRootsFieldIsAskedAgain` and `TestRepeatedRootsAnswerWithoutAnArrayBacksOff`. The cwd rule stays DO NOT DECIDE (`decisions/ws-fix-15.md`).
 
+### WS-FIX-15b — Register the working directory while the client's roots are unknown, behind an opt-in
+
+**Goal.** The owner decided WS-FIX-15's open question (`decisions/ws-fix-15.md`, option 2, `decisions/OWNER-DECISIONS.md`): a disabled rule becomes an opt-in configuration key. While the client's roots are **unknown** (its `roots/list` failed, backed off, or was never delivered), `resolveWorkspace` refuses to auto-register the server's working directory, so every call in a fresh worktree fails with "not auto-registered while the client's roots are unavailable" until an agent passes `workspace_id` by hand. This row adds `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN`, **off by default**, which allows exactly that one case and nothing else: the working directory's own enclosing git repository, resolved from the cwd signal only. The reason text changes with it, so an operator reading an answer can tell which rule refused.
+
+**Requirements.** No new PAR id. This closes the owner-decided option 2 of the WS-FIX-15 decision memo and keeps `XMUSTARD_MCP_AUTO_REGISTER=0` orthogonal: auto-registration must still be on for this key to have any effect, and with it off the refusal names the auto-registration rule as before.
+
+**Files.** `api-go/internal/mcpserver/resolve_workspace.go` (`Options`-driven registration policy at the cwd signal), `api-go/internal/mcpserver/server.go` (the `Options` field), `api-go/internal/mcpserver/resolve_workspace_test.go` (on/off tests and the reason-text tests), `api-go/cmd/xmustard-mcp/main.go` and `api-go/cmd/xmustard-api/mcp_routes.go` (the two `Options` builders read the variable), `docs/SECURITY.md` (the exposure-posture table row and the workspace-registration prose), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- `TestCwdIsNotRegisteredWhileRootsAreUnknownByDefault`: on a fresh session with `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN` unset, the cwd repository is not registered and the reason still names "not auto-registered while the client's roots are unavailable".
+- `TestTheOptInRegistersTheCwdWhileRootsAreUnknown`: with the variable set to a non-`0` value, the cwd repository is registered once, the workspace resolves with `source: cwd` and `registered: true`, and the failure text no longer says the cwd was not auto-registered.
+- `TestTheOptInRefusesNothingElse`: with the key on, a `roots/list` failure that is not the cwd case still resolves nothing (no `path` argument registers, a roots answer with more than one root that contains no cwd still registers nothing), and with `AutoRegister: false` and the key on, the cwd is still refused and the refusal names the auto-registration rule, not the roots rule.
+- One mutation per new test (`slop-audit.md` S5).
+
+**Acceptance.** With the key unset or `0` (the default), behaviour is byte-identical to the merged tip: the same refusals, the same reason text, no registration. With the key on, an agent's first call in an unregistered working-directory repository registers and indexes exactly that repository and resolves. `XMUSTARD_MCP_AUTO_REGISTER=0` still wins over the key. `MAC` on `./internal/mcpserver` is green and `BOXALL` gives `remote_exit=0`, `clippy_warnings` at or under 6 and `rss_lines=ok`.
+
+**WS-48 note.** `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN` is a new environment variable; WS-48's single configuration struct must absorb it.
+
+**Owner decision.** `decisions/OWNER-DECISIONS.md` (2026-10-03T16:04:48Z) chose option 2 of `decisions/ws-fix-15.md`: a configuration option, off by default. Option 3 (capability-based auto-registration with no configuration) was not chosen and is not implemented here.
+
 ### WS-RT1 — Scale fixtures and pass counters
 
 **Goal.** The streaming-runtime design (`.git/xm-parity/runtime-2026-10-03/STREAMING_RUNTIME.md` §5, owner-approved 2026-10-04, goal §3.5e) starts by making whole-repository passes visible and measurable before any of RT2..RT15 changes them. Two deliverables:
