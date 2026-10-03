@@ -458,7 +458,7 @@ func TestNineToolProjectionsUnchangedWithoutHook(t *testing.T) {
 // Family reduction is O(window): reducing a 64 MiB original allocates about what a
 // 16 MiB one does (no allocation proportional to the input).
 func TestFamilyReducersUseBoundedMemory(t *testing.T) {
-	if raceEnabled && testing.Short() {
+	if raceEnabled {
 		t.Skip("allocation bound is not meaningful under -race")
 	}
 	pattern := []byte("=== RUN   TestCase\n--- PASS: TestCase (0.00s)\nsome log line from the test\n")
@@ -897,7 +897,7 @@ func scaled(gen func(int) []byte, size int) []byte {
 // tables, rings and line buffers are bounded; lint parses without per-line
 // allocation).
 func TestFamilyReducersUseBoundedMemoryOnRealShapes(t *testing.T) {
-	if raceEnabled && testing.Short() {
+	if raceEnabled {
 		t.Skip("allocation bound is not meaningful under -race")
 	}
 	jsonDoc := func(n int) []byte {

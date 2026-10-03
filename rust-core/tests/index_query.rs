@@ -72,6 +72,13 @@ fn commit(root: &Path, msg: &str) {
     git(root, &["commit", "-qm", msg]);
 }
 
+/// Owner-only on a temporary directory, so a fixture that hands one to the index
+/// does not depend on the process umask for the index directory guard (WS-FIX-11).
+fn tighten(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 /// Several languages, imports, calls, inheritance, a test file and an isolated file.
 fn fixture() -> TempDir {
     repo(&[
@@ -237,6 +244,7 @@ fn key(seg: &Segment, a: u32, b: u32, e: &Edge) -> EdgeKey {
 fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
     let r = fixture();
     let dir = TempDir::new().unwrap();
+    tighten(dir.path());
     let db = build(r.path(), dir.path());
     // add typed symbol-level edges (what the resolver will write) next to the lexical
     // ones, so both node kinds are exercised
@@ -506,6 +514,7 @@ fn assert_legacy_equal(root: &Path, db: &Path, max_names: usize) -> usize {
 fn bfs_trace_and_blast_radius_equal_the_legacy_graph_on_the_same_edges() {
     let r = fixture();
     let dir = TempDir::new().unwrap();
+    tighten(dir.path());
     let db = build(r.path(), dir.path());
     let checked = assert_legacy_equal(r.path(), &db, 1000);
     assert!(checked > 10);
@@ -1196,6 +1205,55 @@ impl Serve {
     fn mem(&self) -> memprobe::Mem {
         memprobe::sample(self.child.id()).expect("a memory sample of the service")
     }
+
+    /// One reading of the service once it has settled: samples until two consecutive
+    /// readings agree to within `SETTLE_STABLE_MIB` and the window is at least
+    /// `settle_ms` long, and the reading is the **peak** of the samples after the
+    /// first one. Waiting for the readings to stop moving is what makes the name
+    /// true — a fixed delay does not establish that anything settled, and a bound
+    /// read before the service has finished releasing the round it just ran
+    /// compares against a service that is still working. Keeping the peak of the
+    /// settled samples means a genuine regression inside the window is still
+    /// caught; only the samples before it are discarded.
+    ///
+    /// The single instantaneous sample this replaced was the cause of WS-FLK-01:
+    /// `steady` and `after swap` name a settled service and neither delivered one,
+    /// so the two figures the bound checked depended on which instant the sample
+    /// landed on. `swap peak` was already a peak, taken while the swap ran.
+    fn mem_settled(&self, settle_ms: u64) -> memprobe::Mem {
+        let within = (SETTLE_STABLE_MIB * memprobe::MIB) as u64;
+        let started = std::time::Instant::now();
+        // The pre-settlement instant: read once, and not part of the figure. A
+        // round the service has just finished can still be holding its
+        // allocations, and seeding the peak with this sample is what kept that
+        // transient in the reading through rounds 1 and 2 of this row.
+        let mut previous = self.mem();
+        let mut peak = memprobe::Mem::default();
+        let mut settled_samples = 0usize;
+        loop {
+            std::thread::sleep(Duration::from_millis(5));
+            let Some(m) = memprobe::sample(self.child.id()) else {
+                // the child is gone or unreadable, so no bound can be read and
+                // waiting for it to come back would hang the suite
+                panic!("the service stopped answering memory samples");
+            };
+            // the first sample inside the loop is the second reading, so `peak` is
+            // never seeded with `previous` and the transient cannot return
+            if settled_samples == 0 {
+                peak = m;
+                settled_samples = 1;
+            } else {
+                peak.rss = peak.rss.max(m.rss);
+                peak.dirty = peak.dirty.max(m.dirty);
+            }
+            let settled = started.elapsed() >= Duration::from_millis(settle_ms)
+                && m.dirty.abs_diff(previous.dirty) <= within;
+            previous = m;
+            if settled {
+                return peak;
+            }
+        }
+    }
 }
 
 impl Drop for Serve {
@@ -1254,11 +1312,11 @@ struct Above {
 }
 
 struct Measured {
-    /// After the first query rounds.
+    /// After the first query rounds, once the service has settled (`SETTLE_MS`).
     steady: Above,
     /// The highest sampled while the swap happened under load.
     swap_peak: Above,
-    /// After the swap settled.
+    /// After the swap settled (`SETTLE_MS`).
     after_swap: Above,
     generations: BTreeSet<i64>,
 }
@@ -1291,6 +1349,23 @@ const OVERLAPPING: Lines = Lines {
     rss: 32.0,
 };
 
+/// The shortest settle window `steady` and `after swap` wait out, in milliseconds.
+/// The window is a floor, not the settling rule: `mem_settled` also waits for two
+/// consecutive readings to agree, so a slower cleanup extends the wait instead of
+/// being read mid-flight. Measured on the Linux build box at load 3.3-8.6 over 26
+/// runs, `steady` and `after swap` stop moving inside 500 ms, so this is the floor
+/// every one of those runs cleared rather than a fitted constant. The swap already
+/// waits 3 s for the new generation to land.
+const SETTLE_MS: u64 = 500;
+
+/// How close two consecutive dirty readings must be for the service to count as
+/// settled, in MiB. `/proc/<pid>/status` is reported in whole pages, so two readings
+/// of a service that has stopped allocating differ by at most a page or two plus
+/// whatever the kernel has accounted; a quarter of a MiB is well inside the noise a
+/// settling allocator makes and well under the 0.3-0.5 MiB spread this row measured
+/// on the instantaneous reading.
+const SETTLE_STABLE_MIB: f64 = 0.25;
+
 /// Measure the service on the synthetic store: base after the handshake, then after
 /// queries, then during and after a snapshot swap with queries in flight.
 fn measure(storage: &str, load: Load) -> Measured {
@@ -1298,6 +1373,11 @@ fn measure(storage: &str, load: Load) -> Measured {
     let root = r.path().to_str().unwrap().to_string();
     let head = git(r.path(), &["rev-parse", "HEAD"]);
     let dir = TempDir::new().unwrap();
+    // WS-FIX-11 refuses a group- or world-writable index directory, and a
+    // TempDir inherits the process umask, so under a 002 umask this fixture's
+    // directory lands at 0o775 and `ensure_graph_segment` refuses it. Tighten it
+    // rather than depend on the umask the box happens to run with.
+    tighten(dir.path());
     let db = dir.path().join(index::DB_FILE);
     synthetic_store(&db, &head, 1);
     // the index worker writes the segment; the service only reads it
@@ -1316,7 +1396,7 @@ fn measure(storage: &str, load: Load) -> Measured {
             );
         }
     }
-    let steady = s.mem();
+    let steady = s.mem_settled(SETTLE_MS);
 
     // swap: a new generation lands while four clients keep querying
     let pid = s.child.id();
@@ -1362,12 +1442,22 @@ fn measure(storage: &str, load: Load) -> Measured {
     let (mut s, seen) = clients.join().unwrap();
     gens.extend(seen);
     let peak = sampler.join().unwrap();
+    // `peak` starts at `Mem::default()` and only moves when `sample` returns `Some`, so
+    // a sampler that observed nothing leaves both fields at 0 and `above`'s
+    // `saturating_sub` turns that into a 0.0 MiB delta that passes every bound below.
+    assert!(
+        peak.rss > 0 && peak.dirty > 0,
+        "{load:?}: the sampler observed no reading of the service (rss {}, dirty {}), so \
+         `swap peak` below would bound a figure that was never taken",
+        peak.rss,
+        peak.dirty
+    );
     for i in 0..4 {
         for v in client_rounds(&mut s, &root, load, i + 500) {
             gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
         }
     }
-    let swapped = s.mem();
+    let swapped = s.mem_settled(SETTLE_MS);
     let stats = s.call("$/stats", &[]);
     let above = |m: memprobe::Mem| Above {
         rss: memprobe::mib(m.rss.saturating_sub(base.rss)),

@@ -136,6 +136,20 @@ fn edge<'m>(
         .unwrap_or_else(|| panic!("missing edge {key:?}\nhave: {:#?}", m.keys()))
 }
 
+/// (path, path) file pairs holding an edge of the given layer.
+fn layer_edges(conn: &Connection, layer: &str) -> BTreeSet<(String, String)> {
+    let mut st = conn
+        .prepare(
+            "SELECT a.path, b.path FROM edges e JOIN files a ON a.id = e.src_file
+             JOIN files b ON b.id = e.dst_file WHERE e.layer = ?1",
+        )
+        .unwrap();
+    st.query_map([layer], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect()
+}
+
 /// (path, name, cause) → count
 fn drops(conn: &Connection) -> BTreeMap<(String, String, String), i64> {
     let mut st = conn
@@ -355,7 +369,17 @@ fn resolution_tiers_imports_reexports_namespaces_packages_and_receivers() {
     // method receivers: a method on the same type declared in another package file
     let bump = edge(&e, (s, "Store.Put"), "CALLS", "", (x, "Store.bump"));
     assert_eq!((bump.0, bump.2.as_str()), (0.9, "receiver-typed"));
-    let items = edge(&e, (s, "Store.Put"), "ACCESSES", "read", (s, "Store.items"));
+    // `s.items[k] = v` is a WRITE. This assertion read "read" until WS-FIX-19: it pinned
+    // the bug the row was opened for, because the extractor stopped at the
+    // `selector_expression` and never saw the assignment through the `index_expression`
+    // above it.
+    let items = edge(
+        &e,
+        (s, "Store.Put"),
+        "ACCESSES",
+        "write",
+        (s, "Store.items"),
+    );
     assert_eq!(items.0, 0.95);
     edge(&e, (x, "Store.Get"), "ACCESSES", "read", (s, "Store.items"));
     edge(
@@ -777,5 +801,294 @@ fn precision_against_type_checker_ground_truth() {
         total.0,
         total.2,
         total.0 as f64 / total.2 as f64
+    );
+}
+
+// ---------------------------------------------------------------------------
+// WS-FIX-19: the WS-17 minors whose status was unknown. Each test here measures the
+// behaviour the row names. Where the behaviour is already correct the test pins it,
+// so a later change that reintroduces the finding fails instead of passing silently.
+// ---------------------------------------------------------------------------
+
+// Item 2, "Go selector writes read as `read`": REPRODUCED, and fixed here. A plain
+// selector write (`b.Count = n`), a package-level var and a cross-file receiver were
+// already `write`; an index-assignment (`b.Items["k"] = n`) was `read`, because
+// `is_write_target` looked two ancestors up for the assignment and stopped at the
+// `index_expression` above the selector. `WRITE_WRAPPERS` makes that level transparent.
+//
+// Each read assertion sits in a function whose ONLY mention of the symbol is a read, so
+// it cannot be satisfied by a write that was misread: `ReadsOnly` names each symbol once.
+// Without that separation a write classified as `read` would pass the read assertion and
+// the test could not see the finding it is named for.
+#[test]
+fn a_go_selector_write_is_a_write_and_not_a_read() {
+    let r = repo(&[
+        ("go.mod", GO_MOD),
+        (
+            "pkg/s/s.go",
+            r#"package s
+
+type Box struct {
+	Count int
+	Name  string
+	Items map[string]int
+}
+
+var Global int
+
+// WritesOnly names each symbol exactly once, in write position.
+func WritesOnly(b *Box, n int) {
+	b.Count = n
+	b.Name = "x"
+	b.Items["k"] = n
+	Global = n
+}
+
+// ReadsOnly names each symbol exactly once, in read position.
+func ReadsOnly(b *Box) (int, int, int, int) {
+	return b.Count + len(b.Name) + len(b.Items) + Global
+}
+
+// CompoundsOnly: `b.Count += 1` is a WRITE. The RHS is also a read of `b.Count`,
+    // but the extractor emits one reference per name occurrence and the write
+    // classification wins, so only the write edge exists.
+func CompoundsOnly(b *Box) { b.Count += 1 }
+
+// SubscriptOnly: `b.Items[b.Name] = 1` writes b.Items and READS b.Name as the key.
+// The key is a subscript, not the base, so a wrapper traversal that ignored which
+// child of the index expression it came through would call this a write (review
+// round 2, finding 1).
+func SubscriptOnly(b *Box) { b.Items[b.Name] = 1 }
+"#,
+        ),
+        (
+            "pkg/s/u.go",
+            "package s\n\nfunc Other(b *Box) { b.Count = 9 }\n",
+        ),
+    ]);
+    let conn = db(&index("build", r.path(), &[]));
+    let e = symbol_edges(&conn);
+    let s = "pkg/s/s.go";
+    let x = "pkg/s/u.go";
+    // plain selector writes, an index-write and a package-level var
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Box.Count"));
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Box.Name"));
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Box.Items"));
+    edge(&e, (s, "WritesOnly"), "ACCESSES", "write", (s, "Global"));
+    // the reads: only ReadsOnly mentions these symbols, and it reads them
+    let c = edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Box.Count"));
+    assert_eq!(c.0, 0.95);
+    edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Box.Name"));
+    edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Box.Items"));
+    edge(&e, (s, "ReadsOnly"), "ACCESSES", "read", (s, "Global"));
+    // `b.Count += 1`: a compound assignment is a write
+    edge(
+        &e,
+        (s, "CompoundsOnly"),
+        "ACCESSES",
+        "write",
+        (s, "Box.Count"),
+    );
+    // `b.Items[b.Name] = 1`: the BASE is written, the SUBSCRIPT is read
+    edge(
+        &e,
+        (s, "SubscriptOnly"),
+        "ACCESSES",
+        "write",
+        (s, "Box.Items"),
+    );
+    edge(
+        &e,
+        (s, "SubscriptOnly"),
+        "ACCESSES",
+        "read",
+        (s, "Box.Name"),
+    );
+    // a write through a receiver typed in ANOTHER file of the same package
+    let far = edge(&e, (x, "Other"), "ACCESSES", "write", (s, "Box.Count"));
+    assert_eq!((far.0, far.2.as_str()), (0.9, "receiver-typed"));
+}
+
+// Item 3, "Go/TS lexical file edges": NOT REPRODUCED as a defect. The WS-17 Decision
+// (plan line 1319) keeps the lexical `structure`/`flow` layers beside the resolved
+// `symbol` layer for exactly these two languages, as data for the legacy consumers.
+// A Go package-qualified call and a TS named import BOTH resolve
+// to symbol edges, and both files still keep their file-level edge, so `index impact`
+// on a resolved symbol walks `symbol` while a file-level consumer still has `lexical`.
+#[test]
+fn a_resolved_go_or_ts_edge_keeps_its_lexical_file_edge() {
+    let r = repo(&[
+        (
+            "web/a.ts",
+            "export function alpha(): number { return 1; }\n",
+        ),
+        (
+            "web/b.ts",
+            "import { alpha } from './a';\nexport function beta(): number { return alpha(); }\n",
+        ),
+        ("go.mod", GO_MOD),
+        ("pkg/x/x.go", "package x\n\nfunc Alpha() int { return 1 }\n"),
+        (
+            "pkg/y/y.go",
+            "package y\n\nimport \"example.com/app/pkg/x\"\n\nfunc Beta() int { return x.Alpha() }\n",
+        ),
+    ]);
+    let conn = db(&index("build", r.path(), &[]));
+    // the resolved symbol layer
+    let e = symbol_edges(&conn);
+    let ts = edge(&e, ("web/b.ts", "beta"), "CALLS", "", ("web/a.ts", "alpha"));
+    assert_eq!(
+        (ts.0, ts.1.as_str(), ts.2.as_str()),
+        (0.9, "scope", "import")
+    );
+    let go = edge(
+        &e,
+        ("pkg/y/y.go", "Beta"),
+        "CALLS",
+        "",
+        ("pkg/x/x.go", "Alpha"),
+    );
+    assert_eq!(
+        (go.0, go.1.as_str(), go.2.as_str()),
+        (0.9, "scope", "package")
+    );
+    // and the lexical file edges the Decision keeps beside them
+    let lexical = layer_edges(&conn, "structure");
+    assert!(
+        lexical.contains(&("web/b.ts".into(), "web/a.ts".into())),
+        "the TS importer lost its lexical file edge: {lexical:?}"
+    );
+    assert!(
+        lexical.contains(&("pkg/y/y.go".into(), "pkg/x/x.go".into())),
+        "the Go importer lost its lexical file edge: {lexical:?}"
+    );
+}
+
+// Item 4, "the TS global-tier candidate limit": NOT REPRODUCED. The global tier
+// resolves a unique top-level definition for every referencing file, not only for
+// one, so a nine-caller fixture must produce nine edges at 0.5/lexical. The lookup
+// is bounded (`top_level_files(..., 2)` decides uniqueness however many rows one file
+// holds), so the candidate set cannot grow with the number of callers.
+#[test]
+fn a_global_tier_name_resolves_for_every_calling_file() {
+    let mut list: Vec<(String, String)> = vec![(
+        "src/uniq.ts".to_string(),
+        "export function oneAndOnlyUniqueName(): number { return 1; }\n".to_string(),
+    )];
+    // nine caller files, each calling the name with NO import: the global tier, not the
+    // import tier (which would resolve at 0.9 and prove nothing about the candidate set)
+    for i in 1..=9 {
+        list.push((
+            format!("src/c{i}.ts"),
+            format!("export function c{i}(): number {{ return oneAndOnlyUniqueName(); }}\n"),
+        ));
+    }
+    let dir = TempDir::new().unwrap();
+    for (rel, content) in &list {
+        write(dir.path(), rel, content);
+    }
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "c"]);
+    let conn = db(&index("build", dir.path(), &[]));
+    let e = symbol_edges(&conn);
+    let mut callers = 0;
+    for ((_, _, kind, _, dst_path, dst_name), (conf, prov, reason, _)) in &e {
+        if kind == "CALLS" && dst_name == "oneAndOnlyUniqueName" && dst_path == "src/uniq.ts" {
+            assert_eq!(
+                (*conf, prov.as_str(), reason.as_str()),
+                (0.5, "lexical", "global-unique-name")
+            );
+            callers += 1;
+        }
+    }
+    assert_eq!(callers, 9, "one global-tier caller is missing: {e:?}");
+}
+
+// Item 5, "`find_export` falling back to a non-exported declaration": NOT REPRODUCED
+// as a defect. `imports_ts::find` falls back to a file's top-level declaration when the
+// file uses NO ES export syntax at all (`has_es_exports`), which is the documented rule —
+// "a CommonJS file (no ES export syntax) exports without the keyword" — and the index does
+// not read `module.exports`. So a non-ES-module file's declarations ARE its exports by
+// design, and a barrel naming one is honoured correctly rather than falling back wrongly.
+// Three halves, so the rule's boundary is what is pinned and not just one side of it.
+#[test]
+fn find_export_follows_a_real_re_export_and_stops_at_an_es_module_boundary() {
+    // (a) `deep.ts` declares `secret` and re-exports it by name: a true positive.
+    let r = repo(&[
+        (
+            "src/deep.ts",
+            "function secret(): number { return 1; }\nexport { secret };\n",
+        ),
+        ("src/barrel.ts", "export { secret } from './deep';\n"),
+        (
+            "src/use.ts",
+            "import { secret } from './barrel';\nexport function go(): number { return secret(); }\n",
+        ),
+    ]);
+    let conn = db(&index("build", r.path(), &[]));
+    let e = symbol_edges(&conn);
+    let hit = edge(
+        &e,
+        ("src/use.ts", "go"),
+        "CALLS",
+        "",
+        ("src/deep.ts", "secret"),
+    );
+    assert_eq!((hit.0, hit.2.as_str()), (0.9, "re-export"));
+
+    // (b) the documented non-ES-module rule, and the half the reviewer's finding is
+    // about. `find_export`'s fallback fires when the file uses NO ES export syntax --
+    // `imports_ts.rs` says "a CommonJS file (no ES export syntax) exports without the
+    // keyword" -- and the index does not read `module.exports`, so the rule is exactly
+    // "no ES export syntax", not "has a CommonJS export". `cjs.js` is written as a real
+    // CommonJS module so the fixture matches the rule it exercises; the assertion would
+    // be the same without the `module.exports` line, and that is the limitation, stated
+    // here rather than left for the next reader to assume otherwise.
+    let r2 = repo(&[
+        (
+            "src/cjs.js",
+            "function helper() { return 1; }\nmodule.exports = { helper };\n",
+        ),
+        ("src/barrel2.js", "export { helper } from './cjs';\n"),
+        (
+            "src/use2.js",
+            "import { helper } from './barrel2';\nexport function go2() { return helper(); }\n",
+        ),
+    ]);
+    let e2 = symbol_edges(&db(&index("build", r2.path(), &[])));
+    let cjs = edge(
+        &e2,
+        ("src/use2.js", "go2"),
+        "CALLS",
+        "",
+        ("src/cjs.js", "helper"),
+    );
+    assert_eq!((cjs.0, cjs.2.as_str()), (0.9, "re-export"));
+
+    // (c) and the guard really is the boundary: an ES module that exports something ELSE
+    // does NOT export `hidden`, so the barrel's claim is refused even though the
+    // declaration is there. This is the half that regresses if the `!has_es_exports`
+    // guard is dropped.
+    let r3 = repo(&[
+        (
+            "src/mod.ts",
+            "export const shown = 1;\nfunction hidden(): number { return 2; }\n",
+        ),
+        ("src/barrel3.ts", "export { hidden } from './mod';\n"),
+        (
+            "src/use3.ts",
+            "import { hidden } from './barrel3';\nexport function go3(): number { return hidden(); }\n",
+        ),
+    ]);
+    let e3 = symbol_edges(&db(&index("build", r3.path(), &[])));
+    let leaked = e3.iter().any(|((_, _, _, _, dst_path, dst_name), _)| {
+        dst_path == "src/mod.ts" && dst_name == "hidden"
+    });
+    assert!(
+        !leaked,
+        "an unexported declaration resolved through a barrel: {e3:?}"
     );
 }

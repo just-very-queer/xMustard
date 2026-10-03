@@ -54,3 +54,30 @@ func TestSecretPathsMatchGoldenSpec(t *testing.T) {
 		t.Error("SecretPathPatterns returned the package's own slice")
 	}
 }
+
+// A template file name exempts the .env patterns and nothing else, so a
+// template under a secret directory is refused by the directory rule itself.
+// The pattern is the evidence: a boolean verdict alone cannot tell the
+// directory rule winning from the .env rule being applied to the same name.
+func TestSecretPathTemplateUnderASecretDirectoryNamesTheDirectoryRule(t *testing.T) {
+	for _, c := range []struct{ path, pattern string }{
+		{".ssh/.env.example", "**/.ssh/**"},
+		{".ssh/.env.sample", "**/.ssh/**"},
+		{".ssh/.env.template", "**/.ssh/**"},
+		{"home/u/.ssh/.env.example", "**/.ssh/**"},
+		{`C:\Users\u\.ssh\.env.template`, "**/.ssh/**"},
+		{".SSH/.ENV.EXAMPLE", "**/.ssh/**"},
+		{"repo/../.ssh/.env.example", "**/.ssh/**"},
+	} {
+		if p, ok := MatchSecretPath(c.path); !ok || p != c.pattern {
+			t.Errorf("MatchSecretPath(%q) = %q, %v; want %q, true", c.path, p, ok, c.pattern)
+		}
+	}
+	// The counterpart: the same file name outside a secret directory stays
+	// public, so the rule is the file name's directory and not "never exempt".
+	for _, path := range []string{".env.example", "app/.env.sample", "docs/.env.template"} {
+		if p, ok := MatchSecretPath(path); ok {
+			t.Errorf("MatchSecretPath(%q) = %q, true; want public", path, p)
+		}
+	}
+}

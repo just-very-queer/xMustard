@@ -9,6 +9,8 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+
+	"xmustard/api-go/internal/hooks/transport"
 )
 
 type IssueUpdateRequest struct {
@@ -65,6 +67,27 @@ type SavedIssueViewRequest struct {
 	ReviewReadyOnly bool     `json:"review_ready_only"`
 }
 
+// checkPlatformID refuses an issue or view id that could not be carried back in a
+// path. The API validates every path wildcard before the handler runs and answers
+// 400 invalid_id for one that is not a safe segment, so an id stored here that fails
+// the check would make the object unreadable for the rest of its life.
+//
+// The rule is transport.ValidWorkspaceID, the same predicate the hook socket applies
+// to a workspace pin: 1-128 ASCII letters, digits, '_', '.' and '-', with "..",
+// "/", "\", a NUL and a control character all refused. It is not workspaceops's own
+// validateSafeID because that one has no length ceiling, and an unbounded id grows a
+// file name and an activity line with no bound.
+//
+// The one extra refusal is a lone ".", which transport.ValidWorkspaceID accepts and
+// the read layer's safeSegment does not: it answers 400 invalid_id for a wildcard of
+// exactly ".", so an id of "." would be stored and then unreachable.
+func checkPlatformID(kind, id string) error {
+	if id == "." || !transport.ValidWorkspaceID(id) {
+		return fmt.Errorf("invalid %s id: %w", kind, ErrInvalidInput)
+	}
+	return nil
+}
+
 func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest) (*issueRecord, error) {
 	if _, err := loadSnapshot(dataDir, workspaceID); err != nil {
 		return nil, err
@@ -76,6 +99,18 @@ func CreateIssue(dataDir string, workspaceID string, request IssueCreateRequest)
 	snapshot, err := loadSnapshot(dataDir, workspaceID)
 	if err != nil {
 		return nil, err
+	}
+	// The supplied id is checked before the trim: firstNonEmptyPtr trims, so
+	// checking its result would turn "TRK_0001\n" into a valid "TRK_0001" and
+	// normalize a control character at either end away instead of refusing it. The
+	// gate is on the raw string being non-empty, not on its trimmed form, so a
+	// supplied id that is only control characters is still a supplied id and is
+	// refused; only an absent or genuinely empty one falls through to the generated
+	// TRK_%04d.
+	if request.BugID != nil && *request.BugID != "" {
+		if err := checkPlatformID("issue", *request.BugID); err != nil {
+			return nil, err
+		}
 	}
 	bugID := strings.TrimSpace(firstNonEmptyPtr(request.BugID))
 	if bugID == "" {
@@ -283,6 +318,9 @@ func CreateSavedView(dataDir string, workspaceID string, request SavedIssueViewR
 	digest := sha1.Sum([]byte(seed))
 	slug := url.QueryEscape(strings.ReplaceAll(strings.ToLower(base), " ", "-"))
 	viewID := slug + "-" + hex.EncodeToString(digest[:])[:8]
+	if err := checkPlatformID("view", viewID); err != nil {
+		return nil, err
+	}
 	view := SavedIssueView{
 		ViewID:          viewID,
 		WorkspaceID:     workspaceID,
