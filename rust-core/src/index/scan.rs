@@ -135,6 +135,7 @@ fn stat_file(
     mode: Mode,
     max_file_size: u64,
 ) -> Option<(StatKey, Option<&'static str>)> {
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
     let meta = match std::fs::symlink_metadata(root.join(path)) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -241,6 +242,7 @@ fn now_ns() -> i64 {
 /// clean and dirty files alike.
 pub fn blob_id(bytes: &[u8]) -> String {
     use sha1::{Digest, Sha1};
+    crate::passcount::hashed(bytes.len() as u64);
     let mut h = Sha1::new();
     h.update(format!("blob {}\0", bytes.len()).as_bytes());
     h.update(bytes);
@@ -318,6 +320,21 @@ fn stream_git_records(
     root: &Path,
     args: &[&str],
     mut on_record: impl FnMut(&[u8]),
+) -> Result<(), String> {
+    let mut records = 0u64;
+    let mut on_record = |rec: &[u8]| {
+        records += 1;
+        on_record(rec);
+    };
+    let result = stream_git_records_inner(root, args, &mut on_record);
+    crate::passcount::note(crate::passcount::Pass::FilesListed, records);
+    result
+}
+
+fn stream_git_records_inner(
+    root: &Path,
+    args: &[&str],
+    on_record: &mut impl FnMut(&[u8]),
 ) -> Result<(), String> {
     let what = || format!("git {}", args.join(" "));
     crate::indexcache::note_git_spawn();
@@ -757,6 +774,9 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
             continue;
         }
         let ft = entry.file_type();
+        if !ft.is_dir() {
+            crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
+        }
         if ft.is_dir() {
             // an undecided directory is entered: its files are then reported one by one
             if ig.check(&mut memo, &rel, true) == Verdict::Ignored {

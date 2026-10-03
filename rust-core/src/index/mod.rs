@@ -1160,6 +1160,7 @@ fn incremental(
         }
     }
     let db_total = existing.len();
+    crate::passcount::note(crate::passcount::Pass::RowsLoaded, db_total as u64);
 
     // ---- classify without extracting: trusted unchanged stat keys skip the read; other
     // files are identified by hashing (or by the same read failure as before). Envelope
