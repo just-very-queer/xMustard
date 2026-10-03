@@ -77,8 +77,14 @@ fn commit(root: &Path, msg: &str) {
 /// suite (WS-FIX-27). `TempDir::new` creates through `fs::create_dir`, which takes the umask's
 /// bits: under a `0002` login umask the directory lands at `0775` and WS-FIX-11's refusal
 /// answers a fixture that changed nothing. A creation-time mode is narrowed by the umask and
-/// never widened, so `0700` holds under any umask, and unlike a `chmod` after the fact it
-/// leaves no window in which the directory is wider than the guard will accept.
+/// never widened, so no umask can make the directory **group- or other-accessible**, which is
+/// the property the guard tests; unlike a `chmod` after the fact it also leaves no window in
+/// which the directory is wider than the guard will accept.
+///
+/// A umask that clears owner bits (a `0177` or `0777` login umask) still narrows `0700` to
+/// `0600`, which no index call can traverse. That is left as it is: the umask is the operator's
+/// own setting, and the `0002` case that opened this row — and every other group/other bit —
+/// is closed. The claim is "no other user can reach it", not "the mode is always 0700".
 fn index_dir() -> TempDir {
     let mut b = tempfile::Builder::new();
     b.permissions(perm(0o700)).tempdir().unwrap()
@@ -168,26 +174,38 @@ fn umask_child_reports_the_mode_of_a_plain_tempdir() {
 /// plain `TempDir` is already `0700`, so `index_dir` could be a no-op without this noticing.
 #[test]
 fn an_index_fixture_dir_is_owner_only_whatever_the_process_umask() {
-    let mode_in = |body: &str| -> u32 {
-        let out = under_umask(0o002, body);
-        let line = out
-            .lines()
-            .find_map(|l| l.trim().strip_prefix("UMASK_MODE="))
-            .unwrap_or_else(|| panic!("no UMASK_MODE line in child output: {out:?}"));
-        u32::from_str_radix(line.trim(), 8).unwrap()
-    };
     assert_eq!(
-        mode_in("index_dir"),
+        mode_of_dir_under(0o002, "index_dir"),
         0o700,
         "index_dir did not create 0700 under umask 0002, so a fixture's mode comes from \
          whoever logged in and WS-FIX-11's refusal is umask-dependent"
     );
     assert_eq!(
-        mode_in("plain_tempdir"),
+        mode_of_dir_under(0o002, "plain_tempdir"),
         0o775,
         "a plain TempDir must land at 0775 under umask 0002, otherwise this test cannot \
          tell the explicit mode from the umask and proves nothing"
     );
+    // A umask that clears owner bits narrows the request too, so the mode is 0600 rather
+    // than 0700. It stays traversable-by-no-one, which is the property the guard tests, so
+    // the suite's result does not depend on the umask here either — but the figure is not
+    // 0700 and an assertion written as `== 0o700` would be claiming more than mkdir gives.
+    assert_eq!(
+        mode_of_dir_under(0o177, "index_dir"),
+        0o600,
+        "umask 0177 must narrow index_dir to 0600, since mkdir applies the umask to the \
+         requested mode rather than replacing it"
+    );
+}
+
+/// The mode `body` creates under umask `mask`, by way of the same child helper.
+fn mode_of_dir_under(mask: u32, body: &str) -> u32 {
+    let out = under_umask(mask, body);
+    let line = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("UMASK_MODE="))
+        .unwrap_or_else(|| panic!("no UMASK_MODE line in child output: {out:?}"));
+    u32::from_str_radix(line.trim(), 8).unwrap()
 }
 
 /// Several languages, imports, calls, inheritance, a test file and an isolated file.

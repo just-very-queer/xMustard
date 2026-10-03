@@ -1503,9 +1503,13 @@ four instead of a chmod after the fact at three.
 
 This row makes each fixture create its index directory with an **explicit `0700`** at creation
 time — `tempfile::Builder::permissions`, which `tempfile` passes to `mkdir`
-(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`), and which the umask can only narrow and never widen
-— so no fixture's
-result depends on the umask of whoever logs into the machine. It replaces the `tighten()`
+(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`) — so no fixture's result depends on the umask of
+whoever logs into the machine. The umask can only **narrow** the requested mode, never widen it,
+so no umask makes a fixture directory group- or other-accessible, which is what WS-FIX-11's
+refusal tests. A umask that clears owner bits (`0177`, `0777`) narrows `0700` to `0600`, which
+no index call can traverse; that is the operator's own setting and is left as it is, so the
+claim this row makes is "no other user can reach a fixture's index directory", not "the mode is
+always `0700`". It replaces the `tighten()`
 after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
 at every site, and it extends the fix to the one site that never had it
 (`legacy_equality_holds_on_parity_fixtures`, which builds into a `TempDir` with no `tighten` and
@@ -1554,10 +1558,10 @@ needs the `TempDir` itself to be the index directory, which only `index_query.rs
 - `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
 
 **Acceptance.** Every fixture in `rust-core/tests/index_query.rs` that hands a directory to the
-index creates it `0700` at creation time, so the suite's result is the same under `umask 0002`,
-`0022` and `0077`; no fixture calls `tighten` any more; and the new test fails if the explicit
-mode is removed. `BOXALL` is green on the box with clippy's warning count unchanged and
-`cargo fmt --check` clean.
+index creates it with an explicit `0700` at creation time, so no group- or other-accessible bit
+can appear under any umask and the suite's result is the same under `umask 0002` and `0022`; no
+fixture calls `tighten` any more; and the new test fails if the explicit mode is removed.
+`BOXALL` is green on the box with clippy's warning count unchanged and `cargo fmt --check` clean.
 
 **Collision risk.** `rust-core/tests/index_query.rs` is named by WS-FLK-01's row (merged
 `f543ae1`), which added `tighten` and the memprobe assertions, and by WS-FLK-08's row (merged
