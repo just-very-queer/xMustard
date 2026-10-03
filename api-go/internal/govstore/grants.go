@@ -114,8 +114,10 @@ type CollectionFilter struct {
 	Limit   int
 }
 
-// CollectionMemberResult reports whether an Add or Remove changed the store. A re-add
-// or a second remove is not an error and not a change.
+// CollectionMemberResult reports whether an Add or Remove inserted or deleted the row.
+// A re-add reports Created false but is not a no-op: it moves the membership to the end
+// of the collection's order and writes an event, so Created answers "did this row
+// exist", not "did anything change".
 type CollectionMemberResult struct {
 	CollectionID string `json:"collection_id"`
 	EntryID      string `json:"entry_id"`
@@ -286,11 +288,19 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 	if err != nil {
 		return CollectionMemberResult{}, err
 	}
-	// The collection's own workspace holds its members: a collection in another
-	// workspace cannot name this one.
-	if entry.WorkspaceID != col.OwnerWorkspace {
-		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, collection %s is owned by %s",
-			ErrInvalid, entryID, entry.WorkspaceID, collectionID, col.OwnerWorkspace)
+	// A collection holds its owner's memories, and the memories of any workspace that
+	// has granted this collection away: sharing is the point of a collection, so the
+	// cross-workspace case is the normal one and not a leak. A workspace with no grant
+	// naming this collection cannot place a memory in it.
+	var reachable int
+	if err := t.queryRow(ctx, `SELECT count(*) FROM grants
+		WHERE collection_id = ? AND source_workspace = ? AND revoked_at IS NULL`,
+		collectionID, entry.WorkspaceID).Scan(&reachable); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	if entry.WorkspaceID != col.OwnerWorkspace && reachable == 0 {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, which has no grant naming collection %s",
+			ErrInvalid, entryID, entry.WorkspaceID, collectionID)
 	}
 	// rowsAffected counts an upsert's update as a write too, so whether the membership
 	// was already there is read rather than inferred from the write.
@@ -324,11 +334,13 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 // RemoveFromCollection takes an entry out of a collection. Removing an entry that is
 // not in it is not an error and reports Removed false.
 //
-// A purged entry cannot be removed, and the store already enforces that: the removal
-// event carries data, and events_purged_no_text (schema.sql) aborts any insert naming a
-// purged entry that carries a note or data. The write is therefore refused at the SQL
-// layer rather than by a guard here, which is why the removal of a purged member
-// deletes the membership row and then fails the transaction: nothing is committed.
+// A purged entry's membership cannot be removed, and the store refuses it one layer
+// down as well: the removal event carries data, and events_purged_no_text
+// (schema.sql:264) aborts any insert naming a purged entry that carries a note or data.
+// The guard here exists because the trigger does not: it leaves the caller a clear
+// ErrInvalid instead of a SQL constraint message, and it makes the refusal independent
+// of whether the caller passed a note. Without it the membership row of a purged entry
+// would have no successful removal path at all.
 func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
 	if err := actor.validate(); err != nil {
 		return CollectionMemberResult{}, err
@@ -337,8 +349,12 @@ func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID st
 	if err != nil {
 		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
 	}
-	if _, err := t.GetEntry(ctx, entryID); err != nil {
+	entry, err := t.GetEntry(ctx, entryID)
+	if err != nil {
 		return CollectionMemberResult{}, err
+	}
+	if entry.Lifecycle == LifecyclePurged {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is purged; its membership is not written to", ErrInvalid, entryID)
 	}
 	res, err := t.exec(ctx, "DELETE FROM collection_members WHERE collection_id = ? AND entry_id = ?",
 		collectionID, entryID)

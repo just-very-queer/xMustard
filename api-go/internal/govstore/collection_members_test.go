@@ -199,8 +199,8 @@ func TestCollectionMembershipRefusesAMissingCollectionOrEntry(t *testing.T) {
 	}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("membership on a missing entry: %v", err)
 	}
-	// A collection in ws2 cannot hold an entry from ws1: membership is a relation
-	// inside the collection's own workspace, not a cross-workspace link.
+	// A collection in ws2 cannot hold an entry from ws1 while no grant names it:
+	// sharing is done by a grant, not by naming the collection.
 	var foreign Collection
 	mustUpdate(t, s, func(tx Tx) error {
 		var err error
@@ -211,10 +211,46 @@ func TestCollectionMembershipRefusesAMissingCollectionOrEntry(t *testing.T) {
 		_, err := tx.AddToCollection(ctx, foreign.ID, "m1", admin)
 		return err
 	}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("membership across workspaces: %v", err)
+		t.Fatalf("membership across workspaces with no grant: %v", err)
 	}
-	if n := countRows(t, s, "SELECT count(*) FROM collection_members"); n != 0 {
-		t.Fatalf("refused memberships stored %d rows, want 0", n)
+	// With a grant naming the collection, the same membership is the sharing case and
+	// is allowed: that is the flow the whole relation exists for.
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.Grant(ctx, GrantInput{SourceWorkspace: "ws1", CollectionID: foreign.ID,
+			Permission: PermissionReadWrite}, admin); err != nil {
+			return err
+		}
+		_, err := tx.AddToCollection(ctx, foreign.ID, "m1", admin)
+		return err
+	})
+	granted, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: foreign.ID})
+	if err != nil {
+		t.Fatalf("granted members: %v", err)
+	}
+	if len(granted) != 1 || granted[0].EntryID != "m1" {
+		t.Fatalf("granted members = %+v, want m1", granted)
+	}
+	// Revoking the grant closes the membership again: the entry is no longer reachable
+	// through that collection, so a later add is refused.
+	mustUpdate(t, s, func(tx Tx) error {
+		grants, err := tx.ListGrants(ctx, GrantFilter{CollectionID: foreign.ID})
+		if err != nil {
+			return err
+		}
+		if len(grants) != 1 {
+			t.Fatalf("grants = %+v", grants)
+		}
+		_, err = tx.Revoke(ctx, grants[0].ID, admin)
+		return err
+	})
+	if err := s.Update(ctx, func(tx Tx) error {
+		_, err := tx.AddToCollection(ctx, foreign.ID, "m1", admin)
+		return err
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("membership through a revoked grant: %v", err)
+	}
+	if n := countRows(t, s, "SELECT count(*) FROM collection_members"); n != 1 {
+		t.Fatalf("membership rows = %d, want only the granted one", n)
 	}
 	if err := s.Update(ctx, func(tx Tx) error {
 		_, err := tx.RemoveFromCollection(ctx, "col_nope", "m1", admin)
@@ -413,6 +449,13 @@ func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
 	}
 	if len(after) != len(before) {
 		t.Fatalf("a refused removal still wrote an event: %d before, %d after", len(before), len(after))
+	}
+	// The membership row of a purged entry must still have a way out, or it is
+	// metadata nothing can ever remove. It cannot be removed through this API, by the
+	// refusal above, so the store's own cleanup has to be the answer; this asserts the
+	// row is reachable there and not that some other writer exists.
+	if n := countRows(t, s, "SELECT count(*) FROM collection_members WHERE entry_id = 'm1'"); n != 1 {
+		t.Fatalf("membership rows for the purged entry = %d, want 1 pending cleanup", n)
 	}
 }
 
