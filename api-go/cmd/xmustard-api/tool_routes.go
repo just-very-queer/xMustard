@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"strconv"
@@ -34,30 +35,48 @@ func search(w http.ResponseWriter, r *http.Request) {
 	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
 	var result json.RawMessage
 	var err error
-	switch {
-	case q.Get("mode") == "symbol":
+	// `pattern` and `symbol` answer from their own surfaces, so they are dispatched
+	// first. The lexical modes share one request. A mode the tool does not advertise is
+	// bad input, not the hybrid by default, so `mode=exact|regex` (WS-59c) cannot answer
+	// silently until it lands.
+	switch mode := q.Get("mode"); {
+	case mode == "symbol":
 		// name-path lookup over the code index (WS-36): q is a name path.
 		var req workspaceops.SymbolSearchRequest
 		if req, err = workspaceops.ParseSymbolSearch(q, limit); err == nil {
 			result, err = workspaceops.SymbolSearchCtx(r.Context(), dd, ws, req)
 		}
-	case q.Get("mode") == "pattern":
+	case mode == "pattern":
 		// structural AST search: the query is an ast-grep pattern (e.g. `$A && $A()`).
+		// `lang` is ast-grep's own language here, not the lexical filter.
 		pat, perr := workspaceops.SearchSemanticPatternCtx(r.Context(), dd, ws, query, q.Get("lang"), q.Get("path"), limit)
 		if perr != nil {
 			respondError(w, perr)
 			return
 		}
 		result, err = json.Marshal(pat)
+	case mode != "" && mode != workspaceops.SearchModeHybrid && mode != workspaceops.SearchModeText:
+		respondError(w, fmt.Errorf("mode %q is not a search mode: %w", mode, workspaceops.ErrInvalidInput))
+		return
 	case q.Get("rerank") != "":
+		// The neural lane reranks a plain hybrid search and takes neither `mode` nor
+		// `lang`, so honouring one of them here would answer from a search that never
+		// applied it. Refuse rather than drop the filter silently.
+		if q.Get("mode") == workspaceops.SearchModeText || q.Get("lang") != "" {
+			respondError(w, fmt.Errorf("rerank cannot be combined with %w: rerank does not apply the mode or language filter",
+				workspaceops.ErrInvalidInput))
+			return
+		}
 		// optional neural lane: ?rerank=<provider>&embed_model=<model>
 		result, err = workspaceops.WorkspaceSearchReranked(dd, ws, query, q.Get("rerank"), q.Get("embed_model"), limit)
 	default:
-		// default search fuses the agent-feedback boost and records retrieval.
-		// optional ?seed=<symbol> activates the graph-proximity lane, ?path_glob=
-		// filters paths and ?cursor= continues a page (next_cursor).
+		// the default search fuses the agent-feedback boost and records retrieval.
+		// ?seed=<symbol> activates the graph-proximity lane, ?lang= and ?path_glob=
+		// filter, ?mode=text answers from the body lane alone, and ?cursor= continues a
+		// page (next_cursor).
 		result, err = workspaceops.WorkspaceSearchPage(r.Context(), dd, ws, workspaceops.SearchRequest{
-			Query: query, Seed: q.Get("seed"), PathGlob: q.Get("path_glob"), Cursor: q.Get("cursor"), Limit: limit,
+			Query: query, Seed: q.Get("seed"), PathGlob: q.Get("path_glob"), Lang: q.Get("lang"),
+			Mode: q.Get("mode"), Cursor: q.Get("cursor"), Limit: limit,
 		})
 	}
 	reply(w, result, err, respondError)
@@ -94,12 +113,18 @@ func explainFailure(w http.ResponseWriter, err error) {
 // edges; ?symbol= → blast radius by depth tier; ?path= → the files referencing one
 // file (WS-FIX-05); ?scope= → the symbols a scoped diff touches; otherwise the changes
 // since the index baseline. A parameter of another form (two targets among them), or
-// a value out of range, is a 400 before any core runs.
+// a value out of range, is a 400 before any core runs. A cursor= continues the tier page
+// the previous call handed back and becomes the core's offset (WS-59e); the paged forms
+// report has_more and next_cursor when a tier was cut.
 func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
 	params := map[string]string{}
 	for name := range q {
 		params[name] = q.Get(name)
+	}
+	if err := workspaceops.ResolveImpactCursor(ws, q, params); err != nil {
+		respondError(w, err)
+		return
 	}
 	form, rest, err := workspaceops.CheckImpactRequest(params)
 	if err != nil {
@@ -114,6 +139,7 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
 		if err == nil {
 			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+			result = workspaceops.WithImpactPaging(ws, q, result)
 		}
 	case workspaceops.ImpactFile:
 		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
@@ -122,6 +148,9 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	case workspaceops.ImpactChanges:
 		result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
+		if err == nil {
+			result = workspaceops.WithImpactPaging(ws, q, result)
+		}
 	default:
 		result, err = workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
 	}

@@ -1,11 +1,13 @@
 package workspaceops
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 
 	"xmustard/api-go/internal/rustcore"
@@ -125,6 +127,323 @@ func FileImpactCtx(ctx context.Context, dataDir, workspaceID, path string, param
 		return nil, err
 	}
 	return read.annotate(out), nil
+}
+
+// impactPagingMember is the member an impact result carries when a tier page has a
+// successor, beside the members the budget layer's own contract already writes for a
+// producer-paged list (toolbudget.ReportMember's siblings in apply.go).
+const (
+	impactHasMoreMember    = "has_more"
+	impactNextCursorMember = "next_cursor"
+	// impactTruncatedMember names a cut the answer cannot page past: the budget removed
+	// the tier list outright, so the answer carries counts and no position to continue
+	// from. It sits beside the paging members rather than in output_budget because it is
+	// the caller's answer to "is this everything", not the budget's own accounting.
+	impactTruncatedMember = "truncated"
+	// impactTruncatedTiers is its only value: the tiers went, the counts stayed.
+	impactTruncatedTiers = "tiers_removed"
+)
+
+// WithImpactPaging adds the paging members to an impact result whose tiers were cut:
+// has_more, and a next_cursor signed for the ranking that asked for the page. The core
+// already emits each tier's next_offset, so this reads the page rather than
+// recomputing it. A diff-scope result holds its walk under affected and only that walk
+// pages, so the members go at the top level beside by_depth either way: one result,
+// one page, one cursor. A result with no cut tier, or one that is not a JSON object, is
+// returned unchanged: the members are never invented for a form that has no list to
+// page.
+func WithImpactPaging(workspaceID string, q url.Values, raw json.RawMessage) json.RawMessage {
+	var res map[string]json.RawMessage
+	if json.Unmarshal(raw, &res) != nil || res == nil {
+		return raw
+	}
+	next := 0
+	for _, tiers := range []json.RawMessage{res["by_depth"], tiersOf(res["affected"])} {
+		if n := nextTierOffset(tiers); n > next {
+			next = n
+		}
+	}
+	if next == 0 {
+		return raw
+	}
+	cursor, err := json.Marshal(ImpactCursor(workspaceID, q)(next))
+	if err != nil {
+		return raw
+	}
+	res[impactHasMoreMember] = json.RawMessage("true")
+	res[impactNextCursorMember] = cursor
+	out, err := json.Marshal(res)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// tiersOf returns the by_depth member of a nested impact answer (a diff-scope result's
+// affected walk), or nil when it holds none.
+func tiersOf(body json.RawMessage) json.RawMessage {
+	if len(body) == 0 {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return nil
+	}
+	return obj["by_depth"]
+}
+
+// nextTierOffset returns the offset the deepest cut tier continues from: the highest
+// next_offset among the tiers, or 0 when none was cut. next_offset is absent on a tier
+// that returned its last item (the core skips it when there is none), so a complete
+// result yields 0 and gets no cursor. A page that carried no items at all yields 0 too:
+// summary_only drops every tier's items while keeping next_offset, and a cursor over a
+// ranking the caller cannot read would advance through pages that say nothing.
+func nextTierOffset(tiers json.RawMessage) int {
+	var page []tierReading
+	if json.Unmarshal(tiers, &page) != nil {
+		return 0
+	}
+	next := 0
+	for _, tier := range page {
+		if tier.items == 0 {
+			continue
+		}
+		if tier.NextOffset != nil && *tier.NextOffset > next {
+			next = *tier.NextOffset
+		}
+	}
+	return next
+}
+
+// tierReading is the part of a tier this file reads: how many items it carried, where the
+// page started and what the core said comes next. The items themselves are counted, not
+// kept: a result may be megabytes and decoding each item into a json.RawMessage would
+// copy every one of them, which is an allocation proportional to the response on a path
+// that runs before the output budget fits anything.
+type tierReading struct {
+	Offset     int  `json:"offset"`
+	Total      int  `json:"total"`
+	NextOffset *int `json:"next_offset"`
+	items      int
+}
+
+// UnmarshalJSON counts the items array without materialising it.
+func (t *tierReading) UnmarshalJSON(b []byte) error {
+	t.items = countArray(b, "items")
+	var v struct {
+		Offset     int  `json:"offset"`
+		Total      int  `json:"total"`
+		NextOffset *int `json:"next_offset"`
+	}
+	if err := json.Unmarshal(b, &v); err != nil {
+		return err
+	}
+	t.Offset, t.Total, t.NextOffset = v.Offset, v.Total, v.NextOffset
+	return nil
+}
+
+// countArray returns how many elements the named top-level member's array holds, or 0
+// when the member is absent or not an array. It walks the raw bytes tracking string and
+// nesting state and counting the commas that separate elements at the array's own level,
+// so nothing proportional to the array's size is allocated.
+//
+// Only a member at the object's top level counts. A tier carries user-controlled text —
+// a symbol name, a file path, a label — and that text can hold the bytes `"items":[`. A
+// plain byte search would find that first and count an array the caller put in a string,
+// so the walk starts after the opening brace and each match must sit at depth 1.
+func countArray(b []byte, name string) int {
+	key := []byte(`"` + name + `"`)
+	depth := 0
+	inStr, esc := false, false
+	for i := 0; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case esc:
+			esc = false
+			continue
+		case inStr && c == '\\':
+			esc = true
+			continue
+		case c == '"':
+			// A key at the object's own level is the only match; text inside a string is
+			// skipped wholesale, so a name holding `"items":[ cannot be read as the member.
+			if !inStr && depth == 1 && bytes.HasPrefix(b[i:], key) {
+				if n := arrayLen(b, i+len(key)); n >= 0 {
+					return n
+				}
+			}
+			inStr = !inStr
+			continue
+		case inStr:
+			continue
+		case c == '{' || c == '[':
+			depth++
+			continue
+		case c == '}' || c == ']':
+			depth--
+			continue
+		}
+	}
+	return 0
+}
+
+// arrayLen counts the elements of the array that follows the member key at i, or -1 when
+// what follows the key is not an array.
+func arrayLen(b []byte, i int) int {
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
+	}
+	if i >= len(b) || b[i] != ':' {
+		return -1
+	}
+	i++
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
+	}
+	if i >= len(b) || b[i] != '[' {
+		return -1
+	}
+	i++
+	for i < len(b) && isJSONSpace(b[i]) {
+		i++
+	}
+	if i < len(b) && b[i] == ']' {
+		return 0 // an empty array has no elements
+	}
+	// depth is the array's own level plus any container open inside an element, so an
+	// element starts at depth 1, the commas between elements are the ones at depth 1, and
+	// the array's closing ] is the ] seen at depth 1. Strings are skipped wholesale so a
+	// bracket or comma inside one is not counted.
+	elements, depth := 1, 1
+	inStr, esc := false, false
+	for ; i < len(b); i++ {
+		c := b[i]
+		switch {
+		case esc:
+			esc = false
+		case inStr && c == '\\':
+			esc = true
+		case c == '"':
+			inStr = !inStr
+		case inStr:
+		case c == '{' || c == '[':
+			depth++
+		case c == '}' || c == ']':
+			if c == ']' && depth == 1 {
+				return elements
+			}
+			depth--
+		case c == ',' && depth == 1:
+			elements++
+		}
+	}
+	return -1
+}
+
+func isJSONSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// ImpactBudgetTrimmed reports whether the output budget cut a tier page. A cursor
+// continues at the core's next_offset, which describes the core's page rather than the
+// delivered one, so a trimmed page's cursor would skip the items the budget removed.
+// The budget's report names the rung that cut it; the caller uses this to drop the
+// cursor instead of letting a client follow it past items it never saw. The tier's own
+// total still reports what the tier holds, so re-paging with offset= is lossless.
+func ImpactBudgetTrimmed(out []byte) bool {
+	var res struct {
+		OutputBudget *struct {
+			Stages []string `json:"stages"`
+		} `json:"output_budget"`
+	}
+	if json.Unmarshal(out, &res) != nil || res.OutputBudget == nil {
+		return false
+	}
+	for _, stage := range res.OutputBudget.Stages {
+		if stage == "tiers_trimmed" || stage == "tiers_total" {
+			return true
+		}
+	}
+	return false
+}
+
+// ReconcileImpactPaging fixes up a budgeted impact result whose tier page the budget
+// cut. The cursor the handler signed describes the core's page, not the delivered one,
+// so following it would skip the items the budget removed. It is re-signed here to
+// continue at the first item the caller did not receive, which is the core's offset plus
+// the items actually delivered: the caller then pages without computing an offset, which
+// is the hand-computed paging this row exists to remove. When nothing can be signed (a
+// rung removed the tiers outright, or the page delivered no item), the paging contract
+// closes rather than hanging open: has_more goes false and the cut is named, because a
+// has_more with no next_cursor tells the caller to keep calling and hands back the same
+// page. A result the budget did not cut is returned unchanged.
+func ReconcileImpactPaging(workspaceID string, q url.Values, out []byte) []byte {
+	var res map[string]json.RawMessage
+	if json.Unmarshal(out, &res) != nil || res == nil {
+		return out
+	}
+	if !ImpactBudgetTrimmed(out) {
+		return out
+	}
+	next, ok := deliveredTierOffset(res)
+	// has_more and next_cursor appear together or not at all: has_more is true exactly
+	// when a cursor was signed, so a client that follows it always has somewhere to go.
+	// Neither a rung that removed the tiers outright (tiers_total) nor a page that
+	// delivered no item leaves a cursor to sign, and both close the contract the same
+	// way, with truncated naming the cut so a counts-only answer is not read as the
+	// whole walk.
+	if !ok || next == 0 {
+		delete(res, impactNextCursorMember)
+		res[impactHasMoreMember] = json.RawMessage("false")
+		res[impactTruncatedMember] = json.RawMessage(strconv.Quote(impactTruncatedTiers))
+	} else {
+		cursor, err := json.Marshal(ImpactCursor(workspaceID, q)(next))
+		if err != nil {
+			return out
+		}
+		delete(res, impactTruncatedMember)
+		res[impactNextCursorMember] = cursor
+		res[impactHasMoreMember] = json.RawMessage("true")
+	}
+	reconciled, err := json.Marshal(res)
+	if err != nil {
+		return out
+	}
+	return reconciled
+}
+
+// deliveredTierOffset returns the offset the next page continues from when a budget cut
+// this one: the page's own offset plus the fewest items any tier delivered, so no tier
+// is skipped (the shortest tier is the binding constraint). ok is false when no tier
+// list survived to read, which is the tiers_total case.
+func deliveredTierOffset(res map[string]json.RawMessage) (int, bool) {
+	next := 0
+	sawTiers := false
+	for _, body := range []json.RawMessage{res["by_depth"], tiersOf(res["affected"])} {
+		if len(body) == 0 {
+			continue
+		}
+		var page []tierReading
+		if json.Unmarshal(body, &page) != nil {
+			return 0, false
+		}
+		for _, tier := range page {
+			sawTiers = true
+			// A tier that has delivered everything it holds is finished and does not
+			// bind the cursor. "Everything" is offset+items against total, not the
+			// page's item count: a tier at offset 3 with two items of five has
+			// delivered all five, and counting only the page would let a finished
+			// tier's stale position constrain the tiers that still have items.
+			at := tier.Offset + tier.items
+			if at >= tier.Total {
+				continue
+			}
+			if next == 0 || at < next {
+				next = at
+			}
+		}
+	}
+	return next, sawTiers
 }
 
 // indexedRead brings the workspace's code index to its observed identity, runs one

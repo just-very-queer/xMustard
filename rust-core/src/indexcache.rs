@@ -27,7 +27,6 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -134,19 +133,17 @@ pub fn sweep_stale_temps(dir: &Path, max_age: Duration) -> usize {
 /// Stdout cap for index/identity Git commands (`status -z`, `ls-files -s -z`).
 pub const MAX_GIT_OUTPUT_BYTES: usize = 32 << 20;
 
-static GIT_SPAWNS: AtomicU64 = AtomicU64::new(0);
-
 /// Count one Git child started by this process. Every Git spawn outside the tests
 /// calls this (`run_git_bounded*`, the index scan's streamed listings, change
 /// tracking's `git` helper, `ownership owners`), so `serve`'s `$/stats` can show that
 /// queries spawn none while the watcher vouches for the tree (PAR-FRESH-03).
 pub fn note_git_spawn() {
-    GIT_SPAWNS.fetch_add(1, Ordering::Relaxed);
+    crate::passcount::note(crate::passcount::Pass::GitSpawns, 1);
 }
 
 /// Git children this process has started.
 pub fn git_spawns() -> u64 {
-    GIT_SPAWNS.load(Ordering::Relaxed)
+    crate::passcount::totals().get(crate::passcount::Pass::GitSpawns)
 }
 
 /// Why a bounded Git command produced no usable output.
@@ -254,11 +251,26 @@ pub fn run_git_bounded_input(
         Ok(Err(())) => Err(GitRunError::Overflow(max_bytes)),
         Err(_) => Err(GitRunError::TimedOut(timeout)),
     };
-    if result.is_err() {
-        let _ = child.kill();
-        let _ = child.wait();
+    match &result {
+        Ok(out) => crate::passcount::note(crate::passcount::Pass::FilesListed, listed(args, out)),
+        Err(_) => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
     result
+}
+
+/// Path records in a NUL-separated listing (`ls-files -z`, `status -z`); 0 for any other
+/// command. A status rename's origin path is a record of its own.
+fn listed(args: &[&str], out: &[u8]) -> u64 {
+    let sub = args.iter().find(|a| !a.starts_with('-')).copied();
+    match sub {
+        Some("ls-files" | "status") if args.contains(&"-z") => {
+            out.split(|b| *b == 0).filter(|r| !r.is_empty()).count() as u64
+        }
+        _ => 0,
+    }
 }
 
 fn git_output(root: &Path, args: &[&str]) -> Option<Vec<u8>> {
@@ -710,6 +722,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
                     budget -= bytes.len() as u64;
                     id.files_hashed += 1;
                     id.bytes_hashed += bytes.len() as u64;
+                    crate::passcount::hashed(bytes.len() as u64);
                     DirtyContent::Sha256(sha_hex(&bytes))
                 }
                 Err(SourceReadFailure::Missing) => DirtyContent::Deleted,
@@ -743,6 +756,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
                     DirtyContent::Incomplete(f) => f.reason(),
                     _ => "identity_budget",
                 };
+                crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
                 match fs::symlink_metadata(layout.toplevel.join(&rel)) {
                     Ok(m) => format!("{what}:{}", change_token(&m)),
                     Err(_) => format!("{what}:no-metadata"),

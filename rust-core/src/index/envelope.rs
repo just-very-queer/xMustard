@@ -193,6 +193,7 @@ impl Freshness {
                 break;
             }
             let Some(recorded) = indexed(p) else { continue };
+            crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
             let now = std::fs::symlink_metadata(root.join(p)).ok().map(|m| {
                 let k = super::scan::StatKey::of(&m);
                 (k.size, k.mtime_ns)

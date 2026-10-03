@@ -1255,6 +1255,7 @@ fn build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib() {
     assert_eq!(cov["complete"], true, "{cov:#}");
     assert!(cov["symbols"].as_u64().unwrap() > 20_000);
     let (dirty, rss) = (memprobe::mib(peaks.dirty), memprobe::mib(peaks.tree_rss));
+    peaks.assert_sampled_dirty("index build of 5,000 files");
     eprintln!(
         "index build of 5,000 files: dirty peak {dirty:.1} MiB, RSS peak {rss:.1} MiB \
          (own {:.1}), report {:?}",
@@ -1262,7 +1263,6 @@ fn build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib() {
         rep["timing"]
     );
     if let Some(line) = BUILD_5000_DIRTY_MIB {
-        assert!(peaks.dirty > 0, "no dirty-memory sample");
         assert!(
             dirty <= line,
             "dirty peak {dirty:.1} MiB exceeds the {line} MiB bound"
@@ -1831,6 +1831,7 @@ fn deep_nesting_is_bounded_and_reported() {
         .unwrap();
     assert_eq!(engine, "tree_sitter");
     let mib = memprobe::mib(peaks.tree_rss);
+    peaks.assert_sampled("deeply nested and dense build");
     eprintln!(
         "deeply nested and dense build: peak RSS {mib:.1} MiB, dirty peak {:.1} MiB",
         memprobe::mib(peaks.dirty)
@@ -1913,6 +1914,7 @@ fn tracked_sets_far_past_the_envelope_keep_the_worker_bounded() {
     // `git ls-files` itself holds the whole Git index (about 28 MiB for 120k entries,
     // measured alone); it is an external child and runs while the worker is at its
     // scan-time low, so the worker's own peak is the bound asserted here.
+    peaks.assert_sampled("120,000 tracked entries past the envelope");
     eprintln!(
         "120,000 tracked entries past the envelope: worker peak RSS {mib:.1} MiB (sampled), \
          with children {:.1} MiB, dirty peak {:.1} MiB",
@@ -2064,6 +2066,7 @@ fn max_size_ignore_files_keep_the_worker_bounded() {
         "{cov:#}"
     );
     let mib = memprobe::mib(peaks.rss);
+    peaks.assert_sampled("max-size ignore files");
     eprintln!(
         "max-size ignore files: worker peak RSS {mib:.1} MiB, dirty peak {:.1} MiB in {elapsed:?}",
         memprobe::mib(peaks.dirty)

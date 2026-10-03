@@ -202,6 +202,7 @@ impl Files {
     fn load(seg: &Segment) -> Result<Files, String> {
         let (heap, off) = seg.path_heap()?;
         let rows = seg.file_rows()?;
+        crate::passcount::note(crate::passcount::Pass::RowsLoaded, rows.len() as u64);
         let mut files = Files {
             heap,
             off,
@@ -273,6 +274,12 @@ impl Snapshot {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Which files have a scope resolver, so their symbols have resolved symbol edges
+    /// (WS-38b's `areas` projects over exactly those).
+    pub fn resolved_files(&self) -> &[bool] {
+        &self.files.resolved
     }
 
     /// The import-cycle report of this generation, computed once.

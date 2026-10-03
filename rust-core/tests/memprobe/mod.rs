@@ -109,6 +109,39 @@ pub struct Peaks {
     pub status: ExitStatus,
 }
 
+impl Peaks {
+    /// Fail unless the loop in [`child_peaks`] actually sampled this child.
+    ///
+    /// `dirty` and `rss` start at zero and `sample` returns `None` for a pid it
+    /// cannot read, so a child that was never observed leaves both at zero — and
+    /// an upper bound checked against zero (`mib(0.0) <= line`) passes vacuously
+    /// while measuring nothing. Every memory guard calls this before its bound, so
+    /// a probe that stopped sampling is a loud failure instead of a green line.
+    /// `tree_rss` needs no check: the kernel fills `wait4` rusage whether or not
+    /// this loop sampled.
+    pub fn assert_sampled(&self, probe: &str) {
+        assert!(
+            self.rss > 0,
+            "{probe}: memprobe sampled no RSS (rss 0, tree_rss {}), so the bound below \
+             would pass on a reading that was never taken; the child was alive \
+             (tree_rss > 0), so /proc was unreadable while it ran -- check \
+             XMUSTARD_MEMPROBE_BLANK and the uid the test binary runs under",
+            self.tree_rss
+        );
+    }
+
+    /// [`Self::assert_sampled`], plus a dirty peak, for a guard that bounds `dirty`.
+    pub fn assert_sampled_dirty(&self, probe: &str) {
+        self.assert_sampled(probe);
+        assert!(
+            self.dirty > 0,
+            "{probe}: memprobe sampled no dirty memory (rss {}), so the dirty bound below \
+             would pass on a reading that was never taken",
+            self.rss
+        );
+    }
+}
+
 /// Run `cmd` to completion, sampling the child while it runs.
 pub fn child_peaks(cmd: &mut Command) -> Peaks {
     let child = cmd.spawn().unwrap();
