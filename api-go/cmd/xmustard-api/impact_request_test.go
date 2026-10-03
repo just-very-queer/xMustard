@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -58,6 +59,105 @@ func TestImpactRouteRefusesMixedFormsBeforeRunningTheCore(t *testing.T) {
 	}
 	if _, err := os.Stat(ran); err == nil {
 		t.Fatal("a refused impact request ran the core")
+	}
+}
+
+// A cursor drives the route end to end: the first page's next_cursor is accepted by
+// the same query with cursor= in place of offset=, it becomes the core's --offset, and
+// the cursor it returns continues the next page. The stub core pages a five-item tier
+// the way the real one does (offset, then limit, next_offset when the page does not
+// reach total), so the pages walked here are the core's own rule.
+func TestImpactCursorPagesTheRouteEndToEnd(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	argsLog := filepath.Join(t.TempDir(), "core-args")
+	core := filepath.Join(t.TempDir(), "xmustard-core")
+	// The stub records its argv so the test can assert the cursor became --offset, and
+	// pages the fixture tier itself rather than echoing a canned answer.
+	script := `#!/bin/sh
+echo "$@" >> ` + argsLog + `
+offset=0
+limit=2
+total=5
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --offset=*) offset="${1#--offset=}" ;;
+    --limit=*) limit="${1#--limit=}" ;;
+  esac
+  shift
+done
+items=""
+i=$offset
+end=$((offset + limit))
+[ $end -gt $total ] && end=$total
+while [ $i -lt $end ]; do
+  items="$items{\"name\":\"i$i\",\"depth\":1},"
+  i=$((i + 1))
+done
+[ -n "$items" ] && items="${items%,}"
+next=""
+[ $end -lt $total ] && next=",\"next_offset\":$end"
+printf '{"symbol":"Serve","impacted_count":%s,"by_depth":[{"depth":1,"total":%s,"offset":%s,"items":[%s]%s}]}' "$total" "$total" "$offset" "$items" "$next"
+`
+	if err := os.WriteFile(core, []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	ws, root := "wsCursor", t.TempDir()
+	snap, _ := json.Marshal(map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": root}})
+	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workspaces", ws, "snapshot.json"), snap, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	seen := map[string]bool{}
+	query := "?symbol=Serve&limit=2"
+	for page := 0; page < 4; page++ {
+		resp, err := http.Get(srv.URL + "/api/workspaces/" + ws + "/changes/since-index" + query)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("page %d: status %d, body %s", page, resp.StatusCode, body)
+		}
+		var res struct {
+			ByDepth []struct {
+				Items []struct {
+					Name string `json:"name"`
+				} `json:"items"`
+			} `json:"by_depth"`
+			NextCursor string `json:"next_cursor"`
+		}
+		if err := json.Unmarshal(body, &res); err != nil {
+			t.Fatalf("page %d: %v (%s)", page, err, body)
+		}
+		if len(res.ByDepth) == 0 || len(res.ByDepth[0].Items) == 0 {
+			t.Fatalf("page %d returned no items", page)
+		}
+		for _, it := range res.ByDepth[0].Items {
+			if seen[it.Name] {
+				t.Fatalf("page %d repeats %q: the cursor overlapped", page, it.Name)
+			}
+			seen[it.Name] = true
+		}
+		if res.NextCursor == "" {
+			break
+		}
+		query = "?symbol=Serve&limit=2&cursor=" + url.QueryEscape(res.NextCursor)
+	}
+	if len(seen) != 5 {
+		t.Fatalf("walked %d of 5 items: the cursor left a gap: %v", len(seen), seen)
+	}
+	// The cursor reached the core as --offset, not as a cursor the core would ignore.
+	args, err := os.ReadFile(argsLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--offset=2") || !strings.Contains(string(args), "--offset=4") {
+		t.Errorf("the cursor became the core's offset: %s", args)
 	}
 }
 
