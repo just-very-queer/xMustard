@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"path/filepath"
 	"testing"
 )
@@ -241,40 +242,168 @@ func TestCollectionMembersListingIsBounded(t *testing.T) {
 		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "team", OwnerWorkspace: "ws1"}, admin)
 		return err
 	})
-	for _, id := range []string{"m1", "m2", "m3"} {
-		propose(t, s, id, "t", "c")
-		mustUpdate(t, s, func(tx Tx) error {
-			_, err := tx.AddToCollection(ctx, col.ID, id, admin)
-			return err
-		})
+	// More members than the store cap, so the clamp and the cursor are measured
+	// against the ceiling rather than against three fixtures. They are added in one
+	// transaction: 1,001 separate writes would cost more than they prove.
+	const n = maxListLimit + 1
+	ids := make([]string, n)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("b%04d", i)
 	}
-	members, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, Limit: 2})
-	if err != nil {
-		t.Fatalf("bounded members: %v", err)
-	}
-	if len(members) != 2 || members[0].EntryID != "m1" || members[1].EntryID != "m2" {
-		t.Fatalf("bounded members = %+v", members)
-	}
-	// Page past the cap: the second call starts after the first call's last seq, so
-	// every member stays reachable however many there are.
-	more, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, AfterSeq: members[1].Seq})
-	if err != nil {
-		t.Fatalf("paged members: %v", err)
-	}
-	if len(more) != 1 || more[0].EntryID != "m3" {
-		t.Fatalf("paged members = %+v, want m3", more)
-	}
-	// An over-large limit is clamped to the store cap, never honoured as asked, so a
-	// caller cannot make one read unbounded.
-	if want, got := maxListLimit, clampLimit(1<<20); got != want {
-		t.Errorf("clampLimit(1<<20) = %d, want %d", got, want)
-	}
-	members, err = s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, Limit: 1 << 20})
+	mustUpdate(t, s, func(tx Tx) error {
+		for _, id := range ids {
+			if _, err := tx.InsertEntry(ctx, NewEntry{
+				ID: id, WorkspaceID: "ws1", Title: "t", Content: "c",
+			}, alice); err != nil {
+				return err
+			}
+		}
+		for _, id := range ids {
+			if _, err := tx.AddToCollection(ctx, col.ID, id, admin); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+
+	// The cap holds: an over-large limit is clamped, and the read stops there.
+	members, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, Limit: 1 << 20})
 	if err != nil {
 		t.Fatalf("clamped members: %v", err)
 	}
+	if len(members) != maxListLimit {
+		t.Fatalf("clamped members = %d, want the cap %d", len(members), maxListLimit)
+	}
+	if want, got := maxListLimit, clampLimit(1<<20); got != want {
+		t.Errorf("clampLimit(1<<20) = %d, want %d", got, want)
+	}
+	// A small limit is honoured.
+	members, err = s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, Limit: 2})
+	if err != nil {
+		t.Fatalf("bounded members: %v", err)
+	}
+	if len(members) != 2 || members[0].EntryID != ids[0] || members[1].EntryID != ids[1] {
+		t.Fatalf("bounded members = %+v", members)
+	}
+	// Paging past the cap reaches the member the clamped read could not return, which
+	// is the promise the cursor exists for.
+	more, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, Limit: 1 << 20, AfterSeq: members[1].Seq})
+	if err != nil {
+		t.Fatalf("paged members: %v", err)
+	}
+	// 1,001 members, the first two already read: 999 remain, the tail the clamped
+	// first read could not return, in membership order.
+	if len(more) != n-2 || more[0].EntryID != ids[2] || more[len(more)-1].EntryID != ids[n-1] {
+		t.Fatalf("second page = %d members from %q to %q, want %d from %q to %q",
+			len(more), more[0].EntryID, more[len(more)-1].EntryID, n-2, ids[2], ids[n-1])
+	}
+}
+
+// A membership's order number is never reused. Removing the member holding the highest
+// seq and then adding another must not hand the new member a number a caller paging
+// with AfterSeq has already passed.
+func TestCollectionMemberSequenceIsNotReusedAfterRemoval(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "t", "c")
+	propose(t, s, "m2", "t2", "c2")
+	propose(t, s, "m3", "t3", "c3")
+	admin := Actor{Principal: "admin"}
+	var col Collection
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "team", OwnerWorkspace: "ws1"}, admin)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		for _, id := range []string{"m1", "m2", "m3"} {
+			if _, err := tx.AddToCollection(ctx, col.ID, id, admin); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	members, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID})
+	if err != nil {
+		t.Fatalf("members: %v", err)
+	}
 	if len(members) != 3 {
-		t.Fatalf("clamped members = %+v", members)
+		t.Fatalf("members = %+v", members)
+	}
+	highest := members[2].Seq
+	// A caller has paged as far as the member holding the highest seq.
+	cursor := members[2].Seq
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.RemoveFromCollection(ctx, col.ID, "m3", admin) // the highest
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin) // a re-add after the removal
+		return err
+	})
+	members, err = s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID})
+	if err != nil {
+		t.Fatalf("members after removal and re-add: %v", err)
+	}
+	if len(members) != 2 {
+		t.Fatalf("members after removal and re-add = %+v, want 2", members)
+	}
+	// m2 keeps the seq it was given: only the member added after the removal moves. The
+	// point is that no member's seq drops to or below a number a paged caller has passed.
+	for _, m := range members {
+		if m.EntryID == "m1" && m.Seq <= highest {
+			t.Errorf("the re-added member has seq %d, want above the removed high-water %d", m.Seq, highest)
+		}
+	}
+	// The member added after the removal is reachable from a cursor already at the old
+	// high-water mark, which is what a caller paging at that point holds.
+	after, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, AfterSeq: cursor})
+	if err != nil {
+		t.Fatalf("members after the cursor: %v", err)
+	}
+	if len(after) != 1 || after[0].EntryID != "m1" {
+		t.Fatalf("members after the cursor = %+v, want only the re-added m1", after)
+	}
+}
+
+// A purged entry's membership is not removable: the removal would append an event
+// naming an entry whose history Purge ended.
+func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "t", "c")
+	admin := Actor{Principal: "admin"}
+	var col Collection
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "team", OwnerWorkspace: "ws1"}, admin)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin)
+		return err
+	})
+	if err := s.Update(ctx, func(tx Tx) error {
+		return tx.Purge(ctx, "m1", "retracted", admin)
+	}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	before, err := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", Types: []string{EventCollectionMember}})
+	if err != nil {
+		t.Fatalf("events before: %v", err)
+	}
+	if err := s.Update(ctx, func(tx Tx) error {
+		_, err := tx.RemoveFromCollection(ctx, col.ID, "m1", Actor{Principal: "admin", Note: "free text"})
+		return err
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("removing a purged member: %v", err)
+	}
+	after, err := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", Types: []string{EventCollectionMember}})
+	if err != nil {
+		t.Fatalf("events after: %v", err)
+	}
+	if len(after) != len(before) {
+		t.Fatalf("a refused removal still wrote an event: %d before, %d after", len(before), len(after))
 	}
 }
 

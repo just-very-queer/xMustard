@@ -292,11 +292,6 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, collection %s is owned by %s",
 			ErrInvalid, entryID, entry.WorkspaceID, collectionID, col.OwnerWorkspace)
 	}
-	var seq int64
-	if err := t.queryRow(ctx, "SELECT coalesce(max(seq), 0) + 1 FROM collection_members WHERE collection_id = ?",
-		collectionID).Scan(&seq); err != nil {
-		return CollectionMemberResult{}, err
-	}
 	// rowsAffected counts an upsert's update as a write too, so whether the membership
 	// was already there is read rather than inferred from the write.
 	var n int
@@ -306,23 +301,31 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 	}
 	created := n == 0
 	principal := strings.TrimSpace(actor.Principal)
+	// The membership's order is the history's seq, which the append below allocates and
+	// which never repeats even when the member holding the highest seq is removed: a
+	// per-collection max(seq) over the live rows would reuse the number and a caller
+	// paging with AfterSeq would never reach the entry added next.
+	seq, err := t.insertEvent(ctx, actor, eventRow{
+		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember, Revision: entry.Revision,
+		Data: map[string]any{"collection_id": collectionID, "op": "add", "created": created},
+	})
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
 	if _, err := t.exec(ctx, `INSERT INTO collection_members (collection_id, entry_id, added_by, added_at, seq)
 		VALUES (?, ?, ?, ?, ?) ON CONFLICT (collection_id, entry_id) DO UPDATE SET
 		added_by = excluded.added_by, added_at = excluded.added_at, seq = excluded.seq`,
 		collectionID, entryID, principal, t.nowText(), seq); err != nil {
 		return CollectionMemberResult{}, err
 	}
-	if err := t.appendEvent(ctx, actor, eventRow{
-		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember, Revision: entry.Revision,
-		Data: map[string]any{"collection_id": collectionID, "op": "add", "created": created},
-	}); err != nil {
-		return CollectionMemberResult{}, err
-	}
 	return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID, Created: created}, nil
 }
 
 // RemoveFromCollection takes an entry out of a collection. Removing an entry that is
-// not in it is not an error and reports Removed false.
+// not in it is not an error and reports Removed false. A purged entry is refused rather
+// than removed: the removal event names the entry, and Purge exists to end an entry's
+// history, so an event naming it afterwards would undo that. The membership row stays
+// and both reads already skip it.
 func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
 	if err := actor.validate(); err != nil {
 		return CollectionMemberResult{}, err
@@ -330,6 +333,13 @@ func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID st
 	col, err := t.GetCollection(ctx, collectionID)
 	if err != nil {
 		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
+	}
+	entry, err := t.GetEntry(ctx, entryID)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	if entry.Lifecycle == LifecyclePurged {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is purged; its membership is no longer written to", ErrInvalid, entryID)
 	}
 	res, err := t.exec(ctx, "DELETE FROM collection_members WHERE collection_id = ? AND entry_id = ?",
 		collectionID, entryID)

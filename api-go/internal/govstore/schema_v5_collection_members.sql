@@ -24,8 +24,10 @@ CREATE TABLE collection_members (
 -- Listing a collection's members reads one collection's rows in the order they were
 -- added, and `seq` is the membership's own order rather than the entry's `pk`, so a
 -- re-add moves an entry to the end instead of leaving it where it first appeared. It is
--- allocated per collection as max(seq)+1 inside the writing IMMEDIATE transaction, so
--- two writers never collide on it.
+-- the seq of the membership's own `collection_member` event, which is the store's
+-- monotonic counter: a per-collection max(seq) over the live rows would reuse a number
+-- once the member holding it was removed, and a caller paging with AfterSeq would never
+-- reach the entry added next.
 CREATE INDEX collection_members_order ON collection_members (collection_id, seq);
 
 -- The entry side is read when a memory is shown or purged: which collections hold it.
