@@ -421,7 +421,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "depth", type: "integer", minimum: 0, maximum: 3, desc: "mode=symbol: child levels" },
 			{ name: "include_body", type: "boolean", desc: "mode=symbol: add bodies" },
 			{ name: "include_info", type: "boolean", desc: "mode=symbol: add signatures, docs" },
-			{ name: "substring", type: "boolean", desc: "mode=symbol: substring match" },
+			{ name: "substring", type: "boolean", desc: "mode=symbol: substring" },
 		],
 		build: (a) => ({
 			method: "GET",
@@ -464,13 +464,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+			"Blast radius. symbol= → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since baseline.",
 		args: [
 			workspaceArg,
-			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
+			{ name: "symbol", type: "string", desc: "name, Container.name, UID or path" },
 			{ name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file" },
-			{ name: "from", type: "string", desc: "trace path from this symbol" },
-			{ name: "to", type: "string", desc: "trace path to this symbol" },
+			{ name: "from", type: "string", desc: "trace from here" },
+			{ name: "to", type: "string", desc: "trace to here" },
 			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "hops (default 3; path= 4)" },
 		],
 		// impactTool.Advanced in tool_impact.go: the diff scopes, the walk's filters and
@@ -484,18 +484,22 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 				name: "scope",
 				type: "string",
 				enum: ["unstaged", "staged", "all", "workspace", "compare", "commit", "range"],
-				desc: "symbols a diff touches, and their dependents",
+				desc: "symbols a diff touches, and dependents",
 			},
-			{ name: "base", type: "string", maxLength: 256, desc: "scope=compare|range: base revision" },
-			{ name: "head", type: "string", maxLength: 256, desc: "scope=compare|commit|range: head revision" },
-			{ name: "worktree", type: "string", maxLength: MAX_PATH_ARG, desc: "another checkout of this repository to diff" },
-			{ name: "relation_types", type: "string", maxLength: 128, desc: "edge kinds to walk (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)" },
+			{ name: "base", type: "string", maxLength: 256, desc: "scope=compare|range: base" },
+			{ name: "head", type: "string", maxLength: 256, desc: "scope=compare|commit|range: head" },
+			{ name: "worktree", type: "string", maxLength: MAX_PATH_ARG, desc: "another checkout to diff" },
+			{ name: "relation_types", type: "string", maxLength: 128, desc: "edge kinds (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)" },
 			{ name: "min_confidence", type: "number", minimum: 0, maximum: 1, desc: "skip edges below this confidence" },
 			{ name: "include_tests", type: "boolean", desc: "walk test files (default false)" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: BUDGET_MAX_LIMIT, desc: "items per depth tier (default 50)" },
-			{ name: "offset", type: "integer", minimum: 0, maximum: 50000, desc: "items skipped per depth tier" },
-			{ name: "summary_only", type: "boolean", desc: "counts, risk and envelope without items" },
+			{ name: "offset", type: "integer", minimum: 0, maximum: 50000, desc: "items skipped per tier" },
+			{ name: "summary_only", type: "boolean", desc: "counts, risk, no items" },
 			{ name: "timeout_ms", type: "integer", minimum: 1, maximum: 60000, desc: "walk budget (default 10000)" },
+			// WS-59e: the tier cursor, Advanced like the rest and documented at
+			// xmustard://docs/tools. The budget layer does not page impact's tiers, so
+			// it is declared here rather than coming from maxCharsArg's set.
+			{ name: "cursor", type: "string", maxLength: 64, desc: "next_cursor of the previous page" },
 		],
 		build: (a) => ({
 			method: "GET",
@@ -504,6 +508,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			path: query(
 				ws(a, "/changes/since-index"),
 				...impactQuery.flatMap((k) => [k === "max_depth" ? "depth" : k, str(a, k)]),
+				// WS-59e: the tier cursor travels beside the budget arguments, as Go's
+				// Build sends it (budgetQuery omits it for a non-Paged budget tool).
+				"cursor", str(a, "cursor"),
 				"max_chars", budgetMaxChars(a, IMPACT_DEFAULT_MAX_CHARS),
 			),
 		}),
