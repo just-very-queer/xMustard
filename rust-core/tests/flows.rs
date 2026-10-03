@@ -625,12 +625,18 @@ fn the_cap_keeps_the_highest_scoring_candidates_and_drops_the_rest() {
 /// Two seeds with identical scores are ordered by (path, line, name), so the list is the
 /// same on every run and does not depend on the order the index happened to store them.
 ///
-/// The 240-candidate fixture pins the cap and this one pins the tie-break: same score for
-/// every entry point, all in one file, so path is equal and the order must fall to line and
-/// then to name. `Entry0`..`Entry9` are declared in source order, so line order and name
-/// order agree here; the point is that a rule reading only one of the two would still pass
-/// on this fixture, so the assertion checks that the emitted order is the declared one
-/// rather than that some particular comparator produced it.
+/// Twelve entry points, every one scoring the same, all in one file — so `path` is equal
+/// for all of them and the order must fall to `line` and then to `name`. They are declared
+/// in source order, so line order and name order agree here and the emitted list reads as
+/// the declared one; the point of asserting the list rather than a single comparator is
+/// that a rule reading only one of the two keys would pass this fixture too, so the test
+/// pins the RESULT the reader sees.
+///
+/// Mutation row M29 is not this row's subject and does not need it. Dropping the `name`
+/// tie-break from `flows_of`'s sort is EQUIVALENT, because `rank_seeds` has already
+/// ordered `ranked` by the identical (score, path, line, name) key one call earlier, and
+/// this sort is stable over an already-sorted vector. `rank_seeds` is where the tie-break
+/// does its work, and its own copy of the key is what this test exercises.
 #[test]
 fn seeds_with_equal_scores_keep_a_stable_declared_order() {
     let mut src = String::from("package pkg\n\n");
@@ -960,13 +966,18 @@ fn a_flow_takes_its_shared_name_stem_and_says_so() {
 /// The stem is cut back to a WHOLE word, and the cut is what separates this rule from
 /// "take the longest shared character prefix".
 ///
-/// `BatchOne`, `BatchTwo`, `BatchThree` and `BatchFour` share six characters and then
-/// diverge inside the next word, so the character prefix and the whole-word stem are
-/// different strings and only one of them is the answer. The previous attempt at this row
-/// mutated the `trim_end_matches` on `word`, which is a no-op — the line above it already
-/// cut `common` at the same boundary — so the row survived for a reason that had nothing to
-/// do with the test. This fixture's names are chosen so that removing the whole-word cut
-/// changes the label the answer reports.
+/// Two previous fixtures for this row failed to bite, for two different reasons worth
+/// naming. Names like `BatchOne`/`BatchTwo` share six characters with no separator, so the
+/// whole-word cut has nothing to cut and the mutation is a no-op. `Harvest*` shares ten
+/// characters with no separator either, for the same reason. So the names here carry a
+/// separator INSIDE the shared region: `Batch_One` and `Batch_Two` share `Batch_`, and the
+/// character prefix of all four is `Batch_` while the whole-word stem is `Batch`. Dropping
+/// the `rfind`/`map_or` step therefore changes the label the answer reports, which is what
+/// the row needs.
+///
+/// The earlier version of this row also mutated the `trim_end_matches` on `word`, which is
+/// a no-op because the line above already cut `common` at the same boundary. The mutation
+/// that bites is the `word` step, and the previous one was worth nothing.
 #[test]
 fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
     let d = repo(&[
@@ -974,10 +985,10 @@ fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
         (
             "pkg/stem.go",
             gofuncs_ref(&[
-                go_func("BatchOne", &["BatchTwo", "BatchThree"]),
-                go_func("BatchTwo", &["BatchThree"]),
-                go_func("BatchThree", &["BatchFour"]),
-                go_func("BatchFour", &[]),
+                go_func("Batch_One", &["Batch_Two", "Batch_Three"]),
+                go_func("Batch_Two", &["Batch_Three"]),
+                go_func("Batch_Three", &["Batch_Four"]),
+                go_func("Batch_Four", &[]),
             ]),
         ),
     ]);
@@ -988,26 +999,16 @@ fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
         .iter()
         .find(|f| f.rule == "name_stem")
         .unwrap_or_else(|| panic!("a name_stem flow in {flows:?}"));
+    // The separator is inside the shared region, so the character prefix would carry a
+    // trailing underscore and the whole-word cut drops it.
     assert_eq!(
         f.label, "Batch",
-        "the stem is the shared whole word: {f:?}"
+        "the stem is the shared whole word, without the separator: {f:?}"
     );
     assert!(
         f.steps.iter().all(|(n, _)| n.starts_with("Batch")),
         "every step leads with the label: {f:?}"
     );
-    // The label ends at a word boundary in every step, so no listed name is cut in half by
-    // it. A character-prefix rule would fail this on the first step whose next character
-    // is lowercase.
-    for (name, _) in &f.steps {
-        let after = name.strip_prefix("Batch").unwrap_or_else(|| {
-            panic!("step {name} does not start with the label Batch: {f:?}")
-        });
-        assert!(
-            after.starts_with(|c: char| c.is_uppercase()) || after.is_empty(),
-            "the label must end at a word boundary, not mid-word ({name}): {f:?}"
-        );
-    }
 }
 
 #[test]
@@ -1262,6 +1263,14 @@ fn only_resolved_call_edges_become_steps() {
     // Two Go modules in one repository that call across each other. The resolver admits
     // those as symbol CALLS, so there is a flow; and the answer reports how many resolved
     // CALLS its walks read, which is the number a lexical edge would inflate and cannot.
+    //
+    // Mutation row M15 drops the `layer == "symbol"` half of the admission filter and is
+    // EQUIVALENT on this graph: the walk reads `Direction::Downstream.adjacency()` of a
+    // SYMBOL node, and the only layers reachable there are the symbol layer and the file
+    // layer's self-loop — no lexical `structure` or `flow` edge is adjacent to a symbol row,
+    // so the kind filter alone is sufficient to keep them out. The filter is kept because
+    // it states the intent and because a future adjacency change could break it; it is not
+    // claimed as test-covered, and row M15 is the evidence for that.
     let d = repo(&[
         ("one/go.mod", "module example/one\n\ngo 1.21\n"),
         ("two/go.mod", "module example/two\n\ngo 1.21\n"),
