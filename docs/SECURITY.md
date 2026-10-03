@@ -879,6 +879,17 @@ below.
   given only when the answer that carries its frame, or the note that withheld it, was
   written. A memory that does not fit in the ~10,000-character context left is counted
   in the withheld note as `too_large`, with the `recall` call that shows it.
+- **A disabled `recall` disables pushed memory too.** A hook route names no `Tool` in the
+  gate table below, because naming one would make the route answer `403 tool_disabled`
+  and take `watchPaths`, the restored snapshot and the prior session's handoff away with
+  the memories. So the handler applies the switch itself, at the two places a hook
+  injects memory: the standing-memory projection and ground's memory section on
+  SessionStart and SubagentStart, and every candidate a UserPromptSubmit or PreToolUse
+  event pushes. It asks the same predicate `/api/auth/whoami` and `tools/list` ask, so a
+  hook can never reach memory a `recall` call would be refused, and it fails closed: no
+  frame, and no withheld note naming which memories the agent is not being shown. The
+  hook still answers, with its watch list, its restored session state and its run
+  failures (a failed run is an outcome, not memory).
 - **Processes.** The daemon starts no process for a hook: Rust work runs only on a
   resident worker that is already running. Claude Code itself starts the static client
   once per event for the two command hooks, SessionStart and WorktreeRemove; every

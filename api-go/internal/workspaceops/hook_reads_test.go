@@ -182,6 +182,34 @@ func TestHookGroundingSpawnsNothingAndListsWhatItSkipped(t *testing.T) {
 	}
 }
 
+// HookGroundingNoMemory is HookGrounding for a deployment that serves this caller no
+// recall, and the HTTP test cannot see the difference: its fixture has no stale and no
+// pending memory, so a read store would answer 0 where a skipped one answers nil and both
+// render "0". So the assertion is at the subject, and it is fail-closed by shape: every
+// memory field is left unset, never zero, so a renderer cannot report a count it did not
+// read. The run fields stay, because a failed run is an outcome and not memory.
+func TestHookGroundingNoMemoryLeavesTheMemorySectionUnread(t *testing.T) {
+	dir, ws, _ := hookMemoryFixture(t)
+	hookPropose(t, dir, ws, ProposeContextRequest{Title: "t", Content: "c"})
+	t.Setenv("XMUSTARD_CORE_BIN", "/nonexistent/xmustard-core")
+
+	g := HookGroundingNoMemory(context.Background(), dir, ws)
+	if g.StaleMemory != nil || g.PendingForYou != nil || g.MemoryPressure != nil || g.MemoryRevision != nil {
+		t.Fatalf("the no-memory grounding read a count: %+v", g)
+	}
+	if g.Onboarding != nil {
+		t.Errorf("onboarding is a memory-store conclusion: %+v", g.Onboarding)
+	}
+	if g.BlockedByFailingVerification == nil {
+		t.Error("the run section must stay: it is an outcome, not memory")
+	}
+	for _, f := range hookUnsampled {
+		if !g.isUnknown(f) {
+			t.Errorf("%s not listed unknown: %+v", f, g.Unknown)
+		}
+	}
+}
+
 // A client-reported change drops the cached identity; without a watcher on the root
 // nothing takes the paths, and nothing is started to find one.
 func TestNoteChangedPathsDropsTheCachedIdentity(t *testing.T) {
