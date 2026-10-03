@@ -529,6 +529,8 @@ fn push_field(h: &mut Sha256, bytes: &[u8]) {
 
 /// Bytes read from a Git dir's small files (`HEAD`, a loose ref, a `gitdir:` pointer).
 const GIT_POINTER_BYTES: u64 = 4 << 10;
+/// Bytes of `.gitmodules` read to tell a submodule from an unregistered gitlink.
+const MAX_GITMODULES_BYTES: u64 = 1 << 20;
 
 fn read_small(path: &Path, cap: u64) -> Option<Vec<u8>> {
     use std::io::Read;
@@ -569,13 +571,15 @@ fn nested_git_dir(dir: &Path) -> Option<PathBuf> {
 /// The token of a nested repository at `dir`, read without a Git child: its HEAD, the
 /// ref HEAD names (the loose ref, else the stat key of `packed-refs`) and the stat key
 /// of its Git index. A commit, a checkout or staging inside it changes the token; an
-/// unstaged edit in its worktree belongs to that repository and does not.
-fn nested_repo_token(dir: &Path) -> String {
+/// unstaged edit in its worktree belongs to that repository and does not. None when
+/// its Git dir does not resolve or its HEAD cannot be read: then nothing keys it.
+fn nested_repo_token(dir: &Path) -> Option<String> {
     let mut h = Sha256::new();
     match nested_git_dir(dir) {
-        None => push_field(&mut h, b"no-git-dir"),
+        None => return None,
         Some(git_dir) => {
-            let head = read_small(&git_dir.join("HEAD"), GIT_POINTER_BYTES).unwrap_or_default();
+            let head =
+                read_small(&git_dir.join("HEAD"), GIT_POINTER_BYTES).filter(|h| !h.is_empty())?;
             push_field(&mut h, &head);
             let common = read_small(&git_dir.join("commondir"), GIT_POINTER_BYTES).map_or_else(
                 || git_dir.clone(),
@@ -599,11 +603,12 @@ fn nested_repo_token(dir: &Path) -> String {
             push_field(&mut h, stat_token(&git_dir.join("index")).as_bytes());
         }
     }
-    format!("nested_repo:{:x}", h.finalize())
+    Some(format!("nested_repo:{:x}", h.finalize()))
 }
 
-/// The `path` values of the `[submodule "..."]` sections of `<toplevel>/.gitmodules`,
-/// read line by line (only the paths are kept); empty when absent. A value is decoded
+/// The `path` values of the `[submodule "..."]` sections of `<toplevel>/.gitmodules`
+/// within its first MAX_GITMODULES_BYTES (a gitlink named only past them reads as
+/// unregistered); empty when absent. A value is decoded
 /// as Git config does: quotes removed, `\"`, `\\`, `\t` and `\n` unescaped, and an
 /// unquoted `#` or `;` starts a comment.
 pub(crate) fn submodule_paths(toplevel: &Path) -> std::collections::BTreeSet<String> {
@@ -612,11 +617,15 @@ pub(crate) fn submodule_paths(toplevel: &Path) -> std::collections::BTreeSet<Str
     let Ok(f) = fs::File::open(toplevel.join(".gitmodules")) else {
         return paths;
     };
+    let f = std::io::Read::take(f, MAX_GITMODULES_BYTES);
     let mut in_submodule = false;
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         let line = line.trim();
         if let Some(section) = line.strip_prefix('[') {
-            in_submodule = section.trim_start().starts_with("submodule");
+            in_submodule = section
+                .trim_start()
+                .strip_prefix("submodule")
+                .is_some_and(|rest| rest.starts_with([' ', '\t', '"', ']']));
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -677,17 +686,19 @@ fn directory_entry(
     if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
         return None;
     }
-    // a `.git` whose Git dir does not resolve has no state to key: not a nested repository
-    if !has_own_git(&dir) || nested_git_dir(&dir).is_none() {
+    if !has_own_git(&dir) {
         return Some(DirtyContent::Incomplete(SourceReadFailure::NotRegular));
     }
+    // a `.git` whose Git dir or HEAD cannot be read has no state to key
+    let Some(token) = nested_repo_token(&dir) else {
+        return Some(DirtyContent::Incomplete(SourceReadFailure::Unreadable(
+            "nested repository: its Git dir or HEAD cannot be read".into(),
+        )));
+    };
     let rel = String::from_utf8_lossy(trimmed);
     let modules = modules.get_or_insert_with(|| submodule_paths(toplevel));
     let kind = nested_kind(!e.is_untracked(), &rel, modules);
-    Some(DirtyContent::NestedRepo {
-        kind,
-        token: nested_repo_token(&dir),
-    })
+    Some(DirtyContent::NestedRepo { kind, token })
 }
 
 /// Compute the source identity of the working tree at `root` (see module docs).
@@ -1512,6 +1523,7 @@ mod tests {
         fs::write(top.path().join("good/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
         fs::create_dir_all(top.path().join("broken")).unwrap();
         fs::write(top.path().join("broken/.git"), b"gitdir: /nonexistent/xm\n").unwrap();
+        fs::create_dir_all(top.path().join("headless/.git")).unwrap();
         fs::create_dir_all(top.path().join("plain")).unwrap();
         fs::write(top.path().join("file.rs"), b"fn f() {}\n").unwrap();
         let mut modules = None;
@@ -1522,7 +1534,8 @@ mod tests {
             None => "none".into(),
         };
         assert_eq!(kind("good"), NESTED_GITLINK_UNREGISTERED);
-        assert_eq!(kind("broken"), "not_regular");
+        assert_eq!(kind("broken"), "unreadable");
+        assert_eq!(kind("headless"), "unreadable");
         assert_eq!(kind("plain"), "not_regular");
         assert_eq!(kind("file.rs"), "none");
         assert_eq!(kind("gone"), "none");
@@ -1538,6 +1551,7 @@ mod tests {
                 "[submodule \"a\"]\n\tpath = libs/a ; comment\n\turl = ../a\n",
                 "[submodule \"b\"]\n\tPath = \"with space/b\"\n",
                 "[submodule \"c\"]\n\tpath = \"quote\\\"d\" # trailing\n",
+                "[submodule-extra \"x\"]\n\tpath = not/either\n",
             ),
         )
         .unwrap();
