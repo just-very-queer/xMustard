@@ -2063,6 +2063,26 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 
 **Collision risk.** main.go gets one line. xmustard-ops main.go is shared with WS-32, WS-34 and WS-44 (add subcommand files, not inline code). The per-tool mcpserver files are shared.
 
+### WS-29a — Govstore migration 5: collection membership
+
+**Goal.** Append migration 5 to `api-go/internal/govstore/migrate.go`, adding the one sharing relation the store does not have: which entries a collection holds. `collections`, `grants` and `applicability` have been in migration 1 since `bd3d2fc` (WS-01), and `grants.go` writes and reads them, but nothing links a memory to a collection. `grants.collection_id` is a foreign key to `collections (id)` and is the only relationship either table has; a collection is today a named grant target that holds nothing, so WS-29c's "a granted collection appears in the target" and WS-29e's `shared list` have nothing to resolve. This row adds the membership table, the two membership reads the rest of WS-29 needs, and nothing else.
+
+**Requirements.** PAR-SHARE-02 (PAR-SHARE-01 is untouched: principal-derived scopes are WS-29b, and no scope is derived or written by this row.)
+
+**Files.** `api-go/internal/govstore/schema_v5_collection_members.sql`, `api-go/internal/govstore/migrate.go`, `api-go/internal/govstore/grants.go`, `api-go/internal/govstore/store_test.go`
+
+**New modules.** none (one new SQL migration file; the Go members go in the existing `grants.go`)
+
+**Tests required.**
+- A v4 file migrates to 5 and its collections, grants, applicability and entries survive the step
+- An entry can be added to and listed from a collection, and removing it stops the listing
+- A membership for an entry or collection that does not exist is refused, and a grant never carries a membership across a missing entry
+- A collection's members list is bounded and the newest membership wins on a re-add
+
+**Acceptance.** `LatestSchemaVersion()` is 5; a database opened at migration 4 upgrades and keeps its data; `AddToCollection`, `ListCollectionMembers` and `RemoveFromCollection` answer for a collection that holds entries. No route, gate row, MCP argument or budget line changes, so `SECDOC`, `CAPS`, `GOLD`, `RET`, `PI` and `BUD` are not named by §3.0 for this row.
+
+**Not in this row, deliberately.** Principal-derived scopes and the identity-smuggling test (WS-29b); grant-driven visibility, revoke-hides and the applicability labels reaching recall (WS-29c); routes, the gate table and `SECDOC` (WS-29d); `xmustard-ops shared` (WS-29e); the scope-leak fixture suite (WS-29f). Membership is a store-level relation and nothing above `internal/govstore` reads it yet; that is what makes 29a's diff small and its gate narrow.
+
 ### WS-30 — Cross-workspace code query, residency LRU, worktree identity and path rewriting
 
 **Goal.** search, explain and impact accept workspaces or a group. The resident service holds at most K hot indexes (default 1) with LRU and idle eviction; cold repos are served by pread or loaded on demand in the heavy slot. Detect linked worktrees and record branch/worktree identity. Store anchors repo-relative, with a longest-prefix path rewrite map for foreign absolute paths.
