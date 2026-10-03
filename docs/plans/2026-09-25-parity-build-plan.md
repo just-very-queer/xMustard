@@ -3919,17 +3919,6 @@ PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operatio
 
 **Acceptance.** (1) `search(mode="text", lang="go")` returns chunk-text matches in Go files only, checked against an independent oracle: a term planted in a Go and a Rust function body, and a term planted in a Go and a Rust file path. (2) `search(mode="hybrid", lang="go")` narrows the hybrid's hits to Go files and invents none: every hit it returns is a hit of the unfiltered query. (3) The retrieval gate does not regress: `RET` is ≥21/21 and never below the merge base. (4) `CAPS` passes with both caps unchanged and `instructions` unchanged: no new argument is added, so §5.1 rule 9 is satisfied by construction. (5) `go-calls.txt` still holds `called search` and no new subcommand appears, so the manifest test is untouched. (6) Every `mode` value the tool advertises is one the route accepts, and an unknown `mode` is a 400 rather than the hybrid.
 
-**Design.** The cursor is the existing `cursorCodec` with a new kind, `i2`, carrying the
-per-tier offset as one field, signed over a ranking key that is the workspace plus every
-argument that selects or shapes the tier page (the fields `explainRanking` marshals,
-`navigation.go:380-383`), so 52a's unification has one shape to fold rather than three.
-`ImpactCursor`/`DecodeImpactCursor` mirror `ExplainCursor`/`DecodeExplainCursor`. The names
-are the query's own: `Build` and the Pi mirror both send the walk's depth as `depth`, and
-`ImpactFlags` reads `params["depth"]`. `has_more` is computed where the page is, from the
-tier's own `next_offset` and `total`, and a `next_offset` of 0 is never issued. This row
-adds the *reporting* and the cursor, not a second paging mechanism (`pageParams` owns
-`limit`/`offset` and is unchanged, so there is no dead knob).
-
 **Boundary.** 59c adds `mode=exact|regex` beside this one and 59d/59e/59f do not touch `search`; 59b therefore owns the `mode` dispatch and the `lang` semantics, and a later row reads them. G§5.3 is untouched: `impact path=` is neither replaced nor renamed here. No new argument, no new subcommand and no new `tools/list` property. Two existing `search` properties do change in `tools_list.json`: `mode`'s enum gains `text` and `lang`'s gains `maxLength`, and the full-profile byte caps in `tools_list_budget.json` are reduced by the saving, never raised.
 
 **Verified facts this section rests on** (`rg` on this branch's base `4dd9164`):

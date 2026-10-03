@@ -234,6 +234,91 @@ func TestImpactCursorBindsTheDepthTheAPIRecieves(t *testing.T) {
 	if n, err := DecodeImpactCursor("ws", with(q, "max_depth", "5"), c); err != nil || n != 4 {
 		t.Errorf("a max_depth the API never received changes nothing: %d %v", n, err)
 	}
+	// symbols= bounds the diff-scope walk, so it is part of that ranking: a cursor
+	// issued against one bound must not page a ranking that used another
+	// (WS-59e-r5-1). The bound is read from the form table the code validates against,
+	// so a parameter added there later cannot be left out of the key unnoticed.
+	scoped := url.Values{"scope": {"unstaged"}, "depth": {"3"}, "limit": {"2"}}
+	scopedCursor := ImpactCursor("ws", scoped)(4)
+	if _, err := DecodeImpactCursor("ws", with(scoped, "symbols", "50"), scopedCursor); !IsInvalidInput(err) {
+		t.Error("another symbols= bound's ranking refuses it, want invalid input")
+	}
+	if n, err := DecodeImpactCursor("ws", scoped, scopedCursor); err != nil || n != 4 {
+		t.Errorf("the same symbols= bound round trips: %d %v", n, err)
+	}
+}
+
+// Every parameter the diff-scope and blast forms accept is bound by the ranking key.
+// This walks the form's own table rather than a hand-copied list, so a parameter added
+// to impactParams without reaching impactRanking fails here (WS-59e-r5-1). Each value is
+// one the parameter's own validator accepts, so the oracle is the code under test's
+// table and not a hand-picked literal; a parameter whose validator takes no value this
+// helper can invent is listed rather than skipped silently.
+func TestEveryImpactParameterThatShapesAPageIsBoundByTheCursor(t *testing.T) {
+	q := url.Values{"scope": {"unstaged"}, "depth": {"3"}, "limit": {"2"}}
+	cursor := ImpactCursor("ws", q)(4)
+	var unchecked []string
+	for _, form := range []ImpactForm{ImpactBlast, ImpactChanges} {
+		for _, p := range impactParams[form] {
+			if p.param == "cursor" || p.param == "offset" || p.check == nil {
+				continue // the page position itself, not a shaping argument
+			}
+			value := nextValue(p.check, q.Get(p.param))
+			if value == "" {
+				unchecked = append(unchecked, string(form)+":"+p.param)
+				continue
+			}
+			other := with(q, p.param, value)
+			if n, err := DecodeImpactCursor("ws", other, cursor); err == nil && n == 4 {
+				t.Errorf("%s is accepted for the %s form but %s=%s does not change the cursor's ranking",
+					p.param, form, p.param, value)
+			}
+		}
+	}
+	if len(unchecked) > 0 {
+		t.Errorf("these accepted parameters had no value this helper could use, so they are unproven: %v", unchecked)
+	}
+}
+
+// nextValue returns a value check accepts that differs from current, so the
+// table-driven test needs no hand-copied per-parameter values: it walks the closed sets
+// the package already declares (the scope names, the directions, the relation types) and
+// then a few plausible scalars, picking the first the parameter's own validator takes
+// that is not the one the query already carries. Returns "" when it cannot find one,
+// which the caller reports rather than skips silently.
+func nextValue(check func(string) error, current string) string {
+	values := append([]string{}, ChangeScopes...)
+	values = append(values, "upstream", "downstream")
+	values = append(values, RelationTypes...)
+	values = append(values, "7", "1", "true", "false", "go", "/tmp/x", "0.5", "50", "2")
+	for _, v := range values {
+		if v != current && check(v) == nil {
+			return v
+		}
+	}
+	return ""
+}
+
+// The signer refuses to name a page position its own validator would reject, so a tier
+// reaching past the bound yields has_more with no cursor rather than a cursor the next
+// request cannot follow (WS-59e-r5-2). The bound is read from the constant the
+// validator uses, so the two cannot drift apart.
+func TestTheCursorSignerNeverNamesAPositionTheValidatorRefuses(t *testing.T) {
+	q := url.Values{"symbol": {"Serve"}}
+	if c := ImpactCursor("ws", q)(MaxImpactOffset); c == "" {
+		t.Errorf("the last accepted position %d signs nothing", MaxImpactOffset)
+	}
+	if c := ImpactCursor("ws", q)(MaxImpactOffset + 1); c != "" {
+		t.Errorf("position %d past the bound signs %q, which the next request refuses", MaxImpactOffset+1, c)
+	}
+	// The bound itself is what the form table enforces, asserted here so a test that
+	// reads MaxImpactOffset cannot pass against a constant nothing validates against.
+	if _, _, err := CheckImpactRequest(map[string]string{"scope": "unstaged", "offset": "50001"}); !IsInvalidInput(err) {
+		t.Errorf("offset=50001 past the bound is accepted (err=%v), want invalid input", err)
+	}
+	if _, _, err := CheckImpactRequest(map[string]string{"scope": "unstaged", "offset": "50000"}); err != nil {
+		t.Errorf("offset=50000 at the bound is refused: %v", err)
+	}
 }
 
 // Two successive pages cover a tier with no overlap and no gap, checked against the
