@@ -4563,7 +4563,7 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 4. `build-repo-map` counts files from `git ls-files -z --cached --others --exclude-standard` in a Git worktree, so files inside nested repositories and ignored files are not counted; outside Git it walks as before.
 5. The watcher skips events under any `.git` path component, so activity inside a nested repository's Git dir queues no refresh path for the outer root.
 6. `changetrack` passes `--ignore-submodules=none` like `source_identity`, so a dirty `ignore = all` submodule counts as dirty in both.
-7. A ground that finds a registration baseline build running for its workspace waits for it (at most `codeIndexWait`, never past its request) before it reads drift; if the build is still running it says so instead of "no index baseline exists".
+7. A ground that finds a registration baseline build running for its workspace waits for it (at most `codeIndexWait`, never past its request) before it reads drift, so a ground right after registration reports the baseline instead of "no index baseline exists"; past the wait it reports the build in progress as before.
 
 **Requirements.** PAR-FRESH-01 (one identity scheme), PAR-FRESH-03 (watcher), PAR-FRESH-05 (freshness labels), PAR-FRESH-06 (registration baseline).
 
