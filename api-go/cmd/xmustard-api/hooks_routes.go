@@ -532,12 +532,18 @@ func groundLine(ws workspaceops.ResolvedWorkspace, g *workspaceops.SessionGround
 }
 
 // userPrompt pushes the memories a keyword of the prompt triggers (tags
-// "trigger-<keyword>", workspaceops.TriggerTagPrefix).
+// "trigger-<keyword>", workspaceops.TriggerTagPrefix). A caller this deployment serves no
+// recall to records the prompt in the ledger and stops there: the trigger index is read
+// from the memory store, so reading it is the memory work the refusal is for, and the head
+// line names only keywords a trigger would have matched.
 func (s *hookServer) userPrompt(ctx context.Context, c *hookCall) hookResult {
 	if !c.bound || strings.TrimSpace(c.in.Prompt) == "" {
 		return hookResult{}
 	}
 	s.record(c, workspaceops.LedgerEvent{Kind: workspaceops.LedgerPrompt, Text: c.in.Prompt})
+	if c.recallRefused {
+		return hookResult{}
+	}
 	idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID)
 	if err != nil || len(idx.Triggers) == 0 {
 		return hookResult{}
@@ -659,8 +665,12 @@ func (c *hookCall) moves() map[string]string {
 }
 
 // memoryContext pushes the served memories recall ranks for a pattern or a path; they
-// come first in a pre-hook's context.
+// come first in a pre-hook's context. A caller this deployment serves no recall to ranks
+// nothing: HookMemories reads the memory store, so the refusal comes before it.
 func (s *hookServer) memoryContext(ctx context.Context, c *hookCall, query string, paths []string) (string, map[string]string) {
+	if c.recallRefused {
+		return "", nil
+	}
 	cands, err := workspaceops.HookMemories(ctx, dataDir(), c.ws.WorkspaceID, c.caller, query, paths, hookMemoryLimit)
 	if err != nil || len(cands) == 0 {
 		return "", nil
