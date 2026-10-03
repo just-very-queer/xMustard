@@ -1343,12 +1343,17 @@ The fix is to stop parsing the text form. `git status --porcelain=v2 -z` emits N
 **Goal.** `memprobe::child_peaks` (`rust-core/tests/memprobe/mod.rs:113`) accumulates a child's
 peak `dirty` and `rss` by sampling `sample(pid)` in a 1 ms loop, and initialises both to `0`.
 `sample` returns `None` whenever `/proc/<pid>/status` cannot be read, so a loop whose every
-iteration reads `None` returns `Peaks { dirty: 0, rss: 0, .. }`. Every memory guard in the suite
-then asserts an upper bound against a reading of zero and passes vacuously: `mib <= 25.0` is
-`0.0 <= 25.0`. `tree_rss` is not affected — it comes from `wait4(2)` rusage, which the kernel
-fills regardless of sampling. The row closes that hole by asserting `peaks.rss > 0` (and
-`peaks.dirty > 0` where a dirty bound is asserted) **before** the bound is checked, so a guard
-that never sampled fails loudly instead of passing. The source of the hole is named in the
+iteration reads `None` returns `Peaks { dirty: 0, rss: 0, .. }`. **Four of the six
+`child_peaks` guards then asserted an upper bound against a reading of zero and passed
+vacuously: `mib <= 25.0` is `0.0 <= 25.0`.** The other two were already narrower than that
+claim, and the row does not widen it: the 5,000-file build guard and the language-pack guard
+each asserted `dirty > 0` before their dirty bound, so they failed loudly when the *dirty*
+sample was missing, and every guard that bounds `tree_rss` reads `wait4(2)` rusage, which the
+kernel fills whether or not this loop sampled. What no guard checked was the **RSS** figure,
+which is the one every bound in the suite is stated against. The row closes that hole by
+asserting `peaks.rss > 0` (and `peaks.dirty > 0` where a dirty bound is asserted) **before**
+the bound is checked, so a guard that never sampled fails loudly instead of passing. The
+source of the hole is named in the
 goal's own §3.3 note as "memprobe all-or-nothing (WS-FIX-06/H6)" with the instruction "Add
 `peaks.rss>0` asserts"; that is the whole of this row's scope.
 

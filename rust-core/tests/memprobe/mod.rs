@@ -123,7 +123,9 @@ impl Peaks {
         assert!(
             self.rss > 0,
             "{probe}: memprobe sampled no RSS (rss 0, tree_rss {}), so the bound below \
-             would pass on a reading that was never taken",
+             would pass on a reading that was never taken; the child was alive \
+             (tree_rss > 0), so /proc was unreadable while it ran -- check \
+             XMUSTARD_MEMPROBE_BLANK and the uid the test binary runs under",
             self.tree_rss
         );
     }
