@@ -568,9 +568,38 @@ fn nested_git_dir(dir: &Path) -> Option<PathBuf> {
     git_dir.is_dir().then_some(git_dir)
 }
 
+/// Bytes of a nested repository's `packed-refs` scanned for one ref.
+const MAX_PACKED_REFS_BYTES: u64 = 64 << 20;
+
+/// The object id `packed-refs` at `path` holds for ref `name`: Some(None) when the file
+/// is absent or does not name it (an unborn branch), None when it could not be read
+/// to its end within MAX_PACKED_REFS_BYTES. Read line by line; nothing else is kept.
+fn packed_ref(path: &Path, name: &[u8]) -> Option<Option<Vec<u8>>> {
+    use std::io::{BufRead, Read};
+    let Ok(f) = fs::File::open(path) else {
+        return Some(None);
+    };
+    let mut r = std::io::BufReader::new(f.take(MAX_PACKED_REFS_BYTES));
+    let (mut line, mut total) = (Vec::new(), 0u64);
+    loop {
+        line.clear();
+        let n = r.read_until(b'\n', &mut line).ok()?;
+        if n == 0 {
+            return (total < MAX_PACKED_REFS_BYTES).then_some(None);
+        }
+        total += n as u64;
+        let l = line.trim_ascii_end();
+        if let Some(sp) = l.iter().position(|b| *b == b' ')
+            && &l[sp + 1..] == name
+        {
+            return Some(Some(l[..sp].to_vec()));
+        }
+    }
+}
+
 /// The token of a nested repository at `dir`, read without a Git child: its HEAD, the
-/// ref HEAD names (the loose ref, else the stat key of `packed-refs`) and the stat key
-/// of its Git index. A commit, a checkout or staging inside it changes the token; an
+/// object id of the ref HEAD names (the loose ref, else its `packed-refs` line) and
+/// the stat key of its Git index. A commit, a checkout or staging inside it changes the token; an
 /// unstaged edit in its worktree belongs to that repository and does not. None when
 /// its Git dir does not resolve or its HEAD cannot be read: then nothing keys it.
 fn nested_repo_token(dir: &Path) -> Option<String> {
@@ -593,12 +622,13 @@ fn nested_repo_token(dir: &Path) -> Option<String> {
                 });
             if let Some(name) = named {
                 let rel = path_from_bytes(name);
-                match read_small(&git_dir.join(&rel), GIT_POINTER_BYTES)
-                    .or_else(|| read_small(&common.join(&rel), GIT_POINTER_BYTES))
-                {
-                    Some(oid) => push_field(&mut h, &oid),
-                    None => push_field(&mut h, stat_token(&common.join("packed-refs")).as_bytes()),
-                }
+                let loose = read_small(&git_dir.join(&rel), GIT_POINTER_BYTES)
+                    .or_else(|| read_small(&common.join(&rel), GIT_POINTER_BYTES));
+                let oid = match loose {
+                    Some(oid) => Some(oid),
+                    None => packed_ref(&common.join("packed-refs"), name)?,
+                };
+                push_field(&mut h, oid.as_deref().unwrap_or(b"unborn"));
             }
             push_field(&mut h, stat_token(&git_dir.join("index")).as_bytes());
         }
@@ -622,10 +652,13 @@ pub(crate) fn submodule_paths(toplevel: &Path) -> std::collections::BTreeSet<Str
     for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
         let line = line.trim();
         if let Some(section) = line.strip_prefix('[') {
-            in_submodule = section
-                .trim_start()
-                .strip_prefix("submodule")
-                .is_some_and(|rest| rest.starts_with([' ', '\t', '"', ']']));
+            // Git section names are case-insensitive: `[Submodule "a"]` counts
+            let s = section.trim_start();
+            let n = "submodule".len();
+            in_submodule = s
+                .get(..n)
+                .is_some_and(|p| p.eq_ignore_ascii_case("submodule"))
+                && s[n..].starts_with([' ', '\t', '"', ']']);
             continue;
         }
         let Some((key, value)) = line.split_once('=') else {
@@ -1541,6 +1574,32 @@ mod tests {
         assert_eq!(kind("gone"), "none");
     }
 
+    // A ref kept only in `packed-refs` keys the nested repository by its object id, so
+    // a rewrite that keeps the file's size changes the token.
+    #[test]
+    fn a_packed_ref_keys_the_nested_repository_by_its_object_id() {
+        let top = tempfile::TempDir::new().unwrap();
+        let git = top.path().join("sub/.git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let packed = |oid: &str| {
+            fs::write(
+                git.join("packed-refs"),
+                format!("# pack-refs with: peeled\n{oid} refs/heads/main\n"),
+            )
+            .unwrap()
+        };
+        let dir = top.path().join("sub");
+        packed("aaaa");
+        let a = nested_repo_token(&dir).unwrap();
+        packed("bbbb");
+        let b = nested_repo_token(&dir).unwrap();
+        assert_ne!(a, b);
+        fs::remove_file(git.join("packed-refs")).unwrap();
+        let unborn = nested_repo_token(&dir).unwrap();
+        assert!(unborn != a && unborn != b);
+    }
+
     #[test]
     fn submodule_paths_reads_only_submodule_sections_as_git_does() {
         let top = tempfile::TempDir::new().unwrap();
@@ -1552,11 +1611,12 @@ mod tests {
                 "[submodule \"b\"]\n\tPath = \"with space/b\"\n",
                 "[submodule \"c\"]\n\tpath = \"quote\\\"d\" # trailing\n",
                 "[submodule-extra \"x\"]\n\tpath = not/either\n",
+                "[SubModule \"d\"]\n\tpath = mixed/case\n",
             ),
         )
         .unwrap();
         let got: Vec<String> = submodule_paths(top.path()).into_iter().collect();
-        assert_eq!(got, ["libs/a", "quote\"d", "with space/b"]);
+        assert_eq!(got, ["libs/a", "mixed/case", "quote\"d", "with space/b"]);
         assert!(submodule_paths(&top.path().join("absent")).is_empty());
     }
 
