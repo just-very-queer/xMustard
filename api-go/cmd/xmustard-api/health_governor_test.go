@@ -146,7 +146,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 			if want[who] {
 				release = holdSlot(t)
 			}
-			before := served.Load()
+			before, beforeAll := served.Load(), samples.Load()
 			h := health(tok)
 			got := isFull(t, h)
 			release()
@@ -159,7 +159,10 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				if !strings.Contains(detail, reason) {
 					t.Fatalf("%s token: the detail must say why (%q): %q", who, reason, detail)
 				}
-				if served.Load() != before {
+				// No slot is held here, so no watchdog runs: the global counter
+				// must not move either, which also catches a sample taken on a
+				// goroutine the handler spawned and waited for.
+				if served.Load() != before || samples.Load() != beforeAll {
 					t.Fatalf("%s mode, %s token: a restricted poll sampled the process tree", mode, who)
 				}
 			}
