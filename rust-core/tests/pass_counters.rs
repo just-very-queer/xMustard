@@ -152,7 +152,11 @@ fn the_cli_reports_the_calls_counters_last() {
         .args(["index", "build", r.path().to_str().unwrap()])
         .output()
         .unwrap();
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let text = String::from_utf8(out.stdout).unwrap();
     let v: Value = serde_json::from_str(&text).unwrap();
     let pc = counters_of(&v);
@@ -161,8 +165,15 @@ fn the_cli_reports_the_calls_counters_last() {
     assert!(pc["git_spawns"].as_u64().unwrap() >= 2, "{v}");
     let tail = text.trim_end();
     let start = tail.rfind("\"pass_counters\":").unwrap();
-    assert_eq!(&tail[tail.len() - 2..], "}}", "pass_counters is the last field");
-    assert!(!tail[start..].contains('['), "pass_counters is the last field");
+    assert_eq!(
+        &tail[tail.len() - 2..],
+        "}}",
+        "pass_counters is the last field"
+    );
+    assert!(
+        !tail[start..].contains('['),
+        "pass_counters is the last field"
+    );
 }
 
 #[test]
@@ -208,7 +219,10 @@ fn each_worker_response_carries_its_own_counters_and_stats_the_totals() {
     let second = call(2, "repo-key", &[root]);
     let two = counters_of(&second).clone();
     let stats = call(3, "$/stats", &[]);
-    assert!(stats.get("pass_counters").is_none(), "$/stats is not a call: {stats}");
+    assert!(
+        stats.get("pass_counters").is_none(),
+        "$/stats is not a call: {stats}"
+    );
     for name in NAMES {
         let sum = one[name].as_u64().unwrap() + two[name].as_u64().unwrap();
         assert_eq!(

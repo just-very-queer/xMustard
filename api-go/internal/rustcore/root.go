@@ -60,8 +60,18 @@ func (r *Refusal) Error() string { return "rust-core " + r.Sub + " refused the r
 // carries a request scope the reservation is held until the request finishes (through
 // decode and response construction); otherwise it is released on return. A refused
 // reservation kills the child and returns budget.ErrOverloaded. Whole-repository
-// builds first take the governor's heavy slot (heavy.go).
+// builds first take the governor's heavy slot (heavy.go). A successful result's pass
+// counters are added to the health block's core_passes (passes.go).
 func runCoreCtx(parent context.Context, sub string, args ...string) ([]byte, error) {
+	out, err := runCoreUncounted(parent, sub, args...)
+	if err == nil {
+		notePasses(out)
+	}
+	return out, err
+}
+
+// runCoreUncounted is runCoreCtx before the result's pass counters are read.
+func runCoreUncounted(parent context.Context, sub string, args ...string) ([]byte, error) {
 	if residentOnly(parent) {
 		if out, handled, err := runViaWorker(parent, sub, args); handled {
 			return out, err

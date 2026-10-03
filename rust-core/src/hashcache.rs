@@ -493,6 +493,7 @@ fn decode(mut input: impl Read, len: u64, written_ns: i64) -> Option<StatCache> 
     if checksum[..] != body_sum[..] {
         return None;
     }
+    crate::passcount::note(crate::passcount::Pass::RowsLoaded, count);
     Some(StatCache {
         recorded_at_ns: started_ns.min(written_ns.saturating_sub(elapsed_ns)),
         entries,
@@ -628,6 +629,33 @@ mod tests {
         assert!(p2.cache_loaded && !p2.cache_written, "{p2:?}");
         assert_eq!(m1, direct(repo.path(), &names));
         assert_eq!(m2, m1);
+    }
+
+    // WS-RT1: the pass counters see the same thing: a cached pass loads the stored rows,
+    // stats every file and hashes none.
+    #[test]
+    fn a_cached_pass_counts_loaded_rows_and_no_hashing() {
+        use crate::passcount::{Call, Pass};
+        let names = ["a.rs", "b.rs", "c.rs"];
+        let (repo, _s, cache) = setup(&names);
+        settle();
+        let first = Call::begin();
+        hash_files_with(repo.path(), rels(&names), Some(&cache), Duration::ZERO);
+        let c1 = first.counts();
+        drop(first);
+        assert_eq!(c1.get(Pass::FilesHashed), 3);
+        assert_eq!(
+            c1.get(Pass::BytesHashed),
+            3 * "content of a.rs\n".len() as u64
+        );
+        assert_eq!(c1.get(Pass::RowsLoaded), 0, "no cache yet");
+        let second = Call::begin();
+        hash_files_with(repo.path(), rels(&names), Some(&cache), Duration::ZERO);
+        let c2 = second.counts();
+        assert_eq!(c2.get(Pass::FilesHashed), 0);
+        assert_eq!(c2.get(Pass::BytesHashed), 0);
+        assert_eq!(c2.get(Pass::RowsLoaded), 3);
+        assert_eq!(c2.get(Pass::FilesStatted), 3);
     }
 
     // Files changed just before a pass sit in the racy window, so their cached hashes

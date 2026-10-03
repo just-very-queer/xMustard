@@ -9,7 +9,7 @@ import (
 	"xmustard/api-go/internal/budget"
 )
 
-func fakeCore(t *testing.T, stdout string) {
+func passCore(t *testing.T, stdout string) {
 	t.Helper()
 	core := filepath.Join(t.TempDir(), "xmustard-core")
 	script := "#!/bin/sh\ncat <<'EOF'\n" + stdout + "\nEOF\n"
@@ -25,7 +25,7 @@ func TestCorePassCountersReachTheHealthCounters(t *testing.T) {
 	withPool(t, 64<<20)
 	t.Setenv("XMUSTARD_CORE_WORKER", "")
 	const result = `{"ok":true,"nested":{"pass_counters":{"files_listed":1000}},"pass_counters":{"files_listed":4,"files_statted":5,"files_hashed":2,"bytes_hashed":100,"git_spawns":3,"rows_loaded":7}}`
-	fakeCore(t, result)
+	passCore(t, result)
 	before := budget.Counters().CorePasses
 	for range 2 {
 		out, err := runCoreCtx(context.Background(), "search", "x")
@@ -53,7 +53,7 @@ func TestCoreResultsWithoutPassCountersCountOnlyTheCall(t *testing.T) {
 		`{"ok":true}`,
 		`{"ok":true,"pass_counters":"not an object"}`,
 	} {
-		fakeCore(t, result)
+		passCore(t, result)
 		before := budget.Counters().CorePasses
 		if _, err := runCoreCtx(context.Background(), "scan-signals", "x"); err != nil {
 			t.Fatal(err)
