@@ -1503,13 +1503,15 @@ four instead of a chmod after the fact at three.
 
 This row makes each fixture create its index directory with an **explicit `0700`** at creation
 time — `tempfile::Builder::permissions`, which `tempfile` passes to `mkdir`
-(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`) — so no fixture's result depends on the umask of
-whoever logs into the machine. The umask can only **narrow** the requested mode, never widen it,
-so no umask makes a fixture directory group- or other-accessible, which is what WS-FIX-11's
-refusal tests. A umask that clears owner bits (`0177`, `0777`) narrows `0700` to `0600`, which
-no index call can traverse; that is the operator's own setting and is left as it is, so the
-claim this row makes is "no other user can reach a fixture's index directory", not "the mode is
-always `0700`". It replaces the `tighten()`
+(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`). A umask can only **narrow** the requested mode and
+never widen it, so no umask can give a fixture's index directory a group- or other-**write** bit,
+which is the property `classify_dir` refuses (`mode & 0o022`). The umask is therefore no longer a
+source of a fixture's result: the `0002` case that opened this row, and every other umask that
+keeps the owner's bits, all land on `0o700`. Two bounds on that claim, both stated so they are not
+mistaken for more: a umask clearing owner bits (`0177`, `0777`) narrows `0700` to `0600`, which no
+index call can traverse — that is the operator's own setting and is left alone; and `0700` is
+*stronger* than the guard requires, since `classify_dir` accepts group- or other-read and execute
+bits and refuses only the write ones. It replaces the `tighten()`
 after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
 at every site, and it extends the fix to the one site that never had it
 (`legacy_equality_holds_on_parity_fixtures`, which builds into a `TempDir` with no `tighten` and

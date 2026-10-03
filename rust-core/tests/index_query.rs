@@ -73,18 +73,19 @@ fn commit(root: &Path, msg: &str) {
 }
 
 /// A temporary directory to hand the index as an operator-named `--index-dir`, created
-/// `0700` at creation time so the result does not depend on the umask of whoever runs the
+/// `0700` at creation time so its mode does not come from the umask of whoever runs the
 /// suite (WS-FIX-27). `TempDir::new` creates through `fs::create_dir`, which takes the umask's
 /// bits: under a `0002` login umask the directory lands at `0775` and WS-FIX-11's refusal
-/// answers a fixture that changed nothing. A creation-time mode is narrowed by the umask and
-/// never widened, so no umask can make the directory **group- or other-accessible**, which is
-/// the property the guard tests; unlike a `chmod` after the fact it also leaves no window in
+/// answers a fixture that changed nothing. A umask narrows a creation-time mode and never
+/// widens it, so no umask can add the group- or other-**write** bit that `classify_dir`
+/// refuses (`mode & 0o022`); unlike a `chmod` after the fact, it also leaves no window in
 /// which the directory is wider than the guard will accept.
 ///
-/// A umask that clears owner bits (a `0177` or `0777` login umask) still narrows `0700` to
-/// `0600`, which no index call can traverse. That is left as it is: the umask is the operator's
-/// own setting, and the `0002` case that opened this row — and every other group/other bit —
-/// is closed. The claim is "no other user can reach it", not "the mode is always 0700".
+/// `0700` is stronger than the guard needs — `classify_dir` accepts group- and other-read
+/// and execute bits — and it is not the only mode the umask can produce: one clearing owner
+/// bits (`0177`) narrows it to `0600`, which no index call can traverse. That is the
+/// operator's own setting and is left as it is; the claim is that the umask is no longer a
+/// source of the mode, not that the mode is always `0700`.
 fn index_dir() -> TempDir {
     let mut b = tempfile::Builder::new();
     b.permissions(perm(0o700)).tempdir().unwrap()
