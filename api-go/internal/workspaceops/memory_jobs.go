@@ -329,7 +329,8 @@ func lastCursorOf(entries []govstore.Entry) int64 {
 // a pass can put the work it has not queued first.
 func queuedSignatures(ctx context.Context, tx govstore.Tx, workspaceID string) (map[string]bool, error) {
 	jobs, err := tx.ListJobs(ctx, govstore.JobFilter{WorkspaceID: workspaceID, States: []string{
-		govstore.JobQueued, govstore.JobLeased, govstore.JobDone, govstore.JobFailed}, Limit: consolidationJobsPerRun})
+		govstore.JobQueued, govstore.JobLeased, govstore.JobDone, govstore.JobFailed},
+		Limit: consolidationQueuedSignatures})
 	if err != nil {
 		return nil, err
 	}
