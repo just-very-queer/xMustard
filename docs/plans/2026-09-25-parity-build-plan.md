@@ -4037,3 +4037,25 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
   - **Open-mode records.** A cited record written in open mode is refused, since its author cannot be shown distinct from the approver. This goes beyond "distinct from the approver". For the same reason an open-mode record cannot name producer `human`.
   - **Named lineages are bound to a repository and base ref, not to a branch.** Ancestry keeps an unrelated head from outdating a lineage's findings. A descendant head recorded under an explicit `--lineage` can still outdate them, which is true on that line of history.
   - **Budget.** REV-06's figure is met by live heap (+0.06 MiB; +0.07 to +0.12 MiB after review round 1), not by RSS: the RSS growth of +0.60 MiB (+0.59 to +0.71 MiB after round 1) for three times the rows is above 0.5 MiB and is recorded, not asserted. The ledger note makes WS-67 assert it, with a tolerance, once the daemon serves review rows. A lineage page sorts and reads the JSON of every finding in the lineage, so its cost grows with the lineage: 51 to 62 ms for a page of 500 from a 5,000-finding lineage.
+
+### WS-32a — Consolidation work queue: deterministic candidate preparation, watermarks and CAS leases
+
+**Goal.** `govstore/jobs.go` already holds the job table, the closed kind set, the compare-and-set lease and the watermark (WS-12, with tests in `store_test.go`). What is missing is everything above it: nothing in `workspaceops` prepares a job, so PAR-GOV-13 has no producer and its acceptance — "the consolidation loop runs end to end with an external agent doing the reasoning, and no memory is auto-promoted" — cannot run. WS-32a builds the deterministic preparation layer: given a workspace's memory store, derive candidate consolidation jobs, enqueue each idempotently under its conflict signature, and advance a per-source watermark only when a pass succeeded.
+
+**Requirements.** PAR-GOV-13 (the queue, the per-source watermark advanced only on success, the CAS lease, idempotence and non-destructiveness). PAR-GOV-21 supplies the boundary this row keeps: xMustard prepares candidates and never performs the reasoning, so nothing here merges, invalidates or promotes a memory.
+
+**Files.**
+`api-go/internal/workspaceops/memory_jobs.go`, `api-go/internal/workspaceops/memory_jobs_test.go`
+
+**New modules.** None: `govstore/jobs.go` and `workspaceops/memory_store.go` already exist and are reused as they are.
+
+**Tests required.**
+- Jobs are idempotent: preparing the same workspace twice enqueues each candidate once and returns the same job id, and a cancelled signature is free again.
+- The watermark advances only on success: a failed pass leaves `reflected_through`, `reflected_count` and `version` untouched while `last_started_at` moves, and a later successful pass advances it.
+- A crashed lease is retried and a finished-failed lease is reported, never relaunched (the govstore half is already asserted in `store_test.go`; this row asserts the preparation loop does not re-enqueue either).
+- Preparation is non-destructive: no entry's lifecycle, promotion, votes or content changes, and a prepared job is advisory — a cluster is proposed for the agent to judge, not merged.
+- Every kind the loop emits is one `govstore` names in `jobKindSubjects`, and every conflict signature is stable across passes and distinguishes two candidates that differ in any candidate id.
+
+**Acceptance.** `PrepareConsolidationJobs` over a fixture store produces a deterministic, ordered set of jobs with stable signatures, enqueues each exactly once across repeated passes, and advances the source watermark only on a successful pass. No memory is auto-promoted: the loop reads the store and writes only job and watermark rows.
+
+**Deviation from the plan row's text.** The row's first bullet lists session digests and init seeds from `AGENTS.md` among the kinds. WS-32a prepares the kinds whose inputs the memory store already holds — dedupe clusters, stale and orphaned anchors, supersession chains and ageing proposals — and defers session digests to WS-32c's capture work and init seeds to the `remember`-time seed path WS-27 built, rather than reading a repository file inside a memory preparation pass. The kind constants and `jobKindSubjects` table already name all six, so the deferred kinds stay available to the agent; nothing is removed.
