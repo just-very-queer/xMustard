@@ -1638,7 +1638,7 @@ pub fn areas(root: &Path, cfg: &IndexConfig, seed: u64) -> Result<serde_json::Va
         .flat_map(|a| {
             a.total_paths
                 .iter()
-                .map(|p| p.clone())
+                .cloned()
                 .chain(a.members.iter().map(|m| m.path.clone()))
         })
         .collect();

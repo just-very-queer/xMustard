@@ -246,10 +246,10 @@ fn word_stems(name: &str) -> Vec<String> {
         if out.last() != Some(&lower) {
             out.push(lower.clone());
         }
-        if let Some(stem) = lower.strip_suffix('s').filter(|s| !s.is_empty()) {
-            if out.last() != Some(&stem.to_string()) {
-                out.push(stem.to_string());
-            }
+        if let Some(stem) = lower.strip_suffix('s').filter(|s| !s.is_empty())
+            && out.last() != Some(&stem.to_string())
+        {
+            out.push(stem.to_string());
         }
     }
     out
@@ -562,11 +562,11 @@ fn propagate(p: &Projection, resolution: f64, max_iterations: u32) -> (Vec<u32>,
                     _ => cand,
                 });
             }
-            if let Some((_, _, c, _)) = best {
-                if c != mine {
-                    community[i as usize] = c;
-                    changed = true;
-                }
+            if let Some((_, _, c, _)) = best
+                && c != mine
+            {
+                community[i as usize] = c;
+                changed = true;
             }
         }
         if !changed {
