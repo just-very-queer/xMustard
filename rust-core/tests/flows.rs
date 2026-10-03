@@ -534,8 +534,11 @@ fn seeds_are_listed_from_the_highest_score_to_the_lowest() {
         "the fixture must exceed the cap: {} seeds",
         seeds.len()
     );
-    // The scores are a product of a rank and 2, so the highest is 16 and the lowest
-    // 2: if the cut were reversed the first seed would score 2 and the last 16.
+    // The fixture's ranks are 0..=7 callees and every entry point is exported and uncalled,
+    // so a rank-r candidate scores (r+1) * 2: the leader is 16. The cut of 200 falls inside
+    // the rank-3 group — measured, not derived — so the weakest KEPT score is 4, and the
+    // ranks 0..=2 (scores 2 and 4... ) sit entirely below it. Asserting the measured ends
+    // is what makes a reversed list fail: the first element would be 4 and the last 16.
     let scores: Vec<f64> = seeds.iter().map(|s| s.score).collect();
     assert_eq!(
         scores.first().copied(),
@@ -544,12 +547,19 @@ fn seeds_are_listed_from_the_highest_score_to_the_lowest() {
     );
     assert_eq!(
         scores.last().copied(),
-        Some(2.0),
+        Some(4.0),
         "the weakest kept candidate is last: {scores:?}"
     );
+    // And the whole list descends, which is the property the two ends are read from.
     let mut desc = scores.clone();
     desc.sort_by(|a, b| b.partial_cmp(a).unwrap());
     assert_eq!(scores, desc, "seeds must be listed highest score first");
+    // The cut really did remove the low ranks: `dropped_candidates` counts them.
+    assert_eq!(
+        truncation(&v)["dropped_candidates"],
+        40,
+        "the cap stopped 40 of the 240 candidates: {v:#}"
+    );
 }
 
 /// Two seeds with identical scores are ordered by (path, line, name), so the list is the
@@ -1366,24 +1376,25 @@ fn a_symbol_local_to_a_function_body_is_neither_a_seed_nor_a_step() {
         !all.contains("inner"),
         "a local binding is not a flow member: {all:?}"
     );
-    // The seed the walk does report carries only its file-scope callees, and the edge count
-    // covers the resolved calls alone — a local edge would inflate both.
-    assert!(
-        v["call_edges"].as_u64().unwrap() <= 3,
-        "only the three declared calls are resolved edges: {v:#}"
+    // The walk from `Outer` reaches only its file-scope callees: the closure binding adds
+    // no resolved edge, so the count is 2 whether or not the `row.local` filter is present.
+    assert_eq!(
+        v["call_edges"].as_u64().unwrap(),
+        2,
+        "only the two declared calls are resolved edges: {v:#}"
     );
     // Why this test pins a filter and cannot be shown to kill it: the row is a REACHABILITY
     // row, not a scoring one. The Go closure above is the only candidate for a local
     // resolved CALL in this fixture, and the index never records one — `local` marks a name
     // bound in a callable's body, and the extractor gives a closure no symbol node the
-    // resolver can bind a CALL to. So `call_edges` is 3 with or without the filter, and
+    // resolver can bind a CALL to. So `call_edges` is 2 with or without the filter, and
     // mutation row M16 survives. What the fixture does pin is the reporting: no local name
     // appears in any step or seed. The filter itself is asserted by construction rather
     // than by mutation, and this comment is where that fact lives so it is not mistaken
     // for a passing row.
     assert_eq!(
         v["call_edges"].as_u64().unwrap(),
-        3,
+        2,
         "a closure binding adds no resolved edge: {v:#}"
     );
 }
