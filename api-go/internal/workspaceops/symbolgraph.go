@@ -233,23 +233,54 @@ func ImpactBudgetTrimmed(out []byte) bool {
 	return false
 }
 
-// DropImpactCursor removes next_cursor from a budgeted impact result whose tier page the
-// budget cut, leaving has_more and the tier totals so the caller knows more exists and
-// can reach it with offset=. A result without the member is returned unchanged.
-func DropImpactCursor(out []byte) []byte {
+// ReconcileImpactPaging fixes up a budgeted impact result whose tier page the budget
+// cut. A cursor signed from the core's next_offset describes the core's page, not the
+// delivered one, so it is removed: following it would skip the items the budget
+// removed. What stays is has_more, set true whenever a tier holds more than it returned,
+// so a page the budget trimmed on the way past its last item still tells the caller
+// there is more, and each tier's total, which is how offset= reaches the rest. A result
+// the budget did not cut is returned unchanged.
+func ReconcileImpactPaging(out []byte) []byte {
 	var res map[string]json.RawMessage
 	if json.Unmarshal(out, &res) != nil || res == nil {
 		return out
 	}
-	if _, ok := res[impactNextCursorMember]; !ok {
+	if !ImpactBudgetTrimmed(out) {
 		return out
 	}
 	delete(res, impactNextCursorMember)
-	dropped, err := json.Marshal(res)
+	if !tiersDeliveredAll(res["by_depth"], tiersOf(res["affected"])) {
+		res[impactHasMoreMember] = json.RawMessage("true")
+	}
+	reconciled, err := json.Marshal(res)
 	if err != nil {
 		return out
 	}
-	return dropped
+	return reconciled
+}
+
+// tiersDeliveredAll reports whether every tier returned as many items as its total says
+// it holds. A budget-trimmed page delivers fewer, and a tier with no items (summary_only,
+// or a rung that dropped them) delivers none, so both are "more".
+func tiersDeliveredAll(candidates ...json.RawMessage) bool {
+	for _, tiers := range candidates {
+		if len(tiers) == 0 {
+			continue
+		}
+		var page []struct {
+			Total int               `json:"total"`
+			Items []json.RawMessage `json:"items"`
+		}
+		if json.Unmarshal(tiers, &page) != nil {
+			continue
+		}
+		for _, tier := range page {
+			if len(tier.Items) < tier.Total {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // indexedRead brings the workspace's code index to its observed identity, runs one

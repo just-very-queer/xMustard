@@ -349,43 +349,63 @@ func TestImpactPagesTiersOfDifferentLengthsWithoutAGap(t *testing.T) {
 // skip the items the budget removed: has_more and the tier total stay, and offset=
 // reaches the rest.
 func TestABudgetTrimmedPageDropsItsCursor(t *testing.T) {
+	// A cut page the core had more of: has_more was already true and stays true.
 	trimmed := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789",` +
+		`"by_depth":[{"depth":1,"total":5,"offset":0,"items":[{"name":"i0"}],"next_offset":2}],` +
 		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
-	if !ImpactBudgetTrimmed(trimmed) {
-		t.Fatal("a result whose report names tiers_trimmed is trimmed")
-	}
-	var res map[string]json.RawMessage
-	if err := json.Unmarshal(DropImpactCursor(trimmed), &res); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
+	res := decodeMembers(t, ReconcileImpactPaging(trimmed))
 	if _, ok := res["next_cursor"]; ok {
 		t.Error("a trimmed page keeps a cursor that would skip removed items")
 	}
-	// has_more and the budget report survive, so the caller still knows more exists.
-	if _, ok := res["has_more"]; !ok {
-		t.Error("has_more is dropped too, so the caller cannot tell there is more")
+	if got := string(res["has_more"]); got != "true" {
+		t.Errorf("has_more = %s, want true", got)
 	}
 	if _, ok := res["output_budget"]; !ok {
 		t.Error("the budget report is dropped, so the trim becomes silent")
 	}
 
-	// An untrimmed result keeps its cursor: the route calls DropImpactCursor only when
-	// ImpactBudgetTrimmed is true, so the common case must survive that pairing.
-	whole := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789"}`)
-	if ImpactBudgetTrimmed(whole) {
-		t.Error("a result with no budget report is not trimmed")
+	// The case the second triage check raised: the core page had no successor, so the
+	// result carried no cursor at all, and the budget cut the last items off it. The
+	// tier still holds more than it delivered, so has_more must be set here or the
+	// caller is told the walk is finished while items remain.
+	finalPage := []byte(`{"symbol":"Serve","by_depth":[{"depth":1,"total":5,"offset":2,` +
+		`"items":[{"name":"i2"}]}],` +
+		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
+	res = decodeMembers(t, ReconcileImpactPaging(finalPage))
+	if got := string(res["has_more"]); got != "true" {
+		t.Errorf("a trimmed final page reports has_more = %s, want true", got)
 	}
-	out := whole
-	if ImpactBudgetTrimmed(out) {
-		out = DropImpactCursor(out)
+	if _, ok := res["next_cursor"]; ok {
+		t.Error("a trimmed page signs no cursor")
 	}
-	var kept map[string]json.RawMessage
-	if err := json.Unmarshal(out, &kept); err != nil {
-		t.Fatalf("unmarshal: %v", err)
+
+	// An untrimmed result is untouched: the route calls this on every impact answer,
+	// so the common case must survive it.
+	whole := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789",` +
+		`"by_depth":[{"depth":1,"total":5,"offset":0,"items":[{"name":"i0"},{"name":"i1"}],"next_offset":2}]}`)
+	if string(ReconcileImpactPaging(whole)) != string(whole) {
+		t.Errorf("an untrimmed result is returned unchanged: %s", ReconcileImpactPaging(whole))
 	}
-	if got := string(kept["next_cursor"]); got != `"i2.2.abcdef0123456789"` {
-		t.Errorf("an untrimmed result keeps its cursor, got %s", got)
+	// A trimmed page that delivered every item has nothing more, so has_more is left as
+	// it was rather than invented.
+	complete := []byte(`{"symbol":"Serve","has_more":false,"next_cursor":"i2.2.abcdef0123456789",` +
+		`"by_depth":[{"depth":1,"total":1,"offset":0,"items":[{"name":"i0"}]}],` +
+		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
+	res = decodeMembers(t, ReconcileImpactPaging(complete))
+	if got := string(res["has_more"]); got != "false" {
+		t.Errorf("a page that delivered its whole tier reports has_more = %s, want false", got)
 	}
+}
+
+// decodeMembers unmarshals a JSON object into its members, failing the test on a shape
+// it cannot read.
+func decodeMembers(t *testing.T, out []byte) map[string]json.RawMessage {
+	t.Helper()
+	var res map[string]json.RawMessage
+	if err := json.Unmarshal(out, &res); err != nil {
+		t.Fatalf("unmarshal %s: %v", out, err)
+	}
+	return res
 }
 
 // An absent cursor is the first page; one that is present but empty is refused, so a

@@ -86,8 +86,8 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 		// core's page; when the budget cut that page the cursor would skip the items
 		// it removed, so it is dropped and has_more plus the tier totals carry the
 		// caller on with offset= instead (WS-59e).
-		if spec.Tool == "impact" && workspaceops.ImpactBudgetTrimmed(out) {
-			out = workspaceops.DropImpactCursor(out)
+		if spec.Tool == "impact" {
+			out = workspaceops.ReconcileImpactPaging(out)
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})
