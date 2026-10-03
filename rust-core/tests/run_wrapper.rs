@@ -158,6 +158,13 @@ fn a_term_sent_to_the_wrapper_reaches_the_child() {
     signal_wrapper(dir.path(), "TERM");
     let log = await_seen(dir.path(), "TERM");
     assert!(log.contains("TERM"), "the child was never told: {log:?}");
+    // The child is still alive here (it traps TERM), so a wrapper that ended now would have
+    // left it orphaned: the wrapper must still be waiting before the release.
+    thread::sleep(Duration::from_millis(200));
+    assert!(
+        wrapper.try_wait().unwrap().is_none(),
+        "the wrapper ended while its child was still running"
+    );
     release(dir.path());
     let status = wrapper.wait().unwrap();
     // The child exits 0 on release, so a wrapper that ends on its own reports 0. Asserting
@@ -622,16 +629,22 @@ fn a_term_while_the_wrapper_prints_ends_it() {
 #[test]
 fn a_child_that_exits_zero_on_term_makes_the_wrapper_exit_zero() {
     let dir = tempfile::tempdir().unwrap();
-    let script = r#"trap 'exit 0' TERM; printf '%s' "$$" > "$1/pid"; printf 'ready\n' > "$1/ready"; i=0; while [ "$i" -lt 600 ]; do i=$((i+1)); sleep 0.05; done; exit 9"#;
+    let script = r#"trap 'echo trapped; exit 0' TERM; echo started; printf '%s' "$$" > "$1/pid"; printf 'ready\n' > "$1/ready"; i=0; while [ "$i" -lt 600 ]; do i=$((i+1)); sleep 0.05; done; exit 9"#;
     let mut wrapper = Command::new(BIN)
         .args(["run", "--", "sh", "-c", script, "sh", dir.path().to_str().unwrap()])
         .env_remove("XMUSTARD_WORKSPACE_ID")
         .env_remove("XMUSTARD_API_TOKEN")
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .spawn()
         .unwrap();
     await_file(&dir.path().join("ready"));
     signal_wrapper(dir.path(), "TERM");
+    let mut out = String::new();
+    wrapper.stdout.take().unwrap().read_to_string(&mut out).unwrap();
     let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
     assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
+    assert!(
+        out.contains("started") && out.contains("trapped"),
+        "the child's output was not kept: {out:?}"
+    );
 }
