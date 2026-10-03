@@ -1231,9 +1231,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
         "occurrences" => {
             // impact op= (WS-59d, PAR-IMP-03): the symbol-level occurrences of a name
             use xmustard_core::index::occurrences;
-            let u = usage(&format!(
-                " <name_path|uid> (flags: op, limit, cursor)"
-            ));
+            let u = usage(" <name_path|uid> (flags: op, limit, cursor)");
             let root = need(&mut args, &u)?;
             let ws = need(&mut args, &u)?;
             let target = need(&mut args, &u)?;
