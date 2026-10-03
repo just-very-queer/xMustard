@@ -91,33 +91,34 @@ fn perm(mode: u32) -> fs::Permissions {
 
 /// The mode `index_dir` creates at, read back off a real directory it made. The
 /// expected value is the literal `0o700`, never the result of calling `index_dir`.
-/// The second half pins the mask itself: a mask keeping only the owner bits would
-/// accept every mode, so the widest mode the guard refuses has to fail it.
+/// The second half asserts the same mask against the group-writable mode this row
+/// exists for, so narrowing the mask to the owner bits fails here instead of passing
+/// every mode — an `0o700` mask maps both `0o700` and `0o775` to `0o700`.
 #[test]
 fn an_index_fixture_dir_is_owner_only_whatever_the_process_umask() {
     use std::os::unix::fs::PermissionsExt;
     let mode_of = |d: &TempDir| fs::symlink_metadata(d.path()).unwrap().permissions().mode();
+    let is_private = |d: &TempDir| mode_of(d) & 0o777 == 0o700;
     let dir = index_dir();
-    assert_eq!(
-        mode_of(&dir) & 0o777,
-        0o700,
-        "an index fixture directory is not 0700, so WS-FIX-11's refusal depends on the umask \
-         of whoever logged in"
+    assert!(
+        is_private(&dir),
+        "an index fixture directory is {mode:04o}, not 0700, so WS-FIX-11's refusal depends \
+         on the umask of whoever logged in",
+        mode = mode_of(&dir) & 0o777
     );
     // 0o775 is what `TempDir::new` yields under umask 0002 and what `classify_dir`
-    // refuses, so it is the case the mask above has to be able to see.
+    // refuses. Under the mask above this is the value that must NOT read as private.
     let wide = TempDir::new().unwrap();
     fs::set_permissions(wide.path(), perm(0o775)).unwrap();
     assert_eq!(
         mode_of(&wide) & 0o777,
         0o775,
-        "set_permissions must be able to plant the group-writable mode this row exists for"
+        "set_permissions must plant 0o775 verbatim"
     );
-    assert_ne!(
-        mode_of(&wide) & 0o700,
-        0o700,
-        "a mask of 0o700 cannot see a group-writable directory, so the assertion above would \
-         pass over the exact defect it exists to catch"
+    assert!(
+        !is_private(&wide),
+        "a group-writable index directory read as private, so the mask above cannot see the \
+         group bit and would accept every mode"
     );
 }
 
