@@ -544,12 +544,12 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 // unwarmed Apply also pays for the heap's growth into this working set, and that cost
 // lands on whichever fixture is measured first. Cold, over 12 runs, the difference spans
 // -14,688 to +2,456 bytes (logs/ws-flk-09-run-20261003T213617Z.log); warm, over 12 runs
-// it spans 41 to 1,637 (logs/ws-flk-09-run-20261003T214246Z.log). So the first Apply
-// this test makes is measured separately and held to WorkingSet, because WorkingSet is
-// what a caller admits before its own first call. It is the first call in this test,
-// not the first in the process: the package's other tests call Apply before it, so
-// under a full run the figure is a warmed one wearing a colder label. Both readings
-// stay inside the same line, which is the point.
+// it spans 41 to 1,637 (logs/ws-flk-09-run-20261003T214246Z.log). So the earliest Apply
+// here is measured separately and held to WorkingSet, because WorkingSet is what a
+// caller admits before its own first call. It is the earliest call in this test, not the
+// earliest in the process: the package's other tests call Apply before it, so under a
+// full run the figure is a warmed one wearing a colder label. Both readings stay inside
+// the same line, which is the point.
 const (
 	allocPadBytes  = 400
 	allocProbeRuns = 8
