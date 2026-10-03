@@ -33,6 +33,7 @@ use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
@@ -93,6 +94,10 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
     child
         .stdout(Stdio::from(write_end))
         .stderr(Stdio::from(dup));
+    // Armed BEFORE the spawn, so no signal can reach the wrapper while it still has the
+    // default disposition and a child it could orphan; one that lands before `arm` waits for
+    // the pid instead (WS-FIX-20-r1-10).
+    let mut forwarder = Forwarder::start();
     let mut spawned = match child.spawn() {
         Ok(c) => c,
         // the shell's own answers: 127 not found, 126 not executable
@@ -106,7 +111,7 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
             return Ok(Output::Exit(text, ChildExit::Code(code)));
         }
     };
-    let mut forwarder = Forwarder::start(spawned.id());
+    forwarder.arm(spawned.id());
     drop(child); // the parent's copies of the write end must close for EOF
     let drained = drain(File::from(read_end), limits);
     let status = spawned.wait().map_err(io_failed("wait"))?;
@@ -183,25 +188,31 @@ struct Forwarder {
     /// Set once `wait` has reaped the child. From that point there is nobody left to forward
     /// to, so a forwarded signal ends the WRAPPER instead — see `install`.
     reaped: Arc<AtomicBool>,
+    /// Hands the child's pid to the watcher once it exists. Dropping it unsent (the spawn
+    /// failed) tells a watcher holding a signal that there will be no child.
+    pid: Option<mpsc::Sender<u32>>,
 }
 
 impl Forwarder {
     /// Starts forwarding to the child. A failure to install is not fatal: the wrapper then
     /// behaves as it did before, which is worse for the child but never worse than not
     /// running the command at all, so the refusal is a note, not an error.
-    fn start(pid: u32) -> Self {
+    fn start() -> Self {
         let reaped = Arc::new(AtomicBool::new(false));
-        let Some((handle, watcher)) = Self::install(pid, Arc::clone(&reaped)) else {
-            return Self {
-                handle: None,
-                watcher: None,
-                reaped,
-            };
-        };
+        let (tx, rx) = mpsc::channel();
+        let (handle, watcher) = Self::install(rx, Arc::clone(&reaped)).unzip();
         Self {
-            handle: Some(handle),
-            watcher: Some(watcher),
+            handle,
+            watcher,
             reaped,
+            pid: Some(tx),
+        }
+    }
+
+    /// Names the child the watcher forwards to; a signal held since `start` goes now.
+    fn arm(&mut self, pid: u32) {
+        if let Some(tx) = self.pid.take() {
+            let _ = tx.send(pid);
         }
     }
 
@@ -213,10 +224,9 @@ impl Forwarder {
     /// Registers the forwarded signals and starts the thread that relays them to the
     /// child. `None` when the platform refuses the registration.
     fn install(
-        pid: u32,
+        pid: mpsc::Receiver<u32>,
         reaped: Arc<AtomicBool>,
     ) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
-        let child = rustix::process::Pid::from_raw(pid as i32);
         let mut signals = signal_hook::iterator::Signals::new(FORWARDED)
             .map_err(|e| io::Error::other(e.to_string()))
             .inspect_err(|e| {
@@ -225,7 +235,19 @@ impl Forwarder {
             .ok()?;
         let handle = signals.handle();
         let watcher = thread::spawn(move || {
+            let mut child = None;
             for raw in signals.forever() {
+                if child.is_none() {
+                    // Before `arm`: wait for the spawn. No pid ever coming means the spawn
+                    // failed, and the signal ends the wrapper as it would have unforwarded.
+                    match pid.recv() {
+                        Ok(p) => child = rustix::process::Pid::from_raw(p as i32),
+                        Err(_) => {
+                            let _ = signal_hook::low_level::emulate_default_handler(raw);
+                            return;
+                        }
+                    }
+                }
                 let (Some(sig), Some(child)) =
                     (rustix::process::Signal::from_named_raw(raw), child)
                 else {
@@ -256,6 +278,7 @@ impl Forwarder {
     /// watcher's actions; `end_like` restores SIG_DFL itself before re-raising the child's
     /// signal, and no forwarded signal can reach the wrapper after this point.
     fn stop(&mut self) {
+        self.pid = None;
         if let Some(handle) = self.handle.take() {
             handle.close();
         }
@@ -562,6 +585,34 @@ fn digest(argv: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// WS-FIX-20-r1-10: a TERM that reaches the wrapper before the child's pid is known
+    /// must not take the default action (ending the wrapper and orphaning the child); it is
+    /// held and forwarded once the child exists. Without the pre-spawn arm this test
+    /// process dies of SIGTERM.
+    #[test]
+    fn a_term_before_the_child_exists_is_forwarded_once_it_does() {
+        let mut forwarder = Forwarder::start();
+        let me = rustix::process::getpid();
+        rustix::process::kill_process(me, rustix::process::Signal::TERM).unwrap();
+        thread::sleep(Duration::from_millis(200));
+        let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+        forwarder.arm(child.id());
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(s) = child.try_wait().unwrap() {
+                break Some(s);
+            }
+            if std::time::Instant::now() > deadline {
+                let _ = child.kill();
+                break None;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        forwarder.stop();
+        let status = status.expect("the held TERM never reached the child");
+        assert_eq!(status.signal(), Some(signal_hook::consts::signal::SIGTERM));
+    }
 
     #[test]
     fn command_hint_keeps_program_and_plain_subcommand_only() {
