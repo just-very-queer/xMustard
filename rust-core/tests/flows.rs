@@ -508,34 +508,48 @@ fn at_most_the_top_two_hundred_candidates_are_seeds() {
 /// The tie-break is asserted separately in the next test; this one only fixes the order.
 #[test]
 fn seeds_are_listed_from_the_highest_score_to_the_lowest() {
+    // More than 200 candidates with DISTINCT scores, so the cap has to choose and the
+    // choice has to be the right one. 240 entry points whose scores cycle through eight
+    // ranks: the cap therefore cuts inside a rank group, and a list reversed after the cut
+    // would come back lowest-first.
     let mut src = String::from("package pkg\n\n");
-    // Rungs of 1..=8 callees, so the scores are 1, 2, ... 8 (each entry point is exported,
-    // so each score is doubled, and none is called, so the ratio is callees/1).
-    for rung in 1..=8u32 {
-        src.push_str(&format!("func Rung{rung}() {{\n"));
-        for leaf in 0..rung {
-            src.push_str(&format!("\tRung{rung}Leaf{leaf}()\n"));
+    for i in 0..240usize {
+        let rank = i % 8;
+        src.push_str(&format!("func Entry{i:03}() {{\n"));
+        for leaf in 0..=rank {
+            src.push_str(&format!("\tEntry{i:03}Leaf{leaf}()\n"));
         }
         src.push_str("}\n");
-        for leaf in 0..rung {
-            src.push_str(&format!("func Rung{rung}Leaf{leaf}() {{}}\n"));
+        for leaf in 0..=rank {
+            src.push_str(&format!("func Entry{i:03}Leaf{leaf}() {{}}\n"));
         }
     }
     let d = repo(&[GO_MOD, ("pkg/rungs.go", &src)]);
     build(d.path());
     let v = flows(d.path(), &[]);
     let seeds = read_seeds(&v);
-    // Every rung is present, and the scores fall strictly rung by rung, so the order is
-    // forced: Rung8 first, Rung1 last.
-    let names: Vec<&str> = seeds.iter().map(|s| s.name.as_str()).collect();
-    let rungs: Vec<u32> = names
-        .iter()
-        .filter_map(|n| n.strip_prefix("Rung").and_then(|r| r.parse().ok()))
-        .collect();
-    let mut desc = rungs.clone();
-    desc.sort_unstable_by(|a, b| b.cmp(a));
-    assert_eq!(rungs, desc, "the rungs must fall from widest to narrowest: {names:?}");
-    assert!(seeds.len() >= 8, "the fixture must reach every rung: {names:?}");
+    assert_eq!(
+        seeds.len(),
+        200,
+        "the fixture must exceed the cap: {} seeds",
+        seeds.len()
+    );
+    // The scores are a product of a rank and 2, so the highest is 16 and the lowest
+    // 2: if the cut were reversed the first seed would score 2 and the last 16.
+    let scores: Vec<f64> = seeds.iter().map(|s| s.score).collect();
+    assert_eq!(
+        scores.first().copied(),
+        Some(16.0),
+        "the best candidate leads the list: {scores:?}"
+    );
+    assert_eq!(
+        scores.last().copied(),
+        Some(2.0),
+        "the weakest kept candidate is last: {scores:?}"
+    );
+    let mut desc = scores.clone();
+    desc.sort_by(|a, b| b.partial_cmp(a).unwrap());
+    assert_eq!(scores, desc, "seeds must be listed highest score first");
 }
 
 /// Two seeds with identical scores are ordered by (path, line, name), so the list is the
@@ -1357,6 +1371,20 @@ fn a_symbol_local_to_a_function_body_is_neither_a_seed_nor_a_step() {
     assert!(
         v["call_edges"].as_u64().unwrap() <= 3,
         "only the three declared calls are resolved edges: {v:#}"
+    );
+    // Why this test pins a filter and cannot be shown to kill it: the row is a REACHABILITY
+    // row, not a scoring one. The Go closure above is the only candidate for a local
+    // resolved CALL in this fixture, and the index never records one — `local` marks a name
+    // bound in a callable's body, and the extractor gives a closure no symbol node the
+    // resolver can bind a CALL to. So `call_edges` is 3 with or without the filter, and
+    // mutation row M16 survives. What the fixture does pin is the reporting: no local name
+    // appears in any step or seed. The filter itself is asserted by construction rather
+    // than by mutation, and this comment is where that fact lives so it is not mistaken
+    // for a passing row.
+    assert_eq!(
+        v["call_edges"].as_u64().unwrap(),
+        3,
+        "a closure binding adds no resolved edge: {v:#}"
     );
 }
 
