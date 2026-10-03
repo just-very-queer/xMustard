@@ -504,6 +504,20 @@ func TestRevokedGrantHidesACrossWorkspaceMembership(t *testing.T) {
 	if len(held) != 0 {
 		t.Fatalf("a revoked grant still holds the entry: %+v", held)
 	}
+	// The entry side applies the target condition too: a grant naming this collection
+	// but addressed elsewhere does not put it back, so the two reads cannot disagree.
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.Grant(ctx, GrantInput{SourceWorkspace: "ws1", TargetWorkspace: "ws9",
+			CollectionID: col.ID, Permission: PermissionReadWrite}, admin)
+		return err
+	})
+	stillHidden, err := s.ListEntryCollections(ctx, "m1", CollectionFilter{})
+	if err != nil {
+		t.Fatalf("entry collections with a wrong-target grant: %v", err)
+	}
+	if len(stillHidden) != 0 {
+		t.Fatalf("a grant addressed elsewhere restored the entry: %+v", stillHidden)
+	}
 }
 
 // A grant from the entry's workspace to some other target does not make this collection
@@ -520,16 +534,20 @@ func TestGrantToAnUnrelatedTargetDoesNotReachACollection(t *testing.T) {
 		return err
 	})
 	mustUpdate(t, s, func(tx Tx) error {
-		// A grant from ws1 to ws3 that names no collection says nothing about ws2's.
-		_, err := tx.Grant(ctx, GrantInput{SourceWorkspace: "ws1", TargetWorkspace: "ws3",
-			Permission: PermissionReadWrite}, admin)
-		return err
+		var err error
+		// A grant that names this collection but is addressed to ws3, not to the
+		// collection's owner ws2. It must not reach ws2's collection.
+		if _, err = tx.Grant(ctx, GrantInput{SourceWorkspace: "ws1", TargetWorkspace: "ws3",
+			CollectionID: col.ID, Permission: PermissionReadWrite}, admin); err != nil {
+			return err
+		}
+		return nil
 	})
 	if err := s.Update(ctx, func(tx Tx) error {
 		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin)
 		return err
 	}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("a grant naming another target reached this collection: %v", err)
+		t.Fatalf("a grant naming this collection but another target reached it: %v", err)
 	}
 	if n := countRows(t, s, "SELECT count(*) FROM collection_members"); n != 0 {
 		t.Fatalf("the refused membership stored %d rows", n)
