@@ -40,3 +40,26 @@ This product includes software translated from Graphiti
   This file remains under the Apache License, Version 2.0. It keeps upstream's
   copyright line, carries an SPDX-License-Identifier and states the changes xMustard
   contributors made to it.
+
+This product includes the Rust crate signal-hook
+(https://github.com/vorner/signal-hook), licensed under the Apache License,
+Version 2.0 OR the MIT License, at the copyright holder's option
+(https://github.com/vorner/signal-hook/blob/main/LICENSE-APACHE and LICENSE-MIT).
+signal-hook ships no NOTICE file. It is a dependency of rust-core, not a translation.
+
+  Copyright (c) 2017 Michal 'vorner' Vaner and signal-hook contributors
+
+  Used at signal-hook 0.3.18 for SIGTERM/SIGINT/SIGQUIT/SIGHUP forwarding from the
+  run wrapper to its child (WS-FIX-20), because rust-core is #![forbid(unsafe_code)]
+  and the crate forbids sigaction for the same reason. xMustard contributes no changes
+  to it.
+
+This product includes the Rust crate signal-hook-registry
+(https://github.com/vorner/signal-hook, directory signal-hook-registry), licensed
+under the Apache License, Version 2.0 OR the MIT License, at the copyright holder's
+option. It ships no NOTICE file and is a dependency of signal-hook, not a translation.
+
+  Copyright (c) 2017 Michal 'vorner' Vaner and signal-hook contributors
+
+  Used at signal-hook-registry 1.4.8, pulled in by signal-hook for the same
+  forwarding. xMustard contributes no changes to it.
