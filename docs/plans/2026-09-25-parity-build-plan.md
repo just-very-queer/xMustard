@@ -3532,7 +3532,16 @@ PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operatio
 
 **Acceptance.** (1) `search(mode="text", lang="go")` returns chunk-text matches in Go files only, checked against an independent oracle: a term planted in a Go and a Rust function body, and a term planted in a Go and a Rust file path. (2) `search(mode="hybrid", lang="go")` narrows the hybrid's hits to Go files and invents none: every hit it returns is a hit of the unfiltered query. (3) The retrieval gate does not regress: `RET` is ≥21/21 and never below the merge base. (4) `CAPS` passes with both caps unchanged and `instructions` unchanged: no new argument is added, so §5.1 rule 9 is satisfied by construction. (5) `go-calls.txt` still holds `called search` and no new subcommand appears, so the manifest test is untouched. (6) Every `mode` value the tool advertises is one the route accepts, and an unknown `mode` is a 400 rather than the hybrid.
 
-**Design.** The `lang` filter is one SQL predicate added to the existing `CODE_SQL` (`AND (?5 = '' OR f.lang = ?5)`), not a post-filter in Go: filtering in SQL keeps the lane's `k` meaningful, so a filter that removes most rows widens the pool it draws from instead of truncating the answer. The empty-`lang` disjunct is required, because a bare `f.lang = ?5` with an absent `lang` matches no row and would silently empty the whole bm25 lane. The graph-side name and file lanes have no `files.lang` to read, so they go through the same `admit` closure `path_glob` uses, keyed on `Lang::for_path` — the same mapping the writer stored in `files.lang`. The body lane reuses the same `chunk_fts` table with a column-scoped FTS5 expression (`body:"term"`), which is why no new table and no index migration is needed. The text lane reuses the existing `TextHit` shape and the existing AND-then-OR fallback; it differs only in that it reads the `body` column, drops the docs lane, and drops the name and file candidates, so the fusion, paging, snippets and feedback boost are unchanged code paths.
+**Design.** The cursor is the existing `cursorCodec` with a new kind, `i2`, carrying the
+per-tier offset as one field, signed over a ranking key that is the workspace plus every
+argument that selects or shapes the tier page (the fields `explainRanking` marshals,
+`navigation.go:380-383`), so 52a's unification has one shape to fold rather than three.
+`ImpactCursor`/`DecodeImpactCursor` mirror `ExplainCursor`/`DecodeExplainCursor`. The names
+are the query's own: `Build` and the Pi mirror both send the walk's depth as `depth`, and
+`ImpactFlags` reads `params["depth"]`. `has_more` is computed where the page is, from the
+tier's own `next_offset` and `total`, and a `next_offset` of 0 is never issued. This row
+adds the *reporting* and the cursor, not a second paging mechanism (`pageParams` owns
+`limit`/`offset` and is unchanged, so there is no dead knob).
 
 **Boundary.** 59c adds `mode=exact|regex` beside this one and 59d/59e/59f do not touch `search`; 59b therefore owns the `mode` dispatch and the `lang` semantics, and a later row reads them. G§5.3 is untouched: `impact path=` is neither replaced nor renamed here. No new argument, no new subcommand and no new `tools/list` property. Two existing `search` properties do change in `tools_list.json`: `mode`'s enum gains `text` and `lang`'s gains `maxLength`, and the full-profile byte caps in `tools_list_budget.json` are reduced by the saving, never raised.
 
@@ -3559,44 +3568,92 @@ PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operatio
 
 ### WS-59e — `impact` paging remainder: `has_more` / `next_cursor`
 
-**Goal.** Close the PAR-CTX-05 paging remainder 59a assigned here. The blast and diff-scope impact results already carry a per-tier `total`, `offset` and `next_offset` (the Rust core computes them, `impact.rs:766-776` and `:988-1012`), and the API already accepts `limit`/`offset` per tier (`pageParams`, `impact_flags.go:113-118`), but no cursor names a *ranking* and no `has_more`/`next_cursor` member reaches the client for those forms. So a caller can page only by hand-computing an offset, cannot tell from the result whether a page had a successor, and a budget-trimmed tier silently loses its remainder. This row adds the missing members: the operation form's results report `has_more`, and `next_cursor` continues them through the signed cursor helper 59a ruled this row owns. It reuses `cursorCodec` (`api-go/internal/workspaceops/cursor.go:21`) rather than writing a new signer, and WS-52a later unifies the codec across the tools.
+**Goal.** Close the PAR-CTX-05 paging remainder 59a assigned here. The blast and diff-scope
+impact results already carry a per-tier `total`, `offset` and `next_offset`, and the API
+already accepts `limit`/`offset` per tier (`pageParams`, `impact_flags.go:113-118`), but no
+cursor names a *ranking*, no `has_more`/`next_cursor` member reaches the client for those
+forms, and a budget-trimmed tier silently loses its remainder. This row adds them: the
+operation forms report `has_more`, and `next_cursor` continues them through the signed
+cursor helper 59a ruled this row owns. It reuses `cursorCodec` (`cursor.go:21`) rather than
+writing a new signer; WS-52a later unifies the codec.
 
-**Requirements.** PAR-CTX-05's impact paging remainder only: `max_chars`, `limit`, `cursor` → `has_more`, `next_cursor` on impact's already-budgeted operation forms. It does not touch `search`/`explain` paging (WS-18, WS-20), does not add the PAR-IMP-03 occurrences form (59d), and does not replace or rename `impact path=` (G§5.3).
+**Requirements.** PAR-CTX-05's impact paging remainder only: `max_chars`, `limit`,
+`cursor` → `has_more`, `next_cursor` on impact's already-budgeted operation forms. It does
+not touch `search`/`explain` paging (WS-18, WS-20), does not add the PAR-IMP-03 occurrences
+form (59d), and does not replace or rename `impact path=` (G§5.3).
 
-**Files.** `api-go/internal/workspaceops/cursor.go` (the impact cursor codec and its ranking key), `api-go/internal/workspaceops/navigation.go` (`ImpactCursor` / `DecodeImpactCursor`, alongside `ExplainCursor`), `api-go/internal/workspaceops/symbolgraph.go` (`has_more` / `next_cursor` on the blast and scope results), `api-go/internal/mcpserver/tool_impact.go` (the `cursor` argument's description and the output members), and this plan file.
+**Files.** `api-go/internal/workspaceops/cursor.go` (the impact codec and its ranking
+key), `navigation.go` (`ImpactCursor`/`DecodeImpactCursor`, beside `ExplainCursor`),
+`symbolgraph.go` (`has_more`/`next_cursor` on the blast and scope results),
+`api-go/internal/mcpserver/tool_impact.go` (the `cursor` argument and the output members),
+and this plan file.
 
-**Tests required.** (1) A blast result whose tier was cut by `limit` reports `has_more: true` and a `next_cursor`; taking that cursor with the same arguments returns the next tier page, and the pages do not overlap. (2) `has_more` is `false` and no `next_cursor` is issued when the last item returned is the tier's last. (3) A cursor is bound to the ranking it pages: two blast calls that differ only in `symbol`, `direction`, `max_depth`, `relation_types`, `min_confidence`, `include_tests` or `scope` do not accept each other's cursor. (4) An edited or foreign cursor is refused with the same error shape as search's. (5) An over-long `cursor` is refused at the same bound as search's. (6) `offset` and `cursor` together: a cursor that names a ranking but a caller-supplied `offset` for the same tier is refused rather than one silently winning. (7) The `has_more`/`next_cursor` members appear on the blast and diff-scope forms and not on the trace (`from=&to=`) or no-argument forms, which keep today's shapes.
+**Tests required.** (1) A blast result whose tier was cut by `limit` reports
+`has_more: true` and a `next_cursor`, and taking that cursor with the same arguments
+returns the next tier page with no overlap. (2) `has_more` is false and no cursor is
+issued when the last item returned is the tier's last. (3) A cursor is bound to its
+ranking: two blast calls differing only in `symbol`, `direction`, `max_depth`,
+`relation_types`, `min_confidence`, `include_tests` or `scope` do not accept each other's
+cursor. (4) An edited or foreign cursor is refused with search's error shape. (5) An
+over-long `cursor` is refused at search's bound. (6) `offset` and `cursor` together are
+refused rather than one silently winning. (7) The two members appear on the blast and
+diff-scope forms and not on the trace (`from=&to=`) or no-argument forms.
 
-**Acceptance.** (1) `impact(symbol=…)` with a `limit` smaller than a tier returns `has_more: true` and a non-empty `next_cursor`; without a `limit` cut, `has_more` is absent-or-false and no cursor is issued. (2) Two successive `cursor=` pages cover the same tier with no overlap and no gap, checked against the tier's own `total`. (3) `CAPS` passes with the lean and full byte caps unchanged: `has_more` and `next_cursor` are output members (the full-profile schema) and `cursor` is an Advanced argument already present on the tool via `budgetArgs`, so no new property enters the lean schema. (4) `instructions` is unchanged. (5) Every existing impact test is green; no existing member is renamed or removed. (6) No member of `search` or `explain` changes.
+**Acceptance.** (1) `impact(symbol=…)` with a `limit` smaller than a tier returns
+`has_more: true` and a non-empty `next_cursor`; without a cut, `has_more` is absent-or-false
+and no cursor is issued. (2) Two successive `cursor=` pages cover the tier with no overlap
+and no gap, checked against the tier's own `total`. (3) `CAPS` passes with lean and full
+byte caps unchanged: the two members are output members and `cursor` is Advanced, so
+nothing enters the lean schema. (4) `instructions` is unchanged. (5) Every existing impact
+test is green and no member is renamed. (6) No member of `search` or `explain` changes.
 
-**Design.** The cursor is the existing `cursorCodec` with a new kind, `i2`, carrying the per-tier offset as one field, signed over a ranking key that is the workspace plus every argument that selects or shapes the tier page (the same fields `explainRanking` marshals, `navigation.go:380-383`). `ImpactCursor` and `DecodeImpactCursor` mirror `ExplainCursor`/`DecodeExplainCursor` exactly, so 52a's unification has one shape to fold rather than three. `has_more` is computed where the page is: the Go side reads the Rust tier's `next_offset` (already emitted, `impact.rs:1011`) and the tier's `total`, and sets `has_more: true` when a successor exists. A `next_offset` of 0 is not issued (a cursor names a position after the last returned item, `cursor.go:59-61`). This row does not make the budget layer page impact's tiers: that is `pageParams`' `limit`/`offset`, owned by WS-35 and unchanged here, so the row adds the *reporting* and the *cursor*, not a second paging mechanism (A7: no dead knobs).
+**Design.** The cursor is the existing `cursorCodec` with a new kind, `i2`, carrying the
+per-tier offset as one field, signed over a ranking key that is the workspace plus every
+argument that selects or shapes the tier page (the fields `explainRanking` marshals,
+`navigation.go:380-383`), so 52a's unification has one shape to fold rather than three;
+`ImpactCursor`/`DecodeImpactCursor` mirror `ExplainCursor`/`DecodeExplainCursor`. The key's
+names are the query's own: `Build` and the Pi mirror both send the walk's depth as `depth`
+and `ImpactFlags` reads `params["depth"]`. `has_more` is computed where the page is, from
+the tier's own `next_offset` and `total`, and a `next_offset` of 0 is never issued. This
+row adds the *reporting* and the cursor, not a second paging mechanism (`pageParams` owns
+`limit`/`offset` and is unchanged, so there is no dead knob).
 
-**Boundary.** 59d adds the PAR-IMP-03 occurrences form to the same tool and reuses this row's cursor helper for its occurrence paging; 59f adds read-only rename/delete plans. 59e therefore owns the codec and the `has_more`/`next_cursor` members that 59d/59f read, and its `Files` list names only the existing blast/scope forms. 59c (search `mode=exact|regex`) and WS-52a (cursor unification) do not block this row and are not touched here.
+**Boundary.** 59d adds the PAR-IMP-03 occurrences form and reuses this row's cursor
+helper; 59f adds read-only rename/delete plans. 59e owns the codec and the two members
+that 59d/59f read, and its `Files` list names only the existing blast/scope forms. 59c
+(`search mode=exact|regex`) and WS-52a (cursor unification) do not block this row and are
+not touched here.
 
-**Verified facts this section rests on** (`rg` on this branch's base `642106b`):
+**Verified facts this section rests on** (`rg` on this branch's base `642106b`; the full
+list is in the round-1 record under `reviews/ws-59e/`):
 
-- The Rust core already computes per-tier `total`, `offset` and `next_offset` and skips `next_offset` when the page reaches the tier's end (`rust-core/src/index/impact.rs:766-776`, `:988-1012`: `next_offset: (end < total).then_some(end)`). No Rust change is needed to *know* a page has a successor; this row surfaces it. The diff-scope form's `affected` is an `Impact` (`detect_changes.rs:145`, `:535-538`), so it already carries the same `by_depth` tiers.
-- `impact`'s `Paged` spec is false (`toolbudget.go:78`, with the comment "impact: WS-35 owns its paging" at `:56`), so the budget layer does not add `has_more`/`next_cursor` for it; the two members must come from the result itself. `explain` is the model to follow: it is `Paged: true`, its page is `Page{Slice: true, …, Cursor: workspaceops.ExplainCursor(ws, q)}` (`tool_budget_routes.go:99-100`), and its cursor rides `cursorCodec` kind `e1` (`navigation.go:376`).
-- `budgetArgs` returns `max_chars` alone for a tool whose spec is not `Paged`, and `budgetQuery` sends only `max_chars` in that case (`mcpserver/degrade.go:26-36`, `:47-51`), so impact has **no** `cursor` argument today and none is sent. This row declares `cursor` on the tool itself (Advanced, documented at `xmustard://docs/tools`) and appends it in `impactQuery`, which is where every other impact argument is forwarded; `TestImpactForwardsEveryDeclaredArgument` is what proves the two agree. The output members map (`tool_impact.go:48-52`) is where `has_more`/`next_cursor` are declared for the full profile.
-- The API's query parameter for the walk's depth is `depth`, not the tool's `max_depth`: `Build` maps it (`tool_impact.go`), the Pi mirror maps it (`k === "max_depth" ? "depth" : k`), and `ImpactFlags` reads `params["depth"]` (`impact_flags.go:125`). A ranking key that read `max_depth` would therefore be empty on the wire and bind nothing, which is the defect review round 1 found; the key reads `depth`.
-- `impact`'s existing per-tier paging arguments are `limit` (1-500) and `offset` (0-50000) in `pageParams` (`impact_flags.go:110-116`), validated by `ImpactFlags`; a blast tier's page size is the core's `DEFAULT_LIMIT` 50 (`impact.rs:159`, `:197`). The trace form takes neither, so it is left alone.
-- `CheckImpactRequest` refuses an argument of another form before any core runs (`impact_flags.go:172-184`), so a `cursor` that names the wrong form is refused by adding `cursor` to the blast/scope parameter tables, not by a new post-check.
-- The core pages every tier with the same rule: `skip(offset).take(limit)`, and `next_offset` is emitted only when that page does not reach the tier's `total` (`rust-core/src/index/impact.rs:990-1011`). One cursor for all tiers is therefore sufficient: a tier short enough to finish early has already delivered everything it holds and carries no `next_offset`, so the largest `next_offset` among the tiers that have one is the shortest offset at which every unfinished tier still has items.
-- The output budget runs after the handler (`tool_budget_routes.go` calls `spec.Apply` on the recorded response), and impact is not a `Paged` budget spec, so the ladder may cut a tier's items and the budget layer leaves a producer's cursor alone. The tier `total` survives every rung and the budget report names the stage, so a trimmed page can be detected and its cursor dropped rather than made to skip items the caller never received.
+- The core already emits per-tier `total`, `offset` and `next_offset`, skipping
+  `next_offset` when a page reaches the tier's end, so no Rust change is needed to know a
+  page has a successor.
+- `impact` is not a `Paged` budget spec, so the budget layer adds no paging members for it
+  and they must come from the result itself; `explain` is the model.
+- **The wire parameter for the walk's depth is `depth`, not the tool's `max_depth`**, so a
+  key reading `max_depth` would be empty on the wire and bind nothing — round 1's defect.
+- Every tier is paged by `skip(offset).take(limit)` and carries `next_offset` only when the
+  page misses `total`, so every unfinished tier at the same `(offset, limit)` ends in the
+  same place and one cursor serves them all. This is the premise `WS-59e-r2-5` adjudicates.
+- The budget runs after the handler, so it can cut a tier's items after the cursor was
+  signed; `total` survives every rung and the report names the stage, so a trimmed page is
+  detectable and its cursor re-signable.
 
-**Collision risk.** `tool_impact.go` (59d, 59f also touch it), `cursor.go` / `navigation.go` (WS-52a unifies the codec), the plan file (every lane appends its section here).
+**Collision risk.** `tool_impact.go` (59d, 59f also touch it), `cursor.go` /
+`navigation.go` (WS-52a unifies the codec), the plan file (every lane appends here).
 
-**Implementation record (branch parity/ws-59e, 2026-10-03).**
+**Implementation record (branch parity/ws-59e, 2026-10-03).** Detail lives in
+`reviews/ws-59e/`; this is the §4 step 7 summary.
 
-- **Built.** `cursor.go` gains the `i2` codec kind; `navigation.go` gains `ImpactCursor`/`DecodeImpactCursor` and `impactRanking`, signed over the wire's own parameter names (`depth`, not the tool's `max_depth`) plus every argument that shapes a tier page; `symbolgraph.go` reports `has_more`/`next_cursor` on the blast and diff-scope tier pages and re-signs a trimmed page's cursor to the first undelivered item; `impact_flags.go` refuses a cursor on the trace and path forms, an explicitly empty cursor, and `cursor` with `offset` in any form; `tool_impact.go` declares `cursor` and the two output members; the Pi mirror forwards them.
-- **Measured.** `BOXALL` on 25e36ec: `remote_exit=0`, 24 Go packages ok, 18 Rust test binaries ok, `clippy_warnings=6` (the merge-base count), `rss_lines=ok` (Linux build box; `logs/ws-59e-check-*.log` in the ledger entry). `CAPS`: `--- PASS: TestToolsListStaysWithinByteCaps`, and all 16 changed numeric caps **fell** (deltas −76/−64/−14/−2). `PI`: `remote_exit=0`.
-- **Deviations.** 1. The row's `Files` list names five files; eleven more are in the diff, each with a reason in `reviews/ws-59e/r3/slop-audit.md` S9 — the budget route, the Pi mirror and the generated snapshots are consequences of the row, and `toolbudget/apply.go` is where the `used_chars` fixed point lives. 2. **A settled report is not a settled budget contract by itself** (round 3): `Apply`'s `used_chars` is a fixed point over the members it wrote, so `ReconcileImpactPaging`'s members were outside it. `toolbudget.Settle` re-fits through the same ladder and carries the earlier pass's stages and recovery forward, because `load` drops the incoming report. 3. Tier items are counted from the raw bytes (`tierReading`/`countArray`) rather than decoded into `json.RawMessage`: the old form copied every item on a path that runs before fitting, on results allowed to 16 MiB.
-- **Review.** Rounds r1, r2, r3 under `reviews/ws-59e/`. r2 closed six findings (four fixed, `WS-59e-r2-5` rejected with `adjudication-WS-59e-r2-5.md` answering AGREE, and `WS-59e-r2-6` fixed here rather than deferred — §4.6 allows a deferral only for a minor). r3 found three (`codex-spec:1..3`), all fixed in 25e36ec with mutation rows M14/M15.
-- **Merge recheck.** Rule 4 fired on both grounds (lane C's WS-FIX-19 touched four Rust files outside this row and the plan file); the re-merge `d80c836` left this row's 14 files untouched, and the core's `end`/`next_offset` paging rule that `WS-59e-r2-5` rests on is byte-identical after it. Details in `reviews/ws-59e/r3/merge-recheck.md`.
-- **Checks.** `BOXALL` (2 runs: one red for a group-writable temp index dir, §5.3 item 4 not crossed — the retry is the gate cited), `CAPS`, `PI`. Not run: `RET` (no index/search change), `BUD` (no resident component and no in-heap structure added; `countArray` removes an allocation proportional to the response), `SECDOC` (no route or gate row changed), `GOLD` (the tools/list snapshots the row regenerates are cited under `CAPS`).
-- **Follow-ups.** `WS-59e-r2-6`'s budget follow-up is withdrawn and replaced by `Settle`; the general rule (settle a result a producer changed) is in FU with a proposed owner. `countArray` has no mutation row and none is claimed — the reasoning is in the r3 audit's S5. Proposed owner for the next row that mutates a budgeted result: call `spec.Settle`.
-
-### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
+- **Built.** `cursor.go` the `i2` codec kind; `navigation.go` `ImpactCursor`/`DecodeImpactCursor` and `impactRanking`, signed over the wire's names (`depth`, not `max_depth`); `symbolgraph.go` `has_more`/`next_cursor` on the blast and scope pages, and a trimmed page's cursor re-signed to the first undelivered item; `impact_flags.go` refuses a cursor on the trace and path forms, an empty cursor, and `cursor` with `offset`; `tool_impact.go` declares `cursor` and the members; the Pi mirror forwards them.
+- **Measured** (Linux box, `25e36ec`). `BOXALL` `remote_exit=0`, 24 Go packages, 18 Rust binaries, `clippy_warnings=6` (base count), `rss_lines=ok`. `CAPS` PASS, all 16 changed caps **fell** (−76/−64/−14/−2). `PI` `remote_exit=0`. Log paths in the ledger entry.
+- **Deviations.** 1. Eleven files outside the row's `Files`, each with a reason in `reviews/ws-59e/r3/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members it wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same ladder and carries the earlier stages and recovery forward. 3. Tier items are counted from raw bytes, not decoded into `json.RawMessage`, which copied every item before fitting on results allowed to 16 MiB.
+- **Review.** r1-r3 under `reviews/ws-59e/`. r2 closed six (four fixed, `WS-59e-r2-5` rejected on an AGREE adjudication, `WS-59e-r2-6` fixed rather than deferred — §4.6 allows a deferral only for a minor). r3's three all fixed in `25e36ec` (M14/M15/M18/M19/M21b).
+- **Merge recheck.** Rule 4 fired on both grounds; `d80c836` left this row's 14 files untouched and the core's `end`/`next_offset` rule byte-identical, so `WS-59e-r2-5` still holds. See `reviews/ws-59e/r3/merge-recheck.md`.
+- **Checks.** `BOXALL` (an earlier run red for a group-writable temp index dir; §5.3 item 4 not crossed, the retry is the gate), `CAPS`, `PI`. Not run: `RET`, `BUD`, `SECDOC`, `GOLD`.
+- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`. Next row that mutates a budgeted result: call `spec.Settle`.### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
 
 Route/DI extractors (Django, FastAPI, Next.js, Nest, Spring, Laravel, tRPC, Expo) seeding flow entry points; Vue, Dart, Objective-C packs; reimplemented from design (GitNexus is PolyForm NC).
 
