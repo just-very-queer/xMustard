@@ -395,4 +395,14 @@ printf '{"symbol":"Serve","impacted_count":120,"by_depth":[{"depth":1,"total":12
 	if checked == 0 {
 		t.Error("every cursor in the sweep named the wrong position")
 	}
+	// What this test does NOT prove, and why (WS-59e-r5-5): the sweep is green with a
+	// single pass, because toolbudget's fitEach binary-searches the item count against
+	// max_chars, so after the first fit the page already sits at the boundary and the
+	// second pass trims back to the count the first reconcile signed. M22 (drop the
+	// second pass) survived five attempts through this route. The invariant asserted
+	// above -- used_chars describes the bytes written, and a cursor names the first
+	// undelivered item -- holds either way, which is exactly why the mutation survives:
+	// the second pass is correct by construction and unreachable through the route at
+	// these budgets. The M22 row in reviews/ws-59e/r5/slop-audit.md is the honest
+	// record of that, not this sweep.
 }
