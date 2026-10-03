@@ -46,6 +46,13 @@ func replyRefused(err error) (map[string]any, *rpcError) { return mcpserver.Repl
 
 func mcpText(text string, isError bool) map[string]any { return mcpserver.TextResult(text, isError) }
 
+// registerCwdWhenRootsUnknown reads the WS-FIX-15b opt-in. It is off unless the
+// variable is set to 1: an unset or empty value must not register, which is why
+// this is `== "1"` and not the `!= "0"` its neighbours use.
+func registerCwdWhenRootsUnknown() bool {
+	return strings.TrimSpace(os.Getenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN")) == "1"
+}
+
 // One stdio process is one MCP session.
 var (
 	backend = &mcpserver.HTTPBackend{}
@@ -54,14 +61,12 @@ var (
 	// an invalid value stops the server in main.
 	schemaProfile, schemaErr = mcpserver.ParseSchemaProfile(os.Getenv("XMUSTARD_MCP_SCHEMA"))
 	session                  = mcpserver.New(mcpserver.Options{
-		Backend:      backend,
-		Delivery:     evidence,
-		Resources:    evidence,
-		Cwd:          workingDir(),
-		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
-		// the operator's opt-in: register the cwd while the client's roots are
-		// unknown (WS-FIX-15b, off by default)
-		RegisterCwdWhenRootsUnknown: strings.TrimSpace(os.Getenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN")) != "0",
+		Backend:                     backend,
+		Delivery:                    evidence,
+		Resources:                   evidence,
+		Cwd:                         workingDir(),
+		AutoRegister:                strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
+		RegisterCwdWhenRootsUnknown: registerCwdWhenRootsUnknown(),
 		HomeDir:                     homeDir(),
 		Schema:                      schemaProfile,
 		// initialize appends the workspace's standing memory (WS-31)

@@ -157,7 +157,7 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	// repository.
 	cwdRegister := ""
 	if rootsUnknown && !s.srv.opts.RegisterCwdWhenRootsUnknown {
-		cwdRegister = "not auto-registered while the client's roots are unavailable (XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=0)"
+		cwdRegister = "not auto-registered while the client's roots are unavailable"
 	}
 	if cwd := s.srv.opts.Cwd; cwd != "" {
 		ws, err := s.byPathSignal(ctx, cwd, SourceCWD, cwdRegister)
