@@ -282,10 +282,10 @@ func TestEveryImpactParameterThatShapesAPageIsBoundByTheCursor(t *testing.T) {
 
 // nextValue returns a value check accepts that differs from current, so the
 // table-driven test needs no hand-copied per-parameter values: it walks the closed sets
-// the package already declares (the scope names, the directions, the relation types) and
-// then a few plausible scalars, picking the first the parameter's own validator takes
-// that is not the one the query already carries. Returns "" when it cannot find one,
-// which the caller reports rather than skips silently.
+// the package already declares (the scope names, the directions, the relation types),
+// followed by a few plausible scalars, picking the first the parameter's own validator
+// takes that is not the one the query already carries. Returns "" when it cannot find
+// one, which the caller reports rather than skips silently.
 func nextValue(check func(string) error, current string) string {
 	values := append([]string{}, ChangeScopes...)
 	values = append(values, "upstream", "downstream")
