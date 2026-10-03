@@ -406,12 +406,55 @@ func TestRootsAnswerWithoutARootsFieldIsAskedAgain(t *testing.T) {
 	s := newSession(t, api, Options{}, client, "2026-06-18")
 
 	res, _ := call(t, s, "ground", map[string]any{})
-	if !strings.Contains(text(res), "carries no roots field") {
+	if !strings.Contains(text(res), "carries no roots array") {
 		t.Fatalf("an answer with no roots field must say so: %v", text(res))
 	}
 	res, _ = call(t, s, "ground", map[string]any{})
 	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
 		t.Fatalf("the client must be asked again: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// {"roots":null} carries the field but no array, so it is not a statement about the
+// client's roots either: it is asked again rather than cached until roots/list_changed.
+func TestNullRootsFieldIsAskedAgain(t *testing.T) {
+	project := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	null := func() (json.RawMessage, error) { return json.RawMessage(`{"roots":null}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){null, rootsAnswer(project)}}
+	s := newSession(t, api, Options{}, client, "2026-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "carries no roots array") {
+		t.Fatalf("a null roots field must be reported as carrying no array: %v", text(res))
+	}
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
+		t.Fatalf("the client must be asked again: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// An answer that keeps omitting the roots array is a repeated failure like any other:
+// the second in a row opens the back-off window, so a persistently broken client is
+// not asked on every call.
+func TestRepeatedRootsAnswerWithoutAnArrayBacksOff(t *testing.T) {
+	noField := func() (json.RawMessage, error) { return json.RawMessage(`{"capabilities":{}}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){noField, noField, noField}}
+	s := newSession(t, &fakeAPI{}, Options{}, client, "2026-06-18")
+
+	call(t, s, "ground", map[string]any{})
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
+		t.Fatalf("a repeated answer without a roots array must back off: %v", text(res))
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	s.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		call(t, s, "ground", map[string]any{})
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
 	}
 }
 
