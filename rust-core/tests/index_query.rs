@@ -72,6 +72,13 @@ fn commit(root: &Path, msg: &str) {
     git(root, &["commit", "-qm", msg]);
 }
 
+/// Owner-only on a temporary directory, so a fixture that hands one to the index
+/// does not depend on the process umask for the index directory guard (WS-FIX-11).
+fn tighten(dir: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
 /// Several languages, imports, calls, inheritance, a test file and an isolated file.
 fn fixture() -> TempDir {
     repo(&[
@@ -237,6 +244,7 @@ fn key(seg: &Segment, a: u32, b: u32, e: &Edge) -> EdgeKey {
 fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
     let r = fixture();
     let dir = TempDir::new().unwrap();
+    tighten(dir.path());
     let db = build(r.path(), dir.path());
     // add typed symbol-level edges (what the resolver will write) next to the lexical
     // ones, so both node kinds are exercised
@@ -506,6 +514,7 @@ fn assert_legacy_equal(root: &Path, db: &Path, max_names: usize) -> usize {
 fn bfs_trace_and_blast_radius_equal_the_legacy_graph_on_the_same_edges() {
     let r = fixture();
     let dir = TempDir::new().unwrap();
+    tighten(dir.path());
     let db = build(r.path(), dir.path());
     let checked = assert_legacy_equal(r.path(), &db, 1000);
     assert!(checked > 10);
@@ -1197,24 +1206,24 @@ impl Serve {
         memprobe::sample(self.child.id()).expect("a memory sample of the service")
     }
 
-    /// One reading of the settled service: the peak over `settle_ms`, so a sample
-    /// taken before the service has returned everything the last round allocated
-    /// cannot read low and a sample taken while it is still settling cannot read
-    /// high. The single instantaneous sample the sweep in `measure` used for
-    /// `steady` and `after swap` was the cause of WS-FLK-01: both names claim a
-    /// settled service and neither delivered one, so the two figures the bound
-    /// checked were timing-dependent (see `SETTLE_MS`).
+    /// One reading of the service once it has settled: every sample over
+    /// `settle_ms` is discarded and the reading is the last of them, so the
+    /// instant the window opens — when the service may still hold what the round
+    /// it just ran allocated — cannot leak into the figure. The single
+    /// instantaneous sample this replaced was the cause of WS-FLK-01: `steady`
+    /// and `after swap` name a settled service and neither delivered one, so the
+    /// two figures the bound checked depended on which instant the sample landed
+    /// on. `swap peak` was already a peak, taken while the swap ran.
     fn mem_settled(&self, settle_ms: u64) -> memprobe::Mem {
+        let mut settled = self.mem();
         let until = std::time::Instant::now() + Duration::from_millis(settle_ms);
-        let mut peak = self.mem();
         while std::time::Instant::now() < until {
-            if let Some(m) = memprobe::sample(self.child.id()) {
-                peak.rss = peak.rss.max(m.rss);
-                peak.dirty = peak.dirty.max(m.dirty);
-            }
             std::thread::sleep(Duration::from_millis(5));
+            if let Some(m) = memprobe::sample(self.child.id()) {
+                settled = m;
+            }
         }
-        peak
+        settled
     }
 }
 
@@ -1312,12 +1321,13 @@ const OVERLAPPING: Lines = Lines {
 };
 
 /// How long `steady` and `after swap` let the service settle before reading them,
-/// in milliseconds. Both readings are peaks over this window, so the figure a bound
-/// checks is the highest the settled service reaches rather than one instant's
-/// sample. Measured on the Linux build box at load 4.3-8.6: 0-500 ms windows are
-/// indistinguishable from each other on both `steady` and `after swap`, so the
-/// window is not fitted to a number. It is one 5 s sleep's tenth, and the swap
-/// already waits 3 s for the new generation to land.
+/// in milliseconds. Both readings discard every sample inside the window and keep the
+/// last one, so the figure a bound checks is the service at rest rather than one
+/// instant's sample of it. Measured on the Linux build box at load 4.9-8.6 over 26
+/// runs: `steady` and `after swap` stop moving once the window opens, and the 0 ms
+/// reading of the same runs spread 4.3 MiB on `after swap` where the settled one does
+/// not. It is one 5 s sleep's tenth, and the swap already waits 3 s for the new
+/// generation to land.
 const SETTLE_MS: u64 = 500;
 
 /// Measure the service on the synthetic store: base after the handshake, then after
@@ -1327,6 +1337,11 @@ fn measure(storage: &str, load: Load) -> Measured {
     let root = r.path().to_str().unwrap().to_string();
     let head = git(r.path(), &["rev-parse", "HEAD"]);
     let dir = TempDir::new().unwrap();
+    // WS-FIX-11 refuses a group- or world-writable index directory, and a
+    // TempDir inherits the process umask, so under a 002 umask this fixture's
+    // directory lands at 0o775 and `ensure_graph_segment` refuses it. Tighten it
+    // rather than depend on the umask the box happens to run with.
+    tighten(dir.path());
     let db = dir.path().join(index::DB_FILE);
     synthetic_store(&db, &head, 1);
     // the index worker writes the segment; the service only reads it
