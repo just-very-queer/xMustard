@@ -87,16 +87,46 @@ type Applicability struct {
 	CheckedAt       string `json:"checked_at"`
 }
 
-// GrantReader reads collections, grants and applicability.
+// CollectionMember is one entry a collection holds (migration 5). Seq is the
+// membership's own order within the collection, so a re-add moves the entry to the end
+// rather than leaving it where it first appeared.
+type CollectionMember struct {
+	CollectionID string `json:"collection_id"`
+	EntryID      string `json:"entry_id"`
+	AddedBy      string `json:"added_by"`
+	AddedAt      string `json:"added_at"`
+	Seq          int64  `json:"seq"`
+}
+
+// CollectionMemberFilter pages through a collection's members, oldest membership first.
+type CollectionMemberFilter struct {
+	CollectionID string
+	Limit        int
+}
+
+// CollectionMemberResult reports whether an Add or Remove changed the store. A re-add
+// or a second remove is not an error and not a change.
+type CollectionMemberResult struct {
+	CollectionID string `json:"collection_id"`
+	EntryID      string `json:"entry_id"`
+	Created      bool   `json:"created,omitempty"`
+	Removed      bool   `json:"removed,omitempty"`
+}
+
+// GrantReader reads collections, grants, membership and applicability.
 type GrantReader interface {
 	GetCollection(ctx context.Context, id string) (Collection, error)
 	ListGrants(ctx context.Context, f GrantFilter) ([]Grant, error)
+	ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error)
+	ListEntryCollections(ctx context.Context, entryID string) ([]string, error)
 	ListApplicability(ctx context.Context, entryID string) ([]Applicability, error)
 }
 
-// GrantWriter writes collections, grants and applicability.
+// GrantWriter writes collections, grants, membership and applicability.
 type GrantWriter interface {
 	CreateCollection(ctx context.Context, in CollectionInput, actor Actor) (Collection, error)
+	AddToCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error)
+	RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error)
 	Grant(ctx context.Context, in GrantInput, actor Actor) (Grant, error)
 	Revoke(ctx context.Context, grantID string, actor Actor) (Grant, error)
 	SetApplicability(ctx context.Context, entryID, targetWorkspace, state string, actor Actor) (Applicability, error)
@@ -228,6 +258,122 @@ func (t *txn) CreateCollection(ctx context.Context, in CollectionInput, actor Ac
 		return Collection{}, err
 	}
 	return t.GetCollection(ctx, id)
+}
+
+// AddToCollection puts an entry in a collection. Both names are checked first, so a
+// membership never names a collection or an entry that is not there. Re-adding an
+// entry already in the collection is not an error: it moves the membership to the end
+// and reports Created false, so a caller replaying a collection converges.
+func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
+	if err := actor.validate(); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	col, err := t.GetCollection(ctx, collectionID)
+	if err != nil {
+		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
+	}
+	entry, err := t.liveEntry(ctx, entryID)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	// The collection's own workspace holds its members: a collection in another
+	// workspace cannot name this one.
+	if entry.WorkspaceID != col.OwnerWorkspace {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, collection %s is owned by %s",
+			ErrInvalid, entryID, entry.WorkspaceID, collectionID, col.OwnerWorkspace)
+	}
+	var seq int64
+	if err := t.queryRow(ctx, "SELECT coalesce(max(seq), 0) + 1 FROM collection_members WHERE collection_id = ?",
+		collectionID).Scan(&seq); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	principal := strings.TrimSpace(actor.Principal)
+	res, err := t.exec(ctx, `INSERT INTO collection_members (collection_id, entry_id, added_by, added_at, seq)
+		VALUES (?, ?, ?, ?, ?) ON CONFLICT (collection_id, entry_id) DO UPDATE SET
+		added_by = excluded.added_by, added_at = excluded.added_at, seq = excluded.seq`,
+		collectionID, entryID, principal, t.nowText(), seq)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	created := rowsAffected(res) > 0
+	if err := t.appendEvent(ctx, actor, eventRow{
+		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember, Revision: entry.Revision,
+		Data: map[string]any{"collection_id": collectionID, "added": created},
+	}); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID, Created: created}, nil
+}
+
+// RemoveFromCollection takes an entry out of a collection. Removing an entry that is
+// not in it is not an error and reports Removed false.
+func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
+	if err := actor.validate(); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	col, err := t.GetCollection(ctx, collectionID)
+	if err != nil {
+		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
+	}
+	res, err := t.exec(ctx, "DELETE FROM collection_members WHERE collection_id = ? AND entry_id = ?",
+		collectionID, entryID)
+	if err != nil {
+		return CollectionMemberResult{}, err
+	}
+	removed := rowsAffected(res) > 0
+	if !removed {
+		return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID}, nil
+	}
+	if err := t.appendEvent(ctx, actor, eventRow{
+		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember,
+		Data: map[string]any{"collection_id": collectionID, "added": false},
+	}); err != nil {
+		return CollectionMemberResult{}, err
+	}
+	return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID, Removed: true}, nil
+}
+
+// ListCollectionMembers returns a collection's members, oldest membership first. The
+// collection must exist, so a name that is not one is ErrNotFound rather than an empty
+// list.
+func (r *reader) ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error) {
+	if _, err := r.GetCollection(ctx, f.CollectionID); err != nil {
+		return nil, fmt.Errorf("collection %s: %w", f.CollectionID, err)
+	}
+	rows, err := r.query(ctx, `SELECT collection_id, entry_id, added_by, added_at, seq FROM collection_members
+		WHERE collection_id = ? ORDER BY seq LIMIT ?`, f.CollectionID, clampLimit(f.Limit))
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []CollectionMember
+	for rows.Next() {
+		var m CollectionMember
+		if err := rows.Scan(&m.CollectionID, &m.EntryID, &m.AddedBy, &m.AddedAt, &m.Seq); err != nil {
+			return nil, err
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+// ListEntryCollections returns the ids of the collections holding an entry.
+func (r *reader) ListEntryCollections(ctx context.Context, entryID string) ([]string, error) {
+	rows, err := r.query(ctx, "SELECT collection_id FROM collection_members WHERE entry_id = ? ORDER BY collection_id LIMIT ?",
+		entryID, maxListLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		out = append(out, id)
+	}
+	return out, rows.Err()
 }
 
 // Grant creates an active grant, or returns the identical active one.
