@@ -7,6 +7,7 @@ import (
 	"math"
 	"sort"
 	"strconv"
+	"unicode/utf8"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -28,6 +29,19 @@ const DefaultSearchLimit = 10
 // matches it against every candidate path.
 const maxSearchPathGlobLen = 256
 
+// maxSearchLangLen bounds the `lang` filter at the same 256 bytes as `path_glob`, and the
+// MCP argument advertises the same maxLength, so a schema-valid `lang` is never refused by
+// the route. A pack name is short; the bound keeps an over-long value from reaching the
+// core's SQL as a parameter.
+const maxSearchLangLen = maxSearchPathGlobLen
+
+// The lexical modes of search, the closed set the tool advertises and the route accepts
+// (WS-59b). `pattern` and `symbol` answer from other surfaces and are listed with them.
+const (
+	SearchModeHybrid = "hybrid"
+	SearchModeText   = "text"
+)
+
 // SearchRequest is one hybrid search call.
 type SearchRequest struct {
 	Query string
@@ -35,6 +49,12 @@ type SearchRequest struct {
 	Seed string
 	// PathGlob keeps only matching paths (gitignore semantics).
 	PathGlob string
+	// Lang keeps only files of this language (the index's pack name, `go` or `rust`).
+	// Empty admits every file; a name no file carries matches nothing.
+	Lang string
+	// Mode is `hybrid` (the default fusion) or `text` (the body lane alone). It is a
+	// name here, not an enum, so the route decides which value reaches the core.
+	Mode string
 	// Cursor continues a previous page (next_cursor).
 	Cursor string
 	Limit  int
@@ -43,7 +63,7 @@ type SearchRequest struct {
 // rankingKey names the ranking a cursor pages: the workspace and every argument that
 // orders or filters it. The page size may change between pages.
 func (r SearchRequest) rankingKey(workspaceID string) []byte {
-	b, _ := json.Marshal([]string{workspaceID, r.Query, r.Seed, r.PathGlob})
+	b, _ := json.Marshal([]string{workspaceID, r.Query, r.Seed, r.PathGlob, r.Lang, r.Mode})
 	return b
 }
 
@@ -84,6 +104,19 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if len(req.PathGlob) > maxSearchPathGlobLen {
 		return nil, fmt.Errorf("path_glob is longer than %d bytes: %w", maxSearchPathGlobLen, ErrInvalidInput)
 	}
+	// Characters, not bytes: the MCP argument advertises maxLength 256, and JSON Schema
+	// counts characters, so a 256-rune value is schema-valid and must reach the core.
+	if utf8.RuneCountInString(req.Lang) > maxSearchLangLen {
+		return nil, fmt.Errorf("lang is longer than %d characters: %w", maxSearchLangLen, ErrInvalidInput)
+	}
+	// Only `text` is ever sent to the core, which is `hybrid` when the flag is absent, so
+	// an unrecognised mode would be answered by the hybrid. The route validates before it
+	// gets here, but this function is exported and its other callers do not.
+	switch req.Mode {
+	case "", SearchModeHybrid, SearchModeText:
+	default:
+		return nil, fmt.Errorf("mode %q is not a search mode: %w", req.Mode, ErrInvalidInput)
+	}
 	ranking := req.rankingKey(workspaceID)
 	offset, err := decodeSearchCursor(req.Cursor, ranking)
 	if err != nil {
@@ -107,6 +140,13 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	}
 	if req.PathGlob != "" {
 		coreArgs = append(coreArgs, "--path-glob="+req.PathGlob)
+	}
+	if req.Lang != "" {
+		coreArgs = append(coreArgs, "--lang="+req.Lang)
+	}
+	// `hybrid` is the core's default, so only `text` is sent.
+	if req.Mode == SearchModeText {
+		coreArgs = append(coreArgs, "--mode="+SearchModeText)
 	}
 	coreArgs = append(coreArgs, root, workspaceID, req.Query, strconv.Itoa(limit))
 	if req.Seed != "" {
