@@ -377,6 +377,25 @@ func StartRegistrationBaseline(dataDir, workspaceID string) {
 	}()
 }
 
+// awaitRegistrationBaseline waits for the registration build of workspaceID when one
+// is running, at most codeIndexWait and never past ctx, so a ground that follows
+// registration reads the baseline that build writes instead of finding none.
+func awaitRegistrationBaseline(ctx context.Context, dataDir, workspaceID string) {
+	registrationBaselines.Lock()
+	done := registrationBaselines.running[baselinePath(dataDir, workspaceID)]
+	registrationBaselines.Unlock()
+	if done == nil {
+		return
+	}
+	t := time.NewTimer(codeIndexWait)
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
 // WaitRegistrationBaselines waits until the detached registration builds running now
 // have finished, or ctx ends.
 func WaitRegistrationBaselines(ctx context.Context) error {
