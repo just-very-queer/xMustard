@@ -25,18 +25,18 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "")
-	// samples counts every walk of the tree; served counts only the walks taken on
-	// a goroutine serving an HTTP request, so a handler's sample is attributed to
-	// the handler and never confused with a watchdog tick or an admission sample.
+	// samples counts every walk of the tree; offWatchdog counts every walk the
+	// heavy-slot watchdog did not take, so a handler's sample (on the request
+	// goroutine or on one it spawned) is never confused with a watchdog tick.
 	// Every sample is stamped an hour old so the health cache never answers: a
 	// handler that reads the governor always reaches the sampler, and so always
-	// shows up in served, even while the watchdog keeps a fresh sample around.
-	var samples, served atomic.Int64
+	// shows up in offWatchdog, even while the watchdog keeps a fresh sample around.
+	var samples, offWatchdog atomic.Int64
 	prev := budget.Gov
 	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{SoftCeilingBytes: 1 << 40, Sampler: func() (budget.TreeSample, error) {
 		samples.Add(1)
-		if onHTTPServeGoroutine() {
-			served.Add(1)
+		if !onWatchdogGoroutine() {
+			offWatchdog.Add(1)
 		}
 		return budget.TreeSample{At: time.Now().Add(-time.Hour), Supported: true, Processes: 1, RSSBytes: 1 << 20, SelfRSSBytes: 1 << 20}, nil
 	}})
@@ -146,7 +146,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 			if want[who] {
 				release = holdSlot(t)
 			}
-			before, beforeAll := served.Load(), samples.Load()
+			before := offWatchdog.Load()
 			h := health(tok)
 			got := isFull(t, h)
 			release()
@@ -159,10 +159,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				if !strings.Contains(detail, reason) {
 					t.Fatalf("%s token: the detail must say why (%q): %q", who, reason, detail)
 				}
-				// No slot is held here, so no watchdog runs: the global counter
-				// must not move either, which also catches a sample taken on a
-				// goroutine the handler spawned and waited for.
-				if served.Load() != before || samples.Load() != beforeAll {
+				if offWatchdog.Load() != before {
 					t.Fatalf("%s mode, %s token: a restricted poll sampled the process tree", mode, who)
 				}
 			}
@@ -189,7 +186,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 			if want[who] {
 				continue
 			}
-			before := served.Load()
+			before := offWatchdog.Load()
 			under := health(tok)
 			if isFull(t, under) {
 				busy()
@@ -199,9 +196,9 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				busy()
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work leaked activity: %v", mode, who, b)
 			}
-			// served moves only on a request goroutine, so the watchdog cannot
-			// pollute it and no headroom is needed: a restricted poll adds zero.
-			if n := served.Load() - before; n != 0 {
+			// offWatchdog never moves for a watchdog tick, so no headroom is
+			// needed: a restricted poll adds zero.
+			if n := offWatchdog.Load() - before; n != 0 {
 				busy()
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work sampled the process tree %d times", mode, who, n)
 			}
@@ -350,14 +347,14 @@ esac
 	}
 }
 
-// onHTTPServeGoroutine reports whether the caller runs on a goroutine net/http
-// started to serve a request. The watchdog and the test's own goroutine never do.
-func onHTTPServeGoroutine() bool {
+// onWatchdogGoroutine reports whether the caller runs on the heavy-slot
+// watchdog's goroutine, the only sampler a restricted poll may run beside.
+func onWatchdogGoroutine() bool {
 	pcs := make([]uintptr, 128)
 	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
 	for {
 		f, more := frames.Next()
-		if f.Function == "net/http.(*conn).serve" {
+		if strings.Contains(f.Function, "budget.(*Governor).watchWhileHeld") {
 			return true
 		}
 		if !more {
