@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -24,6 +25,11 @@ import (
 // clusters it derives and the jobs it enqueues are all bounded, so a large store costs a
 // bounded pass rather than an unbounded one.
 const (
+	// maxSignatureLen is govstore's own limit on a conflict signature; a signature at or
+	// under it is kept in its readable form, and one longer is shortened.
+	maxSignatureLen = 256
+	// signatureDigestLen is how much of the digest a shortened signature keeps.
+	signatureDigestLen = 32
 	// consolidationEntries is how many entries one pass reflects over. The store's own
 	// ListEntries clamps a limit to its maxListLimit of 1,000, so a bound above that would
 	// be a number this pass cannot reach: the watermark would record the clamp, not the
@@ -34,6 +40,17 @@ const (
 	// work than one pass takes and the cut is reachable: what it leaves out is counted
 	// (Skipped) rather than dropped in silence.
 	consolidationCandidatesPerPass = 400
+	// consolidationAnchors bounds the anchor rows one pass reads across all its entries.
+	// The store holds no per-entry anchor cap, so without this a pass would read an
+	// unbounded anchor set and the budget the section claims would be fiction. Anchors read
+	// past it are counted (AnchorsRead) and their entries contribute no candidates.
+	consolidationAnchors = 20000
+	// consolidationPage bounds how many entries one pass reflects over, and
+	// consolidationPages bounds how many pages of those it may walk in one pass. A workspace
+	// with more entries than this needs a later pass, which resumes at the cursor this one
+	// recorded: without a cursor, every pass would re-read the first page forever.
+	consolidationPage  = 500
+	consolidationPages = 4
 	// consolidationJobsPerRun bounds the jobs one pass enqueues. It matches the candidate
 	// bound, so a pass that took candidates queues all of them.
 	consolidationJobsPerRun = consolidationCandidatesPerPass
@@ -48,8 +65,8 @@ const (
 	ageingProposalBefore = 14
 )
 
-// passInput is one consolidation pass.
-type passInput struct {
+// ConsolidationPassInput is one consolidation pass.
+type ConsolidationPassInput struct {
 	// Source is the watermark's source: what the pass reflects over.
 	Source string
 	Actor  govstore.Actor
@@ -63,6 +80,13 @@ type ConsolidationPass struct {
 	Jobs []govstore.Job `json:"jobs"`
 	// Seen is how many entries the pass reflected over: the watermark's reflected count.
 	Seen int `json:"seen"`
+	// Cursor is the entry cursor the pass reached, recorded in the watermark so a later pass
+	// resumes here rather than re-reading the first page.
+	Cursor int64 `json:"cursor"`
+	// Complete is whether the pass reached the end of the entry table. A source that has
+	// caught up is scanned from the start on the next pass, so a memory added after the last
+	// pass is still seen.
+	Complete bool `json:"complete"`
 	// Skipped is how many candidates the per-run bound left out; a later pass takes them.
 	Skipped int `json:"skipped"`
 }
@@ -73,7 +97,7 @@ type ConsolidationPass struct {
 //
 // A failing pass stamps the watermark's start and returns its error with the watermark
 // where it was (PAR-GOV-13: the watermark advances only on success).
-func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in passInput) (ConsolidationPass, error) {
+func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in ConsolidationPassInput) (ConsolidationPass, error) {
 	var res ConsolidationPass
 	if err := ctx.Err(); err != nil {
 		return res, err
@@ -86,10 +110,19 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 	}
 	// The start stamp is what a reached-the-store pass looks like. It never advances the
 	// watermark, so a pass that dies mid-way leaves the next one exactly where this found
-	// the source, and last_started_at shows the attempt happened.
+	// the source, and last_started_at shows the attempt happened. Its version is kept: the
+	// advance below compares against the version this pass started from, so a pass that
+	// overlapped another is refused rather than silently merged over it.
+	var startVersion, startReflected int64
+	var startCursor int64
 	startErr := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
-		_, err := tx.StartWatermark(ctx, workspaceID, in.Source, in.Actor)
-		return err
+		w, err := tx.StartWatermark(ctx, workspaceID, in.Source, in.Actor)
+		if err != nil {
+			return err
+		}
+		startVersion, startReflected = w.Version, w.ReflectedCount
+		startCursor = cursorOf(w.ReflectedThrough)
+		return nil
 	})
 	if in.Err != nil {
 		if startErr != nil {
@@ -101,14 +134,43 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 		return res, startErr
 	}
 
-	candidates, seen, skipped, err := consolidationCandidates(ctx, dataDir, workspaceID)
+	// The cursor is where the pass resumes in the entry table, but a workspace that is fully
+	// consolidated must still be revisited: a new memory lands at a cursor past the one the
+	// last pass reached, so a pass that only ever walked forward would never see it. The
+	// scan therefore starts at the beginning when the source has caught up, and the cursor
+	// only matters while entries remain.
+	candidates, seen, skipped, cursor, complete, err := consolidationCandidates(ctx, dataDir, workspaceID, startCursor)
 	if err != nil {
 		return res, err
 	}
+	if complete {
+		candidates, seen, skipped, cursor, complete, err = consolidationCandidates(ctx, dataDir, workspaceID, 0)
+		if err != nil {
+			return res, err
+		}
+	}
 	res.Seen = seen
+	res.Cursor = cursor
+	res.Complete = complete
 
+	// Candidates whose signature has no job yet are taken first, so a pass that hit its
+	// bound last time advances into the work it has not queued instead of re-selecting the
+	// same first candidates and starving the rest forever.
 	if err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
+		existing, err := queuedSignatures(ctx, tx, workspaceID)
+		if err != nil {
+			return err
+		}
+		pending := make([]govstore.JobInput, 0, len(candidates))
+		var done []govstore.JobInput
 		for _, c := range candidates {
+			if existing[c.ConflictSignature] {
+				done = append(done, c)
+				continue
+			}
+			pending = append(pending, c)
+		}
+		for _, c := range append(pending, done...) {
 			if len(res.Jobs) >= consolidationJobsPerRun {
 				res.Skipped++
 				continue
@@ -125,18 +187,19 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 	}
 	res.Skipped += skipped
 
-	// The watermark advances only here, once every candidate is queued, and it records how
-	// far this pass reflected. ExpectVersion is re-read inside the transaction, so two
-	// passes that overlap cannot both advance the same source: the second sees a moved
-	// version and is refused.
+	// The watermark advances only here, once every candidate is queued, and it records the
+	// cursor this pass reached, so a workspace larger than one pass reads resumes where it
+	// stopped instead of re-reading its first page for ever.
 	if err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
-		cur, err := tx.GetWatermark(ctx, workspaceID, in.Source)
-		if err != nil {
-			return err
-		}
-		_, err = tx.AdvanceWatermark(ctx, govstore.WatermarkAdvance{WorkspaceID: workspaceID, Source: in.Source,
-			ExpectVersion: cur.Version, ReflectedThrough: in.Source, TotalCount: int64(seen),
-			ReflectedCount: int64(seen)}, in.Actor)
+		// ReflectedCount accumulates across the source's passes: it counts the entries the
+		// source has reflected over in total, which is what the store's monotonicity check
+		// needs. A pass that read four pages adds those pages to what earlier passes read,
+		// and the position it stopped at is the cursor, which is what the next pass resumes
+		// from.
+		reflected := startReflected + int64(seen)
+		_, err := tx.AdvanceWatermark(ctx, govstore.WatermarkAdvance{WorkspaceID: workspaceID, Source: in.Source,
+			ExpectVersion: startVersion, ReflectedThrough: formatCursor(cursor), TotalCount: reflected,
+			ReflectedCount: reflected}, in.Actor)
 		return err
 	}); err != nil {
 		return res, err
@@ -144,10 +207,42 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in p
 	return res, nil
 }
 
+// queuedSignatures is every signature that already has a job the agent has not cancelled, so
+// a pass can put the work it has not queued first.
+func queuedSignatures(ctx context.Context, tx govstore.Tx, workspaceID string) (map[string]bool, error) {
+	jobs, err := tx.ListJobs(ctx, govstore.JobFilter{WorkspaceID: workspaceID, States: []string{
+		govstore.JobQueued, govstore.JobLeased, govstore.JobDone, govstore.JobFailed}, Limit: consolidationJobsPerRun})
+	if err != nil {
+		return nil, err
+	}
+	out := make(map[string]bool, len(jobs))
+	for _, j := range jobs {
+		out[j.ConflictSignature] = true
+	}
+	return out, nil
+}
+
+// cursorOf reads the entry cursor a watermark recorded. A watermark that recorded something
+// else, or nothing, starts at the beginning.
+func cursorOf(reflectedThrough string) int64 {
+	if reflectedThrough == "" {
+		return 0
+	}
+	n, err := strconv.ParseInt(reflectedThrough, 10, 64)
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// formatCursor records the entry cursor a pass reached. It is a bare number so cursorOf can
+// read it back without knowing the source's name.
+func formatCursor(cursor int64) string { return strconv.FormatInt(cursor, 10) }
+
 // PrepareConsolidationJobs derives the candidates without queueing them, for a caller that
 // wants the work before it is queued. RunConsolidationPass is what the loop calls.
 func PrepareConsolidationJobs(ctx context.Context, dataDir, workspaceID string) ([]govstore.JobInput, error) {
-	candidates, _, _, err := consolidationCandidates(ctx, dataDir, workspaceID)
+	candidates, _, _, _, _, err := consolidationCandidates(ctx, dataDir, workspaceID, 0)
 	return candidates, err
 }
 
@@ -200,28 +295,83 @@ var consolidationNow = time.Now
 // two passes over one snapshot produce the same sequence.
 // The second return is how many entries the pass reflected over; the third is how many
 // candidates the per-run bound left out, so a caller can see that work remains.
-func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) ([]govstore.JobInput, int, int, error) {
+// consolidationCandidates derives the candidates from the entries past the cursor, and
+// reports whether it reached the end of the table.
+func consolidationCandidates(ctx context.Context, dataDir, workspaceID string, from int64) ([]govstore.JobInput, int, int, int64, bool, error) {
 	var snap consolidationSnapshot
 	seen := 0
+	cursor := from
+	// anchorsRead is the pass's whole anchor budget across every page, and anchorsLeft counts
+	// what it could not read, so a store with more anchors than the budget says so rather
+	// than quietly reflecting over a prefix of itself.
+	anchorsRead := 0
+	anchorsLeft := 0
+	complete := false
 	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
-		entries, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, Lifecycles: []string{"*"}, Limit: consolidationEntries})
-		if err != nil {
-			return err
+		// Pages from the cursor the watermark recorded, not from the start: a workspace with
+		// more entries than one pass reads would otherwise have every entry past the first
+		// page ignored for ever, while the watermark still recorded a successful pass.
+		for page := 0; page < consolidationPages; page++ {
+			entries, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID,
+				Lifecycles: []string{"*"}, AfterCursor: cursor, Limit: consolidationPage})
+			if err != nil {
+				return err
+			}
+			if len(entries) == 0 {
+				return nil
+			}
+			seen += len(entries)
+			slices.SortFunc(entries, func(a, b govstore.Entry) int { return strings.Compare(a.ID, b.ID) })
+			ids := make([]string, 0, len(entries))
+			for _, e := range entries {
+				ids = append(ids, e.ID)
+			}
+			anchors, err := r.AnchorsFor(ctx, ids)
+			if err != nil {
+				return err
+			}
+			// The anchor budget is the whole pass's, not one page's: a pass that reads one
+			// page of a thousand anchors per page still reads four thousand.
+			for id, list := range anchors {
+				if anchorsRead >= consolidationAnchors {
+					anchorsLeft += len(list)
+					delete(anchors, id)
+					continue
+				}
+				if room := consolidationAnchors - anchorsRead; len(list) > room {
+					anchorsLeft += len(list) - room
+					anchors[id] = list[:room]
+					anchorsRead = consolidationAnchors
+				} else {
+					anchorsRead += len(list)
+				}
+			}
+			if snap.Entries == nil {
+				snap.Entries = entries
+				snap.Anchors = anchors
+			} else {
+				snap.Entries = append(snap.Entries, entries...)
+				for id, list := range anchors {
+					snap.Anchors[id] = list
+				}
+			}
+			// The cursor is the store's own: ListEntries orders by pk and AfterCursor is
+			// that pk, so the last row read is where the next page starts.
+			cursor = entries[len(entries)-1].Cursor
+			if len(entries) < consolidationPage {
+				complete = true
+				return nil
+			}
 		}
-		seen = len(entries)
-		slices.SortFunc(entries, func(a, b govstore.Entry) int { return strings.Compare(a.ID, b.ID) })
-		ids := make([]string, 0, len(entries))
-		for _, e := range entries {
-			ids = append(ids, e.ID)
-		}
-		anchors, err := r.AnchorsFor(ctx, ids)
-		if err != nil {
-			return err
-		}
-		snap = consolidationSnapshot{Entries: entries, Anchors: anchors}
 		return nil
 	}); err != nil {
-		return nil, 0, 0, err
+		return nil, 0, 0, 0, false, err
+	}
+	// Anchors left unread are work the pass did not cover: counted with the candidates it
+	// could not take, so the pass never reads as a pass that saw everything.
+	anchorSkips := 0
+	if anchorsLeft > 0 {
+		anchorSkips = 1
 	}
 
 	var out []govstore.JobInput
@@ -231,7 +381,7 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) (
 		if !ok {
 			// Unreachable while jobKindOrder and jobGenerators are edited together; a
 			// missing generator is a programming error, not a silently skipped kind.
-			return nil, 0, 0, fmt.Errorf("consolidation: no generator for kind %q", kind)
+			return nil, 0, 0, 0, false, fmt.Errorf("consolidation: no generator for kind %q", kind)
 		}
 		candidates := gen(snap)
 		// Kinds run in order and each kind's candidates are sorted by signature, so the
@@ -255,7 +405,7 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string) (
 			})
 		}
 	}
-	return out, seen, skipped, nil
+	return out, seen, skipped + anchorSkips, cursor, complete, nil
 }
 
 // dedupeClusterCandidates asks whether two or more memories on one anchor restate each
@@ -303,7 +453,9 @@ func staleAnchorCandidates(snap consolidationSnapshot) []consolidationCandidate 
 		if len(stale) == 0 {
 			continue
 		}
-		out = append(out, consolidationCandidate{Signature: clusterSignature(govstore.JobStaleAnchor, stale), Members: []string{e.ID}})
+		// The entry id is in the signature as well as in the members: one job is one
+		// question about one memory, so two memories stale on one anchor are two jobs.
+		out = append(out, consolidationCandidate{Signature: singleEntrySignature(govstore.JobStaleAnchor, e.ID, stale), Members: []string{e.ID}})
 	}
 	return out
 }
@@ -325,7 +477,7 @@ func orphanedAnchorCandidates(snap consolidationSnapshot) []consolidationCandida
 		if len(gone) == 0 {
 			continue
 		}
-		out = append(out, consolidationCandidate{Signature: clusterSignature(govstore.JobOrphanedAnchor, gone), Members: []string{e.ID}})
+		out = append(out, consolidationCandidate{Signature: singleEntrySignature(govstore.JobOrphanedAnchor, e.ID, gone), Members: []string{e.ID}})
 	}
 	return out
 }
@@ -373,7 +525,7 @@ func ageingProposalCandidates(snap consolidationSnapshot) []consolidationCandida
 		if !ok || created.After(cutoff) {
 			continue
 		}
-		out = append(out, consolidationCandidate{Signature: clusterSignature(govstore.JobAgeingProposal, []string{e.ID}), Members: []string{e.ID}})
+		out = append(out, consolidationCandidate{Signature: singleEntrySignature(govstore.JobAgeingProposal, e.ID, nil), Members: []string{e.ID}})
 	}
 	return out
 }
@@ -400,10 +552,28 @@ func staleAnchorRefs(anchors []govstore.Anchor) []string {
 // clusterSignature identifies the work a candidate is: it names the kind and every member,
 // so two candidates that differ in any one member are different work. The order the members
 // arrive in does not change it.
+//
+// EnqueueJob refuses a conflict signature over maxSignatureLen bytes, and the ids Remember
+// mints are longer than a cluster of fifteen members fits, so a signature that would exceed
+// the limit is replaced by the digest of its own joined form. The digest keeps the property
+// that matters, two candidates differing in any member are different work, at a fixed length.
 func clusterSignature(kind string, members []string) string {
 	sorted := slices.Clone(members)
 	slices.Sort(sorted)
-	return kind + ":" + strings.Join(sorted, ",")
+	joined := strings.Join(sorted, ",")
+	if len(kind)+1+len(joined) <= maxSignatureLen {
+		return kind + ":" + joined
+	}
+	return kind + ":" + govstore.Digest(joined)[:signatureDigestLen]
+}
+
+// singleEntrySignature is a candidate about one memory: it names the kind, the entry and the
+// anchors that prompted it. The entry is what keeps two memories asking the same question
+// about one shared anchor two separate jobs.
+func singleEntrySignature(kind, entryID string, refs []string) string {
+	sorted := slices.Clone(refs)
+	slices.Sort(sorted)
+	return clusterSignature(kind, append([]string{entryID}, sorted...))
 }
 
 func validConsolidationSource(s string) error {

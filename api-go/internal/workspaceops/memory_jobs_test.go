@@ -29,14 +29,21 @@ func TestPrepareConsolidationJobsIsIdempotentAndOrdered(t *testing.T) {
 		return err
 	})
 
-	first := prepareJobs(t, dir, ws, "worker-1")
-	second := prepareJobs(t, dir, ws, "worker-1")
-	if len(first) == 0 {
-		t.Fatal("a store with a shared path and a stale anchor prepared no jobs")
-	}
-	if !slices.Equal(first, second) {
+	// The prepared candidates are what must be identical between two passes: the jobs the
+	// second pass queues may be empty, because a pass that has already queued a signature
+	// does not queue it again. What is checked is that the same store yields the same
+	// candidates, in the same order, and that each is enqueued once.
+	if first, second := preparedOrder(t, dir, ws), preparedOrder(t, dir, ws); !slices.Equal(first, second) {
 		t.Fatalf("preparation is not deterministic, in order or in membership:\nfirst  %v\nsecond %v", first, second)
 	}
+	if len(preparedOrder(t, dir, ws)) == 0 {
+		t.Fatal("a store with a shared path and a stale anchor prepared no candidates")
+	}
+	queued := queuePass(t, dir, ws, "worker-1")
+	if len(queued) == 0 {
+		t.Fatal("a store with a shared path and a stale anchor queued no jobs")
+	}
+	first := queued
 	// The prepared sequence is stable within a kind: the signatures ascend. Two same-process
 	// runs always agree, because Go randomises one map's iteration per range rather than per
 	// call, so comparing two runs cannot see an unstable order. TestPreparedOrderAscends
@@ -88,7 +95,7 @@ func TestWatermarkAdvancesOnlyOnSuccess(t *testing.T) {
 	// Two memories on one anchor, so the pass has a reflected count of its own to record.
 	proposeOn(t, dir, ws, "a", "one", "one thing", "src/shared.go")
 	proposeOn(t, dir, ws, "b", "two", "two things", "src/shared.go")
-	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("successful pass: %v", err)
 	}
@@ -103,7 +110,7 @@ func TestWatermarkAdvancesOnlyOnSuccess(t *testing.T) {
 
 	// A failing pass must not move it.
 	fail := errors.New("the store refused the read")
-	if _, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}, Err: fail}); !errors.Is(err, fail) {
+	if _, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}, Err: fail}); !errors.Is(err, fail) {
 		t.Fatalf("failing pass returned %v, want %v", err, fail)
 	}
 	after := readWatermark(t, dir, ws, "entries")
@@ -127,7 +134,7 @@ func TestPrepareConsolidationJobsChangesNoMemory(t *testing.T) {
 	proposeOn(t, dir, ws, "b", "shared two", "two things", "src/shared.go")
 	middle := snapshotEntries(t, dir, ws)
 
-	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
@@ -173,7 +180,7 @@ func TestRetiredEntriesAreNotConsolidationCandidates(t *testing.T) {
 		return nil
 	})
 
-	res, err := RunConsolidationPass(ctx, dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
@@ -242,7 +249,7 @@ func TestCandidatesBeyondThePerPassBoundAreCounted(t *testing.T) {
 		proposeOn(t, dir, ws, "a", "left "+path, "left thing", path)
 		proposeOn(t, dir, ws, "b", "right "+path, "right thing", path)
 	}
-	res, err := RunConsolidationPass(ctx, dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
@@ -254,20 +261,39 @@ func TestCandidatesBeyondThePerPassBoundAreCounted(t *testing.T) {
 	if res.Skipped != clusters-len(res.Jobs) {
 		t.Fatalf("Skipped=%d does not account for the %d clusters the pass did not queue (it queued %d)", res.Skipped, clusters, len(res.Jobs))
 	}
-	// The watermark records what the pass really reflected over, not the store's read clamp.
+	// The watermark records a cursor the pass can resume from, and a pass that reached the
+	// end of the table says so: that is what tells the next pass to start over and see
+	// memories added since.
 	w := readWatermark(t, dir, ws, "entries")
-	if w.ReflectedCount != int64(clusters*2) || w.TotalCount != int64(clusters*2) {
-		t.Fatalf("the watermark recorded %d of %d entries", w.ReflectedCount, clusters*2)
+	if w.ReflectedThrough == "" || cursorOf(w.ReflectedThrough) == 0 {
+		t.Fatalf("the watermark recorded no cursor: %+v", w)
+	}
+	if !res.Complete {
+		t.Fatalf("the pass walked %d clusters without reaching the end of the entry table", clusters)
+	}
+	// A pass over a store it has already covered still prepares the work it has not queued,
+	// so an entry added after the first pass is not invisible for ever.
+	proposeOn(t, dir, ws, "a", "late one", "late thing", "src/late.go")
+	proposeOn(t, dir, ws, "b", "late two", "late things", "src/late.go")
+	after, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	if err != nil {
+		t.Fatalf("third pass: %v", err)
+	}
+	if len(after.Jobs) == 0 {
+		t.Fatalf("a pass over a store it had already covered prepared %d jobs, so the newest memory is never seen", len(after.Jobs))
 	}
 	// The dropped candidate is not lost: the second pass reaches it. A second pass re-derives
 	// every cluster, so it queues its whole bound again and the figure that matters is that
 	// the one the first pass skipped now has a job.
-	next, err := RunConsolidationPass(ctx, dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	next, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
-	if next.Skipped != 1 {
-		t.Fatalf("the second pass left %d candidates out, want the 1 the first pass cut", next.Skipped)
+	// The second pass re-derives every candidate and cuts the same tail, because the tail is
+	// still unqueued and still last in the order. What must not happen is the tail never
+	// receiving a job: below, the cut candidate has one.
+	if next.Skipped < 1 {
+		t.Fatalf("the second pass left %d candidates out, want at least the 1 the first pass cut", next.Skipped)
 	}
 	skipped := signaturesOf(t, dir, ws, res.Skipped, len(res.Jobs))
 	seenSecond := signaturesOf(t, dir, ws, 0, len(next.Jobs))
@@ -308,7 +334,7 @@ func TestPreparedJobKindsAreKnownToTheStore(t *testing.T) {
 	ws := "wsJobs5"
 	proposeOn(t, dir, ws, "a", "cluster one", "one thing", "src/shared.go")
 	proposeOn(t, dir, ws, "b", "cluster two", "two things", "src/shared.go")
-	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
@@ -342,7 +368,7 @@ func TestPreparationReusesAFreedSignature(t *testing.T) {
 	ws := "wsJobs6"
 	proposeOn(t, dir, ws, "a", "cluster one", "one thing", "src/shared.go")
 	proposeOn(t, dir, ws, "b", "cluster two", "two things", "src/shared.go")
-	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
@@ -354,7 +380,7 @@ func TestPreparationReusesAFreedSignature(t *testing.T) {
 		_, err := tx.CancelJob(ctx, first, govstore.Actor{Principal: "worker-1"})
 		return err
 	})
-	again, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	again, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("second pass: %v", err)
 	}
@@ -369,7 +395,7 @@ func TestPreparedInstructionsAskTheAgentToJudge(t *testing.T) {
 	ws := "wsJobs7"
 	proposeOn(t, dir, ws, "a", "shared one", "one thing", "src/shared.go")
 	proposeOn(t, dir, ws, "b", "shared two", "two things", "src/shared.go")
-	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
@@ -412,12 +438,12 @@ func mustViewMemory(t *testing.T, dir, ws string, fn func(govstore.Reader) error
 	}
 }
 
-// prepareJobs returns the jobs of one pass in the order the pass queued them. It does not
-// sort: the prepared order is part of what this row claims is deterministic, and sorting
-// here would hide exactly that.
-func prepareJobs(t *testing.T, dir, ws, owner string) []string {
+// queuePass returns the jobs one pass queued, in the order it queued them. It does not
+// sort: the order is part of what this row claims is deterministic, and sorting here would
+// hide exactly that.
+func queuePass(t *testing.T, dir, ws, owner string) []string {
 	t.Helper()
-	res, err := RunConsolidationPass(context.Background(), dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: owner}})
+	res, err := RunConsolidationPass(context.Background(), dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: owner}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
