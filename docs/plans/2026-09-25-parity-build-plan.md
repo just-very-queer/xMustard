@@ -86,7 +86,8 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Goal.** Get the already-written wave-0 fixes into a merge-ready stack on top of HEAD 7ab61a0 so later workstreams build on them instead of colliding with them. The fixes are: models.rs removal and honest tool descriptions (w0-cleanup), honest open mode plus author-bound edits plus strict JSON (w0-kernel), feedback taken off the request path (w0-feedback), and stat-cached drift hashing (w0-drift). A human performs every merge; the agent only prepares the stack.
 
-**Requirements.** No new PAR ids. This closes a gap in PAR-RCL-05's serving surface and in WS-09's exposure posture: `XMUSTARD_DISABLED_TOOLS` is a refusal switch, and a memory read naming no tool outlived it. It is a security guard, so §5.1 rule 7 applies: the refusal path is tested, and the guard stays a guard, not a table entry.
+**Requirements.** PAR-RT-08, PAR-ADP-01, PAR-GOV-01, PAR-SEC-01, PAR-RET-11, PAR-FRESH-01
+
 
 **Files.** `rust-core/src/lib.rs`, `rust-core/src/models.rs`, `rust-core/src/changetrack.rs`, `rust-core/src/indexcache.rs`, `rust-core/src/symbolgraph.rs`, `rust-core/src/hashcache.rs`, `api-go/cmd/xmustard-mcp/main.go`, `api-go/cmd/xmustard-mcp/descriptions_test.go`, `integrations/pi/src/tools.ts`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-api/feedback_shutdown_test.go`, `api-go/internal/workspaceops/context_governance.go`, `api-go/internal/workspaceops/grounding.go`, `api-go/internal/workspaceops/feedback.go`, `api-go/internal/workspaceops/feedback_recorder.go`, `api-go/internal/workspaceops/knowledge.go`, `api-go/internal/workspaceops/shutdown.go`  
 **New modules.** `rust-core/src/hashcache.rs`, `api-go/internal/workspaceops/feedback_recorder.go`
@@ -100,7 +101,8 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Acceptance.** Four rebased branches plus a combined integration branch, all passing cargo test/clippy and go test/build, with review notes that list each behavioral change and its risk. No merge is done by the agent. The human merges in the documented order.
 
-**Collision risk.** `route_gates.go` and the `cmd/xmustard-api` tests are WS-FIX-09's and WS-48's; `dispatch.go` and `docs_resource.go` are WS-38f's and WS-FIX-13's; `standing_memory.go` is unclaimed. This continuation adds `hooks_routes.go` and `hook_reads.go` (the hook surface WS-44 owns) and the shared `security_middleware.go` predicate.
+**Collision risk.** The hot files for everything else: main.go, context_governance.go, grounding.go, knowledge.go, xmustard-mcp/main.go, lib.rs, symbolgraph.rs, changetrack.rs, indexcache.rs. Must land before WS-03, WS-04, WS-09 and WS-12. It does not touch the diagnostics session files. That session's branch at /private/tmp/xmustard-opus-l9b1F4 sits at the older cd13e2b and also modified main.go and context_governance.go, so coordinate before its eventual landing.
+
 
 **Correction.** DONE by the orchestrating session: the four w0 branches were implemented, reviewed twice, and re-fixed; they sit on 7ab61a0 and are stacked onto feat/parity-v2 (integration branch). Human merges feat/parity-v2 to main.
 
