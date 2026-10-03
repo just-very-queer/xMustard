@@ -4498,3 +4498,21 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 - *Follow-ups.* (1) The cwd rule: DO NOT DECIDE, owner. (2) `xm-review-run.sh` undercounts channel findings and OCR aborts above 8,000 chars of `background.md`; owner: the runner. (3) Index-staleness gaps in `ground`/`recall`/`explain`/`impact` proposed here by many rows; recorded, not acted on.
 
 **Owner-delegate run (2026-10-03).** Parked at five rounds (`505492e`); the owner allowed two more. Round 6 on the merged head found `{"roots":null}` cached as definitive and a repeated array-less answer never backing off; both now go through the shape check (`roots` must be an array) and `rootsBackoff`, with `TestNullRootsFieldIsAskedAgain` and `TestRepeatedRootsAnswerWithoutAnArrayBacksOff`. The cwd rule stays DO NOT DECIDE (`decisions/ws-fix-15.md`).
+
+### WS-FLK-09 — Deflake `TestApplyDoesNotCopyTheResult` (api-go/internal/groundbudget)
+
+**Goal.** `TestApplyDoesNotCopyTheResult` (`api-go/internal/groundbudget/apply_test.go`) fails under box load on `feat/parity-v2` and on the untouched merge base `5de6a8f`. It is an **allocation line**: it reads `runtime.MemStats.TotalAlloc` either side of one `Apply` call and requires the delta to be at most `len(raw)/4`. `TotalAlloc` is a process-wide counter, so it also counts whatever else the process allocates inside that window, and the recorded figures for one unchanged tree ranged from 386,120 to 423,592 bytes against a 402,909-byte line. The row decides which of two things it is — a measurement that cannot see what it is measuring, or a real copy inside `Apply` — and fixes the cause the §3.3 way: never raise the bound, add a retry or add a skip. The bound itself is not this row's to move (a test's numeric bound is DO NOT DECIDE, goal §3.0), and neither is `ladderSlack` (`apply.go`), which the same test is the guard for.
+
+**Requirements.** No new PAR id. This closes a documented flake in the output-budget contract's own guard (WS-54, PAR-CTX-05), which is what lets a caller admit `WorkingSet` before `Apply`.
+
+**Files.** `api-go/internal/groundbudget/apply.go` (only if the cause is a real copy: the per-section scans, `sectionChars`/`longestList`/`measure`), `api-go/internal/groundbudget/apply_test.go` (the allocation guard's measurement, and new tests), `api-go/internal/groundbudget/sections.go` (only if a section-index belongs here), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The pre-fix distribution is measured and recorded before any change: the same `-count` runs on this row's head and on the untouched merge base, so a "pre-existing red" claim rests on a base measured in the same command shape that shows the red (the WS-32a lesson).
+- Whatever replaces the counter must fail when `Apply` does copy the result: a test that drives `Apply` with a result whose size is known and whose allocations are attributed to `Apply` alone, plus one mutation row showing the guard is not vacuous.
+- The `WorkingSet` half of the test keeps its current meaning: the admitted set covers the result plus what `Apply` allocates.
+- No `-count`, retry, skip, `testing.Short` gate or new env var makes the line pass. Any such change is a rejected fix with the measurement that rejected it.
+
+**Acceptance.** `TestApplyDoesNotCopyTheResult` is deterministic: it passes or fails on the code under test, not on the box's live heap. Its pass condition is not weakened — the same or a tighter bound on a real per-call measurement. The distribution before and after is recorded with commands and log paths, and the row says which of the two causes it was. `MAC` on `./internal/groundbudget` is green and `BOXALL` gives `remote_exit=0`, `clippy_warnings` at or under 6 and `rss_lines=ok`.
+
+**DO NOT DECIDE (written, not chosen).** The numeric bound `len(raw)/4` and `ladderSlack` (256 KiB) are the owner's (goal §3.0: any change to a test's numeric bound). If the measured cause is that `Apply` genuinely allocates more than a quarter of the result, this row reports the number and the options and routes around it; it does not move either constant.
