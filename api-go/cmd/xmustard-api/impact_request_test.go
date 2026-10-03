@@ -206,8 +206,8 @@ printf '{"symbol":"Serve","impacted_count":400,"by_depth":[{"depth":1,"total":40
 	var res struct {
 		HasMore      *bool `json:"has_more"`
 		OutputBudget *struct {
-			MaxChars  int  `json:"max_chars"`
-			UsedChars int  `json:"used_chars"`
+			MaxChars   int  `json:"max_chars"`
+			UsedChars  int  `json:"used_chars"`
 			OverBudget bool `json:"over_budget"`
 		} `json:"output_budget"`
 	}
