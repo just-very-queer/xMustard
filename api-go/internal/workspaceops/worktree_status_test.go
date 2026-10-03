@@ -67,10 +67,44 @@ func TestReadWorktreeStatusFromGit(t *testing.T) {
 	}
 }
 
+// A real rename and a real path with a space, through readWorktreeStatus. The unit
+// tests pin the record fold; this one pins that `-z` is on the command, since without
+// it git prints a TAB-joined pair the fold cannot read and neither the rename's new
+// path nor the spaced path can survive.
+func TestReadWorktreeStatusReportsARenameAndASpacedPath(t *testing.T) {
+	repo := initGitRepo(t)
+	writeFile(t, filepath.Join(repo, "old name.go"), "package p\n")
+	writeFile(t, filepath.Join(repo, "sp ace.txt"), "x\n")
+	runGit(t, repo, "add", "-A")
+	runGit(t, repo, "commit", "-q", "-m", "init")
+	runGit(t, repo, "mv", "old name.go", "new.go")
+	writeFile(t, filepath.Join(repo, "sp ace.txt"), "y\n")
+
+	st := readWorktreeStatus(repo)
+	if st.DirtyFiles != 2 || st.StagedFiles != 1 || st.UntrackedFiles != 0 {
+		t.Fatalf("counts: staged %d dirty %d untracked %d", st.StagedFiles, st.DirtyFiles, st.UntrackedFiles)
+	}
+	// git orders worktree entries as the rename first; assert membership, not order,
+	// so the test does not pin git's ordering.
+	seen := map[string]bool{}
+	for _, p := range st.DirtyPaths {
+		seen[p] = true
+	}
+	for _, want := range []string{"new.go", "sp ace.txt"} {
+		if !seen[want] {
+			t.Fatalf("dirty paths %q missing %q", st.DirtyPaths, want)
+		}
+	}
+	if seen["old name.go"] {
+		t.Fatalf("dirty paths %q still names the rename origin", st.DirtyPaths)
+	}
+}
+
 // Every porcelain v2 record type, including renamed/copied and unmerged entries that
-// are awkward to produce with git in a test.
+// are awkward to produce with git in a test. The records are NUL-separated, the shape
+// `git status --porcelain=v2 -z` emits.
 func TestPorcelainV2Records(t *testing.T) {
-	lines := []string{
+	records := []string{
 		"# branch.oid 1234567890abcdef1234567890abcdef12345678",
 		"# branch.head topic",
 		"# branch.upstream origin/topic",
@@ -78,7 +112,8 @@ func TestPorcelainV2Records(t *testing.T) {
 		"# branch.head",
 		"1 .M N... 100644 100644 100644 aaa bbb src/changed.go",
 		"1 A. N... 000000 100644 100644 000 ccc src/added.go",
-		"2 R. N... 100644 100644 100644 ddd eee R100 src/new name.go\tsrc/old.go",
+		"2 R. N... 100644 100644 100644 ddd eee R100 src/new name.go",
+		"src/old.go",
 		"u UU N... 100644 100644 100644 100644 f1 f2 f3 src/conflict.go",
 		"1 short",
 		"? notes/todo.md",
@@ -87,22 +122,106 @@ func TestPorcelainV2Records(t *testing.T) {
 		"",
 	}
 	st := &WorktreeStatus{DirtyPaths: []string{}}
-	for _, l := range lines {
-		st.addPorcelainV2Line(l)
-	}
+	st.addPorcelainV2Records(records)
 	if st.Branch == nil || *st.Branch != "topic" || st.HeadSHA == nil || *st.HeadSHA != "1234567890abcdef1234567890abcdef12345678" {
 		t.Fatalf("branch headers: %+v", st)
 	}
 	if st.Ahead != 3 || st.Behind != 2 || st.DirtyFiles != 5 || st.StagedFiles != 3 || st.UntrackedFiles != 1 {
 		t.Fatalf("counts: %+v", st)
 	}
-	want := []string{"src/changed.go", "src/added.go", "src/old.go", "src/conflict.go", "notes/todo.md"}
+	// The rename record's new path, not the origin that follows it.
+	want := []string{"src/changed.go", "src/added.go", "src/new name.go", "src/conflict.go", "notes/todo.md"}
 	if !reflect.DeepEqual(st.DirtyPaths, want) {
 		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
 	}
 	unborn := &WorktreeStatus{}
-	unborn.addPorcelainV2Line("# branch.oid (initial)")
+	unborn.addPorcelainV2Records([]string{"# branch.oid (initial)"})
 	if unborn.HeadSHA != nil {
 		t.Fatalf("unborn head: %v", *unborn.HeadSHA)
+	}
+}
+
+// A rename or copy record carries its origin in the next record; the path the file
+// occupies now is the one reported. A parser that reports the origin names a path
+// that is no longer in the worktree, and `project_targets.go` keys its target set
+// and `run_review_reads.go` its changed-file list off these.
+func TestPorcelainV2RenameReportsTheNewPath(t *testing.T) {
+	st := &WorktreeStatus{}
+	st.addPorcelainV2Records([]string{"2 R. N... 100644 100644 100644 aaa bbb R100 src/renamed.go", "src/before.go"})
+	want := []string{"src/renamed.go"}
+	if !reflect.DeepEqual(st.DirtyPaths, want) {
+		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
+	}
+	if st.DirtyFiles != 1 {
+		t.Fatalf("dirty files %d, want 1", st.DirtyFiles)
+	}
+}
+
+// A rename record as the very last record has no origin after it. The stream is
+// truncated, so the rename is skipped whole rather than counted with a path whose
+// origin was never read. git does not emit this, so the only way to produce it is a
+// truncated read; the guard is that a truncated record is skipped rather than guessed
+// at, which is what WS-FIX-17's acceptance requires.
+func TestPorcelainV2RenameWithNoOriginAtAllIsSkipped(t *testing.T) {
+	st := &WorktreeStatus{}
+	st.addPorcelainV2Records([]string{"2 R. N... 100644 100644 100644 aaa bbb R100 renamed.go"})
+	if st.DirtyFiles != 0 || len(st.DirtyPaths) != 0 {
+		t.Fatalf("truncated rename counted: %+v", st)
+	}
+}
+
+// A rename whose origin is a record that would pass as a status record on its own
+// shape: it opens with the "2" record keyword and carries the nine space-separated
+// tokens a type "2" record needs to clear the arity guard. Only the rename record
+// consuming it keeps the fold from reading it as a second rename, so this is the
+// fixture that discriminates the consumption. Confirmed against git 2.50.1 and
+// 2.53.0: renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits
+// exactly this pair.
+func TestPorcelainV2RenameConsumesAnOriginThatLooksLikeARecord(t *testing.T) {
+	st := &WorktreeStatus{}
+	// Renaming a directory named `2 3 4 5 6 7 8 9 10 x` to `renamed` emits this
+	// origin. It opens with the "2" record keyword and, after that keyword, carries the
+	// nine space-separated tokens a type "2" record needs to pass the arity guard, so it
+	// is indistinguishable from a second rename by shape alone.
+	st.addPorcelainV2Records([]string{
+		"2 R. N... 100644 100644 100644 aaa bbb R100 renamed/deep.go",
+		"2 3 4 5 6 7 8 9 10 x/deep.go",
+	})
+	want := []string{"renamed/deep.go"}
+	if !reflect.DeepEqual(st.DirtyPaths, want) {
+		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
+	}
+	if st.DirtyFiles != 1 {
+		t.Fatalf("dirty files %d, want 1: the origin was read as a rename record", st.DirtyFiles)
+	}
+}
+
+// The v2 text form does not quote paths, so a path with a space cannot be recovered
+// from it by splitting on whitespace. This is also true end to end: git prints
+// `? with space.txt` verbatim under --porcelain=v2.
+func TestPorcelainV2PathWithASpaceStaysOnePath(t *testing.T) {
+	st := &WorktreeStatus{}
+	st.addPorcelainV2Records([]string{"1 .M N... 100644 100644 100644 aaa bbb notes/my file.md"})
+	want := []string{"notes/my file.md"}
+	if !reflect.DeepEqual(st.DirtyPaths, want) {
+		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
+	}
+	if st.DirtyFiles != 1 {
+		t.Fatalf("dirty files %d, want 1", st.DirtyFiles)
+	}
+}
+
+// A TAB is the rename separator in the text form, so no split on it can be correct.
+// This record cannot be written at all without -z, which makes it the strongest guard
+// against a revert to whitespace splitting.
+func TestPorcelainV2PathWithATabStaysOnePath(t *testing.T) {
+	st := &WorktreeStatus{}
+	st.addPorcelainV2Records([]string{"? notes/we\tird.md"})
+	want := []string{"notes/we\tird.md"}
+	if !reflect.DeepEqual(st.DirtyPaths, want) {
+		t.Fatalf("dirty paths %q, want %q", st.DirtyPaths, want)
+	}
+	if st.UntrackedFiles != 1 {
+		t.Fatalf("untracked files %d, want 1", st.UntrackedFiles)
 	}
 }

@@ -64,6 +64,17 @@ func mustUpdate(t *testing.T, s Store, fn func(Tx) error) {
 	}
 }
 
+// mustFail runs a write expected to be refused and returns its error; a write that
+// succeeds fails the test, so a case cannot pass by the store accepting it.
+func mustFail(t *testing.T, s Store, fn func(Tx) error) error {
+	t.Helper()
+	err := s.Update(context.Background(), fn)
+	if err == nil {
+		t.Fatal("the write was not refused")
+	}
+	return err
+}
+
 func propose(t *testing.T, s Store, id, title, content string, paths ...string) Entry {
 	t.Helper()
 	var e Entry
@@ -1981,5 +1992,151 @@ func TestAnchorsInPathsAndRankInterval(t *testing.T) {
 	}
 	if e := byID["bySymbol"]; e.NeedsReverify || e.StaleSince != "" {
 		t.Fatalf("an unmarked entry: %+v", e)
+	}
+}
+
+// ReanchorCode (WS-28B) moves a quoted-code anchor to the lines its code now holds and
+// records the move. Every refusal leaves the anchor where it was: a writer that moved an
+// anchor it could not address would point a memory's quote at another block's lines.
+func TestReanchorCodeMovesAndRefuses(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "a1", "t", "c", "src/a.go")
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.ReplaceAnchors(ctx, "a1", []string{"src/a.go"}, []AnchorInput{
+			{Kind: AnchorCode, Value: "src/a.go#L4-L5", Extracted: true, SymbolUID: "snippet:aa"},
+			{Kind: AnchorCode, Value: "src/a.go#L9-L9", Extracted: true, SymbolUID: "snippet:bb"},
+		}, alice)
+	})
+	move := CodeMove{SnippetID: "snippet:aa", From: "src/a.go#L4-L5", To: "src/a.go#L6-L7"}
+
+	var n int
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		n, err = tx.ReanchorCode(ctx, "a1", []CodeMove{move}, "beef", bob)
+		return err
+	})
+	if n != 1 {
+		t.Fatalf("moved %d, want 1", n)
+	}
+	anchors, _ := s.ListAnchors(ctx, "a1")
+	if anchors[1].Value != "src/a.go#L6-L7" || anchors[1].StaleSince != "" {
+		t.Fatalf("the moved anchor = %+v", anchors[1])
+	}
+	if evs, _ := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", EntryID: "a1", Types: []string{EventAnchorReanchor}}); len(evs) != 1 {
+		t.Fatalf("anchor_reanchor events = %d, want 1", len(evs))
+	}
+	// The entry's search row carries its anchors, so a move that did not refresh it would
+	// keep matching the range the anchor left and stop matching the one it took. The
+	// query's terms are the line numbers alone: ftsQuery keeps runs of letters and digits,
+	// so "src/a.go#L4-L5" would match on the file name whatever range is indexed.
+	if hits, _ := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "l4 l5"}); len(hits) != 0 {
+		t.Fatalf("the moved range is still searchable: %+v", hits)
+	}
+	if hits, _ := s.SearchMemories(ctx, MemoryQuery{WorkspaceID: "ws1", Text: "l6 l7"}); len(hits) != 1 || hits[0].EntryID != "a1" {
+		t.Fatalf("the new range is not searchable: %+v", hits)
+	}
+
+	// The same move a second time names an anchor that has already moved, which is refused
+	// rather than silently accepted as a no-op: a caller that cannot tell "nothing to do"
+	// from "I addressed the wrong anchor" would read a lost move as a move that was not
+	// needed.
+	if err := mustFail(t, s, func(tx Tx) error {
+		_, err := tx.ReanchorCode(ctx, "a1", []CodeMove{move}, "beef", bob)
+		return err
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a repeated move: got %v, want ErrInvalid", err)
+	}
+
+	for name, bad := range map[string]CodeMove{
+		"a reversed range":           {SnippetID: "snippet:bb", From: "src/a.go#L9-L9", To: "src/a.go#L2-L1"},
+		"another file":               {SnippetID: "snippet:bb", From: "src/a.go#L9-L9", To: "src/b.go#L9-L9"},
+		"no snippet digest":          {From: "src/a.go#L9-L9", To: "src/a.go#L10-L10"},
+		"the range it already holds": {SnippetID: "snippet:bb", From: "src/a.go#L9-L9", To: "src/a.go#L9-L9"},
+		"an unknown snippet digest":  {SnippetID: "snippet:zz", From: "src/a.go#L9-L9", To: "src/a.go#L10-L10"},
+	} {
+		if err := mustFail(t, s, func(tx Tx) error {
+			_, err := tx.ReanchorCode(ctx, "a1", []CodeMove{bad}, "beef", bob)
+			return err
+		}); !errors.Is(err, ErrInvalid) {
+			t.Fatalf("%s: got %v, want ErrInvalid", name, err)
+		}
+	}
+	if err := mustFail(t, s, func(tx Tx) error {
+		_, err := tx.ReanchorCode(ctx, "a1", []CodeMove{move}, "beef", Actor{})
+		return err
+	}); err == nil {
+		t.Fatal("an actor that fails validate was not refused")
+	}
+	// A move onto lines another anchor of the same entry already holds is refused by the
+	// store's own (entry_id, kind, value) uniqueness rather than by a check here: it
+	// would leave the entry holding two anchors with one value, and the second one would
+	// be unreachable by any later lookup.
+	if err := mustFail(t, s, func(tx Tx) error {
+		_, err := tx.ReanchorCode(ctx, "a1", []CodeMove{{SnippetID: "snippet:bb", From: "src/a.go#L9-L9",
+			To: "src/a.go#L6-L7"}}, "beef", bob)
+		return err
+	}); err == nil {
+		t.Fatal("a move onto another block's lines was not refused")
+	}
+	anchors, _ = s.ListAnchors(ctx, "a1")
+	if anchors[1].Value != "src/a.go#L6-L7" || anchors[2].Value != "src/a.go#L9-L9" {
+		t.Fatalf("a refused move changed an anchor: %+v", anchors)
+	}
+}
+
+// A transaction that cannot commit reports its error and leaves nothing behind, so a
+// caller never reports an entry as moved or marked on the strength of a rolled-back write.
+// The second move in the batch is the one that fails, so the first has already run inside
+// the transaction when the rollback happens: that is the case the caller cannot see.
+func TestReanchorCodeRollsBackTheWholeBatch(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "a1", "t", "c", "src/a.go")
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.ReplaceAnchors(ctx, "a1", []string{"src/a.go"}, []AnchorInput{
+			{Kind: AnchorCode, Value: "src/a.go#L4-L5", Extracted: true, SymbolUID: "snippet:aa"},
+			{Kind: AnchorCode, Value: "src/a.go#L9-L9", Extracted: true, SymbolUID: "snippet:bb"},
+			{Kind: AnchorCode, Value: "src/a.go#L14-L14", Extracted: true, SymbolUID: "snippet:cc"},
+		}, alice)
+	})
+	var n int
+	err := s.Update(ctx, func(tx Tx) error {
+		var err error
+		n, err = tx.ReanchorCode(ctx, "a1", []CodeMove{
+			{SnippetID: "snippet:aa", From: "src/a.go#L4-L5", To: "src/a.go#L5-L6"},
+			// onto the range snippet:bb holds, which the store's uniqueness refuses
+			{SnippetID: "snippet:cc", From: "src/a.go#L14-L14", To: "src/a.go#L9-L9"},
+		}, "beef", bob)
+		return err
+	})
+	if err == nil {
+		t.Fatal("a batch whose second move is refused committed")
+	}
+	if n != 0 {
+		t.Fatalf("a rolled-back batch reported %d moves", n)
+	}
+	anchors, _ := s.ListAnchors(ctx, "a1")
+	for i, want := range []string{"src/a.go#L4-L5", "src/a.go#L9-L9", "src/a.go#L14-L14"} {
+		if anchors[i+1].Value != want {
+			t.Fatalf("the rollback left anchor %d at %q, want %q", i, anchors[i+1].Value, want)
+		}
+	}
+	if evs, _ := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", EntryID: "a1", Types: []string{EventAnchorReanchor}}); len(evs) != 0 {
+		t.Fatalf("a rolled-back batch recorded %d events", len(evs))
+	}
+}
+
+// ParseCodeAnchorValue is the one place that turns a code anchor's value back into lines.
+func TestParseCodeAnchorValue(t *testing.T) {
+	got, err := ParseCodeAnchorValue("src/a.go#L4-L7")
+	if err != nil || got.Path != "src/a.go" || got.Start != 4 || got.End != 7 {
+		t.Fatalf("got %+v, %v", got, err)
+	}
+	for _, bad := range []string{"", "src/a.go", "src/a.go#L4", "src/a.go#4-7", "src/a.go#L0-L7",
+		"src/a.go#L7-L4", "src/a.go#Lx-Ly", "#L4-L5"} {
+		if _, err := ParseCodeAnchorValue(bad); err == nil {
+			t.Fatalf("%q was accepted", bad)
+		}
 	}
 }

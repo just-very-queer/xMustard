@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -45,6 +46,16 @@ func TestProbeIDUsesOnlyTopLevelID(t *testing.T) {
 // it. End-to-end smoke only: the pool here is not provably full (see the in-process
 // saturation test below for the proof).
 func TestCancellationServiceableUnderPoolSaturation(t *testing.T) {
+	// callHeld closes once the API has received call 1's remember POST. Everything call 1
+	// reserves is taken before that POST is built and sent (the decoded params, then 2x the
+	// argument bytes), so once the server has seen the request call 1's reservations are
+	// settled and held. Frame 2 is only sent after that signal, so the second admission is
+	// refused deterministically instead of racing call 1's own reserves: the pool (204800)
+	// fits call 1 alone (its peak is its 41062 decoded params plus 81924 = 2x argBytes) but
+	// not call 1 plus a concurrent frame 2 admission, and a 300ms sleep does not order the
+	// two under load.
+	callHeld := make(chan struct{})
+	var callOnce sync.Once
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet && r.URL.Path == "/api/workspaces" {
 			// the listing read for the result's workspace root answers at once, so the
@@ -54,6 +65,7 @@ func TestCancellationServiceableUnderPoolSaturation(t *testing.T) {
 		}
 		// read the body so the server notices the shim cancelling (closing) the request
 		_, _ = io.Copy(io.Discard, r.Body)
+		callOnce.Do(func() { close(callHeld) })
 		<-r.Context().Done()
 	}))
 	defer api.Close()
@@ -74,7 +86,12 @@ func TestCancellationServiceableUnderPoolSaturation(t *testing.T) {
 	}()
 	content := strings.Repeat("c", 40<<10)
 	fmt.Fprintf(stdin, `{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"remember","arguments":{"workspace_id":"ws","content":"%s"}}}`+"\n", content)
-	time.Sleep(300 * time.Millisecond)
+	// wait until call 1 is admitted and holding the pool before sending frame 2
+	select {
+	case <-callHeld:
+	case <-time.After(5 * time.Second):
+		t.Fatal("call 1 never reached the API, so the pool was never held")
+	}
 	// the pool is now held by call 1: a further large frame is refused...
 	fmt.Fprintf(stdin, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"remember","arguments":{"workspace_id":"ws","content":"%s"}}}`+"\n", content)
 	// ...but the cancellation for call 1 still gets through

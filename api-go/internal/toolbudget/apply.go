@@ -405,6 +405,10 @@ type budgeter struct {
 	applied  []string
 	recovery *Recovery
 	buf      bytes.Buffer
+
+	// ranked is the result's own ranked total; a trimmed paged list rewrites the
+	// omitted member against it (WS-FIX-18).
+	ranked int
 }
 
 // Apply fits a tool result (a JSON object) to req and appends the output_budget
@@ -544,6 +548,11 @@ func (b *budgeter) load(top []kv) {
 			if !b.page.Slice {
 				kept = append(kept, m)
 			}
+		case "total":
+			if err := json.Unmarshal(m.raw, &b.ranked); err != nil {
+				b.ranked = 0
+			}
+			kept = append(kept, m)
 		default:
 			kept = append(kept, m)
 		}
@@ -789,6 +798,10 @@ func (b *budgeter) render(report func(int) []byte) []byte {
 		sep()
 		w.Write(quote(m.key))
 		w.WriteByte(':')
+		if m.key == "omitted" && b.recountsOmitted() {
+			b.writeOmitted(w)
+			continue
+		}
 		if m.sub == nil {
 			w.Write(m.raw)
 			continue
@@ -879,6 +892,28 @@ func (b *budgeter) writeListValue(w *bytes.Buffer, l *listState) {
 		return
 	}
 	writeList(w, l.items, l.k, l.item)
+}
+
+// recountsOmitted reports whether the budget is the one that made this result's
+// omitted count untrue, so writeOmitted may replace the producer's value. It
+// did when the budget cut the paged hybrid hits list: the producer counted the
+// ranked hits after its own page, and the delivered answer carries fewer. Two
+// guards keep the arithmetic to the one list it describes. `hits` is the only
+// list in the three ladder files whose top-level total and offset describe the
+// ranking it is a page of, so any other result's omitted keeps its own value.
+// And a list the budget did not cut still carries the producer's count: a
+// producer need not describe its page as total - offset - delivered, since
+// WorkspaceSearchReranked sets total to the hits it returned while keeping the
+// core's omitted for the hits it never fetched (WS-FIX-18).
+func (b *budgeter) recountsOmitted() bool {
+	return b.paged != nil && b.paged.spec.Member == "hits" && b.paged.cut()
+}
+
+// writeOmitted writes a hybrid result's omitted member after the budget cut its
+// hits: the ranked hits that come after this page, total - the offset the page
+// starts at - the hits the paged list kept (WS-FIX-18).
+func (b *budgeter) writeOmitted(w *bytes.Buffer) {
+	w.WriteString(strconv.Itoa(max(b.ranked-b.page.Offset-b.paged.kept(), 0)))
 }
 
 // nextCursor continues the paged list at its first item not returned. When the budget
