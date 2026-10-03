@@ -744,4 +744,16 @@ func TestTheOptInRefusesNothingElse(t *testing.T) {
 			t.Fatalf("resolved %+v", ws)
 		}
 	})
+	t.Run("a session with no working directory never registers", func(t *testing.T) {
+		api := &fakeAPI{}
+		s := newSession(t, api, Options{AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+		res, _ := call(t, s, "ground", map[string]any{})
+		out := text(res)
+		if res["isError"] != true || !strings.Contains(out, "the server has no working directory") {
+			t.Fatalf("the opt-in must not invent a working directory: %s", out)
+		}
+		if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+			t.Fatalf("registered %d times with no working directory", n)
+		}
+	})
 }

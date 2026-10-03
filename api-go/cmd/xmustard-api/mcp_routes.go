@@ -107,10 +107,10 @@ func openMCPSession(r *http.Request) (*mcpserver.Server, error) {
 		// roots-based registration goes through POST /api/workspaces/load as the
 		// caller, so the registration scope (WS-09B) decides it
 		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
-		// the operator's opt-in: register the cwd while the client's roots are
-		// unknown (WS-FIX-15b, off by default)
-		RegisterCwdWhenRootsUnknown: strings.TrimSpace(os.Getenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN")) != "0",
-		HomeDir:                     home,
+		// Cwd stays empty here (an HTTP transport has no working directory), so the cwd
+		// signal never runs and XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN, which gates
+		// only that signal, has nothing to gate. The stdio shim reads it.
+		HomeDir: home,
 		// the binding (or the header) names the workspace, so initialize can append its
 		// standing memory
 		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
