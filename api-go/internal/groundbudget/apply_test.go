@@ -540,22 +540,25 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 // unchanged tree, and reached 410,824-423,592 under WS-32a's load against a
 // 402,909-byte line: the flake this test is.
 //
-// The copy guard's two windows are steady-state, and that is measured rather than
-// assumed: the very first Apply into a fresh heap also pays for the heap's growth into
-// this working set, and that cost lands on whichever fixture is measured first. Cold,
-// over 12 runs, the difference spans -14,688 to +2,456 bytes
-// (logs/ws-flk-09-run-20261003T213617Z.log); warmed, over 6 runs it spans -1,323 to +551
-// (logs/ws-flk-09-run-20261003T211132Z.log). The first call is not left unasserted: the
-// guard reads it separately and holds WorkingSet to it, because WorkingSet is what a
-// caller admits before that first call.
+// The copy guard's two windows are warm, and that is measured rather than assumed: an
+// unwarmed Apply also pays for the heap's growth into this working set, and that cost
+// lands on whichever fixture is measured first. Cold, over 12 runs, the difference spans
+// -14,688 to +2,456 bytes (logs/ws-flk-09-run-20261003T213617Z.log); warm, over 12 runs
+// it spans 41 to 1,637 (logs/ws-flk-09-run-20261003T214246Z.log). So the first Apply
+// this test makes is measured separately and held to WorkingSet, because WorkingSet is
+// what a caller admits before its own first call. It is the first call in this test,
+// not the first in the process: the package's other tests call Apply before it, so
+// under a full run the figure is a warmed one wearing a colder label. Both readings
+// stay inside the same line, which is the point.
 const (
 	allocPadBytes  = 400
 	allocProbeRuns = 8
 )
 
 // allocOf returns the bytes Apply allocates for raw in one call, after an untimed warm-up
-// call when warm is set. It reads a process-wide counter, so it carries the same noise the
-// difference the caller takes is there to cancel; never read it alone as a copy guard.
+// call when warm is set. It reads a process-wide counter, so it carries whatever the
+// runtime allocates inside its window; the caller's allowance is sized for that, and it
+// is never read alone as a copy guard.
 func allocOf(t *testing.T, raw []byte, req Request, warm bool) int64 {
 	t.Helper()
 	if warm {
@@ -593,14 +596,14 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 			len(wide), len(narrow))
 	}
 
-	// The first call a caller makes is the one WorkingSet has to cover, so it is read
-	// before anything else has called Apply in this process, and asserted on its own:
-	// the result plus that call's allocations must fit in what the API admits. Its line
-	// is the one Apply has always had to meet for a single call, len(raw)/4, unchanged by
-	// this row. Read first or it would be a warmed call wearing a cold label.
+	// The first Apply this test makes is the one a caller's WorkingSet has to cover, so
+	// it is read before this test's own copy measurement and asserted on its own: the
+	// result plus that call's allocations must fit in what the API admits. Its line is
+	// the one Apply has always had to meet for a single call, len(raw)/4, unchanged by
+	// this row.
 	coldAlloc := allocOf(t, narrow, req, false)
 	if coldAlloc > int64(len(narrow))/4 {
-		t.Fatalf("the first Apply call allocated %d bytes for a %d-byte result; it must not copy the result",
+		t.Fatalf("this test's first Apply call allocated %d bytes for a %d-byte result; it must not copy the result",
 			coldAlloc, len(narrow))
 	}
 	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+coldAlloc {
