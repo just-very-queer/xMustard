@@ -2999,6 +2999,15 @@ No Cursor is installed on the build box or the Mac, and no Cursor source is clon
 
 **New modules.** `rust-core/src/cursorhook.rs`, `integrations/cursor`.
 
+**PARKED (2026-10-03).** Branch `parity/ws-40c-b`, head `45b531e`, **not merged**. Review round 1 (`reviews/ws-40c-b/r1`) found **three blockers and four majors**, all open, and they share one root: this row built the client half of the adapter and the server half does not exist.
+
+- **No route.** `hooks.Clients` is `[]Client{Claude, Codex}` (`api-go/internal/hooks/client.go:49`); `/api/hooks/cursor/<event>` is registered for nothing, so every event the packaged `hooks.json` fires returns no route. `WS-40c-b-r1-1`.
+- **The pin is a path, not an id.** `workspace_pin` returns a member of `workspace_roots` and the client sends it in `X-Xmustard-Workspace`, which every other client fills from a `transport.ValidWorkspaceID`-checked value. `WS-40c-b-r1-2`.
+- **A root disagreement is posted instead of refused.** The fallback to `XMUSTARD_WORKSPACE_ID` fires when the roots are present and disagree, which is exactly the case WS-40c-a requires to be refused, and a new test asserts the fallback. `WS-40c-b-r1-3`.
+- Also open: header injection through an unvalidated token or pin (`r1-4`, major), a nested JSON member shadowing a top-level one (`r1-5`, major), a reply shape the client cannot read (`r1-6`, major), `"."` matching every project path (`r1-7`, major), and six minors (`r1-8` to `r1-13`).
+
+**Next step.** The server-side Cursor hook client is its own task and is the precondition for everything else here: a `hooks.Client` entry with `FormatCursor`, the four events, a gate row per event, a `docs/SECURITY.md` row per route, a `cursorReply` writer in Cursor's schema, and the pin as a validated id. Once that exists, `r1-2`, `r1-3` and `r1-6` are one commit, `r1-4` through `r1-9` are one more, and the recorded fixtures `r1-12` asks for need a live Cursor session (`xmustard-ops setup --client cursor`, WS-44's territory). Nothing on this branch should be installed until then: a hook that posts to an unregistered route writes nothing, which is the fail-open behaviour, so the failure is silent rather than loud.
+
 ### WS-41 — Command-wrapper reducer, retention classes and upstream references
 
 **Goal.** Add `xmustard-core run -- <argv>` (RTK pattern): it streams child output to the spool with a bounded tail, preserves exit code and signals, and prints the projection plus a handle. Add retention classes (hook-captured, own outputs, snapshots) with separate TTLs and quotas, and hashed upstream references when the client already persisted the original. A full quota means bounded passthrough, never eviction of a promised original.
