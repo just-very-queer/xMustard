@@ -12,10 +12,10 @@ import (
 // reader's symlink-refusing open) can key a cache entry on what it actually read.
 //
 // os.FileInfo.Sys() on unix returns *syscall.Stat_t, which is a distinct type from
-// x/sys/unix.Stat_t even where they carry the same fields, so the assertion must be to
-// syscall.Stat_t. Asserting to unix.Stat_t silently always fails, and the mark degrades to
-// size and mtime with no inode or ctime, which is what an atomic same-size replacement
-// preserves.
+// x/sys/unix.Stat_t even where the two carry the same fields, so the assertion below must be
+// to syscall.Stat_t. Asserting to unix.Stat_t fails silently and always: the mark degrades to
+// size and mtime, with no inode and no ctime, and those are exactly what an atomic same-size
+// replacement preserves.
 func fileMarkFromInfo(info os.FileInfo) fileMark {
 	st, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
