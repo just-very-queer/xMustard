@@ -191,11 +191,15 @@ func recallAllActive(w http.ResponseWriter, r *http.Request) {
 // history=true (revisions and events) need a reviewer: the verifier or human-approver
 // role (admin holds both; open mode is the operator).
 func recallEntry(w http.ResponseWriter, r *http.Request, id string) {
-	history := r.URL.Query().Get("history") == "true"
+	q := r.URL.Query()
+	history := q.Get("history") == "true"
 	if history && !requireReviewer(w, r) {
 		return
 	}
-	result, err := workspaceops.GetContextEntry(dataDir(), r.PathValue("workspace_id"), id, history, isReviewer(r), callerOf(r).ID)
+	// the reader's own keys follow the principal, so a run, session or directory
+	// scoped memory is fetchable by id from inside that key and by nobody else
+	result, err := workspaceops.GetContextEntry(dataDir(), r.PathValue("workspace_id"), id, history, isReviewer(r),
+		append([]string{callerOf(r).ID}, q.Get("dir"), q.Get("run_id"), q.Get("session_id"))...)
 	reply(w, result, err, respondError)
 }
 

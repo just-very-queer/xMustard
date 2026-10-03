@@ -453,6 +453,48 @@ func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 	}
 }
 
+// The by-id read is not a one-way door: the author of a run, session or directory
+// scoped memory must still be able to fetch it by id from inside that key, because
+// the check that refuses everyone else would otherwise make it unreadable to
+// everyone.
+func TestTheByIDReadServesTheAuthorInsideTheConfiningKey(t *testing.T) {
+	dir := singleAgentDir(t)
+	run := propose(t, dir, "ws-1", "author-a", "by id run", "the run holds an open migration",
+		func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" })
+	dirScoped := propose(t, dir, "ws-1", "author-a", "by id dir", "the resolver drops unexported edges",
+		func(r *ProposeContextRequest) { r.Visibility = ScopeDir; r.Dir = "api-go/internal" })
+	sess := propose(t, dir, "ws-1", "author-a", "by id session", "the handoff names the next step",
+		func(r *ProposeContextRequest) { r.Visibility = ScopeSession; r.SessionID = "claude:s1" })
+
+	for _, c := range []struct {
+		name  string
+		id    string
+		keys  []string
+		serve bool
+	}{
+		{"a run entry inside its run", run.ID, []string{"author-a", "", "run-1", ""}, true},
+		{"a run entry in another run", run.ID, []string{"author-a", "", "run-2", ""}, false},
+		{"a run entry with no run", run.ID, []string{"author-a"}, false},
+		{"a dir entry inside its directory", dirScoped.ID, []string{"author-a", "api-go/internal", "", ""}, true},
+		{"a dir entry in a child directory", dirScoped.ID, []string{"author-a", "api-go/internal/govstore", "", ""}, true},
+		{"a dir entry in a sibling of its directory", dirScoped.ID, []string{"author-a", "api-go/cmd", "", ""}, false},
+		{"a dir entry in a parent of its directory", dirScoped.ID, []string{"author-a", "api-go", "", ""}, false},
+		{"a dir entry with no directory", dirScoped.ID, []string{"author-a"}, false},
+		{"a session entry inside its session", sess.ID, []string{"author-a", "", "", "claude:s1"}, true},
+		{"a session entry in another session", sess.ID, []string{"author-a", "", "", "claude:s2"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			_, err := GetContextEntry(dir, "ws-1", c.id, false, true, c.keys...)
+			if c.serve && err != nil {
+				t.Fatalf("the author must fetch it inside the key: %v", err)
+			}
+			if !c.serve && err == nil {
+				t.Fatal("the by-id read must refuse it outside the key")
+			}
+		})
+	}
+}
+
 // Knowing or guessing an entry id is not a way round a private memory: the by-id
 // read refuses with the not-found shape, and the listing paths leave it out.
 func TestTheByIDAndListingReadPathsEnforceTheSameScope(t *testing.T) {

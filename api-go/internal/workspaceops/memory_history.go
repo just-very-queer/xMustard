@@ -43,9 +43,12 @@ const unverifiedWithheld = "content is not verified; reading it needs the verifi
 // A non-empty reader is checked against the entry's scope BEFORE anything is loaded
 // (WS-29b): knowing or guessing an entry id is not a way round a private, run,
 // session or directory memory, and the check is on the stored row rather than on a
-// ranking view, so no route can skip it. The refusal is the same shape as "not
-// found", so an id probe cannot tell a private memory from an absent one. An empty
-// reader is the operator's own view.
+// ranking view, so no route can skip it. The reader's own keys arrive as the trailing
+// arguments (reader, then dir, run_id, session_id), so the author of a run- or
+// directory-scoped memory can still fetch it by id from inside that key; without
+// them every confined entry would be unreadable even by its author. The refusal is
+// the not-found shape, so an id probe cannot tell a private memory from an absent
+// one. No reader at all is the operator's own view.
 func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer bool, reader ...string) (map[string]any, error) {
 	if err := validateSafeID("entry", entryID); err != nil {
 		return nil, err
@@ -54,6 +57,16 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer boo
 		return nil, fmt.Errorf("memory history: %w", ErrVerifierRequired)
 	}
 	who := firstOf(reader)
+	keys := ScopeRequest{}
+	if len(reader) > 1 {
+		keys.Dir = reader[1]
+	}
+	if len(reader) > 2 {
+		keys.RunID = reader[2]
+	}
+	if len(reader) > 3 {
+		keys.SessionID = reader[3]
+	}
 	ctx := context.Background()
 	var out map[string]any
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
@@ -61,7 +74,7 @@ func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer boo
 		if err != nil {
 			return err
 		}
-		if who != "" && !ScopesVisible(e.Scope, e.ScopeKey, e.Source, who, ScopeRequest{}) {
+		if who != "" && !ScopesVisible(e.Scope, e.ScopeKey, e.Source, who, keys) {
 			return fmt.Errorf("memory %s: %w", entryID, govstore.ErrNotFound)
 		}
 		out = map[string]any{"workspace_id": workspaceID, "content_digest": e.ContentDigest, "data_notice": injection.DataNotice}
