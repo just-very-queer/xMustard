@@ -38,6 +38,14 @@ pub const MIN_STEPS: usize = 3;
 /// Flows one answer lists.
 pub const MAX_FLOWS: usize = 200;
 /// Steps listed per flow.
+///
+/// No walk can reach this cap at the other two bounds. A node is expanded once per
+/// distinct strictly-decreasing depth in `0..=MAX_DEPTH`, so it contributes at most
+/// `MAX_BRANCHING` new steps per depth and a whole walk at most
+/// `1 + MAX_BRANCHING * (MAX_DEPTH + 1)` = 45 steps. The cap is still applied, because it
+/// is the stated bound and raising `MAX_BRANCHING` must not silently change what a reader
+/// is promised, but at today's caps it never fires and the truncation counter beside it is
+/// always zero. Mutation row M7 measures this rather than assuming it.
 pub const MAX_STEPS_LISTED: usize = 50;
 /// Steps that must share a name prefix before it is a flow's label.
 pub const LABEL_MIN_MEMBERS: usize = 2;
@@ -587,6 +595,15 @@ fn build_graph(
             // by the segment's symbol count — so a node past it is not an admitted symbol
             // and must be skipped rather than indexed. `areas.rs` guards the same lookup
             // for the same reason.
+            //
+            // Mutation row M3 replaced this guard with an unchecked index and nothing
+            // failed, which is the correct outcome: `csr::edge_query` joins BOTH endpoints
+            // through `seg_syms` and drops the edge when either end is not in the segment
+            // (`csr.rs:936-937`), so a symbol-layer edge's node id is always in range on a
+            // well-formed index. The guard is kept for the same reason as `areas.rs`'s —
+            // a bounds check that costs one comparison and turns a future CSR change into
+            // a wrong answer rather than a panic — but it is recorded unreachable rather
+            // than claimed as covered, and the arithmetic is on `csr.rs` rather than here.
             let Some(&j) = slot.get(other as usize) else {
                 continue;
             };
@@ -724,6 +741,13 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
     while let Some((node, depth)) = stack.pop() {
         // A re-expansion only happens on a strictly shorter route, so a symbol's subtree
         // is walked once per distinct shorter depth at most.
+        //
+        // Mutation row M5 dropped this guard and no test failed. Without it a node is
+        // expanded once per PUSH rather than once per distinct depth, so on a graph where
+        // the same node is pushed at several depths the answer grows — but `visited_set`
+        // still refuses to push a node twice, and each expansion adds at most
+        // `max_branching` steps, so the two agree on every graph the chain and fan fixtures
+        // build. Recorded as equivalent on those fixtures rather than claimed as covered.
         if expanded_at[node] <= depth {
             continue;
         }

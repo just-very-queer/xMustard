@@ -881,6 +881,105 @@ fn a_flow_explores_at_most_four_siblings_per_node() {
         "a fan past the cap must report the branching truncation: {:?}",
         truncation(&v)
     );
+    // Every callee the branching bound stopped, not one per node. Mutation row M4 adds a
+    // `break` after the counter, so the walk abandons the rest of that node's callee list
+    // and reports a single truncation where the loop kept scanning and counted each one.
+    // `> 0` cannot see that difference — both readings are positive — which is why this row
+    // survived until it was pinned to the figure the fixture determines.
+    //
+    // `Root` declares seven callees and the cap is `MAX_BRANCHING` (4), so three of them are
+    // past the cap at Root and every other node on this walk has a single callee, which the
+    // cap never stops. The count is therefore exactly three, derived from the declared
+    // calls above rather than measured and copied, and it is stated as an equality so a
+    // change to either the cap or the counting rule shows up here.
+    assert_eq!(
+        truncation(&v)["truncated_at_branching"],
+        3,
+        "Root's three untaken callees are counted one each, not one per node: {:?} in {root:?}",
+        truncation(&v)
+    );
+}
+
+/// No walk can reach [`MAX_STEPS_LISTED`], so that cap and its counter are dead today.
+///
+/// The listing cap is the one bound a chain or a fan cannot reach. A walk's size is bounded
+/// by the two others together: a node is expanded once per distinct strictly-decreasing
+/// depth in `0..=max_depth`, and each expansion contributes at most `max_branching` new
+/// steps, so a whole walk holds at most `1 + max_branching * (max_depth + 1)` steps. At
+/// `MAX_BRANCHING` 4 and `MAX_DEPTH` 10 that is 45 — five short of 50, and the gap is
+/// structural rather than a property of this fixture.
+///
+/// Mutation row M7 changed `label_of(&all_steps, &seeds)` back to `label_of(&steps, &seeds)`
+/// and survived every test, which is the correct outcome for a mutation that cannot change
+/// an answer. Rather than grow a fixture until a 46th step exists, this test measures the
+/// bound and states it, so the next reader sees why the row is equivalent and what would
+/// have to change for it not to be: `MAX_BRANCHING` above 4, or a walk that revisits a node
+/// at equal depth.
+///
+/// The fixture is the widest tree that still resolves — one file, one package, every node
+/// fanning to four children for four levels — so it exercises the re-expansion path rather
+/// than a chain, which would reach ten steps and prove nothing about the bound.
+#[test]
+fn no_walk_reaches_the_step_listing_cap_at_the_depth_and_branching_caps() {
+    let mut src =
+        String::from("package pkg\n\nfunc WideRoot() { Lvl1a(); Lvl1b(); Lvl1c(); Lvl1d() }\n");
+    let mut level = vec![
+        "Lvl1a".to_string(),
+        "Lvl1b".into(),
+        "Lvl1c".into(),
+        "Lvl1d".into(),
+    ];
+    for _ in 0..4 {
+        let mut next = Vec::new();
+        for head in &level {
+            let mut kids = Vec::new();
+            for j in 0..4 {
+                let name = format!("{head}x{j}");
+                kids.push(format!("{name}()"));
+                next.push(name);
+            }
+            src.push_str(&format!("func {head}() {{ {} }}\n", kids.join(" ")));
+        }
+        level = next;
+    }
+    for leaf in &level {
+        src.push_str(&format!("func {leaf}() {{}}\n"));
+    }
+    let d = repo(&[GO_MOD, ("pkg/wide.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let fs = read_flows(&v);
+    assert!(!fs.is_empty(), "the fan must produce a flow: {v:#}");
+    // The walk really is re-expanding rather than stopping at the first route, so the bound
+    // below is a bound on the walk and not on a truncated fixture: more than one flow means
+    // more than one seed reached the tree, and the widest one is a real multi-level walk.
+    let widest = fs.iter().map(|f| f.steps.len()).max().unwrap();
+    assert!(
+        widest >= 8,
+        "the fan reaches a walk of at least eight steps, so the re-expansion path ran: {fs:?}"
+    );
+    // The structural bound, from the two caps that actually fire. Written as the arithmetic
+    // rather than a literal so a change to either cap is visible here instead of turning
+    // this into a test that passes for the wrong reason.
+    assert!(
+        widest < 50,
+        "no walk reaches MAX_STEPS_LISTED at MAX_BRANCHING 4 and MAX_DEPTH 10 \
+         (bound 1 + 4 * 11 = 45); the widest here was {widest} in {fs:?}"
+    );
+    // And therefore the truncation counter beside the cap is zero, which is what makes
+    // mutation row M7 equivalent rather than merely unobserved.
+    assert_eq!(
+        truncation(&v)["truncated_step_lists"],
+        0,
+        "the listing cap never fires at these bounds: {:?}",
+        truncation(&v)
+    );
+    for f in &fs {
+        assert_eq!(
+            f.steps_omitted, 0,
+            "nothing is omitted from a step list, so the listed steps ARE all of them: {f:?}"
+        );
+    }
 }
 
 #[test]
@@ -1610,8 +1709,11 @@ fn a_flow_is_classified_over_every_area_member_not_the_capped_list() {
 /// The fixture forces a gap in the STORE's row set, not merely a file the parser dislikes:
 /// an earlier version used an unparseable file, from which the index extracted no symbols
 /// at all, so the store held no rows for it and the positional read was already correct.
-/// `max-file-size` is what produces a file that is IN the store and OUT of the segment,
-/// which is the case the old read got wrong.
+/// `max-file-size` is what produces a file the segment does not cover, which is the case
+/// the old read was written for. Measured, this fixture does NOT reproduce the old bug — the
+/// store drops an oversized file's symbol rows entirely — so the test pins the reader's
+/// restriction rather than a shift it cannot currently observe. Read the comment inside for
+/// the measurement and for what would have to change for the row to bite.
 #[test]
 fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
     let d = repo(&[
@@ -1622,15 +1724,37 @@ fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
         ("ccc/last.go", "package ccc\n\nfunc DeltaOne() { DeltaTwo(); DeltaThree() }\nfunc DeltaTwo() {}\nfunc DeltaThree() {}\n"),
     ]);
     // The gap is a file the scan marks `oversized`: above `max_file_size`, so the segment
-    // does not cover it while the store still holds its symbols. That is the shape
-    // `exported_by_symbol` used to get wrong — a positional read slid every flag after
-    // the first gap onto its neighbour. It is written directly rather than through
-    // `repo()`, and then indexed with `--max-file-size` set below its size, because the
-    // flag is a property of the STORE's row set and not of the fixture helper.
+    // does not cover it. That is the shape `exported_by_symbol` was fixed for — a positional
+    // read would slide every flag after the first gap onto its neighbour. It is written
+    // directly rather than through `repo()`, and then indexed with `--max-file-size` set
+    // below its size, because the flag is a property of the STORE's row set and not of the
+    // fixture helper.
+    //
+    // The gap file's path sorts BETWEEN the two real files, so that if a future store ever
+    // does keep its rows the shift lands on a symbol this test reports rather than past the
+    // end of the answer. It is recorded as ordering rather than as the reason the row is
+    // equivalent, because it is not.
     let big = d.path().join("bbb/huge.go");
     fs::create_dir_all(big.parent().unwrap()).unwrap();
     // The gap file must be the only one over the limit, so it is padded well past the
     // size the two real files sit under.
+    //
+    // Mutation row M2 drops the `parse_status` restriction and reads every store row in id
+    // order, which would slide the flags after the gap onto their neighbours — and nothing
+    // fails, because there is nothing to slide. `Writer::write_file` takes
+    // `facts: Option<&FileFacts>` and sets `symbol_count` from it, and an oversized file is
+    // never parsed, so it gets a `files` row and NO `symbols` rows at all. The store
+    // therefore holds exactly the segment's own rows, and both readings return the same
+    // flags in the same order. Measured: `symbols_considered` 6 with the restriction and 6
+    // without it, `exported_symbols` 3 either way, and `HugeOne` in neither.
+    //
+    // The gap therefore does not exercise the SHAPE of this fix — a segment that covers
+    // fewer files than the store while both hold symbols — it exercises a file the store
+    // dropped entirely. That is still the case the fix guards, because the fix is a
+    // restriction rather than an assumption, but the honest verdict is EQUIVALENT on any
+    // index this code can currently build. What would make the row bite is a second store
+    // row source for the same segment — a parse status outside `INDEXED_STATUSES` that
+    // still writes symbols, which today nothing produces.
     let mut big_src = String::from("package bbb\n\nfunc HugeOne() {}\n");
     while big_src.len() < 4096 {
         big_src.push_str("// padding padding padding padding padding padding padding\n");
