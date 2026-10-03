@@ -592,6 +592,7 @@ fn set_meta_common(
 fn set_scan_meta(conn: &Connection, scan: &Scan) -> rusqlite::Result<()> {
     let beyond = serde_json::to_string(&scan.beyond).unwrap_or_default();
     let sample = serde_json::to_string(&scan.beyond_sample).unwrap_or_default();
+    let nested = serde_json::to_string(&scan.nested_repos).unwrap_or_default();
     for (k, v) in [
         ("last_commit", scan.head.clone()),
         ("ignored_files", scan.ignored.to_string()),
@@ -603,6 +604,7 @@ fn set_scan_meta(conn: &Connection, scan: &Scan) -> rusqlite::Result<()> {
         ("worktree_deleted", scan.worktree_deleted.to_string()),
         (meta::BEYOND, beyond),
         (meta::BEYOND_SAMPLE, sample),
+        (meta::NESTED_REPOS, nested),
     ] {
         if meta::get(conn, k)?.as_deref() != Some(v.as_str()) {
             meta::set(conn, k, &v)?;
