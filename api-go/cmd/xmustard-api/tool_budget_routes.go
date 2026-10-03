@@ -85,9 +85,20 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 		// impact's cursor continues at the core's next_offset, which describes the
 		// core's page; when the budget cut that page the cursor is re-signed to
 		// continue at the first item the caller did not receive, so the caller pages
-		// without computing an offset (WS-59e).
+		// without computing an offset (WS-59e). The paging members land after Apply
+		// settled the report, so the result is settled again to keep used_chars and
+		// over_budget true of what is actually written.
 		if spec.Tool == "impact" {
 			out = workspaceops.ReconcileImpactPaging(ws, q, out)
+			settled, serr := spec.Settle(out, req, page)
+			if serr != nil {
+				// Settle fails only on a result that is no longer valid JSON, which
+				// reconciliation cannot produce. Refuse rather than write an answer
+				// whose report would describe something other than the body.
+				writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "impact result is too large to budget; narrow the call"})
+				return
+			}
+			out = settled
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})

@@ -443,6 +443,32 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 	return b.render(b.report), nil
 }
 
+// Settle re-fits a result that a producer changed after Apply. Apply settles
+// output_budget.used_chars against the members it wrote, so a member added after it
+// returned leaves the report naming a length the result no longer has. A producer that
+// adds its own members (impact's has_more and next_cursor, WS-59e) settles the result
+// through here so the report describes what is actually sent.
+//
+// Settling fits, so a result that no longer fits is trimmed again rather than reported
+// over budget; the ladder that trims it is named in stages as usual. It never adds
+// items, and an unbudgeted result (MaxChars 0) carries no report to settle and is
+// returned unchanged.
+func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
+	if req.MaxChars <= 0 {
+		return result, nil
+	}
+	top, ok := parseObject(result)
+	if !ok {
+		return result, nil
+	}
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}}
+	b.ladder = s.ladderFor(top)
+	b.load(top)
+	b.reset()
+	b.fit()
+	return b.render(b.report), nil
+}
+
 func (s *Spec) ladderFor(top []kv) *Ladder {
 	for _, l := range s.Ladders {
 		if l.Match == "" {
