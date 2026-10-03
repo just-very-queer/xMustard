@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // scriptedRoots answers roots/list from a script, one step per request; the last
@@ -134,6 +137,384 @@ func TestTimedOutRootsBackOffThenRetry(t *testing.T) {
 	res, _ := call(t, s, "ground", map[string]any{})
 	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
 		t.Fatalf("after the back-off: %+v (roots/list asked %d times)", ws, client.count())
+	}
+}
+
+// A roots/list that keeps failing backs off: one request inside the window, and a
+// retry once it expires. Today only a deadline sets retryAt, so a client that always
+// answers -32603 is re-asked on every call (FU:10 measured 5 calls, 5 requests).
+// A first fast failure is still asked again on the next call, so a client that fails
+// once recovers immediately.
+func TestRepeatedRootsFailureBacksOffUntilTheWindowExpires(t *testing.T) {
+	project, other := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy, rootsAnswer(project)}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	// The first failure is asked again immediately: one-shot recovery is preserved.
+	// other is an unregistered git repository, so resolution falls through to it and
+	// fails there: the working directory never registers while the roots are unknown.
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !res["isError"].(bool) || strings.Contains(text(res), "asked again after") {
+		t.Fatalf("a single fast failure must not back off: %v", text(res))
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
+	}
+	if n := client.count(); n != 1 {
+		t.Fatalf("roots/list asked %d times on the first call", n)
+	}
+
+	// The second failure opens the back-off window, and calls inside it keep failing
+	// from the cached answer without sending another request.
+	res, _ = call(t, s, "ground", map[string]any{})
+	if !res["isError"].(bool) || !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
+		t.Fatalf("the second failure must open the back-off window: %v", text(res))
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	s.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		res, _ = call(t, s, "ground", map[string]any{})
+		if !res["isError"].(bool) {
+			t.Fatalf("call %d inside the window should still fail: %v", i+3, text(res))
+		}
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2 (the first failure and the back-off that followed it)", n)
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(-time.Second) // the back-off expires
+	s.mu.Unlock()
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 3 {
+		t.Fatalf("after the back-off: %+v (roots/list asked %d times)", ws, client.count())
+	}
+}
+
+// A registered working directory still answers every call while the client's roots
+// are unknown, and still registers nothing. The window is pinned far into the future
+// before the calls that must land inside it, so a slow host cannot expire it and the
+// request count becomes a deterministic assertion.
+func TestRegisteredCwdAnswersInsideTheBackOffWindow(t *testing.T) {
+	other := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "other-ws", Root: other}}}
+	busy := fail(fmt.Errorf("client error -32603: %w", errors.New("no roots configured")))
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){busy, busy, busy}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	// the first two failures open the window
+	for i := 0; i < 2; i++ {
+		if _, _ = call(t, s, "ground", map[string]any{}); client.count() != i+1 {
+			t.Fatalf("after %d calls roots/list was asked %d times", i+1, client.count())
+		}
+	}
+	s.mu.Lock()
+	windowed := s.roots != nil && s.roots.transient && !s.roots.retryAt.IsZero()
+	if windowed {
+		s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	}
+	s.mu.Unlock()
+	if !windowed {
+		t.Fatal("two failures must leave the answer cached with a window")
+	}
+
+	for i := 0; i < 4; i++ {
+		res, _ := call(t, s, "ground", map[string]any{})
+		if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD || ws.Registered {
+			t.Fatalf("call %d: a registered working directory must answer: %+v", i+3, ws)
+		}
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("the working directory was registered while the roots were unavailable (%d loads)", n)
+	}
+	if asked := client.count(); asked != 2 {
+		t.Fatalf("roots/list asked %d times inside the window; the calls above must be served from cache", asked)
+	}
+}
+
+// rootsBackoff is the table behind that: a timeout backs off immediately, a prompt
+// failure backs off once it has followed a cached failure, and a first prompt failure
+// does not back off at all.
+func TestRootsBackoffTable(t *testing.T) {
+	cases := []struct {
+		name     string
+		cached   *rootsState
+		timedOut bool
+		want     time.Duration
+	}{
+		{"timeout after nothing", nil, true, rootsRetryAfter},
+		{"timeout after a cached failure", &rootsState{transient: true}, true, rootsRetryAfter},
+		{"prompt failure after a timeout", &rootsState{transient: true}, false, rootsRetryAfterFailure},
+		{"prompt failure after a prompt failure", &rootsState{transient: true}, false, rootsRetryAfterFailure},
+		{"prompt failure after nothing", nil, false, 0},
+		{"prompt failure after a good answer", &rootsState{}, false, 0},
+	}
+	for _, c := range cases {
+		if got := rootsBackoff(c.cached, c.timedOut); got != c.want {
+			t.Errorf("%s: rootsBackoff = %s, want %s", c.name, got, c.want)
+		}
+	}
+}
+
+// A roots/list answer that cannot be parsed is a client failure, not a definitive
+// "the client has no usable roots": it is asked again once it has failed twice, the
+// same as any other failure.
+func TestMalformedRootsAnswerIsAskedAgain(t *testing.T) {
+	project, other := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	garbage := func() (json.RawMessage, error) { return json.RawMessage(`{"roots": [`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){garbage, garbage, rootsAnswer(project)}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "roots/list answer is malformed") {
+		t.Fatalf("a malformed answer must be reported as one: %v", text(res))
+	}
+	res, _ = call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
+		t.Fatalf("a repeated malformed answer must back off: %v", text(res))
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	s.mu.Unlock()
+	// calls inside the window are served from the cached failure, so no further
+	// request is sent even when the answer would be malformed again
+	for i := 0; i < 3; i++ {
+		res, _ = call(t, s, "ground", map[string]any{})
+		if !strings.Contains(text(res), "roots/list answer is malformed") {
+			t.Fatalf("call %d inside the window should still report the malformed answer: %v", i+3, text(res))
+		}
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times inside the window", n)
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(-time.Second)
+	s.mu.Unlock()
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 3 {
+		t.Fatalf("after the back-off a malformed answer must be asked again: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// A failure is cached for the session, so its text is held for the session's
+// lifetime. The client's message can be as large as one transport message, so the
+// cached text is bounded and the reported error still names the cause.
+func TestCachedRootsFailureTextIsBounded(t *testing.T) {
+	other := tempRepo(t)
+	huge := strings.Repeat("x", 64*1024)
+	api := &fakeAPI{}
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){
+		fail(fmt.Errorf("client error -32603: %w", errors.New(huge))),
+		fail(fmt.Errorf("client error -32603: %w", errors.New(huge))),
+	}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2025-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if len(text(res)) > rootsErrClip+512 {
+		t.Fatalf("the reported error is %d bytes, over the clip", len(text(res)))
+	}
+	if !strings.Contains(text(res), "client error -32603") {
+		t.Fatalf("the clipped error must still name the cause: %v", text(res))
+	}
+	s.mu.Lock()
+	cached := len(s.roots.err)
+	s.mu.Unlock()
+	if cached > rootsErrClip+128 {
+		t.Fatalf("the cached failure text is %d bytes; a failure is held for the whole session", cached)
+	}
+}
+
+// A malformed answer must contribute no roots at all. Go's decoder fills array
+// elements before it reports a later type error, so an answer whose first root is
+// usable and whose second is a number parses partially; the usable one is still
+// discarded, because the answer was rejected as a whole.
+func TestMalformedRootsAnswerContributesNoRoots(t *testing.T) {
+	partial := tempRepo(t)
+	other := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "other-ws", Root: other}}}
+	halfValid := func() (json.RawMessage, error) {
+		return json.RawMessage(`{"roots": [{"uri": "file://` + partial + `"}, {"uri": 7}]}`), nil
+	}
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){halfValid}}
+	s := newSession(t, api, Options{Cwd: other, AutoRegister: true}, client, "2025-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	// A rejected answer supplies no root, so resolution falls through to the
+	// registered working directory rather than to the answer's usable first root.
+	if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD {
+		t.Fatalf("a rejected answer must not supply a root: %+v", ws)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("a root from a rejected answer was registered (%d loads)", n)
+	}
+	s.mu.Lock()
+	paths, st := len(s.roots.paths), s.roots.transient
+	s.mu.Unlock()
+	if paths != 0 {
+		t.Fatalf("%d roots kept from a rejected answer", paths)
+	}
+	if !st {
+		t.Fatal("a rejected answer must stay transient")
+	}
+}
+
+// A roots/list request that was never delivered says nothing about the client, so it
+// is not cached and cannot open a window. On a Streamable HTTP session a plain JSON
+// exchange has no event stream to ask on; if that counted as a client failure, two
+// streamless calls would suppress the next stream-capable call and it would resolve
+// from the working directory instead of the client's root.
+func TestUnsentRootsRequestIsNotCached(t *testing.T) {
+	project, other := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}, {ID: "other-ws", Root: other}}}
+	// every request before the last never reaches the client
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){
+		fail(errNoStream), fail(errNoStream), fail(errNoStream), rootsAnswer(project),
+	}}
+	s := newSession(t, api, Options{Cwd: other}, client, "2026-06-18")
+
+	for i := 0; i < 3; i++ {
+		res, _ := call(t, s, "ground", map[string]any{})
+		// the working directory answers while the client's roots are unknown
+		if ws := wsOf(t, res); ws.ID != "other-ws" || ws.Source != SourceCWD {
+			t.Fatalf("call %d: %+v", i+1, ws)
+		}
+	}
+	// nothing is kept: an undelivered request says nothing about the client
+	s.mu.Lock()
+	cached := s.roots
+	s.mu.Unlock()
+	if cached != nil {
+		t.Fatalf("an undelivered request was cached: %+v", cached)
+	}
+	// the next request is still made, and the client's root is used
+	res, _ := call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || ws.Source != SourceRoots || client.count() != 4 {
+		t.Fatalf("the client's root must be used after unsent requests: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// An answer that carries no roots field is not a statement about the client's roots,
+// so it is asked again; one that carries an empty roots array is.
+func TestRootsAnswerWithoutARootsFieldIsAskedAgain(t *testing.T) {
+	project := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	noField := func() (json.RawMessage, error) { return json.RawMessage(`{"capabilities":{}}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){noField, rootsAnswer(project)}}
+	s := newSession(t, api, Options{}, client, "2026-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "carries no roots array") {
+		t.Fatalf("an answer with no roots field must say so: %v", text(res))
+	}
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
+		t.Fatalf("the client must be asked again: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// {"roots":null} carries the field but no array, so it is not a statement about the
+// client's roots either: it is asked again rather than cached until roots/list_changed.
+func TestNullRootsFieldIsAskedAgain(t *testing.T) {
+	project := tempRepo(t)
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+	null := func() (json.RawMessage, error) { return json.RawMessage(`{"roots":null}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){null, rootsAnswer(project)}}
+	s := newSession(t, api, Options{}, client, "2026-06-18")
+
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "carries no roots array") {
+		t.Fatalf("a null roots field must be reported as carrying no array: %v", text(res))
+	}
+	res, _ = call(t, s, "ground", map[string]any{})
+	if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
+		t.Fatalf("the client must be asked again: %+v (asked %d)", ws, client.count())
+	}
+}
+
+// An answer that keeps omitting the roots array is a repeated failure like any other:
+// the second in a row opens the back-off window, so a persistently broken client is
+// not asked on every call.
+func TestRepeatedRootsAnswerWithoutAnArrayBacksOff(t *testing.T) {
+	noField := func() (json.RawMessage, error) { return json.RawMessage(`{"capabilities":{}}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){noField, noField, noField}}
+	s := newSession(t, &fakeAPI{}, Options{}, client, "2026-06-18")
+
+	call(t, s, "ground", map[string]any{})
+	res, _ := call(t, s, "ground", map[string]any{})
+	if !strings.Contains(text(res), "asked again after "+rootsRetryAfterFailure.String()) {
+		t.Fatalf("a repeated answer without a roots array must back off: %v", text(res))
+	}
+	s.mu.Lock()
+	s.roots.retryAt = time.Now().Add(time.Hour) // the window cannot expire mid-test
+	s.mu.Unlock()
+	for i := 0; i < 3; i++ {
+		call(t, s, "ground", map[string]any{})
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
+	}
+}
+
+// A stream write that fails never delivered roots/list either, so it is classed with
+// errNoStream: not a client failure, never cached.
+func TestHTTPClientStreamWriteFailureIsUnsent(t *testing.T) {
+	c := &httpClient{pending: map[string]chan rpcMessage{}}
+	ctx := withStream(context.Background(), &eventStream{w: failingWriter{httptest.NewRecorder()}})
+	_, err := c.Request(ctx, "roots/list", map[string]any{})
+	if err == nil || !unsentRootCause(err) {
+		t.Fatalf("a failed stream write must count as undelivered: %v", err)
+	}
+	if !unsentRootCause(errNoStream) || unsentRootCause(errors.New("client error -32603")) {
+		t.Fatal("errNoStream is undelivered; a client error is not")
+	}
+}
+
+type failingWriter struct{ http.ResponseWriter }
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// A roots array whose entries carry no uri is malformed, not a definitive "no roots".
+func TestRootsEntriesWithoutAURIAreAskedAgain(t *testing.T) {
+	for _, body := range []string{`{"roots":[null]}`, `{"roots":[{}]}`} {
+		project := tempRepo(t)
+		api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+		bad := func() (json.RawMessage, error) { return json.RawMessage(body), nil }
+		client := &scriptedRoots{steps: []func() (json.RawMessage, error){bad, rootsAnswer(project)}}
+		s := newSession(t, api, Options{}, client, "2026-06-18")
+		call(t, s, "ground", map[string]any{})
+		res, _ := call(t, s, "ground", map[string]any{})
+		if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
+			t.Fatalf("%s: the client must be asked again: %+v (asked %d)", body, ws, client.count())
+		}
+	}
+}
+
+// clip never splits a UTF-8 sequence, so a cached error stays valid text.
+func TestClipKeepsValidUTF8(t *testing.T) {
+	for _, n := range []int{1, 2, 3, 4, 5} {
+		if got := clip("aé€😀", n); !utf8.ValidString(got) {
+			t.Fatalf("clip(_, %d) = %q is not valid UTF-8", n, got)
+		}
+	}
+}
+
+// An empty roots array is a real answer: the client has no file roots, and that is
+// kept until roots/list_changed.
+func TestEmptyRootsArrayIsDefinitive(t *testing.T) {
+	empty := func() (json.RawMessage, error) { return json.RawMessage(`{"roots":[]}`), nil }
+	client := &scriptedRoots{steps: []func() (json.RawMessage, error){empty}}
+	s := newSession(t, &fakeAPI{}, Options{}, client, "2026-06-18")
+	for i := 0; i < 3; i++ {
+		call(t, s, "ground", map[string]any{})
+	}
+	if n := client.count(); n != 1 {
+		t.Fatalf("roots/list asked %d times; an empty roots array is definitive", n)
 	}
 }
 
