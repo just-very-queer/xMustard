@@ -118,9 +118,9 @@ mutate M11 " -- \${SHELL} \${SHELL_FLAG} " " -- " || true
 # M12: quoting is dropped, so a command with a quote or a space in the id breaks
 mutate M12 '${SHELL} ${SHELL_FLAG} ${shellQuote(command)}' '${SHELL} ${SHELL_FLAG} ${command}' || true
 
-# M13: carriesHandle loses the literal `]`, which is the exact defect this row found:
-# the class then has to span the bracket closing the tag and can never match.
-mutate M13 'search)\][^\n]*xm1\.' 'search)[^\]]*xm1\.' "$DLV" || true
+# M13: carriesHandle loses the literal `]` closing the tag, which is the exact defect
+# this row found: the tag never matches and no wrapper footer is recognised.
+mutate M13 'search)\]/g;' 'search)/g;' "$DLV" || true
 
 # M14: the wrapper's footer tag is no longer recognised, so a captured result never
 # activates expansion and the model holds a handle with no tool.
