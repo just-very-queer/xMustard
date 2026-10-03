@@ -595,6 +595,53 @@ func TestByDepthTiersKeepTheirFirstItems(t *testing.T) {
 	}
 }
 
+// A producer that adds members after Apply (WS-59e adds impact's has_more and
+// next_cursor) settles the result through here. Settling must not lose the earlier
+// pass's per-list accounting: a report that still names tiers_trimmed while dropping
+// each_kept describes a cut the caller cannot size (WS-59e-r5-7). The expected value
+// is read from the delivered page rather than from the code, so the test cannot pass by
+// agreeing with it.
+func TestSettleKeepsThePerListAccountingOfThePageItSettled(t *testing.T) {
+	var tiers []map[string]any
+	for d := 1; d <= 3; d++ {
+		items := make([]map[string]any, 40)
+		for i := range items {
+			items[i] = map[string]any{"name": fmt.Sprintf("caller_%d_%02d", d, i), "path": fmt.Sprintf("pkg/f%02d.go", i), "line": i, "edge": "CALLS", "confidence": 0.9}
+		}
+		tiers = append(tiers, map[string]any{"depth": d, "label": "WILL BREAK", "items": items, "offset": 0, "total": 40})
+	}
+	res := map[string]any{"symbol": "Add", "by_depth": tiers, "counts": map[string]any{"total": 120, "by_depth": []int{40, 40, 40}},
+		"epistemic": map[string]any{"completeness": "exact"}, "risk": "HIGH"}
+	a := run(t, "impact", res, Request{MaxChars: 4000}, Page{}, nil)
+	if a.rep.DegradedStage != "tiers_trimmed" {
+		t.Fatalf("the fixture did not reach tiers_trimmed: %s", a.rep.DegradedStage)
+	}
+
+	spec, _ := For("impact")
+	settled, err := spec.Settle(a.raw, Request{MaxChars: 4000}, Page{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		ByDepth []struct {
+			Items []any `json:"items"`
+		} `json:"by_depth"`
+		OutputBudget report `json:"output_budget"`
+	}
+	if err := json.Unmarshal(settled, &got); err != nil {
+		t.Fatalf("output is not JSON: %v\n%s", err, settled)
+	}
+	lr := got.OutputBudget.Lists["by_depth"]
+	if lr.State != "tiers_trimmed" {
+		t.Fatalf("settling lost the stage: %+v", lr)
+	}
+	// The accounting has to describe the page the caller received, so each_kept is
+	// checked against the delivered tier and not against anything the budget reports.
+	if n := len(got.ByDepth[0].Items); lr.EachKept != n {
+		t.Errorf("each_kept %d does not describe the %d items delivered", lr.EachKept, n)
+	}
+}
+
 // The WS-35 scope shape: its dependents live in affected.by_depth, a nested list of
 // tiers, which keeps the same leading items per tier.
 func TestImpactScopeTrimsNestedTiers(t *testing.T) {

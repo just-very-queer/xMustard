@@ -398,6 +398,9 @@ type budgeter struct {
 	// origCursor is the result's own next_cursor (a producer-paged list).
 	origCursor string
 	more       bool
+	// priorLists is the per-list accounting an earlier pass recorded, carried into the
+	// rebuilt report for lists this pass does not reduce again (Settle).
+	priorLists map[string]listReport
 
 	// sig is how far signal objects are reduced: sigFull, sigCounts or sigFlags.
 	sig      int
@@ -454,10 +457,15 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 // items, and an unbudgeted result (MaxChars 0) carries no report to settle and is
 // returned unchanged.
 //
-// The stages and the recovery handle the earlier pass recorded are carried forward:
-// load drops the incoming report (it is rebuilt here), so without this a result that
-// Apply already reduced would settle to a report naming no stage and no recovery,
-// which would read as unreduced.
+// The stages, the recovery handle and the per-list accounting the earlier pass
+// recorded are carried forward: load drops the incoming report (it is rebuilt here), so
+// without this a result that Apply already reduced would settle to a report naming no
+// stage, no recovery and no list, which would read as unreduced. The list accounting
+// has to be carried for a second reason: the earlier pass already trimmed the list to
+// the boundary, so this pass's fit does not run that rung again and the rebuilt report
+// would lose the state, kept and each_kept the caller sizes the cut by
+// (WS-59e-r5-7). A rung this pass does run overwrites the carried entry, so the carried
+// value describes the page only when nothing new reduced it.
 func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 	if req.MaxChars <= 0 {
 		return result, nil
@@ -467,7 +475,7 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 		return result, nil
 	}
 	prev := prior(top)
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}}
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
@@ -478,10 +486,11 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 }
 
 // priorReport is what an earlier pass recorded in the result's own output_budget: the
-// rungs it ran and the recovery it kept.
+// rungs it ran, the recovery it kept and the per-list accounting it wrote.
 type priorReport struct {
 	stages   []string
 	recovery *Recovery
+	lists    map[string]listReport
 }
 
 func prior(top []kv) priorReport {
@@ -495,6 +504,7 @@ func prior(top []kv) priorReport {
 			return out
 		}
 		out.stages = rep.Stages
+		out.lists = rep.Lists
 		if rep.RecoverURI != "" || rep.RecoverHandle != "" || rep.RecoverUnavailable != "" {
 			out.recovery = &Recovery{URI: rep.RecoverURI, Handle: rep.RecoverHandle, Unavailable: rep.RecoverUnavailable}
 		}
@@ -1083,6 +1093,21 @@ func (b *budgeter) report(used int) []byte {
 		}
 		if rep.Lists == nil {
 			rep.Lists = map[string]listReport{}
+		}
+		rep.Lists[name] = lr
+	}
+	// A list an earlier pass reduced and this pass did not touch again keeps the
+	// accounting that pass wrote. Only a list this budget still carries is restored, so
+	// a rung that took the list away entirely is not resurrected as a phantom entry.
+	for name, lr := range b.priorLists {
+		if _, ok := b.lists[name]; !ok {
+			continue
+		}
+		if rep.Lists == nil {
+			rep.Lists = map[string]listReport{}
+		}
+		if _, redone := rep.Lists[name]; redone {
+			continue
 		}
 		rep.Lists[name] = lr
 	}
