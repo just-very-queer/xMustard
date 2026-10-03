@@ -29,13 +29,11 @@ const (
 	// be a number this pass cannot reach: the watermark would record the clamp, not the
 	// store. The ceiling is named here so the two cannot drift apart silently.
 	consolidationEntries = 1000
-	// consolidationCandidatesPerPass bounds the candidates one pass derives, and
-	// consolidationClusters bounds the dedupe clusters among them. Both are below the entry
-	// bound divided by the smallest cluster (two entries), so a store can hold more work
-	// than one pass takes and the cut is reachable: what it leaves out is counted (Skipped)
-	// rather than dropped.
+	// consolidationCandidatesPerPass bounds the candidates one pass derives. It is below the
+	// entry bound divided by the smallest cluster (two entries), so a store can hold more
+	// work than one pass takes and the cut is reachable: what it leaves out is counted
+	// (Skipped) rather than dropped in silence.
 	consolidationCandidatesPerPass = 400
-	consolidationClusters          = 400
 	// consolidationJobsPerRun bounds the jobs one pass enqueues. It matches the candidate
 	// bound, so a pass that took candidates queues all of them.
 	consolidationJobsPerRun = consolidationCandidatesPerPass
@@ -283,9 +281,9 @@ func dedupeClusterCandidates(snap consolidationSnapshot) []consolidationCandidat
 		}
 		clusters = append(clusters, members)
 	}
-	// The per-kind bound is consolidationCandidates', which counts what it leaves out.
-	// Clamping here as well would make the drop invisible twice over.
-	slices.SortFunc(clusters, func(a, b []string) int { return strings.Compare(a[0], b[0]) })
+	// No sort here: consolidationCandidates sorts each kind's candidates by signature, so
+	// sorting the clusters first would be a second order the caller overwrites. Mutation M12
+	// deleted this line and every test still passed, which is the measure that it was dead.
 	out := make([]consolidationCandidate, 0, len(clusters))
 	for _, members := range clusters {
 		out = append(out, consolidationCandidate{Signature: clusterSignature(govstore.JobDedupeCluster, members), Members: members})

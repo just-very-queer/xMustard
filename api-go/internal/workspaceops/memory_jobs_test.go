@@ -37,11 +37,10 @@ func TestPrepareConsolidationJobsIsIdempotentAndOrdered(t *testing.T) {
 	if !slices.Equal(first, second) {
 		t.Fatalf("preparation is not deterministic, in order or in membership:\nfirst  %v\nsecond %v", first, second)
 	}
-	// The prepared sequence itself is stable, kind then signature, so two passes over one
-	// store ask the agent the same questions in the same order.
-	if o1, o2 := preparedOrder(t, dir, ws), preparedOrder(t, dir, ws); !slices.Equal(o1, o2) {
-		t.Fatalf("prepared order is not stable:\nfirst  %v\nsecond %v", o1, o2)
-	}
+	// The prepared sequence is stable within a kind: the signatures ascend. Two same-process
+	// runs always agree, because Go randomises one map's iteration per range rather than per
+	// call, so comparing two runs cannot see an unstable order. TestPreparedOrderAscends
+	// asserts the property directly, on a fixture with several candidates of one kind.
 	// Every candidate is enqueued exactly once across the two passes.
 	for _, id := range first {
 		if n := countJobsWithSignature(t, dir, ws, signatureOfJob(t, dir, ws, id)); n != 1 {
@@ -203,6 +202,30 @@ func TestRetiredEntriesAreNotConsolidationCandidates(t *testing.T) {
 
 // The per-run bound drops the candidates it cannot take this pass and counts them, so an
 // operator can see that work is left rather than believing the pass covered everything.
+// The prepared candidates of one kind ascend by signature. Go randomises a map's iteration
+// order per range, so an unsorted generator would hand the same store's candidates over in a
+// different order across processes; two runs inside one process always agree and cannot see
+// it. The property is asserted on the sequence itself, which is what a consumer reads.
+func TestPreparedOrderAscendsWithinAKind(t *testing.T) {
+	dir := singleAgentDir(t)
+	ws := "wsJobs10"
+	// Several clusters, so the fixture holds several candidates of the dedupe kind.
+	for i := 0; i < 8; i++ {
+		path := fmt.Sprintf("src/mem%02d.go", i)
+		proposeOn(t, dir, ws, "a", "left "+path, "left thing", path)
+		proposeOn(t, dir, ws, "b", "right "+path, "right thing", path)
+	}
+	got := preparedOrder(t, dir, ws)
+	if len(got) < 2 {
+		t.Fatalf("the fixture prepared %d candidates, too few to order", len(got))
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i-1] > got[i] {
+			t.Fatalf("prepared order is not ascending within its kind:\n%v\n%v", got[i-1], got[i])
+		}
+	}
+}
+
 func TestCandidatesBeyondThePerPassBoundAreCounted(t *testing.T) {
 	ctx := context.Background()
 	dir := singleAgentDir(t)
