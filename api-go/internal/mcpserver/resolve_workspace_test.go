@@ -5,11 +5,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 )
 
 // scriptedRoots answers roots/list from a script, one step per request; the last
@@ -455,6 +458,49 @@ func TestRepeatedRootsAnswerWithoutAnArrayBacksOff(t *testing.T) {
 	}
 	if n := client.count(); n != 2 {
 		t.Fatalf("roots/list asked %d times: want 2, then none inside the window", n)
+	}
+}
+
+// A stream write that fails never delivered roots/list either, so it is classed with
+// errNoStream: not a client failure, never cached.
+func TestHTTPClientStreamWriteFailureIsUnsent(t *testing.T) {
+	c := &httpClient{pending: map[string]chan rpcMessage{}}
+	ctx := withStream(context.Background(), &eventStream{w: failingWriter{httptest.NewRecorder()}})
+	_, err := c.Request(ctx, "roots/list", map[string]any{})
+	if err == nil || !unsentRootCause(err) {
+		t.Fatalf("a failed stream write must count as undelivered: %v", err)
+	}
+	if !unsentRootCause(errNoStream) || unsentRootCause(errors.New("client error -32603")) {
+		t.Fatal("errNoStream is undelivered; a client error is not")
+	}
+}
+
+type failingWriter struct{ http.ResponseWriter }
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// A roots array whose entries carry no uri is malformed, not a definitive "no roots".
+func TestRootsEntriesWithoutAURIAreAskedAgain(t *testing.T) {
+	for _, body := range []string{`{"roots":[null]}`, `{"roots":[{}]}`} {
+		project := tempRepo(t)
+		api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+		bad := func() (json.RawMessage, error) { return json.RawMessage(body), nil }
+		client := &scriptedRoots{steps: []func() (json.RawMessage, error){bad, rootsAnswer(project)}}
+		s := newSession(t, api, Options{}, client, "2026-06-18")
+		call(t, s, "ground", map[string]any{})
+		res, _ := call(t, s, "ground", map[string]any{})
+		if ws := wsOf(t, res); ws.ID != "project-ws" || client.count() != 2 {
+			t.Fatalf("%s: the client must be asked again: %+v (asked %d)", body, ws, client.count())
+		}
+	}
+}
+
+// clip never splits a UTF-8 sequence, so a cached error stays valid text.
+func TestClipKeepsValidUTF8(t *testing.T) {
+	for _, n := range []int{1, 2, 3, 4, 5} {
+		if got := clip("aé€😀", n); !utf8.ValidString(got) {
+			t.Fatalf("clip(_, %d) = %q is not valid UTF-8", n, got)
+		}
 	}
 }
 
