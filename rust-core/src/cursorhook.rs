@@ -447,28 +447,45 @@ mod tests {
         assert_eq!(a.additional_context.as_deref(), Some("ground line"));
     }
 
+    /// The measured vendor line, written as a literal on purpose.
+    ///
+    /// Every expected value here is the number from Cursor's own bundle
+    /// (`limits.ts`, `Cbt=1e4`), not `CURSOR_CONTEXT_CHARS`: a property asserted
+    /// against the constant it is testing moves with it, so mutation M2 (raising the
+    /// cap to 12,000) passed every assertion before this was corrected.
+    const MEASURED_CAP: usize = 10_000;
+
+    #[test]
+    fn the_cap_is_the_measured_vendor_line() {
+        assert_eq!(
+            CURSOR_CONTEXT_CHARS, MEASURED_CAP,
+            "Cursor's additional_context cap is 10,000 characters (limits.ts, Cbt=1e4); \
+             a different number here is a claim with no measurement behind it"
+        );
+    }
+
     #[test]
     fn injected_context_is_capped_at_the_measured_vendor_line() {
-        let long = "x".repeat(CURSOR_CONTEXT_CHARS + 500);
+        let long = "x".repeat(MEASURED_CAP + 500);
         let Outcome::Answered(a) = event_answer("sessionStart", Some(&long), None) else {
             panic!("expected an answer");
         };
         assert_eq!(
             a.additional_context.as_deref().map(|c| c.chars().count()),
-            Some(CURSOR_CONTEXT_CHARS),
+            Some(MEASURED_CAP),
             "Cursor throws above the cap rather than truncating, so the client caps first"
         );
     }
 
     #[test]
     fn context_exactly_at_the_cap_is_untouched() {
-        let exact = "x".repeat(CURSOR_CONTEXT_CHARS);
+        let exact = "x".repeat(MEASURED_CAP);
         let Outcome::Answered(a) = event_answer("sessionStart", Some(&exact), None) else {
             panic!("expected an answer");
         };
         assert_eq!(
             a.additional_context.as_deref().map(str::len),
-            Some(CURSOR_CONTEXT_CHARS)
+            Some(MEASURED_CAP)
         );
     }
 

@@ -467,6 +467,16 @@ mod tests {
             answer_of("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\n{}\r\n0\r\n\r\n"),
             None
         );
+        // A response carrying BOTH is refused on the transfer-encoding alone. Without
+        // this case the header is redundant (a chunked reply has no length, so the
+        // length rule already returns None) and mutation M7 survived.
+        assert_eq!(
+            answer_of(
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nTransfer-Encoding: chunked\r\n\r\n{}"
+            ),
+            None,
+            "a body whose framing is ambiguous is not an answer, whatever its length says"
+        );
     }
 
     #[test]
