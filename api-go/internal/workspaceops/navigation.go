@@ -401,6 +401,44 @@ func DecodeExplainCursor(workspaceID string, q url.Values, cursor string) (int, 
 	return nums[0], nil
 }
 
+// impactRanking names the tier page an impact cursor pages: the workspace and every
+// argument that selects or shapes it. A blast tier and a diff-scope tier page
+// differently, so the form's own target is part of the key.
+func impactRanking(workspaceID string, q url.Values) []byte {
+	b, _ := json.Marshal([]string{
+		workspaceID, q.Get("symbol"), q.Get("path"), q.Get("from"), q.Get("to"), q.Get("scope"),
+		q.Get("base"), q.Get("head"), q.Get("worktree"), q.Get("direction"), q.Get("max_depth"),
+		q.Get("relation_types"), q.Get("min_confidence"), q.Get("include_tests"), q.Get("limit"),
+	})
+	return b
+}
+
+// ImpactCursor signs the cursors of one impact tier page. An offset at or below the
+// first page signs nothing: a cursor names a position after the last item returned.
+func ImpactCursor(workspaceID string, q url.Values) func(offset int) string {
+	ranking := impactRanking(workspaceID, q)
+	return func(offset int) string {
+		if offset <= 0 {
+			return ""
+		}
+		return impactCursors.encode(ranking, offset)
+	}
+}
+
+// DecodeImpactCursor returns the offset an impact cursor continues from; "" is 0. A
+// cursor that is over-long, malformed, edited or from another ranking is rejected, and
+// so is a zero offset, which no page hands out.
+func DecodeImpactCursor(workspaceID string, q url.Values, cursor string) (int, error) {
+	if cursor == "" {
+		return 0, nil
+	}
+	nums, ok := impactCursors.decode(cursor, impactRanking(workspaceID, q))
+	if !ok || nums[0] <= 0 {
+		return 0, fmt.Errorf("cursor is not a next_cursor of this impact call: %w", ErrInvalidInput)
+	}
+	return nums[0], nil
+}
+
 // SearchCursor signs the cursors of one search ranking, by mode: a symbol cursor and a
 // hybrid one never continue each other. `lang` and `mode` are part of the ranking key, so
 // they must be read here too: a budget-truncated search continues through this function,

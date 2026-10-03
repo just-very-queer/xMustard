@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -101,6 +102,12 @@ func checkoutPath(v string) error {
 	return nil
 }
 
+// cursorParam lists cursor= as an argument the blast and diff-scope forms accept, so
+// the form tables decide whether a cursor applies. It is never forwarded as a core flag
+// (ResolveImpactCursor deletes it before ImpactFlags runs and leaves the offset it
+// names); the flag name here is only the parameter's identity in a refusal message.
+var cursorParam = impactParam{"cursor", "cursor", func(string) error { return nil }}
+
 var (
 	walkParams = []impactParam{
 		{"relation_types", "relation-types", listOf(RelationTypes...)},
@@ -117,6 +124,7 @@ var (
 		ImpactBlast: concat(walkParams, pageParams, []impactParam{
 			{"depth", "max-depth", intIn(1, 32)},
 			{"direction", "direction", oneOf("upstream", "downstream")},
+			cursorParam,
 		}),
 		ImpactTrace: concat(walkParams, []impactParam{{"depth", "max-depth", intIn(1, 30)}}),
 		// the legacy file-level walk takes no filters; its core takes depth positionally
@@ -128,6 +136,7 @@ var (
 			{"head", "head", gitdiff.CheckRef},
 			{"worktree", "worktree", checkoutPath},
 			{"symbols", "symbols", intIn(1, 500)},
+			cursorParam,
 		}),
 		ImpactSinceIndex: nil,
 	}
@@ -168,7 +177,9 @@ func ImpactFormOf(params map[string]string) (ImpactForm, error) {
 
 // CheckImpactRequest picks the form of an impact request and checks every parameter
 // against it, so a request is refused whole before any core runs. It returns the form
-// and the parameters less the form's targets (the ImpactFlags input).
+// and the parameters less the form's targets (the ImpactFlags input). A cursor= is
+// resolved into the offset it names by ResolveImpactCursor before this runs, so this
+// sees one page position, not two.
 func CheckImpactRequest(params map[string]string) (ImpactForm, map[string]string, error) {
 	form, err := ImpactFormOf(params)
 	if err != nil {
@@ -182,6 +193,30 @@ func CheckImpactRequest(params map[string]string) (ImpactForm, map[string]string
 		return "", nil, err
 	}
 	return form, rest, nil
+}
+
+// ResolveImpactCursor turns one impact request's cursor= into the offset the page
+// continues from, so the core takes one page position (--offset) and cursor= and
+// offset= can never disagree. The cursor is signed for the ranking the caller's own
+// arguments describe, so a cursor from another ranking, another form or another
+// workspace is refused here. A request with both is refused too: one names the
+// position twice. The cursor is deleted from params, so it never reaches the core as a
+// flag.
+func ResolveImpactCursor(workspaceID string, q url.Values, params map[string]string) error {
+	cursor := params["cursor"]
+	if cursor == "" {
+		return nil
+	}
+	if params["offset"] != "" {
+		return fmt.Errorf("cursor and offset both name the page position: %w", ErrInvalidInput)
+	}
+	offset, err := DecodeImpactCursor(workspaceID, q, cursor)
+	if err != nil {
+		return err
+	}
+	delete(params, "cursor")
+	params["offset"] = strconv.Itoa(offset)
+	return nil
 }
 
 // impactParamNames is every parameter any form takes, the forms' own targets
@@ -203,7 +238,8 @@ func impactParamNames() map[string]bool {
 
 // ImpactFlags checks params against form and returns the core flags, in the table's
 // order. A parameter of another form, or a value that fails its check, is
-// ErrInvalidInput.
+// ErrInvalidInput. A cursor= is not a flag and is not read here; CheckImpactRequest
+// decodes it into the offset it names and drops it before it gets this far.
 func ImpactFlags(form ImpactForm, params map[string]string) ([]string, error) {
 	table, known := impactParams[form]
 	if !known {

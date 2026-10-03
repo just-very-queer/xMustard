@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/url"
 	"strconv"
 
 	"xmustard/api-go/internal/rustcore"
@@ -125,6 +126,82 @@ func FileImpactCtx(ctx context.Context, dataDir, workspaceID, path string, param
 		return nil, err
 	}
 	return read.annotate(out), nil
+}
+
+// impactPagingMember is the member an impact result carries when a tier page has a
+// successor, beside the members the budget layer's own contract already writes for a
+// producer-paged list (toolbudget.ReportMember's siblings in apply.go).
+const (
+	impactHasMoreMember    = "has_more"
+	impactNextCursorMember = "next_cursor"
+)
+
+// WithImpactPaging adds the paging members to an impact result whose tiers were cut:
+// has_more, and a next_cursor signed for the ranking that asked for the page. The core
+// already emits each tier's next_offset, so this reads the page rather than
+// recomputing it. A diff-scope result holds its walk under affected and its own
+// changed-symbol list, and only the walk pages, so the members go at the top level
+// beside by_depth either way: one result, one page, one cursor. A result with no cut
+// tier, or one that is not a JSON object, is returned unchanged: the members are never
+// invented for a form that has no list to page.
+func WithImpactPaging(workspaceID string, q url.Values, raw json.RawMessage) json.RawMessage {
+	var res map[string]json.RawMessage
+	if json.Unmarshal(raw, &res) != nil || res == nil {
+		return raw
+	}
+	next := 0
+	for _, tiers := range []json.RawMessage{res["by_depth"], tiersOf(res["affected"])} {
+		if n := nextTierOffset(tiers); n > next {
+			next = n
+		}
+	}
+	if next == 0 {
+		return raw
+	}
+	cursor, err := json.Marshal(ImpactCursor(workspaceID, q)(next))
+	if err != nil {
+		return raw
+	}
+	res[impactHasMoreMember] = json.RawMessage("true")
+	res[impactNextCursorMember] = cursor
+	out, err := json.Marshal(res)
+	if err != nil {
+		return raw
+	}
+	return out
+}
+
+// tiersOf returns the by_depth member of a nested impact answer (a diff-scope result's
+// affected walk), or nil when it holds none.
+func tiersOf(body json.RawMessage) json.RawMessage {
+	if len(body) == 0 {
+		return nil
+	}
+	var obj map[string]json.RawMessage
+	if json.Unmarshal(body, &obj) != nil {
+		return nil
+	}
+	return obj["by_depth"]
+}
+
+// nextTierOffset returns the offset the deepest cut tier continues from: the highest
+// next_offset among the tiers, or 0 when none was cut. next_offset is absent on a tier
+// that returned its last item (the core skips it when there is none), so a complete
+// result yields 0 and gets no cursor.
+func nextTierOffset(tiers json.RawMessage) int {
+	var page []struct {
+		NextOffset *int `json:"next_offset"`
+	}
+	if json.Unmarshal(tiers, &page) != nil {
+		return 0
+	}
+	next := 0
+	for _, tier := range page {
+		if tier.NextOffset != nil && *tier.NextOffset > next {
+			next = *tier.NextOffset
+		}
+	}
+	return next
 }
 
 // indexedRead brings the workspace's code index to its observed identity, runs one
