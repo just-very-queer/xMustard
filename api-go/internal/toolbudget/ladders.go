@@ -220,10 +220,12 @@ var explainLadders = []*Ladder{
 var impactLadders = []*Ladder{
 	{
 		// impact op= (WS-59d, PAR-IMP-03): the symbol-level occurrences. Staged as the
-		// requirement names it: snippets go, then the rows become per-file counts, then
-		// only the total remains; next_cursor continues either way.
+		// requirement names it: snippets go, then the lines, then fewer rows, then
+		// per-file counts, then the total. The list is not Paged: impact's own
+		// limit/cursor page it (WS-59e generalises that cursor), so the budget layer
+		// must not claim to continue it, and search is the only tool whose list it does.
 		Shape: "occurrences (op)", Match: "occurrences",
-		Lists:   []List{{Member: "occurrences", GroupBy: "path", Paged: true}},
+		Lists:   []List{{Member: "occurrences", GroupBy: "path"}},
 		Signals: append([]string{"epistemic"}, envelope...),
 		Keep:    envelopeKeep,
 		Rungs: []Rung{
