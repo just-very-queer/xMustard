@@ -2675,7 +2675,7 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 - Cohesion is sampled over at most 50 members and is bounded 0..=1; keywords are a bounded list.
 - A community never merges symbols across the CALLS/EXTENDS/IMPLEMENTS projection into a file-level answer: two files that never reference each other land in different areas.
 
-**Acceptance.** `xmustard-core index areas <root> <workspace_id> [--seed=N]` emits the areas with their labels, sizes, cohesion, keywords and mode, deterministically; 38c..38f build on it. This row adds no MCP tool, no MCP argument, no `tools/list` byte and no `instructions` text.
+**Acceptance.** `xmustard-core index areas <root> [--seed=N]` emits the areas with their labels, sizes, cohesion, keywords and mode, deterministically; 38c..38f build on it. The index family takes no workspace id (every other `index` subcommand takes a root), so a workspace id after `<root>` is refused as an unknown flag. This row adds no MCP tool, no MCP argument, no `tools/list` byte and no `instructions` text.
 
 **Collision risk.** `rust-core/src/index/mod.rs` (WS-07 index, WS-36 search) and `rust-core/src/bin/xmustard-core.rs` (every subcommand). Lane C owns rust-core lanes; this row touches two core files and no Go file.
 

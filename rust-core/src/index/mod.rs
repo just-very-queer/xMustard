@@ -1628,10 +1628,19 @@ pub fn areas(root: &Path, cfg: &IndexConfig, seed: u64) -> Result<serde_json::Va
     drop(conn);
     let opened = reader::open_at(&root, &path, csr::GraphStorage::from_env())?;
     let result = areas::areas_for(&opened.snapshot, seed)?;
+    // Every contributing path, not just the listed members: an area caps its member list at
+    // MAX_MEMBERS, so freshness computed from the listed rows alone would miss a change in
+    // a file that only omitted members live in, and `dirty_paths_touching_result` would
+    // understate the staleness of the answer.
     let paths: Vec<String> = result
         .areas
         .iter()
-        .flat_map(|a| a.members.iter().map(|m| m.path.clone()))
+        .flat_map(|a| {
+            a.total_paths
+                .iter()
+                .map(|p| p.clone())
+                .chain(a.members.iter().map(|m| m.path.clone()))
+        })
         .collect();
     let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
     v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))

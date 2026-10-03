@@ -215,10 +215,88 @@ fn the_same_seed_gives_the_same_areas_after_a_full_rebuild() {
     std::fs::remove_dir_all(d.path().join(".git/xmustard-cache").join("index-v3")).unwrap();
     build(d.path());
     let after = areas(d.path(), &["--seed=7"]);
+    // The whole answer, not just the membership: a rebuild that kept the area ids but
+    // changed a label, a cohesion figure, the keyword list, the member order, the
+    // truncation flag or the mode would pass a membership comparison.
     assert_eq!(
-        membership(&before),
-        membership(&after),
-        "the same seed gave different areas after a rebuild"
+        without_freshness(&before),
+        without_freshness(&after),
+        "the same seed gave a different answer after a rebuild"
+    );
+}
+
+/// The answer with its freshness block removed: that block carries the index generation and
+/// identity age, which differ between two builds over the same bytes and are not part of
+/// what "the same areas" means.
+fn without_freshness(v: &Value) -> Value {
+    let mut c = v.clone();
+    if let Some(o) = c.as_object_mut() {
+        o.remove("freshness");
+    }
+    c
+}
+
+/// Standard mode has to actually cluster. PAR-SYM-08's resolution floor is a large-graph
+/// rule; applied at standard mode's resolution of 1.0 the adoption threshold is a node's
+/// entire incident weight, so no node could ever leave the community it started in and
+/// every area stayed a singleton. This is the regression: a three-symbol call ring, the
+/// smallest shape in which the difference is visible.
+#[test]
+fn standard_mode_forms_one_area_from_a_call_ring() {
+    let d = repo(&[(
+        "billing/cycle.go",
+        "package billing\n\nfunc Alpha() int { return Beta() }\n\nfunc Beta() int { return Gamma() }\n\nfunc Gamma() int { return Alpha() }\n",
+    )]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=3"]);
+    assert_eq!(v["mode"], "standard", "{v:#}");
+    let m = membership(&v);
+    assert_eq!(
+        m.get("Alpha"),
+        m.get("Beta"),
+        "a call ring was not clustered in standard mode: {v:#}"
+    );
+    assert_eq!(
+        m.get("Beta"),
+        m.get("Gamma"),
+        "the ring's third symbol landed elsewhere: {v:#}"
+    );
+    assert_eq!(
+        v["areas"].as_array().unwrap().len(),
+        1,
+        "a three-symbol ring must be one area: {v:#}"
+    );
+}
+
+/// The name-prefix rule reads every member, not the first one. `rows` is ordered by
+/// (path, line, name), so seeding candidates from the first member missed a prefix that
+/// two later members share whenever the first name was unrelated to them.
+#[test]
+fn a_name_prefix_is_found_when_the_first_member_does_not_share_it() {
+    // One file in a generic folder: Go drops a call to a name in another package as external
+    // (the resolver's `global: false` rule), so a fixture that spanned packages would not
+    // form an area at all; and the folder rule runs before the name-prefix rule, so a
+    // non-generic folder would label the area before the prefix was ever tried. `Alpha` is
+    // first by (path, line, name) and shares no leading word with the other two.
+    let d = repo(&[(
+        "src/store.go",
+        "package src\n\nfunc Alpha() int { return InvoiceStore() }\n\nfunc InvoiceStore() int { return InvoiceService() }\n\nfunc InvoiceService() int { return 0 }\n",
+    )]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=3"]);
+    // The three symbols form one area, and its first member by (path, line, name) is
+    // `Alpha`, which shares no leading word with the other two.
+    let labelled: Vec<(String, String)> = read_areas(&v)
+        .into_iter()
+        .filter(|a| a.size > 1)
+        .map(|a| (a.rule.clone(), a.label.clone()))
+        .collect();
+    assert!(
+        labelled
+            .iter()
+            .any(|(rule, label)| rule == "name_prefix" && label == "invoice"),
+        "the shared `invoice` prefix was not found when the first member was unrelated: \
+         {labelled:?} in {v:#}"
     );
 }
 
@@ -319,14 +397,13 @@ fn large_graph_mode_triggers_above_ten_thousand_symbols() {
     );
     assert_eq!(
         v["iterations"].as_u64().unwrap(),
-        3,
-        "a ring settles in PAR-SYM-08's 3-pass cap: {v:#}"
+        2,
+        "a ring settles as soon as a pass changes no label: {v:#}"
     );
     assert_eq!(
         v["areas"].as_array().unwrap().len(),
-        8_438,
-        "4,200 rings of four collapse into 4,200 communities of four, joined by the \
-         238-file tail of the shared package: {v:#}"
+        4_200,
+        "each ring of four is one community: {v:#}"
     );
 }
 
@@ -362,18 +439,25 @@ fn large_graph_mode_prunes_a_path_to_nothing() {
     );
     assert_eq!(v["mode"], "large", "{v:#}");
     // 2,700 chains of four: each chain's two middle symbols are of degree 2 and the two
-    // ends of degree 1, so the first pass prunes the 5,400 ends and the second pass
-    // leaves the middles with no edge at all. Every symbol ends up pruned, which is the
-    // rule applied to a fixpoint rather than in one pass.
+    // ends of degree 1. Pruning runs to a fixpoint, so the ends go first and the middles
+    // are left with no edge and go too: every symbol is dropped, which is the rule applied
+    // to a fixpoint rather than in one pass. The count answers for the whole pruning.
     assert_eq!(
         v["dropped_low_degree"].as_u64().unwrap(),
-        5_400,
-        "the first pass prunes the two degree-1 ends of each chain: {v:#}"
+        10_800,
+        "every symbol of every chain is pruned once the pruning reaches its fixpoint: {v:#}"
+    );
+    // A dropped node is not reported: PAR-SYM-08 drops degree-below-2 nodes, so none of
+    // them may come back as a singleton area.
+    assert_eq!(
+        v["areas"].as_array().unwrap().len(),
+        0,
+        "pruned symbols are still reported as areas: {v:#}"
     );
     assert_eq!(
         v["singleton_symbols"].as_u64().unwrap(),
-        10_800,
-        "the second pass leaves every symbol without an edge: {v:#}"
+        0,
+        "a pruned symbol is not a singleton either: {v:#}"
     );
 }
 
@@ -406,7 +490,10 @@ fn a_global_tier_edge_is_the_only_shape_that_reaches_the_confidence_floor() {
     ]);
     build(d.path());
     let v = areas(d.path(), &["--seed=3"]);
-    assert_eq!(v["mode"], "standard", "a small graph is not large mode: {v:#}");
+    assert_eq!(
+        v["mode"], "standard",
+        "a small graph is not large mode: {v:#}"
+    );
     // The unique-name call resolves across files with no import and no qualifier, so the
     // two symbols land in one community — the edge exists, and it is the below-floor one.
     let m = membership(&v);
@@ -422,7 +509,10 @@ fn a_global_tier_edge_is_the_only_shape_that_reaches_the_confidence_floor() {
             "billing/invoice.go",
             "package billing\n\nfunc Alpha() int { return Zeta() }\n",
         ),
-        ("other/zeta.go", "package other\n\nfunc Zeta() int { return 0 }\n"),
+        (
+            "other/zeta.go",
+            "package other\n\nfunc Zeta() int { return 0 }\n",
+        ),
     ]);
     build(g.path());
     let gv = areas(g.path(), &["--seed=3"]);
@@ -588,6 +678,15 @@ fn a_generic_folder_is_never_a_label() {
         !labels.contains("src"),
         "a generic folder became a label: {labels:?}"
     );
+    // The same filter governs the keywords, so a layout name cannot crowd out a subsystem
+    // term there either.
+    for a in read_areas(&v) {
+        assert!(
+            !a.keywords.iter().any(|k| k == "src"),
+            "a generic folder became a keyword: {:?} in {v:#}",
+            a.keywords
+        );
+    }
 }
 
 #[test]

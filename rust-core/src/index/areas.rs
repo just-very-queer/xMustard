@@ -121,6 +121,11 @@ pub struct Area {
     pub cohesion_sample: usize,
     /// `true` when [`MAX_MEMBERS`] capped the listed members.
     pub members_truncated: bool,
+    /// Every member's path, whether or not the member is listed. Not serialized: the
+    /// dispatch uses it to compute freshness over the whole answer rather than the capped
+    /// member rows, and the answer's shape must not grow a field for it.
+    #[serde(skip)]
+    pub total_paths: Vec<String>,
 }
 
 /// The areas of one index generation.
@@ -180,16 +185,19 @@ fn shared_prefix(names: &[String]) -> Option<String> {
         return None;
     }
     let mut best: Option<String> = None;
-    for candidate in word_stems(names[0].as_str()) {
-        if best.as_ref().is_some_and(|b| b.len() >= candidate.len()) {
-            break;
-        }
-        let shared = names
-            .iter()
-            .filter(|n| word_stems(n.as_str()).contains(&candidate))
-            .count();
+    // Candidates come from every member, not from the first one: `rows` is ordered by
+    // (path, line, name), so the first member shares no leading word with the rest often
+    // enough that seeding from it alone missed a prefix two later members do share.
+    let stems: Vec<Vec<String>> = names.iter().map(|n| word_stems(n.as_str())).collect();
+    let mut candidates: Vec<String> = stems.iter().flat_map(|s| s.iter().cloned()).collect();
+    // Longest first, so the longest shared stem wins; duplicates collapse.
+    candidates.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    candidates.dedup();
+    for candidate in candidates {
+        let shared = stems.iter().filter(|s| s.contains(&candidate)).count();
         if shared >= LABEL_MIN_MEMBERS {
             best = Some(candidate);
+            break;
         }
     }
     best
@@ -254,6 +262,9 @@ struct Projection<'a> {
     strength: Vec<u64>,
     /// The order propagation visits slots in, under the seed.
     order: Vec<u32>,
+    /// Whether each slot survived large-graph pruning. A dropped slot has no edges and no
+    /// community evidence, so it is not reported as an area.
+    kept: Vec<bool>,
 }
 
 impl<'a> Projection<'a> {
@@ -264,16 +275,6 @@ impl<'a> Projection<'a> {
             self.off[i as usize + 1] as usize,
         );
         (&self.dst[a..b], &self.wgt[a..b])
-    }
-
-    /// The weight between two slots, summed over every admitted edge between them.
-    fn weight_between(&self, a: u32, b: u32) -> u32 {
-        let (dst, wgt) = self.neighbours(a);
-        dst.iter()
-            .zip(wgt)
-            .filter(|(d, _)| **d == b)
-            .map(|(_, w)| *w)
-            .sum()
     }
 }
 
@@ -295,23 +296,33 @@ fn assemble<'a>(
         pre[b as usize] += 1;
     }
     let mut dropped_low_degree = 0u64;
+    let mut kept: Vec<bool> = vec![true; n];
     if large {
-        dropped_low_degree = pre.iter().filter(|&&d| d < MIN_DEGREE).count() as u64;
         // A node of degree below 2 carries no community evidence. Its edges go with it,
         // which can leave a neighbour below 2 as well: the drop is repeated until it
-        // reaches a fixpoint, or pruning a path one edge at a time would empty it.
+        // reaches a fixpoint, or pruning a path one edge at a time would empty it. Every
+        // node that loses its last edge in any pass is dropped, so the count answers for
+        // the whole pruning rather than for its first pass.
         loop {
-            let before = edges.len();
-            edges.retain(|&(a, b, _)| pre[a as usize] >= MIN_DEGREE && pre[b as usize] >= MIN_DEGREE);
-            if edges.len() == before {
-                break;
-            }
+            let before: Vec<bool> = kept.clone();
+            edges.retain(|&(a, b, _)| {
+                pre[a as usize] >= MIN_DEGREE && pre[b as usize] >= MIN_DEGREE
+            });
             pre.fill(0);
             for &(a, b, _) in &edges {
                 pre[a as usize] += 1;
                 pre[b as usize] += 1;
             }
+            for (i, k) in kept.iter_mut().enumerate() {
+                if *k && pre[i] < MIN_DEGREE {
+                    *k = false;
+                }
+            }
+            if kept == before {
+                break;
+            }
         }
+        dropped_low_degree = kept.iter().filter(|k| !**k).count() as u64;
     }
     let mut degree = vec![0u32; n];
     let mut strength = vec![0u64; n];
@@ -354,6 +365,7 @@ fn assemble<'a>(
             degree,
             strength,
             order,
+            kept,
         },
         dropped_low_degree,
     )
@@ -391,7 +403,7 @@ fn project<'a>(
     }
     // Both directions are read per node and a pair is kept once, so the CSR holds one
     // undirected edge per pair rather than two.
-    let mut pairs: BTreeMap<(u32, u32), (u32, u8)> = BTreeMap::new();
+    let mut pairs: BTreeMap<(u32, u32), (u64, u8)> = BTreeMap::new();
     let mut dropped_low_confidence = 0u64;
     for (i, &node) in nodes.iter().enumerate() {
         for dir in [Direction::Downstream, Direction::Upstream] {
@@ -414,8 +426,11 @@ fn project<'a>(
                 } else {
                     (j, i as u32)
                 };
-                let slot = pairs.entry(pair).or_insert((0u32, u8::MAX));
-                slot.0 += edge.weight as u32 * edge.confidence as u32;
+                let slot = pairs.entry(pair).or_insert((0u64, u8::MAX));
+                // u64, not u32: this accumulates over every matching record in both
+                // directions, and a u32 would overflow (and panic in debug builds) on a
+                // pair with a large number of repeated edges.
+                slot.0 += edge.weight as u64 * edge.confidence as u64;
                 slot.1 = slot.1.min(edge.confidence);
             }
         }
@@ -428,7 +443,9 @@ fn project<'a>(
             dropped_low_confidence += 1;
             continue;
         }
-        edges.push((a, b, w));
+        // The CSR's per-entry weight is u32; the pair total is accumulated in u64 above so
+        // the sum cannot overflow on the way here.
+        edges.push((a, b, w.min(u64::from(u32::MAX)) as u32));
     }
     let (p, dropped_low_degree) = assemble(seg, nodes, rows, key, edges, large);
     Ok((
@@ -485,14 +502,21 @@ fn propagate(p: &Projection, resolution: f64, max_iterations: u32) -> (Vec<u32>,
                 e.1 = e.1.min(d);
             }
             let mine = community[i as usize];
-            // PAR-SYM-08's resolution: a community must hold at least 1/resolution of the
-            // node's incident weight to be adopted, which is what keeps one weakly-attached
-            // edge from moving a node out of its subsystem. Standard mode's resolution is
-            // 1.0, so the threshold is every weight.
-            let threshold = (p.strength[i as usize] as f64 / resolution).ceil() as u64;
+            // PAR-SYM-08's resolution: in large-graph mode a community must hold at
+            // least 1/resolution of the node's incident weight to be adopted, which is
+            // what keeps one weakly-attached edge from moving a node out of its
+            // subsystem. Standard mode has no such floor: at resolution 1.0 the
+            // threshold would be the node's entire incident weight, so no node could
+            // ever leave the community it started in and standard-mode clustering
+            // would be a no-op. Standard mode adopts the heaviest community outright.
+            let threshold = if resolution > 1.0 {
+                (p.strength[i as usize] as f64 / resolution).ceil() as u64
+            } else {
+                1
+            };
             let mut best: Option<(u64, u64, u32, u32)> = None;
             for (&c, &(weight, first)) in &by_comm {
-                if c == mine || weight < threshold.max(1) {
+                if weight < threshold.max(1) {
                     continue;
                 }
                 // heaviest, then the community whose smallest member sorts first under
@@ -504,8 +528,10 @@ fn propagate(p: &Projection, resolution: f64, max_iterations: u32) -> (Vec<u32>,
                 });
             }
             if let Some((_, _, c, _)) = best {
-                community[i as usize] = c;
-                changed = true;
+                if c != mine {
+                    community[i as usize] = c;
+                    changed = true;
+                }
             }
         }
         if !changed {
@@ -524,6 +550,11 @@ fn areas(p: &Projection, community: &[u32]) -> Vec<Area> {
     let seg = p.seg;
     let mut groups: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
     for (i, c) in community.iter().enumerate() {
+        // A slot large-graph pruning dropped has no edges left and no community evidence,
+        // so it is not an area: PAR-SYM-08 drops those nodes rather than reporting them.
+        if !p.kept[i] {
+            continue;
+        }
         groups.entry(*c).or_default().push(i as u32);
     }
     let mut ranked: Vec<Vec<u32>> = groups.into_values().collect();
@@ -578,6 +609,10 @@ fn areas(p: &Projection, community: &[u32]) -> Vec<Area> {
             size: listed,
             total_size: members.len(),
             members: out_members,
+            total_paths: rows
+                .iter()
+                .map(|r| seg.file_path(p.rows[r.3 as usize].file).unwrap_or_default())
+                .collect(),
         });
     }
     out
@@ -621,7 +656,14 @@ fn keywords(rows: &[(String, u32, String, u32)], sample: usize) -> Vec<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut folder: BTreeMap<String, usize> = BTreeMap::new();
     for (path, _, name, _) in &rows[..sample] {
-        if let Some(f) = path.split('/').rev().nth(1) {
+        // The same generic-folder filter `label_for` applies, so one rule governs the
+        // label and the keywords: `src` or `tests` cannot become a keyword either.
+        if let Some(f) = path
+            .split('/')
+            .rev()
+            .skip(1)
+            .find(|p| !GENERIC_FOLDERS.contains(p))
+        {
             *folder.entry(f.to_string()).or_default() += 1;
         }
         *counts.entry(name.clone()).or_default() += 1;
@@ -651,17 +693,23 @@ fn cohesion(p: &Projection, sample: &[(String, u32, String, u32)]) -> f64 {
         return 0.0;
     }
     let slots: Vec<u32> = sample.iter().map(|r| r.3).collect();
-    let mut present = 0u32;
-    let mut possible = 0u32;
-    for a in 0..n {
-        for b in (a + 1)..n {
-            possible += 1;
-            if p.weight_between(slots[a], slots[b]) > 0 {
-                present += 1;
-            }
-        }
+    let in_sample: std::collections::BTreeSet<u32> = slots.iter().copied().collect();
+    // One pass over each sampled member's adjacency, counting the edges whose other end is
+    // also in the sample. Asking weight_between per pair instead scanned one member's whole
+    // adjacency once per pair, so a dense area cost sample-pairs times degree.
+    let mut internal = 0u64;
+    for &s in &slots {
+        let (dst, _) = p.neighbours(s);
+        internal += dst.iter().filter(|d| in_sample.contains(d)).count() as u64;
     }
-    f64::from(present) / f64::from(possible)
+    // Each internal edge is counted from both of its ends.
+    let present = internal / 2;
+    let n = u64::try_from(n).unwrap_or(0);
+    let possible = n * n.saturating_sub(1) / 2;
+    if possible == 0 {
+        return 0.0;
+    }
+    present as f64 / possible as f64
 }
 
 // ---------------------------------------------------------------------------
@@ -682,7 +730,14 @@ pub fn areas_of(seg: &Segment, resolved: &[bool], seed: u64) -> Result<Areas, St
         ("standard", 1.0, STANDARD_MAX_ITERATIONS)
     };
     let (community, iterations) = propagate(&p, resolution, cap);
-    let singleton_symbols = p.degree.iter().filter(|&&d| d == 0).count() as u64;
+    // A kept slot with no edge left is an isolated symbol; a dropped one is not reported
+    // at all, so it is not counted here either.
+    let singleton_symbols = p
+        .degree
+        .iter()
+        .zip(p.kept.iter())
+        .filter(|pair| *pair.0 == 0 && *pair.1)
+        .count() as u64;
     Ok(Areas {
         command: "areas",
         seed,
