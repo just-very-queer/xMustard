@@ -652,9 +652,27 @@ fn seeds_with_equal_scores_keep_a_stable_declared_order() {
     let names: Vec<&str> = seeds.iter().map(|s| s.name.as_str()).collect();
     let expected: Vec<String> = (0..12).map(|i| format!("Entry{i}")).collect();
     assert_eq!(names, expected, "equal scores fall to declared order: {names:?}");
-    // Two runs over one index are byte-identical, which is the property the tie-break
-    // exists to provide.
-    assert_eq!(first, second, "the answer must not vary between runs");
+    // Two runs over one index answer the same, which is the property the tie-break exists
+    // to provide. The freshness block is excluded: it carries the generation's identity age
+    // and index timestamp, which differ between any two reads and are not part of "the same
+    // flows". Comparing whole answers would fail under load and pass when idle, which is
+    // what made this assertion look like a load-sensitive flake until the block was named.
+    assert_eq!(
+        without_freshness(&first),
+        without_freshness(&second),
+        "the flows answer must not vary between runs"
+    );
+}
+
+/// The answer with its freshness block removed: that block carries the index generation's
+/// identity age, which differs between any two reads and is not part of what "the same
+/// answer" means.
+fn without_freshness(v: &Value) -> Value {
+    let mut c = v.clone();
+    if let Some(o) = c.as_object_mut() {
+        o.remove("freshness");
+    }
+    c
 }
 
 #[test]
