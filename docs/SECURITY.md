@@ -879,6 +879,17 @@ below.
   given only when the answer that carries its frame, or the note that withheld it, was
   written. A memory that does not fit in the ~10,000-character context left is counted
   in the withheld note as `too_large`, with the `recall` call that shows it.
+- **A disabled `recall` disables pushed memory too.** A hook route names no `Tool` in the
+  gate table below, because naming one would make the route answer `403 tool_disabled`
+  and take `watchPaths`, the restored snapshot and the prior session's handoff away with
+  the memories. So the handler applies the switch itself, at the two places a hook
+  injects memory: the standing-memory projection and ground's memory section on
+  SessionStart and SubagentStart, and every candidate a UserPromptSubmit or PreToolUse
+  event pushes. It asks the same predicate `/api/auth/whoami` and `tools/list` ask, so a
+  hook can never reach memory a `recall` call would be refused, and it fails closed: no
+  frame, and no withheld note naming which memories the agent is not being shown. The
+  hook still answers, with its watch list, its restored session state and its run
+  failures (a failed run is an outcome, not memory).
 - **Processes.** The daemon starts no process for a hook: Rust work runs only on a
   resident worker that is already running. Claude Code itself starts the static client
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
@@ -1094,7 +1105,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
 | `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |
 | `POST /api/workspaces/{workspace_id}/index` | core | indexer | refused |  | rebaseline the index; agents cannot reset it |
-| `GET /api/workspaces/{workspace_id}/memory/core` | core | reader | served |  | standing-memory projection: human-approved core tier and the deferred index |
+| `GET /api/workspaces/{workspace_id}/memory/core` | core | reader | served | recall | standing-memory projection: human-approved core tier and the deferred index; recall's gate row, so a deployment that disables recall serves neither |
 | `GET /api/workspaces/{workspace_id}/outcomes` | core | reader | served |  | run-independent outcomes, newest first; reads only |
 | `DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}` | core | admin | refused |  | removes one outcome (a secret the redactor missed in its command or tail) |
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |
