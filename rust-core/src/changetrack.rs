@@ -132,8 +132,10 @@ fn file_hash_map_counted(
     root: &Path,
 ) -> Result<(BTreeMap<String, String>, crate::hashcache::HashPass), String> {
     // resolve the cache location (one `git rev-parse`) while `git ls-files` runs.
+    let call = crate::passcount::current();
     let (rels, cache) = std::thread::scope(|s| {
-        let cache = s.spawn(|| crate::hashcache::cache_file(root));
+        let cache =
+            s.spawn(|| crate::passcount::within(call, || crate::hashcache::cache_file(root)));
         (tracked_files(root), cache.join().ok().flatten())
     });
     Ok(crate::hashcache::hash_files(root, rels?, cache.as_deref()))
@@ -706,6 +708,7 @@ fn build_baseline(
         }
         let regular = uncommitted.iter().filter(|e| e.is_regular()).collect();
         for_each_head_blob(root, regular, |entry, bytes| {
+            crate::passcount::hashed(bytes.len() as u64);
             let digest = Sha256::digest(&bytes);
             file_hashes.insert(entry.path.clone(), crate::symbolgraph::hex_lower(&digest));
             if is_symbol_source(&entry.path) {

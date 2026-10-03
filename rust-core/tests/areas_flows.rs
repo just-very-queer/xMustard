@@ -199,8 +199,11 @@ fn the_same_seed_over_the_same_index_is_byte_identical_across_runs() {
         String::from_utf8_lossy(&first.stderr)
     );
     assert!(second.status.success());
+    // pass_counters is the call's own accounting (the first run loads rows the second
+    // finds resident on disk), so the answer is compared without it.
     assert_eq!(
-        first.stdout, second.stdout,
+        without_pass_counters(&first.stdout),
+        without_pass_counters(&second.stdout),
         "the same seed over the same index gave two different answers"
     );
     let v: Value = serde_json::from_slice(&first.stdout).unwrap();
@@ -890,4 +893,14 @@ fn a_non_numeric_seed_is_refused() {
         err.contains("--seed"),
         "the refusal does not name the flag: {err}"
     );
+}
+
+/// `out` up to the trailing `"pass_counters"` field the CLI appends, byte for byte.
+fn without_pass_counters(out: &[u8]) -> &[u8] {
+    let key = b",\"pass_counters\":";
+    let at = out
+        .windows(key.len())
+        .rposition(|w| w == key)
+        .expect("a JSON object result ends with pass_counters");
+    &out[..at]
 }

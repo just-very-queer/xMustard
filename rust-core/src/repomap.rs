@@ -223,6 +223,7 @@ pub fn build_repo_map(
         if !entry.file_type().is_file() {
             continue;
         }
+        crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
         let relative = match relative_path(root_path, entry.path()) {
             Some(value) => value,
             None => continue,
@@ -289,6 +290,7 @@ pub fn build_repo_map(
             test_files += 1;
         }
 
+        crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
         let size_bytes = fs::metadata(entry.path()).ok().map(|meta| meta.len());
         for (pattern, role) in REPO_MAP_KEY_FILE_PATTERNS {
             if relative == *pattern && !discovered_key_paths.contains(&relative) {

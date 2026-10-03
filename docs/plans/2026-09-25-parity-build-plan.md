@@ -88,7 +88,6 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Requirements.** PAR-RT-08, PAR-ADP-01, PAR-GOV-01, PAR-SEC-01, PAR-RET-11, PAR-FRESH-01
 
-
 **Files.** `rust-core/src/lib.rs`, `rust-core/src/models.rs`, `rust-core/src/changetrack.rs`, `rust-core/src/indexcache.rs`, `rust-core/src/symbolgraph.rs`, `rust-core/src/hashcache.rs`, `api-go/cmd/xmustard-mcp/main.go`, `api-go/cmd/xmustard-mcp/descriptions_test.go`, `integrations/pi/src/tools.ts`, `api-go/cmd/xmustard-api/main.go`, `api-go/cmd/xmustard-api/feedback_shutdown_test.go`, `api-go/internal/workspaceops/context_governance.go`, `api-go/internal/workspaceops/grounding.go`, `api-go/internal/workspaceops/feedback.go`, `api-go/internal/workspaceops/feedback_recorder.go`, `api-go/internal/workspaceops/knowledge.go`, `api-go/internal/workspaceops/shutdown.go`  
 **New modules.** `rust-core/src/hashcache.rs`, `api-go/internal/workspaceops/feedback_recorder.go`
 
@@ -102,7 +101,6 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 **Acceptance.** Four rebased branches plus a combined integration branch, all passing cargo test/clippy and go test/build, with review notes that list each behavioral change and its risk. No merge is done by the agent. The human merges in the documented order.
 
 **Collision risk.** The hot files for everything else: main.go, context_governance.go, grounding.go, knowledge.go, xmustard-mcp/main.go, lib.rs, symbolgraph.rs, changetrack.rs, indexcache.rs. Must land before WS-03, WS-04, WS-09 and WS-12. It does not touch the diagnostics session files. That session's branch at /private/tmp/xmustard-opus-l9b1F4 sits at the older cd13e2b and also modified main.go and context_governance.go, so coordinate before its eventual landing.
-
 
 **Correction.** DONE by the orchestrating session: the four w0 branches were implemented, reviewed twice, and re-fixed; they sit on 7ab61a0 and are stacked onto feat/parity-v2 (integration branch). Human merges feat/parity-v2 to main.
 
@@ -2775,6 +2773,157 @@ before the row is claimed resident-affecting, as recorded in the follow-ups belo
 - *Checks (2026-09-29, local, box down).* `cargo build --release --locked`: builds. `cargo test --release`: every suite `ok`, 0 failed (navigation.rs's 5 tests included). `cargo clippy`: 6 warnings, unchanged from the `2ad3315` baseline (`--all-targets` shows 2 more from test code; the Makefile's plain `cargo clippy` is the comparable count). `gofmt -l` clean on every changed file. `go build ./...` and `XMUSTARD_CORE_BIN=<local release core> go vet ./...`: clean. `go test -p 2 -count=1 ./...` and a repeat at `-p 1`: `TestExplainPagesADirectory`, `TestSymbolNavigationRoutes` (both in `cmd/xmustard-api`), `TestHealthFullViewIsForOperatorsOnly` and `xmustard-mcp`'s `TestShimNegotiatesBeforePipelinedRequests` failed intermittently, every failure logging `xmustard overloaded: transient budget exhausted` or `heavy slot refused` against the soft memory ceiling — this 8 GB Mac running the real resident rust-core workers for the full suite at once, not a code defect. Isolated (`-run`, one test file's worth at a time) and at `-count=5`, all four passed every time, matching this branch's own earlier note about `TestCodexEventWithAWorkspacePin` under the same constraint. Pi `node --test test/unit.test.ts`: 45/45.
 - *Deviations.* None beyond the route-file mechanics above; no requirement or interface changed.
 
+### WS-FIX-27 — the index fixtures in `index_query.rs` create index directories under the process umask
+
+**Goal.** WS-FIX-11 (merged `932106d`) turned the group- and world-writable index-directory
+warning into a refusal. `classify_dir` (`rust-core/src/index/mod.rs:249`) refuses an
+operator-named directory carrying any group- or other-**write** bit, and its error names
+`chmod 700 <dir>`. **Four** fixtures in `rust-core/tests/index_query.rs` hand a `TempDir`
+straight to the index as an operator-named `--index-dir`, so their outcome depends on the
+**process umask** rather than on anything the test says. `TempDir::new` creates through
+`std::fs::create_dir`, which takes the umask's permissions: under a login umask of `0002` the
+directory lands at `0775`, the guard refuses it, and a test fails on a host that changed
+nothing.
+
+Measured on the build box, `umask 0002`, pre-fix tree: the suite is **green, 9 passed**
+(`logs/ws-fix-27-run-20261003T144047Z.log`). Three of the four sites were
+already saved by the `tighten()` chmod that WS-FIX-11 and WS-FLK-01 added, so the umask
+never reached them. The one site with no `tighten` is
+`legacy_equality_holds_on_parity_fixtures` (`index_query.rs:556`), and it **skips itself**
+unless `XMUSTARD_PARITY_FIXTURES` is set, which is why no gate run reached it. The defect
+is therefore latent at three sites rather than active, and the fix is creation-time for all
+four instead of a chmod after the fact at three.
+
+This row makes each fixture create its index directory with an **explicit `0700`** at creation
+time — `tempfile::Builder::permissions`, which `tempfile` passes to `mkdir`
+(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`). A umask can only **narrow** the requested mode and
+never widen it, so no umask can give a fixture's index directory a group- or other-**write** bit,
+which is the property `classify_dir` refuses (`mode & 0o022`). The umask is therefore no longer a
+source of a fixture's result: the `0002` case that opened this row, and every other umask that
+keeps the owner's bits, all land on `0o700`. Two bounds on that claim, both stated so they are not
+mistaken for more: a umask clearing owner bits narrows `0700` to the complement — `0o700 & ~0o177`
+is `0o600`, and `0o700 & ~0o777` is `0o000` — so the owner cannot traverse the directory and a
+fixture using it would fail, which is the operator's own setting and is left alone; and `0700` is
+*stronger* than the guard requires, since `classify_dir` accepts group- or other-read and execute
+bits and refuses only the write ones. It replaces the `tighten()`
+after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
+at every site, and it extends the fix to the one site that never had it
+(`legacy_equality_holds_on_parity_fixtures`, which builds into a `TempDir` with no `tighten` and
+would fail the same way). **No product source changes**: `ensure_private_dir` already creates
+`0700` on the path where the core owns the directory; this row fixes the fixtures, which is where
+the operator is the test.
+
+**Requirements.** No new PAR ids. It is test hygiene on a guard §5.1 rule 7 lists, and it changes
+no product behaviour, no bound, no timeout and no gate threshold. §5.1 rule 11 forbids the
+alternative repair, which would be to loosen `classify_dir`'s mask back to a warning: the refusal
+is the merged, reviewed, correct behaviour and a fixture that cannot satisfy it is the fixture
+that is wrong. The owner's box prelude already sets `umask 022` for gates, which hides this class
+of failure rather than closing it, so the acceptance condition is stated against `umask 0002`
+explicitly.
+
+**Files.** `rust-core/tests/index_query.rs` (one index-directory constructor used by every
+fixture that hands a directory to the index, replacing `tighten`),
+`docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+`rust-core/tests/index_build.rs` was checked and is **not** in scope, so it is named here only to
+record the answer: its `--index-dir` sites (`index_build.rs:786`, `:817`, `:1075`, `:1683`) all pass
+a `join("idx")` **subdirectory** of a `TempDir`, so the core creates that directory itself and
+`ensure_private_dir`'s `DirBuilder.mode(0o700)` already makes it umask-independent. The defect
+needs the `TempDir` itself to be the index directory, which only `index_query.rs` does — through
+`cfg_at(dir)` (`index_query.rs:130`) for the build sites and through `dir.path().join(DB_FILE)`
+(`index_query.rs:1381`) for `ensure_graph_segment`.
+
+**Tests required.**
+- One new test asserts the property directly, without depending on which tests happen to fail:
+  under a deliberately permissive `0002` umask it asserts `index_dir()` creates `0o700` **and**
+  that a plain `TempDir` creates `0o775` under the same umask. Both expected values are
+  literals, not results of calling the code under test, and the pair is what makes the first
+  meaningful: under a `0077` umask a plain `TempDir` is already `0700`, so a one-sided
+  assertion would pass with the explicit mode removed. The umask is set in a **child process**
+  (this same test binary re-invoked), because a process-global `umask` is not safe to set in a
+  binary whose tests run in parallel threads.
+- A mutation row for the constructor: removing `b.permissions(perm(0o700))` turns the test
+  **red** with `left: 509` (`0o775`) against `right: 448` (`0o700`), measured under `umask 0002`
+  on the box. Restored from a tree `git status --short` showed clean.
+- A mutation row for the assertion: narrowing the mode mask must fail, so the test cannot be
+  satisfied by a mask that cannot see a group-write bit. This one **survived its first form**
+  (the negative half read the mode through a second mask rather than the predicate the
+  positive half used) and the test was strengthened until it was killed.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines and `BUILD_5000_*` are
+  byte-identical to the merge base.
+- `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
+
+**Acceptance.** Every fixture in `rust-core/tests/index_query.rs` that hands a directory to the
+index creates it with an explicit `0700` at creation time, so no group- or other-**write** bit can
+appear under any umask and the suite's result is the same under `umask 0002` and `0022`; no
+fixture calls `tighten` any more; and the new test fails if the explicit mode is removed.
+`BOXALL` is green on the box with clippy's warning count unchanged and `cargo fmt --check` clean.
+
+**Collision risk.** `rust-core/tests/index_query.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which added `tighten` and the memprobe assertions, and by WS-FLK-08's row (merged
+`246e0b5`), which touched the same file's guard call sites. Both are merged, so neither is in
+flight. WS-FIX-11 (merged `932106d`) owns the `classify_dir` guard this row does not touch.
+Lane C is the only lane in this build that edits `rust-core`. `rust-core/tests/index_build.rs` is
+named by WS-FLK-02's row (merged `799d8c8`), also merged; this row does not change that file's
+bounds or its expected values.
+
+**Implementation record (branch parity/ws-fix-27, 2026-10-03).** Two files, all test code and this
+plan; `git diff --numstat 246e0b5 HEAD` gives the plan +94/-0 and `index_query.rs` +139/-15. No
+product source, no bound, no timeout, no retry, no dependency, no route or dispatch entry.
+- *What was built.* `rust-core/tests/index_query.rs`: one `index_dir()` built from
+  `tempfile::Builder::permissions(0o700)`, replacing `TempDir::new()` plus `tighten` at all four
+  sites that hand a directory to the index; `perm(mode)` and `mode_of_dir(dir)` keep the mode
+  literals in one place; `under_umask(mask, body)` re-invokes this test binary with
+  `--exact <child>` and reads a `UMASK_MODE=` line from it; two child tests print the mode for
+  `index_dir` and for a plain `TempDir`; `an_index_fixture_dir_is_owner_only_whatever_the_process_umask`
+  asserts `0o700` and `0o775` under umask `0002` and `0o600` under `0177`. `tighten` is gone, and
+  `TempDir::new` survives only in `repo()`, where the directory is a source tree rather than an
+  index directory.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64, debug profile unless `--release` is
+  named). Pre-fix under `umask 0002`: **9 passed**, the suite is green (`…T144047Z.log`), because
+  three of the four sites already had `tighten`. M3 (drop the explicit mode) fails with `left:
+  509` / `right: 448` under the same umask (`…T165838Z.log`); M1 also fails
+  `csr_equals_the_edges_table_and_reverse_edges_mirror_it` with `classify_dir`'s own refusal
+  naming `chmod 700` (`…T155850Z.log`); M2 **survived** (`…T160114Z.log`) and was killed only
+  after the test was strengthened (`…T161443Z.log`). Child arms green: 3 passed (`…T165817Z.log`,
+  and with the `0177` arm `…T174650Z.log`). `BOXALL` on `8d9358f0`: `remote_exit=0`,
+  `clippy_warnings=6`, `rss_lines=ok`, 24 Go packages and 18 Rust binaries, `…T184240Z.log`.
+  `cargo fmt --check` exit 0 locally.
+- *Deviations.* (1) The row's own text said three tests fail under `umask 0002`; that was wrong
+  on my own measurement and is corrected above and in the Goal — the defect was latent at three
+  sites and live at one that skips by default. (2) The umask half runs in a child process rather
+  than in-process, because a process-global `umask` is not safe in a binary whose tests run in
+  parallel threads; this was round 1's finding from all three channels. (3) Three further
+  low-severity rounds narrowed prose claims about the umask (rounds 2-4); no behaviour changed
+  after `da7c17ab`.
+- *Review.* Round 1 (`reviews/ws-fix-27/r1`): 2 codex-spec (1 medium, 1 low) + 1 OCR medium + 1
+  `codex-review` `[P2]`, all one defect — the test never set the permissive umask; fixed in
+  `da7c17ab`. Round 2 (`r2`): 1 low, the `0700`-under-any-umask overclaim; fixed in `e190522f`.
+  Round 3 (`r3`): 2 lows, the guard's mask is `mode & 0o022` so `0700` is stronger than required;
+  fixed in `f851838c`. Round 4 (`r4`): 2 lows, the `0777` figure is `0o000` not `0o600` and the
+  `0177` case is not result-independent; fixed in `8d9358f0`, the gate's head. `gate=PASS
+  changed=2 covered=2 channel_findings=2 triaged=2 reviewer=gpt-6-sol` on r4; the five earlier
+  rounds' entries are in `r4/triage-all-rounds.json` because the gate reviews one sealed round.
+  `triage-check.md` returns DISAGREE on the standing behaviour-free objection (prose findings owe
+  no test); answered in `r4/triage-notes.md`. OCR's channel contributed nothing structural
+  (`ocr_review=0`) and the OpenCode channel reads `unavailable`.
+- *Merge recheck.* Recorded in `reviews/ws-fix-27/r4/merge-recheck.md`.
+- *Checks.* `xm-box.sh check <wt> all -count=1` (BOXALL) as cited; `cargo test --locked --test
+  index_query` under `umask 0002` and via the in-test children; `cargo fmt --check`. **not run:**
+  RET, BUD, PI, CAPS, SECDOC, GOLD — §3.0 names none of them for a row that changes no index
+  behaviour, no memory store, no Pi source, no route gate, no projection and no `tools/list`
+  byte; BUD is explicitly not owed, as no resident component or in-heap structure was added.
+- *Follow-ups.* (1) **`xm-box.sh run` can gate a stale binary and a stale red reads exactly like
+  a real one**: `…T161604Z.log` reported `remote_exit=1` for a test that passes on every later run
+  of a clean tree, and the log's tell is the absence of a `Compiling` line. Proposed owner:
+  whoever maintains `xm-box.sh`. (2) `xm-review-run.sh` refuses a pre-existing `r<N>`, so the
+  hand-written `slop-audit.md` and `dogfood.md` had to be staged outside the round directory and
+  copied in; proposed owner the review runner. (3) The gate reads S12/S13 only as `##` headings
+  and wants each S5 test named on a line carrying `FAIL`, which is narrower than §4.6's prose;
+  proposed owner the gate. (4) Three `dogfood:` lines in `reviews/ws-fix-27/r4/dogfood.md` — MCP
+  `search` ranked a Go reducer and a React prop above the Rust `fn classify_dir` the query named,
+  `explain` returned not-found for a tracked test file, and `impact symbol=index_dir` returned
+  `defined_in: []` with no reason; proposed owner WS-FIX-15, as in every prior row.
 ### WS-FIX-18 — WS-36 deferred minors: an accurate hybrid `omitted` and a `source_identity` fixture case
 
 **Goal.** Close the two minors WS-36 deferred as "not cheap" (this file's WS-36 *Deferred (minor, not cheap)* bullet). (1) A hybrid search page's `omitted` member goes stale after the ladder's `trimmed` rung cuts `hits`: the member keeps the producer's page value (hits after the page) while the delivered result carries fewer hits, so `omitted + returned != total` and an agent reading it undercounts what the answer left out. (2) The `signal_flags` fixture carries no `coverage.source_identity` member, so the rung's promise to keep it is never exercised by a test.
@@ -4424,6 +4573,36 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
   - **Named lineages are bound to a repository and base ref, not to a branch.** Ancestry keeps an unrelated head from outdating a lineage's findings. A descendant head recorded under an explicit `--lineage` can still outdate them, which is true on that line of history.
   - **Budget.** REV-06's figure is met by live heap (+0.06 MiB; +0.07 to +0.12 MiB after review round 1), not by RSS: the RSS growth of +0.60 MiB (+0.59 to +0.71 MiB after round 1) for three times the rows is above 0.5 MiB and is recorded, not asserted. The ledger note makes WS-67 assert it, with a tolerance, once the daemon serves review rows. A lineage page sorts and reads the JSON of every finding in the lineage, so its cost grows with the lineage: 51 to 62 ms for a page of 500 from a 5,000-finding lineage.
 
+### WS-FIX-20 — The run wrapper forwards a termination signal to the child
+
+**Goal.** `xmustard-core run -- <argv>` (WS-41) is the command-wrapper reducer: a client that cannot replace a shell result rewrites its command to `xmustard-core run -- <command>`, so the wrapper is the process the shell, the client's timeout and the operator's `Ctrl-C` actually signal. The wrapper installs no signal handler, so a SIGTERM sent to the *wrapper* kills the wrapper on the default disposition and the child is never told: it is orphaned, keeps running, and keeps writing into a pipe whose read end has just been dropped, so it ends on SIGPIPE or holds whatever it acquired (a lock, a temp file, a port) for as long as it lives. WS-41 recorded this as deviation (2) — "the wrapper does not forward SIGTERM sent to the wrapper itself to the child (no signal handler without unsafe); a terminal signal still reaches the child through the process group" — so the row closes that deviation rather than contradicting it: the process-group clause is true for a signal typed at a terminal and false for a signal sent to the wrapper's pid, which is what a client timeout and `kill <pid>` do. The wrapper forwards SIGTERM (and SIGINT, SIGQUIT and SIGHUP, the other dispositions that mean "stop") to the child, then ends the way the child ended.
+
+**Requirements.** No new PAR ids. It closes WS-41 deviation (2) and the WS-41 "Tests required" line "the wrapper preserves the exit code, signals and stdout/stderr ordering", which today covers only a signal the *child* receives (`kill -TERM $$` inside the shell), never one the *wrapper* receives. The wrapper's other contract is unchanged: the same exit code, the same signal for a signalled child, the same bounded memory, and fail-open passthrough.
+
+**Files.** `rust-core/src/run_wrapper.rs` (the forwarding and the reap boundary), `rust-core/tests/run_wrapper.rs` (the new tests), `rust-core/Cargo.toml` and `rust-core/Cargo.lock` (the one new dependency; licence and reason in its commit message), `NOTICE` (the dependency's licence), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The refusal path first, against the base, and the FAIL line saved: a SIGTERM sent to the wrapper's own pid reaches a child that ignores SIGTERM at start and records what it saw. Today the wrapper dies on the default disposition and the child is never signalled, so the test fails with the child still alive.
+- The child's death is what the wrapper reports: a child that traps SIGTERM, exits 0 and prints a marker gives a wrapper that exits 0 with the marker in its output. A child killed by the forwarded SIGTERM makes the wrapper end with signal 15 (`WIFSIGNALED`), the same rule `a_child_killed_by_a_signal_kills_the_wrapper_the_same_way` already pins for a self-signalled child.
+- Forwarding happens before the wrapper ends, measured rather than asserted by construction: the child is observed to have been signalled while the wrapper was still running, so the fix cannot be "the wrapper dies and the child notices the closed pipe".
+- Every forwarded signal has a refusal case of its own: SIGINT, SIGQUIT and SIGHUP are forwarded, and a signal that is *not* forwarded (SIGUSR1) leaves the wrapper's own disposition alone — the wrapper does not swallow a signal it was not asked to forward, so SIGUSR1's default disposition ends the wrapper and the child is not told.
+- A signal that arrives when the child has already exited is not a crash and does not leave the wrapper unkillable: the signal still ends the wrapper, because the forwarding path is gone but the handler must not be left installed with no action behind it.
+- One mutation per new test (`slop-audit.md` S5).
+
+**Acceptance.** A SIGTERM sent to the wrapper's pid reaches the child, and the wrapper ends with the child's own outcome: the child's exit code when it exits on the signal, or the signal when the signal killed it. SIGINT, SIGQUIT and SIGHUP are forwarded the same way. No other signal's disposition is changed. The child is not orphaned: after the wrapper ends, a child that outlives it is asserted *not* to exist, so the fix cannot be satisfied by signalling and then immediately dying. The wrapper's existing properties hold unchanged: the same exit code, the same signal for a self-signalled child, stdout/stderr order, the bounded 100 MB streaming test at its 24 MiB dirty bound, and fail-open passthrough. `BOX1` on the touched Rust tests and `BOXALL` on the reviewed head are green, with `clippy_warnings` at or under the merge-base count and `rss_lines=ok`. The dependency added for signal handling is one crate whose licence is recorded in its commit message and in `NOTICE`.
+
+**Collision risk.** Lane C owns `rust-core/`. `run_wrapper.rs` is one file edited only by this row. `NOTICE` is shared: §4.8 step 2 re-reads the diff after merging `feat/parity-v2`, and a concurrent port adding a third-party licence conflicts on it, which is resolved by keeping both sections. The plan section and the record are shared files that only this row edits at this tip.
+
+**Implementation record (branch parity/ws-fix-20, 2026-10-02).** What was built, file by file, and where it differs from the text above.
+- *Forwarding (`rust-core/src/run_wrapper.rs`).* `Forwarder` registers SIGHUP, SIGINT, SIGQUIT and SIGTERM through `signal-hook`'s self-pipe iterator (async-signal-safe, no `unsafe`, and this crate is `#![forbid(unsafe_code)]` in both the lib and the bin) and relays each to the child from one watcher thread. A signal not in `FORWARDED` keeps its own disposition, so the wrapper neither forwards nor swallows it.
+- *The reap boundary.* After `wait` reaps the child, `mark_reaped` flips a flag; a signal arriving from then on ends the wrapper through `emulate_default_handler` rather than being forwarded to a process that no longer exists. The forwarder stays armed through `present`, so a client that timed out can still stop the wrapper while it uploads. `end_like` keeps its own `emulate_default_handler` re-raise, which is what restores SIG_DFL first: `signal-hook-registry`'s unregister does not restore the previous disposition, so a plain `kill(getpid())` would be swallowed. Without that change `a_child_killed_by_a_signal_kills_the_wrapper_the_same_way` fails with `unix_wait_status(36608)`.
+- *Dependency.* `signal-hook` 0.3.18 (Apache-2.0 OR MIT) and `signal-hook-registry` 1.4.8 (Apache-2.0 OR MIT), recorded in `NOTICE` and in the commit message. No other new dependency.
+- *Deviations.* (1) The window between `spawn()` and registering the handlers is closed without `sigprocmask` (unavailable safely under `#![forbid(unsafe_code)]`): the handlers are registered BEFORE the spawn, and a signal that lands before the child's pid is known is held by the watcher and forwarded once `arm` names the child; if the spawn fails, the held signal ends the wrapper as it would have unforwarded (owner-delegate run 2026-10-03, WS-FIX-20-r1-10; unit test `a_term_before_the_child_exists_is_forwarded_once_it_does`). (2) Forwarding targets the child, not its process group, so a grandchild that inherited the output pipe can still keep `drain` waiting. Group signalling needs `CommandExt::process_group(0)`, which moves the child out of the terminal's foreground group — WS-21B's isolation policy, DO NOT DECIDE (G§5.11). Tried, measured to fail without that (ESRCH), reverted, and proposed to the owner in FU. (3) `a_child_killed_by_a_forwarded_signal_kills_the_wrapper_the_same_way` cannot separate a forwarded signal from the wrapper's own default disposition — on the base it reaches signal 15 by dying itself. The discriminating case is `a_term_sent_to_the_wrapper_reaches_the_child`, whose child records the signal and whose wrapper exit code proves the wrapper stayed alive. (4) The tests poll process state through `pgrep`/`ps`, so they are unix-only, like the file they test. (5) A terminal Ctrl-C reaches wrapper and child through the shared foreground group, and the watcher relays the wrapper's copy, so a child that traps SIGINT/SIGQUIT sees it twice (WS-FIX-20-r1-8 / r4-1). Closing it means either moving the child into its own group or relaying only process-sent signals; both are owner trade-offs written to `decisions/ws-fix-20.md`, not decided here. (6) When the handlers cannot be registered, the wrapper execs the command in place (unreduced, every signal direct) rather than run a child it could orphan (WS-FIX-20-r4-2). (7) After the child exits, a signal ends the wrapper even while a grandchild still holds the output pipe (`waitid` with `NOWAIT`), and the forwarder stays armed through the final print.
+- *Measured.* macOS arm64, rustc 1.93.1, debug: `cargo test --locked --test run_wrapper` = 15 passed. Mutations M1/M2/M3 all killed (S5), each restored to a clean tree. The M2 failure without the fix is `unix_wait_status(1024)`: the wrapper swallowed the signal and ran on unkillable for the full 30 s stall. Box: see the ledger `gate=` line.
+- *Review round 1 (codex-spec 4 high/2 medium/2 low, codex-review P1+3 P2, OCR 2 medium).* Fixed: the reap window (P1, high), the hard-coded Linux SIGUSR1 that reddened every macOS run (P2, measured here: `Some(30)` vs `Some(10)`), the orphan assertion that could not fail (`outlived` is never written) and the discarded wrapper status, INT/QUIT/HUP coverage, the post-reap case, and the `Cargo.toml` claim that `signal-hook` restores the previous disposition. Rejected with reasons: the spawn-window and process-group findings, per deviations 1 and 2.
+- *Review round 2.* Round 1's channels ran to completion before the reboot and their outputs are the triage inputs; the round-2 fixes are `0872d6d` and `7a11601`.
+- *Checks.* `cargo fmt --check` clean; `cargo build --release --locked` clean; `cargo test --locked --test run_wrapper` 15 passed; BOXALL on the reviewed head per the ledger. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — the row changes no index, memory, Pi source, projection or `tools/list` byte, so §3.0 names none of them.
+- *Follow-ups (proposed owner).* The spawn window (deviation 1) and the process group (deviation 2) need the WS-21B isolation decision. `explain` returns "Workspace or path not found" for files this row edits and `impact symbol=run_with` returns an empty `defined_in` with no reason — WS-FIX-15 and WS-FIX-19.
 ### WS-FIX-15 — A non-deadline roots/list failure gets no back-off, so every call re-asks
 
 **Goal.** `clientRoots` (`api-go/internal/mcpserver/resolve_workspace.go`) marked a `roots/list` request that failed for any reason other than `CodeMethodNotFound` as `transient`, but only a `context.DeadlineExceeded` got a `retryAt` (the `errors.Is` at line 374). A prompt non-deadline failure (a JSON-RPC error answer, a closed transport) therefore left `transient` true and `retryAt` zero, and the cache test at line 359 (`cached != nil && (!cached.transient || time.Now().Before(cached.retryAt))`) is false on every later call, so the failure was discarded and `roots/list` re-sent on every call. FU:10 measured it: 5 calls, 5 requests, 0 loads. This row gives a repeated failure a bounded back-off, so a persistently failing `roots/list` costs one request per window and a retry after it. **A first prompt failure is still asked again on the very next call**, because `TestFailedRootsAreAskedAgainAndNeverRegisterTheCwd` and `TestFailedRootsFallBackToARegisteredCwdForOneCall` require a client that fails once to recover immediately; the window opens from the second consecutive failure, which is what bounds the persistent case. A malformed answer is the same class of client failure and is made transient: today it is cached as a definitive "the client has no usable roots" until `roots/list_changed`, the opposite of what a parse error means. The cwd auto-registration rule is unchanged (lines 146-149) and is DO NOT DECIDE, so the options go to FU.
@@ -4454,3 +4633,31 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 - *Follow-ups.* (1) The cwd rule: DO NOT DECIDE, owner. (2) `xm-review-run.sh` undercounts channel findings and OCR aborts above 8,000 chars of `background.md`; owner: the runner. (3) Index-staleness gaps in `ground`/`recall`/`explain`/`impact` proposed here by many rows; recorded, not acted on.
 
 **Owner-delegate run (2026-10-03).** Parked at five rounds (`505492e`); the owner allowed two more. Round 6 on the merged head found `{"roots":null}` cached as definitive and a repeated array-less answer never backing off; both now go through the shape check (`roots` must be an array) and `rootsBackoff`, with `TestNullRootsFieldIsAskedAgain` and `TestRepeatedRootsAnswerWithoutAnArrayBacksOff`. The cwd rule stays DO NOT DECIDE (`decisions/ws-fix-15.md`).
+
+### WS-RT1 — Scale fixtures and pass counters
+
+**Goal.** The streaming-runtime design (`.git/xm-parity/runtime-2026-10-03/STREAMING_RUNTIME.md` §5, owner-approved 2026-10-04, goal §3.5e) starts by making whole-repository passes visible and measurable before any of RT2..RT15 changes them. Two deliverables:
+1. **Per-call pass counters in the core.** Every `xmustard-core` call (one-shot CLI and the resident `serve` worker) counts, for that call only: `files_listed` (path records a Git listing — `ls-files -z`, `status -z`, the index scan's streamed listings — or a filesystem walk returned to it), `files_statted` (per-file `lstat`/`fstat` of a repository path), `files_hashed` and `bytes_hashed` (file contents fed through SHA-256 or the Git blob id), `git_spawns` (Git children started), and `rows_loaded` (stored rows read back: index `files` rows, the resident file table, stat-cache entries). A JSON object result carries them as a trailing `pass_counters` object; a non-object result (an array, such as `scan-signals`) is unchanged. A helper thread that works for a call counts into that call. `serve`'s `$/stats` reports the process totals.
+2. **The API reports them.** The Go bridge reads each core result's `pass_counters` and adds them to the `/api/health` budget block's data-movement counters (`counters.core_passes`: `calls`, `counted` (the calls whose result carried counters) and the six totals; a failed call counts as a call with nothing reported); core-backed reads that pass the core's JSON through (search, explain and impact via the code index) carry the per-call object unchanged.
+3. **Fixtures and a baseline.** A generator, run only on the build box, for the scale and nested-repository cases the evidence (`runtime-2026-10-03/EVIDENCE.md`) probed: 100,000 and 1,000,000 tracked paths, 200,000 untracked files, and the nested set (an unregistered nested repository, one two levels deep with a repository inside it, one inside an ignored folder, a bare repository, a `.git` file pointer and a broken one, a gitlink added without `.gitmodules`, and registered submodules that are dirty, uninitialised and `ignore = all`). A baseline runner records each core call's wall time, peak RSS and pass counters on today's code. The numbers go into `docs/benchmarks/` and this section's record. No behaviour changes: RT2, RT3 and RT6 change the passes, measured against this baseline.
+
+**Requirements.** PAR-EVAL-04 (data-movement accounting per call: git spawns, bytes hashed and read), PAR-RT-09 (declared scale envelope; here measured, not changed), PAR-FRESH-03 (the query path spawns no Git child while the watcher vouches; the counters are how RT3 and RT15 will assert it).
+
+**Files.** `rust-core/src/passcount.rs` (new: the counters, the call scope, the helper-thread handle and the JSON splice), `rust-core/src/lib.rs` (module), `rust-core/src/dispatch.rs` (`run_counted`), `rust-core/src/bin/xmustard-core.rs` (the CLI runs through `run_counted`), `rust-core/src/serve.rs` (each job runs through `run_counted`; `$/stats` `passes`), `rust-core/src/indexcache.rs` (Git spawns and listing records counted in the bounded runner; dirty-file hashing and stats), `rust-core/src/index/scan.rs` (streamed listing records, candidate `lstat`, blob-id hashing), `rust-core/src/index/mod.rs` (stored `files` rows loaded by an update), `rust-core/src/index/reader.rs` (resident file-table rows), `rust-core/src/index/envelope.rs` and `rust-core/src/index/fts.rs` (per-path freshness stats), `rust-core/src/hashcache.rs` (stat-cache entries loaded), `rust-core/src/symbolgraph.rs` (the no-follow opener's `fstat`, streamed SHA-256), `rust-core/src/changetrack.rs` (HEAD-blob hashing; the scoped cache-path thread counts into its call), `rust-core/src/repomap.rs` and `rust-core/src/scanner.rs` (walk entries and stats), `api-go/internal/budget/counters.go` (`core_passes`), `api-go/internal/rustcore/root.go` and the new `api-go/internal/rustcore/passes.go` (`notePasses` on every result `runCoreCtx` returns, one-shot or worker), `api-go/cmd/xmustard-api/health_budget_test.go` (the health block over HTTP carries `core_passes`), `rust-core/tests/serve_process.rs` (`pass_counters` joins the per-call fields the worker-versus-CLI comparison drops), `docs/ARCHITECTURE.md` (the serve row and a pass-counters row), tests beside each, `scripts/bench/rt_fixtures.sh` and `scripts/bench/rt_baseline.sh` (new, box only), `scripts/bench/README.md` (one row), `docs/benchmarks/2026-10-04-ws-rt1-baseline.md` (new), this plan section.
+
+**Tests required.**
+- `passcount` unit tests: a call scope counts only its own thread's work and a nested scope adds into its parent; a helper thread given the call's handle counts into it; the splice puts `pass_counters` last in an object (empty object included) and leaves an array untouched; totals keep growing across calls.
+- Counting at the sources, each with literal expectations from a fixture whose contents the test writes: a bounded `ls-files -z` of a three-file repository is 1 Git spawn and 3 listed records; hashing two files of known size with no cache is 2 hashed, their byte sum, 2 statted; a cached rehash is 0 hashed; an index `update` after a build loads exactly the stored file rows; the index scan of a three-file repository lists and stats 3 files.
+- End to end: the CLI's `index build` output has `pass_counters` with `files_listed` equal to the tracked source files and `files_statted` twice that (the scan's `lstat` and the read's `fstat`), and a `serve` response to the same call carries the call's own counters while `$/stats` reports totals.
+- Go: a fake core whose result ends in `pass_counters` adds to `budget.Counters().CorePasses` once per call, and a result without them, or a failed call, adds a call and nothing else.
+- Each new test fails before the change (saved FAIL line) and has one mutation row.
+
+**Acceptance.** Counters per call in the core's JSON and in the API health block as specified, tests green; the generator builds every listed fixture on the box; baseline numbers for today's code (counters, wall time and peak RSS per call on the 100k, 1M, 200k-untracked and nested fixtures) recorded in `docs/benchmarks/2026-10-04-ws-rt1-baseline.md` and summarised in this record. No cap, bound or timeout changes. `BOXALL` gives `remote_exit=0`, clippy at or under the merge base's count and `rss_lines=ok`.
+
+**Implementation record (branch parity/ws-rt1, 2026-10-04).**
+- **Built.** `passcount.rs`: six counters, a thread-local `Call` scope (nested scopes add into the outer one), `current`/`within` for helper threads, process totals, and `attach`, which appends `pass_counters` as the last field of an object result. `dispatch::run_counted` wraps every CLI call and `serve` job; `$/stats` reports `passes`. Sources: `indexcache` (spawns route through `passcount`; `ls-files`/`status -z` records counted in the bounded runner; dirty-file hashing and stats), `index/scan.rs` (streamed listing records, `lstat`, blob ids, walk entries), `index/mod.rs` (an update's stored rows), `index/reader.rs` (resident file rows), `hashcache.rs` (stat-cache entries), `symbolgraph.rs` (opener `fstat`, streamed SHA-256), `changetrack.rs` (HEAD blobs; its cache-path thread counts into its call), `envelope.rs`, `fts.rs`, `repomap.rs`, `scanner.rs`. Go: `budget.CorePasses` in `counters.core_passes`, `rustcore/passes.go` reads the trailing object of every `runCoreCtx` result. Box-only `scripts/bench/rt_fixtures.sh` and `rt_baseline.sh`.
+- **Measured** (box, single runs, load 4.5-10; `docs/benchmarks/2026-10-04-ws-rt1-baseline.md`, `logs/ws-rt1-run-20261003T192828Z.log`). A one-path `index update --paths` lists and stats 1,000,000 paths on t1m (3.56 s, 210.6 MiB with the git child) and 100,000 on t100k (0.32 s). u200k `repo-key` hashes 200,000 untracked files cold (2.20 s and 1.91 s on a rerun, `logs/ws-rt1-run-20261003T194739Z.log`; 293.72 s once under load) and one API ground lists 800,012 records. t1m `changetrack index` timed out at 300 s and t1m registration returned HTTP 500 after 121.94 s.
+- **Deviations.** (1) Three tests that compare whole outputs across calls drop or cut `pass_counters` with the other per-call accounting: `serve_process.rs` `normalize`, Go `normalizeCoreJSON`, and `areas_flows` byte identity (compared up to the trailing field). They were red in BOXALL `logs/ws-rt1-check-20261003T191348Z.log` for exactly this. (2) A listing that overflows or times out counts no records, and a killed call prints no counters; the baseline marks those rows. (3) Go counts results of `runCoreCtx` only; the goal, LSP and streamed-command paths print text and carry no counters. (4) The scale fixtures use about 20-byte paths; the 80-byte-path variant is RT3's acceptance. (5) The t1m API ground and search rows were not run because registration failed.
+- **Review round 1** (`reviews/ws-rt1/r1`, `gate=PASS changed=31 covered=31 channel_findings=5 triaged=5`). OCR's review aborted on its 8,000-character background limit, so the delegate file stands in for it. Five minors: r1-1 (failed calls now count), r1-2 (`attach` edits in place), r1-4 (CLI stat assertion; the spec's "equal to the tracked files" was wrong, a build stats each file twice) and r1-5 (spec names `counted`) fixed in `599d2e50`; r1-3 (a Git spawn is counted before `spawn` succeeds, at every pre-existing call site) deferred to FU for WS-RT5.
+- **Checks.** Red `logs/ws-rt1-run-20261003T190625Z.log`; 22 mutations, all killed (`logs/ws-rt1-run-20261003T201053Z.log`); `BOXALL` on `599d2e50` `remote_exit=0`, clippy 6, `rss_lines=ok` (`logs/ws-rt1-check-20261003T201330Z.log`). Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — no retrieval ranking, resident structure, Pi source, route, gate row, projection or `tools/list` byte changes (whether MCP tools copy `pass_counters` into their output was not checked; the golden and `tools/list` tests inside `BOXALL` passed unchanged).
+- **Follow-ups.** WS-RT1-r1-3 (owner WS-RT5); the box mutation-artifact hazard (owner: the goal's §6 A4 recipe); RT2/RT3/RT6 take this baseline as their before numbers.
