@@ -322,10 +322,13 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 }
 
 // RemoveFromCollection takes an entry out of a collection. Removing an entry that is
-// not in it is not an error and reports Removed false. A purged entry is refused rather
-// than removed: the removal event names the entry, and Purge exists to end an entry's
-// history, so an event naming it afterwards would undo that. The membership row stays
-// and both reads already skip it.
+// not in it is not an error and reports Removed false.
+//
+// A purged entry cannot be removed, and the store already enforces that: the removal
+// event carries data, and events_purged_no_text (schema.sql) aborts any insert naming a
+// purged entry that carries a note or data. The write is therefore refused at the SQL
+// layer rather than by a guard here, which is why the removal of a purged member
+// deletes the membership row and then fails the transaction: nothing is committed.
 func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID string, actor Actor) (CollectionMemberResult, error) {
 	if err := actor.validate(); err != nil {
 		return CollectionMemberResult{}, err
@@ -334,12 +337,8 @@ func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID st
 	if err != nil {
 		return CollectionMemberResult{}, fmt.Errorf("collection %s: %w", collectionID, err)
 	}
-	entry, err := t.GetEntry(ctx, entryID)
-	if err != nil {
+	if _, err := t.GetEntry(ctx, entryID); err != nil {
 		return CollectionMemberResult{}, err
-	}
-	if entry.Lifecycle == LifecyclePurged {
-		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is purged; its membership is no longer written to", ErrInvalid, entryID)
 	}
 	res, err := t.exec(ctx, "DELETE FROM collection_members WHERE collection_id = ? AND entry_id = ?",
 		collectionID, entryID)

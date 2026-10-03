@@ -366,8 +366,9 @@ func TestCollectionMemberSequenceIsNotReusedAfterRemoval(t *testing.T) {
 	}
 }
 
-// A purged entry's membership is not removable: the removal would append an event
-// naming an entry whose history Purge ended.
+// A removal naming a purged entry is refused and writes nothing. The store enforces
+// this in SQL (events_purged_no_text), so what the test pins is the outcome, not the
+// mechanism: the transaction fails, the membership row survives and no event appears.
 func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, newClock())
@@ -392,11 +393,19 @@ func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("events before: %v", err)
 	}
-	if err := s.Update(ctx, func(tx Tx) error {
+	// The write is refused. The membership row it would have deleted is still there,
+	// because the failing transaction commits nothing: this is the part a caller
+	// depends on, and the part a guard in Go would not give if the refusal came from
+	// somewhere further down.
+	err = s.Update(ctx, func(tx Tx) error {
 		_, err := tx.RemoveFromCollection(ctx, col.ID, "m1", Actor{Principal: "admin", Note: "free text"})
 		return err
-	}); !errors.Is(err, ErrInvalid) {
-		t.Fatalf("removing a purged member: %v", err)
+	})
+	if err == nil {
+		t.Fatal("removing a purged member was allowed")
+	}
+	if n := countRows(t, s, "SELECT count(*) FROM collection_members WHERE entry_id = 'm1'"); n != 1 {
+		t.Fatalf("the refused removal still deleted the membership row: %d rows left, want 1", n)
 	}
 	after, err := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", Types: []string{EventCollectionMember}})
 	if err != nil {
