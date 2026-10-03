@@ -2934,6 +2934,46 @@ before the row is claimed resident-affecting, as recorded in the follow-ups belo
 
 *Follow-ups.* (a) §4.6's triage closure needs a docs/behavior-free exemption clause, and the triage-check prompt needs the matching question; both are owner edits and this is the thirteenth row to raise it. (b) `explain` returned "Workspace or path not found" for every path tried against the owner's `:8077` index, so it contributed nothing; `impact`'s `defined_in` for `Instructions` named the wrong file. Both in `reviews/ws-38a/r1/dogfood.md`, proposed owner: whoever maintains the MCP server. (c) `refresh::the_directory_watch_count_follows_the_tree` is load-sensitive on Linux and is now on four lane ledgers (this one plus WS-HYG-01, WS-FIX-11 and WS-FIX-17); it is a candidate for WS-FLK-01, proposed owner: WS-FLK-01's owner.
 
+### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
+
+**Goal.** The areas half of the WS-38 row above, closing PAR-SYM-08. Communities over the **resolved symbol** projection (CALLS, EXTENDS, IMPLEMENTS), not the file projection WS-38a measured:
+
+- Deterministic across runs from a seed, and reproducible across a rebuild (same seed, same index, same result).
+- Large-graph mode above 10k symbols: resolution 2.0, at most 3 iterations, dropping low-confidence edges and nodes of degree below 2.
+- Labels from the members' folders with generic folders skipped, then a name prefix, then `Cluster_N`.
+- Cohesion sampled over at most 50 members, plus keywords.
+
+**Requirements.** PAR-SYM-08 (closed by this row). PAR-SYM-09, PAR-SYM-10, PAR-RET-06, PAR-HAR-11, PAR-GOV-20 are carried from the parent row and belong to 38c..38f; this row closes none of them and changes no requirement text.
+
+**Files.** `rust-core/src/index/areas.rs`, `rust-core/src/index/mod.rs` (module declaration, `index areas` dispatch, usage text), `rust-core/src/bin/xmustard-core.rs` (the dispatch entry §4 step 5 requires), `rust-core/tests/areas_flows.rs`, plan record.
+
+**New modules.** `rust-core/src/index/areas.rs`.
+
+**Tests required.** (`rust-core/tests/areas_flows.rs`, exercised through the real `xmustard-core` binary against disposable Git repositories, as `tests/impact_v2.rs` does)
+
+- The same seed over the same index gives byte-identical output across runs, and the same seed after a full rebuild gives the same output.
+- A different seed is a different result, so the seed is load-bearing rather than decorative.
+- Large-graph mode triggers above 10k symbols, and says so in its output, with resolution 2.0, at most 3 iterations and degree-below-2 nodes dropped.
+- Labels come from a member folder when it is not generic, from a name prefix when no folder qualifies, and from `Cluster_N` when neither does.
+- Cohesion is sampled over at most 50 members and is bounded 0..=1; keywords are a bounded list.
+- A community never merges symbols across the CALLS/EXTENDS/IMPLEMENTS projection into a file-level answer: two files that never reference each other land in different areas.
+
+**Acceptance.** `xmustard-core index areas <root> [--seed=N]` emits the areas with their labels, sizes, cohesion, keywords and mode, deterministically; 38c..38f build on it. The index family takes no workspace id (every other `index` subcommand takes a root), so a workspace id after `<root>` is refused as an unknown flag. This row adds no MCP tool, no MCP argument, no `tools/list` byte and no `instructions` text.
+
+**Collision risk.** `rust-core/src/index/mod.rs` (WS-07 index, WS-36 search) and `rust-core/src/bin/xmustard-core.rs` (every subcommand). Lane C owns rust-core lanes; this row touches two core files and no Go file.
+
+**Implementation record (branch `parity/ws-38b`, 2026-10-03).**
+
+- **Built.** `rust-core/src/index/areas.rs` (new): the resolved CALLS/EXTENDS/IMPLEMENTS projection, label propagation in seeded visit order with large-graph mode above 10k symbols, the folder/name-prefix/`Cluster_N` label chain, sampled cohesion and keywords. `rust-core/src/index/mod.rs`: the `index areas` dispatch, `--seed`, and a freshness path over every contributing path. `rust-core/src/index/reader.rs`: one accessor, `Snapshot::resolved_files()`. `rust-core/tests/areas_flows.rs`: 22 tests, all through the real binary against disposable repositories. `rust-core/src/bin/xmustard-core.rs` is untouched — `index` dispatches through `index::run`.
+- **Measured.** 22 tests pass (`logs/ws-38b-run-20261003T112448Z.log`); `BOXALL` `remote_exit=0`, `clippy_warnings=6` (the merge-base count, none in this row's files), `rss_lines=ok`, 24 Go packages and 19 Rust binaries (`logs/ws-38b-check-*.log`). Linux box, full-suite load. Small-fixture cost 18.6-18.9 MiB peak RSS (`logs/ws-38b-run-20261003T024537Z.log`) — a whole-process figure, not a budget line.
+- **Deviations.** (1) Three mutation rows are recorded unreachable rather than killed: M5 and M15 need an edge below the confidence floor, and no shipped language produces one that survives admission at scale (measured: Go sets `global: false`, so it never can; the TypeScript global edge does not survive at 16.8k symbols). `a_global_tier_edge_is_the_only_shape_that_reaches_the_confidence_floor` pins what is reachable so the constant cannot go silently dead. (2) The number of areas is unbounded; raised in three rounds and deferred each time pending the BUD report this row owes. An independent adjudication (`reviews/ws-38b/r3/adjudication-WS-38b-r3-2.md`) read PAR-SYM-08 and confirmed it names no area-count cap, so no stated spec is unmet and the open question is a measured budget decision, not a defect. (3) 2-core pruning of chains is PAR-SYM-08 applied to a fixpoint, escalated to the owner and unanswered.
+- **Review.** Round 1 (three majors, six minors, all fixed in `1a63a0a`), round 2 (one blocker, three majors, three minors; blocker and majors fixed in `eef0edc`), round 3 (one major, fixed in `c55c891`; one minor deferred). `gate=PASS changed=5 covered=5 channel_findings=3 triaged=2 reviewer=gpt-6-sol` at `reviews/ws-38b/r3`. The mutation pass over the eight rows the parked entry left open is in `reviews/ws-38b/mutation-pass/`: six killed, two unreachable.
+- **Merge recheck.** See `reviews/ws-38b/r3/merge-recheck.md`.
+- **Checks.** `xm-box.sh check <wt> all -count=1` (BOXALL); `cargo fmt -p xmustard-core -- --check` clean (`logs/ws-38b-run-20261003T104851Z.log`); `cargo test --test areas_flows -- --test-threads=1` (22 passed). Not run: `RET`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no search, no Pi source, no route or gate row, no projection and no `tools/list` byte. **`BUD` is owed and not run**: the row is resident-affecting and no budget line was measured.
+- **Follow-ups.** `BUD` for the row (owner of the unbounded-area-count question, with WS-38d); the stale-cargo-fingerprint defect in `xm-box.sh`, which makes a passing test fail and could make a surviving mutation look killed (FU, proposed owner the gate-tooling maintainer); `recall` returning `total_matches: 0` with no reason field and `explain` returning "Workspace or path not found" for files newer than the index (FU/WS-FIX-15, now 22 and 3 rows respectively).
+
+**PARKED (superseded 2026-10-03).** The record above replaces this bullet; the parked entry is kept for the §5.3 item 7 history it records.
+
 ### WS-39 — Resolvers for Rust, Python and Java
 
 **Goal.** Extend scope/import resolution to Rust (use paths, impl blocks, traits), Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), with the same confidence tiers, provenance and drop counters.
