@@ -308,7 +308,7 @@ fn build_of_5000_files_across_all_packs_stays_under_25_mib_dirty() {
         mib(dirty),
         mib(rss)
     );
-    assert!(dirty > 0, "no dirty-memory sample");
+    peaks.assert_sampled_dirty("index build of 5,000 files over every pack");
     assert!(
         mib(dirty) <= 25.0,
         "dirty peak {:.1} MiB exceeds 25 MiB",

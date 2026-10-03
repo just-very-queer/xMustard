@@ -1220,6 +1220,36 @@ The fix is to stop parsing the text form. `git status --porcelain=v2 -z` emits N
 - *Review round 1* (`reviews/ws-flk-05/r1`): one `codex-spec` finding, medium, correct — this section required the measured distribution and the record to exist and the diff supplied neither, so a reader could not tell the drain fixed anything. That is what this record is; fixed in `84a567e`. `codex-review`: no actionable regression ("the test change drains the request body before responding and leaves the workspace-pin assertions intact"); it could not run the test itself, its sandbox refusing the Go build directory. OCR: 0 comments across 2 files. OpenCode: unavailable, recorded. `gate=PASS` at that round.
 - *Follow-ups.* (1) The `xm-review-run.sh` summary printed `codex_spec=0` while `codex-spec.findings.json` held one finding, the same undercount WS-DOC-03 recorded; the count was read from the channel file. Proposed owner: whoever maintains the review runner. (2) `ocr` warned that `background.md` is 2,689 characters against a recommended 2,000. Proposed owner: whoever maintains the review runner; the warning names review quality, not this row's diff. (3) `cmd/xmustard-hook` is absent from the owner's code index, so `explain` and `search` return nothing for it; proposed owner WS-FIX-15, as in the three preceding rows.
 
+### WS-FLK-04 — Deflake `TestHealthFullViewIsForOperatorsOnly` (cmd/xmustard-api)
+
+**Goal.** `TestHealthFullViewIsForOperatorsOnly` (`api-go/cmd/xmustard-api/health_governor_test.go`) pins the operator-only split of the full `/api/health` view: an operator token gets the live activity, a reader-only or workspace-scoped token gets the static limits, and **a restricted poll never samples the process tree**. It has failed intermittently (FU:146, recorded at the WS-06B/WS-12 merge as "the heavy-slot watchdog can sample during a restricted poll, which breaks the samples-unchanged assertion"), with the note that it reproduces on the pre-merge tree. This row measures the failure, finds the cause, and fixes the cause.
+
+**Requirements.** No new PAR ids. The row is test hygiene: it closes no requirement and adds no behaviour. The contract the test pins is unchanged — a restricted poll still must not walk the process tree, and the full view still goes only to operators.
+
+**Files.** `api-go/cmd/xmustard-api/health_governor_test.go`, `api-go/internal/budget/governor.go` (only if the fix belongs in the governor rather than the test), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The failure is measured before it is fixed, on the build box, with the command and log path recorded: the test `-count=20` on its own, and again under the load of the full suite, with the load stated. A distribution is recorded either way, including when no cause is found, in which case the test is left unchanged.
+- The fix is one of the three §3.3 allows: isolate the test from parallel load, add synchronisation, or change a bound. A bound change needs the owner's approval and is DO NOT DECIDE, so this row will not make one.
+- Whatever the fix, the test still fails when the behaviour it pins breaks — the `samples-unchanged` assertion must still catch a restricted poll that samples. One mutation row for that assertion, with the FAIL line and the restored `git status`.
+- The sibling tests in the same file keep their own bounds: `TestIndexRebaselineRunsInTheHeavySlot` deliberately holds the heavy slot across a 1 s sleep and asserts `RefusedBusy`, and is not in scope.
+
+**Acceptance.** The row states a measured cause with a log path, or records the distribution and leaves the test unchanged. If a cause is fixed, the fix is isolation or synchronisation rather than a bound, and the test is green on the box at `-count=20` on its own and in the full `BOXALL` suite. The test's product assertions are unchanged in meaning: operators still get the full view with the heavy-slot owner and the `rust_worker` component, restricted tokens still get the four-key static budget with a `detail` naming why, and a restricted poll still must not sample. `gofmt -l` is empty and `go vet` passes.
+
+**Implementation record (branch parity/ws-flk-04, 2026-10-02).** Two files: one test function and this record. No production code, no bound, no timeout, no retry. Commands and `rg -F` lines for every number are in `reviews/ws-flk-04/r4/slop-audit.md` S13.
+- *What was built, and the cause.* The heavy slot is taken only around the full-view polls (open `auto` mode, each operator token, `auth=off`) and released before every restricted one, through one `holdSlot` helper that registers its release with `t.Cleanup`. The original `samples-unchanged` assertion is restored byte-for-byte. A closing guard waits for the watchdog to tick while a slot is held and to fall silent once released; each restricted token also polls once with the slot held and must still get the public view. The cause is not the one FU:146 named: the restricted poll never samples — `healthResponse` returns after three pure getters and never reaches `healthBudgetBlock`, the only caller of `budget.Status` — so the failure was the test's own counter reading the watchdog's correct behaviour as a leak.
+- *Measured* (build box via `xm-box.sh`, Linux; each log's first line carries its load).
+  - Pre-fix, solo: 20/20 green in 96.610s, 100/100 in 482.644s. Too rare for a 20-run gate to see.
+  - **Pre-fix under full-suite load: not obtained, and recorded as not obtained.** Two pre-fix BOXALLs were green for this test (the second red elsewhere), and 120 solo runs plus 2 full-suite runs never reproduced it, so the loaded distribution is **unknown, not zero** and the diagnosis rests on the probes. §3.3's loaded requirement is unmet; `WS-FLK-04-r3-4` is deferred, needing a pre-fix tree this branch no longer has.
+  - Probes. Attribution, 300 restricted windows over 30 runs: `delta=0` on every one, so the restricted poll never samples. Phase, 200 windows: poll 0.23-1.2 ms against a 250 ms tick, smallest gap to the next tick **27.2 ms** (~60x the poll).
+  - Post-fix, 20/20 green on the box. **Four mutations caught, one deferred** (S5 has each subject, command, FAIL line and restore). The fifth, `if budget.HeavyBusy() { budget.Status() }`, **survives `-count=1` and `-count=20`** (`ws-flk-04-mutation-r3-survives-20261002T071234Z.log`, Mac arm64 load 8.77): the watchdog gives ~1 tick per busy window (`PROBE watchdogFloor=5 after_wait=6 restricted=5`, `ws-flk-04-probe-watchdog-headroom-20261002T071654Z.log`), leaving ~4 ticks of headroom.
+  - BOXALL on the reviewed head: `remote_exit=0`, `clippy_warnings=6` (the merge-base count), `rss_lines=ok`, 24 Go packages and 267 Rust tests, 0 FAILED (`ws-flk-04-check-20261002T072023Z.log`). An earlier BOXALL on `0772842` was red in `rust-core` (`semantic::tests::ast_grep_child_is_killed_at_timeout`), untouched here and 10/10 green solo.
+- *Deviations.* (1) An assertion added and removed: the fix first claimed an operator's full view must sample every poll, which the box disproved 20/20 because `Snapshot` reuses a watchdog sample through `cachedSample(250ms)`; removed in `9fadd83`. (2) Neither diagnostic probe is committed — each is a copy of the real test with counters, and one committed would be a permanent test of a test. (3) `governor.go` is named in Files but untouched: the measurement ruled the fix out.
+- *Review.* Rounds r1..r6 in `reviews/ws-flk-04/` hold every finding, closure and `triage-check`. R1-R3 fixes are `dcf527b`, `11f14ca`, `49d10e4`. R4 rated the shared-counter gap `[P1]` (major) and the row parked; r5/r6 are the owner-delegate rounds that close it.
+- *Checks.* `xm-box.sh run` with `go test -count=20 -run TestHealthFullViewIsForOperatorsOnly ./cmd/xmustard-api` before and after; the five mutations; `gofmt -l` empty, `go vet` clean; `xm-box.sh check $WT all -count=1` on the reviewed head. The two round-3 mutations ran on the Mac, their subject being the assertion, not platform behaviour. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no index, memory, Pi source, route gate, projection or `tools/list` byte.
+- *Follow-ups.* (0) `WS-FLK-04-r4-1` fixed 2026-10-03 (below); (1) `WS-FLK-04-r3-4` is deferred with it. (2)/(3) two unlisted flakes found while gating, in `internal/workspaceops` (`runs=1 walks=4`) and `rust-core` (uniform 2.00 s against a 2 s child timeout), measured not exempted, in FU, owners lane B and lane C. (4) `Snapshot`'s 250 ms cache makes "shows a live tree" and "re-measured it now" different claims. (5) This row's MCP conditions are in FU, owners WS-FIX-15, WS-59b.
+
+**Owner-delegate run (2026-10-03).** `WS-FLK-04-r4-1` fixed in the test only: every sample not taken on the watchdog goroutine (`watchWhileHeld`) counts against the handler, and samples are stamped an hour old so the cache never hides one. Busy-slot restricted polls must add zero. The recorded mutation fails 5/5 (`logs/ws-flk-04-owner-mutation-20261003T145210Z.log`); unmutated 20/20 (`logs/ws-flk-04-run-20261003T144642Z.log`).
 ### WS-FLK-03 — Deflake `TestCancellationServiceableUnderPoolSaturation` (cmd/xmustard-mcp)
 
 **Goal.** `TestCancellationServiceableUnderPoolSaturation` (`cmd/xmustard-mcp/ingress_test.go`) sends one large `remember` frame, waits 300 ms, sends a second identical frame, then cancels the first and asserts the second is refused with `-32000` while the first is answered. It has failed intermittently (FU:59), 1-2 in 6 on macOS and never on Linux, with call 1 itself answered `-32000 transient budget exhausted`. This row measures the failure, finds the cause, and fixes the cause.
@@ -1339,6 +1369,180 @@ The fix is to stop parsing the text form. `git status --porcelain=v2 -z` emits N
 - *Review.* Four rounds, none deferred, and the pattern is the row's second transferable result. **Round 1** (`reviews/ws-flk-01/r1`, reviewed `27dc2fb`): `codex-spec` high and `codex-review` `[P1]` found the **same** defect independently — a peak over a window that starts at the pre-settlement sample can only rise, so it could not prevent a high-reading failure — and `codex-spec` medium that the section had no record. All three were right; fixed in `303af62` and the record above. **Round 2** (`reviews/ws-flk-01/r2`, reviewed `303af62`): `codex-spec` medium that a fixed delay does not establish settling, and medium that dropping the whole window lets a regression inside it pass — both correct, and between them they are the difference between a delay and a condition; `codex-review` found nothing. Fixed in `acc1ce2`. **Round 3** (`reviews/ws-flk-01/r3`, reviewed `4891d29`): all three channels named the **same** remaining defect, `codex-spec` high, `codex-review` `[P1]` and `codex-spec` medium — `let mut peak = first;` seeded the peak with the pre-settlement reading while the comment beside it said the sample was discarded, so the transient survived two rounds of fixes; `codex-spec` also found that a `None` sample spun forever, and two record claims that were wrong (the run count against the section's own Tests-required, and the diff line counts). All four fixed in `ada7b96`. **The shape worth carrying:** the first two rounds each fixed a real defect and each left the transient in, by opposite mistakes — round 1 kept it by taking a maximum over it, round 2 by seeding the accumulator with it — and the mutation that exposed round 1 (M1, which survived) is what made round 3's reading checkable by reading rather than by running. A comment asserting a property is not the property; here the comment said "never let it into the figure" for two commits while the line above it did exactly that. OCR: 0 comments at rounds 1 and 2, structurally — `ocr-preview.json` excludes `index_query.rs` by `default_path` and the plan by `unsupported_ext` — which is the "excluded" case WS-FLK-03 told apart from WS-FLK-04's "aborted". At round 3 `ocr_review=1` with no `ocr-review.json` written: `background.md` is 12,811 characters against the 8,000 hard limit, the sixth row to record that limit and the reason it reads identically to "OCR found nothing". OpenCode: unavailable, recorded.
 - *Checks.* `BOXALL` on every head; `cargo fmt --check` locally per §1.7 rule 6, clean; the solo, six-binary-loaded and full-suite runs above; two mutations. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no index behaviour, no memory store, no Pi source, no route gate row, no projection and no `tools/list` byte, and touches no Go file, no route, no gate table, no `main.go`, no dispatch entry, no `go-calls.txt` line and no heavy-table row, so §3.0 names none of them. `BUD` in particular is not owed: no resident component, cache or in-heap structure was added to the product; the change is to how a test reads `/proc`.
 - *Follow-ups.* (1) The `TempDir`s this file uses for repositories rather than index directories (`repo`, and the two in the swap tests) are left at the umask, which is fine today because nothing refuses them; the day a guard covers them the same `tighten` call applies. (2) WS-FIX-11's guard is now a fixture hazard across the suite, not just here: any test handing a `TempDir` to `index::ensure_graph_segment` inherits the umask, and the box's `0002` makes it a 0o775 directory every time. Owner: the row that owns the guard, or a `TempDir` wrapper in `memprobe` every index test could use — that would be the fix in one place rather than one call per test. (3) `mem_settled` now panics when `memprobe::sample` returns `None`, which turns a dead child into a clear failure instead of a hang; it still does not read the child's exit status, so a service that dies between the last query and the settle window reports "the service stopped answering memory samples" rather than the child's own error. `Serve::call` covers the query paths, and this is the only reader left. Owner: whoever next reads a live child's memory here.
+
+### WS-FLK-02 — Deflake `index_build::build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib` (rust-core)
+
+**Goal.** `index_build::build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib` (`rust-core/tests/index_build.rs:1232`) is listed in the goal queue with a debug RSS figure of 24.7-25.2 MiB under load, a spread that would straddle the 25 MiB the test's own name and the heavy slot's line name. The row measures the distribution on the build box, finds the cause, and fixes the cause; if no cause is found it records the distribution and leaves the test unchanged. The record below reports that the queued figure is not this test's, and that the test does not reach either line it asserts against.
+
+**Requirements.** No new PAR ids. This is test hygiene: it closes no requirement and adds no behaviour. The product contract is unchanged — WS-07's streaming index still indexes all 5,000 files with no file cap, still yields more than 20,000 symbols, and the heavy slot's 25 MiB line still holds for the **release** binary, which is what `api-go/internal/rustcore/heavy.go` declares and what budget gate v2 (WS-10) measures. §3.3's rule "never raise a bound, add a retry or lengthen a timeout without a measured cause" is honoured by not touching a bound at all: a bound change is DO NOT DECIDE whatever the measurement says.
+
+**Files.** `rust-core/tests/index_build.rs`, `rust-core/tests/memprobe/mod.rs`, `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- The failure is measured before it is fixed, on the build box, with the command, the platform and the load recorded, per §3.3 step 1: 10 solo runs, then 10 under the full parallel suite. A distribution is recorded either way, including when no cause is found, in which case the test is left unchanged. Every run count the record cites names its own log. The `index_query` sibling is not re-measured here: WS-FLK-01 owns it and measured 26 executions on this tree in its own row.
+- The release profile is measured too, because the 25 MiB in the test's name is `rss_line`'s release arm and the debug figure quoted in the row is not the one the bound names; `make check-rss-lines` runs both tests in the release profile and is the target the budget line depends on, so it stays green on the box.
+- The subject binary is invoked with `--nocapture` in the loaded arm, because `cargo test --workspace` captures a test binary's `eprintln!` and the peak figure would otherwise not appear in the log.
+- The sibling tests in `index_build.rs` keep their own bounds and their own assertions, and `index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` values are untouched by this row.
+
+**Acceptance.** The row states a measured cause with a log path, or records the distribution and leaves the test unchanged. If a cause is fixed, the fix is isolation or synchronisation rather than a bound, the `BUILD_5000_DIRTY_MIB` (6 MiB) and `rss_line(25.0, 32.0)` values are byte-identical to their values at the merge base, and the test is green on the box at the volume step 1 prescribes, solo and in the full `BOXALL` suite. `cargo fmt --check` is clean and clippy's warning count does not rise.
+
+**Collision risk.** `rust-core/tests/index_build.rs` is named by no other row in the queue, and lane C is the only lane in this build that edits `rust-core` sources. `rust-core/tests/memprobe/mod.rs` is named by WS-FLK-01's row, which is merged (`f543ae1`); that row's `Serve::mem_settled` lives in `tests/index_query.rs`, not in `memprobe`. WS-FIX-11's writable-directory guard applies to this fixture's `TempDir`s as it did to `index_query.rs`'s, and WS-FIX-27 covers that for the suite; this row's outcome must not be that guard's fixture fix unless it is the same cause.
+
+**Candidate fix, stated before the work so it can be ruled out by inspection rather than by a session of measurement.** §3.3 names no candidate for this row, and the two obvious ones can be settled without measuring. (1) "Its own test binary, so sibling tests' allocations do not share the process" cannot be the cause for the same reason it was ruled out in WS-FLK-01: the process measured here is the `xmustard-core index build` child, and `memprobe::child_peaks` reads that child's own `/proc/<pid>/status` plus its `wait4` rusage, so no sibling `index_build` test's bytes are on this line. (2) The remaining hypothesis was that `tree_rss` — `ru_maxrss` from `wait4(2)`, which `Peaks.tree_rss` names as covering "the child's own children (the `git ls-files` an index build streams from)" — is the loose reading, since it is a single kernel-recorded figure for the reaped tree rather than this test's sampled maximum, and `git ls-files` is the kind of child whose footprint grows with page-cache pressure on a shared box. That is a hypothesis, and the measurement below decides it.
+
+**Implementation record (branch parity/ws-flk-02, 2026-10-03).** One file in the branch diff: this section and its record, against the merge base `f543ae1`. `rust-core/tests/index_build.rs` and `rust-core/tests/memprobe/mod.rs` are byte-identical to the merge base (`git diff --stat f543ae1 HEAD --` on both paths prints nothing), which is §3.3 step 4 applied: no cause was found, so the distribution is recorded and the test is left unchanged.
+- *The test did not fail in 33 executions, and the reason is that no reachable figure is near either line.* Debug profile, `rss_line`'s debug arm `BUILD_5000_DEBUG_RSS_MIB = 32.0`: **25.3-27.2 MiB over 30 debug executions, 0 failures, 4.8 MiB of headroom at the highest.** Release profile, the 25 MiB the test's name and `api-go/internal/rustcore/heavy.go` name: **16.7-16.9 MiB over 3 release executions, 0 failures, 8.1 MiB of headroom.** Dirty is 4.4 MiB debug and 3.8-3.9 MiB release against the 6 MiB `BUILD_5000_DIRTY_MIB` line. Across all 33 executions the highest figure is 27.2 MiB, 4.8 MiB under the line it is asserted against. That is a clean rate on this tree, and the row's outcome is §3.3 step 4's **not reproduced** rather than a claim that the test can never fail.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64; the helper prints no load line, so each log's line 1 carries it). The commands, verbatim inside the box, were: the solo arm `uptime; for i in $(seq 1 10); do echo "ITER=$i"; cd rust-core && cargo test --locked --test index_build -- --nocapture --exact build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib 2>&1 | grep -E "index build of 5,000|test result:|panicked|exceeds"; cd ..; done; uptime`; the full-suite arm `uptime; cd rust-core; for i in $(seq 1 10); do echo "ITER=$i"; cargo test --locked --workspace >/dev/null 2>&1 & SUITE=$!; cargo test --locked --test index_build -- --nocapture --exact build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib 2>&1 | grep -E "RSS peak|exceeds the|test result:"; wait $SUITE; done; uptime`; the release arm the same solo command with `--release` added to `cargo test`. Results: **10 solo debug runs, 0 failures** at load 9.58 falling to 4.24, 26.6-27.2 MiB (`logs/ws-flk-02-run-20261003T074818Z.log`, 10 `ITER=` markers, `rg -c 'FAILED|panicked|exceeds'` = 0). **10 runs under the full parallel suite**, each iteration the whole 18-binary workspace with the subject binary run alongside it, 0 failures, at load 6.38 falling to 4.90, **25.3-26.2 MiB** (`logs/ws-flk-02-run-20261003T112538Z.log`, 10 `ITER=` markers, 10 peak lines, `remote_exit=0`). **3 release runs**, 0 failures, at load 8.09, 16.7-16.9 MiB (`logs/ws-flk-02-run-20261003T075531Z.log`). `make check-rss-lines` in the release profile, the target the budget line depends on: both tests ok, `remote_exit=0` (`logs/ws-flk-02-run-20261003T075203Z.log`). `BOXALL`: `remote_exit=0`, `clippy_warnings=6` (the merge-base count), `rss_lines=ok`, 24 Go packages and 18 Rust binaries ok, 0 FAILED, 46 untruncated lines (`logs/ws-flk-02-check-20261003T085411Z.log`). **The logs live in `$X/logs/` and not in this repository**, per §4.6's rule that every gate log is saved under `$X/logs/` and never committed; the commands above re-derive every figure, and `reviews/ws-flk-02/r3/slop-audit.md` S13 maps each number to its `rg -F` line.
+- *An intermediate loaded arm, kept because it is the one that produced the one flake.* Before the full-suite arm, 10 runs beside four index binaries (`--test index_build --test index_query --test refresh --test search_hybrid`) gave 0 failures at load 6.63, 26.1-26.9 MiB (`logs/ws-flk-02-run-20261003T075609Z.log`). A separate 10-iteration whole-suite run, without the subject binary's output captured, is `logs/ws-flk-02-run-20261003T091505Z.log`: 10 iterations, and the one failure in the row — `refresh::the_directory_watch_count_follows_the_tree` at `tests/refresh.rs:427`, the 5s `wait_dirs` deadline, in the `refresh` binary at `ITER=3`. That test is not on WS-FLK-01..08, is not in this diff (`rust-core/tests/refresh.rs` is untouched, `git diff --name-only f543ae1 HEAD` names one file and it is the plan), and is the same fixture race six earlier lane-C rows recorded. §3.0's known-flake rule does not cover it, so it is measured and not exempted, and **no bound was changed anywhere in this row**. The 10 full-suite iterations that carry the subject's own figures ran afterwards and were clean.
+- *Two measured facts.* (1) **No measurement here shows load raising the figure.** The 10 solo runs average 26.9 MiB at load 9.58-4.24, the 10 full-suite-loaded runs average 25.8 MiB at load 6.38-4.90, and the four-binary arm 26.4 MiB at load 6.63; the most loaded arm is the lowest of the three. The arms ran at different loads and in different order, so this is **not** evidence that loading lowers RSS — it is evidence that no reading in 33 executions came near the line, which is the fact the row rests on. The premise that load inflates this fixture is unsupported in either direction by these runs. (2) **`tree_rss` and `rss` track each other**: the `wait4` figure, which per `Peaks.tree_rss` covers the `git ls-files` the index streams from, and the child's own sampled `VmHWM` differ by **0.0-0.3 MiB** in all 33 readings that print both. That is the section's second candidate hypothesis measured and not borne out — the two readings do not diverge under load — but it is not an additive breakdown: both are maxima taken at different instants, so this says the `git ls-files` child never lifted either figure measurably above the core's own, not that it contributes nothing at all.
+- *Where the row's quoted 24.7-25.2 MiB came from.* It is not this test's figure, and the sources do not by themselves explain why. Those numbers are peak RSS of the **`index build` worker process** on real repositories, from `docs/benchmarks/2026-09-26-ws17-resolver.md:35` (column "Worker peak RSS (own)"; cline, ws-17, 24.9-25.2 MiB, beside a separate `time -l` full-build column at 24.2-25.7 MiB) and `docs/benchmarks/2026-09-30-ws39-resolvers.md:31` (column "Worker peak RSS (full build)"; OpenHands, base, 25.2-25.5 MiB). This test measures a different process on a different input — one short-lived `xmustard-core index build` child over a synthetic 5,000-file fixture — and the two benchmark tables differ from each other by more than 6 MiB on comparable rows (serena sits at 56.7-59.3 MiB in the ws-39 table), which is itself enough to say the repository fixture dominates the reading. So the honest statement is the negative one: the queued figure belongs to those tables, it is not a measurement of this test, and the row records what this test actually measures rather than deflaking a defect that is not in it. Which of the fixture, the tree shape or the process shape accounts for the gap is not established by these sources and is not claimed here.
+- *Tests.* None added, and none owed: §3.3's method makes a new test unsatisfiable here, because the oracle for a memory bound is `/proc` plus `wait4`, and the subject test *is* that oracle's consumer. §4.6's S5 asks for one row per new test, and there are none; §6 A4's mutation requirement attaches to new tests and so has nothing to attach to. The row's equivalent evidence is the 33-execution distribution plus the two measured facts above, which is what rules the defect in or out. The three-round triage check disagreed on exactly this point (its second objection), and `reviews/ws-flk-02/r3/triage-notes.md` answers it against §6 A4's own wording.
+- *Review.* Three rounds, seven findings, all fixed, none deferred. **Round 1** (`reviews/ws-flk-02/r1`, reviewed `865bf2d`): three `codex-spec` medium, and each was a sentence of mine that asserted more than the evidence carried — the loaded arm labelled "as written" while substituting four binaries for the full suite, the benchmark columns misread as whole-process-tree RSS when both are the resident worker's own, and a causal claim about load drawn from two arms run at different loads. All three fixed in `f0a00fc`. **Round 2** (`reviews/ws-flk-02/r2`, reviewed `f0a00fc`): two `codex-spec` (one medium, one low), both correct and both about the same paragraph — having fixed the column names, the record then invented a process-lifetime explanation the sources do not contain, and "contributes nothing" overstated what two maxima taken at different instants can show. Fixed in `829e1fc`; the third finding, that the loaded arm did not meet the section's own requirement, was a missing measurement and is answered by the full-suite arm. **Round 3** (`reviews/ws-flk-02/r3`, reviewed `9236693`): `gate=PASS changed=1 covered=1 channel_findings=4 triaged=4 reviewer=gpt-6-sol`. Two `codex-spec` findings (medium, low), both fixed in `046dfff` — the record never gave the commands the section requires it to record, and its first bullet claimed "does not flake" while its own outcome is "not reproduced". OCR's LLM channel never ran: `ocr review` aborts on a `background.md` over 8,000 characters (this section is 14,113) and reports it as `ocr_review=1` with no `ocr-review.json`, which reads as an outage; the delegate contract was performed by hand per §4.6 B3 and its two low comments are in `triage.json`. The three rounds share one shape worth carrying: **every finding this row received was a sentence that outran its evidence, and not one was about the measurement.** The numbers were never challenged; the prose around them was, three times, and the fix each time was to state less precisely what had been shown.
+- *Deviations.* (1) The row closes as **not reproduced**, per §3.3 step 4, with the test unchanged — the goal's queue text expects a fix and the method explicitly permits the other branch. (2) `make check-rss-lines` was run without `--nocapture`, so the release figure is absent from that log; the separate `--nocapture --release` run above supplies it, and the target's own pass is what the budget line depends on. (3) Two whole-suite box calls were spent before the subject's figures were captured: `cargo test --workspace` captures the test binary's `eprintln!`, so the peak line does not appear unless the subject binary is invoked separately under `--nocapture` (measured: `…091505Z.log` and `…101409Z.log` contain 0 occurrences of `RSS peak … MiB (own …)` for this reason, the second of them also burning a 10-iteration run). Both are kept rather than discarded because the first is the log that carries the row's one flake.
+- *Checks.* `BOXALL` on the reviewed head; the three measurement runs above; `make check-rss-lines`; `cargo fmt --check` is not run locally (the `macshim` allows `cargo fmt` but this row changes no Rust file, so there is nothing to format). Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no Rust source at all, no index behaviour, no memory store, no Pi source, no route gate row, no projection and no `tools/list` byte, and touches no Go file, no route, no gate table, no `main.go`, no dispatch entry, no `go-calls.txt` line and no heavy-table row, so §3.0 names none of them. `BUD` in particular is not owed: no resident component, cache or in-heap structure was added to the product.
+- *Follow-ups.* (1) The goal's §3.3 note for this row quotes a figure that belongs to a different benchmark, and the same §2.3 table carries 24.7-25.2 MiB for a different subject; anyone reading the row as "this test is near its line" will draw the wrong conclusion. Owner: the goal's author, for the queue text. (2) `cargo test --workspace` captures a test binary's `eprintln!`, so an RSS fixture that reports its peak by `eprintln!` cannot be measured inside a whole-suite run — the suite has to be run alongside a separate `--nocapture` invocation of the same binary. That cost this row two whole-suite box calls and it will cost the next row that measures a peak the same way; `make check-rss-lines` would print every peak if it passed `--nocapture`, which is a one-flag change to the target WS-HYG-02 owns. Owner: the next row that needs a peak figure under full-suite load. (3) `memprobe`'s `Peaks.tree_rss` and `Peaks.rss` never diverged by more than 0.3 MiB in 33 readings on this fixture, so `tree_rss`'s "covers the child's own children" doc comment is accurate but the extra `git ls-files` child cost nothing measurable here — worth knowing before anyone treats it as the loose reading in another row. Owner: whoever next reads these probes.
+
+### WS-FLK-08 — memprobe is all-or-nothing: a memory guard that never sampled passes
+
+**Goal.** `memprobe::child_peaks` (`rust-core/tests/memprobe/mod.rs:113`) accumulates a child's
+peak `dirty` and `rss` by sampling `sample(pid)` in a 1 ms loop, and initialises both to `0`.
+`sample` returns `None` whenever `/proc/<pid>/status` cannot be read, so a loop whose every
+iteration reads `None` returns `Peaks { dirty: 0, rss: 0, .. }`. **Four of the six
+`child_peaks` guards then asserted an upper bound against a reading of zero and passed
+vacuously: `mib <= 25.0` is `0.0 <= 25.0`.** The other two were already narrower than that
+claim, and the row does not widen it: the 5,000-file build guard and the language-pack guard
+each asserted `dirty > 0` before their dirty bound, so they failed loudly when the *dirty*
+sample was missing, and every guard that bounds `tree_rss` reads `wait4(2)` rusage, which the
+kernel fills whether or not this loop sampled. What no guard checked was the **RSS** figure,
+which is the one every bound in the suite is stated against. The row closes that hole by
+asserting `peaks.rss > 0` (and `peaks.dirty > 0` where a dirty bound is asserted) **before**
+the bound is checked, so a guard that never sampled fails loudly instead of passing. The
+source of the hole is named in the
+goal's own §3.3 note as "memprobe all-or-nothing (WS-FIX-06/H6)" with the instruction "Add
+`peaks.rss>0` asserts"; that is the whole of this row's scope.
+
+**Requirements.** No new PAR ids. This is test hygiene: it closes no requirement and adds no
+product behaviour. §6 A1's "a skipped test is not a pass" is the rule at stake — a guard that
+reads zero is the same defect wearing a different hat — and §5.1 rule 11 forbids the alternative
+repair, which would be to loosen or delete the bound. Nothing about what the product does
+changes: the same index builds still run, the same 25 MiB release line still holds, and the
+same numbers are still reported.
+
+**Files.** `rust-core/tests/memprobe/mod.rs` (a `Peaks` precondition helper, so one place
+carries the assertion rather than five call sites each re-deriving it), `rust-core/tests/index_build.rs`,
+`rust-core/tests/lang_fixtures.rs`, `rust-core/tests/run_wrapper.rs`, `rust-core/tests/index_query.rs`
+(the guard call sites), `docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+**Tests required.**
+- The hole is demonstrated before it is closed: a mutation that forces `sample` to return
+  `None` on every iteration must turn each guarded test **red** with the new assertion's
+  message, not green. This is the row's TDD step and it is the whole reason the row exists —
+  the defect is invisible while every guard is green.
+- Each mutation row is one call site, restored from a tree `git status --short` showed clean,
+  with its FAIL line and the tree state after the restore recorded.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines are byte-identical to the
+  merge base, and `BUILD_5000_DIRTY_MIB` (6 MiB) and `rss_line(25.0, 32.0)` are unchanged.
+- `BOXALL` green on the box, so every guard in the suite runs with the assertion present.
+
+**Acceptance.** Every `child_peaks` consumer asserts a sampled reading before it asserts a bound,
+so `peaks.rss == 0` (or `peaks.dirty == 0` on a dirty bound) fails with a message naming the
+probe and the fix rather than passing as `0.0 <= line`. `make check-rss-lines` stays green on
+the box in the release profile, clippy's warning count does not rise, and `cargo fmt --check` is
+clean.
+
+**Collision risk.** `rust-core/tests/memprobe/mod.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which is the last row to have edited it; its `Serve::mem_settled` reader lives in
+`tests/index_query.rs`, not in `memprobe`, so this row does not touch that reader. Lane C is the
+only lane in this build that edits `rust-core` sources. WS-FLK-02 (merged `799d8c8`) owns the
+*distribution* of `build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib` and closed as not
+reproduced; this row does not change that test's bounds or its expected values — it adds the
+precondition that makes the bound it already asserts meaningful, and WS-FLK-02's record is
+untouched.
+
+**Implementation record (branch parity/ws-flk-08, 2026-10-03).** Six files, all test code and this
+plan. The code diff against merge base `799d8c8` is **+49/-2 across the five Rust test files**
+(`git diff --numstat`: `memprobe/mod.rs` +33/-0, `index_query.rs` +10/-0, `index_build.rs`
++4/-1, `lang_fixtures.rs` +1/-1, `run_wrapper.rs` +1/-0); this record adds the rest of the plan
+diff. No product source, no bound, no timeout, no retry, no dependency.
+- *What was built.* `rust-core/tests/memprobe/mod.rs`: an `impl Peaks` block with `assert_sampled`
+  (RSS precondition) and `assert_sampled_dirty` (RSS plus dirty), so the rule lives in one place
+  rather than in five call sites. `rust-core/tests/index_build.rs`, `lang_fixtures.rs`,
+  `run_wrapper.rs`: all six `child_peaks` consumers call one of the two before their bound
+  (`rg -c` gives 4/1/1 for each, a 1:1 match with the `child_peaks` call sites).
+  `rust-core/tests/index_query.rs`: the same defect at its own source, where the `swap_peak`
+  sampler thread's `Mem::default()` becomes a 0.0 MiB delta through `above`'s `saturating_sub`
+  (`index_query.rs:1463`). Two pre-existing inline `dirty > 0` asserts are removed as
+  subsumed: one sat inside `if let Some(line) = BUILD_5000_DIRTY_MIB`, so it was skipped when
+  that bound was `None`, and neither checked RSS.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64, `uptime` on line 1 of each log; debug
+  profile for `BOXALL`, `--release` named explicitly on every focused run). **The defect, before
+  the fix:** with `sample` forced to return `None` on every call, `max_size_ignore_files_keep_
+  the_worker_bounded` printed `worker peak RSS 0.0 MiB, dirty peak 0.0 MiB` and returned
+  `remote_exit=0` / `test result: ok. 1 passed` (`logs/ws-flk-08-run-20261003T133349Z.log`) — a
+  guard that measured nothing, reported success. **After the fix**, four mutations, all killed:
+  `XMUSTARD_MEMPROBE_BLANK=1 … --test index_build` gives `FAILED. 0 passed; 2 failed` with
+  `memprobe sampled no RSS (rss 0, tree_rss 10850304)` and `tree_rss 13553664`
+  (`…134126Z.log`); the same forcing on `--test lang_fixtures` gives `1 failed` with
+  `tree_rss 42610688` (`…134147Z.log`) and on `--test run_wrapper` `1 failed` (`…134201Z.log`);
+  and a fifth mutation that keeps `rss` live but zeroes only `dirty` is caught by the second
+  clause alone — `sampled no dirty memory (rss 5521408)` (`…134227Z.log`). `BOXALL` on the
+  fixed head: `remote_exit=0`, `clippy_warnings=6` (the merge-base count), `rss_lines=ok`, 24 Go
+  packages and 18 Rust binaries ok, 0 FAILED, 46 untruncated lines
+  (`logs/ws-flk-08-check-20261003T135335Z.log` at `c46b692`, and the merge-recheck gate on
+  `b0b450f`). `cargo fmt --check` clean. Nine of the thirteen S13 evidence rows were re-checked
+  with `rg -F` after the fact and each returned exactly 1.
+- *The two `tree_rss` figures are the proof the guards were blind, not idle.* 10.8, 13.5 and
+  42.6 MiB are what `wait4` reported for children that were demonstrably running, while the
+  sampled RSS read 0. That is the distinction the section's Goal draws and it is worth keeping:
+  a guard bounding `tree_rss` could never have had this bug, which is why the fix asserts on the
+  sampled fields only and leaves `tree_rss` unchecked (S5's baseline and M1 rows).
+- *Review.* Round 1 (`reviews/ws-flk-08/r1`, reviewed `c46b692`): `gate=PASS`'s round summary
+  read `ocr_preview=0 ocr_rules=0 ocr_review=0 codex_review=0 codex_spec=0 opencode=unavailable`.
+  OCR reviewed all five files and returned **0 comments**; `codex-review.md` found "no actionable
+  regression in the diff". `codex-spec.findings.json` held three: one medium (the section's own
+  Tests-required bullet had no mutation record in the diff) and two low. All three fixed in
+  `b0b450f`; one was raised to major per §4.6's rule that an unmet spec is major, and the two
+  low ones stayed minor per the goal's own map. `triage-check.md` returned DISAGREE on the
+  standing no-committed-test clause; `r1/triage-notes.md` answers it — this is the nineteenth
+  lane-C row to meet it, and §6 A4 forbids the test it asks for here because the oracle for
+  "did the probe sample anything" is `/proc`, which is the code under test. OCR's anchor step
+  returned empty for both findings files (`anchor_codex-spec.findings=1`), so anchors were written
+  by hand against the cited code.
+- *Deviations.* (1) No new test function, for the §6 A4 reason above; the mutation pass in
+  `r1/slop-audit.md` S5 is the substitute evidence and is what decided whether the assertions do
+  anything. (2) The section's Goal overstated the defect's blast radius and round 1 corrected it:
+  four of the six guards, not all six, are stated as passing vacuously. Verified against the
+  base with `git show 799d8c8` on both files rather than argued — the two exceptions are
+  `index_build.rs:1265` and `lang_fixtures.rs:311`, both `no dirty-memory sample`. (3) The first
+  `BOXALL` was cut off at the tool's 600 s ceiling and wrote no log at all; it was rerun in the
+  background and is the cited one. That is the WS-28c shape, not a red gate. (4) `XM_OPS_REVIEW`
+  had to point at a review-tagged binary built for an earlier row: this machine's Go cannot
+  build `cmd/xmustard-ops` (the `Mtim`/`Ctim` syscall fields are Linux-only), so the binary was
+  built on the box and the anchor step was skipped rather than mis-anchored.
+- *Merge recheck.* See `reviews/ws-flk-08/r1/merge-recheck.md`. No dispatch entry, route, gate
+  table, heavy-table row, `go-calls.txt` line or budget ledger line is in the diff: the class
+  grep over `799d8c8..HEAD` names no `main.go`, `*_routes.go`, `route_gates.go`, `heavy.go`,
+  `budget_ledger.json` or `xmustard-core.rs`, so none can be lost. §3.0's `SEQUENTIAL`/
+  `OVERLAPPING` lines, `BUILD_5000_DIRTY_MIB` (6 MiB) and `rss_line(25.0, 32.0)` are
+  byte-identical to the merge base.
+- *Checks.* `BOXALL` twice (pre-fix head and merge-recheck head), four focused `BOX1` mutation
+  arms, `cargo fmt --check` locally, `rg -c` for the 1:1 wiring, and the leak check over every log
+  this row wrote. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — the row changes no Rust
+  *source* (every changed file is under `rust-core/tests/`), no index behaviour, no memory store,
+  no Pi source, no route gate row, no projection and no `tools/list` byte, and touches no Go
+  file, so §3.0 names none of them. `BUD` in particular is not owed: no resident component, cache
+  or in-heap structure was added to the product.
+- *Follow-ups.* (1) Three `dogfood:` lines, all in `reviews/ws-flk-08/r1/dogfood.md`: the search
+  corpus has no Rust *test* coverage (204 hits, zero in `rust-core/`, for a query naming three
+  literals from the file), `explain` returns not-found for a file the index lists as covered, and
+  `impact symbol=child_peaks` returns `defined_in=[]` with no "unknown symbol" reason, so an
+  empty list reads as "no callers". Proposed owner: the rows owning each resolver. (2)
+  `scripts/bench/rss_bench.py`'s `sample_once` already does the right thing — it records a failed
+  `ps` into `self.errors` and a vanished root into `self.lost_roots` instead of folding either
+  into a silent zero — which makes this fix the repository's existing pattern rather than a new
+  convention. Owner: nobody; recorded so the next row does not re-derive it. (3) The same
+  all-or-nothing shape may exist in any future `Peaks` field; `assert_sampled` names the two it
+  guards, so a third field would need its own clause. Proposed owner: whoever next adds a field.
 
 ### WS-16 — Language packs via the provider contract
 
@@ -2794,6 +2998,46 @@ before the row is claimed resident-affecting, as recorded in the follow-ups belo
 
 *Follow-ups.* (a) §4.6's triage closure needs a docs/behavior-free exemption clause, and the triage-check prompt needs the matching question; both are owner edits and this is the thirteenth row to raise it. (b) `explain` returned "Workspace or path not found" for every path tried against the owner's `:8077` index, so it contributed nothing; `impact`'s `defined_in` for `Instructions` named the wrong file. Both in `reviews/ws-38a/r1/dogfood.md`, proposed owner: whoever maintains the MCP server. (c) `refresh::the_directory_watch_count_follows_the_tree` is load-sensitive on Linux and is now on four lane ledgers (this one plus WS-HYG-01, WS-FIX-11 and WS-FIX-17); it is a candidate for WS-FLK-01, proposed owner: WS-FLK-01's owner.
 
+### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
+
+**Goal.** The areas half of the WS-38 row above, closing PAR-SYM-08. Communities over the **resolved symbol** projection (CALLS, EXTENDS, IMPLEMENTS), not the file projection WS-38a measured:
+
+- Deterministic across runs from a seed, and reproducible across a rebuild (same seed, same index, same result).
+- Large-graph mode above 10k symbols: resolution 2.0, at most 3 iterations, dropping low-confidence edges and nodes of degree below 2.
+- Labels from the members' folders with generic folders skipped, then a name prefix, then `Cluster_N`.
+- Cohesion sampled over at most 50 members, plus keywords.
+
+**Requirements.** PAR-SYM-08 (closed by this row). PAR-SYM-09, PAR-SYM-10, PAR-RET-06, PAR-HAR-11, PAR-GOV-20 are carried from the parent row and belong to 38c..38f; this row closes none of them and changes no requirement text.
+
+**Files.** `rust-core/src/index/areas.rs`, `rust-core/src/index/mod.rs` (module declaration, `index areas` dispatch, usage text), `rust-core/src/bin/xmustard-core.rs` (the dispatch entry §4 step 5 requires), `rust-core/tests/areas_flows.rs`, plan record.
+
+**New modules.** `rust-core/src/index/areas.rs`.
+
+**Tests required.** (`rust-core/tests/areas_flows.rs`, exercised through the real `xmustard-core` binary against disposable Git repositories, as `tests/impact_v2.rs` does)
+
+- The same seed over the same index gives byte-identical output across runs, and the same seed after a full rebuild gives the same output.
+- A different seed is a different result, so the seed is load-bearing rather than decorative.
+- Large-graph mode triggers above 10k symbols, and says so in its output, with resolution 2.0, at most 3 iterations and degree-below-2 nodes dropped.
+- Labels come from a member folder when it is not generic, from a name prefix when no folder qualifies, and from `Cluster_N` when neither does.
+- Cohesion is sampled over at most 50 members and is bounded 0..=1; keywords are a bounded list.
+- A community never merges symbols across the CALLS/EXTENDS/IMPLEMENTS projection into a file-level answer: two files that never reference each other land in different areas.
+
+**Acceptance.** `xmustard-core index areas <root> [--seed=N]` emits the areas with their labels, sizes, cohesion, keywords and mode, deterministically; 38c..38f build on it. The index family takes no workspace id (every other `index` subcommand takes a root), so a workspace id after `<root>` is refused as an unknown flag. This row adds no MCP tool, no MCP argument, no `tools/list` byte and no `instructions` text.
+
+**Collision risk.** `rust-core/src/index/mod.rs` (WS-07 index, WS-36 search) and `rust-core/src/bin/xmustard-core.rs` (every subcommand). Lane C owns rust-core lanes; this row touches two core files and no Go file.
+
+**Implementation record (branch `parity/ws-38b`, 2026-10-03).**
+
+- **Built.** `rust-core/src/index/areas.rs` (new): the resolved CALLS/EXTENDS/IMPLEMENTS projection, label propagation in seeded visit order with large-graph mode above 10k symbols, the folder/name-prefix/`Cluster_N` label chain, sampled cohesion and keywords. `rust-core/src/index/mod.rs`: the `index areas` dispatch, `--seed`, and a freshness path over every contributing path. `rust-core/src/index/reader.rs`: one accessor, `Snapshot::resolved_files()`. `rust-core/tests/areas_flows.rs`: 22 tests, all through the real binary against disposable repositories. `rust-core/src/bin/xmustard-core.rs` is untouched — `index` dispatches through `index::run`.
+- **Measured.** 22 tests pass (`logs/ws-38b-run-20261003T112448Z.log`); `BOXALL` `remote_exit=0`, `clippy_warnings=6` (the merge-base count, none in this row's files), `rss_lines=ok`, 24 Go packages and 19 Rust binaries (`logs/ws-38b-check-*.log`). Linux box, full-suite load. Small-fixture cost 18.6-18.9 MiB peak RSS (`logs/ws-38b-run-20261003T024537Z.log`) — a whole-process figure, not a budget line.
+- **Deviations.** (1) Three mutation rows are recorded unreachable rather than killed: M5 and M15 need an edge below the confidence floor, and no shipped language produces one that survives admission at scale (measured: Go sets `global: false`, so it never can; the TypeScript global edge does not survive at 16.8k symbols). `a_global_tier_edge_is_the_only_shape_that_reaches_the_confidence_floor` pins what is reachable so the constant cannot go silently dead. (2) The number of areas is unbounded; raised in three rounds and deferred each time pending the BUD report this row owes. An independent adjudication (`reviews/ws-38b/r3/adjudication-WS-38b-r3-2.md`) read PAR-SYM-08 and confirmed it names no area-count cap, so no stated spec is unmet and the open question is a measured budget decision, not a defect. (3) 2-core pruning of chains is PAR-SYM-08 applied to a fixpoint, escalated to the owner and unanswered.
+- **Review.** Round 1 (three majors, six minors, all fixed in `1a63a0a`), round 2 (one blocker, three majors, three minors; blocker and majors fixed in `eef0edc`), round 3 (one major, fixed in `c55c891`; one minor deferred). `gate=PASS changed=5 covered=5 channel_findings=3 triaged=2 reviewer=gpt-6-sol` at `reviews/ws-38b/r3`. The mutation pass over the eight rows the parked entry left open is in `reviews/ws-38b/mutation-pass/`: six killed, two unreachable.
+- **Merge recheck.** See `reviews/ws-38b/r3/merge-recheck.md`.
+- **Checks.** `xm-box.sh check <wt> all -count=1` (BOXALL); `cargo fmt -p xmustard-core -- --check` clean (`logs/ws-38b-run-20261003T104851Z.log`); `cargo test --test areas_flows -- --test-threads=1` (22 passed). Not run: `RET`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no search, no Pi source, no route or gate row, no projection and no `tools/list` byte. **`BUD` is owed and not run**: the row is resident-affecting and no budget line was measured.
+- **Follow-ups.** `BUD` for the row (owner of the unbounded-area-count question, with WS-38d); the stale-cargo-fingerprint defect in `xm-box.sh`, which makes a passing test fail and could make a surviving mutation look killed (FU, proposed owner the gate-tooling maintainer); `recall` returning `total_matches: 0` with no reason field and `explain` returning "Workspace or path not found" for files newer than the index (FU/WS-FIX-15, now 22 and 3 rows respectively).
+
+**PARKED (superseded 2026-10-03).** The record above replaces this bullet; the parked entry is kept for the §5.3 item 7 history it records.
+
 ### WS-39 — Resolvers for Rust, Python and Java
 
 **Goal.** Extend scope/import resolution to Rust (use paths, impl blocks, traits), Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), with the same confidence tiers, provenance and drop counters.
@@ -4071,3 +4315,34 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
   - **Open-mode records.** A cited record written in open mode is refused, since its author cannot be shown distinct from the approver. This goes beyond "distinct from the approver". For the same reason an open-mode record cannot name producer `human`.
   - **Named lineages are bound to a repository and base ref, not to a branch.** Ancestry keeps an unrelated head from outdating a lineage's findings. A descendant head recorded under an explicit `--lineage` can still outdate them, which is true on that line of history.
   - **Budget.** REV-06's figure is met by live heap (+0.06 MiB; +0.07 to +0.12 MiB after review round 1), not by RSS: the RSS growth of +0.60 MiB (+0.59 to +0.71 MiB after round 1) for three times the rows is above 0.5 MiB and is recorded, not asserted. The ledger note makes WS-67 assert it, with a tolerance, once the daemon serves review rows. A lineage page sorts and reads the JSON of every finding in the lineage, so its cost grows with the lineage: 51 to 62 ms for a page of 500 from a 5,000-finding lineage.
+
+### WS-FIX-15 — A non-deadline roots/list failure gets no back-off, so every call re-asks
+
+**Goal.** `clientRoots` (`api-go/internal/mcpserver/resolve_workspace.go`) marked a `roots/list` request that failed for any reason other than `CodeMethodNotFound` as `transient`, but only a `context.DeadlineExceeded` got a `retryAt` (the `errors.Is` at line 374). A prompt non-deadline failure (a JSON-RPC error answer, a closed transport) therefore left `transient` true and `retryAt` zero, and the cache test at line 359 (`cached != nil && (!cached.transient || time.Now().Before(cached.retryAt))`) is false on every later call, so the failure was discarded and `roots/list` re-sent on every call. FU:10 measured it: 5 calls, 5 requests, 0 loads. This row gives a repeated failure a bounded back-off, so a persistently failing `roots/list` costs one request per window and a retry after it. **A first prompt failure is still asked again on the very next call**, because `TestFailedRootsAreAskedAgainAndNeverRegisterTheCwd` and `TestFailedRootsFallBackToARegisteredCwdForOneCall` require a client that fails once to recover immediately; the window opens from the second consecutive failure, which is what bounds the persistent case. A malformed answer is the same class of client failure and is made transient: today it is cached as a definitive "the client has no usable roots" until `roots/list_changed`, the opposite of what a parse error means. The cwd auto-registration rule is unchanged (lines 146-149) and is DO NOT DECIDE, so the options go to FU.
+
+**Requirements.** No new PAR id. This closes a documented defect in the workspace-resolution path (FU:10, the WS-04 integration minor) and leaves `XMUSTARD_DISABLED_TOOLS` untouched; roots/list failure text gains the retry window and is clipped.
+
+**Files.** `api-go/internal/mcpserver/resolve_workspace.go` (the back-off constants, `rootsBackoff`, `rootsErrClip`, and `clientRoots`'s failure and malformed-answer branches), `api-go/internal/mcpserver/resolve_workspace_test.go` (new tests for a repeated failure, the malformed answer, the window table, the cwd fallback and the bounded cached text; the existing tests are unchanged), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+
+**Tests required.**
+- `TestRepeatedRootsFailureBacksOffUntilTheWindowExpires` fails before the fix: a client answering `-32603` twice has the second failure open the window, no further request inside it, and the call after expiry ask again and use the client's roots. FAIL line saved before `clientRoots` changes.
+- The window is stated in the error (`asked again after 1s`, derived from the constant), not measured, so the test cannot become load-sensitive; the three window tests pin `retryAt` to an hour after it opens so the request counts are deterministic.
+- `TestRootsBackoffTable` pins the threshold: a timeout backs off immediately, a prompt failure only after a cached failure, a first prompt failure not at all.
+- One-shot recovery and the cwd rule are unchanged: the five existing roots tests pass untouched.
+- One mutation per new test (`slop-audit.md` S5).
+
+**Acceptance.** A `roots/list` that keeps failing sends one request per window, not one per call, and the error names the window. A first prompt failure is still re-asked immediately. A malformed answer is transient, not a cached definitive absence. The `-32601` answer and every definitive answer keep their caching. `XMUSTARD_WORKSPACE_ID`, auto-registration and the "not auto-registered while the client's roots are unavailable" rule are byte-identical. `MAC` on `./internal/mcpserver` is green and `BOXALL` gives `remote_exit=0`, `clippy_warnings` at or under 6 and `rss_lines=ok`.
+
+**DO NOT DECIDE (written, not chosen).** The cwd auto-registration rule while roots are unknown is not this row's to change (goal §3.0). Options, with costs: keep never-register-while-unknown (safe, but a client that never answers `roots/list` leaves an unregistered cwd unregistered forever); register behind an explicit opt-in for the cwd only; or treat a `roots/list` back-off as grounds to try the cwd, registering only when the client declared no roots capability at all. FU carries the same three. This row routes around the decision and implements only the back-off.
+
+**Implementation record (branch parity/ws-fix-15, 2026-10-02).** Eight commits, three files.
+- *What was built.* `resolve_workspace.go`: `rootsBackoff(cached, timedOut)` is the one back-off decision — a timeout backs off `rootsRetryAfter` (15s) because it already cost the caller `rootsTimeout`; a prompt failure backs off `rootsRetryAfterFailure` (1s) once it has followed a cached failure; a first prompt failure returns zero, so a client that fails once recovers on the next call. Both failure branches call it. A malformed answer is now `transient` (it was cached as a definitive absence until `roots/list_changed`). The store guard keeps only its generation check, so a window-less failure is remembered as the first of a pair. Cached failure text is clipped to `rootsErrClip` (200 B), since a retained failure is held for the session and the client's message can be one transport message (8 MiB).
+- *Measured.* RED `logs/ws-fix-15-tdd-red-20261002T052803Z.log` (a prompt `-32603` re-asked on the next call). `BOXALL` per head in the ledger; round 6 head in `cc-progress-A.md`.
+- *Deviations.* (1) The plan as first written demanded a window on **every** transient failure; that breaks `TestFailedRootsAreAskedAgainAndNeverRegisterTheCwd` and `TestFailedRootsFallBackToARegisteredCwdForOneCall`, whose comments require a client that fails once to recover on the next call, while the same plan says existing registration tests are unchanged. The spec now states the second-failure threshold and names those tests. (2) Five tests beyond the first spec, all demanded by review. (3) Mutation M5 survived and is recorded: inlining `rootsBackoff(cached, false)` is behaviourally identical on that call site.
+- *Review.* Rounds 1-5 (`reviews/ws-fix-15/r{1..5}`), eleven findings, all fixed: `r1-1`..`r1-4` (threshold, malformed answers, cwd in the window test), four minor in r2, `r3-1` (unbounded cached error text), `r4-1` (a rejected answer's partial root was registered), `r5-1`/`r5-2` (an undelivered request treated as a client failure; `{}` cached as definitive). Parked at five rounds; round 6 under the owner exception below.
+- *Triage check.* DISAGREE twice, all objections upheld (`r2/triage-check-1.md`, `-2.md`): one severity and one live wall-clock assertion corrected. No closing run; `r2/triage-notes.md` says why.
+- *Merge recheck.* `feat/parity-v2` merged into the branch before round 6.
+- *Checks.* `MAC` on `./internal/mcpserver`; `BOXALL` on each reviewed head; five mutations, four failing and one recorded survivor. Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — no index, memory, Pi source, route gate, projection or `tools/list` byte changes, so §3.0 names none. No new env, flag or key, so no WS-48 note.
+- *Follow-ups.* (1) The cwd rule: DO NOT DECIDE, owner. (2) `xm-review-run.sh` undercounts channel findings and OCR aborts above 8,000 chars of `background.md`; owner: the runner. (3) Index-staleness gaps in `ground`/`recall`/`explain`/`impact` proposed here by many rows; recorded, not acted on.
+
+**Owner-delegate run (2026-10-03).** Parked at five rounds (`505492e`); the owner allowed two more. Round 6 on the merged head found `{"roots":null}` cached as definitive and a repeated array-less answer never backing off; both now go through the shape check (`roots` must be an array) and `rootsBackoff`, with `TestNullRootsFieldIsAskedAgain` and `TestRepeatedRootsAnswerWithoutAnArrayBacksOff`. The cwd rule stays DO NOT DECIDE (`decisions/ws-fix-15.md`).
