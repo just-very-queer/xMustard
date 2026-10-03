@@ -789,3 +789,51 @@ func parseConsolidationTime(s string) (time.Time, bool) {
 	}
 	return t, true
 }
+
+// groundConsolidationJobs is how many jobs ground shows and how many the queue holds. The
+// bound is ground's, not a pass's: ground answers at once, and a block listing a hundred
+// jobs would cost more context than the agent saves reading them. Ten is enough to see the
+// shape of the queue; jobs-list reads the rest.
+const groundConsolidationJobs = 10
+
+// ConsolidationJob is one queued question about memory, as ground shows it (PAR-GOV-13). It
+// carries the instructions because the agent is the one who acts on them, and the evidence
+// refs because the agent checks its answer against the same handles.
+type ConsolidationJob struct {
+	JobID             string   `json:"job_id"`
+	Kind              string   `json:"kind"`
+	CandidateIDs      []string `json:"candidate_ids"`
+	EvidenceRefs      []string `json:"evidence_refs,omitempty"`
+	Instructions      string   `json:"instructions,omitempty"`
+	ConflictSignature string   `json:"conflict_signature,omitempty"`
+}
+
+// readGroundingConsolidationJobs reads the queue for ground: the oldest jobs still waiting,
+// and the queue's total. A cancelled or finished job is not waiting for anyone.
+func readGroundingConsolidationJobs(dataDir, workspaceID string) ([]ConsolidationJob, *int, error) {
+	var out []ConsolidationJob
+	var total int
+	if err := memoryView(context.Background(), dataDir, workspaceID, func(r govstore.Reader) error {
+		all, err := r.ListJobs(context.Background(), govstore.JobFilter{WorkspaceID: workspaceID,
+			States: []string{govstore.JobQueued, govstore.JobLeased}, Limit: groundQueuedJobsTotal})
+		if err != nil {
+			return err
+		}
+		total = len(all)
+		for i, j := range all {
+			if i >= groundConsolidationJobs {
+				break
+			}
+			out = append(out, ConsolidationJob{JobID: j.ID, Kind: j.Kind, CandidateIDs: j.CandidateIDs,
+				EvidenceRefs: j.EvidenceRefs, Instructions: j.Instructions, ConflictSignature: j.ConflictSignature})
+		}
+		return nil
+	}); err != nil {
+		return nil, nil, err
+	}
+	return out, &total, nil
+}
+
+// groundQueuedJobsTotal bounds the count ground reads to name the queue's size. It is well
+// above the number shown, so the total is a count and not the list's length.
+const groundQueuedJobsTotal = 20000

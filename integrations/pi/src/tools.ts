@@ -178,8 +178,9 @@ function bodyOf(a: ToolArgs, members: readonly BodyMember[]): Record<string, unk
 
 // rememberBody is rememberTool.Build's payload in sorted order (tool_remember.go).
 const rememberBody: readonly BodyMember[] = [
-	["base_revision", "number"], ["claims", "claims"], ["content", "string"], ["description", "string"],
-	["entry_id", "string"], ["evidence", "list"], ["expires", "string"], ["kind", "string"],
+	["base_revision", "number"], ["claims", "claims"], ["content", "string"], ["decision", "string"],
+	["description", "string"],
+	["entry_id", "string"], ["evidence", "list"], ["expires", "string"], ["job_id", "string"], ["kind", "string"],
 	["new_string", "string"], ["old_string", "string"], ["op", "string"], ["paths", "list"],
 	["reason", "string"], ["relations", "relations"], ["run_id", "string"], ["session_id", "string"],
 	["supersedes", "list"], ["tags", "list"], ["tier", "string"], ["title", "string"], ["topic", "string"],
@@ -340,7 +341,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		// claim surface. Every member travels in the JSON body under its own name, as
 		// Go's Build sends it.
 		advanced: [
-			{ name: "op", type: "string", enum: ["propose", "supersede", "edit", "retire", "restore", "tier"], desc: "default propose" },
+			{ name: "op", type: "string", enum: ["propose", "supersede", "edit", "retire", "restore", "tier", "job"], desc: "default propose" },
 			{ name: "entry_id", type: "string", desc: "target of edit/retire/restore/tier" },
 			{ name: "base_revision", type: "integer", minimum: 1, maximum: 1073741824, desc: "edit: revision read (CAS)" },
 			{ name: "reason", type: "string", maxLength: 1000, desc: "required unless proposing" },
@@ -350,6 +351,8 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "supersedes", type: "string", maxLength: 1024, desc: "entries this replaces" },
 			{ name: "expires", type: "string", desc: "last UTC date served (YYYY-MM-DD)" },
 			{ name: "evidence", type: "string", maxLength: 1024, desc: "evidence handles it rests on" },
+			{ name: "job_id", type: "string", desc: "op=job: the job answered" },
+			{ name: "decision", type: "string", maxLength: 1000, desc: "op=job: what you concluded" },
 			{ name: "run_id", type: "string", desc: "run it came from" },
 			{
 				name: "kind",

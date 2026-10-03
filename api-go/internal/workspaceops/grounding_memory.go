@@ -40,6 +40,14 @@ type groundingMemory struct {
 	MemoryBudget *MemoryBudget `json:"memory_budget,omitempty"`
 	// Onboarding is set when the workspace has no promoted memory (PAR-GOV-15).
 	Onboarding *Onboarding `json:"onboarding,omitempty"`
+	// ConsolidationJobs are the queued questions about memory waiting for an agent
+	// (WS-32a, PAR-GOV-13). Each is a candidate the store derived and no job decided: the
+	// agent reads it and proposes, and a proposal still needs distinct-principal
+	// verification. At most groundConsolidationJobs; the total and the truncation flag say
+	// when the queue holds more than this block shows.
+	ConsolidationJobs         []ConsolidationJob `json:"consolidation_jobs,omitempty"`
+	ConsolidationJobsTotal    *int               `json:"consolidation_jobs_total,omitempty"`
+	ConsolidationJobsTruncate bool               `json:"consolidation_jobs_truncated,omitempty"`
 	// MemoryDelta answers since_revision (PAR-HAR-03).
 	MemoryDelta *MemoryDelta `json:"memory_delta,omitempty"`
 	// AtRiskMemories are the served memories a change reached: the caller's working
@@ -107,6 +115,16 @@ func (s *groundingMemory) build(dataDir, workspaceID, caller string, opts ground
 	}
 	if !opts.budget {
 		return unknown
+	}
+	// The queue is read on the budget path with the rest of memory, and a failure is unknown
+	// rather than an empty list: an agent must not read a store error as "no work waiting".
+	jobs, jobsTotal, jobsErr := readGroundingConsolidationJobs(dataDir, workspaceID)
+	if jobsErr != nil {
+		unknown = append(unknown, GroundingUnknown{Field: "consolidation_jobs",
+			Reason: "consolidation queue unavailable: " + jobsErr.Error()})
+	} else {
+		s.ConsolidationJobs, s.ConsolidationJobsTotal = jobs, jobsTotal
+		s.ConsolidationJobsTruncate = jobsTotal != nil && *jobsTotal > len(jobs)
 	}
 	p, err := CoreProjection(context.Background(), dataDir, workspaceID, ProjectionDefaultChars)
 	if err != nil {

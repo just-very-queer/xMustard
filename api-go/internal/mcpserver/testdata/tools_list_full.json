@@ -276,6 +276,11 @@
             "description": "the memory text to propose",
             "type": "string"
           },
+          "decision": {
+            "description": "op=job: what you concluded",
+            "maxLength": 1000,
+            "type": "string"
+          },
           "description": {
             "description": "one-line description (deferred index)",
             "type": "string"
@@ -291,6 +296,10 @@
           },
           "expires": {
             "description": "last UTC date served (YYYY-MM-DD)",
+            "type": "string"
+          },
+          "job_id": {
+            "description": "op=job: the job answered",
             "type": "string"
           },
           "kind": {
@@ -325,7 +334,8 @@
               "edit",
               "retire",
               "restore",
-              "tier"
+              "tier",
+              "job"
             ],
             "type": "string"
           },
