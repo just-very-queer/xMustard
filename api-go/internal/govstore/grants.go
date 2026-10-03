@@ -287,15 +287,21 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 		collectionID).Scan(&seq); err != nil {
 		return CollectionMemberResult{}, err
 	}
-	principal := strings.TrimSpace(actor.Principal)
-	res, err := t.exec(ctx, `INSERT INTO collection_members (collection_id, entry_id, added_by, added_at, seq)
-		VALUES (?, ?, ?, ?, ?) ON CONFLICT (collection_id, entry_id) DO UPDATE SET
-		added_by = excluded.added_by, added_at = excluded.added_at, seq = excluded.seq`,
-		collectionID, entryID, principal, t.nowText(), seq)
-	if err != nil {
+	// rowsAffected counts an upsert's update as a write too, so whether the membership
+	// was already there is read rather than inferred from the write.
+	var n int
+	if err := t.queryRow(ctx, "SELECT count(*) FROM collection_members WHERE collection_id = ? AND entry_id = ?",
+		collectionID, entryID).Scan(&n); err != nil {
 		return CollectionMemberResult{}, err
 	}
-	created := rowsAffected(res) > 0
+	created := n == 0
+	principal := strings.TrimSpace(actor.Principal)
+	if _, err := t.exec(ctx, `INSERT INTO collection_members (collection_id, entry_id, added_by, added_at, seq)
+		VALUES (?, ?, ?, ?, ?) ON CONFLICT (collection_id, entry_id) DO UPDATE SET
+		added_by = excluded.added_by, added_at = excluded.added_at, seq = excluded.seq`,
+		collectionID, entryID, principal, t.nowText(), seq); err != nil {
+		return CollectionMemberResult{}, err
+	}
 	if err := t.appendEvent(ctx, actor, eventRow{
 		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember, Revision: entry.Revision,
 		Data: map[string]any{"collection_id": collectionID, "added": created},
