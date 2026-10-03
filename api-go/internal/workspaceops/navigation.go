@@ -403,11 +403,15 @@ func DecodeExplainCursor(workspaceID string, q url.Values, cursor string) (int, 
 
 // impactRanking names the tier page an impact cursor pages: the workspace and every
 // argument that selects or shapes it. A blast tier and a diff-scope tier page
-// differently, so the form's own target is part of the key.
+// differently, so the form's own target is part of the key. The names are the query's
+// own, not the tool's: the MCP and Pi builders both send max_depth as depth
+// (tool_impact.go's Build, and the Pi mirror's k === "max_depth" ? "depth" : k), and
+// ImpactFlags reads params["depth"], so a key reading max_depth would be empty on the
+// wire and depth would never be bound.
 func impactRanking(workspaceID string, q url.Values) []byte {
 	b, _ := json.Marshal([]string{
 		workspaceID, q.Get("symbol"), q.Get("path"), q.Get("from"), q.Get("to"), q.Get("scope"),
-		q.Get("base"), q.Get("head"), q.Get("worktree"), q.Get("direction"), q.Get("max_depth"),
+		q.Get("base"), q.Get("head"), q.Get("worktree"), q.Get("direction"), q.Get("depth"),
 		q.Get("relation_types"), q.Get("min_confidence"), q.Get("include_tests"), q.Get("limit"),
 	})
 	return b

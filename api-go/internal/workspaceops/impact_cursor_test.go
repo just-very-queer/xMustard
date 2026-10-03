@@ -26,7 +26,7 @@ func TestImpactCursorsAreBoundToTheirTierPage(t *testing.T) {
 		"other symbol":    func() (int, error) { return DecodeImpactCursor("ws", with(q, "symbol", "Stop"), c) },
 		"other limit":     func() (int, error) { return DecodeImpactCursor("ws", with(q, "limit", "3"), c) },
 		"other direction": func() (int, error) { return DecodeImpactCursor("ws", with(q, "direction", "downstream"), c) },
-		"other depth":     func() (int, error) { return DecodeImpactCursor("ws", with(q, "max_depth", "2"), c) },
+		"other depth":     func() (int, error) { return DecodeImpactCursor("ws", with(q, "depth", "2"), c) },
 		"other relations": func() (int, error) {
 			return DecodeImpactCursor("ws", with(q, "relation_types", "CALLS"), c)
 		},
@@ -193,6 +193,210 @@ func TestWithImpactPagingPagesTheAffectedTiersOfADiffScope(t *testing.T) {
 	}
 	if _, err := DecodeImpactCursor("ws", url.Values{"scope": {"staged"}}, res.NextCursor); !IsInvalidInput(err) {
 		t.Error("another scope's ranking refuses it, want invalid input")
+	}
+}
+
+// A page that carried no items gets no cursor: summary_only drops every tier's items
+// while the core keeps next_offset, so a cursor there would page through a ranking the
+// caller cannot read.
+func TestWithImpactPagingIssuesNoCursorForAPageWithNoItems(t *testing.T) {
+	summary := json.RawMessage(`{"symbol":"Serve","by_depth":[
+		{"depth":1,"total":9,"offset":0,"next_offset":2}]}`) // no items: summary_only
+	var res struct {
+		HasMore    bool   `json:"has_more"`
+		NextCursor string `json:"next_cursor"`
+	}
+	if err := json.Unmarshal(WithImpactPaging("ws", url.Values{"symbol": {"Serve"}}, summary), &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if res.HasMore || res.NextCursor != "" {
+		t.Fatalf("summary_only page: has_more=%v next_cursor=%q, want false and none", res.HasMore, res.NextCursor)
+	}
+}
+
+// depth is the query parameter the API receives (max_depth is translated to it), so
+// the ranking key binds depth and not the tool's argument name. A key reading max_depth
+// would be empty on the wire and every depth would share one signature.
+func TestImpactCursorBindsTheDepthTheAPIRecieves(t *testing.T) {
+	q := url.Values{"symbol": {"Serve"}, "limit": {"2"}, "depth": {"3"}}
+	c := ImpactCursor("ws", q)(4)
+	if n, err := DecodeImpactCursor("ws", q, c); err != nil || n != 4 {
+		t.Fatalf("round trip: %d %v", n, err)
+	}
+	if _, err := DecodeImpactCursor("ws", with(q, "depth", "5"), c); !IsInvalidInput(err) {
+		t.Error("another depth's ranking refuses it, want invalid input")
+	}
+	// max_depth is not a query parameter the API ever receives, so the key must ignore
+	// it: adding it must not change the signature, which is what proves the key is not
+	// reading the tool's argument name by accident.
+	if n, err := DecodeImpactCursor("ws", with(q, "max_depth", "5"), c); err != nil || n != 4 {
+		t.Errorf("a max_depth the API never received changes nothing: %d %v", n, err)
+	}
+}
+
+// Two successive pages cover a tier with no overlap and no gap, checked against the
+// tier's own total: the row's acceptance criterion (2), which round 1 found untested.
+// The page sequence is the core's own rule (offset, then limit, next_offset is the
+// first item the next page returns), so the assertion does not depend on this row's
+// cursor code to produce it.
+func TestImpactPagesATierWithNoOverlapAndNoGap(t *testing.T) {
+	const total, limit = 5, 2
+	seen := map[string]bool{}
+	offset := 0
+	for page := 0; page < 4; page++ {
+		tier := tierPage(offset, limit, total)
+		names := tierItemNames(tier)
+		if len(names) == 0 {
+			t.Fatalf("page %d returned no items at offset %d", page, offset)
+		}
+		for _, n := range names {
+			if seen[n] {
+				t.Fatalf("page %d repeats %q: pages overlap", page, n)
+			}
+			seen[n] = true
+		}
+		next := nextOffsetOf(tier)
+		if next == 0 {
+			break
+		}
+		offset = next
+	}
+	if len(seen) != total {
+		t.Fatalf("covered %d of %d items: a gap or a lost page", len(seen), total)
+	}
+}
+
+// tierPage is the core's paging for one tier: the items from offset, at most limit of
+// them, and next_offset when the page does not reach total.
+func tierPage(offset, limit, total int) json.RawMessage {
+	items := make([]string, 0, limit)
+	for i := offset; i < min(offset+limit, total); i++ {
+		items = append(items, `{"name":"i`+strconv.Itoa(i)+`"}`)
+	}
+	tier := `{"depth":1,"total":` + strconv.Itoa(total) + `,"offset":` + strconv.Itoa(offset) +
+		`,"items":[` + strings.Join(items, ",") + `]`
+	if end := offset + len(items); end < total {
+		tier += `,"next_offset":` + strconv.Itoa(end)
+	}
+	return json.RawMessage(tier + `}`)
+}
+
+// tierItemNames reads a tier's item names; nil when the shape cannot be read.
+func tierItemNames(tier json.RawMessage) []string {
+	var page struct {
+		Items []struct {
+			Name string `json:"name"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(tier, &page); err != nil {
+		return nil
+	}
+	out := make([]string, 0, len(page.Items))
+	for _, it := range page.Items {
+		out = append(out, it.Name)
+	}
+	return out
+}
+
+// nextOffsetOf reads a tier's next_offset, 0 when it has none.
+func nextOffsetOf(tier json.RawMessage) int {
+	var page struct {
+		NextOffset *int `json:"next_offset"`
+	}
+	if json.Unmarshal(tier, &page) != nil || page.NextOffset == nil {
+		return 0
+	}
+	return *page.NextOffset
+}
+
+// A tier page carries no gap or overlap even when the tiers are of different lengths,
+// which is the shape round 1 raised against one shared offset: the core skips q.offset
+// and takes q.limit for every tier, so a tier short enough to end early has already
+// delivered everything it holds, and advancing by the longest tier's next_offset skips
+// nothing. The cursor is the largest next_offset among the tiers that have one.
+func TestImpactPagesTiersOfDifferentLengthsWithoutAGap(t *testing.T) {
+	// tier 1 holds 3 items, tier 2 holds 8, limit 2: both start at offset 0.
+	totals := []int{3, 8}
+	seen := map[int]map[string]bool{0: {}, 1: {}}
+	offset := 0
+	for page := 0; page < 6; page++ {
+		next := 0
+		for tier, total := range totals {
+			pageItems := tierPage(offset, 2, total)
+			for _, n := range tierItemNames(pageItems) {
+				if seen[tier][n] {
+					t.Fatalf("page %d tier %d repeats %q", page, tier, n)
+				}
+				seen[tier][n] = true
+			}
+			if o := nextOffsetOf(pageItems); o > next {
+				next = o
+			}
+		}
+		if next == 0 {
+			break
+		}
+		offset = next
+	}
+	for tier, total := range totals {
+		if len(seen[tier]) != total {
+			t.Fatalf("tier %d covered %d of %d items", tier, len(seen[tier]), total)
+		}
+	}
+}
+
+// A page the output budget cut loses its cursor rather than keeping one that would
+// skip the items the budget removed: has_more and the tier total stay, and offset=
+// reaches the rest.
+func TestABudgetTrimmedPageDropsItsCursor(t *testing.T) {
+	trimmed := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789",` +
+		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
+	if !ImpactBudgetTrimmed(trimmed) {
+		t.Fatal("a result whose report names tiers_trimmed is trimmed")
+	}
+	var res map[string]json.RawMessage
+	if err := json.Unmarshal(DropImpactCursor(trimmed), &res); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := res["next_cursor"]; ok {
+		t.Error("a trimmed page keeps a cursor that would skip removed items")
+	}
+	// has_more and the budget report survive, so the caller still knows more exists.
+	if _, ok := res["has_more"]; !ok {
+		t.Error("has_more is dropped too, so the caller cannot tell there is more")
+	}
+	if _, ok := res["output_budget"]; !ok {
+		t.Error("the budget report is dropped, so the trim becomes silent")
+	}
+
+	// An untrimmed result keeps its cursor: the route calls DropImpactCursor only when
+	// ImpactBudgetTrimmed is true, so the common case must survive that pairing.
+	whole := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789"}`)
+	if ImpactBudgetTrimmed(whole) {
+		t.Error("a result with no budget report is not trimmed")
+	}
+	out := whole
+	if ImpactBudgetTrimmed(out) {
+		out = DropImpactCursor(out)
+	}
+	var kept map[string]json.RawMessage
+	if err := json.Unmarshal(out, &kept); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got := string(kept["next_cursor"]); got != `"i2.2.abcdef0123456789"` {
+		t.Errorf("an untrimmed result keeps its cursor, got %s", got)
+	}
+}
+
+// An absent cursor is the first page; one that is present but empty is refused, so a
+// malformed cursor never silently answers with the wrong page.
+func TestAnEmptyCursorIsRefusedAndAnAbsentOneIsNot(t *testing.T) {
+	if err := ResolveImpactCursor("ws", url.Values{"symbol": {"Serve"}}, map[string]string{}); err != nil {
+		t.Fatalf("an absent cursor is the first page: %v", err)
+	}
+	given := url.Values{"symbol": {"Serve"}, "cursor": {""}}
+	if err := ResolveImpactCursor("ws", given, map[string]string{"cursor": ""}); !IsInvalidInput(err) {
+		t.Error("an explicitly empty cursor: want invalid input")
 	}
 }
 

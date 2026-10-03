@@ -36,7 +36,9 @@ var impactTool = &Tool{
 		{Name: "head", Type: typeString, MaxLen: 256, Desc: "scope=compare|commit|range: head"},
 		{Name: "worktree", Type: typeString, MaxLen: 4096, Desc: "another checkout to diff"},
 		// WS-59e: the tier cursor, declared here because budgetArgs omits it for a
-		// non-Paged budget tool. Advanced, documented at xmustard://docs/tools.
+		// non-Paged budget tool. Advanced, documented at xmustard://docs/tools; an
+		// explicitly empty cursor= is refused by the API, which can see the parameter's
+		// presence in a way the schema cannot.
 		{Name: "cursor", Type: typeString, MaxLen: maxSearchCursorLen, Desc: "next_cursor of the previous page"},
 	}, budgetArgs("impact")...),
 	Doc: impactDoc + "\n" + budgetSpec("impact").Markdown(),
@@ -91,5 +93,5 @@ scope= reads a diff (system and global Git configuration ignored, every diff opt
 
 from=&to= searches downstream (from depends on to), then upstream; max_depth defaults to 10 (at most 30), 200 edges per node, 5000 nodes per level, 50000 visited. Without a path it returns the furthest node reached and the caps hit.
 
-A tier that limit cut reports has_more and a next_cursor; pass it back as cursor= to continue at the next page. It is signed for the ranking that asked for the page, so two calls that differ in symbol, scope, direction, max_depth, relation_types, min_confidence, include_tests or limit do not accept each other's cursor. cursor= and offset= both name the page position, so giving both is refused; the trace (from=&to=) and file (path=) forms have no tier page and refuse a cursor.
+A tier that limit cut reports has_more and a next_cursor; pass it back as cursor= to continue at the next page. It is signed for the ranking that asked for the page, so two calls that differ in symbol, scope, direction, max_depth, relation_types, min_confidence, include_tests or limit do not accept each other's cursor. cursor= and offset= both name the page position, so giving both is refused; the trace (from=&to=) and file (path=) forms have no tier page and refuse a cursor. A summary_only page carries no items and issues no cursor. If max_chars trims the page below what the core returned (the output_budget report names the stage), next_cursor is dropped rather than made to skip items you never received: has_more and each tier's total still hold, and offset= reaches the rest.
 `

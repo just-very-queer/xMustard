@@ -187,21 +187,69 @@ func tiersOf(body json.RawMessage) json.RawMessage {
 // nextTierOffset returns the offset the deepest cut tier continues from: the highest
 // next_offset among the tiers, or 0 when none was cut. next_offset is absent on a tier
 // that returned its last item (the core skips it when there is none), so a complete
-// result yields 0 and gets no cursor.
+// result yields 0 and gets no cursor. A page that carried no items at all yields 0 too:
+// summary_only drops every tier's items while keeping next_offset, and a cursor over a
+// ranking the caller cannot read would advance through pages that say nothing.
 func nextTierOffset(tiers json.RawMessage) int {
 	var page []struct {
-		NextOffset *int `json:"next_offset"`
+		Items      []json.RawMessage `json:"items"`
+		NextOffset *int              `json:"next_offset"`
 	}
 	if json.Unmarshal(tiers, &page) != nil {
 		return 0
 	}
 	next := 0
 	for _, tier := range page {
+		if len(tier.Items) == 0 {
+			continue
+		}
 		if tier.NextOffset != nil && *tier.NextOffset > next {
 			next = *tier.NextOffset
 		}
 	}
 	return next
+}
+
+// ImpactBudgetTrimmed reports whether the output budget cut a tier page. A cursor
+// continues at the core's next_offset, which describes the core's page rather than the
+// delivered one, so a trimmed page's cursor would skip the items the budget removed.
+// The budget's report names the rung that cut it; the caller uses this to drop the
+// cursor instead of letting a client follow it past items it never saw. The tier's own
+// total still reports what the tier holds, so re-paging with offset= is lossless.
+func ImpactBudgetTrimmed(out []byte) bool {
+	var res struct {
+		OutputBudget *struct {
+			Stages []string `json:"stages"`
+		} `json:"output_budget"`
+	}
+	if json.Unmarshal(out, &res) != nil || res.OutputBudget == nil {
+		return false
+	}
+	for _, stage := range res.OutputBudget.Stages {
+		if stage == "tiers_trimmed" || stage == "tiers_total" {
+			return true
+		}
+	}
+	return false
+}
+
+// DropImpactCursor removes next_cursor from a budgeted impact result whose tier page the
+// budget cut, leaving has_more and the tier totals so the caller knows more exists and
+// can reach it with offset=. A result without the member is returned unchanged.
+func DropImpactCursor(out []byte) []byte {
+	var res map[string]json.RawMessage
+	if json.Unmarshal(out, &res) != nil || res == nil {
+		return out
+	}
+	if _, ok := res[impactNextCursorMember]; !ok {
+		return out
+	}
+	delete(res, impactNextCursorMember)
+	dropped, err := json.Marshal(res)
+	if err != nil {
+		return out
+	}
+	return dropped
 }
 
 // indexedRead brings the workspace's code index to its observed identity, runs one

@@ -201,10 +201,15 @@ func CheckImpactRequest(params map[string]string) (ImpactForm, map[string]string
 // arguments describe, so a cursor from another ranking, another form or another
 // workspace is refused here. A request with both is refused too: one names the
 // position twice. The cursor is deleted from params, so it never reaches the core as a
-// flag.
+// flag. An absent cursor is the first page; one that is present but empty is refused,
+// because silently treating it as the first page would answer a malformed cursor with
+// the wrong page instead of an error.
 func ResolveImpactCursor(workspaceID string, q url.Values, params map[string]string) error {
 	cursor := params["cursor"]
 	if cursor == "" {
+		if _, given := q["cursor"]; given {
+			return fmt.Errorf("cursor is empty: pass the next_cursor of the previous page, or leave cursor out for the first: %w", ErrInvalidInput)
+		}
 		return nil
 	}
 	if params["offset"] != "" {
