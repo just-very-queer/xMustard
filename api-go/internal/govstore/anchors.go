@@ -3,6 +3,7 @@ package govstore
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -22,6 +23,34 @@ const (
 
 var validAnchorKinds = set(AnchorPath, AnchorSymbol, AnchorIdentifier, AnchorCommand, AnchorEnv, AnchorConfig,
 	AnchorErrorCode, AnchorURL, AnchorCode)
+
+// CodeAnchorValue is a parsed "path#Lstart-Lend" anchor value: the file and the
+// 1-based inclusive line range the code sits on.
+type CodeAnchorValue struct {
+	Path       string
+	Start, End int
+}
+
+// ParseCodeAnchorValue reads a code anchor's value back (WS-28B). quoteAnchors writes
+// the value; nothing else in the tree read it, so this is the one place that turns it
+// into lines again. A value without a well-formed range is ErrInvalid rather than a
+// zero range: a range of 0 lines would address nothing.
+func ParseCodeAnchorValue(value string) (CodeAnchorValue, error) {
+	path, rest, ok := strings.Cut(value, "#L")
+	if !ok || path == "" {
+		return CodeAnchorValue{}, fmt.Errorf("%w: code anchor value %q", ErrInvalid, value)
+	}
+	start, end, ok := strings.Cut(rest, "-L")
+	if !ok {
+		return CodeAnchorValue{}, fmt.Errorf("%w: code anchor value %q", ErrInvalid, value)
+	}
+	lo, err1 := strconv.Atoi(start)
+	hi, err2 := strconv.Atoi(end)
+	if err1 != nil || err2 != nil || lo < 1 || hi < lo {
+		return CodeAnchorValue{}, fmt.Errorf("%w: code anchor value %q", ErrInvalid, value)
+	}
+	return CodeAnchorValue{Path: path, Start: lo, End: hi}, nil
+}
 
 // Baseline states: a hash, or the path was missing when the baseline was taken (so its
 // later appearance is drift too).
@@ -71,6 +100,16 @@ type Baseline struct {
 type AnchorRef struct {
 	Kind  string `json:"kind"`
 	Value string `json:"value"`
+}
+
+// CodeMove is one quoted-code anchor's new place (WS-28B). SnippetID is the anchor's
+// symbol_uid, which a code anchor carries as the digest of the snippet it placed and
+// which therefore names the same anchor before and after a move. From and To are the
+// "path#Lstart-Lend" values the anchor had and takes; To is what the caller verified.
+type CodeMove struct {
+	SnippetID string
+	From      string
+	To        string
 }
 
 // AnchorQuery looks memories up through the anchor inverted index. ActiveOnly keeps
@@ -129,6 +168,9 @@ type AnchorWriter interface {
 	MarkStale(ctx context.Context, entryID string, refs []AnchorRef, commit string, actor Actor) (int, error)
 	// ClearDrift resets drift flags, for example after re-verification.
 	ClearDrift(ctx context.Context, entryID string, actor Actor) error
+	// ReanchorCode moves an entry's quoted-code anchors to the lines their code now
+	// holds (WS-28B) and appends one anchor_reanchor event per anchor it moved.
+	ReanchorCode(ctx context.Context, entryID string, moves []CodeMove, commit string, actor Actor) (int, error)
 }
 
 // CleanPaths trims, strips a leading "./", drops empties and de-duplicates, keeping
@@ -545,4 +587,80 @@ func (t *txn) ClearDrift(ctx context.Context, entryID string, actor Actor) error
 		WorkspaceID: e.WorkspaceID, EntryID: entryID, Type: EventDriftCleared, Revision: e.Revision,
 		NewDigest: e.ContentDigest, Data: map[string]any{"anchors": rowsAffected(res1)},
 	})
+}
+
+// ReanchorCode moves quoted-code anchors to the lines their code now holds (WS-28B). A
+// code anchor is addressed by its snippet digest (its symbol_uid), which survives the
+// move, and its value is only rewritten when it still holds the lines the move names:
+// From is the anchor's own value, so a caller that computed a move from a stale read
+// moves nothing rather than overwriting another block's lines. Each move appends one
+// anchor_reanchor event.
+func (t *txn) ReanchorCode(ctx context.Context, entryID string, moves []CodeMove, commit string, actor Actor) (int, error) {
+	moved, err := t.reanchorCode(ctx, entryID, moves, commit, actor)
+	if err != nil {
+		// The transaction this ran in is being rolled back, so no move in it survived and
+		// the count must not say otherwise. Reporting the moves made before the failure
+		// would let a caller record a re-anchor that never happened.
+		return 0, err
+	}
+	return moved, nil
+}
+
+// reanchorCode moves the anchors and returns what it moved; ReanchorCode is the form that
+// zeroes that count when the transaction does not commit.
+func (t *txn) reanchorCode(ctx context.Context, entryID string, moves []CodeMove, commit string, actor Actor) (int, error) {
+	if err := actor.validate(); err != nil {
+		return 0, err
+	}
+	e, err := t.liveEntry(ctx, entryID)
+	if err != nil {
+		return 0, err
+	}
+	moved := 0
+	refresh := false
+	for _, m := range moves {
+		from, err := ParseCodeAnchorValue(m.From)
+		if err != nil {
+			return moved, err
+		}
+		to, err := ParseCodeAnchorValue(m.To)
+		if err != nil {
+			return moved, err
+		}
+		if from.Path != to.Path || m.SnippetID == "" || m.From == m.To {
+			return moved, fmt.Errorf("%w: code anchor move %q to %q", ErrInvalid, m.From, m.To)
+		}
+		res, err := t.exec(ctx, `UPDATE anchors SET value = ? WHERE entry_id = ? AND kind = ? AND symbol_uid = ?
+			AND value = ? AND stale_since IS NULL`, m.To, entryID, AnchorCode, m.SnippetID, m.From)
+		if err != nil {
+			return moved, err
+		}
+		n := rowsAffected(res)
+		if n == 0 {
+			// The move names no live anchor, or names one that has moved since the caller
+			// read it. Both are refusals rather than silent successes: a caller that cannot
+			// tell them apart would read a lost move as a move that was not needed.
+			var got string
+			if err := t.queryRow(ctx, `SELECT value FROM anchors WHERE entry_id = ? AND kind = ? AND symbol_uid = ?`,
+				entryID, AnchorCode, m.SnippetID).Scan(&got); err != nil {
+				return moved, fmt.Errorf("%w: no code anchor %q on %s", ErrInvalid, m.SnippetID, entryID)
+			}
+			return moved, fmt.Errorf("%w: code anchor %q holds %q, not %q", ErrInvalid, m.SnippetID, got, m.From)
+		}
+		if _, err := t.insertEvent(ctx, actor, eventRow{WorkspaceID: e.WorkspaceID, EntryID: entryID, Type: EventAnchorReanchor,
+			Revision: e.Revision, Data: map[string]any{"commit": commit,
+				"from": []int{from.Start, from.End}, "to": []int{to.Start, to.End}}}); err != nil {
+			return moved, err
+		}
+		moved += int(n)
+		refresh = true
+	}
+	if refresh {
+		// The anchors column of the entry's search row holds these values, so a move that
+		// did not refresh it would keep matching the line range the anchor left.
+		if err := t.refreshFTS(ctx, entryID); err != nil {
+			return moved, err
+		}
+	}
+	return moved, nil
 }

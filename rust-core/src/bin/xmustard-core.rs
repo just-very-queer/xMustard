@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use xmustard_core::dispatch::{
     self, Args, CmdError, CmdResult, Command, Output, Residency, json, need,
 };
+use xmustard_core::search::SearchMode;
 
 /// Every subcommand. The one-shot CLI and `xmustard-core serve` dispatch through this
 /// table, so a new subcommand is one entry here plus its handler. `residency` says
@@ -659,7 +660,7 @@ fn identity_flag(args: Args) -> (Option<String>, Args) {
 
 fn search(args: Args) -> CmdResult {
     let usage = "xmustard-core search [--identity-key=K] [--offset=N] [--path-glob=GLOB] \
-                 <root> <workspace_id> <query> [limit] [seed]";
+                 [--lang=LANG] [--mode=hybrid|text] <root> <workspace_id> <query> [limit] [seed]";
     let (key, args) = identity_flag(args);
     // `--name=value` flags lead; the first other argument ends them, so a query or seed
     // symbol that looks like a flag is never read as one.
@@ -667,6 +668,7 @@ fn search(args: Args) -> CmdResult {
     let lead = flags.iter().take_while(|a| a.starts_with("--")).count();
     let mut args = flags.split_off(lead).into_iter();
     let (mut offset, mut path_glob) = (0usize, None::<String>);
+    let (mut lang, mut mode) = (None::<String>, None::<String>);
     for flag in flags {
         match flag.split_once('=') {
             Some(("--offset", n)) => {
@@ -675,6 +677,8 @@ fn search(args: Args) -> CmdResult {
                     .map_err(|_| CmdError::new(2, format!("search: bad --offset {n}\n{usage}")))?
             }
             Some(("--path-glob", g)) => path_glob = Some(g.to_string()),
+            Some(("--lang", l)) => lang = Some(l.to_string()),
+            Some(("--mode", m)) => mode = Some(m.to_string()),
             _ => {
                 return Err(CmdError::new(
                     2,
@@ -683,6 +687,16 @@ fn search(args: Args) -> CmdResult {
             }
         }
     }
+    let mode = match mode.as_deref() {
+        None | Some("hybrid") => SearchMode::Hybrid,
+        Some("text") => SearchMode::Text,
+        Some(other) => {
+            return Err(CmdError::new(
+                2,
+                format!("search: bad --mode {other}\n{usage}"),
+            ));
+        }
+    };
     let root = need(&mut args, usage)?;
     let ws = need(&mut args, usage)?;
     let query = need(&mut args, usage)?;
@@ -702,6 +716,8 @@ fn search(args: Args) -> CmdResult {
             offset,
             seed: seed.as_deref(),
             path_glob: path_glob.as_deref(),
+            lang: lang.as_deref(),
+            mode,
         },
     ))
 }

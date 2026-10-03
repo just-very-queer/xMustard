@@ -24,6 +24,9 @@ var schemaV3ReviewSubjects string
 //go:embed schema_v4_dedupe.sql
 var schemaV4Dedupe string
 
+//go:embed schema_v5_collection_members.sql
+var schemaV5CollectionMembers string
+
 // migration is one forward-only schema step. Migrations are append-only: an applied
 // migration's SQL may never change, which Open verifies through its checksum. Later
 // workstreams add a step here (for example 0002) and keep every earlier one.
@@ -38,6 +41,7 @@ var migrations = []migration{
 	{version: 2, name: "run-independent outcomes", sql: schemaV2RunOutcomes},
 	{version: 3, name: "review subjects on the shared tables", sql: schemaV3ReviewSubjects},
 	{version: 4, name: "dedupe postings, corroborations and quotas", sql: schemaV4Dedupe},
+	{version: 5, name: "collection membership", sql: schemaV5CollectionMembers},
 }
 
 // applicationID marks the file as a govstore database ("xGOV" in ASCII).

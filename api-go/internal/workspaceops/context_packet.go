@@ -1965,7 +1965,7 @@ func readWorktreeStatus(root string) *WorktreeStatus {
 		IsGitRepo:  false,
 		DirtyPaths: []string{},
 	}
-	output, err := exec.Command("git", "-C", root, "status", "--branch", "--porcelain=v2").CombinedOutput()
+	output, err := exec.Command("git", "-C", root, "status", "--branch", "--porcelain=v2", "-z").CombinedOutput()
 	if err != nil {
 		if _, lookErr := exec.LookPath("git"); lookErr != nil {
 			return result
@@ -1978,40 +1978,75 @@ func readWorktreeStatus(root string) *WorktreeStatus {
 	noteGitSpawn()
 	result.Available = true
 	result.IsGitRepo = true
-	for _, line := range strings.Split(string(output), "\n") {
-		result.addPorcelainV2Line(line)
-	}
+	result.addPorcelainV2Records(splitNULRecords(output))
 	if len(result.DirtyPaths) > 20 {
 		result.DirtyPaths = result.DirtyPaths[:20]
 	}
 	return result
 }
 
-// addPorcelainV2Line folds one line of `git status --branch --porcelain=v2` into the
-// status, by its record type: a branch header, an untracked path, or a changed entry
-// (ordinary, renamed or unmerged). Ignored ("!") and unknown lines are skipped.
-func (w *WorktreeStatus) addPorcelainV2Line(line string) {
-	kind, rest, ok := strings.Cut(line, " ")
-	if !ok {
-		return
-	}
-	switch kind {
-	case "#":
-		w.addBranchHeader(rest)
-	case "?":
-		w.UntrackedFiles++
-		w.DirtyFiles++
-		w.DirtyPaths = append(w.DirtyPaths, strings.TrimSpace(rest))
-	case "1", "2", "u":
-		parts := strings.Fields(line)
-		if len(parts) < 3 {
-			return
+// splitNULRecords cuts NUL-terminated `git status --porcelain=v2 -z` output into
+// records, dropping the empty tail the final NUL leaves behind.
+func splitNULRecords(out []byte) []string {
+	parts := strings.Split(string(out), "\x00")
+	records := make([]string, 0, len(parts))
+	for _, p := range parts {
+		if p != "" {
+			records = append(records, p)
 		}
-		xy := parts[1]
-		w.DirtyFiles++
-		w.DirtyPaths = append(w.DirtyPaths, parts[len(parts)-1])
-		if len(xy) > 0 && xy[0] != '.' {
-			w.StagedFiles++
+	}
+	return records
+}
+
+// porcelainV2FixedFields is how many leading space-separated fields a record carries
+// before its path, by record type. Under `-z` a path is one whole field whatever it
+// contains, so the path is read from this offset onward rather than by splitting the
+// rest of the line. Type "2" (renamed or copied) is followed by a second record
+// holding the origin path.
+var porcelainV2FixedFields = map[string]int{
+	"1": 8,  // <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>
+	"2": 9,  // <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>
+	"u": 10, // <XY> <sub> <m1> <m2> <m3> <mW> <h1> <h2> <h3> <path>
+}
+
+// addPorcelainV2Records folds the records of `git status --porcelain=v2 -z` into the
+// status, by record type: a branch header, an untracked path, or a changed entry
+// (ordinary, renamed or unmerged). Ignored ("!") and unknown records are skipped. A
+// rename or copy consumes the record after it, which is its origin path.
+func (w *WorktreeStatus) addPorcelainV2Records(records []string) {
+	for i := 0; i < len(records); i++ {
+		record := records[i]
+		kind, rest, ok := strings.Cut(record, " ")
+		if !ok {
+			continue
+		}
+		switch kind {
+		case "#":
+			w.addBranchHeader(rest)
+		case "?":
+			w.UntrackedFiles++
+			w.DirtyFiles++
+			w.DirtyPaths = append(w.DirtyPaths, rest)
+		case "1", "2", "u":
+			fields := strings.SplitN(rest, " ", porcelainV2FixedFields[kind])
+			if len(fields) < porcelainV2FixedFields[kind] {
+				continue
+			}
+			// A rename or copy is followed by a second record holding its origin.
+			// Without one the stream is truncated, so the record is skipped rather
+			// than counted with an origin that was never read.
+			if kind == "2" && i+1 >= len(records) {
+				continue
+			}
+			xy := fields[0]
+			w.DirtyFiles++
+			w.DirtyPaths = append(w.DirtyPaths, fields[len(fields)-1])
+			if kind == "2" {
+				i++
+			}
+			if len(xy) > 0 && xy[0] != '.' {
+				w.StagedFiles++
+			}
 		}
 	}
 }
