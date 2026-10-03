@@ -54,6 +54,13 @@ func TestResourceReadsApplyTheReadOnlyGate(t *testing.T) {
 		{"read args only", whyFailedTool, map[string]string{"run_id": "oc_1"}, map[string]any{"run_id": "oc_1"}},
 	}
 	for _, tc := range cases {
+		// Each case gets its own copy of the tool. The package's tool vars are shared and
+		// another test in this file sets recallTool.WriteArgs for its own case, so reading
+		// the package var made this test's answer depend on the order go test ran the
+		// tests in: the write-args case stopped being a write-args case.
+		tool := *tc.tool
+		tc.tool = &tool
+
 		named := newSession(t, &fakeAPI{}, Options{WorkspaceID: "bound", ReadOnly: true}, nil, LatestProtocolVersion)
 		namedRes, _, namedErr := named.callKnownTool(context.Background(), tc.tool, tc.raw)
 		if namedErr != nil {

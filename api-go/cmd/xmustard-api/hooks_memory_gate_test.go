@@ -152,6 +152,9 @@ func TestDisabledRecallKeepsTheNonMemoryContextOfAPreToolUse(t *testing.T) {
 // could tell the two placements apart. The counter is what tells them apart — it is the same
 // shape stalenessChecks already uses, and the same reason.
 func TestDisabledRecallRanksNoMemoryForAHook(t *testing.T) {
+	// The counter is process-wide, so compare deltas: another test in this binary ranking
+	// memory is not this test's failure, and asserting an absolute zero would be.
+	before := workspaceops.HookMemoryRanks()
 	f := hookMemoryFixture(t, exposurePosture{DisabledTools: map[string]bool{"recall": true}})
 	for _, step := range []struct{ session, event string }{{"a", "PreToolUse"}, {"b", "PreToolUse"}} {
 		fields := map[string]any{"session_id": step.session, "cwd": f.root, "hook_event_name": step.event,
@@ -161,10 +164,11 @@ func TestDisabledRecallRanksNoMemoryForAHook(t *testing.T) {
 		}
 		f.post(t, f.agent, step.event, hookEvent(fields))
 	}
-	if n := workspaceops.HookMemoryRanks(); n != 0 {
-		t.Errorf("a hook ranked the memory store %d times with recall disabled; the refusal must come before the read", n)
+	if n := workspaceops.HookMemoryRanks() - before; n != 0 {
+		t.Errorf("a refused hook ranked the memory store %d times; the refusal must come before the read", n)
 	}
 
+	after := workspaceops.HookMemoryRanks()
 	served := hookMemoryFixture(t, exposurePosture{})
 	_, body := served.post(t, served.agent, "PreToolUse", hookEvent(map[string]any{
 		"session_id": "c", "cwd": served.root, "hook_event_name": "PreToolUse", "tool_name": "Grep",
@@ -172,7 +176,7 @@ func TestDisabledRecallRanksNoMemoryForAHook(t *testing.T) {
 	if !strings.Contains(hookContext(t, body), "billing rounding") {
 		t.Fatalf("with recall served the hook pushed no memory, so the counter cannot see the refused case either: %s", body)
 	}
-	if workspaceops.HookMemoryRanks() == 0 {
+	if workspaceops.HookMemoryRanks() == after {
 		t.Error("with recall served the hook ranked nothing, so the counter cannot see the refused case either")
 	}
 }

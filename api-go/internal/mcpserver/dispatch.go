@@ -80,7 +80,7 @@ func readOnlyRefusal(readOnly bool, t *Tool, args map[string]string) string {
 // one of them has to be mislabelled. The return is any, not map[string]any, so the shape is
 // a property a test can observe rather than a property of the signature.
 func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) any {
-	text := readOnlyRefusal(false, t, args) // M5: the resource ignores the mode
+	text := readOnlyRefusal(readOnly, t, args)
 	if text == "" {
 		return nil
 	}

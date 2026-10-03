@@ -193,6 +193,10 @@ type HookMemory struct {
 // stalenessChecks uses, for asserting that a hook whose caller may not use recall reads no
 // memory store at all. Without it, a guard placed after the read and one placed before it
 // produce identical answers, so no test can tell them apart.
+//
+// It is process-wide, so a test asserting zero must compare against a value read before the
+// calls it makes, not against zero: another test in the same binary ranking memory is not a
+// failure of this one.
 var hookMemoryRanks atomic.Int64
 
 // HookMemoryRanks is how many store rankings hooks have asked for since the process
