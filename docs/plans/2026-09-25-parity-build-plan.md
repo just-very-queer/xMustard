@@ -1338,6 +1338,58 @@ The fix is to stop parsing the text form. `git status --porcelain=v2 -z` emits N
 - *Checks.* `BOXALL` on the reviewed head; the three measurement runs above; `make check-rss-lines`; `cargo fmt --check` is not run locally (the `macshim` allows `cargo fmt` but this row changes no Rust file, so there is nothing to format). Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no Rust source at all, no index behaviour, no memory store, no Pi source, no route gate row, no projection and no `tools/list` byte, and touches no Go file, no route, no gate table, no `main.go`, no dispatch entry, no `go-calls.txt` line and no heavy-table row, so §3.0 names none of them. `BUD` in particular is not owed: no resident component, cache or in-heap structure was added to the product.
 - *Follow-ups.* (1) The goal's §3.3 note for this row quotes a figure that belongs to a different benchmark, and the same §2.3 table carries 24.7-25.2 MiB for a different subject; anyone reading the row as "this test is near its line" will draw the wrong conclusion. Owner: the goal's author, for the queue text. (2) `cargo test --workspace` captures a test binary's `eprintln!`, so an RSS fixture that reports its peak by `eprintln!` cannot be measured inside a whole-suite run — the suite has to be run alongside a separate `--nocapture` invocation of the same binary. That cost this row two whole-suite box calls and it will cost the next row that measures a peak the same way; `make check-rss-lines` would print every peak if it passed `--nocapture`, which is a one-flag change to the target WS-HYG-02 owns. Owner: the next row that needs a peak figure under full-suite load. (3) `memprobe`'s `Peaks.tree_rss` and `Peaks.rss` never diverged by more than 0.3 MiB in 33 readings on this fixture, so `tree_rss`'s "covers the child's own children" doc comment is accurate but the extra `git ls-files` child cost nothing measurable here — worth knowing before anyone treats it as the loose reading in another row. Owner: whoever next reads these probes.
 
+### WS-FLK-08 — memprobe is all-or-nothing: a memory guard that never sampled passes
+
+**Goal.** `memprobe::child_peaks` (`rust-core/tests/memprobe/mod.rs:113`) accumulates a child's
+peak `dirty` and `rss` by sampling `sample(pid)` in a 1 ms loop, and initialises both to `0`.
+`sample` returns `None` whenever `/proc/<pid>/status` cannot be read, so a loop whose every
+iteration reads `None` returns `Peaks { dirty: 0, rss: 0, .. }`. Every memory guard in the suite
+then asserts an upper bound against a reading of zero and passes vacuously: `mib <= 25.0` is
+`0.0 <= 25.0`. `tree_rss` is not affected — it comes from `wait4(2)` rusage, which the kernel
+fills regardless of sampling. The row closes that hole by asserting `peaks.rss > 0` (and
+`peaks.dirty > 0` where a dirty bound is asserted) **before** the bound is checked, so a guard
+that never sampled fails loudly instead of passing. The source of the hole is named in the
+goal's own §3.3 note as "memprobe all-or-nothing (WS-FIX-06/H6)" with the instruction "Add
+`peaks.rss>0` asserts"; that is the whole of this row's scope.
+
+**Requirements.** No new PAR ids. This is test hygiene: it closes no requirement and adds no
+product behaviour. §6 A1's "a skipped test is not a pass" is the rule at stake — a guard that
+reads zero is the same defect wearing a different hat — and §5.1 rule 11 forbids the alternative
+repair, which would be to loosen or delete the bound. Nothing about what the product does
+changes: the same index builds still run, the same 25 MiB release line still holds, and the
+same numbers are still reported.
+
+**Files.** `rust-core/tests/memprobe/mod.rs` (a `Peaks` precondition helper, so one place
+carries the assertion rather than five call sites each re-deriving it), `rust-core/tests/index_build.rs`,
+`rust-core/tests/lang_fixtures.rs`, `rust-core/tests/run_wrapper.rs`, `rust-core/tests/index_query.rs`
+(the guard call sites), `docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+**Tests required.**
+- The hole is demonstrated before it is closed: a mutation that forces `sample` to return
+  `None` on every iteration must turn each guarded test **red** with the new assertion's
+  message, not green. This is the row's TDD step and it is the whole reason the row exists —
+  the defect is invisible while every guard is green.
+- Each mutation row is one call site, restored from a tree `git status --short` showed clean,
+  with its FAIL line and the tree state after the restore recorded.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines are byte-identical to the
+  merge base, and `BUILD_5000_DIRTY_MIB` (6 MiB) and `rss_line(25.0, 32.0)` are unchanged.
+- `BOXALL` green on the box, so every guard in the suite runs with the assertion present.
+
+**Acceptance.** Every `child_peaks` consumer asserts a sampled reading before it asserts a bound,
+so `peaks.rss == 0` (or `peaks.dirty == 0` on a dirty bound) fails with a message naming the
+probe and the fix rather than passing as `0.0 <= line`. `make check-rss-lines` stays green on
+the box in the release profile, clippy's warning count does not rise, and `cargo fmt --check` is
+clean.
+
+**Collision risk.** `rust-core/tests/memprobe/mod.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which is the last row to have edited it; its `Serve::mem_settled` reader lives in
+`tests/index_query.rs`, not in `memprobe`, so this row does not touch that reader. Lane C is the
+only lane in this build that edits `rust-core` sources. WS-FLK-02 (merged `799d8c8`) owns the
+*distribution* of `build_of_5000_files_has_no_file_cap_and_peaks_under_25_mib` and closed as not
+reproduced; this row does not change that test's bounds or its expected values — it adds the
+precondition that makes the bound it already asserts meaningful, and WS-FLK-02's record is
+untouched.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
