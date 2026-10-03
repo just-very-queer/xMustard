@@ -188,13 +188,33 @@ fn shared_prefix(names: &[String]) -> Option<String> {
     // Candidates come from every member, not from the first one: `rows` is ordered by
     // (path, line, name), so the first member shares no leading word with the rest often
     // enough that seeding from it alone missed a prefix two later members do share.
-    let stems: Vec<Vec<String>> = names.iter().map(|n| word_stems(n.as_str())).collect();
-    let mut candidates: Vec<String> = stems.iter().flat_map(|s| s.iter().cloned()).collect();
-    // Longest first, so the longest shared stem wins; duplicates collapse.
+    //
+    // Only a member's *leading word* counts, with that word's singular form alongside it:
+    // `word_stems` returns a name's words in order and puts the singular after the
+    // plural, so `feeds` offers both `feeds` and `feed`. Matching anywhere in the list
+    // would let `InvoiceStore` and `PaymentStore` share `store` — a common suffix, not a
+    // prefix, and not what this rule is named.
+    let leading: Vec<Vec<String>> = names
+        .iter()
+        .map(|n| {
+            let words = word_stems(n.as_str());
+            // `word_stems` emits each word followed by its singular, so the first word is
+            // `words[0]` and its singular is `words[1]` when there is one. Everything past
+            // that belongs to a later word in the name and cannot make a prefix.
+            let is_singular = words.get(1).is_some_and(|s| words[0].len() == s.len() + 1);
+            if is_singular {
+                vec![words[0].clone(), words[1].clone()]
+            } else {
+                vec![words[0].clone()]
+            }
+        })
+        .collect();
+    let mut candidates: Vec<String> = leading.iter().flatten().cloned().collect();
+    // Longest first, so the longest shared leading stem wins; duplicates collapse.
     candidates.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
     candidates.dedup();
     for candidate in candidates {
-        let shared = stems.iter().filter(|s| s.contains(&candidate)).count();
+        let shared = leading.iter().filter(|s| s.contains(&candidate)).count();
         if shared >= LABEL_MIN_MEMBERS {
             best = Some(candidate);
             break;
@@ -388,14 +408,16 @@ fn project<'a>(
     let mut rows: Vec<SymRow> = Vec::new();
     let mut key: Vec<u64> = Vec::new();
     let mut symbols = 0u64;
+    // Counted after admission, not before: `resolved_files()` decides which symbols the
+    // projection can see, so counting the rest would let the answer report more than 10k
+    // symbols while the mode threshold — which counts only resolved files — kept it in
+    // standard mode. The two figures would then describe different sets.
     for s in 0..seg.counts().symbols {
         let row = seg.symbol(s)?;
-        if !row.local {
-            symbols += 1;
-        }
         if row.local || !resolved.get(row.file as usize).copied().unwrap_or(false) {
             continue;
         }
+        symbols += 1;
         slot[s as usize] = nodes.len() as u32;
         nodes.push(seg.symbol_node(s));
         rows.push(row);
@@ -403,7 +425,8 @@ fn project<'a>(
     }
     // Both directions are read per node and a pair is kept once, so the CSR holds one
     // undirected edge per pair rather than two.
-    let mut pairs: BTreeMap<(u32, u32), (u64, u8)> = BTreeMap::new();
+    // (weight, dropped-below-floor edge count)
+    let mut pairs: BTreeMap<(u32, u32), (u64, u64)> = BTreeMap::new();
     let mut dropped_low_confidence = 0u64;
     for (i, &node) in nodes.iter().enumerate() {
         for dir in [Direction::Downstream, Direction::Upstream] {
@@ -417,7 +440,11 @@ fn project<'a>(
                 let Some(other) = edge.node.checked_sub(files) else {
                     continue;
                 };
-                let j = slot[other as usize];
+                // `other` is a graph node id, not a symbol-row index: the slot map is
+                // sized by the segment's symbol count, so a node id past it would panic.
+                let Some(&j) = slot.get(other as usize) else {
+                    continue;
+                };
                 if j == u32::MAX || j == i as u32 {
                     continue;
                 }
@@ -426,21 +453,29 @@ fn project<'a>(
                 } else {
                     (j, i as u32)
                 };
-                let slot = pairs.entry(pair).or_insert((0u64, u8::MAX));
+                // The confidence floor is per edge, before the pair is combined. Applying
+                // it to the pair's minimum afterwards let one weak CALLS edge remove a
+                // separate high-confidence edge between the same two symbols, which is not
+                // what PAR-SYM-08 says: the rule is about an edge's own confidence. The
+                // count is still per pair, so it answers for both directions at once.
+                if large && edge.confidence < LARGE_MIN_CONFIDENCE {
+                    pairs.entry(pair).or_insert((0u64, 0u64)).1 += 1;
+                    continue;
+                }
+                let slot = pairs.entry(pair).or_insert((0u64, 0u64));
                 // u64, not u32: this accumulates over every matching record in both
                 // directions, and a u32 would overflow (and panic in debug builds) on a
                 // pair with a large number of repeated edges.
                 slot.0 += edge.weight as u64 * edge.confidence as u64;
-                slot.1 = slot.1.min(edge.confidence);
             }
         }
     }
-    // PAR-SYM-08's confidence rule, applied after the pairs are known so one drop count
-    // answers for both directions of every low-confidence pair.
     let mut edges: Vec<(u32, u32, u32)> = Vec::with_capacity(pairs.len());
-    for ((a, b), (w, conf)) in pairs {
-        if large && conf < LARGE_MIN_CONFIDENCE {
-            dropped_low_confidence += 1;
+    for ((a, b), (w, dropped)) in pairs {
+        // A pair with no surviving edge contributes no weight: its records were all below
+        // the floor, so there is nothing to project even though it was seen.
+        dropped_low_confidence += u64::from(dropped > 0);
+        if w == 0 {
             continue;
         }
         // The CSR's per-entry weight is u32; the pair total is accumulated in u64 above so
@@ -668,10 +703,14 @@ fn keywords(rows: &[(String, u32, String, u32)], sample: usize) -> Vec<String> {
         }
         *counts.entry(name.clone()).or_default() += 1;
     }
+    // The cap covers the whole list: folders are taken first but they are bounded too, or an
+    // area spread over more than MAX_KEYWORDS folders would exceed the bound before a
+    // single name keyword was considered.
     let mut out: Vec<String> = folder
         .into_iter()
         .filter(|(_, n)| *n >= LABEL_MIN_MEMBERS)
         .map(|(f, _)| f)
+        .take(MAX_KEYWORDS)
         .collect();
     for (n, c) in counts {
         if out.len() >= MAX_KEYWORDS {

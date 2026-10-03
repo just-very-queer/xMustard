@@ -98,6 +98,7 @@ struct Area {
     rule: String,
     size: u64,
     cohesion: f64,
+    cohesion_sample: u64,
     keywords: Vec<String>,
     members: BTreeSet<String>,
     /// The member rows in the order the answer lists them, as (path, line, name) — the
@@ -117,6 +118,7 @@ fn read_areas(v: &Value) -> Vec<Area> {
             rule: a["label_rule"].as_str().unwrap().to_string(),
             size: a["size"].as_u64().unwrap(),
             cohesion: a["cohesion"].as_f64().unwrap(),
+            cohesion_sample: a["cohesion_sample"].as_u64().unwrap(),
             keywords: a["keywords"]
                 .as_array()
                 .unwrap()
@@ -709,6 +711,21 @@ fn cohesion_samples_at_most_fifty_members() {
         widest.size > 50,
         "the fixture must produce an area above the sample size, got {}",
         widest.size
+    );
+    // The sample the answer reports, not only the constant: cohesion computed over all
+    // 200 members would still report 50 here.
+    assert_eq!(
+        widest.cohesion_sample, 50,
+        "the reported sample is not the cap: {v:#}"
+    );
+    // And the figure is the one a 50-member sample gives, which a 200-member count cannot
+    // reproduce: the 200 members form 199 edges, so the full count is 1.0 while the first
+    // 50 members by (path, line, name) are Hub plus M0..M48, of which 49 pairs share an
+    // edge.
+    assert_eq!(
+        widest.cohesion,
+        49.0 / 1225.0,
+        "cohesion was not computed over the capped sample: {v:#}"
     );
 }
 
