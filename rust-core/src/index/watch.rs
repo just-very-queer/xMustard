@@ -1547,6 +1547,13 @@ pub fn git_epoch(root: &Path) -> Option<u64> {
     REGISTRY.get()?.git_epoch(root)
 }
 
+/// Whether the watcher sees every change to `state`'s key. A nested repository's HEAD is
+/// part of the key, but inotify watches no directory inside a Git dir (`walk_tree`), so
+/// only a recursive native stream sees a commit inside one (WS-RT2).
+fn memo_sees(state: &RepoState, recursive: bool) -> bool {
+    recursive || state.identity.nested_repos.is_empty()
+}
+
 /// `root`'s repository state: the watcher's last observation while it vouches that
 /// nothing changed since (its state is `ok`, it sees every path Git can report, and no
 /// event arrived since the observation began), else `observe()`, kept for the next
@@ -1560,7 +1567,9 @@ pub fn memo(root: &Path, observe: impl FnOnce() -> Arc<RepoState>) -> (Arc<RepoS
     {
         let mut inner = lock(&r.inner);
         match &inner.memo {
-            Some((at, state)) if vouches && *at == epoch => {
+            Some((at, state))
+                if vouches && *at == epoch && memo_sees(state, recursive_native()) =>
+            {
                 let state = state.clone();
                 inner.counters.memo_hits += 1;
                 return (state, true);
@@ -1707,6 +1716,24 @@ mod tests {
         assert!(root.change_epoch.load(Ordering::Acquire) > before);
         let inner = lock(&root.inner);
         assert_eq!((inner.counters.paths, inner.counters.git_events), (0, 0));
+    }
+
+    // On inotify a memo whose key covers a nested repository's HEAD is not reused: no
+    // watch sits inside that repository's Git dir.
+    #[test]
+    fn a_memo_with_nested_repositories_is_reused_only_by_a_recursive_stream() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut state = crate::indexcache::observe_repo_state(dir.path());
+        assert!(memo_sees(&state, false) && memo_sees(&state, true));
+        state
+            .identity
+            .nested_repos
+            .push(crate::indexcache::NestedRepo {
+                path: "sub".into(),
+                kind: crate::indexcache::NESTED_UNTRACKED.into(),
+            });
+        assert!(!memo_sees(&state, false));
+        assert!(memo_sees(&state, true));
     }
 
     #[test]
