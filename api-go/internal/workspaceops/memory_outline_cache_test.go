@@ -42,8 +42,8 @@ func trustOutlineCache(t *testing.T) { setOutlineTrustWindow(t, 0) }
 
 // A file that changes between the read and the store must not be cached: the hash came
 // from the old text, so storing it under the new mark would let a later pass serve that
-// stale hash as current and the edit would never be marked. The stub outline rewrites the
-// file, which is the moment the mark moves.
+// stale hash as current and the edit would never be marked. The outline stub rewrites
+// the file, which is when the mark moves.
 func TestAFileChangedWhileItWasReadIsNotCached(t *testing.T) {
 	resetOutlineCache(t)
 	trustOutlineCache(t)
@@ -207,7 +207,7 @@ func TestTheHeldTotalIsExactAcrossAReplacement(t *testing.T) {
 // The mark carries a real inode and ctime, not only size and mtime: os.FileInfo.Sys()
 // returns *syscall.Stat_t, so an assertion to another stat type silently degrades the
 // mark and an atomic same-size replacement with a preserved mtime keeps its identity.
-// This test is the one that would have caught that, so it asserts the fields themselves.
+// The fields are asserted directly, so a mark that lost them fails here.
 func TestAMarkCarriesItsInodeAndCtime(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o644); err != nil {
