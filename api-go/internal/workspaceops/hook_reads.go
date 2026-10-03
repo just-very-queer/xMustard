@@ -145,6 +145,23 @@ var hookUnsampled = []string{"drift", "baseline", "changed_files", "dirty_symbol
 // failed runs and open failures, and the memory section. The change and index fields
 // are listed unknown with the reason, never guessed; the ground tool samples them.
 func HookGrounding(ctx context.Context, dataDir, workspaceID, caller string) *SessionGrounding {
+	return hookGrounding(ctx, dataDir, workspaceID, func(g *SessionGrounding) {
+		g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller, groundMemoryOptions{since: noSince})...)
+	})
+}
+
+// HookGroundingNoMemory is HookGrounding without its memory section, for a deployment
+// that serves this caller no recall: a hook must not reach memory through the ground line
+// either, and a ground line whose memory fields read "unknown" says so rather than
+// guessing counts from a store the caller may not read. The run fields stay, because a
+// failed run is a run outcome and not memory. It reads no memory store at all.
+func HookGroundingNoMemory(ctx context.Context, dataDir, workspaceID string) *SessionGrounding {
+	return hookGrounding(ctx, dataDir, workspaceID, nil)
+}
+
+// hookGrounding is HookGrounding's shape: the unsampled fields, the run failures, and
+// whatever memory section the caller asked for (none means no store read).
+func hookGrounding(ctx context.Context, dataDir, workspaceID string, memory func(*SessionGrounding)) *SessionGrounding {
 	g := &SessionGrounding{WorkspaceID: workspaceID}
 	for _, f := range hookUnsampled {
 		g.Unknown = append(g.Unknown, GroundingUnknown{Field: f, Reason: "not sampled by a hook (hooks start no Rust or git process); call ground"})
@@ -155,7 +172,9 @@ func HookGrounding(ctx context.Context, dataDir, workspaceID, caller string) *Se
 		g.BlockedByFailingVerification = &failing
 	}
 	g.stampGenerated()
-	g.Unknown = append(g.Unknown, g.groundingMemory.build(dataDir, workspaceID, caller, groundMemoryOptions{since: noSince})...)
+	if memory != nil {
+		memory(g)
+	}
 	g.summarize()
 	return g
 }

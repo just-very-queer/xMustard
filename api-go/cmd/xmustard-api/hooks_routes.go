@@ -149,6 +149,15 @@ type hookCall struct {
 	key    hooks.SessionKey // the context's steering state
 	ws     workspaceops.ResolvedWorkspace
 	bound  bool // ws was resolved and passed the scope checks
+	// recallRefused: this caller may not use recall on this deployment, so no memory
+	// reaches this answer (grounding's projection and every push). A hook route names
+	// no Tool in the gate table, so the middleware's tool_disabled branch never fires
+	// for one and this field is where a deployment's disabled-tool switch is applied to
+	// a hook's memory. It is the predicate whoami and tools/list use, so a hook can
+	// never reach memory a recall call would be refused. The hook still answers: the
+	// refusal is the memory section, not the route, because watchPaths, the restored
+	// snapshot and the prior session's handoff are the caller's own session state.
+	recallRefused bool
 }
 
 // hookResult is what a handler produced. offered maps each memory a push considered to
@@ -251,7 +260,8 @@ func (s *hookServer) handle(client hooks.Client, ev hooks.Event) http.HandlerFun
 			return
 		}
 		caller, _ := principalScope(r)
-		call := &hookCall{r: r, client: client, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID, in.AgentID)}
+		call := &hookCall{r: r, client: client, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID, in.AgentID),
+			recallRefused: toolDisabledFor(postureFrom(r), callerOf(r), "recall")}
 		if ev.Mode == hooks.Enqueue {
 			s.enqueue(call)
 			writeHookAnswer(w, nil)
@@ -403,17 +413,30 @@ func (s *hookServer) subagentStart(ctx context.Context, c *hookCall) hookResult 
 // so FileChanged reports their edits. The projection is pushed once per context: when
 // every core entry it carries was already offered here (a resume), only the ground line
 // is sent. A projection that cannot be compiled pushes no memory (fail closed).
+// When the deployment serves this caller no recall (hookCall.recallRefused) the
+// projection is left out and the watch list is kept: watchPaths names the files memory is
+// anchored to, which the grounding index answers from the store's anchors alone.
 func (s *hookServer) grounding(ctx context.Context, c *hookCall, watch bool, session ...string) hookResult {
 	if !c.bound {
 		return hookResult{}
 	}
-	g := workspaceops.HookGrounding(ctx, dataDir(), c.ws.WorkspaceID, c.caller)
+	var g *workspaceops.SessionGrounding
+	if c.recallRefused {
+		// ground's spawn-free part without its memory section: the runs it reports are
+		// run outcomes, not memory, so a deployment that withholds recall still gets
+		// them and the ground line stays whole.
+		g = workspaceops.HookGroundingNoMemory(ctx, dataDir(), c.ws.WorkspaceID)
+	} else {
+		g = workspaceops.HookGrounding(ctx, dataDir(), c.ws.WorkspaceID, c.caller)
+	}
 	res := hookResult{context: hooks.Compose(append([]string{groundLine(c.ws, g)}, session...)...)}
-	budget := min(hooks.Room(res.context), hookProjectionChars)
-	if p, err := workspaceops.CoreProjection(ctx, dataDir(), c.ws.WorkspaceID, budget); err == nil && p.Text != "" {
-		offered := p.ProjectionOffered()
-		if ids := slices.Collect(maps.Keys(offered)); len(ids) == 0 || len(s.sessions.Unseen(c.key, ids)) > 0 {
-			res.context, res.offered = oneNotice(hooks.Compose(res.context, p.Text)), offered
+	if !c.recallRefused {
+		budget := min(hooks.Room(res.context), hookProjectionChars)
+		if p, err := workspaceops.CoreProjection(ctx, dataDir(), c.ws.WorkspaceID, budget); err == nil && p.Text != "" {
+			offered := p.ProjectionOffered()
+			if ids := slices.Collect(maps.Keys(offered)); len(ids) == 0 || len(s.sessions.Unseen(c.key, ids)) > 0 {
+				res.context, res.offered = oneNotice(hooks.Compose(res.context, p.Text)), offered
+			}
 		}
 	}
 	if idx, err := workspaceops.ReadHookMemoryIndex(ctx, dataDir(), c.ws.WorkspaceID); err == nil && watch {
@@ -675,8 +698,13 @@ const hookTooLarge = "too_large"
 // shows them. A candidate is considered once per context (until compaction): offered
 // maps each one to the text whose presence in the answer written marks it seen, its
 // frame or the note, so a memory whose frame or note never reached the client is
-// considered again. An admission error pushes nothing (fail closed).
+// considered again. An admission error pushes nothing (fail closed). A caller this
+// deployment serves no recall to pushes nothing either: the refused push is empty, so the
+// answer carries no memory and no note counting what was withheld.
 func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Surface, ids []string, stale map[string][]string, recall string, room int) (string, map[string]string) {
+	if c.recallRefused {
+		return "", nil
+	}
 	ids = s.sessions.Unseen(c.key, ids)
 	ids = ids[:min(len(ids), hookMaxCandidates)]
 	if len(ids) == 0 {
