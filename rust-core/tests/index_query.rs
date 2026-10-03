@@ -1206,24 +1206,41 @@ impl Serve {
         memprobe::sample(self.child.id()).expect("a memory sample of the service")
     }
 
-    /// One reading of the service once it has settled: every sample over
-    /// `settle_ms` is discarded and the reading is the last of them, so the
-    /// instant the window opens — when the service may still hold what the round
-    /// it just ran allocated — cannot leak into the figure. The single
-    /// instantaneous sample this replaced was the cause of WS-FLK-01: `steady`
-    /// and `after swap` name a settled service and neither delivered one, so the
-    /// two figures the bound checked depended on which instant the sample landed
-    /// on. `swap peak` was already a peak, taken while the swap ran.
+    /// One reading of the service once it has settled: samples until two consecutive
+    /// readings agree to within `SETTLE_STABLE_MIB` and the window is at least
+    /// `settle_ms` long, and the reading is the **peak** of the samples after the
+    /// first one. Waiting for the readings to stop moving is what makes the name
+    /// true — a fixed delay does not establish that anything settled, and a bound
+    /// read before the service has finished releasing the round it just ran
+    /// compares against a service that is still working. Keeping the peak of the
+    /// settled samples means a genuine regression inside the window is still
+    /// caught; only the samples before it are discarded.
+    ///
+    /// The single instantaneous sample this replaced was the cause of WS-FLK-01:
+    /// `steady` and `after swap` name a settled service and neither delivered one,
+    /// so the two figures the bound checked depended on which instant the sample
+    /// landed on. `swap peak` was already a peak, taken while the swap ran.
     fn mem_settled(&self, settle_ms: u64) -> memprobe::Mem {
-        let mut settled = self.mem();
-        let until = std::time::Instant::now() + Duration::from_millis(settle_ms);
-        while std::time::Instant::now() < until {
+        let within = (SETTLE_STABLE_MIB * memprobe::MIB) as u64;
+        let started = std::time::Instant::now();
+        // the pre-settlement instant: read once and never let it into the figure
+        let first = self.mem();
+        let mut previous = first;
+        let mut peak = first;
+        loop {
             std::thread::sleep(Duration::from_millis(5));
-            if let Some(m) = memprobe::sample(self.child.id()) {
-                settled = m;
+            let Some(m) = memprobe::sample(self.child.id()) else {
+                continue;
+            };
+            peak.rss = peak.rss.max(m.rss);
+            peak.dirty = peak.dirty.max(m.dirty);
+            let settled = started.elapsed() >= Duration::from_millis(settle_ms)
+                && m.dirty.abs_diff(previous.dirty) <= within;
+            previous = m;
+            if settled {
+                return peak;
             }
         }
-        settled
     }
 }
 
@@ -1320,15 +1337,22 @@ const OVERLAPPING: Lines = Lines {
     rss: 32.0,
 };
 
-/// How long `steady` and `after swap` let the service settle before reading them,
-/// in milliseconds. Both readings discard every sample inside the window and keep the
-/// last one, so the figure a bound checks is the service at rest rather than one
-/// instant's sample of it. Measured on the Linux build box at load 4.9-8.6 over 26
-/// runs: `steady` and `after swap` stop moving once the window opens, and the 0 ms
-/// reading of the same runs spread 4.3 MiB on `after swap` where the settled one does
-/// not. It is one 5 s sleep's tenth, and the swap already waits 3 s for the new
-/// generation to land.
+/// The shortest settle window `steady` and `after swap` wait out, in milliseconds.
+/// The window is a floor, not the settling rule: `mem_settled` also waits for two
+/// consecutive readings to agree, so a slower cleanup extends the wait instead of
+/// being read mid-flight. Measured on the Linux build box at load 3.3-8.6 over 26
+/// runs, `steady` and `after swap` stop moving inside 500 ms, so this is the floor
+/// every one of those runs cleared rather than a fitted constant. The swap already
+/// waits 3 s for the new generation to land.
 const SETTLE_MS: u64 = 500;
+
+/// How close two consecutive dirty readings must be for the service to count as
+/// settled, in MiB. `/proc/<pid>/status` is reported in whole pages, so two readings
+/// of a service that has stopped allocating differ by at most a page or two plus
+/// whatever the kernel has accounted; a quarter of a MiB is well inside the noise a
+/// settling allocator makes and well under the 0.3-0.5 MiB spread this row measured
+/// on the instantaneous reading.
+const SETTLE_STABLE_MIB: f64 = 0.25;
 
 /// Measure the service on the synthetic store: base after the handshake, then after
 /// queries, then during and after a snapshot swap with queries in flight.
