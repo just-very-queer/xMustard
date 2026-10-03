@@ -1574,6 +1574,64 @@ Lane C is the only lane in this build that edits `rust-core`. `rust-core/tests/i
 named by WS-FLK-02's row (merged `799d8c8`), also merged; this row does not change that file's
 bounds or its expected values.
 
+**Implementation record (branch parity/ws-fix-27, 2026-10-03).** Two files, all test code and this
+plan; `git diff --numstat 246e0b5 HEAD` gives the plan +94/-0 and `index_query.rs` +139/-15. No
+product source, no bound, no timeout, no retry, no dependency, no route or dispatch entry.
+- *What was built.* `rust-core/tests/index_query.rs`: one `index_dir()` built from
+  `tempfile::Builder::permissions(0o700)`, replacing `TempDir::new()` plus `tighten` at all four
+  sites that hand a directory to the index; `perm(mode)` and `mode_of_dir(dir)` keep the mode
+  literals in one place; `under_umask(mask, body)` re-invokes this test binary with
+  `--exact <child>` and reads a `UMASK_MODE=` line from it; two child tests print the mode for
+  `index_dir` and for a plain `TempDir`; `an_index_fixture_dir_is_owner_only_whatever_the_process_umask`
+  asserts `0o700` and `0o775` under umask `0002` and `0o600` under `0177`. `tighten` is gone, and
+  `TempDir::new` survives only in `repo()`, where the directory is a source tree rather than an
+  index directory.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64, debug profile unless `--release` is
+  named). Pre-fix under `umask 0002`: **9 passed**, the suite is green (`…T144047Z.log`), because
+  three of the four sites already had `tighten`. M3 (drop the explicit mode) fails with `left:
+  509` / `right: 448` under the same umask (`…T165838Z.log`); M1 also fails
+  `csr_equals_the_edges_table_and_reverse_edges_mirror_it` with `classify_dir`'s own refusal
+  naming `chmod 700` (`…T155850Z.log`); M2 **survived** (`…T160114Z.log`) and was killed only
+  after the test was strengthened (`…T161443Z.log`). Child arms green: 3 passed (`…T165817Z.log`,
+  and with the `0177` arm `…T174650Z.log`). `BOXALL` on `8d9358f0`: `remote_exit=0`,
+  `clippy_warnings=6`, `rss_lines=ok`, 24 Go packages and 18 Rust binaries, `…T184240Z.log`.
+  `cargo fmt --check` exit 0 locally.
+- *Deviations.* (1) The row's own text said three tests fail under `umask 0002`; that was wrong
+  on my own measurement and is corrected above and in the Goal — the defect was latent at three
+  sites and live at one that skips by default. (2) The umask half runs in a child process rather
+  than in-process, because a process-global `umask` is not safe in a binary whose tests run in
+  parallel threads; this was round 1's finding from all three channels. (3) Three further
+  low-severity rounds narrowed prose claims about the umask (rounds 2-4); no behaviour changed
+  after `da7c17ab`.
+- *Review.* Round 1 (`reviews/ws-fix-27/r1`): 2 codex-spec (1 medium, 1 low) + 1 OCR medium + 1
+  `codex-review` `[P2]`, all one defect — the test never set the permissive umask; fixed in
+  `da7c17ab`. Round 2 (`r2`): 1 low, the `0700`-under-any-umask overclaim; fixed in `e190522f`.
+  Round 3 (`r3`): 2 lows, the guard's mask is `mode & 0o022` so `0700` is stronger than required;
+  fixed in `f851838c`. Round 4 (`r4`): 2 lows, the `0777` figure is `0o000` not `0o600` and the
+  `0177` case is not result-independent; fixed in `8d9358f0`, the gate's head. `gate=PASS
+  changed=2 covered=2 channel_findings=2 triaged=2 reviewer=gpt-6-sol` on r4; the five earlier
+  rounds' entries are in `r4/triage-all-rounds.json` because the gate reviews one sealed round.
+  `triage-check.md` returns DISAGREE on the standing behaviour-free objection (prose findings owe
+  no test); answered in `r4/triage-notes.md`. OCR's channel contributed nothing structural
+  (`ocr_review=0`) and the OpenCode channel reads `unavailable`.
+- *Merge recheck.* Recorded in `reviews/ws-fix-27/r4/merge-recheck.md`.
+- *Checks.* `xm-box.sh check <wt> all -count=1` (BOXALL) as cited; `cargo test --locked --test
+  index_query` under `umask 0002` and via the in-test children; `cargo fmt --check`. **not run:**
+  RET, BUD, PI, CAPS, SECDOC, GOLD — §3.0 names none of them for a row that changes no index
+  behaviour, no memory store, no Pi source, no route gate, no projection and no `tools/list`
+  byte; BUD is explicitly not owed, as no resident component or in-heap structure was added.
+- *Follow-ups.* (1) **`xm-box.sh run` can gate a stale binary and a stale red reads exactly like
+  a real one**: `…T161604Z.log` reported `remote_exit=1` for a test that passes on every later run
+  of a clean tree, and the log's tell is the absence of a `Compiling` line. Proposed owner:
+  whoever maintains `xm-box.sh`. (2) `xm-review-run.sh` refuses a pre-existing `r<N>`, so the
+  hand-written `slop-audit.md` and `dogfood.md` had to be staged outside the round directory and
+  copied in; proposed owner the review runner. (3) The gate reads S12/S13 only as `##` headings
+  and wants each S5 test named on a line carrying `FAIL`, which is narrower than §4.6's prose;
+  proposed owner the gate. (4) Three `dogfood:` lines in `reviews/ws-fix-27/r4/dogfood.md` — MCP
+  `search` ranked a Go reducer and a React prop above the Rust `fn classify_dir` the query named,
+  `explain` returned not-found for a tracked test file, and `impact symbol=index_dir` returned
+  `defined_in: []` with no reason; proposed owner WS-FIX-15, as in every prior row.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
