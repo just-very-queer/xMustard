@@ -560,6 +560,66 @@ fn seeds_are_listed_from_the_highest_score_to_the_lowest() {
         40,
         "the cap stopped 40 of the 240 candidates: {v:#}"
     );
+    // And the ranks the cap removed are the low ones: no kept seed scores below the
+    // weakest rank still present, and every rank from the top down to that one is there.
+    // This is what makes the list's ORDER load-bearing rather than incidental — with the
+    // wrong 40 kept, the weakest score present would be 2 rather than 4.
+    assert!(
+        scores.iter().all(|s| *s >= 4.0),
+        "the cap kept no low-ranked candidate: {scores:?}"
+    );
+}
+
+/// The cap keeps the top 200 SCORING candidates, so the 40 it drops are the lowest.
+///
+/// The companion test asserts the same fixture's list order; this one asserts WHICH 40 are
+/// gone, which is the cap's actual promise. A cap that truncated by index rather than by
+/// score would keep the same number and report the same pool, and would pass every
+/// sortedness assertion the other test makes.
+#[test]
+fn the_cap_keeps_the_highest_scoring_candidates_and_drops_the_rest() {
+    let mut src = String::from("package pkg\n\n");
+    for i in 0..240usize {
+        let rank = i % 8;
+        src.push_str(&format!("func Entry{i:03}() {{\n"));
+        for leaf in 0..=rank {
+            src.push_str(&format!("\tEntry{i:03}Leaf{leaf}()\n"));
+        }
+        src.push_str("}\n");
+        for leaf in 0..=rank {
+            src.push_str(&format!("func Entry{i:03}Leaf{leaf}() {{}}\n"));
+        }
+    }
+    let d = repo(&[GO_MOD, ("pkg/dropped.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let seeds = read_seeds(&v);
+    // The 40 dropped candidates are the ones the cap saw and did not keep, and they are
+    // the LOWEST scoring 40: the answer reports the pool beside the kept list, so a cap
+    // that dropped the wrong 40 would still report 240 but would keep a 2.
+    assert_eq!(v["candidates"].as_u64().unwrap(), 240, "the pool: {v:#}");
+    assert_eq!(seeds.len(), 200, "the kept list: {v:#}");
+    assert!(
+        seeds.iter().all(|s| s.score >= 4.0),
+        "the kept 40 are the lowest, not the highest: {v:#}"
+    );
+    // Every rank the cap removed is entirely absent from the kept list. Measured: the kept
+    // 200 all score 4 or more, so the whole rank-0 group (score 2) and the score-4 group's
+    // lower half are gone. Rank 0 is `Entry000`, `Entry008`, `Entry016`, ... — every
+    // eighth entry — so those names are the ones that must be absent, and which of them
+    // survive the cut depends on the tie-break, so the assertion names the two that the
+    // measured answer shows are gone rather than deriving them.
+    assert_eq!(
+        seeds.iter().filter(|s| s.score < 4.0).count(),
+        0,
+        "no score-2 candidate survives the cut: {v:#}"
+    );
+    for name in ["Entry000", "Entry232"] {
+        assert!(
+            !seeds.iter().any(|s| s.name == name),
+            "{name} scores 2 and must have been dropped: {v:#}"
+        );
+    }
 }
 
 /// Two seeds with identical scores are ordered by (path, line, name), so the list is the
@@ -897,13 +957,16 @@ fn a_flow_takes_its_shared_name_stem_and_says_so() {
     assert_eq!(f.rule, "name_stem", "{f:?}");
 }
 
-/// The stem is cut back to a WHOLE word, not left as the longest shared character prefix.
+/// The stem is cut back to a WHOLE word, and the cut is what separates this rule from
+/// "take the longest shared character prefix".
 ///
-/// `HarvestOne` and `HarvestTwo` share ten characters, so a rule that stopped at the common
-/// prefix would also answer `Harvest` — this fixture is chosen so the two rules differ.
-/// The names here share the five characters `Batch` and then diverge inside the next word
-/// (`BatchOne`/`BatchTwo` against `BatchList`), so the character prefix is `BatchO`/`BatchL`
-/// depending on the pair while the whole-word stem is `Batch`.
+/// `BatchOne`, `BatchTwo`, `BatchThree` and `BatchFour` share six characters and then
+/// diverge inside the next word, so the character prefix and the whole-word stem are
+/// different strings and only one of them is the answer. The previous attempt at this row
+/// mutated the `trim_end_matches` on `word`, which is a no-op — the line above it already
+/// cut `common` at the same boundary — so the row survived for a reason that had nothing to
+/// do with the test. This fixture's names are chosen so that removing the whole-word cut
+/// changes the label the answer reports.
 #[test]
 fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
     let d = repo(&[
@@ -933,7 +996,9 @@ fn a_shared_stem_is_cut_to_a_whole_word_and_not_left_as_a_character_prefix() {
         f.steps.iter().all(|(n, _)| n.starts_with("Batch")),
         "every step leads with the label: {f:?}"
     );
-    // Not the character prefix: no listed step may be cut in half by the label.
+    // The label ends at a word boundary in every step, so no listed name is cut in half by
+    // it. A character-prefix rule would fail this on the first step whose next character
+    // is lowercase.
     for (name, _) in &f.steps {
         let after = name.strip_prefix("Batch").unwrap_or_else(|| {
             panic!("step {name} does not start with the label Batch: {f:?}")
@@ -1328,12 +1393,23 @@ fn a_non_call_symbol_edge_never_becomes_a_step() {
         !names.contains("ShapeBase"),
         "an IMPLEMENTS edge must not become a step: {names:?}"
     );
-    // And the resolver really did record that edge, or the fixture would prove nothing.
+    // The resolver really did record that edge, or the fixture would prove nothing.
     // `symbols_considered` counts the admitted non-local symbols, which includes the base
     // and the method, so the filter under test is removing an edge from a graph that has it.
     assert!(
         v["symbols_considered"].as_u64().unwrap() >= 6,
         "the fixture's symbols must all be indexed: {v:#}"
+    );
+    // Measured: the index reports four CALLS for this fixture, not the two the source shows —
+    // `ShapeImpl`'s two callees plus the two `ShapeImpl`/`ShapeOther`/`ShapeThird` calls the
+    // fixture's other file makes. None of the four is the EXTENDS edge the method creates,
+    // and the walk's step set above shows it is not among the steps either. So the fixture
+    // does have a symbol-layer edge the kind filter has to reject, and it is not counted
+    // here. The exact figure is stated so a reader can re-check it rather than assume it.
+    assert_eq!(
+        v["call_edges"].as_u64().unwrap(),
+        4,
+        "the fixture's four resolved CALLS, none of them the type relationship: {v:#}"
     );
 }
 
