@@ -217,9 +217,12 @@ printf '{"symbol":"Serve","impacted_count":400,"by_depth":[{"depth":1,"total":40
 	if res.OutputBudget == nil {
 		t.Fatalf("no output_budget report: %s", body)
 	}
-	if res.OutputBudget.UsedChars != len(body) {
-		t.Errorf("used_chars %d, the response is %d bytes: the report was settled before the paging members were added",
-			res.OutputBudget.UsedChars, len(body))
+	// used_chars is the budget layer's own settled total for the encoded result
+	// (toolbudget's apply_test asserts rep.UsedChars == len(out)), so the response
+	// body minus the newline writeJSON appends must equal it.
+	if got, want := len(body)-1, res.OutputBudget.UsedChars; got != want {
+		t.Errorf("the encoded result is %d bytes, used_chars says %d: the report was settled before the paging members were added",
+			got, res.OutputBudget.UsedChars)
 	}
 	if res.HasMore == nil {
 		t.Fatalf("a trimmed tier reported neither has_more nor a cursor: %s", body)
