@@ -73,7 +73,7 @@ pub fn event_answer(event: &str, context: Option<&str>, updated: Option<&str>) -
         // postToolUse replaces an MCP tool's result only. A built-in is observe-only
         // and the daemon says so by sending no replacement, which stays Silent.
         ("postToolUse", Some(payload)) => Outcome::Answered(Answer {
-            updated_mcp_tool_output: Some(cap(payload, usize::MAX)),
+            updated_mcp_tool_output: Some(payload.to_string()),
             additional_context: context.map(|c| cap(c, CURSOR_CONTEXT_CHARS)),
             updated_input: None,
         }),
@@ -82,6 +82,13 @@ pub fn event_answer(event: &str, context: Option<&str>, updated: Option<&str>) -
             additional_context: context.map(|c| cap(c, CURSOR_CONTEXT_CHARS)),
             updated_mcp_tool_output: None,
         }),
+        // preCompact is observational: its output schema takes user_message only, and
+        // it is not one of the five events Cursor's additional-context step accepts
+        // (sessionStart, beforeSubmitPrompt, preToolUse, postToolUse,
+        // postToolUseFailure). A context the daemon prepared here would be an
+        // out-of-schema member, and an out-of-schema member on a response is what
+        // Cursor treats as invalid, so nothing is sent.
+        ("preCompact", _) => Outcome::Silent,
         (_, _) => match context {
             Some(c) => Outcome::Answered(Answer {
                 additional_context: Some(cap(c, CURSOR_CONTEXT_CHARS)),
@@ -163,7 +170,7 @@ pub const FAIL_OPEN_EXIT: i32 = 3;
 
 /// Renders an answer as the JSON object Cursor reads on stdout, or `None` when there
 /// is nothing to say (an empty stdout is the fail-open answer for every event).
-pub fn render(event: &str, answer: &Answer) -> Option<String> {
+pub fn render(answer: &Answer) -> Option<String> {
     if answer.is_empty() {
         return None;
     }
@@ -188,7 +195,6 @@ pub fn render(event: &str, answer: &Answer) -> Option<String> {
     }
     out.push('}');
     debug_assert!(!first, "an empty answer renders no object");
-    let _ = event;
     Some(out)
 }
 
@@ -426,6 +432,25 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_compact_context_is_not_sent_because_the_event_does_not_take_one() {
+        // Cursor's additional-context step covers sessionStart, beforeSubmitPrompt,
+        // preToolUse, postToolUse and postToolUseFailure only, and preCompact's output
+        // schema carries user_message alone.
+        assert_eq!(
+            event_answer("preCompact", Some("ground line"), None),
+            Outcome::Silent
+        );
+    }
+
+    #[test]
+    fn a_session_start_context_is_sent() {
+        let Outcome::Answered(a) = event_answer("sessionStart", Some("ground line"), None) else {
+            panic!("expected an answer");
+        };
+        assert_eq!(a.additional_context.as_deref(), Some("ground line"));
+    }
+
+    #[test]
     fn injected_context_is_capped_at_the_measured_vendor_line() {
         let long = "x".repeat(CURSOR_CONTEXT_CHARS + 500);
         let Outcome::Answered(a) = event_answer("sessionStart", Some(&long), None) else {
@@ -484,7 +509,7 @@ mod tests {
             updated_mcp_tool_output: Some("m".into()),
             updated_input: None,
         };
-        let json = render("postToolUse", &a).expect("an answer renders");
+        let json = render(&a).expect("an answer renders");
         assert_eq!(
             json,
             r#"{"additional_context":"c","updated_mcp_tool_output":"m"}"#
@@ -493,7 +518,7 @@ mod tests {
 
     #[test]
     fn an_empty_answer_renders_nothing() {
-        assert_eq!(render("sessionStart", &Answer::default()), None);
+        assert_eq!(render(&Answer::default()), None);
     }
 
     #[test]
@@ -502,7 +527,7 @@ mod tests {
             additional_context: Some("line\nwith \"quotes\" and \\ backslash".into()),
             ..Answer::default()
         };
-        let json = render("sessionStart", &a).unwrap();
+        let json = render(&a).unwrap();
         assert!(json.contains(r#"\n"#));
         assert!(json.contains(r#"\""#));
         assert!(json.contains(r"\\"));

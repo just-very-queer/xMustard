@@ -1,0 +1,9 @@
+{
+  "derivation": "source-derived",
+  "note": "Each input body is built from Cursor's own event schemas in the installed bundle's workbench.desktop.main.js (agent.v1.SessionStartRequestQuery, PreToolUseRequestQuery, PostToolUseRequestQuery, PreCompactRequestQuery) plus the common base schema. No live session was recorded: that needs an interactive Cursor session and a model call, which this workstream does not make.",
+  "cursor_version": "3.22.7",
+  "bundle_path": "out/vs/workbench/workbench.desktop.main.js",
+  "bundle_sha256": "a9157bf9054d3f27a2a6910c855e028bd5e38896fa74405ca2f766abff590cb8",
+  "additional_context_cap_chars": 10000,
+  "additional_context_cap_source": "limits.ts Cbt=1e4; the injector throws rather than truncating"
+}

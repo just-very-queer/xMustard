@@ -93,7 +93,7 @@ fn run(args: impl Iterator<Item = String>, stdin: &mut dyn Read, stdout: &mut dy
     ) else {
         return 0;
     };
-    let Some(rendered) = cursorhook::render(&cfg.event, &answer) else {
+    let Some(rendered) = cursorhook::render(&answer) else {
         return 0;
     };
     if let Err(e) = stdout.write_all(rendered.as_bytes()) {
