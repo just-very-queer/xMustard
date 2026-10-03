@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"encoding/json"
 	"slices"
 	"testing"
 )
@@ -46,6 +47,72 @@ func TestImpactFlagsForwardsTheOccurrenceOperation(t *testing.T) {
 		if _, err := ImpactFlags(form, map[string]string{"cursor": "abc"}); !IsInvalidInput(err) {
 			t.Fatalf("%s took cursor: %v", form, err)
 		}
+	}
+}
+
+// The page the core answers carries a bare offset; what a client receives is a signed
+// cursor, and the last page carries none at all. This is the only place the core's own
+// next_cursor becomes a cursor, so it is tested directly rather than only through the
+// route, which needs a live core.
+func TestSignOccurrencePageSignsTheCoresOffsetAndDropsTheLastPage(t *testing.T) {
+	ranking := occurrenceRanking("ws", "Store", "refs")
+
+	signed, err := signOccurrencePage([]byte(`{"total":9,"occurrences":[{"path":"a.go"}],"next_cursor":"4"}`), ranking)
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(signed, &page); err != nil {
+		t.Fatalf("the signed page is not a JSON object: %v", err)
+	}
+	var cursor string
+	if err := json.Unmarshal(page["next_cursor"], &cursor); err != nil {
+		t.Fatalf("next_cursor is not a string: %v", err)
+	}
+	got, err := DecodeOccurrenceCursor("ws", "Store", "refs", cursor)
+	if err != nil || got != 4 {
+		t.Fatalf("the signed cursor does not decode to the core's offset: got %d %v", got, err)
+	}
+	if string(page["total"]) != "9" {
+		t.Fatalf("signing changed another member: %s", signed)
+	}
+
+	// the last page: the core's next_cursor is absent, and nothing is added
+	last, err := signOccurrencePage([]byte(`{"total":9,"occurrences":[]}`), ranking)
+	if err != nil {
+		t.Fatalf("sign the last page: %v", err)
+	}
+	var lastPage map[string]json.RawMessage
+	if err := json.Unmarshal(last, &lastPage); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := lastPage["next_cursor"]; ok {
+		t.Fatalf("a last page grew a cursor: %s", last)
+	}
+
+	// an offset of zero signs to nothing, so no cursor is left behind
+	zero, err := signOccurrencePage([]byte(`{"total":0,"occurrences":[],"next_cursor":"0"}`), ranking)
+	if err != nil {
+		t.Fatalf("sign a zero offset: %v", err)
+	}
+	var zeroPage map[string]json.RawMessage
+	if err := json.Unmarshal(zero, &zeroPage); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := zeroPage["next_cursor"]; ok {
+		t.Fatalf("a zero offset left a cursor: %s", zero)
+	}
+}
+
+// The core's next_cursor is an offset, so anything else is a core contract break and is
+// reported rather than signed as a position.
+func TestSignOccurrencePageRefusesACursorThatIsNotAnOffset(t *testing.T) {
+	_, err := signOccurrencePage([]byte(`{"next_cursor":"not a number"}`), occurrenceRanking("ws", "S", "refs"))
+	if err == nil {
+		t.Fatal("a malformed core cursor was signed")
+	}
+	if _, err := signOccurrencePage([]byte(`[1,2]`), occurrenceRanking("ws", "S", "refs")); err == nil {
+		t.Fatal("a page that is not an object was signed")
 	}
 }
 

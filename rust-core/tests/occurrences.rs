@@ -9,6 +9,7 @@ use std::fs;
 use std::path::Path;
 use std::process::Command;
 
+use rusqlite::{Connection, OpenFlags};
 use serde_json::Value;
 use tempfile::TempDir;
 
@@ -165,14 +166,18 @@ fn refs_lists_every_reference_with_its_containing_symbol_and_not_the_declaration
     let v = occ(r.path(), "refs", "NewStore", &[]);
     let got: Vec<(String, String, String, u64)> = rows(&v).iter().map(tuple).collect();
 
-    // the declaration itself is not a use of itself: the row's line is inside the
-    // target's own span, so it is absent
+    // the index records a reference row only for a use, so the declaration in store.go
+    // is not a row at all: the whole answer is the one call site
+    assert_eq!(
+        got.len(),
+        1,
+        "refs listed something other than the single use: {got:?}"
+    );
     assert!(
-        !got.iter()
-            .any(|(n, _, p, l)| n == "NewStore" && p.ends_with("store.go") && *l > 8),
+        !got.iter().any(|(n, _, _, _)| n == "NewStore"),
         "the declaration counted as a reference: {got:?}"
     );
-    // and the call site is, carrying its own containing symbol and line
+    // and the call site carries its own containing symbol and line
     let call = got
         .iter()
         .find(|(n, _k, p, _)| n == "run" && p.ends_with("main.go"))
@@ -351,7 +356,7 @@ fn a_reference_outside_a_symbol_is_reported_as_a_file_and_a_used_name_is_never_r
     assert_eq!(call["kind"].as_str(), Some("Function"));
     // Go is a resolver language, so a bound reference is resolved, never lexical
     assert_eq!(call["provenance"].as_str(), Some("resolved"));
-    // and the declaration inside helper's own span is still not a use of itself
+    // and b.go holds no row at all: a declaration is not a use of itself
     assert!(
         !got.iter().any(|o| o["path"].as_str().unwrap_or("").ends_with("b.go")),
         "the declaration counted as a reference: {got:#?}"
@@ -474,4 +479,109 @@ fn the_epistemic_envelope_reports_whether_the_list_is_a_lower_bound() {
         ["resolved", "mixed", "lexical", "none"].contains(&v["graph"].as_str().unwrap()),
         "no graph label: {v:#}"
     );
+}
+
+// A name only the resolver could not bind is a lower bound, and the envelope says how
+// many, so a caller can tell "there are none" from "some were not found".
+#[test]
+fn a_lexical_only_list_is_a_lower_bound_naming_the_lexical_occurrences() {
+    let r = repo(&[
+        ("lib/a.rb", "class Alpha\n  def run\n    1\n  end\nend\n"),
+        ("lib/b.rb", "class Beta\n  def use\n    Alpha.new\n  end\nend\n"),
+        ("lib/c.rb", "class Gamma\n  def use\n    Alpha.new\n  end\nend\n"),
+    ]);
+    build(r.path());
+    let v = occ(r.path(), "refs", "Alpha", &[]);
+    assert_eq!(v["graph"].as_str(), Some("lexical"));
+    let lexical = rows(&v).len() as u64;
+    assert!(
+        lexical > 1,
+        "the fixture produced {lexical} occurrence(s), so a fixed count of one would pass: {v:#}"
+    );
+    assert_eq!(v["epistemic"]["completeness"].as_str(), Some("lower_bound"));
+    assert_eq!(
+        v["epistemic"]["causes"]["lexical_occurrences"].as_u64(),
+        Some(lexical),
+        "the cause does not count the lexical rows: {:#}",
+        v["epistemic"]
+    );
+}
+
+// A UID and a `Container.name` name path name the same symbol as the bare name, so a
+// caller holding either reads the same occurrences.
+#[test]
+fn a_uid_and_a_name_path_resolve_to_the_bare_names_occurrences() {
+    let r = go_repo();
+    build(r.path());
+    let by_name = occ(r.path(), "refs", "NewStore", &[]);
+    let total = by_name["total"].as_u64().unwrap();
+    assert!(total > 0, "the fixture has no occurrence, so resolution proves nothing");
+
+    // the UID the index itself reports for the same symbol
+    let uid = uid_of(r.path(), "NewStore");
+    let by_uid = occ(r.path(), "refs", &uid, &[]);
+    assert_eq!(
+        by_uid["total"].as_u64(),
+        Some(total),
+        "a uid read a different number of occurrences"
+    );
+    assert_eq!(by_uid["resolved_name"].as_str(), Some("NewStore"));
+
+    let by_path = occ(r.path(), "refs", "Store.NewStore", &[]);
+    assert_eq!(by_path["resolved_name"].as_str(), Some("NewStore"));
+    assert_eq!(
+        by_path["total"].as_u64(),
+        Some(total),
+        "a name path read a different number of occurrences"
+    );
+}
+
+/// The uid the index stores for the symbol declaring `name`.
+fn uid_of(root: &Path, name: &str) -> String {
+    let index = ok_json(&["index", "stats", root.to_str().unwrap(), "--digest"]);
+    let conn = Connection::open_with_flags(
+        index["index_path"].as_str().unwrap(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    let mut st = conn
+        .prepare(
+            "SELECT s.uid FROM symbols s JOIN names n ON n.id = s.name_id WHERE n.name = ?1 LIMIT 1",
+        )
+        .unwrap();
+    st.query_row([name], |r| r.get::<_, String>(0)).unwrap()
+}
+
+/// Each row names the kind of reference that produced it, so a caller can tell a call
+/// from a type position without reading the snippet.
+#[test]
+fn each_row_names_the_kind_of_reference_that_produced_it() {
+    let r = go_repo();
+    build(r.path());
+    let got = rows(&occ(r.path(), "refs", "NewStore", &[]));
+    let call = got
+        .iter()
+        .find(|o| o["path"].as_str().unwrap_or("").ends_with("main.go"))
+        .expect("no occurrence in main.go");
+    assert_eq!(
+        call["kind_of_reference"].as_str(),
+        Some("member_call"),
+        "a qualified call is not reported as a member call: {call:#}"
+    );
+
+    let r2 = repo(&[
+        ("web/base.ts", "export interface Getter { get(k: string): number }\n"),
+        (
+            "web/c.ts",
+            "import { Getter } from './base';\n\
+             \n\
+             export class C implements Getter {\n\
+             \tget(k: string): number { return 1 }\n\
+             }\n",
+        ),
+    ]);
+    build(r2.path());
+    let impls = rows(&occ(r2.path(), "implementations", "Getter", &[]));
+    assert_eq!(impls.len(), 1, "the fixture produced no implementation: {impls:#?}");
+    assert_eq!(impls[0]["kind_of_reference"].as_str(), Some("implements"));
 }

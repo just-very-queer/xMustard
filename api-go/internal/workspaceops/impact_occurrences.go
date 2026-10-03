@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strconv"
 
 	"xmustard/api-go/internal/rustcore"
 )
@@ -93,9 +94,15 @@ func signOccurrencePage(raw []byte, ranking []byte) ([]byte, error) {
 	if !ok {
 		return raw, nil
 	}
-	var offset int
-	if err := json.Unmarshal(cursor, &offset); err != nil {
+	// the core's next_cursor is a decimal string, not a JSON number: it is a position,
+	// not a quantity, and the signed cursor it becomes is a string too.
+	var text string
+	if err := json.Unmarshal(cursor, &text); err != nil {
 		return nil, fmt.Errorf("occurrence next_cursor is not an offset: %w", err)
+	}
+	offset, err := strconv.Atoi(text)
+	if err != nil {
+		return nil, fmt.Errorf("occurrence next_cursor %q is not an offset: %w", text, err)
 	}
 	delete(page, "next_cursor")
 	signed := signOffset(ranking, offset)

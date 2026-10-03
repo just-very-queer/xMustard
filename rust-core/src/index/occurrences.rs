@@ -10,10 +10,14 @@
 //! cursor continue the same list; nothing proportional to the repository is held in
 //! the heap beyond one page plus the file texts a page's snippets need.
 //!
-//! - `refs`: every use of the name, its own declaration excluded (a reference inside
-//!   the target's span is the declaration, not a use of it).
+//! - `refs`: every use of the name. The index records a reference row only for a
+//!   *use*, so a declaration is already absent and needs no filter: what a name is
+//!   declared by is `definition`'s answer, not a row here.
 //! - `definition`: the symbols that declare the name.
-//! - `implementations`: the `refs` rows of kind EXTENDS or IMPLEMENTS.
+//! - `implementations`: the `refs` rows of kind EXTENDS or IMPLEMENTS, which only a
+//!   language that writes the relation down produces (TypeScript's `implements`); a Go
+//!   struct satisfies an interface by having its methods, which is no reference to the
+//!   interface's name, so an implementation list is empty there.
 //!
 //! Provenance is `resolved` when the reference's file is in a language the scope
 //! resolver owns and its `symbol_id` names a symbol, else `lexical` — a name match,
@@ -228,33 +232,6 @@ pub struct Envelope {
     pub causes: BTreeMap<String, u64>,
 }
 
-/// The target's spans, by file id, so a reference inside one is excluded from `refs`.
-fn spans(conn: &Connection, name: &str) -> rusqlite::Result<BTreeMap<i64, Vec<(u32, u32)>>> {
-    let mut st = conn.prepare_cached(
-        "SELECT file_id, start_line, end_line FROM symbols s JOIN names n ON n.id = s.name_id \
-         WHERE n.name = ?1",
-    )?;
-    let rows = st.query_map([name], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            (r.get::<_, u32>(1)?, r.get::<_, u32>(2)?),
-        ))
-    })?;
-    let mut out: BTreeMap<i64, Vec<(u32, u32)>> = BTreeMap::new();
-    for row in rows {
-        let (file, span) = row?;
-        out.entry(file).or_default().push(span);
-    }
-    Ok(out)
-}
-
-/// Whether a reference at `line` sits inside one of `target`'s own spans.
-fn inside(target: &BTreeMap<i64, Vec<(u32, u32)>>, file: i64, line: u32) -> bool {
-    target
-        .get(&file)
-        .is_some_and(|spans| spans.iter().any(|(from, to)| line >= *from && line <= *to))
-}
-
 fn kinds_clause(kinds: &[u8]) -> String {
     kinds
         .iter()
@@ -266,7 +243,6 @@ fn kinds_clause(kinds: &[u8]) -> String {
 /// Every occurrence row of the query, before paging: (path, line, col) order, so the
 /// same index answers the same page every time and the cursor means a position.
 fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<Vec<Row>> {
-    let target_spans = spans(conn, name)?;
     let mut out = Vec::new();
     match q.op.as_str() {
         "definition" => {
@@ -331,12 +307,6 @@ fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<Vec<Row>> 
             })?;
             for row in rows {
                 let (path, lang, file_id, blob, line, kind, symbol, qualified, skind, sline) = row?;
-                // the declaration is not a use of itself: a reference inside the
-                // target's own span is where the name is defined, which `definition`
-                // answers and `refs` must not count twice.
-                if op == "refs" && inside(&target_spans, file_id, line) {
-                    continue;
-                }
                 out.push(Row {
                     path,
                     lang,
