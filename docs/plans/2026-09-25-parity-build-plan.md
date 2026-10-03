@@ -2073,6 +2073,24 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 - *Checks.* `gofmt -l api-go/internal/workspaceops` clean; `go vet ./internal/workspaceops` clean; `go test -p 1 -count=1 ./internal/workspaceops ./internal/govstore ./internal/budget` green on the box (`logs/ws-28c-run-20261002T233500Z.log`); the cache's own tests green under `-race` (`logs/ws-28c-run-20261002T232858Z.log`). Not run: `RET` (no index or ranking changed), `PI`, `CAPS`, `SECDOC`, `GOLD` (no Pi source, no `tools/list` byte, no route or gate row, no projection), and `BUD` (see below).
 - *Follow-ups.* `BUD` is owed before the row is claimed resident-affecting: the cache declares a governor component but no budget-gate report measures it, and the row's own acceptance argues the ceiling is small without measuring it. Proposed owner: whoever takes the next resident-affecting row. The MCP surface cannot see a parity worktree (`explain` answers "Workspace or path not found" for a file that exists, `impact symbol=InvalidateMemory` returns `defined_in: []`, `recall` returns 0); the A6 duplicate check used `rg` instead; seventeenth row, proposed owner WS-FIX-15.
 
+**PARKED (2026-10-03).** branch `parity/ws-28c`, head `1bafede`, gate line
+`gate=FAIL changed=6 covered=6 channel_findings=4 triaged=10 reviewer=gpt-6-sol`.
+What works: the whole cache is built, every defect four review rounds found is fixed, the
+mutation table is complete (16 kills, 1 recorded equivalent), and the box gate is green on the
+rule-4 re-merge (`remote_exit=0 clippy_warnings=6 rss_lines=ok`, 24 Go packages, 18 Rust
+binaries, 0 FAILED, `logs/ws-28c-check-20261003T002540Z.log`). What is open: one gate failure,
+`gate rerun of S1 found a stub/TODO marker in the reviewed range`. It is the phrase "The stub
+outline rewrites the file" in a test comment, inside the SEALED round-4 range
+`5885c44..c1aad95`, and it was already reworded in `d52e8d6` after that round closed; the
+sealed range cannot change and 4.6's amendment forbids opening round 5, so this row parks
+rather than re-reviewing for a comment. Open channel findings: none — all four rounds'
+deduplicated findings (6 + 7 + 6 + 3) are `fixed` in `reviews/ws-28c/r4/triage.json`, none
+deferred, none rejected. Next step for the next session: re-run one review round over
+`1bafede..HEAD` (nothing but the closure commit is in it, so the round will be cheap and will
+clear the marker), or have the owner accept the sealed-range S1 hit on the grounds that the
+comment is fixed in the tree. Either way the row needs no code change: the marker is in a
+comment and the gate's other nine checks pass.
+
 ### WS-29 — Memory scopes and shared collections with grants
 
 **Goal.** Add private, dir, run and global scopes derived from the principal, and shared collections with grants: source, target, permission (rw or ro), granted_by, and a per-collection policy. Recall gives per-target applicability (verified_here, foreign_unchecked, stale) and merges scopes with labels. Add xmustard-ops shared list/create/grant/revoke/history.
