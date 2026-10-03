@@ -1196,6 +1196,26 @@ impl Serve {
     fn mem(&self) -> memprobe::Mem {
         memprobe::sample(self.child.id()).expect("a memory sample of the service")
     }
+
+    /// One reading of the settled service: the peak over `settle_ms`, so a sample
+    /// taken before the service has returned everything the last round allocated
+    /// cannot read low and a sample taken while it is still settling cannot read
+    /// high. The single instantaneous sample the sweep in `measure` used for
+    /// `steady` and `after swap` was the cause of WS-FLK-01: both names claim a
+    /// settled service and neither delivered one, so the two figures the bound
+    /// checked were timing-dependent (see `SETTLE_MS`).
+    fn mem_settled(&self, settle_ms: u64) -> memprobe::Mem {
+        let until = std::time::Instant::now() + Duration::from_millis(settle_ms);
+        let mut peak = self.mem();
+        while std::time::Instant::now() < until {
+            if let Some(m) = memprobe::sample(self.child.id()) {
+                peak.rss = peak.rss.max(m.rss);
+                peak.dirty = peak.dirty.max(m.dirty);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        peak
+    }
 }
 
 impl Drop for Serve {
@@ -1254,11 +1274,11 @@ struct Above {
 }
 
 struct Measured {
-    /// After the first query rounds.
+    /// After the first query rounds, once the service has settled (`SETTLE_MS`).
     steady: Above,
     /// The highest sampled while the swap happened under load.
     swap_peak: Above,
-    /// After the swap settled.
+    /// After the swap settled (`SETTLE_MS`).
     after_swap: Above,
     generations: BTreeSet<i64>,
 }
@@ -1291,6 +1311,15 @@ const OVERLAPPING: Lines = Lines {
     rss: 32.0,
 };
 
+/// How long `steady` and `after swap` let the service settle before reading them,
+/// in milliseconds. Both readings are peaks over this window, so the figure a bound
+/// checks is the highest the settled service reaches rather than one instant's
+/// sample. Measured on the Linux build box at load 4.3-8.6: 0-500 ms windows are
+/// indistinguishable from each other on both `steady` and `after swap`, so the
+/// window is not fitted to a number. It is one 5 s sleep's tenth, and the swap
+/// already waits 3 s for the new generation to land.
+const SETTLE_MS: u64 = 500;
+
 /// Measure the service on the synthetic store: base after the handshake, then after
 /// queries, then during and after a snapshot swap with queries in flight.
 fn measure(storage: &str, load: Load) -> Measured {
@@ -1316,7 +1345,7 @@ fn measure(storage: &str, load: Load) -> Measured {
             );
         }
     }
-    let steady = s.mem();
+    let steady = s.mem_settled(SETTLE_MS);
 
     // swap: a new generation lands while four clients keep querying
     let pid = s.child.id();
@@ -1367,7 +1396,7 @@ fn measure(storage: &str, load: Load) -> Measured {
             gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
         }
     }
-    let swapped = s.mem();
+    let swapped = s.mem_settled(SETTLE_MS);
     let stats = s.call("$/stats", &[]);
     let above = |m: memprobe::Mem| Above {
         rss: memprobe::mib(m.rss.saturating_sub(base.rss)),
