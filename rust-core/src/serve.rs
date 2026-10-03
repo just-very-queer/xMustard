@@ -467,6 +467,7 @@ impl Shared {
             "index": crate::index::reader::resident().map(|r| r.stats()),
             "watch": crate::index::watch::registry().status(None),
             "git_spawns": crate::indexcache::git_spawns(),
+            "passes": crate::passcount::totals(),
         })
     }
 }
@@ -783,11 +784,11 @@ fn run_job(shared: &Shared, job: Job) {
     let outcome = if job.cancelled.load(Ordering::SeqCst) {
         None
     } else {
-        let run = job.command.run;
+        let command = job.command;
         let args = job.args;
-        Some(catch_unwind(AssertUnwindSafe(
-            move || run(args.into_iter()),
-        )))
+        Some(catch_unwind(AssertUnwindSafe(move || {
+            crate::dispatch::run_counted(command, args.into_iter())
+        })))
     };
     lock(&shared.inflight).remove(&id);
     let c = &shared.counters;

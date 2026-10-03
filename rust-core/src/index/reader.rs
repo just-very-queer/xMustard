@@ -202,6 +202,7 @@ impl Files {
     fn load(seg: &Segment) -> Result<Files, String> {
         let (heap, off) = seg.path_heap()?;
         let rows = seg.file_rows()?;
+        crate::passcount::note(crate::passcount::Pass::RowsLoaded, rows.len() as u64);
         let mut files = Files {
             heap,
             off,
