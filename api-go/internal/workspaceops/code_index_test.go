@@ -38,12 +38,12 @@ func TestCodeIndexRefreshRecordsOutcomePerIdentityKey(t *testing.T) {
 	t.Cleanup(func() { codeIndexRunner = prev })
 	run := func(root, key string, out string, err error) *refreshFlight {
 		codeIndexRunner = func(_ context.Context, gotRoot string, args ...string) ([]byte, error) {
-			if gotRoot != root || len(args) != 2 || args[0] != "--identity-key" || args[1] != key {
+			if gotRoot != root || !slices.Equal(args, []string{"--identity-key", key, "--identity-limitations", "0"}) {
 				t.Fatalf("runner got %s %v", gotRoot, args)
 			}
 			return []byte(out), err
 		}
-		f := &refreshFlight{key: key, done: make(chan struct{})}
+		f := &refreshFlight{identityStamp: identityStamp{key: key}, done: make(chan struct{})}
 		runCodeIndexRefresh(root, f)
 		<-f.done
 		return f
@@ -111,20 +111,40 @@ func TestRefreshArgsNameTheBatchPathsOnlyWhenTheBatchIsComplete(t *testing.T) {
 		forced bool
 		want   []string
 	}{
-		{"no watcher", nil, true, []string{"--identity-key", "k"}},
-		{"a synced batch", &rustcore.RefreshBatch{Paths: paths, Synced: true}, false, []string{"--identity-key", "k", "--paths", "a.go", "b/c.ts"}},
-		{"a Git state change only", &rustcore.RefreshBatch{Git: true, Synced: true}, false, []string{"--identity-key", "k", "--paths"}},
-		{"a full refresh", &rustcore.RefreshBatch{Full: "ignore_file", Synced: true}, false, []string{"--identity-key", "k"}},
-		{"an unsynced batch", &rustcore.RefreshBatch{Paths: paths}, false, []string{"--identity-key", "k"}},
-		{"a read found nothing pending", &rustcore.RefreshBatch{Synced: true}, true, []string{"--identity-key", "k"}},
-		{"a read took pending paths", &rustcore.RefreshBatch{Paths: paths, Synced: true}, true, []string{"--identity-key", "k", "--paths", "a.go", "b/c.ts"}},
+		{"no watcher", nil, true, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"a synced batch", &rustcore.RefreshBatch{Paths: paths, Synced: true}, false, []string{"--identity-key", "k", "--identity-limitations", "0", "--paths", "a.go", "b/c.ts"}},
+		{"a Git state change only", &rustcore.RefreshBatch{Git: true, Synced: true}, false, []string{"--identity-key", "k", "--identity-limitations", "0", "--paths"}},
+		{"a full refresh", &rustcore.RefreshBatch{Full: "ignore_file", Synced: true}, false, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"an unsynced batch", &rustcore.RefreshBatch{Paths: paths}, false, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"a read found nothing pending", &rustcore.RefreshBatch{Synced: true}, true, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"a read took pending paths", &rustcore.RefreshBatch{Paths: paths, Synced: true}, true, []string{"--identity-key", "k", "--identity-limitations", "0", "--paths", "a.go", "b/c.ts"}},
 	}
 	for _, c := range cases {
-		if got := refreshArgs("k", c.batch, c.forced); !slices.Equal(got, c.want) {
+		if got := refreshArgs(identityStamp{key: "k"}, c.batch, c.forced); !slices.Equal(got, c.want) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
-	if got := refreshArgs("", nil, false); len(got) != 0 {
+	if got := refreshArgs(identityStamp{}, nil, false); len(got) != 0 {
 		t.Errorf("no identity and no batch: %v", got)
+	}
+}
+
+// The update is stamped with how many limitations the identity it ran for carried, so
+// a reader reports that identity as complete only when it had none (WS-RT2).
+func TestRefreshStampsTheIdentityLimitationCount(t *testing.T) {
+	cases := []struct {
+		name string
+		id   RepoIdentity
+		want []string
+	}{
+		{"complete", RepoIdentity{Key: "k", Complete: true}, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"two limitations", RepoIdentity{Key: "k", Limitations: []IdentityLimitation{{Reason: "oversized"}, {Reason: "unreadable"}}},
+			[]string{"--identity-key", "k", "--identity-limitations", "2"}},
+		{"incomplete with none listed", RepoIdentity{Key: "k"}, []string{"--identity-key", "k", "--identity-limitations", "1"}},
+	}
+	for _, c := range cases {
+		if got := refreshArgs(stampOf(c.id), nil, false); !slices.Equal(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
 	}
 }
