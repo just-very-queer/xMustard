@@ -221,14 +221,18 @@ type ProposeContextRequest struct {
 	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
 	// a single identity can never form.
 	OpenMode bool `json:"-"`
-	// Scope, ScopeKey, Metadata and Visibility are DECLARED and IGNORED (WS-29b): the
-	// stored scope is derived from the principal and the request. They are declared here
-	// so a payload naming them is accepted by the decoder and dropped, rather than
-	// failing the whole request with "unknown field"; the derivation is what is stored.
-	Scope      string            `json:"scope,omitempty"`
-	ScopeKey   string            `json:"scope_key,omitempty"`
-	Metadata   map[string]string `json:"metadata,omitempty"`
-	Visibility string            `json:"visibility,omitempty"`
+	// Scope, ScopeKey and Metadata are DECLARED AND IGNORED (WS-29b): they are the
+	// caller's claim about the entry, and the stored scope comes from DeriveScoped, so
+	// they reach no field below. They are declared so a payload naming them is accepted
+	// by the decoder and dropped, rather than failing the whole request with "unknown
+	// field". Visibility is the exception and is NOT ignored: it is the caller's request
+	// for a narrower scope, and the derivation may still refuse it or narrow it further.
+	Scope    string            `json:"scope,omitempty"`
+	ScopeKey string            `json:"scope_key,omitempty"`
+	Metadata map[string]string `json:"metadata,omitempty"`
+	// Visibility asks for private, dir, run or session scope ("" or workspace for the
+	// default). It can only narrow: nothing here widens a memory beyond the workspace.
+	Visibility string `json:"visibility,omitempty"`
 	// Dir is the directory a dir-scoped memory is derived from, repo-relative and
 	// confined to the workspace. RunID and SessionID name the run and session keys.
 	Dir       string `json:"dir,omitempty"`
@@ -752,10 +756,19 @@ var rememberOps = map[string]func(dataDir, workspaceID string, req RememberReque
 }
 
 // proposal is the proposal a propose or supersede op makes: the request with its
-// one-line description.
+// one-line description. RunID and SessionID are declared on both RememberRequest and
+// ProposeContextRequest and the outer ones shadow the embedded ones, so the keys a
+// remember call supplies are carried across explicitly: without this the derivation
+// would see empty keys and store a workspace-scoped memory (WS-29b).
 func (req RememberRequest) proposal() ProposeContextRequest {
 	p := req.ProposeContextRequest
 	p.Description = derefStr(req.Description)
+	if p.RunID == "" {
+		p.RunID = req.RunID
+	}
+	if p.SessionID == "" {
+		p.SessionID = req.SessionID
+	}
 	return p
 }
 

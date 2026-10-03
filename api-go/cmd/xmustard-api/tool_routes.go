@@ -176,11 +176,13 @@ func recallSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 // recallAllActive is the complete promoted history: every entry, every drift hash.
+// The reader is the authenticated principal, so the scope rule applies here too
+// (WS-29b): an admin is the operator but not a way round a private memory.
 func recallAllActive(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, "admin") {
 		return
 	}
-	result, err := workspaceops.GetActiveContext(dataDir(), r.PathValue("workspace_id"))
+	result, err := workspaceops.GetActiveContext(dataDir(), r.PathValue("workspace_id"), callerOf(r).ID)
 	reply(w, result, err, respondError)
 }
 
@@ -193,7 +195,7 @@ func recallEntry(w http.ResponseWriter, r *http.Request, id string) {
 	if history && !requireReviewer(w, r) {
 		return
 	}
-	result, err := workspaceops.GetContextEntry(dataDir(), r.PathValue("workspace_id"), id, history, isReviewer(r))
+	result, err := workspaceops.GetContextEntry(dataDir(), r.PathValue("workspace_id"), id, history, isReviewer(r), callerOf(r).ID)
 	reply(w, result, err, respondError)
 }
 
@@ -217,7 +219,8 @@ func listContextEntries(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, "admin") {
 		return
 	}
-	result, err := workspaceops.ListContextEntries(dataDir(), r.PathValue("workspace_id"), r.URL.Query().Get("filter"))
+	result, err := workspaceops.ListContextEntries(dataDir(), r.PathValue("workspace_id"),
+		r.URL.Query().Get("filter"), callerOf(r).ID)
 	reply(w, result, err, respondError)
 }
 

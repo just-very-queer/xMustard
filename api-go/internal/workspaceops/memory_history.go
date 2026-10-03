@@ -39,19 +39,30 @@ const unverifiedWithheld = "content is not verified; reading it needs the verifi
 // would; a reviewer (a verifier, a human approver or an admin) also sees unverified
 // text, the pending edit with its diff and votes, and with history the revisions,
 // relations and event log. History without reviewer is refused (ErrVerifierRequired).
-func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer bool) (map[string]any, error) {
+//
+// A non-empty reader is checked against the entry's scope BEFORE anything is loaded
+// (WS-29b): knowing or guessing an entry id is not a way round a private, run,
+// session or directory memory, and the check is on the stored row rather than on a
+// ranking view, so no route can skip it. The refusal is the same shape as "not
+// found", so an id probe cannot tell a private memory from an absent one. An empty
+// reader is the operator's own view.
+func GetContextEntry(dataDir, workspaceID, entryID string, history, reviewer bool, reader ...string) (map[string]any, error) {
 	if err := validateSafeID("entry", entryID); err != nil {
 		return nil, err
 	}
 	if history && !reviewer {
 		return nil, fmt.Errorf("memory history: %w", ErrVerifierRequired)
 	}
+	who := firstOf(reader)
 	ctx := context.Background()
 	var out map[string]any
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		e, ce, err := loadAnyEntryTx(ctx, r, workspaceID, entryID)
 		if err != nil {
 			return err
+		}
+		if who != "" && !ScopesVisible(e.Scope, e.ScopeKey, e.Source, who, ScopeRequest{}) {
+			return fmt.Errorf("memory %s: %w", entryID, govstore.ErrNotFound)
 		}
 		out = map[string]any{"workspace_id": workspaceID, "content_digest": e.ContentDigest, "data_notice": injection.DataNotice}
 		if withheld, err := servedContent(ctx, r, e, &ce, reviewer); err != nil {

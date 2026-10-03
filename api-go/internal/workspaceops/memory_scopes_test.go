@@ -366,56 +366,219 @@ func TestAConfinedEntryWithNoKeyIsServedToNobody(t *testing.T) {
 	}
 }
 
-// The leakage metric over this sub-task's fixture suite is 0: every entry the reader
-// was served is one its scope admits.
+// The leakage metric over this sub-task's fixture suite is 0. Every fixture carries
+// an INDEPENDENT expected-visibility table, keyed by the reader AND the keys that
+// reader's request names, because a run- or dir-scoped memory is served only inside
+// them. Nothing here asks ScopesVisible what it decides: restating the implementation
+// cannot detect it being wrong.
 func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 	dir := singleAgentDir(t)
-	rows := []struct {
-		author string
-		mutate func(*ProposeContextRequest)
-	}{
-		{"author-a", func(r *ProposeContextRequest) {}},
-		{"author-a", func(r *ProposeContextRequest) { r.Visibility = ScopePrivate }},
-		{"author-a", func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" }},
-		{"author-a", func(r *ProposeContextRequest) { r.Visibility = ScopeDir; r.Dir = "api-go/internal" }},
-		{"author-b", func(r *ProposeContextRequest) { r.Visibility = ScopePrivate }},
+	type fixture struct {
+		id       string
+		servable map[string]bool // "caller|run|dir" -> may read it
 	}
-	stored := map[string]ContextEntry{}
-	for i, row := range rows {
+	var fixtures []fixture
+	for i, row := range []struct {
+		mutate   func(*ProposeContextRequest)
+		servable map[string]bool
+	}{
+		// workspace scoped: every principal in the workspace, whatever keys it names
+		{func(r *ProposeContextRequest) {}, map[string]bool{
+			"author-a|run-1|api-go/internal": true, "author-b|run-1|api-go/internal": true,
+			"author-a||api-go/internal": true, "author-a|run-1|docs": true, "verifier-c||": true,
+			OpenModeIdentity + "||": true}},
+		// private: the author alone, whatever keys it names
+		{func(r *ProposeContextRequest) { r.Visibility = ScopePrivate }, map[string]bool{
+			"author-a|run-1|api-go/internal": true, "author-a||api-go/internal": true,
+			"author-a|run-1|docs": true}},
+		// run scoped: the author, inside run-1 only
+		{func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" }, map[string]bool{
+			"author-a|run-1|api-go/internal": true, "author-a|run-1|docs": true}},
+		// dir scoped: the author, inside api-go/internal only
+		{func(r *ProposeContextRequest) { r.Visibility = ScopeDir; r.Dir = "api-go/internal" }, map[string]bool{
+			"author-a|run-1|api-go/internal": true, "author-a||api-go/internal": true,
+			"author-a|run-1|docs": false}},
+		// global: nobody, until a cross-workspace read can scope to one principal
+		{func(r *ProposeContextRequest) { r.Visibility = ScopeGlobal }, map[string]bool{}},
+		// another author's private memory
+		{func(r *ProposeContextRequest) { r.Visibility = ScopePrivate }, nil}, // author-b, fixed below
+	} {
 		req := ProposeContextRequest{Title: fmt.Sprintf("fixture %d", i),
 			Content: fmt.Sprintf("scope fixture body number %d", i), Permission: "readwrite"}
 		row.mutate(&req)
-		e, err := Remember(dir, "ws-1", RememberRequest{ProposeContextRequest: req}, ContextActor{ID: row.author})
+		author := "author-a"
+		if i == 5 {
+			author = "author-b"
+			row.servable = map[string]bool{"author-b|run-1|api-go/internal": true}
+		}
+		e, err := Remember(dir, "ws-1", RememberRequest{ProposeContextRequest: req}, ContextActor{ID: author})
 		if err != nil {
 			t.Fatalf("fixture %d: %v", i, err)
 		}
-		stored[e.ID] = *e
+		fixtures = append(fixtures, fixture{id: e.ID, servable: row.servable})
 	}
-	leaks := 0
 	for _, reader := range []struct{ name, caller, run, dir string }{
 		{"the author of most of them", "author-a", "run-1", "api-go/internal"},
 		{"another author", "author-b", "run-1", "api-go/internal"},
 		{"a reader with no run key", "author-a", "", "api-go/internal"},
 		{"a reader in a directory holding none of them", "author-a", "run-1", "docs"},
+		{"a verifier with no keys", "verifier-c", "", ""},
 		{"open mode", OpenModeIdentity, "", ""},
 	} {
-		res := recallWith(t, dir, "ws-1", RecallRequest{Query: "scope fixture body", Caller: reader.caller,
-			RunID: reader.run, Dir: reader.dir})
-		for _, got := range entriesOf(res) {
-			want, ok := stored[got.ID]
-			if !ok {
-				t.Fatalf("%s was served entry %s, which was never stored", reader.name, got.ID)
-			}
-			if !ScopesVisible(want.Scope, want.ScopeKey, want.Source, reader.caller,
-				ScopeRequest{RunID: reader.run, Dir: reader.dir}) {
-				leaks++
-				t.Fatalf("%s was served entry %s at scope %q, which its scope does not admit",
-					reader.name, got.ID, want.Scope)
+		who := reader.caller + "|" + reader.run + "|" + reader.dir
+		admitted := map[string]bool{}
+		for _, f := range fixtures {
+			if f.servable[who] {
+				admitted[f.id] = true
 			}
 		}
+		res := recallWith(t, dir, "ws-1", RecallRequest{Query: "scope fixture body", Caller: reader.caller,
+			RunID: reader.run, Dir: reader.dir})
+		served := map[string]bool{}
+		for _, got := range entriesOf(res) {
+			if !admitted[got.ID] {
+				t.Fatalf("%s was served entry %s, which the fixture table does not admit", reader.name, got.ID)
+			}
+			served[got.ID] = true
+		}
+		for id := range admitted {
+			if !served[id] {
+				t.Fatalf("%s was not served entry %s, which the fixture table admits", reader.name, id)
+			}
+		}
+		if n := ScopeLeaks(len(served), len(admitted)); n != 0 {
+			t.Fatalf("%s: scope leak metric = %d over %d served and %d admitted",
+				reader.name, n, len(served), len(admitted))
+		}
 	}
-	if n := ScopeLeaks(len(stored), len(stored)-leaks); n != 0 {
-		t.Fatalf("scope leak metric = %d, want 0", n)
+}
+
+// Knowing or guessing an entry id is not a way round a private memory: the by-id
+// read refuses with the not-found shape, and the listing paths leave it out.
+func TestTheByIDAndListingReadPathsEnforceTheSameScope(t *testing.T) {
+	dir := singleAgentDir(t)
+	private := propose(t, dir, "ws-1", "author-a", "by id", "the token rotation path mints a secret",
+		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate })
+	run := propose(t, dir, "ws-1", "author-a", "by id run", "the run holds an open migration",
+		func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" })
+
+	other := ContextActor{ID: "verifier-b", Verifier: true}
+	admin := ContextActor{ID: "admin-b", Admin: true, Verifier: true}
+	for _, reader := range []struct {
+		name   string
+		caller string
+		id     string
+	}{
+		{"a verifier fetching by id", "verifier-b", private.ID},
+		{"an admin fetching by id", "admin-b", private.ID},
+		{"a verifier fetching a run entry with no run", "verifier-b", run.ID},
+		{"an admin fetching a run entry with no run", "admin-b", run.ID},
+	} {
+		t.Run(reader.name, func(t *testing.T) {
+			if _, err := GetContextEntry(dir, "ws-1", reader.id, false, true, reader.caller); err == nil {
+				t.Fatal("a by-id fetch must not disclose an entry its scope does not admit")
+			}
+		})
+	}
+	for _, actor := range []ContextActor{other, admin} {
+		t.Run(actor.ID+" listing", func(t *testing.T) {
+			for _, filter := range []string{"all", "pending", "promoted"} {
+				entries, err := ListContextEntries(dir, "ws-1", filter, actor.ID)
+				if err != nil {
+					t.Fatalf("list %s: %v", filter, err)
+				}
+				for _, e := range entries {
+					if e.ID == private.ID || e.ID == run.ID {
+						t.Fatalf("%s was listed under %q at scope %q, which its scope does not admit",
+							actor.ID, filter, e.Scope)
+					}
+				}
+			}
+		})
+	}
+	// The author still reads its own entries by id, and the operator's own view
+	// (no reader named) still counts what exists.
+	if _, err := GetContextEntry(dir, "ws-1", private.ID, false, true, "author-a"); err != nil {
+		t.Fatalf("the author must fetch its own private entry by id: %v", err)
+	}
+	if _, err := GetContextEntry(dir, "ws-1", private.ID, false, true); err != nil {
+		t.Fatalf("the operator view must fetch any entry by id: %v", err)
+	}
+	if entries, err := ListContextEntries(dir, "ws-1", "all"); err != nil || len(entries) < 2 {
+		t.Fatalf("the operator view must list every entry: %v (%d entries)", err, len(entries))
+	}
+}
+
+// An escaping or absolute directory is refused on the implicit path too, so a
+// memory is never stored under a key that confines it to nothing.
+func TestAnImplicitDirectoryKeyIsValidatedLikeAnExplicitOne(t *testing.T) {
+	for _, dir := range []string{"../elsewhere", "/etc", ".", "api-go//internal", "..", "a/../b"} {
+		if _, err := DeriveScope(ScopeRequest{Dir: dir}, ContextActor{ID: "author-a"}); err == nil {
+			t.Fatalf("implicit dir %q must be refused, not stored", dir)
+		}
+	}
+	if _, err := DeriveScope(ScopeRequest{Dir: "api-go/internal"}, ContextActor{ID: "author-a"}); err != nil {
+		t.Fatalf("a plain repo-relative dir must be accepted: %v", err)
+	}
+}
+
+// A remember call supplies run and session keys on the outer request, which shadows
+// the embedded fields: the derivation must still see them. A run id is additionally
+// checked against the workspace's runs by bindProvenance, so the stored case uses the
+// session key and the derivation case covers the run key.
+func TestARememberCallCarriesItsRunAndSessionKeysIntoTheDerivation(t *testing.T) {
+	dir := singleAgentDir(t)
+	t.Run("session_id on the outer request", func(t *testing.T) {
+		req := RememberRequest{SessionID: "claude:s9",
+			ProposeContextRequest: ProposeContextRequest{Title: "outer session", Content: "the key must survive",
+				Permission: "readwrite"}}
+		e, err := Remember(dir, "ws-1", req, ContextActor{ID: "author-a"})
+		if err != nil {
+			t.Fatalf("propose: %v", err)
+		}
+		if e.Scope != ScopeSession || e.ScopeKey != "claude:s9" {
+			t.Fatalf("stored scope %q/%q, want session/claude:s9", e.Scope, e.ScopeKey)
+		}
+	})
+	t.Run("run_id on the outer request reaches the derivation", func(t *testing.T) {
+		// bindProvenance checks a run id against the workspace's runs before the write,
+		// so the stored run case needs a real run; what this asserts is that the key
+		// survives proposal() and reaches the derivation at all.
+		p := RememberRequest{RunID: "run-9"}.proposal()
+		if p.RunID != "run-9" {
+			t.Fatalf("proposal() dropped the outer run id: %q", p.RunID)
+		}
+		scoped, err := DeriveScoped(ScopeRequest{RunID: p.RunID}, ContextActor{ID: "author-a"})
+		if err != nil {
+			t.Fatalf("derive: %v", err)
+		}
+		if scoped.Scope != ScopeRun || scoped.Key != "run-9" {
+			t.Fatalf("derived %q/%q, want run/run-9", scoped.Scope, scoped.Key)
+		}
+	})
+}
+
+// global is derived from the principal like private, so it can never be widened to
+// another user, and it is stored but served to nobody until a cross-workspace read
+// exists.
+func TestGlobalIsDerivedFromThePrincipalAndServedToNobodyYet(t *testing.T) {
+	dir := singleAgentDir(t)
+	e := propose(t, dir, "ws-1", "author-a", "global", "the toolchain lives in the home image",
+		func(r *ProposeContextRequest) { r.Visibility = ScopeGlobal })
+	if e.Scope != ScopeGlobal || e.ScopeKey != "author-a" {
+		t.Fatalf("stored scope %q/%q, want global keyed by the author", e.Scope, e.ScopeKey)
+	}
+	for _, reader := range []string{"author-a", "admin-a", "verifier-a", OpenModeIdentity, ""} {
+		if ScopesVisible(ScopeGlobal, "author-a", "author-a", reader, ScopeRequest{}) {
+			t.Fatalf("global must not be served to %q before the cross-workspace read exists", reader)
+		}
+	}
+	// Open mode has no principal, so it owns no user-level namespace.
+	if _, err := DeriveScope(ScopeRequest{Visibility: ScopeGlobal}, ContextActor{ID: OpenModeIdentity}); err == nil {
+		t.Fatal("open mode must not derive a global scope")
+	}
+	if _, err := DeriveScope(ScopeRequest{Visibility: ScopeGlobal}, ContextActor{}); err == nil {
+		t.Fatal("an anonymous caller must not derive a global scope")
 	}
 }
 

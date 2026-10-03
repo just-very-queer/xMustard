@@ -148,7 +148,11 @@ func promotedFilter(f *govstore.EntryFilter) { f.ServedOnly = true }
 
 // ListContextEntries returns entries filtered by status: "" / "all", "pending",
 // "promoted"/"active"/"verified", "rejected". An unknown filter selects nothing.
-func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, error) {
+// A non-empty reader applies the scope rule (WS-29b): an entry its scope does not
+// admit is left out, so this listing is not a way round a private memory. An empty
+// reader is the operator's own view (runtime settings and verifier telemetry count
+// what exists, not what one principal may read).
+func ListContextEntries(dataDir, workspaceID, filter string, reader ...string) ([]ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
@@ -156,6 +160,8 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 	if !ok {
 		return []ContextEntry{}, nil
 	}
+	who := firstOf(reader)
+	keys := ScopeRequest{}
 	f := govstore.EntryFilter{WorkspaceID: workspaceID}
 	apply(&f)
 	ctx := context.Background()
@@ -164,6 +170,15 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 		entries, err := listWorkspaceEntries(ctx, r, f)
 		if err != nil {
 			return err
+		}
+		if who != "" {
+			kept := entries[:0]
+			for _, e := range entries {
+				if ScopesVisible(e.Scope, e.ScopeKey, e.Source, who, keys) {
+					kept = append(kept, e)
+				}
+			}
+			entries = kept
 		}
 		if out, _, err = attachContent(ctx, r, entries); err != nil {
 			return err
@@ -178,9 +193,10 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 }
 
 // GetActiveContext returns only promoted (verified) entries — the read-only view
-// that actually enters an agent's working context.
-func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
-	promoted, err := ListContextEntries(dataDir, workspaceID, "promoted")
+// that actually enters an agent's working context. A non-empty reader applies the
+// scope rule, as ListContextEntries does.
+func GetActiveContext(dataDir, workspaceID string, reader ...string) (map[string]any, error) {
+	promoted, err := ListContextEntries(dataDir, workspaceID, "promoted", reader...)
 	if err != nil {
 		return nil, err
 	}

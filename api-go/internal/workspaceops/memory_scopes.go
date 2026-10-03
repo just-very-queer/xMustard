@@ -19,6 +19,9 @@ const (
 	// ScopeRun serves one run, and ScopeSession one session, and dies with it.
 	ScopeRun     = "run"
 	ScopeSession = "session"
+	// ScopeGlobal is user-level: one principal across every workspace it may reach
+	// (PAR-SHARE-01). Its key is the principal, so it is derived and never supplied.
+	ScopeGlobal = "global"
 	// ScopeShared serves what a grant admits (WS-29c); this sub-task never derives it.
 	ScopeShared = "shared"
 )
@@ -63,14 +66,20 @@ func DeriveScoped(req ScopeRequest, actor ContextActor) (Scoped, error) {
 	visibility := strings.TrimSpace(req.Visibility)
 	if visibility == "" {
 		// A run or session key alone already narrows the memory to that execution:
-		// it is why the request was made, not an extra assertion about visibility.
+		// it is why the request was made, not an extra assertion about visibility. A
+		// directory is validated here exactly as the explicit dir scope is, so an
+		// escaping or absolute directory is refused on both paths.
 		switch {
 		case strings.TrimSpace(req.RunID) != "":
 			return Scoped{Scope: ScopeRun, Key: strings.TrimSpace(req.RunID)}, nil
 		case strings.TrimSpace(req.SessionID) != "":
 			return Scoped{Scope: ScopeSession, Key: strings.TrimSpace(req.SessionID)}, nil
 		case strings.TrimSpace(req.Dir) != "":
-			return Scoped{Scope: ScopeDir, Key: strings.TrimSpace(req.Dir)}, nil
+			dir := strings.TrimSpace(req.Dir)
+			if err := validScopeDir(dir); err != nil {
+				return Scoped{}, err
+			}
+			return Scoped{Scope: ScopeDir, Key: dir}, nil
 		}
 		return Scoped{Scope: ScopeWorkspace}, nil
 	}
@@ -79,6 +88,17 @@ func DeriveScoped(req ScopeRequest, actor ContextActor) (Scoped, error) {
 	}
 	if visibility == ScopePrivate {
 		return Scoped{Scope: ScopePrivate, Key: strings.TrimSpace(actor.ID)}, nil
+	}
+	if visibility == ScopeGlobal {
+		// User-level and derived from the principal, exactly like private: the key is
+		// who wrote it, so no caller can widen a global memory to another user. It is
+		// served to nobody until a cross-workspace read path can scope a query to one
+		// principal's key across workspaces (PAR-SHARE-01's merge step, and WS-30e).
+		who := strings.TrimSpace(actor.ID)
+		if who == "" || IsOpenModeIdentity(who) {
+			return Scoped{}, fmt.Errorf("%w: scope %q needs a named principal", ErrInvalidInput, visibility)
+		}
+		return Scoped{Scope: ScopeGlobal, Key: who}, nil
 	}
 	keyed, known := scopeKeys[visibility]
 	if !known {
@@ -99,7 +119,7 @@ func DeriveScoped(req ScopeRequest, actor ContextActor) (Scoped, error) {
 
 // ScopeNames lists every derivable scope, canonical order.
 func ScopeNames() []string {
-	return []string{ScopeWorkspace, ScopePrivate, ScopeDir, ScopeRun, ScopeSession, ScopeShared}
+	return []string{ScopeWorkspace, ScopePrivate, ScopeDir, ScopeRun, ScopeSession, ScopeGlobal, ScopeShared}
 }
 
 // validScopeDir refuses a directory key that is not a plain repo-relative path
@@ -128,10 +148,14 @@ func validScopeDir(dir string) error {
 //   - private: the author only, whatever roles the reader holds (admin included)
 //   - run, session: the author inside the matching key, and nobody else
 //   - dir: the author, inside the directory or one below it
+//   - global: nobody, until a cross-workspace read can scope to one principal's key
 //   - shared: WS-29c decides from grants; this sub-task never serves it
 func ScopesVisible(scope, key, author, reader string, req ScopeRequest) bool {
 	if scope == ScopeShared {
 		return false // no grant can reach an entry whose scope was never shared
+	}
+	if scope == ScopeGlobal {
+		return false // derived and stored, served once WS-30e can scope across workspaces
 	}
 	if scope == ScopeWorkspace || scope == "" {
 		return true
@@ -165,12 +189,13 @@ func samePrincipal(a, b string) bool {
 	return a == b
 }
 
-// ScopeLeaks reports how many more entries a reader was served than its scope
-// admits: the scope-leak metric a fixture suite collects. It is 0 or the row has a
-// leak.
-func ScopeLeaks(total, admitted int) int {
-	if admitted > total {
-		return admitted - total
+// ScopeLeaks is the scope-leak metric a fixture suite collects: how many of the
+// entries a reader was SERVED its scope does not admit. It is 0 or the row has a
+// leak, so a reader served more than it was admitted is a leak, and a reader served
+// fewer is an under-serve, not a leak.
+func ScopeLeaks(served, admitted int) int {
+	if served > admitted {
+		return served - admitted
 	}
 	return 0
 }
