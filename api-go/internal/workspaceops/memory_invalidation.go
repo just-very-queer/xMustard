@@ -127,8 +127,8 @@ func (s *rehashSession) path(a govstore.Anchor) (anchorState, bool) {
 
 // fileRead is one read of a file: its text, or why there is none. A file that is absent
 // is missing; one too large or unreadable is unknown, not missing. mark is the identity
-// the text was read under, so a later anchor that finds the file moved re-reads it rather
-// than hashing an older text against a newer mark.
+// the text was read under, taken from the same descriptor, so a caller storing a hash of
+// this text is storing it under the version it came from.
 type fileRead struct {
 	text    string
 	ok      bool
@@ -138,15 +138,15 @@ type fileRead struct {
 
 // text reads a file once. Past maxInvalidationCacheBytes the file is read and handed back
 // without being retained, so one pass cannot hold every file a large change touches; the
-// cost is one read per anchor that needs the same file. want is the mark the caller has
-// already read; when it differs from the one the retained text was read under, the file is
-// read again.
-func (s *rehashSession) text(rel string, want fileMark) fileRead {
-	if r, ok := s.files[rel]; ok && (r.mark == want || !want.exists) {
+// cost is one read per anchor that needs the same file.
+func (s *rehashSession) text(rel string) fileRead {
+	if r, ok := s.files[rel]; ok {
 		return r
 	}
-	r := fileRead{mark: want}
-	if r.text, r.ok = readWorkspaceText(s.root, rel, maxSymbolFileBytes); !r.ok {
+	r := fileRead{}
+	mark, text, ok := readOutlineFile(s.root, rel, maxSymbolFileBytes)
+	r.mark, r.text, r.ok = mark, text, ok
+	if !r.ok {
 		f, err := openWorkspaceFileBeneath(s.root, rel)
 		if err == nil {
 			f.Close()
@@ -177,22 +177,22 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	}
 	want := normalizeNamePath(a.Value)
 	// The cache is consulted before the file is read, so a warm pass costs a stat rather
-	// than the file's bytes (WS-28C). The mark read here is the one the hit is judged on
-	// and the one the file is read under.
+	// than the file's bytes (WS-28C).
 	mark, hasMark := markOutlineFile(s.root, file)
 	readAt := time.Now()
 	if hasMark {
 		if hashes, hit := outlineHashesFor(s.workspaceID, s.root, file, mark, readAt); hit {
 			if h, named := hashes[want]; named {
-				// The mark is re-read before the hit is served, so a file that changed
-				// between this pass's stat and the lookup does not answer from the entry.
-				if after, still := markOutlineFile(s.root, file); !still || after == mark {
+				// The mark is re-read before the hit is served, and a file that cannot be
+				// marked now is a miss, not a hit: a file removed between the two reads
+				// must read as missing, not as the hash it used to have.
+				if after, still := markOutlineFile(s.root, file); still && after == mark {
 					return anchorState{govstore.BaselineHash, h}, true
 				}
 			}
 		}
 	}
-	src := s.text(file, mark)
+	src := s.text(file)
 	if !src.ok {
 		return missingState, src.missing
 	}
@@ -211,11 +211,12 @@ func (s *rehashSession) symbol(a govstore.Anchor) (anchorState, bool) {
 	s.countHashedFile(file)
 	// An incomplete outline is not cached: the index may name declarations it did not
 	// return, so an entry built from a partial outline could answer "missing" wrongly.
-	// The mark is re-read after the hash, so a file that changed while it was read is
-	// never stored under the version its text came from; a moved mark means no entry.
-	if !incomplete && hasMark {
-		if after, still := markOutlineFile(s.root, file); still && after == mark {
-			s.storeBody(file, mark, readAt, want, h)
+	// src.mark is the identity of the very text that was hashed (one open), so the hash
+	// is stored under the mark the text came from; a file that has since moved has a
+	// different mark now and is not stored.
+	if !incomplete && src.mark.exists {
+		if after, still := markOutlineFile(s.root, file); still && after == src.mark {
+			s.storeBody(file, src.mark, readAt, want, h)
 		}
 	}
 	return anchorState{govstore.BaselineHash, h}, true

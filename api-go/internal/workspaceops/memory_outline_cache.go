@@ -1,7 +1,10 @@
 package workspaceops
 
 import (
+	"io"
 	"maps"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -81,30 +84,68 @@ func outlineHashKey(workspaceID, root, rel string) string {
 // the path: the reader refuses a symlink component, and a mark taken through a symlink
 // could identify a file the reader would refuse, so a warm entry would answer a path the
 // confined read rejects. The cache must never be the weaker of the two.
-func markOutlineFile(root, rel string) (fileMark, bool) {
-	f, err := openWorkspaceFileBeneath(root, rel)
-	if err != nil {
+//
+// It is a var so a test can move the moment a file changes; production never replaces it.
+var markOutlineFile = markOutlineFileNow
+
+func markOutlineFileNow(root, rel string) (fileMark, bool) {
+	f, info, ok := openOutlineFile(root, rel)
+	if !ok {
 		return fileMark{}, false
+	}
+	f.Close()
+	return fileMarkFromInfo(info), true
+}
+
+// readOutlineFile reads rel through the confined walk and returns its identity and its
+// text from the SAME descriptor. The mark and the text therefore describe one version of
+// one file: a rename that swaps another file in between two separate opens cannot make the
+// pair disagree, because there is only one open. fd is nil: the descriptor is closed
+// before returning, and the text is what a caller keeps.
+func readOutlineFile(root, rel string, limit int64) (fileMark, string, bool) {
+	f, info, ok := openOutlineFile(root, rel)
+	if !ok {
+		return fileMark{}, "", false
 	}
 	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return fileMark{}, false
+	if info.Size() > limit {
+		return fileMark{}, "", false
 	}
-	return fileMarkFromInfo(info), true
+	var b strings.Builder
+	b.Grow(int(info.Size()))
+	n, err := io.Copy(&b, io.LimitReader(f, limit+1))
+	if err != nil || n > limit {
+		return fileMark{}, "", false
+	}
+	return fileMarkFromInfo(info), b.String(), true
+}
+
+// openOutlineFile opens rel beneath root through the symlink-refusing walk and returns it
+// with its stat when it is a regular file; the caller closes it.
+func openOutlineFile(root, rel string) (*os.File, os.FileInfo, bool) {
+	f, err := openWorkspaceFileBeneath(root, rel)
+	if err != nil {
+		return nil, nil, false
+	}
+	info, err := f.Stat() // fstat on the held fd, not a re-stat by path
+	if err != nil || !info.Mode().IsRegular() {
+		f.Close()
+		return nil, nil, false
+	}
+	return f, info, true
 }
 
 // trustedOutlineMark is a mark old enough to serve from the cache. A file written inside
 // the racy window has a mark another write inside the same tick can share, so it is read
 // rather than cached until it ages out; that is the registry's rule for the same reason.
-// fileMark.trusted already subtracts registryRacyWindow from readAt, and
-// outlineHashTrustWindow is that same window, so readAt is passed through unchanged; a
-// test sets the window to zero to close the rule.
+// The window is outlineHashTrustWindow itself, not fileMark.trusted's built-in one: the
+// mark must be at least that far in the past, and any other window (a test's wider one)
+// has to take effect, which passing the value through to trusted() would not do.
 func trustedOutlineMark(m fileMark, readAt time.Time) bool {
 	if outlineHashTrustWindow <= 0 {
 		return true
 	}
-	return m.trusted(readAt)
+	return newestNs(m.mtimeNs, m.ctimeNs) < readAt.Add(-outlineHashTrustWindow).UnixNano()
 }
 
 // outlineHashesFor returns a file's cached body hashes when its mark is unchanged and old
@@ -148,26 +189,24 @@ func storeOutlineHash(workspaceID, root, rel string, mark fileMark, readAt time.
 	}
 	hashes[want] = hash
 	held := outlineHashHeld(hashes)
-	// The budget this store would move the total to: grow adds to the entry already
-	// counted, everything else replaces it, so the old entry's bytes leave the total once.
-	moved := outlineHashes.held - heldBefore(old, cached, grow) + held
+	// The total this store moves the cache to. Both cases release what was counted: a
+	// grown entry is re-counted at its new size, and a replaced one stops counting. Only
+	// a genuinely new entry adds to the total.
+	released := int64(0)
+	if cached {
+		released = old.held
+	}
+	moved := outlineHashes.held - released + held
 	if moved > outlineHashMaxHeld {
 		return
 	}
-	if !grow && len(outlineHashes.byKey) >= outlineHashMaxEntries {
+	// A replacement does not add an entry, so it is allowed at the entry bound; only a
+	// new one is refused there.
+	if !cached && len(outlineHashes.byKey) >= outlineHashMaxEntries {
 		return
 	}
 	outlineHashes.byKey[key] = &outlineHashEntry{hashes: hashes, mark: mark, held: held}
 	outlineHashes.held = moved
-}
-
-// heldBefore is the entry's contribution to the total before this store: a grown entry was
-// already counted, a replaced one was, and an absent one was not.
-func heldBefore(old *outlineHashEntry, cached, grow bool) int64 {
-	if !cached || grow {
-		return 0
-	}
-	return old.held
 }
 
 // outlineHashHeld is the bytes one entry's map retains: each key and value, plus a fixed

@@ -325,26 +325,44 @@ func TestAnEditRehashesItsFileAndStillMarks(t *testing.T) {
 	}
 }
 
-// The key carries the file's identity, not its path alone: a file rewritten in place keeps
-// its path and may keep its size, so its mtime and inode identity are what must move for
-// the next pass to re-hash.
+// The key carries the file's identity, not its path alone. A same-size rewrite is the case
+// a size-only key would miss, and the assertion is on the mark itself, so an
+// implementation keyed only on size or only on mtime fails here rather than passing by
+// accident.
 func TestTheCacheKeyCarriesTheFileStatNotThePath(t *testing.T) {
 	resetOutlineCache(t)
 	trustOutlineCache(t)
 	f := newInvalidationFixture(t)
 	clearOutlineHashes()
 	ctx := context.Background()
+	before, ok := markOutlineFile(f.root, "srv.go")
+	if !ok {
+		t.Fatal("srv.go has no mark")
+	}
 	if _, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"}); err != nil {
 		t.Fatal(err)
 	}
 
-	// A file rewritten in place keeps its path and may keep its size; its mtime and inode
-	// identity are what move, so the next pass must re-hash.
+	// A file rewritten in place keeps its path and its size.
 	body := strings.Replace(srvSource, "return 8081", "return 7070", 1)
 	if len(body) != len(srvSource) {
 		t.Fatalf("the fixture edit changed the file size, so it would not prove the key")
 	}
 	writeRepoFile(t, f.root, "srv.go", body)
+	after, ok := markOutlineFile(f.root, "srv.go")
+	if !ok {
+		t.Fatal("srv.go has no mark after the rewrite")
+	}
+	if after.size != before.size {
+		t.Fatalf("the rewrite changed the size, so it would not prove the key")
+	}
+	if after == before {
+		t.Fatal("a same-size rewrite left the mark unchanged, so the key cannot see it")
+	}
+	if after.mtimeNs == before.mtimeNs && after.ctimeNs == before.ctimeNs && after.ino == before.ino {
+		t.Fatalf("nothing in the mark moved: %+v against %+v", before, after)
+	}
+
 	rep, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
 	if err != nil {
 		t.Fatal(err)
@@ -397,6 +415,92 @@ func TestTheOutlineCacheIsBoundedAndStillReads(t *testing.T) {
 	}
 	if again.Hashed != 1 {
 		t.Fatalf("an uncacheable file was cached anyway: %+v", again)
+	}
+}
+
+// One entry grows across several stores, and the total the governor sees stays exact: a
+// growth that added the whole new size instead of the difference would over-report and
+// refuse later entries early.
+func TestGrowingOneEntryAcrossStoresKeepsTheTotalExact(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	root := t.TempDir()
+	rel := "many/x.go"
+	if err := os.MkdirAll(filepath.Join(root, "many"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, rel), []byte("package many\n\nfunc X() int { return 1 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mark, ok := markOutlineFile(root, rel)
+	if !ok {
+		t.Fatal("many/x.go has no mark")
+	}
+
+	for i := range 5 {
+		storeOutlineHash("ws", root, rel, mark, time.Now(), fmt.Sprintf("Sym%d", i), strings.Repeat("a", 1024))
+	}
+	if n := outlineHashEntries(); n != 1 {
+		t.Fatalf("five stores made %d entries, want 1", n)
+	}
+	total, _ := outlineHashUsed()
+	outlineHashes.Lock()
+	var held int64
+	for _, e := range outlineHashes.byKey {
+		held += e.held
+	}
+	outlineHashes.Unlock()
+	if total != held {
+		t.Fatalf("after five stores the total is %d but the entry holds %d: the sizes were added, not differenced", total, held)
+	}
+	// And the entry really does hold all five, so the total is not right by being empty.
+	hashes, hit := outlineHashesFor("ws", root, rel, mark, time.Now())
+	if !hit || len(hashes) != 5 {
+		t.Fatalf("the entry holds %d hashes, want 5", len(hashes))
+	}
+}
+
+// A replacement is allowed at the entry bound, because it does not add an entry: a cache
+// full of entries must still refresh one whose file was edited.
+func TestAReplacementIsAllowedAtTheEntryBound(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	root := t.TempDir()
+	body := "package full\n\nfunc X() int { return 1 }\n"
+	for i := range outlineHashMaxEntries {
+		rel := fmt.Sprintf("full/f%04d/x.go", i)
+		if err := os.MkdirAll(filepath.Join(root, "full", fmt.Sprintf("f%04d", i)), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, filepath.FromSlash(rel)), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		mark, ok := markOutlineFile(root, rel)
+		if !ok {
+			t.Fatalf("%s has no mark", rel)
+		}
+		storeOutlineHash("ws", root, rel, mark, time.Now(), "X", strings.Repeat("a", 64))
+	}
+	if n := outlineHashEntries(); n != outlineHashMaxEntries {
+		t.Fatalf("the cache holds %d entries, want it full at %d", n, outlineHashMaxEntries)
+	}
+
+	// One of them is edited: its mark moves, so storing is a replacement, not a new entry.
+	target := "full/f0000/x.go"
+	if err := os.WriteFile(filepath.Join(root, target), []byte("package full\n\nfunc X() int { return 2 }\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	moved, ok := markOutlineFile(root, target)
+	if !ok {
+		t.Fatal("the edited file has no mark")
+	}
+	storeOutlineHash("ws", root, target, moved, time.Now(), "X", strings.Repeat("b", 64))
+	if n := outlineHashEntries(); n != outlineHashMaxEntries {
+		t.Fatalf("a replacement at the bound left %d entries, want the bound kept at %d", n, outlineHashMaxEntries)
+	}
+	hashes, hit := outlineHashesFor("ws", root, target, moved, time.Now())
+	if !hit || hashes["X"] != strings.Repeat("b", 64) {
+		t.Fatalf("the edited file's entry was not refreshed at the bound: %v (hit=%v)", hashes["X"], hit)
 	}
 }
 
@@ -692,6 +796,47 @@ func TestConcurrentPassesDoNotRaceOnACachedEntry(t *testing.T) {
 		if _, ok := hashes[fmt.Sprintf("Extra%02d", i)]; !ok {
 			t.Fatalf("writer %d's hash is missing from the entry", i)
 		}
+	}
+}
+
+// A file removed between the two marks a hit is judged on is a miss, not a hit: the cached
+// hash must never be served for a file that is gone. The mark hook removes the file on the
+// third read, which is the window between the lookup and the hit's confirmation.
+func TestAFileRemovedBeforeTheSecondMarkIsAMiss(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	f := newInvalidationFixture(t)
+	clearOutlineHashes()
+	ctx := context.Background()
+	if _, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"}); err != nil {
+		t.Fatal(err)
+	}
+	if n := outlineHashEntries(); n == 0 {
+		t.Fatal("the first pass cached nothing, so the removal has nothing to serve")
+	}
+
+	orig := markOutlineFile
+	t.Cleanup(func() { markOutlineFile = orig })
+	// The second read is the one that confirms a hit, so the file is removed there: the
+	// entry was found, and by the time it would be served the file is gone.
+	marks, remove := 0, true
+	markOutlineFile = func(root, rel string) (fileMark, bool) {
+		marks++
+		if remove && marks >= 2 {
+			remove = false
+			if err := os.Remove(filepath.Join(root, filepath.FromSlash(rel))); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return orig(root, rel)
+	}
+	rep, err := InvalidateMemory(ctx, f.dir, f.ws, []string{"srv.go"})
+	markOutlineFile = orig
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rep.Marked) != 1 {
+		t.Fatalf("a file removed mid-pass marked %v, want the one memory: the cached hash was served as current", rep.Marked)
 	}
 }
 

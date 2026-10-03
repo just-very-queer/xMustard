@@ -179,10 +179,7 @@ func (s *rehashSession) reanchorSite(site codeAnchorSite) (reanchorOutcome, stri
 	if err != nil {
 		return reanchorKept, ""
 	}
-	// The zero mark asks for whatever text the session already holds: re-anchoring
-	// searches the file for a snippet rather than hashing a declaration, so it has no
-	// reason to insist on a particular version.
-	content := s.text(from.Path, fileMark{})
+	content := s.text(from.Path)
 	if !content.ok {
 		return reanchorKept, ""
 	}
