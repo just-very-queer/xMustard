@@ -572,24 +572,34 @@ fn nested_git_dir(dir: &Path) -> Option<PathBuf> {
 const MAX_PACKED_REFS_BYTES: u64 = 64 << 20;
 
 /// The object id `packed-refs` at `path` holds for ref `name`: Some(None) when the file
-/// is absent or does not name it (an unborn branch), None when it could not be read
-/// to its end within MAX_PACKED_REFS_BYTES. Read line by line; nothing else is kept.
+/// is absent or does not name it (an unborn branch), None when it cannot be opened or
+/// read to its end within MAX_PACKED_REFS_BYTES. Read in lines of at most
+/// GIT_POINTER_BYTES (a longer line names no ref and is skipped); nothing else is kept.
 fn packed_ref(path: &Path, name: &[u8]) -> Option<Option<Vec<u8>>> {
     use std::io::{BufRead, Read};
-    let Ok(f) = fs::File::open(path) else {
-        return Some(None);
+    let f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
     };
     let mut r = std::io::BufReader::new(f.take(MAX_PACKED_REFS_BYTES));
-    let (mut line, mut total) = (Vec::new(), 0u64);
+    let (mut line, mut total, mut long) = (Vec::new(), 0u64, false);
     loop {
         line.clear();
-        let n = r.read_until(b'\n', &mut line).ok()?;
+        let n = (&mut r)
+            .take(GIT_POINTER_BYTES)
+            .read_until(b'\n', &mut line)
+            .ok()?;
         if n == 0 {
             return (total < MAX_PACKED_REFS_BYTES).then_some(None);
         }
         total += n as u64;
+        let ended = line.last() == Some(&b'\n');
+        // the rest of an over-long line, or its head, is not a ref line
+        let skip = std::mem::replace(&mut long, !ended) || !ended;
         let l = line.trim_ascii_end();
-        if let Some(sp) = l.iter().position(|b| *b == b' ')
+        if !skip
+            && let Some(sp) = l.iter().position(|b| *b == b' ')
             && &l[sp + 1..] == name
         {
             return Some(Some(l[..sp].to_vec()));
@@ -1595,9 +1605,20 @@ mod tests {
         packed("bbbb");
         let b = nested_repo_token(&dir).unwrap();
         assert_ne!(a, b);
+        // a ref line inside an over-long line is not read as one
+        let long = format!("{} {}\naaaa refs/heads/main\n", "x".repeat(8 << 10), "y");
+        fs::write(git.join("packed-refs"), long).unwrap();
+        assert_eq!(nested_repo_token(&dir).unwrap(), a);
+        fs::write(
+            git.join("packed-refs"),
+            format!("{}aaaa refs/heads/main\n", "z".repeat(8 << 10)),
+        )
+        .unwrap();
+        let tail = nested_repo_token(&dir).unwrap();
         fs::remove_file(git.join("packed-refs")).unwrap();
         let unborn = nested_repo_token(&dir).unwrap();
         assert!(unborn != a && unborn != b);
+        assert_eq!(tail, unborn, "the tail of an over-long line names no ref");
     }
 
     #[test]

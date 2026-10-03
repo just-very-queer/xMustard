@@ -1734,23 +1734,25 @@ fn stamp_identity(
     let conn = Connection::open(db).map_err(sql_err)?;
     schema::configure(&conn).map_err(sql_err)?;
     let count = id.limitations.map(|n| n.to_string());
+    // one transaction: a reader never sees a new key beside the previous count
+    let tx = conn.unchecked_transaction().map_err(sql_err)?;
     for (k, v) in [
         (meta::IDENTITY_KEY, Some(id.key.clone())),
         (meta::IDENTITY_LIMITATIONS, count),
     ] {
-        let stored = meta::get(&conn, k).map_err(sql_err)?;
+        let stored = meta::get(&tx, k).map_err(sql_err)?;
         match v {
             Some(v) if stored.as_deref() != Some(v.as_str()) => {
-                meta::set(&conn, k, &v).map_err(sql_err)?
+                meta::set(&tx, k, &v).map_err(sql_err)?
             }
             None if stored.is_some() => {
-                conn.execute("DELETE FROM meta WHERE key = ?1", [k])
+                tx.execute("DELETE FROM meta WHERE key = ?1", [k])
                     .map_err(sql_err)?;
             }
             _ => {}
         }
     }
-    Ok(())
+    tx.commit().map_err(sql_err)
 }
 
 /// `xmustard-core index <build|update|stats> <root> [flags]`: the subcommand-table

@@ -232,6 +232,8 @@ fn git_class(rel: &str) -> Class {
         "info/exclude" => Class::IgnoreFile,
         "index" => Class::Git { index: true },
         r if GIT_STATE_FILES.contains(&r) || r.starts_with("refs/") => Class::Git { index: false },
+        // a submodule's own Git dir: its commits move the HEAD this root's key covers
+        r if r.starts_with("modules/") => Class::NestedGit,
         _ => Class::Skip,
     }
 }
@@ -1548,10 +1550,12 @@ pub fn git_epoch(root: &Path) -> Option<u64> {
 }
 
 /// Whether the watcher sees every change to `state`'s key. A nested repository's HEAD is
-/// part of the key, but inotify watches no directory inside a Git dir (`walk_tree`), so
-/// only a recursive native stream sees a commit inside one (WS-RT2).
-fn memo_sees(state: &RepoState, recursive: bool) -> bool {
-    recursive || state.identity.nested_repos.is_empty()
+/// part of the key, and so is a submodule's once a commit inside it makes it dirty, but
+/// inotify watches no directory inside a Git dir (`walk_tree`, and a submodule's Git dir
+/// sits in this root's `.git/modules/`), so only a recursive native stream sees such a
+/// commit (WS-RT2). `submodules` says whether the Git dir has a `modules/` directory.
+fn memo_sees(state: &RepoState, recursive: bool, submodules: impl FnOnce() -> bool) -> bool {
+    recursive || (state.identity.nested_repos.is_empty() && !submodules())
 }
 
 /// `root`'s repository state: the watcher's last observation while it vouches that
@@ -1568,7 +1572,13 @@ pub fn memo(root: &Path, observe: impl FnOnce() -> Arc<RepoState>) -> (Arc<RepoS
         let mut inner = lock(&r.inner);
         match &inner.memo {
             Some((at, state))
-                if vouches && *at == epoch && memo_sees(state, recursive_native()) =>
+                if vouches
+                    && *at == epoch
+                    && memo_sees(state, recursive_native(), || {
+                        lock(&r.layout)
+                            .git_dir()
+                            .is_some_and(|g| g.join("modules").is_dir())
+                    }) =>
             {
                 let state = state.clone();
                 inner.counters.memo_hits += 1;
@@ -1661,6 +1671,7 @@ mod tests {
             ("/r/.git/objects/ab/cdef", Class::Skip),
             ("/r/.git/index.lock", Class::Skip),
             ("/r/.git/xmustard-cache/index-v3/x/index.db", Class::Skip),
+            ("/r/.git/modules/mod/refs/heads/main", Class::NestedGit),
             ("/r", Class::Skip),
             ("/elsewhere/a.go", Class::Skip),
         ];
@@ -1724,7 +1735,10 @@ mod tests {
     fn a_memo_with_nested_repositories_is_reused_only_by_a_recursive_stream() {
         let dir = tempfile::tempdir().expect("a temp dir");
         let mut state = crate::indexcache::observe_repo_state(dir.path());
-        assert!(memo_sees(&state, false) && memo_sees(&state, true));
+        assert!(memo_sees(&state, false, || false) && memo_sees(&state, true, || false));
+        // a clean submodule is in no status entry, but its Git dir sits in .git/modules
+        assert!(!memo_sees(&state, false, || true));
+        assert!(memo_sees(&state, true, || true));
         state
             .identity
             .nested_repos
@@ -1732,8 +1746,8 @@ mod tests {
                 path: "sub".into(),
                 kind: crate::indexcache::NESTED_UNTRACKED.into(),
             });
-        assert!(!memo_sees(&state, false));
-        assert!(memo_sees(&state, true));
+        assert!(!memo_sees(&state, false, || false));
+        assert!(memo_sees(&state, true, || false));
     }
 
     #[test]
