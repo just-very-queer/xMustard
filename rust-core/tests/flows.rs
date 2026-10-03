@@ -1607,23 +1607,52 @@ fn a_flow_is_classified_over_every_area_member_not_the_capped_list() {
 /// flag onto the wrong symbol — and PAR-SYM-09's ×2 doubling then applied to symbols that
 /// are not exported and withheld from ones that are.
 ///
-/// The fixture forces the gap: a file the extractor cannot parse sits between two files that
-/// it can, so the store holds symbols the segment does not, and the flag read has to skip
-/// them rather than slide. The entry point after the gap is exported and the one before it
-/// is not, so a shifted read gets both wrong.
+/// The fixture forces a gap in the STORE's row set, not merely a file the parser dislikes:
+/// an earlier version used an unparseable file, from which the index extracted no symbols
+/// at all, so the store held no rows for it and the positional read was already correct.
+/// `max-file-size` is what produces a file that is IN the store and OUT of the segment,
+/// which is the case the old read got wrong.
 #[test]
 fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
     let d = repo(&[
         GO_MOD,
         // Before the gap: an UNEXPORTED entry point, so its expected score has no ×2.
         ("aaa/first.go", "package aaa\n\nfunc alphaOne() { alphaTwo(); alphaThree() }\nfunc alphaTwo() {}\nfunc alphaThree() {}\n"),
-        // The gap: a file the index cannot parse, so its symbols are in the store and not
-        // in the segment.
-        ("bbb/broken.go", "\u{feff}package bbb\n\nfunc ???Broken( {\n"),
         // After the gap: an EXPORTED entry point, which must keep its ×2.
         ("ccc/last.go", "package ccc\n\nfunc DeltaOne() { DeltaTwo(); DeltaThree() }\nfunc DeltaTwo() {}\nfunc DeltaThree() {}\n"),
     ]);
-    build(d.path());
+    // The gap is a file the scan marks `oversized`: above `max_file_size`, so the segment
+    // does not cover it while the store still holds its symbols. That is the shape
+    // `exported_by_symbol` used to get wrong — a positional read slid every flag after
+    // the first gap onto its neighbour. It is written directly rather than through
+    // `repo()`, and then indexed with `--max-file-size` set below its size, because the
+    // flag is a property of the STORE's row set and not of the fixture helper.
+    let big = d.path().join("bbb/huge.go");
+    fs::create_dir_all(big.parent().unwrap()).unwrap();
+    // The gap file must be the only one over the limit, so it is padded well past the
+    // size the two real files sit under.
+    let mut big_src = String::from("package bbb\n\nfunc HugeOne() {}\n");
+    while big_src.len() < 4096 {
+        big_src.push_str("// padding padding padding padding padding padding padding\n");
+    }
+    fs::write(&big, &big_src).unwrap();
+    let an_hour_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+    fs::File::options()
+        .write(true)
+        .open(&big)
+        .unwrap()
+        .set_modified(an_hour_ago)
+        .unwrap();
+    git(d.path(), &["add", "-A"]);
+    git(d.path(), &["commit", "-qm", "gap"]);
+    // 512 bytes sits above both real files (each under 200) and below the padded one.
+    ok_json(&[
+        "index",
+        "build",
+        d.path().to_str().unwrap(),
+        "--max-file-size",
+        "512",
+    ]);
     let v = flows(d.path(), &[]);
     let seeds = read_seeds(&v);
     let by_name = |n: &str| -> Seed {
