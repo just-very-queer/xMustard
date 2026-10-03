@@ -12,9 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"xmustard/api-go/internal/budget"
 )
@@ -377,9 +379,9 @@ func (st *rootsState) backOff(cached *rootsState, timedOut bool) {
 // every such call fails this way; treating that as a client failure would let two
 // streamless calls open a window that suppresses the next stream-capable call, which
 // would then resolve from the server's working directory instead of the client's
-// root. Such a failure is not cached at all.
+// root. A stream write that fails is the same case. Such a failure is not cached.
 func unsentRootCause(err error) bool {
-	return errors.Is(err, errNoStream)
+	return errors.Is(err, errNotSent)
 }
 
 // isJSONArray reports whether raw is a JSON array (leading whitespace allowed).
@@ -450,6 +452,17 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			// rejected answer can still hold usable roots; r is not walked, which drops
 			// them.
 			st.err, st.transient = "roots/list answer is malformed: "+clip(err.Error(), rootsErrClip), true
+			st.backOff(cached, false)
+			break
+		}
+		// Every root must carry a uri; [null] and [{}] decode cleanly but describe
+		// nothing, so they are malformed rather than a definitive "no roots".
+		if slices.ContainsFunc(r.Roots, func(root struct {
+			URI string `json:"uri"`
+		}) bool {
+			return root.URI == ""
+		}) {
+			st.err, st.transient = "roots/list answer is malformed: a root carries no uri", true
 			st.backOff(cached, false)
 			break
 		}
@@ -609,6 +622,9 @@ func clip(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n-- // back off to the start of the rune at n, so no sequence is split
 	}
 	return s[:n] + "…"
 }
