@@ -2,6 +2,7 @@ package govstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"testing"
@@ -14,9 +15,9 @@ func TestMigrationUpgradesV4FileToCollectionMembers(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "gov.db")
 	all := migrations
 	migrations = all[:4]
+	t.Cleanup(func() { migrations = all })
 	old, err := Open(ctx, path, Options{})
 	if err != nil {
-		migrations = all
 		t.Fatal(err)
 	}
 	propose(t, old, "m1", "t", "c")
@@ -58,8 +59,9 @@ func TestMigrationUpgradesV4FileToCollectionMembers(t *testing.T) {
 	if app, err := s.ListApplicability(ctx, "m1"); err != nil || len(app) != 1 || app[0].State != ApplicabilityForeignUnchecked {
 		t.Fatalf("v4 applicability lost in the upgrade: %+v, %v", app, err)
 	}
-	if _, err := s.ListEntries(ctx, EntryFilter{WorkspaceID: "ws1"}); err != nil {
-		t.Fatalf("v4 entries lost in the upgrade: %v", err)
+	entries, err := s.ListEntries(ctx, EntryFilter{WorkspaceID: "ws1"})
+	if err != nil || len(entries) != 1 || entries[0].ID != "m1" {
+		t.Fatalf("v4 entries lost in the upgrade: %+v, %v", entries, err)
 	}
 }
 
@@ -118,7 +120,7 @@ func TestCollectionMembershipAddListAndRemove(t *testing.T) {
 		t.Errorf("members are not in membership order: %+v", members)
 	}
 	// The entry side of the relation answers the same fact.
-	cols, err := s.ListEntryCollections(ctx, "m1")
+	cols, err := s.ListEntryCollections(ctx, "m1", CollectionFilter{})
 	if err != nil {
 		t.Fatalf("entry collections: %v", err)
 	}
@@ -253,11 +255,124 @@ func TestCollectionMembersListingIsBounded(t *testing.T) {
 	if len(members) != 2 || members[0].EntryID != "m1" || members[1].EntryID != "m2" {
 		t.Fatalf("bounded members = %+v", members)
 	}
+	// Page past the cap: the second call starts after the first call's last seq, so
+	// every member stays reachable however many there are.
+	more, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, AfterSeq: members[1].Seq})
+	if err != nil {
+		t.Fatalf("paged members: %v", err)
+	}
+	if len(more) != 1 || more[0].EntryID != "m3" {
+		t.Fatalf("paged members = %+v, want m3", more)
+	}
+	// An over-large limit is clamped to the store cap, never honoured as asked, so a
+	// caller cannot make one read unbounded.
+	if want, got := maxListLimit, clampLimit(1<<20); got != want {
+		t.Errorf("clampLimit(1<<20) = %d, want %d", got, want)
+	}
 	members, err = s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID, Limit: 1 << 20})
 	if err != nil {
 		t.Fatalf("clamped members: %v", err)
 	}
 	if len(members) != 3 {
 		t.Fatalf("clamped members = %+v", members)
+	}
+}
+
+// A purged entry is not a member. Purge leaves the entry row as a tombstone, and
+// AddToCollection refuses a purged entry, so the listing must refuse it too: the two
+// must not disagree about what a collection holds.
+func TestCollectionMembershipHidesAPurgedEntry(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "t", "c")
+	propose(t, s, "m2", "t2", "c2")
+	admin := Actor{Principal: "admin"}
+	var col Collection
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "team", OwnerWorkspace: "ws1"}, admin)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.AddToCollection(ctx, col.ID, "m1", admin); err != nil {
+			return err
+		}
+		_, err := tx.AddToCollection(ctx, col.ID, "m2", admin)
+		return err
+	})
+	if err := s.Update(ctx, func(tx Tx) error {
+		return tx.Purge(ctx, "m1", "retracted", admin)
+	}); err != nil {
+		t.Fatalf("purge: %v", err)
+	}
+	members, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID})
+	if err != nil {
+		t.Fatalf("members after purge: %v", err)
+	}
+	if len(members) != 1 || members[0].EntryID != "m2" {
+		t.Fatalf("members after purge = %+v, want only m2", members)
+	}
+	cols, err := s.ListEntryCollections(ctx, "m1", CollectionFilter{})
+	if err != nil {
+		t.Fatalf("entry collections after purge: %v", err)
+	}
+	if len(cols) != 0 {
+		t.Fatalf("purged entry still holds collections: %+v", cols)
+	}
+}
+
+// A re-add and a removal are different facts in the history, so the membership event
+// names the operation and reports whether the row was newly created.
+func TestCollectionMemberEventSeparatesReAddFromRemoval(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "t", "c")
+	propose(t, s, "m2", "t2", "c2")
+	admin := Actor{Principal: "admin"}
+	var col Collection
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "team", OwnerWorkspace: "ws1"}, admin)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.AddToCollection(ctx, col.ID, "m1", admin); err != nil {
+			return err
+		}
+		if _, err := tx.AddToCollection(ctx, col.ID, "m2", admin); err != nil {
+			return err
+		}
+		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin) // the re-add
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.RemoveFromCollection(ctx, col.ID, "m2", admin)
+		return err
+	})
+	evs, err := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", Types: []string{EventCollectionMember}})
+	if err != nil {
+		t.Fatalf("events: %v", err)
+	}
+	if len(evs) != 4 {
+		t.Fatalf("membership events = %+v, want 4", evs)
+	}
+	// In order: add m1 created, add m2 created, add m1 re-added (not created), remove m2.
+	type op struct {
+		kind    string
+		created bool
+		entry   string
+	}
+	want := []op{{"add", true, "m1"}, {"add", true, "m2"}, {"add", false, "m1"}, {"remove", false, "m2"}}
+	for i, e := range evs {
+		var data struct {
+			Op      string `json:"op"`
+			Created bool   `json:"created"`
+		}
+		if err := json.Unmarshal(e.Data, &data); err != nil {
+			t.Fatalf("event %d data: %v", i, err)
+		}
+		if data.Op != want[i].kind || data.Created != want[i].created || e.EntryID != want[i].entry {
+			t.Errorf("event %d = op %q created %v entry %q, want %+v", i, data.Op, data.Created, e.EntryID, want[i])
+		}
 	}
 }

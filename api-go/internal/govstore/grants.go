@@ -99,9 +99,19 @@ type CollectionMember struct {
 }
 
 // CollectionMemberFilter pages through a collection's members, oldest membership first.
+// AfterSeq is the seq of the last member of the previous call, so every member stays
+// reachable while each read stays bounded.
 type CollectionMemberFilter struct {
 	CollectionID string
+	AfterSeq     int64
 	Limit        int
+}
+
+// CollectionFilter pages through the collections holding an entry. AfterID is the last
+// collection id of the previous call.
+type CollectionFilter struct {
+	AfterID string
+	Limit   int
 }
 
 // CollectionMemberResult reports whether an Add or Remove changed the store. A re-add
@@ -118,7 +128,7 @@ type GrantReader interface {
 	GetCollection(ctx context.Context, id string) (Collection, error)
 	ListGrants(ctx context.Context, f GrantFilter) ([]Grant, error)
 	ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error)
-	ListEntryCollections(ctx context.Context, entryID string) ([]string, error)
+	ListEntryCollections(ctx context.Context, entryID string, f CollectionFilter) ([]string, error)
 	ListApplicability(ctx context.Context, entryID string) ([]Applicability, error)
 }
 
@@ -304,7 +314,7 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 	}
 	if err := t.appendEvent(ctx, actor, eventRow{
 		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember, Revision: entry.Revision,
-		Data: map[string]any{"collection_id": collectionID, "added": created},
+		Data: map[string]any{"collection_id": collectionID, "op": "add", "created": created},
 	}); err != nil {
 		return CollectionMemberResult{}, err
 	}
@@ -332,7 +342,7 @@ func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID st
 	}
 	if err := t.appendEvent(ctx, actor, eventRow{
 		WorkspaceID: col.OwnerWorkspace, EntryID: entryID, Type: EventCollectionMember,
-		Data: map[string]any{"collection_id": collectionID, "added": false},
+		Data: map[string]any{"collection_id": collectionID, "op": "remove", "created": false},
 	}); err != nil {
 		return CollectionMemberResult{}, err
 	}
@@ -341,13 +351,17 @@ func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID st
 
 // ListCollectionMembers returns a collection's members, oldest membership first. The
 // collection must exist, so a name that is not one is ErrNotFound rather than an empty
-// list.
+// list. A purged member is not a member: purge leaves the entry row as a tombstone, and
+// AddToCollection refuses a purged entry, so listing it would contradict the writer.
+// AfterSeq pages: the seq of the last member of the previous call.
 func (r *reader) ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error) {
 	if _, err := r.GetCollection(ctx, f.CollectionID); err != nil {
 		return nil, fmt.Errorf("collection %s: %w", f.CollectionID, err)
 	}
-	rows, err := r.query(ctx, `SELECT collection_id, entry_id, added_by, added_at, seq FROM collection_members
-		WHERE collection_id = ? ORDER BY seq LIMIT ?`, f.CollectionID, clampLimit(f.Limit))
+	rows, err := r.query(ctx, `SELECT m.collection_id, m.entry_id, m.added_by, m.added_at, m.seq
+		FROM collection_members m JOIN entries e ON e.id = m.entry_id
+		WHERE m.collection_id = ? AND e.lifecycle <> ? AND m.seq > ?
+		ORDER BY m.seq LIMIT ?`, f.CollectionID, LifecyclePurged, f.AfterSeq, clampLimit(f.Limit))
 	if err != nil {
 		return nil, err
 	}
@@ -363,10 +377,13 @@ func (r *reader) ListCollectionMembers(ctx context.Context, f CollectionMemberFi
 	return out, rows.Err()
 }
 
-// ListEntryCollections returns the ids of the collections holding an entry.
-func (r *reader) ListEntryCollections(ctx context.Context, entryID string) ([]string, error) {
-	rows, err := r.query(ctx, "SELECT collection_id FROM collection_members WHERE entry_id = ? ORDER BY collection_id LIMIT ?",
-		entryID, maxListLimit)
+// ListEntryCollections returns the ids of the collections holding a live entry, paging
+// with AfterID from the last collection of the previous call. Purged entries hold
+// nothing: see ListCollectionMembers.
+func (r *reader) ListEntryCollections(ctx context.Context, entryID string, f CollectionFilter) ([]string, error) {
+	rows, err := r.query(ctx, `SELECT m.collection_id FROM collection_members m JOIN entries e ON e.id = m.entry_id
+		WHERE m.entry_id = ? AND e.lifecycle <> ? AND m.collection_id > ?
+		ORDER BY m.collection_id LIMIT ?`, entryID, LifecyclePurged, f.AfterID, clampLimit(f.Limit))
 	if err != nil {
 		return nil, err
 	}
