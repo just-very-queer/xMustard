@@ -1485,16 +1485,26 @@ diff. No product source, no bound, no timeout, no retry, no dependency.
 **Goal.** WS-FIX-11 (merged `932106d`) turned the group- and world-writable index-directory
 warning into a refusal. `classify_dir` (`rust-core/src/index/mod.rs:249`) refuses an
 operator-named directory carrying any group- or other-**write** bit, and its error names
-`chmod 700 <dir>`. Three fixtures in `rust-core/tests/index_query.rs` hand a `TempDir` straight
-to the index as an operator-named `--index-dir`, so their outcome now depends on the **process
-umask** rather than on anything the test says. `TempDir::new` creates through
+`chmod 700 <dir>`. **Four** fixtures in `rust-core/tests/index_query.rs` hand a `TempDir`
+straight to the index as an operator-named `--index-dir`, so their outcome depends on the
+**process umask** rather than on anything the test says. `TempDir::new` creates through
 `std::fs::create_dir`, which takes the umask's permissions: under a login umask of `0002` the
-directory lands at `0775`, the guard refuses it, and the test fails on a host that changed
-nothing. Measured on the build box: under `umask 0002` the three tests fail, under `umask 0022`
-they pass.
+directory lands at `0775`, the guard refuses it, and a test fails on a host that changed
+nothing.
 
-This row makes each fixture create its index directory with an **explicit `0700`**
-(`DirBuilder::mode(0o700)`, which the umask can only narrow and never widen) so no fixture's
+Measured on the build box, `umask 0002`, pre-fix tree: the suite is **green, 9 passed**
+(`logs/ws-fix-27-run-20261003T144047Z.log`). Three of the four sites were
+already saved by the `tighten()` chmod that WS-FIX-11 and WS-FLK-01 added, so the umask
+never reached them. The one site with no `tighten` is
+`legacy_equality_holds_on_parity_fixtures` (`index_query.rs:556`), and it **skips itself**
+unless `XMUSTARD_PARITY_FIXTURES` is set, which is why no gate run reached it. The defect
+is therefore latent at three sites rather than active, and the fix is creation-time for all
+four instead of a chmod after the fact at three.
+
+This row makes each fixture create its index directory with an **explicit `0700`** at creation
+time — `tempfile::Builder::permissions`, which `tempfile` passes to `mkdir`
+(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`), and which the umask can only narrow and never widen
+— so no fixture's
 result depends on the umask of whoever logs into the machine. It replaces the `tighten()`
 after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
 at every site, and it extends the fix to the one site that never had it
@@ -1524,16 +1534,21 @@ needs the `TempDir` itself to be the index directory, which only `index_query.rs
 (`index_query.rs:1381`) for `ensure_graph_segment`.
 
 **Tests required.**
-- The defect is demonstrated before it is closed: with `umask 0002` the affected tests must be
-  **red** on the unmodified tree, with `classify_dir`'s own refusal in the panic text naming the
-  mode. This is the row's TDD step and it is what makes the fix more than a claim.
 - One new test asserts the property directly, without depending on which tests happen to fail:
-  it creates an index directory through the new constructor and asserts `mode & 0o077 == 0`,
-  under a deliberately permissive `0002` umask set for the process. Its expected value is the
-  literal `0o077`, not the result of calling the code under test.
-- A mutation row per site: removing the explicit mode from the constructor turns that site back
-  to the umask-dependent creation and the new test goes red. Each is restored from a tree
-  `git status --short` showed clean.
+  under a deliberately permissive `0002` umask it asserts `index_dir()` creates `0o700` **and**
+  that a plain `TempDir` creates `0o775` under the same umask. Both expected values are
+  literals, not results of calling the code under test, and the pair is what makes the first
+  meaningful: under a `0077` umask a plain `TempDir` is already `0700`, so a one-sided
+  assertion would pass with the explicit mode removed. The umask is set in a **child process**
+  (this same test binary re-invoked), because a process-global `umask` is not safe to set in a
+  binary whose tests run in parallel threads.
+- A mutation row for the constructor: removing `b.permissions(perm(0o700))` turns the test
+  **red** with `left: 509` (`0o775`) against `right: 448` (`0o700`), measured under `umask 0002`
+  on the box. Restored from a tree `git status --short` showed clean.
+- A mutation row for the assertion: narrowing the mode mask must fail, so the test cannot be
+  satisfied by a mask that cannot see a group-write bit. This one **survived its first form**
+  (the negative half read the mode through a second mask rather than the predicate the
+  positive half used) and the test was strengthened until it was killed.
 - `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines and `BUILD_5000_*` are
   byte-identical to the merge base.
 - `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
