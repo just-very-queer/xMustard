@@ -5,7 +5,8 @@ mod memprobe;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::process::ExitStatusExt;
+use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -97,6 +98,29 @@ fn await_file(path: &std::path::Path) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("{} never appeared", path.display());
+}
+
+/// `await_file` for a child that is an interpreter rather than a shell: starting one on a
+/// loaded box costs seconds, which the shell's 18 s budget does not always cover, and a
+/// timeout here would read as a broken wrapper rather than as a slow child.
+fn await_child(path: &std::path::Path, dir: &std::path::Path) {
+    for _ in 0..3000 {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{} never appeared; the wrapper said: {:?}; the dir holds {:?}",
+        path.display(),
+        std::fs::read_to_string(dir.join("wrapper-err")).unwrap_or_default(),
+        std::fs::read_dir(dir)
+            .map(|r| {
+                r.filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    );
 }
 
 fn seen(dir: &std::path::Path) -> String {
@@ -710,5 +734,171 @@ fn without_forwarding_the_wrapper_becomes_the_command() {
         out.trim(),
         format!("pid={}", wrapper.id()),
         "not exec'd in place: {out:?}"
+    );
+}
+
+/// WS-FIX-20b: one Ctrl-C is one signal.
+///
+/// A terminal delivers SIGINT to every process in its foreground process group, so the child
+/// already receives the operator's keystroke. WS-FIX-20's watcher then relayed the wrapper's
+/// own copy on to the child, and the child ran its handler twice per keystroke
+/// (WS-FIX-20-r4-1). The wrapper must not relay a signal the terminal or the kernel
+/// generated for the whole group.
+///
+/// The terminal here is a real pty and the wrapper's group is its foreground group, which is
+/// what a shell does with a job: measured on the box, `fg == pgid == child's pgid`. Writing
+/// `\x03` to the master is then what the line discipline turns into SIGINT for that group,
+/// so the child gets the terminal's copy directly and the wrapper gets its own to relay. No
+/// `kill(2)` is involved, so a relayed copy is distinguishable from the terminal's.
+///
+/// The child is `python3`, not `sh`, and that is load-bearing rather than stylistic: `dash`
+/// coalesces back-to-back SIGINTs, so the two copies arrived microseconds apart and its trap
+/// ran **once** (measured on the box: three SIGINTs in a tight loop, one trap call). A
+/// shell-based version of this test passes on the broken code, which is how the first
+/// version of it did.
+#[test]
+fn one_terminal_keystroke_reaches_the_child_once() {
+    // The keystrokes a terminal turns into SIGINT (INTR) and SIGQUIT (QUIT) for its
+    // foreground group. Each keystroke gets its own wrapper, because a run is what leaves a
+    // child and its log behind and the first run's child is released before the next starts.
+    for (name, byte) in [("INT", b"\x03"), ("QUIT", b"\x1c")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut wrapper, mut master, _slave) = terminal_job(dir.path());
+        await_child(&dir.path().join("ready"), dir.path());
+        let counted = keystroke_and_count(dir.path(), &mut master, byte);
+        release(dir.path());
+        let _ = wait_within(&mut wrapper, 10);
+        assert_eq!(
+            counted, 1,
+            "{name}: the child recorded {counted} copies of the operator's keystroke, so the \
+             wrapper relayed the terminal's own"
+        );
+    }
+}
+
+/// Writes `byte` to the pty master and returns how many lines the child's log holds once
+/// the count stops growing, so a second copy is read rather than raced past.
+fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: &[u8]) -> usize {
+    master.write_all(byte).unwrap();
+    master.flush().unwrap();
+    let mut last = usize::MAX;
+    for _ in 0..900 {
+        let n = seen(dir).lines().filter(|l| !l.trim().is_empty()).count();
+        if n > 0 && n == last {
+            return n;
+        }
+        last = n;
+        thread::sleep(Duration::from_millis(20));
+    }
+    seen(dir).lines().filter(|l| !l.trim().is_empty()).count()
+}
+
+/// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
+/// terminal is a fresh pty, and returns the wrapper, the pty master and the slave fd. The
+/// child inherits the wrapper's process group, so wrapper and child are the pty's one
+/// foreground group, exactly as a shell runs a job.
+fn terminal_job(dir: &std::path::Path) -> (std::process::Child, std::fs::File, i32) {
+    let master =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .unwrap();
+    rustix::pty::grantpt(&master).unwrap();
+    rustix::pty::unlockpt(&master).unwrap();
+    let master = std::fs::File::from(master);
+    let slave = {
+        let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
+        rustix::fs::open(name, rustix::fs::OFlags::RDWR, rustix::fs::Mode::empty())
+            .unwrap()
+            .into_raw_fd()
+    };
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .arg("python3")
+        .arg(COUNTER_CHILD)
+        .arg(dir.to_str().unwrap())
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdin(owned(slave))
+        .stdout(owned(slave))
+        .stderr(std::fs::File::create(dir.join("wrapper-err")).unwrap());
+    // A controlling terminal is what makes the line discipline signal the group, and only a
+    // session leader may acquire one, so `setsid` runs between the fork and the exec. The
+    // wrapper then leads its own session and group, and the child it spawns inherits that
+    // group: the terminal job a shell would set up. Both calls are safe wrappers and nothing
+    // between them allocates, so the post-fork window is the one `spawn` already requires
+    // its caller to keep minimal.
+    unsafe {
+        c.pre_exec(|| {
+            rustix::process::setsid()?;
+            rustix::process::ioctl_tiocsctty(std::io::stdin())?;
+            Ok(())
+        });
+    }
+    let wrapper = c.spawn().unwrap_or_else(|e| {
+        panic!(
+            "the wrapper could not start in its own session: {e}; setsid on a process group \
+             leader answers EPERM, and the pty cannot signal a group it does not own"
+        );
+    });
+    // The parent's copy of the slave must close, or the master never sees EOF.
+    drop(unsafe { std::fs::File::from_raw_fd(slave) });
+    (wrapper, master, slave)
+}
+
+/// `Stdio` for an inherited copy of `fd`. The dup is deliberate: three stdio slots need three
+/// descriptors and the pty has one.
+fn owned(fd: i32) -> Stdio {
+    let copy = unsafe { libc::dup(fd) };
+    assert!(copy >= 0, "the pty could not be duplicated");
+    unsafe { Stdio::from_raw_fd(copy) }
+}
+
+/// The child the pty tests run: it appends one line per signal it is handed, so two
+/// deliveries are two lines. A file rather than an inline script because `dash`'s trap
+/// coalesces the two copies into one call and cannot witness the defect. It is a path,
+/// because the wrapper runs an interpreter over it, and `CARGO_MANIFEST_DIR` is how a test
+/// names a file in its own crate without guessing the working directory.
+const COUNTER_CHILD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/testdata/counter_child.py"
+);
+
+/// The other half of the contract, on the same harness: a signal a **process** sent is still
+/// relayed, which is WS-41 deviation (2) proper — a client timeout and `kill <pid>` reach
+/// the wrapper alone, and the pty test above proves a terminal one no longer is.
+#[test]
+fn a_signal_a_process_sent_still_reaches_the_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut wrapper, _master, _slave) = terminal_job(dir.path());
+    await_child(&dir.path().join("ready"), dir.path());
+    Command::new("kill")
+        .args(["-TERM", &wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    let log = await_seen(dir.path(), "TERM");
+    assert!(
+        log.contains("TERM"),
+        "a sent TERM was not relayed to the child: {log:?}"
+    );
+    release(dir.path());
+    let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
+}
+
+/// The rule that decides the tests above, as one decision with a refusal case on each side
+/// and no process or timing in it, so it is auditable without a terminal.
+#[test]
+fn only_a_signal_with_a_sender_is_relayed() {
+    assert!(
+        xmustard_core::run_wrapper::relay_origin(Some(4321)),
+        "a signal a process sent must be relayed"
+    );
+    assert!(
+        !xmustard_core::run_wrapper::relay_origin(None),
+        "a terminal-generated signal has no sender and must not be relayed"
+    );
+    assert!(
+        !xmustard_core::run_wrapper::relay_origin(Some(0)),
+        "a sender of 0 means the field was not filled, which is the same as no sender"
     );
 }

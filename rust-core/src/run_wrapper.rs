@@ -182,6 +182,25 @@ const FORWARDED: &[i32] = &[
     signal_hook::consts::signal::SIGTERM,
 ];
 
+/// Whether a signal the wrapper caught should be relayed to the child, from the sender
+/// `siginfo` reports (`None` when the signal names no sender).
+///
+/// A terminal delivers SIGINT/SIGQUIT (and SIGHUP at logout) to **every** process in the
+/// foreground process group, so the child already has the operator's keystroke. Relaying
+/// the wrapper's own copy gives the child a second one, and a child that traps the signal
+/// runs its handler twice per keystroke (WS-FIX-20-r4-1). A terminal-generated signal names
+/// no sender — Linux fills `si_code` with `SI_TTY` (job control) or `SI_KERNEL`, both with
+/// `si_pid == 0` — while `kill(2)` and `sigqueue(3)` fill the sender, so the sender is the
+/// discriminator and needs no per-platform `si_code` table.
+///
+/// A sender of 0 is treated as absent, because a kernel that does not fill the field at all
+/// leaves it 0 and that is the same shape. Failing closed towards relaying keeps the
+/// wrapper's older behaviour there rather than losing a timeout signal, which is the worse
+/// of the two.
+pub fn relay_origin(sender: Option<i32>) -> bool {
+    sender.is_some_and(|pid| pid != 0)
+}
+
 /// Forwards a termination signal to the child while the wrapper runs.
 ///
 /// The wrapper is the process a client times out on and an operator `kill`s, so without
@@ -189,7 +208,8 @@ const FORWARDED: &[i32] = &[
 /// orphaned and keeps whatever it took (a lock, a temp file, a port) until it ends on its
 /// own. A terminal signal reaches the child through the process group, which is what
 /// WS-41's deviation (2) recorded; a signal to the wrapper's own pid does not, and that is
-/// the case this closes.
+/// the case this closes. A terminal signal that also arrives here is not relayed on, so the
+/// child sees one copy and not two (`relay_origin`).
 ///
 /// The child's outcome is still what the wrapper reports: `wait` reaps the real status, so
 /// a child that survives the signal and exits 0 makes the wrapper exit 0, and one the
@@ -244,16 +264,19 @@ impl Forwarder {
         pid: mpsc::Receiver<u32>,
         reaped: Arc<AtomicBool>,
     ) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
-        let mut signals = signal_hook::iterator::Signals::new(FORWARDED)
-            .map_err(|e| io::Error::other(e.to_string()))
-            .inspect_err(|e| {
-                eprintln!("xmustard run: signals are not forwarded to the child: {e}");
-            })
-            .ok()?;
+        let mut signals = signal_hook::iterator::SignalsInfo::<
+            signal_hook::iterator::exfiltrator::WithOrigin,
+        >::new(FORWARDED)
+        .map_err(|e| io::Error::other(e.to_string()))
+        .inspect_err(|e| {
+            eprintln!("xmustard run: signals are not forwarded to the child: {e}");
+        })
+        .ok()?;
         let handle = signals.handle();
         let watcher = thread::spawn(move || {
             let mut child = None;
-            for raw in signals.forever() {
+            for origin in signals.forever() {
+                let raw = origin.signal;
                 if child.is_none() {
                     // Before `arm`: wait for the spawn. No pid ever coming means the spawn
                     // failed, and the signal ends the wrapper as it would have unforwarded.
@@ -278,6 +301,13 @@ impl Forwarder {
                     // stop the wrapper for as long as the capture takes.
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
+                }
+                // A signal the terminal or the kernel generated for the whole foreground
+                // group: the child already has this one, so relaying it would be the second
+                // copy (WS-FIX-20b). Nothing else is skipped — a signal a process sent is
+                // relayed below.
+                if !relay_origin(origin.process.map(|p| p.pid)) {
+                    continue;
                 }
                 // ESRCH: the child is already gone, which is the normal race at exit.
                 // Signalling the PROCESS GROUP instead would need the child to lead its
