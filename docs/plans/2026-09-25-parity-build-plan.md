@@ -1544,6 +1544,158 @@ diff. No product source, no bound, no timeout, no retry, no dependency.
   all-or-nothing shape may exist in any future `Peaks` field; `assert_sampled` names the two it
   guards, so a third field would need its own clause. Proposed owner: whoever next adds a field.
 
+### WS-FIX-27 — the index fixtures in `index_query.rs` create index directories under the process umask
+
+**Goal.** WS-FIX-11 (merged `932106d`) turned the group- and world-writable index-directory
+warning into a refusal. `classify_dir` (`rust-core/src/index/mod.rs:249`) refuses an
+operator-named directory carrying any group- or other-**write** bit, and its error names
+`chmod 700 <dir>`. **Four** fixtures in `rust-core/tests/index_query.rs` hand a `TempDir`
+straight to the index as an operator-named `--index-dir`, so their outcome depends on the
+**process umask** rather than on anything the test says. `TempDir::new` creates through
+`std::fs::create_dir`, which takes the umask's permissions: under a login umask of `0002` the
+directory lands at `0775`, the guard refuses it, and a test fails on a host that changed
+nothing.
+
+Measured on the build box, `umask 0002`, pre-fix tree: the suite is **green, 9 passed**
+(`logs/ws-fix-27-run-20261003T144047Z.log`). Three of the four sites were
+already saved by the `tighten()` chmod that WS-FIX-11 and WS-FLK-01 added, so the umask
+never reached them. The one site with no `tighten` is
+`legacy_equality_holds_on_parity_fixtures` (`index_query.rs:556`), and it **skips itself**
+unless `XMUSTARD_PARITY_FIXTURES` is set, which is why no gate run reached it. The defect
+is therefore latent at three sites rather than active, and the fix is creation-time for all
+four instead of a chmod after the fact at three.
+
+This row makes each fixture create its index directory with an **explicit `0700`** at creation
+time — `tempfile::Builder::permissions`, which `tempfile` passes to `mkdir`
+(`tempfile-3.27.0/src/dir/imp/unix.rs:15-18`). A umask can only **narrow** the requested mode and
+never widen it, so no umask can give a fixture's index directory a group- or other-**write** bit,
+which is the property `classify_dir` refuses (`mode & 0o022`). The umask is therefore no longer a
+source of a fixture's result: the `0002` case that opened this row, and every other umask that
+keeps the owner's bits, all land on `0o700`. Two bounds on that claim, both stated so they are not
+mistaken for more: a umask clearing owner bits narrows `0700` to the complement — `0o700 & ~0o177`
+is `0o600`, and `0o700 & ~0o777` is `0o000` — so the owner cannot traverse the directory and a
+fixture using it would fail, which is the operator's own setting and is left alone; and `0700` is
+*stronger* than the guard requires, since `classify_dir` accepts group- or other-read and execute
+bits and refuses only the write ones. It replaces the `tighten()`
+after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
+at every site, and it extends the fix to the one site that never had it
+(`legacy_equality_holds_on_parity_fixtures`, which builds into a `TempDir` with no `tighten` and
+would fail the same way). **No product source changes**: `ensure_private_dir` already creates
+`0700` on the path where the core owns the directory; this row fixes the fixtures, which is where
+the operator is the test.
+
+**Requirements.** No new PAR ids. It is test hygiene on a guard §5.1 rule 7 lists, and it changes
+no product behaviour, no bound, no timeout and no gate threshold. §5.1 rule 11 forbids the
+alternative repair, which would be to loosen `classify_dir`'s mask back to a warning: the refusal
+is the merged, reviewed, correct behaviour and a fixture that cannot satisfy it is the fixture
+that is wrong. The owner's box prelude already sets `umask 022` for gates, which hides this class
+of failure rather than closing it, so the acceptance condition is stated against `umask 0002`
+explicitly.
+
+**Files.** `rust-core/tests/index_query.rs` (one index-directory constructor used by every
+fixture that hands a directory to the index, replacing `tighten`),
+`docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+`rust-core/tests/index_build.rs` was checked and is **not** in scope, so it is named here only to
+record the answer: its `--index-dir` sites (`index_build.rs:786`, `:817`, `:1075`, `:1683`) all pass
+a `join("idx")` **subdirectory** of a `TempDir`, so the core creates that directory itself and
+`ensure_private_dir`'s `DirBuilder.mode(0o700)` already makes it umask-independent. The defect
+needs the `TempDir` itself to be the index directory, which only `index_query.rs` does — through
+`cfg_at(dir)` (`index_query.rs:130`) for the build sites and through `dir.path().join(DB_FILE)`
+(`index_query.rs:1381`) for `ensure_graph_segment`.
+
+**Tests required.**
+- One new test asserts the property directly, without depending on which tests happen to fail:
+  under a deliberately permissive `0002` umask it asserts `index_dir()` creates `0o700` **and**
+  that a plain `TempDir` creates `0o775` under the same umask. Both expected values are
+  literals, not results of calling the code under test, and the pair is what makes the first
+  meaningful: under a `0077` umask a plain `TempDir` is already `0700`, so a one-sided
+  assertion would pass with the explicit mode removed. The umask is set in a **child process**
+  (this same test binary re-invoked), because a process-global `umask` is not safe to set in a
+  binary whose tests run in parallel threads.
+- A mutation row for the constructor: removing `b.permissions(perm(0o700))` turns the test
+  **red** with `left: 509` (`0o775`) against `right: 448` (`0o700`), measured under `umask 0002`
+  on the box. Restored from a tree `git status --short` showed clean.
+- A mutation row for the assertion: narrowing the mode mask must fail, so the test cannot be
+  satisfied by a mask that cannot see a group-write bit. This one **survived its first form**
+  (the negative half read the mode through a second mask rather than the predicate the
+  positive half used) and the test was strengthened until it was killed.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines and `BUILD_5000_*` are
+  byte-identical to the merge base.
+- `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
+
+**Acceptance.** Every fixture in `rust-core/tests/index_query.rs` that hands a directory to the
+index creates it with an explicit `0700` at creation time, so no group- or other-**write** bit can
+appear under any umask and the suite's result is the same under `umask 0002` and `0022`; no
+fixture calls `tighten` any more; and the new test fails if the explicit mode is removed.
+`BOXALL` is green on the box with clippy's warning count unchanged and `cargo fmt --check` clean.
+
+**Collision risk.** `rust-core/tests/index_query.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which added `tighten` and the memprobe assertions, and by WS-FLK-08's row (merged
+`246e0b5`), which touched the same file's guard call sites. Both are merged, so neither is in
+flight. WS-FIX-11 (merged `932106d`) owns the `classify_dir` guard this row does not touch.
+Lane C is the only lane in this build that edits `rust-core`. `rust-core/tests/index_build.rs` is
+named by WS-FLK-02's row (merged `799d8c8`), also merged; this row does not change that file's
+bounds or its expected values.
+
+**Implementation record (branch parity/ws-fix-27, 2026-10-03).** Two files, all test code and this
+plan; `git diff --numstat 246e0b5 HEAD` gives the plan +94/-0 and `index_query.rs` +139/-15. No
+product source, no bound, no timeout, no retry, no dependency, no route or dispatch entry.
+- *What was built.* `rust-core/tests/index_query.rs`: one `index_dir()` built from
+  `tempfile::Builder::permissions(0o700)`, replacing `TempDir::new()` plus `tighten` at all four
+  sites that hand a directory to the index; `perm(mode)` and `mode_of_dir(dir)` keep the mode
+  literals in one place; `under_umask(mask, body)` re-invokes this test binary with
+  `--exact <child>` and reads a `UMASK_MODE=` line from it; two child tests print the mode for
+  `index_dir` and for a plain `TempDir`; `an_index_fixture_dir_is_owner_only_whatever_the_process_umask`
+  asserts `0o700` and `0o775` under umask `0002` and `0o600` under `0177`. `tighten` is gone, and
+  `TempDir::new` survives only in `repo()`, where the directory is a source tree rather than an
+  index directory.
+- *Measured* (build box through `xm-box.sh`, Linux x86_64, debug profile unless `--release` is
+  named). Pre-fix under `umask 0002`: **9 passed**, the suite is green (`…T144047Z.log`), because
+  three of the four sites already had `tighten`. M3 (drop the explicit mode) fails with `left:
+  509` / `right: 448` under the same umask (`…T165838Z.log`); M1 also fails
+  `csr_equals_the_edges_table_and_reverse_edges_mirror_it` with `classify_dir`'s own refusal
+  naming `chmod 700` (`…T155850Z.log`); M2 **survived** (`…T160114Z.log`) and was killed only
+  after the test was strengthened (`…T161443Z.log`). Child arms green: 3 passed (`…T165817Z.log`,
+  and with the `0177` arm `…T174650Z.log`). `BOXALL` on `8d9358f0`: `remote_exit=0`,
+  `clippy_warnings=6`, `rss_lines=ok`, 24 Go packages and 18 Rust binaries, `…T184240Z.log`.
+  `cargo fmt --check` exit 0 locally.
+- *Deviations.* (1) The row's own text said three tests fail under `umask 0002`; that was wrong
+  on my own measurement and is corrected above and in the Goal — the defect was latent at three
+  sites and live at one that skips by default. (2) The umask half runs in a child process rather
+  than in-process, because a process-global `umask` is not safe in a binary whose tests run in
+  parallel threads; this was round 1's finding from all three channels. (3) Three further
+  low-severity rounds narrowed prose claims about the umask (rounds 2-4); no behaviour changed
+  after `da7c17ab`.
+- *Review.* Round 1 (`reviews/ws-fix-27/r1`): 2 codex-spec (1 medium, 1 low) + 1 OCR medium + 1
+  `codex-review` `[P2]`, all one defect — the test never set the permissive umask; fixed in
+  `da7c17ab`. Round 2 (`r2`): 1 low, the `0700`-under-any-umask overclaim; fixed in `e190522f`.
+  Round 3 (`r3`): 2 lows, the guard's mask is `mode & 0o022` so `0700` is stronger than required;
+  fixed in `f851838c`. Round 4 (`r4`): 2 lows, the `0777` figure is `0o000` not `0o600` and the
+  `0177` case is not result-independent; fixed in `8d9358f0`, the gate's head. `gate=PASS
+  changed=2 covered=2 channel_findings=2 triaged=2 reviewer=gpt-6-sol` on r4; the five earlier
+  rounds' entries are in `r4/triage-all-rounds.json` because the gate reviews one sealed round.
+  `triage-check.md` returns DISAGREE on the standing behaviour-free objection (prose findings owe
+  no test); answered in `r4/triage-notes.md`. OCR's channel contributed nothing structural
+  (`ocr_review=0`) and the OpenCode channel reads `unavailable`.
+- *Merge recheck.* Recorded in `reviews/ws-fix-27/r4/merge-recheck.md`.
+- *Checks.* `xm-box.sh check <wt> all -count=1` (BOXALL) as cited; `cargo test --locked --test
+  index_query` under `umask 0002` and via the in-test children; `cargo fmt --check`. **not run:**
+  RET, BUD, PI, CAPS, SECDOC, GOLD — §3.0 names none of them for a row that changes no index
+  behaviour, no memory store, no Pi source, no route gate, no projection and no `tools/list`
+  byte; BUD is explicitly not owed, as no resident component or in-heap structure was added.
+- *Follow-ups.* (1) **`xm-box.sh run` can gate a stale binary and a stale red reads exactly like
+  a real one**: `…T161604Z.log` reported `remote_exit=1` for a test that passes on every later run
+  of a clean tree, and the log's tell is the absence of a `Compiling` line. Proposed owner:
+  whoever maintains `xm-box.sh`. (2) `xm-review-run.sh` refuses a pre-existing `r<N>`, so the
+  hand-written `slop-audit.md` and `dogfood.md` had to be staged outside the round directory and
+  copied in; proposed owner the review runner. (3) The gate reads S12/S13 only as `##` headings
+  and wants each S5 test named on a line carrying `FAIL`, which is narrower than §4.6's prose;
+  proposed owner the gate. (4) Three `dogfood:` lines in `reviews/ws-fix-27/r4/dogfood.md` — MCP
+  `search` ranked a Go reducer and a React prop above the Rust `fn classify_dir` the query named,
+  `explain` returned not-found for a tracked test file, and `impact symbol=index_dir` returned
+  `defined_in: []` with no reason; proposed owner WS-FIX-15, as in every prior row.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
