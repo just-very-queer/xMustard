@@ -1480,6 +1480,78 @@ diff. No product source, no bound, no timeout, no retry, no dependency.
   all-or-nothing shape may exist in any future `Peaks` field; `assert_sampled` names the two it
   guards, so a third field would need its own clause. Proposed owner: whoever next adds a field.
 
+### WS-FIX-27 — the index fixtures in `index_query.rs` create index directories under the process umask
+
+**Goal.** WS-FIX-11 (merged `932106d`) turned the group- and world-writable index-directory
+warning into a refusal. `classify_dir` (`rust-core/src/index/mod.rs:249`) refuses an
+operator-named directory carrying any group- or other-**write** bit, and its error names
+`chmod 700 <dir>`. Three fixtures in `rust-core/tests/index_query.rs` hand a `TempDir` straight
+to the index as an operator-named `--index-dir`, so their outcome now depends on the **process
+umask** rather than on anything the test says. `TempDir::new` creates through
+`std::fs::create_dir`, which takes the umask's permissions: under a login umask of `0002` the
+directory lands at `0775`, the guard refuses it, and the test fails on a host that changed
+nothing. Measured on the build box: under `umask 0002` the three tests fail, under `umask 0022`
+they pass.
+
+This row makes each fixture create its index directory with an **explicit `0700`**
+(`DirBuilder::mode(0o700)`, which the umask can only narrow and never widen) so no fixture's
+result depends on the umask of whoever logs into the machine. It replaces the `tighten()`
+after-the-fact chmod that WS-FLK-01 added at three of the sites with creation-time correctness
+at every site, and it extends the fix to the one site that never had it
+(`legacy_equality_holds_on_parity_fixtures`, which builds into a `TempDir` with no `tighten` and
+would fail the same way). **No product source changes**: `ensure_private_dir` already creates
+`0700` on the path where the core owns the directory; this row fixes the fixtures, which is where
+the operator is the test.
+
+**Requirements.** No new PAR ids. It is test hygiene on a guard §5.1 rule 7 lists, and it changes
+no product behaviour, no bound, no timeout and no gate threshold. §5.1 rule 11 forbids the
+alternative repair, which would be to loosen `classify_dir`'s mask back to a warning: the refusal
+is the merged, reviewed, correct behaviour and a fixture that cannot satisfy it is the fixture
+that is wrong. The owner's box prelude already sets `umask 022` for gates, which hides this class
+of failure rather than closing it, so the acceptance condition is stated against `umask 0002`
+explicitly.
+
+**Files.** `rust-core/tests/index_query.rs` (one index-directory constructor used by every
+fixture that hands a directory to the index, replacing `tighten`),
+`docs/plans/2026-09-25-parity-build-plan.md` (this section and its record)
+
+`rust-core/tests/index_build.rs` was checked and is **not** in scope, so it is named here only to
+record the answer: its `--index-dir` sites (`index_build.rs:786`, `:817`, `:1075`, `:1683`) all pass
+a `join("idx")` **subdirectory** of a `TempDir`, so the core creates that directory itself and
+`ensure_private_dir`'s `DirBuilder.mode(0o700)` already makes it umask-independent. The defect
+needs the `TempDir` itself to be the index directory, which only `index_query.rs` does — through
+`cfg_at(dir)` (`index_query.rs:130`) for the build sites and through `dir.path().join(DB_FILE)`
+(`index_query.rs:1381`) for `ensure_graph_segment`.
+
+**Tests required.**
+- The defect is demonstrated before it is closed: with `umask 0002` the affected tests must be
+  **red** on the unmodified tree, with `classify_dir`'s own refusal in the panic text naming the
+  mode. This is the row's TDD step and it is what makes the fix more than a claim.
+- One new test asserts the property directly, without depending on which tests happen to fail:
+  it creates an index directory through the new constructor and asserts `mode & 0o077 == 0`,
+  under a deliberately permissive `0002` umask set for the process. Its expected value is the
+  literal `0o077`, not the result of calling the code under test.
+- A mutation row per site: removing the explicit mode from the constructor turns that site back
+  to the umask-dependent creation and the new test goes red. Each is restored from a tree
+  `git status --short` showed clean.
+- `rust-core/tests/index_query.rs`'s `SEQUENTIAL`/`OVERLAPPING` lines and `BUILD_5000_*` are
+  byte-identical to the merge base.
+- `BOXALL` green on the box, and the acceptance run green under `umask 0002`.
+
+**Acceptance.** Every fixture in `rust-core/tests/index_query.rs` that hands a directory to the
+index creates it `0700` at creation time, so the suite's result is the same under `umask 0002`,
+`0022` and `0077`; no fixture calls `tighten` any more; and the new test fails if the explicit
+mode is removed. `BOXALL` is green on the box with clippy's warning count unchanged and
+`cargo fmt --check` clean.
+
+**Collision risk.** `rust-core/tests/index_query.rs` is named by WS-FLK-01's row (merged
+`f543ae1`), which added `tighten` and the memprobe assertions, and by WS-FLK-08's row (merged
+`246e0b5`), which touched the same file's guard call sites. Both are merged, so neither is in
+flight. WS-FIX-11 (merged `932106d`) owns the `classify_dir` guard this row does not touch.
+Lane C is the only lane in this build that edits `rust-core`. `rust-core/tests/index_build.rs` is
+named by WS-FLK-02's row (merged `799d8c8`), also merged; this row does not change that file's
+bounds or its expected values.
+
 ### WS-16 — Language packs via the provider contract
 
 **Goal.** Add feature-gated language packs for Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash (Scala and Lua optional). Grammar crates are cached locally. Queries are written originally or taken from upstream MIT tags.scm, never from GitNexus. Precompile the regex fallbacks once. Report coverage honestly per language.
