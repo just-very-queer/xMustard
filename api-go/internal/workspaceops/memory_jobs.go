@@ -424,7 +424,8 @@ type consolidationSnapshot struct {
 	Anchors map[string][]govstore.Anchor
 }
 
-// now is the pass's clock, replaced in tests so the ageing generator is deterministic.
+// consolidationNow is the pass's clock; a test replaces it so the ageing generator is
+// deterministic.
 var consolidationNow = time.Now
 
 // consolidationCandidates derives the candidate jobs from the store in a deterministic

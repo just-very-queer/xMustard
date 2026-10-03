@@ -10,7 +10,7 @@ import (
 
 // `memory jobs` is the operator surface for the consolidation queue, and it is the only
 // production caller of the pass: without it the loop WS-32a delivers cannot run for anyone.
-// This test drives the real command against a real store.
+// The command is driven against a real store, not a stub.
 func TestMemoryJobsPlanRunAndList(t *testing.T) {
 	dir, ws := t.TempDir(), "ws"
 	// Two memories on one declared path, so the pass has a dedupe candidate to derive.
