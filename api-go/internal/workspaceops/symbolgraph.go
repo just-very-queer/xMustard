@@ -135,6 +135,13 @@ func FileImpactCtx(ctx context.Context, dataDir, workspaceID, path string, param
 const (
 	impactHasMoreMember    = "has_more"
 	impactNextCursorMember = "next_cursor"
+	// impactTruncatedMember names a cut the answer cannot page past: the budget removed
+	// the tier list outright, so the answer carries counts and no position to continue
+	// from. It sits beside the paging members rather than in output_budget because it is
+	// the caller's answer to "is this everything", not the budget's own accounting.
+	impactTruncatedMember = "truncated"
+	// impactTruncatedTiers is its only value: the tiers went, the counts stayed.
+	impactTruncatedTiers = "tiers_removed"
 )
 
 // WithImpactPaging adds the paging members to an impact result whose tiers were cut:
@@ -366,8 +373,10 @@ func ImpactBudgetTrimmed(out []byte) bool {
 // continue at the first item the caller did not receive, which is the core's offset plus
 // the items actually delivered: the caller then pages without computing an offset, which
 // is the hand-computed paging this row exists to remove. When nothing can be signed (a
-// rung removed the tiers outright), the cursor is dropped and has_more stands so the
-// caller knows to re-page. A result the budget did not cut is returned unchanged.
+// rung removed the tiers outright, or the page delivered no item), the paging contract
+// closes rather than hanging open: has_more goes false and the cut is named, because a
+// has_more with no next_cursor tells the caller to keep calling and hands back the same
+// page. A result the budget did not cut is returned unchanged.
 func ReconcileImpactPaging(workspaceID string, q url.Values, out []byte) []byte {
 	var res map[string]json.RawMessage
 	if json.Unmarshal(out, &res) != nil || res == nil {
@@ -377,19 +386,22 @@ func ReconcileImpactPaging(workspaceID string, q url.Values, out []byte) []byte 
 		return out
 	}
 	next, ok := deliveredTierOffset(res)
-	switch {
-	case !ok:
-		// A rung removed the tiers outright (tiers_total), so there is nothing left to
-		// count and nothing to sign: has_more stands and the caller re-pages.
+	// has_more and next_cursor appear together or not at all: has_more is true exactly
+	// when a cursor was signed, so a client that follows it always has somewhere to go.
+	// Neither a rung that removed the tiers outright (tiers_total) nor a page that
+	// delivered no item leaves a cursor to sign, and both close the contract the same
+	// way, with truncated naming the cut so a counts-only answer is not read as the
+	// whole walk.
+	if !ok || next == 0 {
 		delete(res, impactNextCursorMember)
-		res[impactHasMoreMember] = json.RawMessage("true")
-	case next == 0:
-		res[impactHasMoreMember] = json.RawMessage("true")
-	default:
+		res[impactHasMoreMember] = json.RawMessage("false")
+		res[impactTruncatedMember] = json.RawMessage(strconv.Quote(impactTruncatedTiers))
+	} else {
 		cursor, err := json.Marshal(ImpactCursor(workspaceID, q)(next))
 		if err != nil {
 			return out
 		}
+		delete(res, impactTruncatedMember)
 		res[impactNextCursorMember] = cursor
 		res[impactHasMoreMember] = json.RawMessage("true")
 	}
