@@ -38,12 +38,15 @@ type Scoped struct {
 	Key   string
 }
 
-// scopeKeys are the keys each non-default scope needs, so the derivation is one
-// table rather than a ladder over the visibility values.
-var scopeKeys = map[string]string{
-	ScopeRun:     "run_id",
-	ScopeSession: "session_id",
-	ScopeDir:     "dir",
+// scopeKeys names the request field each non-default scope is keyed by, so the
+// derivation is one lookup rather than a ladder over the visibility values.
+var scopeKeys = map[string]struct {
+	field string
+	key   func(ScopeRequest) string
+}{
+	ScopeRun:     {"run_id", func(r ScopeRequest) string { return r.RunID }},
+	ScopeSession: {"session_id", func(r ScopeRequest) string { return r.SessionID }},
+	ScopeDir:     {"dir", func(r ScopeRequest) string { return r.Dir }},
 }
 
 // DeriveScope returns the scope a memory written by actor from req is stored
@@ -77,22 +80,16 @@ func DeriveScoped(req ScopeRequest, actor ContextActor) (Scoped, error) {
 	if visibility == ScopePrivate {
 		return Scoped{Scope: ScopePrivate, Key: strings.TrimSpace(actor.ID)}, nil
 	}
-	field, keyed := scopeKeys[visibility]
-	if !keyed {
+	keyed, known := scopeKeys[visibility]
+	if !known {
 		return Scoped{}, fmt.Errorf("%w: scope %q is not one of %s", ErrInvalidInput, visibility,
 			strings.Join(ScopeNames(), ", "))
 	}
-	key := strings.TrimSpace(req.RunID)
-	if field == "session_id" {
-		key = strings.TrimSpace(req.SessionID)
-	}
-	if field == "dir" {
-		key = strings.TrimSpace(req.Dir)
-	}
+	key := strings.TrimSpace(keyed.key(req))
 	if key == "" {
-		return Scoped{}, fmt.Errorf("%w: scope %q needs %s", ErrInvalidInput, visibility, field)
+		return Scoped{}, fmt.Errorf("%w: scope %q needs %s", ErrInvalidInput, visibility, keyed.field)
 	}
-	if field == "dir" {
+	if keyed.field == "dir" {
 		if err := validScopeDir(key); err != nil {
 			return Scoped{}, err
 		}
