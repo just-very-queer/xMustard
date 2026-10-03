@@ -136,6 +136,9 @@ pub enum Class {
     IgnoreFile,
     /// This process's cookie number n came back.
     Cookie(u64),
+    /// Under a nested repository's Git dir: no path of this root changed, but its HEAD
+    /// (part of this root's identity) may have, so the observation is not reused.
+    NestedGit,
     /// Nothing the index or the identity reads.
     Skip,
 }
@@ -177,16 +180,36 @@ impl Layout {
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let name = rel.rsplit('/').next().unwrap_or_default();
-        // Git never reads an ignore file inside a directory it ignores. A `.git` at any
-        // depth is a Git dir (this root's, or a nested repository's: its commits,
-        // fetches and GC are not source changes of this root).
+        // A `.git` below the top is a nested repository's Git dir: its commits, fetches
+        // and GC are not source changes of this root (and nothing at all when Git
+        // ignores the nested repository).
+        if let Some(dir) = nested_repo_dir(&rel) {
+            return match self.ignored(dir) {
+                true => Class::Skip,
+                false => Class::NestedGit,
+            };
+        }
+        // Git never reads an ignore file inside a directory it ignores
         match () {
-            _ if rel.is_empty() || rel.split('/').any(|c| c == ".git") => Class::Skip,
+            _ if rel.is_empty() || rel == ".git" || rel.starts_with(".git/") => Class::Skip,
             _ if self.ignored(&rel) => Class::Skip,
             _ if IGNORE_FILES.contains(&name) => Class::IgnoreFile,
             _ => Class::Path(rel),
         }
     }
+}
+
+/// The nested repository `rel` lies in the Git dir of (`a/sub` for `a/sub/.git/HEAD`),
+/// or None when no component below the top is `.git`.
+fn nested_repo_dir(rel: &str) -> Option<&str> {
+    let mut at = 0;
+    for c in rel.split('/') {
+        if c == ".git" && at > 0 {
+            return Some(&rel[..at - 1]);
+        }
+        at += c.len() + 1;
+    }
+    None
 }
 
 /// `a/b/c` → `a`, `a/b`, `a/b/c`.
@@ -749,6 +772,11 @@ impl Root {
                     self.cookie_seen.notify_all();
                 }
                 Class::Skip => inner.counters.skipped += 1,
+                Class::NestedGit => {
+                    inner.counters.skipped += 1;
+                    drop(inner);
+                    self.bump(false);
+                }
                 Class::Git { index } => {
                     inner.counters.git_events += 1;
                     inner.recheck_ignored |= index;
@@ -1642,15 +1670,19 @@ mod tests {
     // file) is that repository's state, not a source path of this root.
     #[test]
     fn nested_git_dirs_are_skipped_at_any_depth() {
-        let l = layout(Some(&[]));
+        let l = layout(Some(&["vendor"]));
         for path in [
             "/r/sub/.git",
             "/r/sub/.git/index",
             "/r/sub/.git/refs/heads/main",
             "/r/a/b/sub/.git/objects/ab/cdef",
         ] {
-            assert_eq!(l.classify(Path::new(path)), Class::Skip, "{path}");
+            assert_eq!(l.classify(Path::new(path)), Class::NestedGit, "{path}");
         }
+        assert_eq!(
+            l.classify(Path::new("/r/vendor/sub/.git/HEAD")),
+            Class::Skip
+        );
         assert_eq!(
             l.classify(Path::new("/r/sub/x.go")),
             Class::Path("sub/x.go".into())
@@ -1659,6 +1691,22 @@ mod tests {
             l.classify(Path::new("/r/a/.github/ci.yml")),
             Class::Path("a/.github/ci.yml".into())
         );
+    }
+
+    // A commit inside a nested repository queues no refresh path, but it moves the
+    // change epoch, so the memoised repository state (whose key covers the nested
+    // HEAD) is observed again.
+    #[test]
+    fn a_nested_git_event_queues_nothing_and_ends_the_memo() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (root, _rx) = Root::new(dir.path().to_path_buf(), None, MAX_WATCH_DIRS);
+        let before = root.change_epoch.load(Ordering::Acquire);
+        let ev = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(dir.path().join("sub/.git/refs/heads/main"));
+        root.on_event(Ok(ev));
+        assert!(root.change_epoch.load(Ordering::Acquire) > before);
+        let inner = lock(&root.inner);
+        assert_eq!((inner.counters.paths, inner.counters.git_events), (0, 0));
     }
 
     #[test]
