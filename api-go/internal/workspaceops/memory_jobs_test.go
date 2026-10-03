@@ -44,6 +44,12 @@ func TestPrepareConsolidationJobsIsIdempotentAndOrdered(t *testing.T) {
 		t.Fatal("a store with a shared path and a stale anchor queued no jobs")
 	}
 	first := queued
+	// The second pass must queue nothing: a candidate whose signature already has a job is not
+	// offered again. Calling queuePass a second time is what makes the assertion real; with
+	// only one call it could not see a duplicate at all.
+	if again := queuePass(t, dir, ws, "worker-1"); len(again) != 0 {
+		t.Fatalf("the second pass queued %d jobs it already had: %v", len(again), again)
+	}
 	// The prepared sequence is stable within a kind: the signatures ascend. Two same-process
 	// runs always agree, because Go randomises one map's iteration per range rather than per
 	// call, so comparing two runs cannot see an unstable order. TestPreparedOrderAscends
@@ -249,10 +255,11 @@ func TestCandidatesBeyondThePerPassBoundAreCounted(t *testing.T) {
 		proposeOn(t, dir, ws, "a", "left "+path, "left thing", path)
 		proposeOn(t, dir, ws, "b", "right "+path, "right thing", path)
 	}
-	res, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	firstPass, err := RunConsolidationPass(ctx, dir, ws, ConsolidationPassInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
 	if err != nil {
 		t.Fatalf("pass: %v", err)
 	}
+	res := firstPass
 	if len(res.Jobs) > consolidationJobsPerRun {
 		t.Fatalf("the pass queued %d jobs, past its own bound of %d", len(res.Jobs), consolidationJobsPerRun)
 	}
@@ -296,13 +303,63 @@ func TestCandidatesBeyondThePerPassBoundAreCounted(t *testing.T) {
 	if next.Skipped != 0 {
 		t.Fatalf("the second pass still left %d candidates out with the tail free", next.Skipped)
 	}
-	// Every cluster in the store now has a job, which is the property the cutoff must have:
-	// a bound that starves its tail is not a bound. The second pass may queue more than the
-	// first left out, because the kinds besides dedupe also fire on this fixture, so the
-	// figure asserted is coverage rather than a count.
+	// The specific cluster the first pass cut now has a job. A count would not show this: a
+	// job for some other cluster could make the total reach the bound while the cut one stayed
+	// invisible, which is the starvation this row must not ship.
+	cut := cutSignature(t, dir, ws, len(firstPass.Jobs))
+	if cut == "" {
+		t.Fatalf("no signature was left unqueued by the first pass, so the fixture does not exercise the cut")
+	}
+	if !slices.Contains(signaturesOf(t, dir, ws), cut) {
+		t.Fatalf("candidate %q was cut by the first pass and still has no job", cut)
+	}
+	// And every cluster in the store has a job, which is the property a bound must have.
 	if got := countAllJobs(t, dir, ws); got < clusters {
 		t.Fatalf("the store holds %d clusters and only %d jobs, so %d are invisible", clusters, got, clusters-got)
 	}
+}
+
+// cutSignature is the first signature the store holds that the queue does not: the candidate a
+// pass at its bound had to leave out.
+func cutSignature(t *testing.T, dir, ws string, queued int) string {
+	t.Helper()
+	sigs := signaturesOf(t, dir, ws)
+	held := make(map[string]bool, queued)
+	mustViewMemory(t, dir, ws, func(r govstore.Reader) error {
+		jobs, err := r.ListJobs(context.Background(), govstore.JobFilter{WorkspaceID: ws, Limit: 2000})
+		if err != nil {
+			return err
+		}
+		for i, j := range jobs {
+			if i < queued {
+				held[j.ConflictSignature] = true
+			}
+		}
+		return nil
+	})
+	for _, s := range sigs {
+		if !held[s] {
+			return s
+		}
+	}
+	return ""
+}
+
+// signaturesOf is every signature the queue holds, oldest first.
+func signaturesOf(t *testing.T, dir, ws string) []string {
+	t.Helper()
+	var out []string
+	mustViewMemory(t, dir, ws, func(r govstore.Reader) error {
+		jobs, err := r.ListJobs(context.Background(), govstore.JobFilter{WorkspaceID: ws, Limit: 2000})
+		if err != nil {
+			return err
+		}
+		for _, j := range jobs {
+			out = append(out, j.ConflictSignature)
+		}
+		return nil
+	})
+	return out
 }
 
 // countAllJobs is how many jobs the workspace's queue holds, cancelled ones included: a

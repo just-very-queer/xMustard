@@ -39,25 +39,37 @@ type memoryJobsOutput struct {
 }
 
 // jobsFlagSet is the flags the three actions share.
-func jobsFlagSet(e opsEnv, name string) (*flag.FlagSet, *string, *string, *string) {
+// jobsFlagSet is the flags every action takes. source and principal are added by the one
+// action that runs a pass, so `jobs-plan --source other` cannot be accepted and then ignored:
+// a flag that does not reach the thing it names is worse than no flag.
+func jobsFlagSet(e opsEnv, name string) (*flag.FlagSet, *string) {
 	fs := flag.NewFlagSet("xmustard-ops memory "+name, flag.ContinueOnError)
 	fs.SetOutput(e.stderr)
-	return fs,
-		fs.String("data-dir", envOr(e.getenv, "XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory"),
+	return fs, fs.String("data-dir", envOr(e.getenv, "XMUSTARD_DATA_DIR", "../backend/data"), "xMustard data directory")
+}
+
+// jobsRunFlagSet adds the two flags a pass needs on top of the shared ones.
+func jobsRunFlagSet(e opsEnv) (*flag.FlagSet, *string, *string, *string) {
+	fs, dataDir := jobsFlagSet(e, "jobs-run")
+	return fs, dataDir,
 		fs.String("source", "entries", "watermark source the pass reflects over"),
 		fs.String("principal", "xmustard-ops", "principal recorded as the pass's actor")
 }
 
-const jobsUsage = "usage: xmustard-ops memory jobs-plan <workspace_id> [--source NAME] [--data-dir DIR]"
-
-// The other two actions take the same flags; their own usage names them.
+// Each action names its own flags: a usage line that lists another command's flags sends an
+// operator looking for a flag their command does not have.
+const (
+	jobsPlanUsage = "usage: xmustard-ops memory jobs-plan <workspace_id> [--data-dir DIR]"
+	jobsRunUsage  = "usage: xmustard-ops memory jobs-run <workspace_id> [--source NAME] [--principal ID] [--data-dir DIR]"
+	jobsListUsage = "usage: xmustard-ops memory jobs-list <workspace_id> [--limit N] [--data-dir DIR]"
+)
 
 // runMemoryJobsPlan derives the candidates and prints them without queueing any, so an
 // operator can see the work before it is offered to an agent.
 func runMemoryJobsPlan(e opsEnv, workspaceID string, args []string) int {
-	fs, dataDir, _, _ := jobsFlagSet(e, "jobs-plan")
+	fs, dataDir := jobsFlagSet(e, "jobs-plan")
 	if fs.Parse(args) != nil || fs.NArg() > 0 {
-		return e.usage(jobsUsage)
+		return e.usage(jobsPlanUsage)
 	}
 	prepared, err := workspaceops.PrepareConsolidationJobs(context.Background(), *dataDir, workspaceID)
 	if err != nil {
@@ -68,9 +80,9 @@ func runMemoryJobsPlan(e opsEnv, workspaceID string, args []string) int {
 
 // runMemoryJobsRun queues the candidates and advances the source watermark on success.
 func runMemoryJobsRun(e opsEnv, workspaceID string, args []string) int {
-	fs, dataDir, source, principal := jobsFlagSet(e, "jobs-run")
+	fs, dataDir, source, principal := jobsRunFlagSet(e)
 	if fs.Parse(args) != nil || fs.NArg() > 0 {
-		return e.usage(jobsUsage)
+		return e.usage(jobsRunUsage)
 	}
 	res, err := workspaceops.RunConsolidationPass(context.Background(), *dataDir, workspaceID,
 		workspaceops.ConsolidationPassInput{Source: strings.TrimSpace(*source),
@@ -84,10 +96,10 @@ func runMemoryJobsRun(e opsEnv, workspaceID string, args []string) int {
 
 // runMemoryJobsList reads the queue. It writes nothing and takes no principal.
 func runMemoryJobsList(e opsEnv, workspaceID string, args []string) int {
-	fs, dataDir, _, _ := jobsFlagSet(e, "jobs-list")
+	fs, dataDir := jobsFlagSet(e, "jobs-list")
 	limit := fs.Int("limit", 100, "how many jobs to list, oldest first")
 	if fs.Parse(args) != nil || fs.NArg() > 0 {
-		return e.usage(jobsUsage)
+		return e.usage(jobsListUsage)
 	}
 	jobs, err := workspaceops.ListConsolidationJobs(context.Background(), *dataDir, workspaceID, *limit)
 	if err != nil {

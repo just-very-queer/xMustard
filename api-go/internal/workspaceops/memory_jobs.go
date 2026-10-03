@@ -30,6 +30,10 @@ const (
 	maxSignatureLen = 256
 	// signatureDigestLen is how much of the digest a shortened signature keeps.
 	signatureDigestLen = 32
+	// consolidationQueuedSignatures bounds how many queued signatures one pass compares
+	// against. It is well above the job bound, because a signature set read short would call
+	// a queued candidate absent and hand it to EnqueueJob again.
+	consolidationQueuedSignatures = 20000
 	// consolidationEntries is how many entries one pass reflects over. The store's own
 	// ListEntries clamps a limit to its maxListLimit of 1,000, so a bound above that would
 	// be a number this pass cannot reach: the watermark would record the clamp, not the
@@ -154,12 +158,20 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 	// they are work, so the read did not return empty, but the pass has nothing new to
 	// queue. When that happens and the read reached the end of the table, the entries the
 	// cursor sits past may hold the freed work, so the pass starts again from the beginning.
-	if complete && len(unqueuedCandidates(ctx, dataDir, workspaceID, candidates)) == 0 {
+	free, err := unqueuedCandidates(ctx, dataDir, workspaceID, candidates)
+	if err != nil {
+		return res, err
+	}
+	if complete && len(free) == 0 {
 		fromStart, s2, k2, c2, comp2, err2 := consolidationCandidates(ctx, dataDir, workspaceID, 0)
 		if err2 != nil {
 			return res, err2
 		}
-		if len(unqueuedCandidates(ctx, dataDir, workspaceID, fromStart)) > 0 {
+		freeStart, err := unqueuedCandidates(ctx, dataDir, workspaceID, fromStart)
+		if err != nil {
+			return res, err
+		}
+		if len(freeStart) > 0 {
 			candidates, seen, skipped, cursor, complete = fromStart, s2, k2, c2, comp2
 		}
 	}
@@ -167,9 +179,11 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 	res.Cursor = cursor
 	res.Complete = complete
 
-	// Candidates whose signature has no job yet are taken first, so a pass that hit its
-	// bound last time advances into the work it has not queued instead of re-selecting the
-	// same first candidates and starving the rest forever.
+	// Candidates whose signature has no job yet are taken first, and the per-pass bound is
+	// applied after that split rather than before it. Cutting first would re-select the same
+	// leading candidates every pass, so a store with more candidates than one pass takes would
+	// starve the tail for ever however the queue is ordered afterwards: the omitted candidate
+	// never reaches the comparison that would have rescued it.
 	if err := memoryUpdate(ctx, dataDir, workspaceID, func(tx govstore.Tx) error {
 		existing, err := queuedSignatures(ctx, tx, workspaceID)
 		if err != nil {
@@ -184,14 +198,21 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 			}
 			pending = append(pending, c)
 		}
+		// The already-queued candidates come last, so a pass at its bound spends it on work
+		// the queue does not hold. EnqueueJob returns the existing row for those, and it is
+		// not counted as this pass's work: Jobs is what the pass added, so a caller can tell
+		// a pass that queued from one that found everything already queued.
 		for _, c := range append(pending, done...) {
 			if len(res.Jobs) >= consolidationJobsPerRun {
 				res.Skipped++
 				continue
 			}
-			job, _, err := tx.EnqueueJob(ctx, c, in.Actor)
+			job, created, err := tx.EnqueueJob(ctx, c, in.Actor)
 			if err != nil {
 				return fmt.Errorf("enqueue %s: %w", c.ConflictSignature, err)
+			}
+			if !created {
+				continue
 			}
 			res.Jobs = append(res.Jobs, job)
 		}
@@ -223,14 +244,15 @@ func RunConsolidationPass(ctx context.Context, dataDir, workspaceID string, in C
 
 // unqueuedCandidates is the candidates whose signature the queue does not hold, which is what
 // a pass can actually add. It reads the queue, so it is the test for "this pass has work".
-func unqueuedCandidates(ctx context.Context, dataDir, workspaceID string, candidates []govstore.JobInput) []govstore.JobInput {
+func unqueuedCandidates(ctx context.Context, dataDir, workspaceID string, candidates []govstore.JobInput) ([]govstore.JobInput, error) {
 	if len(candidates) == 0 {
-		return nil
+		return nil, nil
 	}
 	var out []govstore.JobInput
 	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		jobs, err := r.ListJobs(ctx, govstore.JobFilter{WorkspaceID: workspaceID, States: []string{
-			govstore.JobQueued, govstore.JobLeased, govstore.JobDone, govstore.JobFailed}, Limit: consolidationJobsPerRun})
+			govstore.JobQueued, govstore.JobLeased, govstore.JobDone, govstore.JobFailed},
+			Limit: consolidationQueuedSignatures})
 		if err != nil {
 			return err
 		}
@@ -245,9 +267,11 @@ func unqueuedCandidates(ctx context.Context, dataDir, workspaceID string, candid
 		}
 		return nil
 	}); err != nil {
-		return nil
+		// The caller decides whether to re-read from the start, and a transient read failure
+		// returned as an empty queue would look exactly like a fully consolidated workspace.
+		return nil, err
 	}
-	return out
+	return out, nil
 }
 
 // queuedSignatures is every signature that already has a job the agent has not cancelled, so
@@ -392,38 +416,60 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string, f
 			for _, e := range entries {
 				ids = append(ids, e.ID)
 			}
-			anchors, err := r.AnchorsFor(ctx, ids)
-			if err != nil {
-				return err
-			}
-			// The anchor budget is the whole pass's, not one page's: a pass that reads one
-			// page of a thousand anchors per page still reads four thousand.
-			for id, list := range anchors {
+			// Anchors are read one entry at a time, in entry order, and only while the pass's
+			// budget lasts. Reading the whole page at once would materialise every anchor of
+			// 500 entries before the budget could apply, which is the memory the bound is
+			// supposed to prevent. The order is the entries' own, so a store snapshot yields
+			// the same candidates however Go chooses to range a map.
+			kept := make([]govstore.Entry, 0, len(entries))
+			page := make(map[string][]govstore.Anchor, len(entries))
+			for _, e := range entries {
 				if anchorsRead >= consolidationAnchors {
-					anchorsLeft += len(list)
-					delete(anchors, id)
+					anchorsLeft += 1
 					continue
 				}
-				if room := consolidationAnchors - anchorsRead; len(list) > room {
-					anchorsLeft += len(list) - room
-					anchors[id] = list[:room]
-					anchorsRead = consolidationAnchors
-				} else {
-					anchorsRead += len(list)
+				list, err := r.AnchorsFor(ctx, []string{e.ID})
+				if err != nil {
+					return err
+				}
+				a := list[e.ID]
+				if anchorsRead+len(a) > consolidationAnchors {
+					room := consolidationAnchors - anchorsRead
+					if room > 0 {
+						a = a[:room]
+					} else {
+						a = nil
+					}
+					anchorsLeft += len(list[e.ID]) - len(a)
+				}
+				anchorsRead += len(a)
+				kept = append(kept, e)
+				if len(a) > 0 {
+					page[e.ID] = a
 				}
 			}
 			if snap.Entries == nil {
-				snap.Entries = entries
-				snap.Anchors = anchors
+				snap.Entries = kept
+				snap.Anchors = page
 			} else {
-				snap.Entries = append(snap.Entries, entries...)
-				for id, list := range anchors {
+				snap.Entries = append(snap.Entries, kept...)
+				for id, list := range page {
 					snap.Anchors[id] = list
 				}
 			}
 			// The cursor is the store's own: ListEntries orders by pk and AfterCursor is
-			// that pk, so the last row read is where the next page starts.
-			cursor = entries[len(entries)-1].Cursor
+			// that pk, so the last row read is where the next page starts. An entry whose
+			// anchors the budget did not reach keeps the cursor behind it, so the next pass
+			// re-reads it rather than passing over work it never saw.
+			if len(kept) == 0 {
+				complete = true
+				return nil
+			}
+			cursor = kept[len(kept)-1].Cursor
+			if len(kept) < len(entries) {
+				// The budget ran out inside this page, so the table is not exhausted.
+				return nil
+			}
 			if len(entries) < consolidationPage {
 				complete = true
 				return nil
@@ -440,8 +486,11 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string, f
 		anchorSkips = 1
 	}
 
+	// out is every candidate the snapshot yields. The bound is not applied here: a pass that
+	// cut the list before consulting the queue could never recover the tail (see
+	// RunConsolidationPass), so the queue decides what a pass takes and this function reports
+	// what the store holds.
 	var out []govstore.JobInput
-	skipped := 0
 	for _, kind := range jobKindOrder {
 		gen, ok := jobGenerators[kind]
 		if !ok {
@@ -456,12 +505,6 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string, f
 		// the same tail for a later pass.
 		slices.SortFunc(candidates, func(a, b consolidationCandidate) int { return strings.Compare(a.Signature, b.Signature) })
 		for _, c := range candidates {
-			if len(out) >= consolidationCandidatesPerPass {
-				// Counted, not dropped in silence: a pass that quietly left work out would
-				// read as a pass that found nothing more to do.
-				skipped++
-				continue
-			}
 			out = append(out, govstore.JobInput{
 				WorkspaceID:       workspaceID,
 				Kind:              kind,
@@ -471,7 +514,7 @@ func consolidationCandidates(ctx context.Context, dataDir, workspaceID string, f
 			})
 		}
 	}
-	return out, seen, skipped + anchorSkips, cursor, complete, nil
+	return out, seen, anchorSkips, cursor, complete, nil
 }
 
 // dedupeClusterCandidates asks whether two or more memories on one anchor restate each
@@ -492,10 +535,23 @@ func dedupeClusterCandidates(snap consolidationSnapshot) []consolidationCandidat
 			continue
 		}
 		slices.Sort(members)
-		if len(members) > consolidationMaxCluster {
-			members = members[:consolidationMaxCluster]
+		// A cluster larger than the cap becomes several candidates rather than one truncated
+		// one: cutting it to the first members would leave the rest never asked about, and
+		// every pass would make the same cut.
+		for start := 0; start < len(members); start += consolidationMaxCluster {
+			end := min(start+consolidationMaxCluster, len(members))
+			chunk := slices.Clone(members[start:end])
+			if len(chunk) < consolidationMinCluster {
+				// One leftover member is not a question; it joins the last full chunk instead
+				// of becoming a candidate no agent can act on.
+				if len(clusters) > 0 {
+					clusters[len(clusters)-1] = append(clusters[len(clusters)-1], chunk...)
+					continue
+				}
+				continue
+			}
+			clusters = append(clusters, chunk)
 		}
-		clusters = append(clusters, members)
 	}
 	// No sort here: consolidationCandidates sorts each kind's candidates by signature, so
 	// sorting the clusters first would be a second order the caller overwrites. Mutation M12
