@@ -1223,17 +1223,29 @@ impl Serve {
     fn mem_settled(&self, settle_ms: u64) -> memprobe::Mem {
         let within = (SETTLE_STABLE_MIB * memprobe::MIB) as u64;
         let started = std::time::Instant::now();
-        // the pre-settlement instant: read once and never let it into the figure
-        let first = self.mem();
-        let mut previous = first;
-        let mut peak = first;
+        // The pre-settlement instant: read once, and not part of the figure. A
+        // round the service has just finished can still be holding its
+        // allocations, and seeding the peak with this sample is what kept that
+        // transient in the reading through rounds 1 and 2 of this row.
+        let mut previous = self.mem();
+        let mut peak = memprobe::Mem::default();
+        let mut settled_samples = 0usize;
         loop {
             std::thread::sleep(Duration::from_millis(5));
             let Some(m) = memprobe::sample(self.child.id()) else {
-                continue;
+                // the child is gone or unreadable, so no bound can be read and
+                // waiting for it to come back would hang the suite
+                panic!("the service stopped answering memory samples");
             };
-            peak.rss = peak.rss.max(m.rss);
-            peak.dirty = peak.dirty.max(m.dirty);
+            // the first sample inside the loop is the second reading, so `peak` is
+            // never seeded with `previous` and the transient cannot return
+            if settled_samples == 0 {
+                peak = m;
+                settled_samples = 1;
+            } else {
+                peak.rss = peak.rss.max(m.rss);
+                peak.dirty = peak.dirty.max(m.dirty);
+            }
             let settled = started.elapsed() >= Duration::from_millis(settle_ms)
                 && m.dirty.abs_diff(previous.dirty) <= within;
             previous = m;
