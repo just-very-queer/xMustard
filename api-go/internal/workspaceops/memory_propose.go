@@ -97,6 +97,12 @@ type ContextEntry struct {
 	// file changed since the memory was verified, the memory may be stale.
 	Paths      []string          `json:"paths,omitempty"`
 	PathHashes map[string]string `json:"path_hashes,omitempty"`
+	// Scope is the derived memory scope (WS-29b: workspace, private, dir, run or
+	// session). It is read from the stored entry and never from a request, so it is
+	// a report field, not an argument. ScopeKey is the run, session or directory it
+	// is confined to, empty for the workspace and private scopes.
+	Scope    string `json:"scope,omitempty"`
+	ScopeKey string `json:"scope_key,omitempty"`
 	// SearchTokens is the precomputed, deduplicated relevance token set for
 	// title+content, persisted at write time so recall ranks on it WITHOUT
 	// re-tokenizing every entry's full content on every call (XM-PRO-010). Empty on
@@ -215,6 +221,19 @@ type ProposeContextRequest struct {
 	// promoted at once as self_asserted_open_mode instead of waiting for a quorum that
 	// a single identity can never form.
 	OpenMode bool `json:"-"`
+	// Scope, ScopeKey, Metadata and Visibility are DECLARED and IGNORED (WS-29b): the
+	// stored scope is derived from the principal and the request. They are declared here
+	// so a payload naming them is accepted by the decoder and dropped, rather than
+	// failing the whole request with "unknown field"; the derivation is what is stored.
+	Scope      string            `json:"scope,omitempty"`
+	ScopeKey   string            `json:"scope_key,omitempty"`
+	Metadata   map[string]string `json:"metadata,omitempty"`
+	Visibility string            `json:"visibility,omitempty"`
+	// Dir is the directory a dir-scoped memory is derived from, repo-relative and
+	// confined to the workspace. RunID and SessionID name the run and session keys.
+	Dir       string `json:"dir,omitempty"`
+	RunID     string `json:"run_id,omitempty"`
+	SessionID string `json:"session_id,omitempty"`
 	// Caller carries the writer's owner, kind and provenance (Remember sets it); Source
 	// and OpenMode still decide the author.
 	Caller ContextActor `json:"-"`
@@ -416,6 +435,14 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 		if selfNote != "" {
 			required = 1
 		}
+		// The scope is DERIVED here and nowhere else (WS-29b): Scope, ScopeKey, Metadata
+		// and Visibility are caller-supplied and reach no field below.
+		scoped, err := DeriveScoped(ScopeRequest{
+			Visibility: req.Visibility, Dir: req.Dir, RunID: req.RunID, SessionID: req.SessionID,
+		}, caller)
+		if err != nil {
+			return err
+		}
 		e, err := tx.InsertEntry(ctx, govstore.NewEntry{
 			ID:          "ctx_" + hashID(workspaceID, req.Title, req.Content+nowUTC())[:12],
 			WorkspaceID: workspaceID, Title: title, Content: req.Content, Permission: permission,
@@ -423,6 +450,7 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 			Paths: declared, Anchors: extracted, SearchTokens: memoryTokenList(title + " " + req.Content),
 			ExpiresAt: expiresAt, Metadata: proposalMetadata(supersedes, caller.Quarantine),
 			Kind: req.Kind, Topic: normalizeTopic(req.Topic), Tags: cleanPaths(req.Tags), Tier: tier, Description: description,
+			Scope: scoped.Scope, ScopeKey: scoped.Key,
 		}, actor)
 		if err != nil {
 			return err

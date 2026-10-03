@@ -270,6 +270,11 @@ type RecallRequest struct {
 	SessionID string
 	// Caller is the principal recalling, for awaiting_me and the seen-set key.
 	Caller string
+	// Dir and RunID narrow the READ to one directory or run (WS-29b): an entry
+	// confined to a key is served only inside it, and a recall naming no key is
+	// served none of the confined ones. SessionID above doubles as the session key.
+	Dir   string
+	RunID string
 	// asOf is AsOf resolved against the repository, set while ranking.
 	asOf *asOfPoint
 }
@@ -418,6 +423,13 @@ func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool, claimed map
 	add(r.ValidOnly, func(e govstore.RankEntry) bool { return e.InvalidatedAt == "" && e.State == govstore.RankServed })
 	add(r.Status == "awaiting_me", awaits)
 	add(r.Subject != "", func(e govstore.RankEntry) bool { return claimed[e.ID] })
+	// Always, and FIRST among the always-on predicates: a memory's scope decides who
+	// may read it, and a private memory must not be counted in the rank signals of a
+	// call it is not served in (WS-29b).
+	keys := scopeRequestOf(r)
+	add(true, func(e govstore.RankEntry) bool {
+		return ScopesVisible(e.Scope, e.ScopeKey, e.Author, r.Caller, keys)
+	})
 	return out
 }
 

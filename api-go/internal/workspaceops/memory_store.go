@@ -304,6 +304,7 @@ func contextEntryFrom(e govstore.Entry, votes []govstore.Vote, anchors []govstor
 		Kind:       e.Kind, Topic: e.Topic, Tags: e.Tags, Quarantine: e.Metadata[govstore.MetaQuarantine],
 		Description: e.Description, ValidFrom: e.ValidFrom, ValidFromCommit: e.ValidFromCommit,
 		InvalidatedCommit: e.InvalidatedCommit, NeedsReverify: e.NeedsReverify, StaleSince: e.StaleSince,
+		Scope: fallbackString(e.Scope, ScopeWorkspace), ScopeKey: e.ScopeKey,
 	}
 	if e.Tier == govstore.TierCore {
 		ce.Tier = govstore.TierCore

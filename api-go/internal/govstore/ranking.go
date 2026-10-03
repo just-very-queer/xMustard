@@ -59,6 +59,11 @@ type RankEntry struct {
 	Tier   string
 	Tags   []string
 	Author string
+	// Scope and ScopeKey are the entry's derived memory scope and the key that
+	// confines it (WS-29b). A reader is served a confined entry only inside that
+	// key, so the filter needs both without loading the entry.
+	Scope    string
+	ScopeKey string
 	// AuthorOwner is the owner recorded for the author at write time ("" for writes
 	// that recorded none).
 	AuthorOwner           string
@@ -137,7 +142,7 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 		`+rankStateExpr+`, e.status, e.kind, e.topic, e.tier, e.tags, e.source, e.source_owner, e.required_verifications,
 		coalesce(e.superseded_by, ''), e.source_key = ?3 AND ?3 <> '',
 		coalesce(e.valid_from, ''), e.valid_from_commit, coalesce(e.invalidated_at, ''), e.invalidated_commit,
-		e.needs_reverify, coalesce(e.stale_since, ''), coalesce(e.expires_at, '')
+		e.needs_reverify, coalesce(e.stale_since, ''), coalesce(e.expires_at, ''), e.scope, coalesce(e.scope_key, '')
 		FROM entries e WHERE `+where+` ORDER BY e.pk`, args[:3]...)
 	if err != nil {
 		return nil, err
@@ -153,7 +158,8 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 		e = RankEntry{}
 		if err := rows.Scan(&e.ID, &e.Title, &e.VerificationMode, &e.UpdatedAt, &e.ContentDigest, &e.State,
 			&e.Status, &e.Kind, &e.Topic, &e.Tier, &tags, &e.Author, &e.AuthorOwner, &e.RequiredVerifications, &e.SupersededBy, &e.ByCaller,
-			&e.ValidFrom, &e.ValidFromCommit, &e.InvalidatedAt, &e.InvalidatedCommit, &e.NeedsReverify, &e.StaleSince, &e.ExpiresAt); err != nil {
+			&e.ValidFrom, &e.ValidFromCommit, &e.InvalidatedAt, &e.InvalidatedCommit, &e.NeedsReverify, &e.StaleSince, &e.ExpiresAt,
+			&e.Scope, &e.ScopeKey); err != nil {
 			return err
 		}
 		return decodeJSONColumn(tags, &e.Tags)
