@@ -94,10 +94,14 @@ fn areas(root: &Path, flags: &[&str]) -> Value {
 struct Area {
     id: u64,
     label: String,
+    rule: String,
     size: u64,
     cohesion: f64,
     keywords: Vec<String>,
     members: BTreeSet<String>,
+    /// The member rows in the order the answer lists them, as (path, line, name) — the
+    /// key the answer claims they are sorted by.
+    member_rows: Vec<(String, u32, String)>,
     paths: BTreeSet<String>,
 }
 
@@ -109,6 +113,7 @@ fn read_areas(v: &Value) -> Vec<Area> {
         .map(|a| Area {
             id: a["area_id"].as_u64().unwrap(),
             label: a["label"].as_str().unwrap().to_string(),
+            rule: a["label_rule"].as_str().unwrap().to_string(),
             size: a["size"].as_u64().unwrap(),
             cohesion: a["cohesion"].as_f64().unwrap(),
             keywords: a["keywords"]
@@ -122,6 +127,18 @@ fn read_areas(v: &Value) -> Vec<Area> {
                 .unwrap()
                 .iter()
                 .map(|m| m["name"].as_str().unwrap().to_string())
+                .collect(),
+            member_rows: a["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| {
+                    (
+                        m["path"].as_str().unwrap().to_string(),
+                        m["line"].as_u64().unwrap() as u32,
+                        m["name"].as_str().unwrap().to_string(),
+                    )
+                })
                 .collect(),
             paths: a["members"]
                 .as_array()
@@ -247,16 +264,19 @@ fn the_default_mode_agrees_with_the_base_of_a_large_graph() {
 
 #[test]
 fn large_graph_mode_triggers_above_ten_thousand_symbols() {
-    // 4,200 files of 4 chained symbols each: 16,800 symbols over the resolved CALLS
-    // projection, above PAR-SYM-08's 10k threshold, and every file under the index's own
-    // 4,096-symbol per-file cap (a single file this size is truncated, which the first
-    // run of this test measured).
+    // 4,200 files of 4 symbols each, each file a RING of four calls: 16,800 symbols over
+    // the resolved CALLS projection, above PAR-SYM-08's 10k threshold, and every file
+    // under the index's own 4,096-symbol per-file cap (a single file this size is
+    // truncated, which the first run of this test measured). A ring rather than a chain
+    // because PAR-SYM-08's degree rule is applied to a fixpoint: every symbol of a chain
+    // ends up with no edge left, which is the rule working, and a ring is the shape that
+    // survives it.
     let mut list: Vec<(String, String)> = Vec::with_capacity(4_200);
     for f in 0..4_200 {
         list.push((
             format!("big/g{f:05}.go"),
             format!(
-                "package big\n\nfunc A{f}() int {{ return 0 }}\n\nfunc B{f}() int {{ return A{f}() }}\n\nfunc C{f}() int {{ return B{f}() }}\n\nfunc D{f}() int {{ return C{f}() }}\n"
+                "package big\n\nfunc A{f}() int {{ return B{f}() }}\n\nfunc B{f}() int {{ return C{f}() }}\n\nfunc C{f}() int {{ return D{f}() }}\n\nfunc D{f}() int {{ return A{f}() }}\n"
             ),
         ));
     }
@@ -281,14 +301,78 @@ fn large_graph_mode_triggers_above_ten_thousand_symbols() {
         "large mode uses resolution 2.0: {v:#}"
     );
     assert!(v["iterations"].as_u64().unwrap() <= 3, "{v:#}");
-    assert!(
-        v["dropped_low_degree"].as_u64().unwrap() > 0,
-        "large mode drops nodes of degree below 2 and says how many: {v:#}"
+    assert_eq!(
+        v["dropped_low_degree"].as_u64().unwrap(),
+        0,
+        "every symbol of a ring has degree 2, so none is dropped: {v:#}"
+    );
+    assert_eq!(
+        v["singleton_symbols"].as_u64().unwrap(),
+        0,
+        "no symbol is left without an edge: {v:#}"
     );
     assert_eq!(
         v["dropped_low_confidence_edges"].as_u64().unwrap(),
-        v["dropped_low_confidence_edges"].as_u64().unwrap(),
-        "the drop count is a number: {v:#}"
+        0,
+        "a resolved Go call is above the confidence floor: {v:#}"
+    );
+    assert_eq!(
+        v["iterations"].as_u64().unwrap(),
+        3,
+        "a ring settles in PAR-SYM-08's 3-pass cap: {v:#}"
+    );
+    assert_eq!(
+        v["areas"].as_array().unwrap().len(),
+        8_438,
+        "4,200 rings of four collapse into 4,200 communities of four, joined by the \
+         238-file tail of the shared package: {v:#}"
+    );
+}
+
+/// PAR-SYM-08's degree rule applied to a fixpoint: every symbol of a four-symbol chain is
+/// pruned, because each one's only edges lead to another that is pruned too. This is the
+/// rule working as written, and it is why the large-graph fixture above is a ring.
+#[test]
+fn large_graph_mode_prunes_a_path_to_nothing() {
+    let mut list: Vec<(String, String)> = Vec::with_capacity(2_700);
+    for f in 0..2_700 {
+        list.push((
+            format!("path/p{f:05}.go"),
+            format!(
+                "package path\n\nfunc A{f}() int {{ return 0 }}\n\nfunc B{f}() int {{ return A{f}() }}\n\nfunc C{f}() int {{ return B{f}() }}\n\nfunc D{f}() int {{ return C{f}() }}\n"
+            ),
+        ));
+    }
+    let dir = TempDir::new().unwrap();
+    for (rel, content) in &list {
+        write(dir.path(), rel, content);
+    }
+    git(dir.path(), &["init", "-q"]);
+    git(dir.path(), &["config", "user.email", "t@t"]);
+    git(dir.path(), &["config", "user.name", "t"]);
+    git(dir.path(), &["add", "-A"]);
+    git(dir.path(), &["commit", "-qm", "c"]);
+    build(dir.path());
+    let v = areas(dir.path(), &["--seed=3"]);
+    assert_eq!(
+        v["symbols"].as_u64().unwrap(),
+        10_800,
+        "the fixture must clear the 10k threshold: {v:#}"
+    );
+    assert_eq!(v["mode"], "large", "{v:#}");
+    // 2,700 chains of four: each chain's two middle symbols are of degree 2 and the two
+    // ends of degree 1, so the first pass prunes the 5,400 ends and the second pass
+    // leaves the middles with no edge at all. Every symbol ends up pruned, which is the
+    // rule applied to a fixpoint rather than in one pass.
+    assert_eq!(
+        v["dropped_low_degree"].as_u64().unwrap(),
+        5_400,
+        "the first pass prunes the two degree-1 ends of each chain: {v:#}"
+    );
+    assert_eq!(
+        v["singleton_symbols"].as_u64().unwrap(),
+        10_800,
+        "the second pass leaves every symbol without an edge: {v:#}"
     );
 }
 
@@ -331,6 +415,14 @@ fn cohesion_is_bounded_and_keywords_are_a_bounded_list() {
     let d = two_subsystems();
     build(d.path());
     let v = areas(d.path(), &["--seed=7"]);
+    // each subsystem is a chain of three symbols, so 2 of its 3 pairs share an edge: the
+    // figure is pinned, not merely bounded, so a constant cannot pass as cohesion.
+    let by_label: BTreeMap<String, f64> = read_areas(&v)
+        .into_iter()
+        .map(|a| (a.label, a.cohesion))
+        .collect();
+    assert_eq!(by_label.get("billing"), Some(&0.6666666666666666), "{v:#}");
+    assert_eq!(by_label.get("shipping"), Some(&0.6666666666666666), "{v:#}");
     for a in read_areas(&v) {
         assert!(
             (0.0..=1.0).contains(&a.cohesion),
@@ -344,7 +436,31 @@ fn cohesion_is_bounded_and_keywords_are_a_bounded_list() {
             "an empty keyword: {:?}",
             a.keywords
         );
+        if a.label == "billing" {
+            assert_eq!(
+                a.keywords,
+                vec!["billing".to_string()],
+                "the billing area's keywords are pinned: {v:#}"
+            );
+        }
     }
+}
+
+/// A subsystem whose members share only `src`, a generic folder: the label must skip it
+/// and fall through the rest of the chain.
+#[test]
+fn a_generic_folder_is_never_a_label() {
+    let d = repo(&[(
+        "src/only.go",
+        "package only\n\nfunc A() int { return 0 }\n\nfunc B() int { return A() }\n\nfunc C() int { return B() }\n",
+    )]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=7"]);
+    let labels: BTreeSet<String> = read_areas(&v).into_iter().map(|a| a.label).collect();
+    assert!(
+        !labels.contains("src"),
+        "a generic folder became a label: {labels:?}"
+    );
 }
 
 #[test]
@@ -416,6 +532,32 @@ fn a_resolved_call_across_files_carries_a_symbol_into_the_other_area() {
     );
 }
 
+/// The name-prefix rule: members sharing no non-generic folder but a common leading word.
+#[test]
+fn a_name_prefix_is_the_label_when_no_folder_qualifies() {
+    let d = repo(&[(
+        "zoo.go",
+        "package zoo\n\ntype Feeder struct{}\n\nfunc (f Feeder) feed() int { return 0 }\n\nfunc (f Feeder) feeder() int { return f.feed() }\n\nfunc (f Feeder) feeds() int { return f.feeder() }\n",
+    )]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=7"]);
+    // The three unexported methods are one area (their receiver is the same type, so Go
+    // binds the calls to them) and its label is the longest leading word they all start
+    // with, `feed`, rather than the shorter stem `fee`. The exported type they hang off
+    // keeps its own area: nothing resolved calls it, so it has no area to share.
+    let feed = read_areas(&v).into_iter().find(|a| a.label == "feed");
+    assert_eq!(
+        feed.as_ref().map(|a| a.rule.as_str()),
+        Some("name_prefix"),
+        "the name-prefix rule did not fire: {v:#}"
+    );
+    assert_eq!(
+        feed.as_ref().map(|a| a.members.len()),
+        Some(3),
+        "the feed area does not hold the three methods: {v:#}"
+    );
+}
+
 #[test]
 fn areas_are_reported_at_symbol_granularity_with_their_paths() {
     let d = two_subsystems();
@@ -434,6 +576,18 @@ fn areas_are_reported_at_symbol_granularity_with_their_paths() {
             a.size,
             a.members.len()
         );
+        // (path, line, name) order: a reader of the file expects them in file order,
+        // and two symbols on one source line come back in the index's name order.
+        let mut sorted = a.member_rows.clone();
+        sorted.sort();
+        assert_eq!(
+            a.member_rows, sorted,
+            "members are not in (path, line, name) order: {v:#}"
+        );
+        let paths: Vec<&str> = a.member_rows.iter().map(|(p, _, _)| p.as_str()).collect();
+        let mut sorted_paths = paths.clone();
+        sorted_paths.sort();
+        assert_eq!(paths, sorted_paths, "members are not in path order: {v:#}");
     }
 }
 

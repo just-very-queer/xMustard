@@ -104,7 +104,9 @@ pub struct Area {
     pub area_id: u32,
     pub label: String,
     pub label_rule: LabelRule,
-    /// Members in (path, line, name) order, capped at [`MAX_MEMBERS`].
+    /// Members in (path, line, name-id) order, capped at [`MAX_MEMBERS`]. The last key
+    /// is the index's interned name id, which is alphabetical, so two symbols on one
+    /// source line come back in name order rather than the order the extractor saw them.
     pub members: Vec<Member>,
     /// `members.len()`.
     pub size: usize,
@@ -167,23 +169,62 @@ fn node_key(seed: u64, node: u32) -> u64 {
     splitmix64(&mut s)
 }
 
-/// The leading word of a symbol name, for the name-prefix label: `Invoice` from
-/// `Invoice.Total`, `refund` from `refundAll`, nothing from a bare word.
-fn name_prefix(name: &str) -> Option<String> {
-    let tail = match name.rsplit_once('.') {
-        Some((_, tail)) => tail,
-        None => name,
-    };
-    let word: String = tail
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
-        .collect();
-    // A one-character prefix says nothing, and a name with no prefix of its own (the
-    // whole word, or a leading underscore) does not qualify.
-    if word.chars().count() <= 1 || word == tail {
+/// The word a set of members' names share, for the name-prefix label.
+///
+/// `invoice`, `invoice_service` and `InvoiceStore` all start with the word `invoice`;
+/// `feed`, `feeder` and `feeds` share the stem `fee`. The longest word that at least two
+/// members start with wins, and ties go to the alphabetically first, so the rule is a
+/// total order over the members rather than a guess about one name.
+fn shared_prefix(names: &[String]) -> Option<String> {
+    if names.len() < LABEL_MIN_MEMBERS {
         return None;
     }
-    Some(word.split('_').next().unwrap_or(&word).to_ascii_lowercase())
+    let mut best: Option<String> = None;
+    for candidate in word_stems(names[0].as_str()) {
+        if best.as_ref().is_some_and(|b| b.len() >= candidate.len()) {
+            break;
+        }
+        let shared = names
+            .iter()
+            .filter(|n| word_stems(n.as_str()).contains(&candidate))
+            .count();
+        if shared >= LABEL_MIN_MEMBERS {
+            best = Some(candidate);
+        }
+    }
+    best
+}
+
+/// The leading words of one name, longest first: split on `_`, on the camel-case
+/// humps, and on the letters-versus-digits boundary, each stem lowercased and with a
+/// trailing plural `s` dropped so `feeds` and `feed` share `fee`.
+fn word_stems(name: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    for part in name.split('_').filter(|p| !p.is_empty()) {
+        let mut cur = String::new();
+        let mut prev_lower = false;
+        for c in part.chars() {
+            if c.is_ascii_uppercase() && prev_lower {
+                words.push(std::mem::take(&mut cur));
+            }
+            prev_lower = c.is_ascii_lowercase() || c.is_ascii_digit();
+            cur.push(c);
+        }
+        if !cur.is_empty() {
+            words.push(cur);
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    for w in words {
+        let lower = w.to_ascii_lowercase();
+        out.push(lower.clone());
+        if let Some(stem) = lower.strip_suffix('s').filter(|s| !s.is_empty()) {
+            out.push(stem.to_string());
+        }
+    }
+    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+    out.dedup();
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -244,21 +285,36 @@ fn assemble<'a>(
     key: Vec<u64>,
     mut edges: Vec<(u32, u32, u32)>,
     large: bool,
-) -> Projection<'a> {
+) -> (Projection<'a>, u64) {
     let n = nodes.len();
+    // Degree over the edges admitted so far, which is the count PAR-SYM-08's rule speaks
+    // about: the first pass counts every admitted edge, the second what survives the drop.
+    let mut pre = vec![0u32; n];
+    for &(a, b, _) in &edges {
+        pre[a as usize] += 1;
+        pre[b as usize] += 1;
+    }
+    let mut dropped_low_degree = 0u64;
+    if large {
+        dropped_low_degree = pre.iter().filter(|&&d| d < MIN_DEGREE).count() as u64;
+        // A node of degree below 2 carries no community evidence. Its edges go with it,
+        // which can leave a neighbour below 2 as well: the drop is repeated until it
+        // reaches a fixpoint, or pruning a path one edge at a time would empty it.
+        loop {
+            let before = edges.len();
+            edges.retain(|&(a, b, _)| pre[a as usize] >= MIN_DEGREE && pre[b as usize] >= MIN_DEGREE);
+            if edges.len() == before {
+                break;
+            }
+            pre.fill(0);
+            for &(a, b, _) in &edges {
+                pre[a as usize] += 1;
+                pre[b as usize] += 1;
+            }
+        }
+    }
     let mut degree = vec![0u32; n];
     let mut strength = vec![0u64; n];
-    if large {
-        // PAR-SYM-08's own rule: a node of degree below 2 is dropped, and with it every
-        // edge that would have been its only evidence. Degrees are counted before the
-        // drop, because dropping is what the count is for.
-        let mut pre = vec![0u32; n];
-        for &(a, b, _) in &edges {
-            pre[a as usize] += 1;
-            pre[b as usize] += 1;
-        }
-        edges.retain(|&(a, b, _)| pre[a as usize] >= MIN_DEGREE && pre[b as usize] >= MIN_DEGREE);
-    }
     for &(a, b, w) in &edges {
         degree[a as usize] += 1;
         degree[b as usize] += 1;
@@ -286,18 +342,21 @@ fn assemble<'a>(
     }
     let mut order: Vec<u32> = (0..n as u32).collect();
     order.sort_by_key(|&i| (key[i as usize], i));
-    Projection {
-        seg,
-        nodes,
-        rows,
-        key,
-        off: counts,
-        dst,
-        wgt,
-        degree,
-        strength,
-        order,
-    }
+    (
+        Projection {
+            seg,
+            nodes,
+            rows,
+            key,
+            off: counts,
+            dst,
+            wgt,
+            degree,
+            strength,
+            order,
+        },
+        dropped_low_degree,
+    )
 }
 
 /// Collect the projection over the resolved CALLS, EXTENDS and IMPLEMENTS symbol edges.
@@ -310,7 +369,7 @@ fn project<'a>(
     resolved: &[bool],
     seed: u64,
     large: bool,
-) -> Result<(Projection<'a>, u64, u64), String> {
+) -> Result<(Projection<'a>, Stats), String> {
     let files = seg.counts().files;
     let mut slot = vec![u32::MAX; seg.counts().symbols as usize];
     let mut nodes: Vec<u32> = Vec::new();
@@ -371,11 +430,23 @@ fn project<'a>(
         }
         edges.push((a, b, w));
     }
+    let (p, dropped_low_degree) = assemble(seg, nodes, rows, key, edges, large);
     Ok((
-        assemble(seg, nodes, rows, key, edges, large),
-        symbols,
-        dropped_low_confidence,
+        p,
+        Stats {
+            symbols,
+            dropped_low_degree,
+            dropped_low_confidence_edges: dropped_low_confidence,
+        },
     ))
+}
+
+/// What the projection contributes to the answer's counts.
+struct Stats {
+    /// Global symbols considered, which is what the mode switches on.
+    symbols: u64,
+    dropped_low_degree: u64,
+    dropped_low_confidence_edges: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -467,15 +538,17 @@ fn areas(p: &Projection, community: &[u32]) -> Vec<Area> {
     });
     let mut out = Vec::with_capacity(ranked.len());
     for (rank, members) in ranked.into_iter().enumerate() {
-        // Members in (path, line, name) order: the order a reader of the file expects.
-        let mut rows: Vec<(String, u32, u32, u32)> = members
+        // Members in (path, line, name) order: file order, with one source line's symbols
+        // in name order. The name is read once per member rather than compared by its
+        // interned id, which sorts by deduplicated name and so is not alphabetical.
+        let mut rows: Vec<(String, u32, String, u32)> = members
             .iter()
             .map(|&i| {
                 let row = p.rows[i as usize];
                 (
                     seg.file_path(row.file).unwrap_or_default(),
                     row.line,
-                    row.name,
+                    seg.name(row.name).unwrap_or_default(),
                     i,
                 )
             })
@@ -488,18 +561,18 @@ fn areas(p: &Projection, community: &[u32]) -> Vec<Area> {
             let row = p.rows[*i as usize];
             out_members.push(Member {
                 node: p.nodes[*i as usize],
-                name: seg.name(*name).unwrap_or_default(),
+                name: name.clone(),
                 path: seg.file_path(row.file).unwrap_or_default(),
                 line: *line,
             });
         }
-        let (label, rule) = label_for(seg, &rows, rank);
+        let (label, rule) = label_for(&rows, rank);
         out.push(Area {
             area_id: rank as u32,
             label,
             label_rule: rule,
             cohesion: cohesion(p, &rows[..sample]),
-            keywords: keywords(seg, &rows, sample),
+            keywords: keywords(&rows, sample),
             cohesion_sample: sample,
             members_truncated: listed < rows.len(),
             size: listed,
@@ -512,10 +585,9 @@ fn areas(p: &Projection, community: &[u32]) -> Vec<Area> {
 
 /// An area's label and the rule that chose it: the most common non-generic folder shared
 /// by enough members, else the members' common name prefix, else the area's rank.
-fn label_for(seg: &Segment, rows: &[(String, u32, u32, u32)], rank: usize) -> (String, LabelRule) {
+fn label_for(rows: &[(String, u32, String, u32)], rank: usize) -> (String, LabelRule) {
     let mut folders: BTreeMap<String, usize> = BTreeMap::new();
-    let mut prefixes: BTreeMap<String, usize> = BTreeMap::new();
-    for (path, _, name, _) in rows {
+    for (path, _, _, _) in rows {
         let folder = path
             .split('/')
             .rev()
@@ -524,20 +596,20 @@ fn label_for(seg: &Segment, rows: &[(String, u32, u32, u32)], rank: usize) -> (S
         if let Some(f) = folder {
             *folders.entry(f.to_string()).or_default() += 1;
         }
-        if let Some(p) = name_prefix(&seg.name(*name).unwrap_or_default()) {
-            *prefixes.entry(p).or_default() += 1;
-        }
     }
-    let best = |m: &BTreeMap<String, usize>| -> Option<String> {
-        m.iter()
-            .filter(|(_, n)| **n >= LABEL_MIN_MEMBERS)
-            .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
-            .map(|(k, _)| k.clone())
-    };
-    if let Some(f) = best(&folders) {
+    // The folder rule: the most common non-generic folder enough members share, ties to
+    // the alphabetically first, so the label is a total order over the members.
+    let folder = folders
+        .iter()
+        .filter(|(_, n)| **n >= LABEL_MIN_MEMBERS)
+        .max_by(|a, b| a.1.cmp(b.1).then_with(|| b.0.cmp(a.0)))
+        .map(|(k, _)| k.clone());
+    if let Some(f) = folder {
         return (f, LabelRule::Folder);
     }
-    if let Some(p) = best(&prefixes) {
+    // The name-prefix rule: the longest leading word enough members share.
+    let names: Vec<String> = rows.iter().map(|(_, _, n, _)| n.clone()).collect();
+    if let Some(p) = shared_prefix(&names) {
         return (p, LabelRule::NamePrefix);
     }
     (format!("Cluster_{rank}"), LabelRule::Fallback)
@@ -545,15 +617,14 @@ fn label_for(seg: &Segment, rows: &[(String, u32, u32, u32)], rank: usize) -> (S
 
 /// What an area's members share: the folder of the sample's members and the leading words
 /// of their names, most frequent first, bounded to [`MAX_KEYWORDS`].
-fn keywords(seg: &Segment, rows: &[(String, u32, u32, u32)], sample: usize) -> Vec<String> {
+fn keywords(rows: &[(String, u32, String, u32)], sample: usize) -> Vec<String> {
     let mut counts: BTreeMap<String, usize> = BTreeMap::new();
     let mut folder: BTreeMap<String, usize> = BTreeMap::new();
     for (path, _, name, _) in &rows[..sample] {
         if let Some(f) = path.split('/').rev().nth(1) {
             *folder.entry(f.to_string()).or_default() += 1;
         }
-        let n = seg.name(*name).unwrap_or_default();
-        *counts.entry(n).or_default() += 1;
+        *counts.entry(name.clone()).or_default() += 1;
     }
     let mut out: Vec<String> = folder
         .into_iter()
@@ -574,7 +645,7 @@ fn keywords(seg: &Segment, rows: &[(String, u32, u32, u32)], sample: usize) -> V
 /// Internal weight over possible internal edges, over the sampled members: the fraction
 /// of the sample's pairs that share an admitted edge. A singleton scores 0.0 rather than
 /// 1.0, because one member has no pair to be cohesive with.
-fn cohesion(p: &Projection, sample: &[(String, u32, u32, u32)]) -> f64 {
+fn cohesion(p: &Projection, sample: &[(String, u32, String, u32)]) -> f64 {
     let n = sample.len();
     if n < 2 {
         return 0.0;
@@ -604,18 +675,13 @@ fn cohesion(p: &Projection, sample: &[(String, u32, u32, u32)]) -> f64 {
 /// rules produced the answer.
 pub fn areas_of(seg: &Segment, resolved: &[bool], seed: u64) -> Result<Areas, String> {
     let large = global_symbols(seg, resolved) > LARGE_GRAPH_SYMBOLS;
-    let (p, symbols, dropped_low_confidence) = project(seg, resolved, seed, large)?;
+    let (p, stats) = project(seg, resolved, seed, large)?;
     let (mode, resolution, cap) = if large {
         ("large", LARGE_RESOLUTION, LARGE_MAX_ITERATIONS)
     } else {
         ("standard", 1.0, STANDARD_MAX_ITERATIONS)
     };
     let (community, iterations) = propagate(&p, resolution, cap);
-    let dropped_low_degree = p
-        .degree
-        .iter()
-        .filter(|&&d| large && d < MIN_DEGREE)
-        .count() as u64;
     let singleton_symbols = p.degree.iter().filter(|&&d| d == 0).count() as u64;
     Ok(Areas {
         command: "areas",
@@ -623,11 +689,11 @@ pub fn areas_of(seg: &Segment, resolved: &[bool], seed: u64) -> Result<Areas, St
         mode,
         resolution,
         iterations,
-        symbols,
+        symbols: stats.symbols,
         singleton_symbols,
         areas: areas(&p, &community),
-        dropped_low_degree,
-        dropped_low_confidence_edges: dropped_low_confidence,
+        dropped_low_degree: stats.dropped_low_degree,
+        dropped_low_confidence_edges: stats.dropped_low_confidence_edges,
         cohesion_sample_size: COHESION_SAMPLE,
         label_rules: LABEL_RULES,
     })
