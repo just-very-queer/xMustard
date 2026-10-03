@@ -122,3 +122,25 @@ func TestHookGateRowsNameNoToolSoMemoryIsWithdrawnPerSection(t *testing.T) {
 		}
 	}
 }
+
+// Withholding memory must withhold only memory. A search-shaped PreToolUse still gets its
+// index hits, which come from the resident index and not from the memory store, so a
+// deployment that disables recall keeps them. This is the observable half of round 4's
+// r4-2 fix, which moved the refusal ahead of the store reads: it says the answer does not
+// depend on the memory store being readable.
+func TestDisabledRecallKeepsTheNonMemoryContextOfAPreToolUse(t *testing.T) {
+	f := hookMemoryFixture(t, exposurePosture{DisabledTools: map[string]bool{"recall": true}})
+	_, body := f.post(t, f.agent, "PreToolUse", hookEvent(map[string]any{
+		"session_id": "s", "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Grep",
+		"tool_input": map[string]any{"pattern": "total"}}))
+	context := hookContext(t, body)
+	if !strings.Contains(context, "src/billing.go") {
+		t.Errorf("a search PreToolUse lost its index hits with recall disabled:\n%s", context)
+	}
+	if strings.Contains(context, "billing rounding") {
+		t.Errorf("a search PreToolUse injected memory with recall disabled:\n%s", context)
+	}
+	if f.searches.Load() == 0 {
+		t.Error("the index search did not run, so the answer did not come from it")
+	}
+}
