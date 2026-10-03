@@ -2651,6 +2651,63 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 
 *Follow-ups.* (a) §4.6's triage closure needs a docs/behavior-free exemption clause, and the triage-check prompt needs the matching question; both are owner edits and this is the thirteenth row to raise it. (b) `explain` returned "Workspace or path not found" for every path tried against the owner's `:8077` index, so it contributed nothing; `impact`'s `defined_in` for `Instructions` named the wrong file. Both in `reviews/ws-38a/r1/dogfood.md`, proposed owner: whoever maintains the MCP server. (c) `refresh::the_directory_watch_count_follows_the_tree` is load-sensitive on Linux and is now on four lane ledgers (this one plus WS-HYG-01, WS-FIX-11 and WS-FIX-17); it is a candidate for WS-FLK-01, proposed owner: WS-FLK-01's owner.
 
+### WS-38c — `flows.rs`: entry-point scoring, bounded DFS and truncation stats
+
+**Goal.** Execution flows over the **resolved** CALLS projection (PAR-SYM-09), reachable as
+`xmustard-core index flows <root>`. Five deliverables, each of which PAR-SYM-09 names in terms:
+
+1. **Entry-point scoring.** `calleeCount / (callerCount + 1)`, ×2 when the symbol is
+   `exported`, times a name multiplier. The top 200 candidates are seeds.
+2. **Bounded DFS** over resolved CALLS with depth 10, branching 4 and a minimum of 3 steps.
+3. **Deduped and labeled.** A flow is identified by its sorted set of steps, so the same
+   reachability set reached from two seeds is one flow; a flow's label is the shared name
+   stem of its steps when one qualifies, otherwise the seed's name.
+4. **Classified intra- or cross-community**, against the file-level communities the reader
+   already computes (`Snapshot::clusters`, `PathCluster`), because this row's Files list does
+   not include `areas.rs` and 38b is not merged.
+5. **Truncation stats**, reported in every answer and counted in the budget record, never
+   silently.
+
+**Requirements.** PAR-SYM-09. Carried but not closed by this row: `impact`'s
+`affected_flows` and ground's orientation (38d, 38e) and the `xmustard://workspace/{id}/flows`
+resource (38f). PAR-SYM-08's symbol-granularity areas are named as the *intended* community
+layer; that is 38b's, and this row uses the file-level communities instead, below.
+
+**Files.** `rust-core/src/index/flows.rs` (new), `rust-core/src/index/mod.rs` (the
+`index flows` dispatcher, the `--limit` and `--seed` flags, `USAGE`), `rust-core/src/index/reader.rs`
+(only the `resolved_files()` accessor, the same one WS-38b adds), `rust-core/tests/flows.rs`
+(new; `tests/areas_flows.rs` is 38b's and is not on this branch), this plan file.
+
+**Tests required.** Every one runs the real binary against a disposable Git repository.
+- Entry-point scoring: the ratio is computed as `calleeCount/(callerCount+1)`; a symbol with
+  one caller and three callees outranks an equal symbol with four callers; `exported` doubles
+  it; a name multiplier that is a table, one row per multiplier class, with each row pinned.
+- Top 200: a repository with more than 200 scoring candidates answers exactly 200 seeds.
+- Depth 10, branching 4, minimum 3 steps: a chain of 12 gives a flow of 11 steps and not a
+  12th; a fan of 5 siblings explores 4; a two-step reachability set produces **no** flow.
+- Dedup: two seeds with the same reachability set are one flow with two seeds listed.
+- Label: a shared name stem is the label; a set with no shared stem falls back to the seed's
+  name, and the answer says which rule produced it.
+- Classification: a flow inside one file's community is `intra`; one crossing two is `cross`.
+- Truncation stats: a fixture over the depth, branching and step caps answers with
+  `truncated=true` and non-zero `truncated_*` counts, and a small fixture answers
+  `truncated=false` with every count 0.
+- Only resolved edges: a lexical-only call between two files with no `go.mod` contributes
+  neither a seed nor a step.
+- A missing index is refused, and `--limit=nope` is refused before any work.
+
+**Acceptance.** `xmustard-core index flows <root>` answers the entry points, their scores and
+the flows they reach, with the caps it applied and how many each bound stopped; a repository
+with no resolved CALLS answers zero flows rather than refusing; and every bound in
+`USAGE` is a constant in `flows.rs`, so §5.1 rule 10's "adding a subcommand is one table
+entry" holds. The read path is read-only like `impact`, so the row adds no writer, no schema
+migration and no `go-calls.txt` line (there is no Go caller; 38e/38f add the caller).
+
+**Collision risk.** `rust-core/src/index/mod.rs` is also 38b's and WS-45a's file; 38b is
+parked and not merged, so this row's `mod.rs` diff is against a tree without `areas.rs`. Both
+`index areas` and `index flows` take a `--seed` flag and both may merge before either merges
+again; §1.7 rule 4 governs that case and plan-file conflicts keep both sections.
+
 ### WS-39 — Resolvers for Rust, Python and Java
 
 **Goal.** Extend scope/import resolution to Rust (use paths, impl blocks, traits), Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), with the same confidence tiers, provenance and drop counters.
