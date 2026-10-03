@@ -122,9 +122,11 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
     let exit = exit_of(status);
     let mut drained = drained.map_err(io_failed("read child output"))?;
     let text = present(&target, &argv, exit, &mut drained, limits);
-    // Disarms only after the outcome is known, and `end_like` (which re-raises the child's
-    // signal) runs after this, once no handler can swallow the re-raise.
-    forwarder.stop();
+    // Stays armed until the process exits: the caller still prints `text`, which blocks on a
+    // full stdout pipe, and a timeout then must still end the wrapper (WS-FIX-20 r3). A
+    // stopped watcher would leave the handler installed with no action, swallowing it.
+    // `end_like` re-raises through `emulate_default_handler`, which no handler can swallow.
+    forwarder.hold_until_exit();
     Ok(Output::Exit(text, exit))
 }
 
@@ -253,7 +255,7 @@ impl Forwarder {
                 else {
                     continue;
                 };
-                if reaped.load(Ordering::SeqCst) {
+                if reaped.load(Ordering::SeqCst) || has_ended(child) {
                     // The child is reaped and there is nothing left to tell it, so the
                     // signal means what it would have meant without any forwarding at all:
                     // end this process the same way. Without this the handler would consume
@@ -271,6 +273,12 @@ impl Forwarder {
             }
         });
         Some((handle, watcher))
+    }
+
+    /// Leaves the watcher running for the rest of the process, so any forwarded signal
+    /// from here on ends the wrapper (the child is reaped) instead of being swallowed.
+    fn hold_until_exit(self) {
+        std::mem::forget(self);
     }
 
     /// Stops forwarding and joins the watcher. `signal-hook-registry` does NOT restore the
@@ -292,6 +300,17 @@ impl Drop for Forwarder {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// Whether the child has exited, reaped or not. `drain` blocks BEFORE `wait` while a
+/// grandchild holds the output pipe open, so `reaped` alone would forward a timeout to an
+/// exited child and swallow it (WS-FIX-20 r3). `NOWAIT` leaves the status for `wait`; an
+/// error (ECHILD once `wait` reaped it) also means the child is gone, so this fails toward
+/// ending the wrapper rather than toward swallowing the signal.
+fn has_ended(child: rustix::process::Pid) -> bool {
+    use rustix::process::{WaitIdOptions, waitid};
+    let probe = WaitIdOptions::EXITED | WaitIdOptions::NOHANG | WaitIdOptions::NOWAIT;
+    !matches!(waitid(child, probe), Ok(None))
 }
 
 /// What the child printed: the spool (`None` once dropped, with `lost` saying why),

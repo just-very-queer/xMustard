@@ -53,3 +53,13 @@ signal-hook ships no NOTICE file. It is a dependency of rust-core, not a transla
   run wrapper to its child (WS-FIX-20), because rust-core is #![forbid(unsafe_code)]
   and the crate forbids sigaction for the same reason. xMustard contributes no changes
   to it.
+
+This product includes the Rust crate signal-hook-registry
+(https://github.com/vorner/signal-hook, directory signal-hook-registry), licensed
+under the Apache License, Version 2.0 OR the MIT License, at the copyright holder's
+option. It ships no NOTICE file and is a dependency of signal-hook, not a translation.
+
+  Copyright (c) 2017 Michal 'vorner' Vaner and signal-hook contributors
+
+  Used at signal-hook-registry 1.4.8, pulled in by signal-hook for the same
+  forwarding. xMustard contributes no changes to it.

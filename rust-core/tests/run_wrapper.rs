@@ -540,3 +540,98 @@ fn one_hundred_megabytes_stream_through_in_bounded_memory() {
         "the wrapper held {dirty:.1} MiB while streaming 100 MB"
     );
 }
+
+/// Polls `child` until it ends or `secs` pass; on timeout kills it and returns `None`.
+fn wait_within(child: &mut std::process::Child, secs: u64) -> Option<std::process::ExitStatus> {
+    for _ in 0..secs * 50 {
+        if let Some(s) = child.try_wait().unwrap() {
+            return Some(s);
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    None
+}
+
+/// WS-FIX-20 r3 (codex-review P1): the direct child has exited but a grandchild still
+/// holds the output pipe, so the wrapper is inside `drain`, before `wait`. A TERM then must
+/// end the wrapper, not be forwarded to the exited child and swallowed.
+#[test]
+fn a_term_while_a_grandchild_holds_the_pipe_ends_the_wrapper() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"sleep 20 & printf '%s' "$!" > "$1/grandchild"; printf '%s' "$$" > "$1/pid"; exit 0"#;
+    let mut wrapper = Command::new(BIN)
+        .args(["run", "--", "sh", "-c", script, "sh", dir.path().to_str().unwrap()])
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    await_file(&dir.path().join("pid"));
+    let pid = child_pid(dir.path());
+    // the child is a zombie (exited, not yet reaped) once ps reports state Z
+    for _ in 0..500 {
+        let st = Command::new("ps").args(["-o", "stat=", "-p", &pid]).output().unwrap();
+        if String::from_utf8_lossy(&st.stdout).trim_start().starts_with('Z') {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let killed = Command::new("kill")
+        .args(["-TERM", &wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = wait_within(&mut wrapper, 5);
+    let grandchild = std::fs::read_to_string(dir.path().join("grandchild")).unwrap();
+    let _ = Command::new("kill").arg(grandchild.trim()).status();
+    let status = status.expect("the TERM was swallowed: the wrapper kept draining");
+    assert_eq!(status.signal(), Some(15), "wrapper status {status:?}");
+}
+
+/// WS-FIX-20 r3 (codex-spec 1): a TERM while the wrapper is blocked printing its output to
+/// a stdout nobody reads must still end it. The first byte read proves the wrapper is in
+/// the print, which comes only after the child is reaped and the capture is done.
+#[test]
+fn a_term_while_the_wrapper_prints_ends_it() {
+    let mut wrapper = Command::new(BIN)
+        .args(["run", "--", "sh", "-c", "head -c 200000 /dev/zero | tr '\\0' a"])
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut out = wrapper.stdout.take().unwrap();
+    let mut first = [0u8; 1];
+    out.read_exact(&mut first).unwrap();
+    thread::sleep(Duration::from_millis(200)); // let the unread pipe fill
+    let killed = Command::new("kill")
+        .args(["-TERM", &wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(killed.success());
+    let status = wait_within(&mut wrapper, 5);
+    drop(out);
+    let status = status.expect("the TERM was swallowed while the wrapper printed");
+    assert_eq!(status.signal(), Some(15), "wrapper status {status:?}");
+}
+
+/// WS-FIX-20 r3 (codex-spec 4): a child whose TERM trap exits 0 makes the wrapper exit 0.
+/// Without forwarding the wrapper dies of the TERM itself.
+#[test]
+fn a_child_that_exits_zero_on_term_makes_the_wrapper_exit_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let script = r#"trap 'exit 0' TERM; printf '%s' "$$" > "$1/pid"; printf 'ready\n' > "$1/ready"; i=0; while [ "$i" -lt 600 ]; do i=$((i+1)); sleep 0.05; done; exit 9"#;
+    let mut wrapper = Command::new(BIN)
+        .args(["run", "--", "sh", "-c", script, "sh", dir.path().to_str().unwrap()])
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    await_file(&dir.path().join("ready"));
+    signal_wrapper(dir.path(), "TERM");
+    let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
+}
