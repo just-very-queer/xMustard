@@ -1636,6 +1636,29 @@ mod tests {
         }
     }
 
+    // WS-RT2: a nested repository's Git dir (`sub/.git` as a directory or a `gitdir:`
+    // file) is that repository's state, not a source path of this root.
+    #[test]
+    fn nested_git_dirs_are_skipped_at_any_depth() {
+        let l = layout(Some(&[]));
+        for path in [
+            "/r/sub/.git",
+            "/r/sub/.git/index",
+            "/r/sub/.git/refs/heads/main",
+            "/r/a/b/sub/.git/objects/ab/cdef",
+        ] {
+            assert_eq!(l.classify(Path::new(path)), Class::Skip, "{path}");
+        }
+        assert_eq!(
+            l.classify(Path::new("/r/sub/x.go")),
+            Class::Path("sub/x.go".into())
+        );
+        assert_eq!(
+            l.classify(Path::new("/r/a/.github/ci.yml")),
+            Class::Path("a/.github/ci.yml".into())
+        );
+    }
+
     #[test]
     fn without_an_ignored_listing_the_builtin_exclusions_apply() {
         let l = layout(None);
