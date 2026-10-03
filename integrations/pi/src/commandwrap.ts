@@ -22,7 +22,7 @@
 // always runs and its result is never lost, so a malformed argv must never reach
 // the shell in place of the model's command.
 
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, statSync } from "node:fs";
 import { delimiter, join } from "node:path";
 import { normalizeApiBase } from "./config.ts";
 import { resultCarriesHandle } from "./delivery.ts";
@@ -117,12 +117,14 @@ function effectiveToken(t: string | undefined): string | undefined {
 }
 
 // wrapperOnPath reports whether `xmustard-core` resolves to an executable file in
-// one of the PATH entries, the same lookup the shell will do for the wrapped argv.
+// one of the PATH entries (a regular file, not a directory), the same lookup the shell will do for the wrapped argv.
 export function wrapperOnPath(path: string | undefined): boolean {
 	return (path ?? "").split(delimiter).filter(Boolean).some((dir) => {
 		try {
-			accessSync(join(dir, "xmustard-core"), constants.X_OK);
-			return true;
+			const bin = join(dir, "xmustard-core");
+			// A directory is X_OK too, and the shell cannot exec it.
+			accessSync(bin, constants.X_OK);
+			return statSync(bin).isFile();
 		} catch {
 			return false;
 		}

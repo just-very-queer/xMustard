@@ -133,15 +133,34 @@ mutate M15 'if (!isRecord(event) || event.toolName !== "bash") return false;' ''
 # M16: the token gate is removed, so the wrapper is handed an argv with no way to
 # authenticate and every wrapped call fails inside the wrapper instead of running
 # natively.
-mutate M16 'return !!opts.wrapperToken && opts.wrapperToken.trim() === opts.token?.trim();' 'return !!opts.wrapperToken;' || true
+mutate M16 'return effectiveToken(opts.token) === effectiveToken(opts.wrapperToken);' 'return true;' || true
+
+# M22: the executable check is dropped, so a session with no xmustard-core on PATH
+# rewrites every bash call to a command that exits 127.
+mutate M22 'if (!opts.wrapperAvailable) return false;' '' || true
+
+# M23: a directory named xmustard-core counts as the wrapper.
+mutate M23 'return statSync(bin).isFile();' 'return true;' || true
 
 # M19: the API-base reconciliation is dropped, so a session pointed at one server
 # captures through the wrapper into another.
-mutate M19 'if (opts.wrapperApiBase !== undefined && opts.wrapperApiBase !== opts.apiBase) return false;' '' || true
+mutate M19 'if (opts.wrapperApiBase !== undefined && normalizeApiBase(opts.wrapperApiBase) !== opts.apiBase) return false;' '' || true
 
 # M20: every program gets a second word, so `echo hunter2` can put hunter2 in the
 # capture query.
-mutate M20 'Some(one) if SUBCOMMAND_PROGRAMS.contains(&one) => {' 'Some(one) if true => {' "$RUST" || true
+mutate M20 'None => None,
+    };
+    match rest {' 'None => subcommand(&mut words),
+    };
+    match rest {' "$RUST" || true
+
+# M24: any program's -c script is read as a shell command, so `python -c <script>`
+# puts a word of the script in the capture query.
+mutate M24 'let script = SHELLS
+        .contains(&name)' 'let script = true' "$RUST" || true
+
+# M25: make-like targets lose their family keyword, so `make test` is reduced as a build.
+mutate M25 'Some(Hint::Keyword) => keyword(&mut words),' 'Some(Hint::Keyword) => None,' "$RUST" || true
 
 # M21: a handle in the result text no longer activates expansion, so the model holds
 # a recovery handle and no tool to use it with.
@@ -153,7 +172,14 @@ mutate M17 'const SHELL = "bash";' 'const SHELL = "sh";' "$SRC" || true
 
 # M18: the run_wrapper's command hint keeps naming the shell, so a wrapped `git diff`
 # is reduced by the generic shell reducer instead of the diff family.
-mutate M18 'let words = argv.get(1).is_some_and(|f| f == "-c")' 'let words = false.then(|| argv.get(2).map(String::as_str))' "$RUST" || true
+mutate M18 'Some(c) => Box::new(c.split_whitespace()),' 'Some(_) => Box::new(argv.iter().map(String::as_str)),' "$RUST" || true
+
+# M26: a result that already carries a handle is captured again by projectBuiltin.
+mutate M26 '	if (carriesHandle(texts)) return undefined;' '' "$DLV" || true
+
+# M27: the handle scan stops at the first tag, so a handle after a second tag on a
+# later line is missed.
+mutate M27 '		HANDLE_TAG.lastIndex = nl + 1;' '		return false;' "$DLV" || true
 
 restore ALL
 echo "=== final byte-compare"

@@ -832,6 +832,22 @@ describe("built-in tool projection through capture", () => {
 		assert.equal(handles, 1);
 		assert.ok(!("xmustard" in details), "the tool's own details object is not mutated");
 	});
+	test("a result that already carries a handle is not captured again (r5)", async () => {
+		const srv = captureServer();
+		const c = new Capturer(cfg());
+		const text = `${bigText(9000)}\n[xmustard evidence] {"handle":"xm1.W1"}\n`;
+		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), c, resolve, { toolCallId: "w", toolName: "bash", input: {}, content: [{ type: "text", text }], details: undefined, isError: false }, {}, () => {});
+		assert.equal(out, undefined);
+		assert.equal(srv.seen.length, 0, "the wrapper's projection is never re-captured");
+	});
+	test("the handle scan is per line and linear (r5)", () => {
+		assert.equal(carriesHandle(["[xmustard evidence] no\n[xmustard page] {\"h\":\"xm1.P\"}"]), true);
+		assert.equal(carriesHandle(["[xmustard evidence] no\nxm1.elsewhere"]), false, "a handle on another line is not the tag's");
+		const hostile = "[xmustard evidence] ".repeat(200_000);
+		const t0 = Date.now();
+		assert.equal(carriesHandle([hostile]), false);
+		assert.ok(Date.now() - t0 < 2000, "a long line of repeated tags is scanned once");
+	});
 	test("small, image and non-built-in results never reach Go", async () => {
 		const srv = captureServer();
 		const c = new Capturer(cfg());
@@ -1477,6 +1493,9 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		const dir = mkdtempSync(path.join(os.tmpdir(), "xm-wrap-"));
 		try {
 			assert.equal(wrapperOnPath(dir), false, "an empty directory holds no wrapper");
+			const asDir = path.join(dir, "d");
+			mkdirSync(path.join(asDir, "xmustard-core"), { recursive: true });
+			assert.equal(wrapperOnPath(asDir), false, "a directory named xmustard-core is not a wrapper");
 			assert.equal(wrapperOnPath(undefined), false);
 			assert.equal(wrapperOnPath(""), false, "an empty PATH holds no wrapper");
 			const bin = path.join(dir, "xmustard-core");

@@ -675,12 +675,26 @@ export function textBlocks(content: unknown[]): string[] | undefined {
 // wrapper's projection puts its handle in the [xmustard evidence] footer of the
 // text instead, and that result reaches Pi with no details of our own, so the
 // footer is the only place the handle can come from.
-// The `]` must be matched literally after the tag: the footer is one line, and the
-// handle is inside its JSON, so the class between them cannot span a newline.
-const HANDLE_IN_TEXT = /\[xmustard (?:evidence|masked|page|search)\][^\n]*xm1\./;
+// The scan is linear in the text: each line is inspected once, from its first tag
+// to its end, so a long line of repeated tags cannot make it revisit the same span.
+const HANDLE_TAG = /\[xmustard (?:evidence|masked|page|search)\]/g;
+const HANDLE_MARK = "xm1.";
 
 export function carriesHandle(texts: readonly string[]): boolean {
-	return texts.some((t) => HANDLE_IN_TEXT.test(t));
+	return texts.some(lineHoldsTaggedHandle);
+}
+
+function lineHoldsTaggedHandle(t: string): boolean {
+	HANDLE_TAG.lastIndex = 0;
+	for (let m = HANDLE_TAG.exec(t); m; m = HANDLE_TAG.exec(t)) {
+		const nl = t.indexOf("\n", m.index);
+		const end = nl === -1 ? t.length : nl;
+		const at = t.indexOf(HANDLE_MARK, m.index + m[0].length);
+		if (at !== -1 && at < end) return true;
+		if (nl === -1) return false;
+		HANDLE_TAG.lastIndex = nl + 1;
+	}
+	return false;
 }
 
 // resultCarriesHandle is the one rule the tool_result hook applies to every result
@@ -711,6 +725,10 @@ export async function projectBuiltin(
 	if (!texts) return undefined;
 	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
 	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
+	// A result that already names a handle (the run wrapper's projection) is the
+	// reduced form of an original already captured; capturing it again would point
+	// the visible handle at the projection instead of the command's own output.
+	if (carriesHandle(texts)) return undefined;
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });
 	const paused = capturer.paused;
 	if (paused) return passthrough(`capture paused: ${paused}`);

@@ -401,12 +401,6 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-/// Programs whose second word selects the reducer on the Go side (registry.go's
-/// `argvFamily` switches on argv0 and its subcommand). The hint's second word is only
-/// sent for one of these, so a bare `echo hunter2` cannot put `hunter2` in the capture
-/// query: for any other program the first word is the whole hint, which is all the
-/// registry needs to classify it.
-const SUBCOMMAND_PROGRAMS: [&str; 8] = ["go", "git", "cargo", "npm", "pnpm", "yarn", "kubectl", "docker"];
 
 /// What the server may learn of the command line to pick a reducer: the program's name
 /// and, when it is a plain word and the program is one whose subcommand selects a
@@ -420,46 +414,97 @@ const SUBCOMMAND_PROGRAMS: [&str; 8] = ["go", "git", "cargo", "npm", "pnpm", "ya
 /// command-keyed reducer registry falls through to the generic shell reducer.
 fn command_hint(argv: &[String]) -> String {
     let name = basename(&argv[0]);
-    let plain = |s: &str| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-            && !s.starts_with('-')
-    };
     // A shell invocation's words come from the string the shell will run, so the
     // hint describes the command and not the shell that every command shares. Only
-    // the first two words are ever looked at, and the string is split lazily, so a
-    // long generated command costs two words rather than one Vec of all of them.
-    let words = argv.get(1).is_some_and(|f| f == "-c")
-        .then(|| argv.get(2).map(String::as_str))
-        .flatten()
-        .map(|c| c.split_whitespace().take(2).collect::<Vec<&str>>())
-        .unwrap_or_else(|| argv.iter().map(String::as_str).take(2).collect());
-    // The program's name, and its first plain argument: `git diff --stat` is `git
-    // diff`, not `git --stat` and not `git`. A path is reduced to its basename
-    // first, as it was before a shell invocation was recognised. The two words are
-    // taken positionally, because dropping a non-plain word would pair a later one
-    // with an earlier one's role. Nothing past the second word is read, so a token
-    // or secret further along the line never leaves the process.
-    //
-    // `plain` is the disclosure rule and it has not changed: alphanumeric, `.`, `_`
-    // and `-`, never leading `-`. A word holding a quote, a redirect, a glob, a
-    // substitution or a path separator is not metadata and is not sent.
-    let first = words.first().map(|w| basename(w)).filter(|w| plain(w));
-    let sub = match first {
-        // Only a program the registry dispatches on can use its subcommand; for
-        // anything else a second word is an argument, not a family selector, and
-        // sending it would disclose an argument the caller never meant to.
-        Some(one) if SUBCOMMAND_PROGRAMS.contains(&one) => {
-            words.get(1).copied().filter(|w| plain(w))
-        }
-        _ => None,
+    // a program the Go side treats as a shell (registry.go: bash, sh, zsh, dash,
+    // ksh) is read that way: `python -c <script>` is a script, and none of its
+    // words may leave the process. The string is split lazily.
+    let script = SHELLS
+        .contains(&name)
+        .then(|| argv.get(1).filter(|f| *f == "-c").and(argv.get(2)))
+        .flatten();
+    let mut words: Box<dyn Iterator<Item = &str>> = match script {
+        Some(c) => Box::new(c.split_whitespace()),
+        None => Box::new(argv.iter().map(String::as_str)),
     };
-    match (first, sub) {
-        (Some(one), Some(two)) => format!("{one} {two}"),
-        (Some(one), None) => one.to_string(),
-        _ => name.to_string(),
+    // The program's name, reduced to its basename. Words are taken positionally,
+    // because dropping a non-plain word would pair a later one with an earlier one's
+    // role. `plain` is the disclosure rule: alphanumeric, `.`, `_` and `-`, never
+    // leading `-`; a quote, redirect, glob, substitution or path is never sent.
+    let Some(first) = words.next().map(basename).filter(|w| plain(w)) else {
+        return name.to_string();
+    };
+    let rule = HINT_RULES
+        .iter()
+        .find(|(programs, _)| programs.contains(&first))
+        .map(|(_, rule)| *rule);
+    let rest = match rule {
+        Some(Hint::Subcommand) => subcommand(&mut words),
+        Some(Hint::RunScript) => run_script(&mut words),
+        Some(Hint::Keyword) => keyword(&mut words),
+        None => None,
+    };
+    match rest {
+        Some(rest) => format!("{first} {rest}"),
+        None => first.to_string(),
     }
+}
+
+fn plain(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Programs the Go registry reads as a shell wrapping a `-c` string.
+const SHELLS: [&str; 5] = ["bash", "sh", "zsh", "dash", "ksh"];
+
+/// How much of a command line past the program the registry needs, per program
+/// family (registry.go argvFamily). Anything not listed sends its name only.
+#[derive(Clone, Copy)]
+enum Hint {
+    /// The second word selects the family (`git diff`).
+    Subcommand,
+    /// As Subcommand, plus the script name after `run` (`npm run test`).
+    RunScript,
+    /// The registry only asks whether the line contains test, check or lint, so
+    /// only that fixed keyword is sent, never the target's own name.
+    Keyword,
+}
+
+const HINT_RULES: [(&[&str], Hint); 3] = [
+    (&["go", "git", "cargo", "kubectl", "docker"], Hint::Subcommand),
+    (&["npm", "pnpm", "yarn", "bun", "deno"], Hint::RunScript),
+    (
+        &["make", "just", "task", "rake", "mvn", "gradle", "gradlew", "sbt", "dotnet", "swift", "zig", "mix"],
+        Hint::Keyword,
+    ),
+];
+
+fn subcommand<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
+    words.next().filter(|w| plain(w)).map(str::to_string)
+}
+
+fn run_script<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
+    let sub = subcommand(words)?;
+    if sub != "run" {
+        return Some(sub);
+    }
+    Some(match subcommand(words) {
+        Some(script) => format!("run {script}"),
+        None => sub,
+    })
+}
+
+/// The registry's own keywords, in its precedence order (test and check before lint).
+const FAMILY_KEYWORDS: [&str; 3] = ["test", "check", "lint"];
+
+fn keyword<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
+    let line: Vec<String> = words.map(str::to_ascii_lowercase).collect();
+    FAMILY_KEYWORDS
+        .iter()
+        .find(|k| line.iter().any(|w| w.contains(*k)))
+        .map(|k| k.to_string())
 }
 
 fn digest(argv: &[String]) -> String {
@@ -542,6 +587,32 @@ mod tests {
         // A word holding a redirect, a glob or a substitution is never a plain word.
         assert_eq!(command_hint(&a(&["bash", "-c", "go test ./..."])), "go test");
         assert_eq!(command_hint(&a(&["bash", "-c", "go >out"])), "go");
+    }
+
+    #[test]
+    fn command_hint_reads_a_dash_c_script_only_for_a_shell() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(command_hint(&a(&["python", "-c", "hunter2 = 1"])), "python");
+        assert_eq!(command_hint(&a(&["/usr/bin/node", "-c", "git diff"])), "node");
+        assert_eq!(command_hint(&a(&["zsh", "-c", "git diff"])), "git diff");
+    }
+
+    #[test]
+    fn command_hint_keeps_what_the_registry_needs_for_scripts_and_targets() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (command, want) in [
+            ("npm run test", "npm run test"),
+            ("pnpm run lint --fix", "pnpm run lint"),
+            ("npm run", "npm run"),
+            ("npm test", "npm test"),
+            ("make test", "make test"),
+            ("make -j4 check-backend", "make check"),
+            ("make lint", "make lint"),
+            ("make deploy-hunter2", "make"),
+            ("gradle build", "gradle"),
+        ] {
+            assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
+        }
     }
 
     #[test]
