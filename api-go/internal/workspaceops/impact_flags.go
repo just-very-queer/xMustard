@@ -215,6 +215,11 @@ func ResolveImpactCursor(workspaceID string, q url.Values, params map[string]str
 	if params["offset"] != "" {
 		return fmt.Errorf("cursor and offset both name the page position: %w", ErrInvalidInput)
 	}
+	if _, given := q["offset"]; given {
+		// An offset given but empty names no position, and silently letting the cursor
+		// supply one would answer a request the caller wrote twice.
+		return fmt.Errorf("offset is empty: give it a page position or leave it out to use cursor: %w", ErrInvalidInput)
+	}
 	offset, err := DecodeImpactCursor(workspaceID, q, cursor)
 	if err != nil {
 		return err

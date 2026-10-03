@@ -33,6 +33,8 @@ func TestImpactCursorsAreBoundToTheirTierPage(t *testing.T) {
 		"other confidence": func() (int, error) { return DecodeImpactCursor("ws", with(q, "min_confidence", "0.5"), c) },
 		"other tests":      func() (int, error) { return DecodeImpactCursor("ws", with(q, "include_tests", "true"), c) },
 		"other scope":      func() (int, error) { return DecodeImpactCursor("ws", with(q, "scope", "workspace"), c) },
+		"other timeout":    func() (int, error) { return DecodeImpactCursor("ws", with(q, "timeout_ms", "5000"), c) },
+		"other summary":    func() (int, error) { return DecodeImpactCursor("ws", with(q, "summary_only", "true"), c) },
 		"other workspace":  func() (int, error) { return DecodeImpactCursor("ws2", q, c) },
 		"search cursor": func() (int, error) {
 			return DecodeImpactCursor("ws", q, SearchCursor("ws", url.Values{"q": {"Serve"}})(4))
@@ -345,56 +347,67 @@ func TestImpactPagesTiersOfDifferentLengthsWithoutAGap(t *testing.T) {
 	}
 }
 
-// A page the output budget cut loses its cursor rather than keeping one that would
-// skip the items the budget removed: has_more and the tier total stay, and offset=
-// reaches the rest.
-func TestABudgetTrimmedPageDropsItsCursor(t *testing.T) {
-	// A cut page the core had more of: has_more was already true and stays true.
+// A page the output budget cut is re-signed: the cursor continues at the first item the
+// caller did not receive, so following it skips nothing and needs no hand-computed
+// offset. When a rung removed the tiers outright there is nothing to sign, so the cursor
+// goes and has_more stands.
+func TestABudgetTrimmedPageIsResignedToWhatWasDelivered(t *testing.T) {
+	q := url.Values{"symbol": {"Serve"}}
+	// The core returned items 0-1 of 5 at offset 0 and the budget delivered one.
 	trimmed := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789",` +
 		`"by_depth":[{"depth":1,"total":5,"offset":0,"items":[{"name":"i0"}],"next_offset":2}],` +
 		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
-	res := decodeMembers(t, ReconcileImpactPaging(trimmed))
-	if _, ok := res["next_cursor"]; ok {
-		t.Error("a trimmed page keeps a cursor that would skip removed items")
-	}
+	res := decodeMembers(t, ReconcileImpactPaging("ws", q, trimmed))
 	if got := string(res["has_more"]); got != "true" {
 		t.Errorf("has_more = %s, want true", got)
+	}
+	// The cursor continues after the one delivered item, not at the core's next_offset
+	// of 2, which would skip item 1. It arrives as a JSON string, so it is decoded before
+	// it goes back through the decoder.
+	var cursor string
+	if err := json.Unmarshal(res["next_cursor"], &cursor); err != nil {
+		t.Fatalf("the re-signed cursor is a JSON string: %v", err)
+	}
+	if n, err := DecodeImpactCursor("ws", q, cursor); err != nil || n != 1 {
+		t.Errorf("the re-signed cursor continues at %d (%v), want 1", n, err)
 	}
 	if _, ok := res["output_budget"]; !ok {
 		t.Error("the budget report is dropped, so the trim becomes silent")
 	}
 
-	// The case the second triage check raised: the core page had no successor, so the
-	// result carried no cursor at all, and the budget cut the last items off it. The
-	// tier still holds more than it delivered, so has_more must be set here or the
-	// caller is told the walk is finished while items remain.
-	finalPage := []byte(`{"symbol":"Serve","by_depth":[{"depth":1,"total":5,"offset":2,` +
-		`"items":[{"name":"i2"}]}],` +
-		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
-	res = decodeMembers(t, ReconcileImpactPaging(finalPage))
+	// A rung that removed the tiers leaves nothing to count or sign: has_more stands and
+	// no cursor is issued, which is the codex-spec:3 case.
+	removed := []byte(`{"symbol":"Serve","by_depth":[{"depth":1,"total":5,"offset":2,"items":[{"name":"i2"}]}],` +
+		`"output_budget":{"max_chars":2000,"used_chars":900,"degraded_stage":"tiers_total","stages":["tiers_total"]}}`)
+	removed = stripMember(t, removed, "by_depth")
+	res = decodeMembers(t, ReconcileImpactPaging("ws", q, removed))
 	if got := string(res["has_more"]); got != "true" {
-		t.Errorf("a trimmed final page reports has_more = %s, want true", got)
+		t.Errorf("a result whose tiers were removed reports has_more = %s, want true", got)
 	}
 	if _, ok := res["next_cursor"]; ok {
-		t.Error("a trimmed page signs no cursor")
+		t.Error("a result with no tiers left signs no cursor")
 	}
 
 	// An untrimmed result is untouched: the route calls this on every impact answer,
 	// so the common case must survive it.
 	whole := []byte(`{"symbol":"Serve","has_more":true,"next_cursor":"i2.2.abcdef0123456789",` +
 		`"by_depth":[{"depth":1,"total":5,"offset":0,"items":[{"name":"i0"},{"name":"i1"}],"next_offset":2}]}`)
-	if string(ReconcileImpactPaging(whole)) != string(whole) {
-		t.Errorf("an untrimmed result is returned unchanged: %s", ReconcileImpactPaging(whole))
+	if got := string(ReconcileImpactPaging("ws", q, whole)); got != string(whole) {
+		t.Errorf("an untrimmed result is returned unchanged: %s", got)
 	}
-	// A trimmed page that delivered every item has nothing more, so has_more is left as
-	// it was rather than invented.
-	complete := []byte(`{"symbol":"Serve","has_more":false,"next_cursor":"i2.2.abcdef0123456789",` +
-		`"by_depth":[{"depth":1,"total":1,"offset":0,"items":[{"name":"i0"}]}],` +
-		`"output_budget":{"max_chars":2000,"used_chars":1990,"degraded_stage":"tiers_trimmed","stages":["tiers_trimmed"]}}`)
-	res = decodeMembers(t, ReconcileImpactPaging(complete))
-	if got := string(res["has_more"]); got != "false" {
-		t.Errorf("a page that delivered its whole tier reports has_more = %s, want false", got)
+}
+
+// stripMember removes one member from a JSON object, so a fixture can stand for a budget
+// rung that dropped the tier list.
+func stripMember(t *testing.T, out []byte, name string) []byte {
+	t.Helper()
+	res := decodeMembers(t, out)
+	delete(res, name)
+	stripped, err := json.Marshal(res)
+	if err != nil {
+		t.Fatal(err)
 	}
+	return stripped
 }
 
 // decodeMembers unmarshals a JSON object into its members, failing the test on a shape
@@ -409,7 +422,9 @@ func decodeMembers(t *testing.T, out []byte) map[string]json.RawMessage {
 }
 
 // An absent cursor is the first page; one that is present but empty is refused, so a
-// malformed cursor never silently answers with the wrong page.
+// malformed cursor never silently answers with the wrong page. The same holds for
+// offset= alongside a cursor: an empty offset names no position, and letting the cursor
+// supply one would answer a request the caller wrote twice.
 func TestAnEmptyCursorIsRefusedAndAnAbsentOneIsNot(t *testing.T) {
 	if err := ResolveImpactCursor("ws", url.Values{"symbol": {"Serve"}}, map[string]string{}); err != nil {
 		t.Fatalf("an absent cursor is the first page: %v", err)
@@ -417,6 +432,17 @@ func TestAnEmptyCursorIsRefusedAndAnAbsentOneIsNot(t *testing.T) {
 	given := url.Values{"symbol": {"Serve"}, "cursor": {""}}
 	if err := ResolveImpactCursor("ws", given, map[string]string{"cursor": ""}); !IsInvalidInput(err) {
 		t.Error("an explicitly empty cursor: want invalid input")
+	}
+	q := url.Values{"symbol": {"Serve"}}
+	c := ImpactCursor("ws", q)(4)
+	bothEmpty := url.Values{"symbol": {"Serve"}, "cursor": {c}, "offset": {""}}
+	if err := ResolveImpactCursor("ws", bothEmpty, map[string]string{"cursor": c, "offset": ""}); !IsInvalidInput(err) {
+		t.Error("a cursor with an explicitly empty offset: want invalid input")
+	}
+	// offset= on its own is still the caller's page position.
+	offsetOnly := url.Values{"symbol": {"Serve"}, "offset": {"3"}}
+	if err := ResolveImpactCursor("ws", offsetOnly, map[string]string{"offset": "3"}); err != nil {
+		t.Errorf("offset alone names the page: %v", err)
 	}
 }
 

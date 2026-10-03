@@ -413,6 +413,7 @@ func impactRanking(workspaceID string, q url.Values) []byte {
 		workspaceID, q.Get("symbol"), q.Get("path"), q.Get("from"), q.Get("to"), q.Get("scope"),
 		q.Get("base"), q.Get("head"), q.Get("worktree"), q.Get("direction"), q.Get("depth"),
 		q.Get("relation_types"), q.Get("min_confidence"), q.Get("include_tests"), q.Get("limit"),
+		q.Get("timeout_ms"), q.Get("summary_only"),
 	})
 	return b
 }

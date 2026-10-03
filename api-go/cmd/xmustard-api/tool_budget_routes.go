@@ -83,11 +83,11 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 			return
 		}
 		// impact's cursor continues at the core's next_offset, which describes the
-		// core's page; when the budget cut that page the cursor would skip the items
-		// it removed, so it is dropped and has_more plus the tier totals carry the
-		// caller on with offset= instead (WS-59e).
+		// core's page; when the budget cut that page the cursor is re-signed to
+		// continue at the first item the caller did not receive, so the caller pages
+		// without computing an offset (WS-59e).
 		if spec.Tool == "impact" {
-			out = workspaceops.ReconcileImpactPaging(out)
+			out = workspaceops.ReconcileImpactPaging(ws, q, out)
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})

@@ -234,13 +234,14 @@ func ImpactBudgetTrimmed(out []byte) bool {
 }
 
 // ReconcileImpactPaging fixes up a budgeted impact result whose tier page the budget
-// cut. A cursor signed from the core's next_offset describes the core's page, not the
-// delivered one, so it is removed: following it would skip the items the budget
-// removed. What stays is has_more, set true whenever a tier holds more than it returned,
-// so a page the budget trimmed on the way past its last item still tells the caller
-// there is more, and each tier's total, which is how offset= reaches the rest. A result
-// the budget did not cut is returned unchanged.
-func ReconcileImpactPaging(out []byte) []byte {
+// cut. The cursor the handler signed describes the core's page, not the delivered one,
+// so following it would skip the items the budget removed. It is re-signed here to
+// continue at the first item the caller did not receive, which is the core's offset plus
+// the items actually delivered: the caller then pages without computing an offset, which
+// is the hand-computed paging this row exists to remove. When nothing can be signed (a
+// rung removed the tiers outright), the cursor is dropped and has_more stands so the
+// caller knows to re-page. A result the budget did not cut is returned unchanged.
+func ReconcileImpactPaging(workspaceID string, q url.Values, out []byte) []byte {
 	var res map[string]json.RawMessage
 	if json.Unmarshal(out, &res) != nil || res == nil {
 		return out
@@ -248,8 +249,21 @@ func ReconcileImpactPaging(out []byte) []byte {
 	if !ImpactBudgetTrimmed(out) {
 		return out
 	}
-	delete(res, impactNextCursorMember)
-	if !tiersDeliveredAll(res["by_depth"], tiersOf(res["affected"])) {
+	next, ok := deliveredTierOffset(res)
+	switch {
+	case !ok:
+		// A rung removed the tiers outright (tiers_total), so there is nothing left to
+		// count and nothing to sign: has_more stands and the caller re-pages.
+		delete(res, impactNextCursorMember)
+		res[impactHasMoreMember] = json.RawMessage("true")
+	case next == 0:
+		res[impactHasMoreMember] = json.RawMessage("true")
+	default:
+		cursor, err := json.Marshal(ImpactCursor(workspaceID, q)(next))
+		if err != nil {
+			return out
+		}
+		res[impactNextCursorMember] = cursor
 		res[impactHasMoreMember] = json.RawMessage("true")
 	}
 	reconciled, err := json.Marshal(res)
@@ -259,28 +273,37 @@ func ReconcileImpactPaging(out []byte) []byte {
 	return reconciled
 }
 
-// tiersDeliveredAll reports whether every tier returned as many items as its total says
-// it holds. A budget-trimmed page delivers fewer, and a tier with no items (summary_only,
-// or a rung that dropped them) delivers none, so both are "more".
-func tiersDeliveredAll(candidates ...json.RawMessage) bool {
-	for _, tiers := range candidates {
-		if len(tiers) == 0 {
+// deliveredTierOffset returns the offset the next page continues from when a budget cut
+// this one: the page's own offset plus the fewest items any tier delivered, so no tier
+// is skipped (the shortest tier is the binding constraint). ok is false when no tier
+// list survived to read, which is the tiers_total case.
+func deliveredTierOffset(res map[string]json.RawMessage) (int, bool) {
+	next := 0
+	sawTiers := false
+	for _, body := range []json.RawMessage{res["by_depth"], tiersOf(res["affected"])} {
+		if len(body) == 0 {
 			continue
 		}
 		var page []struct {
-			Total int               `json:"total"`
-			Items []json.RawMessage `json:"items"`
+			Offset int               `json:"offset"`
+			Total  int               `json:"total"`
+			Items  []json.RawMessage `json:"items"`
 		}
-		if json.Unmarshal(tiers, &page) != nil {
-			continue
+		if json.Unmarshal(body, &page) != nil {
+			return 0, false
 		}
 		for _, tier := range page {
-			if len(tier.Items) < tier.Total {
-				return false
+			sawTiers = true
+			// A tier that delivered its total is finished and does not bind the cursor.
+			if len(tier.Items) >= tier.Total {
+				continue
+			}
+			if at := tier.Offset + len(tier.Items); next == 0 || at < next {
+				next = at
 			}
 		}
 	}
-	return true
+	return next, sawTiers
 }
 
 // indexedRead brings the workspace's code index to its observed identity, runs one
