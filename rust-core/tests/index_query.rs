@@ -72,11 +72,39 @@ fn commit(root: &Path, msg: &str) {
     git(root, &["commit", "-qm", msg]);
 }
 
-/// Owner-only on a temporary directory, so a fixture that hands one to the index
-/// does not depend on the process umask for the index directory guard (WS-FIX-11).
-fn tighten(dir: &Path) {
+/// A temporary directory to hand the index as an operator-named `--index-dir`, created
+/// `0700` at creation time so the result does not depend on the umask of whoever runs the
+/// suite (WS-FIX-27). `TempDir::new` creates through `fs::create_dir`, which takes the umask's
+/// bits: under a `0002` login umask the directory lands at `0775` and WS-FIX-11's refusal
+/// answers a fixture that changed nothing. A creation-time mode is narrowed by the umask and
+/// never widened, so `0700` holds under any umask, and unlike a `chmod` after the fact it
+/// leaves no window in which the directory is wider than the guard will accept.
+fn index_dir() -> TempDir {
+    let mut b = tempfile::Builder::new();
+    b.permissions(perm(0o700)).tempdir().unwrap()
+}
+
+fn perm(mode: u32) -> fs::Permissions {
     use std::os::unix::fs::PermissionsExt;
-    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::Permissions::from_mode(mode)
+}
+
+/// The mode `index_dir` creates at, read back off a real directory it made. The
+/// expected value is the literal `0o700`, never the result of calling `index_dir`.
+#[test]
+fn an_index_fixture_dir_is_owner_only_whatever_the_process_umask() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = index_dir();
+    assert_eq!(
+        fs::symlink_metadata(dir.path())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700,
+        "an index fixture directory is not 0700, so WS-FIX-11's refusal depends on the umask \
+         of whoever logged in"
+    );
 }
 
 /// Several languages, imports, calls, inheritance, a test file and an isolated file.
@@ -243,8 +271,7 @@ fn key(seg: &Segment, a: u32, b: u32, e: &Edge) -> EdgeKey {
 #[test]
 fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
     let r = fixture();
-    let dir = TempDir::new().unwrap();
-    tighten(dir.path());
+    let dir = index_dir();
     let db = build(r.path(), dir.path());
     // add typed symbol-level edges (what the resolver will write) next to the lexical
     // ones, so both node kinds are exercised
@@ -513,8 +540,7 @@ fn assert_legacy_equal(root: &Path, db: &Path, max_names: usize) -> usize {
 #[test]
 fn bfs_trace_and_blast_radius_equal_the_legacy_graph_on_the_same_edges() {
     let r = fixture();
-    let dir = TempDir::new().unwrap();
-    tighten(dir.path());
+    let dir = index_dir();
     let db = build(r.path(), dir.path());
     let checked = assert_legacy_equal(r.path(), &db, 1000);
     assert!(checked > 10);
@@ -553,7 +579,7 @@ fn legacy_equality_holds_on_parity_fixtures() {
             eprintln!("{} missing; skipped", root.display());
             continue;
         }
-        let dir = TempDir::new().unwrap();
+        let dir = index_dir();
         let db = build(&root, dir.path());
         let n = assert_legacy_equal(&root, &db, 400);
         eprintln!("{name}: legacy-equal on {n} sampled symbols");
@@ -1372,12 +1398,7 @@ fn measure(storage: &str, load: Load) -> Measured {
     let r = repo(&[("README.md", "synthetic\n")]);
     let root = r.path().to_str().unwrap().to_string();
     let head = git(r.path(), &["rev-parse", "HEAD"]);
-    let dir = TempDir::new().unwrap();
-    // WS-FIX-11 refuses a group- or world-writable index directory, and a
-    // TempDir inherits the process umask, so under a 002 umask this fixture's
-    // directory lands at 0o775 and `ensure_graph_segment` refuses it. Tighten it
-    // rather than depend on the umask the box happens to run with.
-    tighten(dir.path());
+    let dir = index_dir();
     let db = dir.path().join(index::DB_FILE);
     synthetic_store(&db, &head, 1);
     // the index worker writes the segment; the service only reads it
