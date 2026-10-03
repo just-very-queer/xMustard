@@ -511,24 +511,43 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 
 // Budgeting does not copy the result: Apply allocates its element tables and the
 // output, and WorkingSet (what the API admits) covers that plus the result itself.
+//
+// The figure is the marginal cost of one Apply call, measured over several
+// identical calls. runtime.MemStats.TotalAlloc is a process-wide counter, so a
+// single-call window also counts whatever the runtime and the test process
+// allocate inside it; on a loaded box that noise reached 40 KiB against a
+// 402,909-byte line and turned this into a flake. Averaging the same call over
+// allocProbeRuns divides that noise by the number of calls and leaves the signal
+// (the element tables, about 23% of the result) unchanged, so the line below
+// still bounds one call and is read off a stable measurement.
+const allocProbeRuns = 16
+
 func TestApplyDoesNotCopyTheResult(t *testing.T) {
 	raw := mustJSON(groundResult(2000, 20000, 50, 5)) // about 2 MB, most of it list elements
 	req := Request{MaxChars: DefaultMaxChars}
-	var before, after runtime.MemStats
-	runtime.GC()
-	runtime.ReadMemStats(&before)
+	// One untimed call first, so the runs below measure steady-state allocation and
+	// not the heap's first growth into this working set.
 	if _, err := Apply(raw, req); err != nil {
 		t.Fatal(err)
 	}
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	for i := 0; i < allocProbeRuns; i++ {
+		if _, err := Apply(raw, req); err != nil {
+			t.Fatal(err)
+		}
+	}
 	runtime.ReadMemStats(&after)
-	alloc := int64(after.TotalAlloc - before.TotalAlloc)
-	if alloc > int64(len(raw))/4 {
-		t.Fatalf("Apply allocated %d bytes for a %d-byte result; it must not copy the result", alloc, len(raw))
+	perCall := int64(after.TotalAlloc-before.TotalAlloc) / allocProbeRuns
+	if perCall > int64(len(raw))/4 {
+		t.Fatalf("Apply allocated %d bytes per call for a %d-byte result; it must not copy the result", perCall, len(raw))
 	}
-	if ws := WorkingSet(raw, req); ws < int64(len(raw))+alloc {
-		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(raw), alloc)
+	if ws := WorkingSet(raw, req); ws < int64(len(raw))+perCall {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(raw), perCall)
 	}
-	t.Logf("result %d bytes: Apply allocated %d bytes; WorkingSet %d", len(raw), alloc, WorkingSet(raw, req))
+	t.Logf("result %d bytes: Apply allocated %d bytes per call over %d calls; WorkingSet %d",
+		len(raw), perCall, allocProbeRuns, WorkingSet(raw, req))
 }
 
 // Result bytes are copied through exactly, whitespace and escapes included.
