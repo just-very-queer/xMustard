@@ -2651,6 +2651,34 @@ A code anchor stores its place as a string: `govstore.AnchorCode` values are `"p
 
 *Follow-ups.* (a) §4.6's triage closure needs a docs/behavior-free exemption clause, and the triage-check prompt needs the matching question; both are owner edits and this is the thirteenth row to raise it. (b) `explain` returned "Workspace or path not found" for every path tried against the owner's `:8077` index, so it contributed nothing; `impact`'s `defined_in` for `Instructions` named the wrong file. Both in `reviews/ws-38a/r1/dogfood.md`, proposed owner: whoever maintains the MCP server. (c) `refresh::the_directory_watch_count_follows_the_tree` is load-sensitive on Linux and is now on four lane ledgers (this one plus WS-HYG-01, WS-FIX-11 and WS-FIX-17); it is a candidate for WS-FLK-01, proposed owner: WS-FLK-01's owner.
 
+### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
+
+**Goal.** The areas half of the WS-38 row above, closing PAR-SYM-08. Communities over the **resolved symbol** projection (CALLS, EXTENDS, IMPLEMENTS), not the file projection WS-38a measured:
+
+- Deterministic across runs from a seed, and reproducible across a rebuild (same seed, same index, same result).
+- Large-graph mode above 10k symbols: resolution 2.0, at most 3 iterations, dropping low-confidence edges and nodes of degree below 2.
+- Labels from the members' folders with generic folders skipped, then a name prefix, then `Cluster_N`.
+- Cohesion sampled over at most 50 members, plus keywords.
+
+**Requirements.** PAR-SYM-08 (closed by this row). PAR-SYM-09, PAR-SYM-10, PAR-RET-06, PAR-HAR-11, PAR-GOV-20 are carried from the parent row and belong to 38c..38f; this row closes none of them and changes no requirement text.
+
+**Files.** `rust-core/src/index/areas.rs`, `rust-core/src/index/mod.rs` (module declaration, `index areas` dispatch, usage text), `rust-core/src/bin/xmustard-core.rs` (the dispatch entry §4 step 5 requires), `rust-core/tests/areas_flows.rs`, plan record.
+
+**New modules.** `rust-core/src/index/areas.rs`.
+
+**Tests required.** (`rust-core/tests/areas_flows.rs`, exercised through the real `xmustard-core` binary against disposable Git repositories, as `tests/impact_v2.rs` does)
+
+- The same seed over the same index gives byte-identical output across runs, and the same seed after a full rebuild gives the same output.
+- A different seed is a different result, so the seed is load-bearing rather than decorative.
+- Large-graph mode triggers above 10k symbols, and says so in its output, with resolution 2.0, at most 3 iterations and degree-below-2 nodes dropped.
+- Labels come from a member folder when it is not generic, from a name prefix when no folder qualifies, and from `Cluster_N` when neither does.
+- Cohesion is sampled over at most 50 members and is bounded 0..=1; keywords are a bounded list.
+- A community never merges symbols across the CALLS/EXTENDS/IMPLEMENTS projection into a file-level answer: two files that never reference each other land in different areas.
+
+**Acceptance.** `xmustard-core index areas <root> <workspace_id> [--seed=N]` emits the areas with their labels, sizes, cohesion, keywords and mode, deterministically; 38c..38f build on it. This row adds no MCP tool, no MCP argument, no `tools/list` byte and no `instructions` text.
+
+**Collision risk.** `rust-core/src/index/mod.rs` (WS-07 index, WS-36 search) and `rust-core/src/bin/xmustard-core.rs` (every subcommand). Lane C owns rust-core lanes; this row touches two core files and no Go file.
+
 ### WS-39 — Resolvers for Rust, Python and Java
 
 **Goal.** Extend scope/import resolution to Rust (use paths, impl blocks, traits), Python (namespace imports, MRO c3) and Java (packages, inheritance, interfaces), with the same confidence tiers, provenance and drop counters.
