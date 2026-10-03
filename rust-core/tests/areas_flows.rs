@@ -91,6 +91,7 @@ fn areas(root: &Path, flags: &[&str]) -> Value {
 }
 
 /// One area row, with the fields this row's contract names.
+#[derive(Debug)]
 struct Area {
     id: u64,
     label: String,
@@ -376,6 +377,68 @@ fn large_graph_mode_prunes_a_path_to_nothing() {
     );
 }
 
+/// The precondition of the confidence floor, and the closest any fixture gets to it.
+///
+/// A below-floor edge is a global-tier one (confidence 0.5, quantized to 127, one step
+/// below `LARGE_MIN_CONFIDENCE`), and Go cannot produce one: its resolver rules set
+/// `global: false`, so a call to a name in another package with no import is dropped as
+/// external. That is why every Go fixture in this file reports
+/// `dropped_low_confidence_edges: 0` — the floor is never reached from Go.
+///
+/// TypeScript does produce the edge. This asserts that it forms at all, so the floor's
+/// input is pinned and a future change to the global tier or to the tier table is caught
+/// here rather than silently making `LARGE_MIN_CONFIDENCE` dead code. It does **not**
+/// assert a drop count: the counter is non-zero only above the 10k large-graph threshold,
+/// and at that scale the projection no longer admits the two-file TypeScript bridge into
+/// the same admitted node set as 16,800 Go symbols (measured: 16,802 symbols,
+/// `singletons: 2`, `dropped_low_confidence_edges: 0`). That gap is FU's, not this row's.
+#[test]
+fn a_global_tier_edge_is_the_only_shape_that_reaches_the_confidence_floor() {
+    let d = repo(&[
+        (
+            "bridge/reach.ts",
+            "export function reach(): number { return zonlyhere(); }\n",
+        ),
+        (
+            "bridge/zonlyhere.ts",
+            "export function zonlyhere(): number { return 0; }\n",
+        ),
+    ]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=3"]);
+    assert_eq!(v["mode"], "standard", "a small graph is not large mode: {v:#}");
+    // The unique-name call resolves across files with no import and no qualifier, so the
+    // two symbols land in one community — the edge exists, and it is the below-floor one.
+    let m = membership(&v);
+    assert_eq!(
+        m.get("reach"),
+        m.get("zonlyhere"),
+        "the global-tier edge did not form, so the confidence floor has no input to drop: {v:#}"
+    );
+    // Go reaches the same shape only through scope, so it never produces a low-confidence
+    // edge; the count is zero in every Go fixture in this file for that reason.
+    let g = repo(&[
+        (
+            "billing/invoice.go",
+            "package billing\n\nfunc Alpha() int { return Zeta() }\n",
+        ),
+        ("other/zeta.go", "package other\n\nfunc Zeta() int { return 0 }\n"),
+    ]);
+    build(g.path());
+    let gv = areas(g.path(), &["--seed=3"]);
+    let gm = membership(&gv);
+    assert!(
+        !gm.contains_key("Alpha") || !gm.contains_key("Zeta") || gm.get("Alpha") != gm.get("Zeta"),
+        "a Go call across packages with no import resolved anyway, which contradicts the \
+         resolver's `global: false` rule: {gv:#}"
+    );
+    assert_eq!(
+        gv["dropped_low_confidence_edges"].as_u64().unwrap(),
+        0,
+        "Go produced a below-floor edge, which the global tier says it cannot: {gv:#}"
+    );
+}
+
 #[test]
 fn a_label_is_a_member_folder_when_it_is_not_generic() {
     let d = two_subsystems();
@@ -407,6 +470,70 @@ fn a_label_falls_back_to_a_name_prefix_and_then_to_cluster_n() {
     assert!(
         v["label_rules"].is_array(),
         "the label rules are not reported: {v:#}"
+    );
+}
+
+/// The tail of the label chain, asserted rather than described. A subsystem whose members
+/// share no folder and no leading name word must land on the cluster rule, and the answer
+/// has to say so per area: `label` is `Cluster_<rank>` and `label_rule` is the rule name,
+/// so a reader can tell a real name from a positional placeholder.
+#[test]
+fn the_fallback_rule_names_a_cluster_and_says_it_fired() {
+    // Five symbols in one generic folder, chained by calls, with five distinct leading
+    // name words. The folder rule skips `src` as generic and the name-prefix rule finds no
+    // word that two members share, so the chain has to reach the fallback.
+    let d = repo(&[
+        (
+            "src/alpha.go",
+            "package src\n\nfunc Alpha() int { return Beta() }\n",
+        ),
+        (
+            "src/beta.go",
+            "package src\n\nfunc Beta() int { return Gamma() }\n",
+        ),
+        (
+            "src/gamma.go",
+            "package src\n\nfunc Gamma() int { return Delta() }\n",
+        ),
+        (
+            "src/delta.go",
+            "package src\n\nfunc Delta() int { return Epsilon() }\n",
+        ),
+        (
+            "src/epsilon.go",
+            "package src\n\nfunc Epsilon() int { return 0 }\n",
+        ),
+    ]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=7"]);
+    let areas = read_areas(&v);
+    let labelled: Vec<&Area> = areas.iter().filter(|a| a.size > 1).collect();
+    assert!(
+        !labelled.is_empty(),
+        "the fixture must produce a multi-member area: {v:#}"
+    );
+    for (rank, a) in areas.iter().enumerate() {
+        if a.rule == "fallback" {
+            // The label is the rank, so two runs that ranked the same way agree and a
+            // renamed placeholder (mutation M10) cannot pass.
+            assert_eq!(
+                a.label,
+                format!("Cluster_{rank}"),
+                "a fallback label is not Cluster_<its rank in the answer>: {a:?}"
+            );
+        } else {
+            assert!(
+                !a.label.starts_with("Cluster_"),
+                "a named rule {:?} produced the placeholder label {:?}",
+                a.rule,
+                a.label
+            );
+        }
+    }
+    // at least one area really did take the fallback, so the loop above is not vacuous
+    assert!(
+        areas.iter().any(|a| a.rule == "fallback" && a.size > 1),
+        "no multi-member area reached the fallback rule, so this test proves nothing: {v:#}"
     );
 }
 
