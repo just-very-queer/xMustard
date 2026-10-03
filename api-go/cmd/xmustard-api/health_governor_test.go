@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -24,11 +25,20 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 	dir := t.TempDir()
 	t.Setenv("XMUSTARD_DATA_DIR", dir)
 	t.Setenv("XMUSTARD_AUTH_TOKENS", "")
-	var samples atomic.Int64
+	// samples counts every walk of the tree; served counts only the walks taken on
+	// a goroutine serving an HTTP request, so a handler's sample is attributed to
+	// the handler and never confused with a watchdog tick or an admission sample.
+	// Every sample is stamped an hour old so the health cache never answers: a
+	// handler that reads the governor always reaches the sampler, and so always
+	// shows up in served, even while the watchdog keeps a fresh sample around.
+	var samples, served atomic.Int64
 	prev := budget.Gov
 	budget.Gov = budget.NewProcessGovernor(budget.GovernorConfig{SoftCeilingBytes: 1 << 40, Sampler: func() (budget.TreeSample, error) {
 		samples.Add(1)
-		return budget.TreeSample{At: time.Now(), Supported: true, Processes: 1, RSSBytes: 1 << 20, SelfRSSBytes: 1 << 20}, nil
+		if onHTTPServeGoroutine() {
+			served.Add(1)
+		}
+		return budget.TreeSample{At: time.Now().Add(-time.Hour), Supported: true, Processes: 1, RSSBytes: 1 << 20, SelfRSSBytes: 1 << 20}, nil
 	}})
 	t.Cleanup(func() { budget.Gov = prev })
 	srv := httptest.NewServer(bodyLimitMiddleware(authMiddleware(dir, "auto", newAPIHandler())))
@@ -136,7 +146,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 			if want[who] {
 				release = holdSlot(t)
 			}
-			before := samples.Load()
+			before := served.Load()
 			h := health(tok)
 			got := isFull(t, h)
 			release()
@@ -149,7 +159,7 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 				if !strings.Contains(detail, reason) {
 					t.Fatalf("%s token: the detail must say why (%q): %q", who, reason, detail)
 				}
-				if samples.Load() != before {
+				if served.Load() != before {
 					t.Fatalf("%s mode, %s token: a restricted poll sampled the process tree", mode, who)
 				}
 			}
@@ -165,31 +175,33 @@ func TestHealthFullViewIsForOperatorsOnly(t *testing.T) {
 		// taken *during* heavy work must still get the public view, with no
 		// activity in the budget block.
 		busy := holdSlot(t)
-		watchdogFloor := samples.Load()
-		restricted := 0
+		// Wait for one watchdog tick first, so the polls below run beside a live
+		// watchdog: that is the state a handler gated on HeavyBusy would sample in.
+		ticked := samples.Load()
+		if !waitFor(t, watchdogDeadline, func() bool { return samples.Load() > ticked }) {
+			busy()
+			t.Fatal("the heavy-slot watchdog never sampled, so the busy-slot polls prove nothing")
+		}
 		for who, tok := range tokens {
 			if want[who] {
 				continue
 			}
-			restricted++
+			before := served.Load()
 			under := health(tok)
 			if isFull(t, under) {
+				busy()
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work got the full view", mode, who)
 			}
 			if b, _ := dig(t, under, "budget").(map[string]any); len(b) != 4 {
+				busy()
 				t.Fatalf("%s mode, %s token: a restricted poll under heavy work leaked activity: %v", mode, who, b)
 			}
-		}
-		// The shape check above cannot see a handler that walks the tree and
-		// still returns the four keys, so bound the sampling too. The watchdog
-		// shares the counter, so the bound is the number of restricted polls: a
-		// restricted handler sampling on demand adds one sample per poll on top
-		// of the watchdog's own cadence, and one interval is waited first so the
-		// watchdog is definitely running and the floor is meaningful.
-		waitFor(t, watchdogDeadline, func() bool { return samples.Load() > watchdogFloor })
-		if over := samples.Load() - watchdogFloor; over > int64(restricted) {
-			busy()
-			t.Fatalf("a restricted poll under heavy work sampled the process tree: %d samples for %d polls", over, restricted)
+			// served moves only on a request goroutine, so the watchdog cannot
+			// pollute it and no headroom is needed: a restricted poll adds zero.
+			if n := served.Load() - before; n != 0 {
+				busy()
+				t.Fatalf("%s mode, %s token: a restricted poll under heavy work sampled the process tree %d times", mode, who, n)
+			}
 		}
 		busy()
 	}
@@ -332,5 +344,21 @@ esac
 	raw, _ := os.ReadFile(ran)
 	if strings.Count(string(raw), "changetrack index") != 1 {
 		t.Fatalf("a refused rebaseline must not start the core: %q", raw)
+	}
+}
+
+// onHTTPServeGoroutine reports whether the caller runs on a goroutine net/http
+// started to serve a request. The watchdog and the test's own goroutine never do.
+func onHTTPServeGoroutine() bool {
+	pcs := make([]uintptr, 128)
+	frames := runtime.CallersFrames(pcs[:runtime.Callers(2, pcs)])
+	for {
+		f, more := frames.Next()
+		if f.Function == "net/http.(*conn).serve" {
+			return true
+		}
+		if !more {
+			return false
+		}
 	}
 }
