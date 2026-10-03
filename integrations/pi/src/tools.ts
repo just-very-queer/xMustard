@@ -108,10 +108,12 @@ const searchQueryArgs: readonly string[] = [
 // explainQueryArgs is explainQueryArgs in tool_explain.go.
 const explainQueryArgs: readonly string[] = ["path", "symbol", "uid", "depth", "chain_depth", "include_content"];
 // impactQuery is impactQuery in tool_impact.go: every impact argument in the order the
-// API receives it.
+// API receives it. cursor= (WS-59e) is in the table so every declared argument is
+// forwarded by it; the budget layer does not page impact's tiers.
 const impactQuery: readonly string[] = [
 	"path", "symbol", "from", "to", "direction", "scope", "base", "head", "worktree",
 	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms",
+	"cursor",
 ];
 
 // How one member of a JSON request body travels: as the string the argument carries, as a
@@ -508,9 +510,6 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			path: query(
 				ws(a, "/changes/since-index"),
 				...impactQuery.flatMap((k) => [k === "max_depth" ? "depth" : k, str(a, k)]),
-				// WS-59e: the tier cursor travels beside the budget arguments, as Go's
-				// Build sends it (budgetQuery omits it for a non-Paged budget tool).
-				"cursor", str(a, "cursor"),
 				"max_chars", budgetMaxChars(a, IMPACT_DEFAULT_MAX_CHARS),
 			),
 		}),

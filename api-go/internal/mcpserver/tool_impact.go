@@ -69,16 +69,18 @@ var impactTool = &Tool{
 		}
 		// The output budget follows the tool's own arguments (WS-36). impact is not a
 		// Paged budget tool (WS-35 pages its tiers itself), so budgetQuery sends
-		// max_chars alone and the tier cursor travels with it (WS-59e).
-		kv = append(kv, "cursor", a["cursor"])
+		// max_chars alone and cursor= travels with impactQuery above (WS-59e).
 		return "GET", query(wsPath(a, "/changes/since-index"), append(kv, budgetQuery("impact", a)...)...), ""
 	},
 }
 
 // impactQuery is every impact argument in the order the API receives it: the forms'
-// own arguments, then the walk's, then paging.
+// own arguments, then the walk's, then paging. cursor= is here (WS-59e) so every
+// declared argument is forwarded by the one table; budgetQuery omits it because the
+// budget layer does not page impact's tiers.
 var impactQuery = []string{"path", "symbol", "from", "to", "direction", "scope", "base", "head", "worktree",
-	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms"}
+	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms",
+	"cursor"}
 
 // impactDoc is the docs resource's paragraph on impact v2.
 const impactDoc = `symbol= accepts a name, Container.name, a UID or a file path; a class or interface is also seeded with its constructors and its file (upstream) or its members (downstream). Results group by depth: 1 WILL BREAK, 2 LIKELY AFFECTED, 3+ MAY NEED TESTING, each paged by limit and offset. risk (upstream only) is CRITICAL when direct dependents >= 30, modules >= 5 or impacted >= 200; HIGH at 15, 3, 100; MEDIUM at 5 direct or 30 impacted; LOW otherwise; UNKNOWN when no dependent is found. epistemic.completeness is exact only when no resolver drop, lexical edge, coverage loss or cap could hide a dependent; otherwise lower_bound with causes and boundaries. Arguments of another form (for example direction with from=&to=, or two of symbol=, path= and from=&to=) are refused.

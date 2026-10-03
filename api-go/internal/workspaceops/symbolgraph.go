@@ -139,11 +139,11 @@ const (
 // WithImpactPaging adds the paging members to an impact result whose tiers were cut:
 // has_more, and a next_cursor signed for the ranking that asked for the page. The core
 // already emits each tier's next_offset, so this reads the page rather than
-// recomputing it. A diff-scope result holds its walk under affected and its own
-// changed-symbol list, and only the walk pages, so the members go at the top level
-// beside by_depth either way: one result, one page, one cursor. A result with no cut
-// tier, or one that is not a JSON object, is returned unchanged: the members are never
-// invented for a form that has no list to page.
+// recomputing it. A diff-scope result holds its walk under affected and only that walk
+// pages, so the members go at the top level beside by_depth either way: one result,
+// one page, one cursor. A result with no cut tier, or one that is not a JSON object, is
+// returned unchanged: the members are never invented for a form that has no list to
+// page.
 func WithImpactPaging(workspaceID string, q url.Values, raw json.RawMessage) json.RawMessage {
 	var res map[string]json.RawMessage
 	if json.Unmarshal(raw, &res) != nil || res == nil {
