@@ -402,9 +402,9 @@ func TestCollectionMemberSequenceIsNotReusedAfterRemoval(t *testing.T) {
 	}
 }
 
-// A removal naming a purged entry is refused and writes nothing. The store enforces
-// this in SQL (events_purged_no_text), so what the test pins is the outcome, not the
-// mechanism: the transaction fails, the membership row survives and no event appears.
+// A removal naming a purged entry is refused. The purge itself cleared the membership
+// row, so nothing is left behind: purge ends an entry's history, and a collection that
+// still named it would be keeping exactly what purge exists to remove.
 func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
 	ctx := context.Background()
 	s := openTestStore(t, newClock())
@@ -420,28 +420,30 @@ func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
 		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin)
 		return err
 	})
+	if n := countRows(t, s, "SELECT count(*) FROM collection_members WHERE entry_id = 'm1'"); n != 1 {
+		t.Fatalf("membership rows before purge = %d, want 1", n)
+	}
 	if err := s.Update(ctx, func(tx Tx) error {
 		return tx.Purge(ctx, "m1", "retracted", admin)
 	}); err != nil {
 		t.Fatalf("purge: %v", err)
 	}
+	// Purge cleared the row: there is no membership left to remove, so there is no
+	// metadata a later call could not clear.
+	if n := countRows(t, s, "SELECT count(*) FROM collection_members WHERE entry_id = 'm1'"); n != 0 {
+		t.Fatalf("membership rows after purge = %d, want 0", n)
+	}
 	before, err := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", Types: []string{EventCollectionMember}})
 	if err != nil {
 		t.Fatalf("events before: %v", err)
 	}
-	// The write is refused. The membership row it would have deleted is still there,
-	// because the failing transaction commits nothing: this is the part a caller
-	// depends on, and the part a guard in Go would not give if the refusal came from
-	// somewhere further down.
+	// And removing it is refused rather than silently accepted.
 	err = s.Update(ctx, func(tx Tx) error {
 		_, err := tx.RemoveFromCollection(ctx, col.ID, "m1", Actor{Principal: "admin", Note: "free text"})
 		return err
 	})
-	if err == nil {
-		t.Fatal("removing a purged member was allowed")
-	}
-	if n := countRows(t, s, "SELECT count(*) FROM collection_members WHERE entry_id = 'm1'"); n != 1 {
-		t.Fatalf("the refused removal still deleted the membership row: %d rows left, want 1", n)
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("removing a purged member: %v", err)
 	}
 	after, err := s.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", Types: []string{EventCollectionMember}})
 	if err != nil {
@@ -450,12 +452,87 @@ func TestCollectionMembershipRefusesToRemoveFromAPurgedEntry(t *testing.T) {
 	if len(after) != len(before) {
 		t.Fatalf("a refused removal still wrote an event: %d before, %d after", len(before), len(after))
 	}
-	// The membership row of a purged entry must still have a way out, or it is
-	// metadata nothing can ever remove. It cannot be removed through this API, by the
-	// refusal above, so the store's own cleanup has to be the answer; this asserts the
-	// row is reachable there and not that some other writer exists.
-	if n := countRows(t, s, "SELECT count(*) FROM collection_members WHERE entry_id = 'm1'"); n != 1 {
-		t.Fatalf("membership rows for the purged entry = %d, want 1 pending cleanup", n)
+}
+
+// Revoking the grant that made a foreign membership legal hides it from the read, not
+// only from future writes: a row nobody may reach must not still be served.
+func TestRevokedGrantHidesACrossWorkspaceMembership(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "t", "c")
+	admin := Actor{Principal: "admin"}
+	var col Collection
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "theirs", OwnerWorkspace: "ws2"}, admin)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		if _, err := tx.Grant(ctx, GrantInput{SourceWorkspace: "ws1", TargetWorkspace: "ws2",
+			CollectionID: col.ID, Permission: PermissionReadWrite}, admin); err != nil {
+			return err
+		}
+		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin)
+		return err
+	})
+	shared, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID})
+	if err != nil {
+		t.Fatalf("shared members: %v", err)
+	}
+	if len(shared) != 1 {
+		t.Fatalf("shared members = %+v, want 1", shared)
+	}
+	mustUpdate(t, s, func(tx Tx) error {
+		grants, err := tx.ListGrants(ctx, GrantFilter{CollectionID: col.ID})
+		if err != nil {
+			return err
+		}
+		_, err = tx.Revoke(ctx, grants[0].ID, admin)
+		return err
+	})
+	hidden, err := s.ListCollectionMembers(ctx, CollectionMemberFilter{CollectionID: col.ID})
+	if err != nil {
+		t.Fatalf("members after revoke: %v", err)
+	}
+	if len(hidden) != 0 {
+		t.Fatalf("a revoked grant still serves its membership: %+v", hidden)
+	}
+	held, err := s.ListEntryCollections(ctx, "m1", CollectionFilter{})
+	if err != nil {
+		t.Fatalf("entry collections after revoke: %v", err)
+	}
+	if len(held) != 0 {
+		t.Fatalf("a revoked grant still holds the entry: %+v", held)
+	}
+}
+
+// A grant from the entry's workspace to some other target does not make this collection
+// reachable: the grant has to name the collection and be addressed to its owner.
+func TestGrantToAnUnrelatedTargetDoesNotReachACollection(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "m1", "t", "c")
+	admin := Actor{Principal: "admin"}
+	var col Collection
+	mustUpdate(t, s, func(tx Tx) error {
+		var err error
+		col, err = tx.CreateCollection(ctx, CollectionInput{Name: "theirs", OwnerWorkspace: "ws2"}, admin)
+		return err
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		// A grant from ws1 to ws3 that names no collection says nothing about ws2's.
+		_, err := tx.Grant(ctx, GrantInput{SourceWorkspace: "ws1", TargetWorkspace: "ws3",
+			Permission: PermissionReadWrite}, admin)
+		return err
+	})
+	if err := s.Update(ctx, func(tx Tx) error {
+		_, err := tx.AddToCollection(ctx, col.ID, "m1", admin)
+		return err
+	}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("a grant naming another target reached this collection: %v", err)
+	}
+	if n := countRows(t, s, "SELECT count(*) FROM collection_members"); n != 0 {
+		t.Fatalf("the refused membership stored %d rows", n)
 	}
 }
 

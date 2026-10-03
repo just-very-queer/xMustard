@@ -980,6 +980,11 @@ func (t *txn) Purge(ctx context.Context, id, reason string, actor Actor) error {
 		{`DELETE FROM anchors WHERE entry_id = ?`, []any{id}},
 		{`DELETE FROM claims WHERE entry_id = ?`, []any{id}},
 		{`DELETE FROM dedupe_keys WHERE entry_pk = ?`, []any{cur.Cursor}},
+		// Collection memberships name the entry, and the entry is about to stop existing
+		// as anything but a tombstone: leaving the rows would keep its id and the actor
+		// who added it, which is exactly what purge is for. RemoveFromCollection refuses
+		// a purged entry, so this is the only path that can clear them (WS-29a).
+		{`DELETE FROM collection_members WHERE entry_id = ?`, []any{id}},
 		{`UPDATE events SET note = NULL, data = NULL, redacted = 1 WHERE entry_id = ? AND redacted = 0`, []any{id}},
 	}
 	for _, s := range steps {

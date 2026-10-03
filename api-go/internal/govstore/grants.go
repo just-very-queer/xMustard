@@ -289,18 +289,14 @@ func (t *txn) AddToCollection(ctx context.Context, collectionID, entryID string,
 		return CollectionMemberResult{}, err
 	}
 	// A collection holds its owner's memories, and the memories of any workspace that
-	// has granted this collection away: sharing is the point of a collection, so the
-	// cross-workspace case is the normal one and not a leak. A workspace with no grant
-	// naming this collection cannot place a memory in it.
-	var reachable int
-	if err := t.queryRow(ctx, `SELECT count(*) FROM grants
-		WHERE collection_id = ? AND source_workspace = ? AND revoked_at IS NULL`,
-		collectionID, entry.WorkspaceID).Scan(&reachable); err != nil {
-		return CollectionMemberResult{}, err
-	}
-	if entry.WorkspaceID != col.OwnerWorkspace && reachable == 0 {
-		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, which has no grant naming collection %s",
-			ErrInvalid, entryID, entry.WorkspaceID, collectionID)
+	// has granted this collection to it: sharing is the point of a collection, so the
+	// cross-workspace case is the normal one and not a leak. The grant must name this
+	// collection and be addressed to this collection's owner (or to nobody in
+	// particular); a grant from the same workspace to some other target says nothing
+	// about this collection and must not satisfy the check.
+	if entry.WorkspaceID != col.OwnerWorkspace && !t.grantReachesCollection(ctx, collectionID, col.OwnerWorkspace, entry.WorkspaceID) {
+		return CollectionMemberResult{}, fmt.Errorf("%w: entry %s is in %s, which has no grant to %s naming collection %s",
+			ErrInvalid, entryID, entry.WorkspaceID, col.OwnerWorkspace, collectionID)
 	}
 	// rowsAffected counts an upsert's update as a write too, so whether the membership
 	// was already there is read rather than inferred from the write.
@@ -374,19 +370,41 @@ func (t *txn) RemoveFromCollection(ctx context.Context, collectionID, entryID st
 	return CollectionMemberResult{CollectionID: collectionID, EntryID: entryID, Removed: true}, nil
 }
 
+// grantReachesCollection reports whether sourceWorkspace has an active grant that names
+// collectionID and is addressed to the collection's owner workspace, or to nobody in
+// particular. Both the write and the read use it, so a membership cannot be created
+// through a grant that is revoked or aimed elsewhere and then still be readable.
+func (r *reader) grantReachesCollection(ctx context.Context, collectionID, ownerWorkspace, sourceWorkspace string) bool {
+	var n int
+	if err := r.queryRow(ctx, `SELECT count(*) FROM grants
+		WHERE collection_id = ? AND source_workspace = ? AND revoked_at IS NULL
+		AND (target_workspace = '' OR target_workspace = ?)`,
+		collectionID, sourceWorkspace, ownerWorkspace).Scan(&n); err != nil {
+		return false
+	}
+	return n > 0
+}
+
 // ListCollectionMembers returns a collection's members, oldest membership first. The
 // collection must exist, so a name that is not one is ErrNotFound rather than an empty
-// list. A purged member is not a member: purge leaves the entry row as a tombstone, and
-// AddToCollection refuses a purged entry, so listing it would contradict the writer.
+// list. A member is listed only while it is reachable: a purged entry is not a member
+// (purge leaves a tombstone and the writer refuses it), and a member from another
+// workspace is listed only while an active grant to this collection's owner still
+// names it, so revoking a grant hides the membership as well as closing future writes.
 // AfterSeq pages: the seq of the last member of the previous call.
 func (r *reader) ListCollectionMembers(ctx context.Context, f CollectionMemberFilter) ([]CollectionMember, error) {
-	if _, err := r.GetCollection(ctx, f.CollectionID); err != nil {
+	col, err := r.GetCollection(ctx, f.CollectionID)
+	if err != nil {
 		return nil, fmt.Errorf("collection %s: %w", f.CollectionID, err)
 	}
 	rows, err := r.query(ctx, `SELECT m.collection_id, m.entry_id, m.added_by, m.added_at, m.seq
 		FROM collection_members m JOIN entries e ON e.id = m.entry_id
 		WHERE m.collection_id = ? AND e.lifecycle <> ? AND m.seq > ?
-		ORDER BY m.seq LIMIT ?`, f.CollectionID, LifecyclePurged, f.AfterSeq, clampLimit(f.Limit))
+		AND (e.workspace_id = ? OR EXISTS (SELECT 1 FROM grants g
+			WHERE g.collection_id = m.collection_id AND g.source_workspace = e.workspace_id
+			AND g.revoked_at IS NULL AND (g.target_workspace = '' OR g.target_workspace = ?)))
+		ORDER BY m.seq LIMIT ?`,
+		f.CollectionID, LifecyclePurged, f.AfterSeq, col.OwnerWorkspace, col.OwnerWorkspace, clampLimit(f.Limit))
 	if err != nil {
 		return nil, err
 	}
@@ -403,11 +421,17 @@ func (r *reader) ListCollectionMembers(ctx context.Context, f CollectionMemberFi
 }
 
 // ListEntryCollections returns the ids of the collections holding a live entry, paging
-// with AfterID from the last collection of the previous call. Purged entries hold
-// nothing: see ListCollectionMembers.
+// with AfterID from the last collection of the previous call. A purged entry holds
+// nothing, and a collection whose grant has been revoked no longer holds it: see
+// ListCollectionMembers for both conditions, which this read repeats rather than
+// re-derives.
 func (r *reader) ListEntryCollections(ctx context.Context, entryID string, f CollectionFilter) ([]string, error) {
-	rows, err := r.query(ctx, `SELECT m.collection_id FROM collection_members m JOIN entries e ON e.id = m.entry_id
+	rows, err := r.query(ctx, `SELECT m.collection_id FROM collection_members m
+		JOIN entries e ON e.id = m.entry_id JOIN collections c ON c.id = m.collection_id
 		WHERE m.entry_id = ? AND e.lifecycle <> ? AND m.collection_id > ?
+		AND (e.workspace_id = c.owner_workspace OR EXISTS (SELECT 1 FROM grants g
+			WHERE g.collection_id = m.collection_id AND g.source_workspace = e.workspace_id
+			AND g.revoked_at IS NULL AND (g.target_workspace = '' OR g.target_workspace = c.owner_workspace)))
 		ORDER BY m.collection_id LIMIT ?`, entryID, LifecyclePurged, f.AfterID, clampLimit(f.Limit))
 	if err != nil {
 		return nil, err
