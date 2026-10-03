@@ -239,6 +239,24 @@ func cursorOf(reflectedThrough string) int64 {
 // read it back without knowing the source's name.
 func formatCursor(cursor int64) string { return strconv.FormatInt(cursor, 10) }
 
+// ListConsolidationJobs is a workspace's consolidation jobs, oldest first, for an operator
+// asking what the queue holds. It reads only; claiming and completing a job is the agent's,
+// through the store's own CAS lease.
+func ListConsolidationJobs(ctx context.Context, dataDir, workspaceID string, limit int) ([]govstore.Job, error) {
+	var out []govstore.Job
+	if err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
+		jobs, err := r.ListJobs(ctx, govstore.JobFilter{WorkspaceID: workspaceID, Limit: limit})
+		if err != nil {
+			return err
+		}
+		out = jobs
+		return nil
+	}); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // PrepareConsolidationJobs derives the candidates without queueing them, for a caller that
 // wants the work before it is queued. RunConsolidationPass is what the loop calls.
 func PrepareConsolidationJobs(ctx context.Context, dataDir, workspaceID string) ([]govstore.JobInput, error) {
