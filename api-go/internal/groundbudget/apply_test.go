@@ -523,15 +523,22 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 // asked to budget the same result twice, once with every list element narrow and once
 // with each element widened by allocPadBytes: the second result is about six times
 // the bytes but holds exactly the same 40,050 list elements, so the tables Apply
-// builds and the output it writes are the same size. Anything proportional to the
-// result's bytes — a copy — shows up as the difference; anything the runtime or the
-// test process allocates inside a window is common to both measurements and cancels.
+// builds and the output it writes are the same size. A copy is proportional to the
+// result's bytes, so it lands in the difference; the tables and the output are not, so
+// they do not.
+//
+// What the difference does not do is cancel the process. Both windows still read a
+// process-wide counter, and unrelated allocation inside either is not guaranteed to
+// appear in both. That is why the guard carries a measured allowance rather than
+// asserting a zero difference: 8,192 bytes, against a steady-state band of 7 to 2,169
+// bytes over 12 runs on a loaded box and about 8.8 MB for a copy. The gap between those
+// two figures is the signal; the allowance is the noise the measurement admits, and it
+// is three orders of magnitude smaller than the defect.
 //
 // That matters because runtime.MemStats.TotalAlloc is process-wide. Read across one
 // call on a loaded build box it ranged 381,792-398,888 bytes over 20 runs of one
 // unchanged tree, and reached 410,824-423,592 under WS-32a's load against a
-// 402,909-byte line: the flake this test is. Subtracting two windows of the same
-// shape removes that term instead of diluting it.
+// 402,909-byte line: the flake this test is.
 //
 // The copy guard's two windows are steady-state, and that is measured rather than
 // assumed: the very first Apply into a fresh heap also pays for the heap's growth into
@@ -586,22 +593,11 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 			len(wide), len(narrow))
 	}
 
-	// A copy is bytes; the element tables and the output are not. Everything the wide
-	// result adds is padding inside elements Apply never copies, so its allocation must
-	// stay within the same small allowance as the narrow one's. The allowance covers the
-	// measurement noise the two windows do not cancel, not the copy: a copy of either
-	// result is about 8.8 MB (the slop audit's S5 rows).
-	const copyAllowance = 8 << 10
-	copied := steadyOf(t, wide, req) - steadyOf(t, narrow, req)
-	if copied > copyAllowance {
-		t.Fatalf("Apply allocated %d more bytes for a %d-byte result than for a %d-byte one with the same %d list elements;"+
-			" it must not copy the result", copied, len(wide), len(narrow), 40050)
-	}
-
 	// The first call a caller makes is the one WorkingSet has to cover, so it is read
-	// cold and asserted on its own: the result plus that call's allocations must fit in
-	// what the API admits. Its line is the one Apply has always had to meet for a single
-	// call, len(raw)/4, unchanged by this row.
+	// before anything else has called Apply in this process, and asserted on its own:
+	// the result plus that call's allocations must fit in what the API admits. Its line
+	// is the one Apply has always had to meet for a single call, len(raw)/4, unchanged by
+	// this row. Read first or it would be a warmed call wearing a cold label.
 	coldAlloc := allocOf(t, narrow, req, false)
 	if coldAlloc > int64(len(narrow))/4 {
 		t.Fatalf("the first Apply call allocated %d bytes for a %d-byte result; it must not copy the result",
@@ -610,6 +606,18 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+coldAlloc {
 		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d)",
 			ws, len(narrow), coldAlloc)
+	}
+
+	// A copy is bytes; the element tables and the output are not. Everything the wide
+	// result adds is padding inside elements Apply never copies, so its allocation must
+	// stay within the same small allowance as the narrow one's. The allowance covers what
+	// the two windows do not have in common, not the copy: a copy of either result is
+	// about 8.8 MB (the slop audit's S5 rows).
+	const copyAllowance = 8 << 10
+	copied := steadyOf(t, wide, req) - steadyOf(t, narrow, req)
+	if copied > copyAllowance {
+		t.Fatalf("Apply allocated %d more bytes for a %d-byte result than for a %d-byte one with the same %d list elements;"+
+			" it must not copy the result", copied, len(wide), len(narrow), 40050)
 	}
 	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: %d bytes apart steady-state (allowance %d);"+
 		" first call %d bytes against its %d-byte line; WorkingSet %d",
