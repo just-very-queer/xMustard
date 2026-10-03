@@ -141,6 +141,60 @@ func TestPrepareConsolidationJobsChangesNoMemory(t *testing.T) {
 	}
 }
 
+// A retired entry is not a consolidation candidate. Two live memories on one anchor are a
+// cluster; a third that was superseded, merged or retracted is not, so preparing work
+// never re-asks a question the store already settled.
+func TestRetiredEntriesAreNotConsolidationCandidates(t *testing.T) {
+	ctx := context.Background()
+	dir := singleAgentDir(t)
+	ws := "wsJobs8"
+	a := proposeOn(t, dir, ws, "a", "live one", "one thing", "src/shared.go")
+	b := proposeOn(t, dir, ws, "b", "live two", "two things", "src/shared.go")
+	retired := proposeOn(t, dir, ws, "c", "retired three", "three things", "src/shared.go")
+	// Retire the third entry through the store's own lifecycle, so the fixture is not a
+	// hand-built row. Retraction is the transition an entry takes without a successor.
+	mustUpdateMemory(t, dir, ws, func(tx govstore.Tx) error {
+		_, err := tx.Transition(ctx, retired.ID, govstore.TransitionInput{To: govstore.LifecycleRetracted, Reason: "superseded by practice"}, govstore.Actor{Principal: "human-approver"})
+		return err
+	})
+	mustViewMemory(t, dir, ws, func(r govstore.Reader) error {
+		got, err := r.GetEntry(ctx, retired.ID)
+		if err != nil {
+			return err
+		}
+		if got.Lifecycle != govstore.LifecycleRetracted {
+			return errors.New("the fixture did not retire the entry, it is " + got.Lifecycle)
+		}
+		return nil
+	})
+
+	res, err := RunConsolidationPass(ctx, dir, ws, passInput{Source: "entries", Actor: govstore.Actor{Principal: "worker-1"}})
+	if err != nil {
+		t.Fatalf("pass: %v", err)
+	}
+	// The two live memories are one cluster of exactly two: the retired one is absent from
+	// every job's candidates, not merely last in the list.
+	live := map[string]bool{a.ID: true, b.ID: true}
+	clusters := 0
+	for _, j := range res.Jobs {
+		if j.Kind != govstore.JobDedupeCluster {
+			continue
+		}
+		clusters++
+		if len(j.CandidateIDs) != 2 {
+			t.Fatalf("cluster names %d candidates, want the 2 live ones: %v", len(j.CandidateIDs), j.CandidateIDs)
+		}
+		for _, id := range j.CandidateIDs {
+			if !live[id] {
+				t.Fatalf("cluster names retired entry %s: %v", id, j.CandidateIDs)
+			}
+		}
+	}
+	if clusters != 1 {
+		t.Fatalf("two live memories on one anchor prepared %d clusters, want 1", clusters)
+	}
+}
+
 // Every kind the loop emits is one govstore names, so a claim of any emitted kind works.
 func TestPreparedJobKindsAreKnownToTheStore(t *testing.T) {
 	ctx := context.Background()
