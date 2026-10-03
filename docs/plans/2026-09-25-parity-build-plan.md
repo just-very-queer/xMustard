@@ -2100,6 +2100,26 @@ principal but the author. The scope-leak metric over this sub-task's fixture sui
 **Collision risk.** `memory_propose.go` and `memory_recall.go` are shared with WS-28C
 (the outline cache), WS-32 and WS-FIX-13.
 
+**PARKED (2026-10-03).** Branch `parity/ws-29b`, head `97338ac`, three review rounds
+(run 4 of the cap for a code task), no merge. What works: the derivation and its refusals,
+the visibility rule on ranked recall, the by-id and listing read paths, ground's ranking
+filter, the standing-memory projection filter, and the keys on the HTTP transport, all
+green (`logs/ws-29b-run-20261003T092405Z.log`, BOXALL `remote_exit=0` clippy 6
+`rss_lines=ok` at `logs/ws-29b-check-20261003T093301Z.log`). What is open, from round 3
+(`reviews/ws-29b/r3`): **WS-29b-r3-1** `readAtRisk` lists every entry marked
+`needs_reverify` without the scope filter, so a private entry still reaches another
+principal's `at_risk_memories` with its id, title, paths and anchors; **WS-29b-r3-2** the
+HTTP `remember` decode populates `RememberRequest`'s own `run_id`/`session_id`, so
+`visibility=run` and `visibility=session` are refused over HTTP while the tests, which
+build the embedded fields directly, pass; **WS-29b-r3-3** a run or session key is
+caller-asserted, so a later run that supplies an earlier run's id reads that run's
+memory, which needs the key from verified execution context; **WS-29b-r3-4** the SQL
+predicate admits run, session and dir by key alone, without the author condition that
+recall applies on top. Next step: fix r3-1 and r3-4 first (both are filters, both are
+local), then r3-2 (a decode-path gap with a failing HTTP test to write), and treat r3-3
+as the owner question it is — a caller-asserted run key is provenance, not authority, and
+deciding which is which belongs to whoever owns run identity (WS-59's fold of run scope).
+
 ### WS-30 — Cross-workspace code query, residency LRU, worktree identity and path rewriting
 
 **Goal.** search, explain and impact accept workspaces or a group. The resident service holds at most K hot indexes (default 1) with LRU and idle eviction; cold repos are served by pread or loaded on demand in the heavy slot. Detect linked worktrees and record branch/worktree identity. Store anchors repo-relative, with a longest-prefix path rewrite map for foreign absolute paths.
