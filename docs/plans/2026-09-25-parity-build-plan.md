@@ -3653,7 +3653,24 @@ list is in the round-1 record under `reviews/ws-59e/`):
 - **Review.** r1-r3 under `reviews/ws-59e/`. r2 closed six (four fixed, `WS-59e-r2-5` rejected on an AGREE adjudication, `WS-59e-r2-6` fixed rather than deferred — §4.6 allows a deferral only for a minor). r3's three all fixed in `25e36ec` (M14/M15/M18/M19/M21b).
 - **Merge recheck.** Rule 4 fired on both grounds; `d80c836` left this row's 14 files untouched and the core's `end`/`next_offset` rule byte-identical, so `WS-59e-r2-5` still holds. See `reviews/ws-59e/r3/merge-recheck.md`.
 - **Checks.** `BOXALL` (an earlier run red for a group-writable temp index dir; §5.3 item 4 not crossed, the retry is the gate), `CAPS`, `PI`. Not run: `RET`, `BUD`, `SECDOC`, `GOLD`.
-- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`. Next row that mutates a budgeted result: call `spec.Settle`.### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
+- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`. Next row that mutates a budgeted result: call `spec.Settle`.
+
+**PARKED (2026-10-03).** Not merged. Four review rounds are spent (§4.6's cap for a code
+task) and round 4 leaves one open major, `WS-59e-r4-3`: when the `tiers_total` rung removes
+the tier list, the answer carries `has_more` with no `next_cursor`, so a client that
+follows it repeats the same page. `adjudication-WS-59e-r4-3.md` answers DISAGREE, so the
+rejection does not stand. Branch `parity/ws-59e` at `a7bb1d0`, twelve commits over
+`642106b`; `BOXALL` green (`remote_exit=0`, `clippy_warnings=6`, `rss_lines=ok`,
+`logs/ws-59e-check-20261003T074045Z.log`), `CAPS` and `PI` green, and `gate=PASS` on r4
+(`reviews/ws-59e/r4/`). What works: the cursor and its ranking binding, the trimmed-page
+re-signing, the tier decoder, and a budget report that describes the bytes shipped with it.
+Open: `WS-59e-r4-3` only. Next step: fix it before any round 5 — both fallbacks Codex names
+are worse than the present shape (the core's old `next_offset` skips undelivered items; the
+unchanged offset repeats the page), so the fix has to carry the tier's `offset` and `total`
+through the rung, or deliver enough tier data to advance without a gap. That is a
+budget-and-paging change and wants its own row rather than a fifth round of this one.
+
+### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
 
 Route/DI extractors (Django, FastAPI, Next.js, Nest, Spring, Laravel, tRPC, Expo) seeding flow entry points; Vue, Dart, Objective-C packs; reimplemented from design (GitNexus is PolyForm NC).
 
