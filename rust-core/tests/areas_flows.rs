@@ -238,6 +238,31 @@ fn without_freshness(v: &Value) -> Value {
     c
 }
 
+/// A shared word is only a prefix when it leads both names. `InvoiceStore` and
+/// `PaymentStore` share the word `store`, and a rule that matches anywhere in a name
+/// would label the area `store`; neither name leads with it, so the area falls through to
+/// the cluster rule.
+#[test]
+fn a_shared_suffix_is_not_a_name_prefix() {
+    let d = repo(&[(
+        "src/store.go",
+        "package src\n\nfunc InvoiceStore() int { return PaymentStore() }\n\nfunc PaymentStore() int { return 0 }\n",
+    )]);
+    build(d.path());
+    let v = areas(d.path(), &["--seed=3"]);
+    let areas = read_areas(&v);
+    let multi: Vec<&Area> = areas.iter().filter(|a| a.size > 1).collect();
+    assert_eq!(
+        multi.len(),
+        1,
+        "the fixture must form exactly one multi-symbol area: {v:#}"
+    );
+    assert_eq!(
+        multi[0].rule, "fallback",
+        "a shared suffix was taken for a prefix: {v:#}"
+    );
+}
+
 /// Standard mode has to actually cluster. PAR-SYM-08's resolution floor is a large-graph
 /// rule; applied at standard mode's resolution of 1.0 the adoption threshold is a node's
 /// entire incident weight, so no node could ever leave the community it started in and

@@ -189,18 +189,14 @@ fn shared_prefix(names: &[String]) -> Option<String> {
     // (path, line, name), so the first member shares no leading word with the rest often
     // enough that seeding from it alone missed a prefix two later members do share.
     //
-    // Only a member's *leading word* counts, with that word's singular form alongside it:
-    // `word_stems` returns a name's words in order and puts the singular after the
-    // plural, so `feeds` offers both `feeds` and `feed`. Matching anywhere in the list
-    // would let `InvoiceStore` and `PaymentStore` share `store` — a common suffix, not a
-    // prefix, and not what this rule is named.
+    // Only a member's leading word counts, with that word's singular alongside it —
+    // `word_stems` is in source order, so `words[0]` is the leading word and `words[1]` is
+    // its singular when it has one. Matching anywhere in the list would let
+    // `InvoiceStore` and `PaymentStore` share `store`: a common suffix, not a prefix.
     let leading: Vec<Vec<String>> = names
         .iter()
         .map(|n| {
             let words = word_stems(n.as_str());
-            // `word_stems` emits each word followed by its singular, so the first word is
-            // `words[0]` and its singular is `words[1]` when there is one. Everything past
-            // that belongs to a later word in the name and cannot make a prefix.
             let is_singular = words.get(1).is_some_and(|s| words[0].len() == s.len() + 1);
             if is_singular {
                 vec![words[0].clone(), words[1].clone()]
@@ -223,9 +219,11 @@ fn shared_prefix(names: &[String]) -> Option<String> {
     best
 }
 
-/// The leading words of one name, longest first: split on `_`, on the camel-case
-/// humps, and on the letters-versus-digits boundary, each stem lowercased and with a
-/// trailing plural `s` dropped so `feeds` and `feed` share `fee`.
+/// The words of one name, in source order: split on `_`, on the camel-case humps and on
+/// the letters-versus-digits boundary, each lowercased and followed by its singular form
+/// (`feeds` yields `feeds` then `feed`). Source order is the contract: the name-prefix rule
+/// reads the first entry as the name's leading word, which a length sort would destroy —
+/// `InvoiceStore` would offer `store` first.
 fn word_stems(name: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     for part in name.split('_').filter(|p| !p.is_empty()) {
@@ -245,13 +243,15 @@ fn word_stems(name: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     for w in words {
         let lower = w.to_ascii_lowercase();
-        out.push(lower.clone());
+        if out.last() != Some(&lower) {
+            out.push(lower.clone());
+        }
         if let Some(stem) = lower.strip_suffix('s').filter(|s| !s.is_empty()) {
-            out.push(stem.to_string());
+            if out.last() != Some(&stem.to_string()) {
+                out.push(stem.to_string());
+            }
         }
     }
-    out.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
-    out.dedup();
     out
 }
 
