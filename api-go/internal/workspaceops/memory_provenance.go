@@ -187,6 +187,107 @@ func checkOwnerDistinct(ctx context.Context, r govstore.Reader, dataDir string, 
 	return nil
 }
 
+// batchVerdict names the verdict a batched guard run answers for. It defaults to
+// VerdictApprove, the verdict the approval queue asks about; the other tests pass a
+// verdict that does not decide verification to reach the guard's early return.
+type batchVerdict string
+
+// batchOwnerVoices answers checkOwnerDistinct for many pending candidates at once,
+// with one govstore query for all of them instead of three per row (WS-FIX-22b). It
+// re-derives the same rule from the same rows, so
+// TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers pins the two
+// together; read that test as part of this function's contract.
+//
+// The result is one entry per candidate, in order: ErrSameOwner for the ones the
+// per-row guard refuses, nil for the ones it admits. An error from the batched read
+// is returned for every candidate, so a caller that must not skip a guard fails closed
+// on the whole batch rather than admitting rows it could not check.
+func batchOwnerVoices(ctx context.Context, r govstore.Reader, dataDir string, candidates []queueCandidate,
+	h HumanApprover, verdict ...batchVerdict) ([]error, error) {
+	out := make([]error, len(candidates))
+	if len(candidates) == 0 {
+		return out, nil
+	}
+	// the same early return checkOwnerDistinct makes, as one clause: the approval
+	// queue asks about approve, so an absent verdict is approve
+	v := govstore.VerdictApprove
+	if len(verdict) > 0 && verdict[0] != "" {
+		v = string(verdict[0])
+	}
+	if !ownerBoundVerdicts[v] || principalDistinctness(dataDir) != DistinctOwner {
+		return out, nil
+	}
+	mine := fallbackString(h.Principal.Owner, h.Principal.ID)
+
+	// only the rows the guard would read: a single-assertion gate is the operator
+	// opting out of peers, so such an entry is admitted whatever its authors are.
+	keys := make([]govstore.PendingKey, 0, len(candidates))
+	guarded := make([]int, 0, len(candidates))
+	for i, c := range candidates {
+		if c.entry.RequiredVerifications <= 1 {
+			continue
+		}
+		rev := c.revision
+		if rev == 0 {
+			rev = c.entry.Revision
+		}
+		keys = append(keys, govstore.PendingKey{EntryID: c.entry.ID, Revision: rev})
+		guarded = append(guarded, i)
+	}
+	if len(keys) == 0 {
+		return out, nil
+	}
+
+	revs, err := r.RevisionOwners(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	voices, err := r.PendingOwnerVoices(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	for n, i := range guarded {
+		c := candidates[i]
+		key := keys[n]
+		rev := c.revision
+		if rev == 0 {
+			rev = c.entry.Revision
+		}
+		refuse := func(whom string) error {
+			return fmt.Errorf("%w: %s is owned by %s, like %s of %s revision %d", ErrSameOwner, h.Principal.ID, mine, whom, c.entry.ID, rev)
+		}
+		if sameOwner(recordedOwner(dataDir, c.entry.SourceOwner, c.entry.Source), mine) {
+			out[i] = refuse("the entry's author")
+			continue
+		}
+		ro, ok := revs[key]
+		if !ok {
+			out[i] = fmt.Errorf("revision %s@%d: %w", key.EntryID, key.Revision, govstore.ErrNotFound)
+			continue
+		}
+		// the same three lines revisionOwner runs, on the same rows: the proposal that
+		// started the entry takes the owner the entry recorded (which survives the token
+		// being revoked), and a later revision takes the owner its edit event recorded
+		revOwner := ro.Owner
+		if ro.Revision == 1 && sameOwner(ro.Author, ro.Source) {
+			revOwner = ro.SourceOwner
+		}
+		revOwner = recordedOwner(dataDir, revOwner, ro.Author)
+		if sameOwner(revOwner, mine) {
+			out[i] = refuse("the revision's author")
+			continue
+		}
+		for _, v := range voices[key] {
+			if !sameOwner(v.Principal, h.Principal.ID) &&
+				sameOwner(recordedOwner(dataDir, v.PrincipalOwner, v.Principal), mine) {
+				out[i] = refuse("a principal (" + v.Principal + ") that already voted " + v.Verdict)
+				break
+			}
+		}
+	}
+	return out, nil
+}
+
 // revisionOwner is the owner recorded when rv was written: the entry's source owner for
 // the proposal, the owner its edit event carries for a later revision.
 func revisionOwner(ctx context.Context, r govstore.Reader, dataDir string, e govstore.Entry, rv govstore.Revision) (string, error) {
