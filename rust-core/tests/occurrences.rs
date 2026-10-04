@@ -741,3 +741,107 @@ fn a_name_a_name_path_and_a_uid_read_the_same_namesakes_because_the_table_keys_t
         "a use is missing from the name match: {got:#?}"
     );
 }
+
+// Several uses of one name inside one function, on lines that share a kind and a
+// container, so they tie on every column the page used to order by except the row's own
+// key. An OFFSET page across such a tie could repeat or skip a row; the unique key is the
+// last ORDER BY term, so walking the list one row at a time returns each use exactly once
+// and in a stable order (WS-59d-r5-4).
+#[test]
+fn many_uses_in_one_file_page_without_repeating_or_skipping() {
+    // Every use shares one file, one container, one kind and one line, so they tie on
+    // every column the page used to order by and only the row key tells them apart. That
+    // is the case an OFFSET page cannot order; repo commits the tree, so the file is part
+    // of the fixture rather than written after the index build.
+    let body: String = (0..6)
+        .map(|_| "NewStore()".to_string())
+        .collect::<Vec<_>>()
+        .join(" + ");
+    let src = format!(
+        "package store\n\nfunc NewStore() {{}}\n\nfunc Uses() int {{\n\treturn {body}\n}}\n"
+    );
+    let r = repo(&[("go.mod", GO_MOD), ("pkg/store/store.go", GO_STORE), ("pkg/store/uses.go", &src)]);
+    build(r.path());
+
+    let all = rows(&occ(r.path(), "refs", "NewStore", &[format!("--limit=50")]));
+    assert!(all.len() >= 6, "the fixture indexed too few uses: {all:#?}");
+
+    let mut seen: Vec<String> = Vec::new();
+    let mut offset = 0usize;
+    loop {
+        let v = occ(
+            r.path(),
+            "refs",
+            "NewStore",
+            &[format!("--limit=1"), format!("--offset={offset}")],
+        );
+        let got = rows(&v);
+        if got.is_empty() {
+            break;
+        }
+        // Every use shares a path and a line, and two tied rows are byte-identical in the
+        // answer, so the row count is what proves the walk neither repeated nor skipped
+        // one: a skipped row shows as a short walk and a repeated one as a long one.
+        for o in &got {
+            seen.push(o["path"].as_str().unwrap_or_default().to_string());
+        }
+        offset += got.len();
+        assert!(offset <= 32, "the walk did not terminate: {seen:?}");
+    }
+    assert_eq!(
+        seen.len(),
+        all.len(),
+        "paging one row at a time returned {} of {} rows: {seen:?}",
+        seen.len(),
+        all.len()
+    );
+}
+
+// One page can hold limit rows in that many files, each up to
+// symbolgraph::MAX_REPO_FILE_BYTES, so a cache that kept every text until the query ended
+// retained gigabytes for one page. Each file's text is dropped as soon as its last row is
+// converted, so the peak is bounded by the file one row needs (WS-59d-r5-2).
+#[test]
+fn a_page_of_rows_in_distinct_files_does_not_hold_every_file() {
+    let mut paths: Vec<String> = Vec::new();
+    let mut bodies: Vec<String> = vec![GO_MOD.to_string()];
+    for i in 0..24 {
+        paths.push(format!("pkg/p{i}/f.go"));
+        bodies.push(format!("package p{i}\n\nfunc Use() {{\n\ts := NewStore()\n\t_ = s\n}}\n"));
+    }
+    let files: Vec<(&str, &str)> = paths
+        .iter()
+        .map(|p| p.as_str())
+        .zip(bodies.iter().map(|b| b.as_str()))
+        .collect();
+    let r = repo(&files);
+    build(r.path());
+
+    let v = occ(r.path(), "refs", "NewStore", &[format!("--limit=24")]);
+    let got = rows(&v);
+    assert!(got.len() >= 20, "the fixture spread its rows too thin: {v:#}");
+    // every row kept its snippet, which is only possible if the file was read before it
+    // was dropped: the drop is per file's last row, never before the row is converted
+    for o in &got {
+        assert!(
+            o["snippet"].as_str().is_some_and(|s| !s.is_empty()),
+            "a row lost its snippet: {o:#}"
+        );
+    }
+    let distinct: std::collections::HashSet<&str> =
+        got.iter().filter_map(|o| o["path"].as_str()).collect();
+    assert!(
+        distinct.len() >= 20,
+        "the rows did not span many files, so the cache was not exercised: {distinct:?}"
+    );
+    // the page spans many files, so holding every text would hold every one of them at
+    // once: the peak must stay near one file, not near the page
+    let peak = v["peak_files_held"].as_u64().unwrap_or_else(|| {
+        panic!("the answer does not report its peak file count: {v:#}")
+    });
+    assert!(
+        peak <= 2,
+        "a page of {} files held {peak} of them at once",
+        distinct.len()
+    );
+}

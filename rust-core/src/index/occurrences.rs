@@ -228,6 +228,10 @@ pub struct Occurrences {
     /// Occurrences dropped because the read is bounded (`MAX_OCCURRENCES`).
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub truncated: bool,
+    /// The most source files this page's snippet cache held at once. Bounded by the
+    /// rows that share a file rather than by the page, so a wide page does not retain
+    /// `limit` whole files (§5.1 rule 8, WS-59d-r5-2).
+    pub peak_files_held: usize,
     pub epistemic: Envelope,
 }
 
@@ -251,11 +255,15 @@ fn kinds_clause(kinds: &[u8]) -> String {
 
 /// The projection and predicate one occurrence operation reads, shared by every page so
 /// the pages of a list can never disagree about what the list is. Both operations
-/// project the same nine columns: path, lang, file id, content hash, line, kind
-/// (-1 on a declaration), the containing symbol's name, kind and start line.
+/// project the same ten columns: a unique row key first, then path, lang, file id,
+/// content hash, line, kind (-1 on a declaration), the containing symbol's name, kind and
+/// start line. That key is projected and ordered on because OFFSET paging needs a total
+/// order: two references on one line with one kind and one container tie on every other
+/// column, and a tie across a page boundary repeats or skips a row (WS-59d-r5-4). It is
+/// `s.id` for a declaration and `(file_id, start_byte)`, the refs primary key, otherwise.
 fn statement(q: &Query) -> String {
     match q.op.as_str() {
-        "definition" => "SELECT f.path, f.lang, f.id, f.content_hash, s.start_line, -1, \
+        "definition" => "SELECT s.id, f.path, f.lang, f.id, f.content_hash, s.start_line, -1, \
                  s.qualified_name, s.kind, s.start_line \
                  FROM symbols s JOIN names n ON n.id = s.name_id JOIN files f ON f.id = s.file_id \
                  WHERE n.name = ?1"
@@ -267,7 +275,7 @@ fn statement(q: &Query) -> String {
                 &USE_KINDS
             };
             format!(
-                "SELECT f.path, f.lang, f.id, f.content_hash, r.line, r.kind, \
+                "SELECT r.start_byte, f.path, f.lang, f.id, f.content_hash, r.line, r.kind, \
                         s.qualified_name, s.kind, s.start_line \
                  FROM refs r JOIN names n ON n.id = r.name_id JOIN files f ON f.id = r.file_id \
                  LEFT JOIN symbols s ON s.id = r.symbol_id \
@@ -278,30 +286,32 @@ fn statement(q: &Query) -> String {
     }
 }
 
-/// One occurrence page, read in (path, line, kind, name) order and bounded by SQL, so a
-/// name with a hundred thousand references costs one page of rows rather than all of them
-/// (§5.1 rule 8: nothing proportional to the repository in a heap). The LIMIT is one more
-/// than the page asks for, so the read learns whether more rows exist without counting
-/// them all, and `more` says whether it did.
+/// One occurrence page, read in (path, line, kind, name, row id) order and bounded by SQL,
+/// so a name with a hundred thousand references costs one page of rows rather than all of
+/// them (§5.1 rule 8: nothing proportional to the repository in a heap). The LIMIT is one
+/// more than the page asks for, so the read learns whether more rows exist without
+/// counting them all, and `more` says whether it did. The last ORDER BY term is the row's
+/// unique key, so every page of a list is a stable window over one order.
 fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<(Vec<Row>, bool)> {
     let sql = format!(
-        "{} ORDER BY 1, 5, 6, 7 LIMIT {} OFFSET {}",
+        "{} ORDER BY 2, 6, 7, 8, 1 LIMIT {} OFFSET {}",
         statement(q),
         q.limit + 1,
         q.offset,
     );
     let mut st = conn.prepare_cached(&sql)?;
     let mapped = st.query_map([name], |r| {
+        // column 0 is the row key, which orders the page and is not part of the row
         Ok((
-            r.get::<_, String>(0)?,
             r.get::<_, String>(1)?,
-            r.get::<_, i64>(2)?,
-            r.get::<_, String>(3)?,
-            r.get::<_, u32>(4)?,
-            r.get::<_, i64>(5)?,
-            r.get::<_, Option<String>>(6)?,
+            r.get::<_, String>(2)?,
+            r.get::<_, i64>(3)?,
+            r.get::<_, String>(4)?,
+            r.get::<_, u32>(5)?,
+            r.get::<_, i64>(6)?,
             r.get::<_, Option<String>>(7)?,
-            r.get::<_, Option<u32>>(8)?,
+            r.get::<_, Option<String>>(8)?,
+            r.get::<_, Option<u32>>(9)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -370,6 +380,11 @@ pub fn answer(
     let mut out = serde_json::to_value(&read).map_err(|e| e.to_string())?;
     let paths: Vec<&str> = read.occurrences.iter().map(|o| o.path.as_str()).collect();
     namepath::envelope(&mut out, src, workspace_id, paths);
+    // The most source files this page held at once. It is bounded by the rows that share
+    // a file rather than by the page, which is the property the budget line needs to see;
+    // without it a reader of a wide page cannot tell one file from five hundred
+    // (WS-59d-r5-2, §5.1 rule 8).
+    out["peak_files_held"] = serde_json::json!(read.peak_files_held);
     Ok(out)
 }
 
@@ -396,10 +411,18 @@ pub fn read(
     let (page, more) = rows(conn, q, &name)?;
     let found = declares(conn, &name)?;
     let mut texts = Texts::default();
-    let occurrences: Vec<Occurrence> = page
-        .iter()
-        .map(|row| occurrence(&mut texts, root, row))
-        .collect();
+    // One page can hold impact::MAX_LIMIT rows in that many distinct files, and each
+    // file is up to MAX_REPO_FILE_BYTES, so keeping every text until the query ends would
+    // retain gigabytes of source for a single page. A file's text is dropped as soon as
+    // its last row is converted, which bounds the cache by the files a single row needs
+    // (WS-59d-r5-2).
+    let mut occurrences: Vec<Occurrence> = Vec::with_capacity(page.len());
+    for (i, row) in page.iter().enumerate() {
+        occurrences.push(occurrence(&mut texts, root, row));
+        if page[i + 1..].iter().all(|r| r.file_id != row.file_id) {
+            texts.forget(row.file_id);
+        }
+    }
     let end = q.offset + occurrences.len();
     let total = if more { end + 1 } else { end };
     let truncated = more || q.offset + q.limit >= MAX_OCCURRENCES;
@@ -467,6 +490,7 @@ pub fn read(
         // issuing a continuation that cannot be followed.
         next_cursor: (more && end < MAX_OCCURRENCES).then(|| end.to_string()),
         truncated,
+        peak_files_held: texts.peak_files(),
         epistemic,
     })
 }
