@@ -630,33 +630,30 @@ fn command_hint(argv: &[String]) -> String {
     }
 }
 
-// The hint over a shell line's simple commands. A command the rules carry wins
-// wherever it sits in the line, which is what the registry does: `commandFamily`
-// classifies every simple command and keeps the most specific, so `cd sub && go test`
-// is a test run there and a bare `ls` is the generic family. A line of only
-// rule-less commands names the first one, because the hint for a single command is
-// always its program (`echo hunter2` -> `echo`) and nothing else in the line is more
-// specific than that.
+// The hint over a shell line's simple commands, by the registry's own rule
+// (`commandFamily`, registry.go:299): every simple command is classified and the most
+// specific wins, compared with a STRICT `>`, so the first of two equally specific
+// commands is the one kept. A package script outranks a plain program because the
+// registry reads a script's own family (`npm run test`) where a plain program's hint
+// is only its subcommand. A line of only rule-less commands (`cd`, `echo`, `ls`)
+// names the first one, which is the same answer a single such command gets.
 fn shell_line_hint(line: &str) -> Option<String> {
-    let hints: Vec<(u8, String)> = split_simple_commands(line)
-        .into_iter()
-        .filter_map(|simple| {
-            let mut words = simple.split_whitespace();
-            let first = words.next().map(basename)?;
-            plain(first).then(|| (hint_rank(first), hint_for(first, &mut words)))
-        })
-        .collect();
-    hints
-        .iter()
-        .rfind(|(rank, _)| *rank > 0)
-        .or_else(|| hints.first())
-        .map(|(_, hint)| hint.clone())
+    let mut best: Option<(u8, String)> = None;
+    for simple in split_simple_commands(line) {
+        let mut words = simple.split_whitespace();
+        let Some(first) = words.next().map(basename).filter(|w| plain(w)) else {
+            continue;
+        };
+        let rank = hint_rank(first);
+        if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+            best = Some((rank, hint_for(first, &mut words)));
+        }
+    }
+    best.map(|(_, hint)| hint)
 }
 
 // The registry's dispatch order, as a rank, with 0 for a program no rule carries.
-// The program set is `HINT_RULES`' own, and a package script outranks the rest
-// because the registry reads a script's own family (`npm run test`) where a plain
-// program's hint is only its subcommand.
+// The program set is `HINT_RULES`' own.
 fn hint_rank(program: &str) -> u8 {
     match HINT_RULES.iter().find(|(p, _)| p.contains(&program)) {
         Some((_, Hint::RunScript)) => 3,
@@ -914,6 +911,30 @@ mod tests {
         // Every separator the registry splits on, and the precedence between them.
         assert_eq!(command_hint(&a(&["bash", "-c", "cd a; npm run test"])), "npm run test");
         assert_eq!(command_hint(&a(&["bash", "-c", "ls || go build ./..."])), "go build");
+        // Two rule-carrying commands. The registry keeps the MOST SPECIFIC
+        // (`familyRank`), and a package script's own family is more specific than a
+        // plain program's subcommand — so it wins in either order, measured against
+        // registry.go's dispatch on the box (logs/ws-44e-run-20261004T080850Z.log).
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "go test && npm run build"])),
+            "npm run build"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "npm run build && go test"])),
+            "npm run build",
+            "and the same line the other way round keeps the script, not the subcommand"
+        );
+        // Two commands of the SAME rank: the registry's comparison is a strict `>`
+        // (registry.go:311), so the FIRST of equals is the one kept. Measured on the
+        // box against that comparison (logs/ws-44e-run-20261004T080925Z.log).
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "go test && git diff"])),
+            "go test"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "git diff && go test"])),
+            "git diff"
+        );
         assert_eq!(
             command_hint(&a(&["bash", "-c", "git diff | head -50"])),
             "git diff",

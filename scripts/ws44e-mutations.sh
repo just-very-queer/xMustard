@@ -160,9 +160,9 @@ mutate M19 'if (wrapperEndpoint(opts.wrapperApiBase) !== opts.apiBase) return fa
 # capture query.
 mutate M20 'None => None,
     };
-    match rest {' 'None => subcommand(&mut words),
+    match tail {' 'None => subcommand(words),
     };
-    match rest {' "$RUST" || true
+    match tail {' "$RUST" || true
 
 # M24: any program's -c script is read as a shell command, so `python -c <script>`
 # puts a word of the script in the capture query.
@@ -170,7 +170,7 @@ mutate M24 'let script = SHELLS
         .contains(&name)' 'let script = true' "$RUST" || true
 
 # M25: make-like targets lose their family keyword, so `make test` is reduced as a build.
-mutate M25 'Some(Hint::Keyword) => keyword(&mut words),' 'Some(Hint::Keyword) => None,' "$RUST" || true
+mutate M25 'Some(Hint::Keyword) => keyword(words),' 'Some(Hint::Keyword) => None,' "$RUST" || true
 
 # M21: a handle in the result text no longer activates expansion, so the model holds
 # a recovery handle and no tool to use it with.
@@ -182,7 +182,7 @@ mutate M17 'const SHELL = "bash";' 'const SHELL = "sh";' "$SRC" || true
 
 # M18: the run_wrapper's command hint keeps naming the shell, so a wrapped `git diff`
 # is reduced by the generic shell reducer instead of the diff family.
-mutate M18 'Some(c) => Box::new(c.split_whitespace()),' 'Some(_) => Box::new(argv.iter().map(String::as_str)),' "$RUST" || true
+mutate M18 'Some(line) => shell_line_hint(line).unwrap_or_else(|| name.to_string()),' 'Some(_line) => name.to_string(),' "$RUST" || true
 
 # M26: the no-re-capture guard is removed, so the wrapper's own projection is captured a
 # second time and the visible handle points at the projection rather than the output.
@@ -250,9 +250,10 @@ mutate M39 'Some(line) => shell_line_hint(line).unwrap_or_else(|| name.to_string
 # three simple commands and the hinted word comes from inside the quoted string.
 mutate M40 'if quote != 0 {' 'if false {' "$RUST" || true
 
-# M41: the rank falls back to the first command whatever it is, so a line whose only
-# rule-carrying command is last is reduced by the generic command before it.
-mutate M41 '.rfind(|(rank, _)| *rank > 0)' '.rev().find(|(rank, _)| *rank > 0).or_else(|| hints.first())' "$RUST" || true
+# M41: the rank comparison becomes `>=`, so a line with two equally specific commands
+# keeps the LAST rather than the first, which is not the registry's strict `>`
+# (registry.go:311): `go test && git diff` would hint `git diff`.
+mutate M41 'rank > *best_rank' 'rank >= *best_rank' "$RUST" || true
 
 restore ALL
 echo "=== final byte-compare"
