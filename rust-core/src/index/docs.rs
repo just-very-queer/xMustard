@@ -11,10 +11,10 @@
 //! order, and `none` indexes no prose (the rows say `retention_none`). A doc on a secret
 //! path (`secretpath`) is listed with status `secret_path` and never read.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Serialize;
 
 use super::chunks;
@@ -47,9 +47,12 @@ struct Stored {
     status: String,
 }
 
-fn stored_docs(conn: &Connection) -> rusqlite::Result<HashMap<String, Stored>> {
-    let mut st = conn.prepare("SELECT id, path, stat_key, content_hash, status FROM docs")?;
-    let rows = st.query_map([], |r| {
+/// The stored doc rows: every one, or those of `only` (a batch decided from its paths).
+fn stored_docs(
+    conn: &Connection,
+    only: Option<&BTreeSet<String>>,
+) -> rusqlite::Result<HashMap<String, Stored>> {
+    let row = |r: &rusqlite::Row<'_>| {
         Ok((
             r.get::<_, String>(1)?,
             Stored {
@@ -59,8 +62,19 @@ fn stored_docs(conn: &Connection) -> rusqlite::Result<HashMap<String, Stored>> {
                 status: r.get(4)?,
             },
         ))
-    })?;
-    rows.collect()
+    };
+    const COLUMNS: &str = "SELECT id, path, stat_key, content_hash, status FROM docs";
+    let Some(only) = only else {
+        return conn.prepare(COLUMNS)?.query_map([], row)?.collect();
+    };
+    let mut st = conn.prepare(&format!("{COLUMNS} WHERE path = ?1"))?;
+    let mut out = HashMap::new();
+    for path in only {
+        if let Some((p, d)) = st.query_row([path], row).optional()? {
+            out.insert(p, d);
+        }
+    }
+    Ok(out)
 }
 
 /// What one scanned doc needs.
@@ -242,7 +256,8 @@ impl DocWriter<'_> {
     }
 }
 
-/// Bring the docs tables to the scan's doc files in one transaction.
+/// Bring the docs tables to the scan's doc files in one transaction. A scan of only
+/// some paths (`Scan::only`) touches only their rows.
 pub fn sync(
     conn: &Connection,
     scan: &Scan,
@@ -252,7 +267,7 @@ pub fn sync(
         beyond: scan.docs_beyond,
         ..Default::default()
     };
-    let stored = stored_docs(conn)?;
+    let stored = stored_docs(conn, scan.only.as_ref())?;
     let listed: HashSet<&str> = scan.docs.iter().map(|d| d.path.as_str()).collect();
     let next_chunk: i64 =
         conn.query_row("SELECT coalesce(max(id), 0) + 1 FROM doc_chunks", [], |r| {
