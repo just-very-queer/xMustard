@@ -358,7 +358,7 @@ impl Forwarder {
     ) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
         let mut signals = signal_hook::iterator::SignalsInfo::<
             signal_hook::iterator::exfiltrator::WithOrigin,
-        >::new(&forwarded())
+        >::new(forwarded())
         .map_err(|e| io::Error::other(e.to_string()))
         .inspect_err(|e| {
             eprintln!("xmustard run: signals are not forwarded to the child: {e}");
