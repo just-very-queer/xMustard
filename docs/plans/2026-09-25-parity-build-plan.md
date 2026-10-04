@@ -2150,6 +2150,25 @@ paths.
   whoever owns `tools_list_budget.json`), and the derivation's precedence question
   (r3-5) is in FU.
 
+
+**PARKED (2026-10-04).** Round 4 is the fourth and last for a code task, and its gate is RED:
+`gate=FAIL changed=24 covered=24 channel_findings=8 triaged=9`, on 23 round-1 tests that have
+no mutation row. `reviews/ws-29b/r1/` and `r2/` have no `slop-audit.md` at all and `r3`'s S5 is
+a bare list, so the parked session's claim that its 23 rows live in r1/r2 S5 points at files that do
+not exist. Writing 23 FAIL lines to pass the gate is what §6 A4 forbids, so the gate stays red.
+
+- Works and is committed: the run-key trust check on BOTH read keys (run and session) without
+  disturbing session-seen suppression; the private-text withhold on a peer's verify response;
+  the approval-queue scope guard; the GLOB directory prefix; ground's delta filter; the
+  session-handoff text drop; the at-risk window that widens until it drains the store.
+- Round 4 findings: all eight channel findings triaged, six FIXED, two (r4-5, r4-9) corrected
+  more than once by the triage check, one (r4-8) rejected as verified-not-a-defect.
+- Open ids: none deferred to FU. Five triage checks ran; every objection they raised was upheld.
+- Next step: whoever continues this row writes the 23 missing mutation rows against the tests as
+  they stand, or the owner accepts the round-1 tests on `go test` and the fixture suite alone.
+  After that, re-run the gate and merge; BOXALL is green on this head
+  (`logs/ws-29b-check-20261004T060234Z.log`, remote_exit=0 clippy=6 rss_lines=ok) and re-runs
+  green on the final head.
 ### WS-30 — Cross-workspace code query, residency LRU, worktree identity and path rewriting
 
 **Goal.** search, explain and impact accept workspaces or a group. The resident service holds at most K hot indexes (default 1) with LRU and idle eviction; cold repos are served by pread or loaded on demand in the heavy slot. Detect linked worktrees and record branch/worktree identity. Store anchors repo-relative, with a longest-prefix path rewrite map for foreign absolute paths.
