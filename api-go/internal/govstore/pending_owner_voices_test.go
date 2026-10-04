@@ -18,8 +18,11 @@ func TestPendingOwnerVoicesReadsTheCountingVerdictsOfManyRevisions(t *testing.T)
 	vote(t, s, "ctx_a", alice, VerdictApprove)
 	vote(t, s, "ctx_a", carol, VerdictReject)
 	// a verdict that does not decide verification is not an owner-bound voice
-	vote(t, s, "ctx_b", alice, VerdictDuplicateOf)
-	vote(t, s, "ctx_b", carol, VerdictRetract)
+	vote(t, s, "ctx_b", alice, VerdictRetract)
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.RecordVote(ctx, VoteInput{EntryID: "ctx_b", Verdict: VerdictDuplicateOf, Target: "ctx_a"}, carol)
+		return err
+	})
 
 	var got map[PendingKey][]Vote
 	if err := s.View(ctx, func(r Reader) error {
@@ -145,6 +148,7 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Logf("keys returned: %d %+v", len(got), got)
 
 	first, ok := got[PendingKey{EntryID: "ctx_edit", Revision: 1}]
 	if !ok || first.Revision != 1 || first.Author != "alice" {

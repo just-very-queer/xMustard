@@ -213,6 +213,7 @@ func (r *reader) EntryContents(ctx context.Context, ids []string) (map[string]En
 // recorded no owner still carries the owner it recorded at write time, which survives
 // the token being revoked.
 type RevisionOwner struct {
+	EntryID     string `json:"entry_id"`
 	Revision    int64  `json:"revision"`
 	Author      string `json:"author"`
 	Owner       string `json:"owner,omitempty"`
@@ -241,13 +242,12 @@ func (r *reader) RevisionOwners(ctx context.Context, keys []PendingKey) (map[Pen
 			return nil, err
 		}
 		for rows.Next() {
-			var k PendingKey
 			var ro RevisionOwner
-			if err := rows.Scan(&k.EntryID, &ro.Revision, &ro.Author, &ro.Source, &ro.SourceOwner); err != nil {
+			if err := rows.Scan(&ro.EntryID, &ro.Revision, &ro.Author, &ro.Source, &ro.SourceOwner); err != nil {
 				rows.Close()
 				return nil, err
 			}
-			out[k] = ro
+			out[PendingKey{EntryID: ro.EntryID, Revision: ro.Revision}] = ro
 		}
 		err = rows.Err()
 		if cerr := rows.Close(); err == nil {
