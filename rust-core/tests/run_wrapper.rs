@@ -1127,8 +1127,8 @@ fn pipe() -> Option<(std::fs::File, std::fs::File)> {
 /// it, so a closed filler leaves `write_end` non-blocking and the report `EAGAIN`s (the
 /// assertion below caught it, logs/ws-fix-20c-run-20261004T163930Z.log). `F_GETPIPE_SZ` is
 /// deliberately not used: it is Linux-only and the repository's checks run on macOS too
-/// (codex-review P1, round 3). The loop stops on the short write the kernel returns when the
-/// pipe has no room.
+/// (codex-review P1, round 3). The loop stops on `EAGAIN`, which is the kernel saying there is no
+/// room at all, and a one-byte probe afterwards proves it rather than assuming it (OCR, round 5).
 fn fill_pipe(write_end: &std::fs::File) {
     {
         // SAFETY: `dup` of a live descriptor; `fcntl(F_SETFL)` on this copy only.
@@ -1142,10 +1142,14 @@ fn fill_pipe(write_end: &std::fs::File) {
             );
             std::fs::File::from_raw_fd(copy)
         };
-        let chunk = vec![b'x'; 64 * 1024];
+        let chunk = vec![b'x'; 4096];
+        // Loop until `EAGAIN`, NOT until a short write. For a write larger than `PIPE_BUF` the
+        // kernel may take only the space that is free and return short while room remains, so a
+        // short write does not mean the pipe is full — and a partly-full pipe may still hold the
+        // decision line, which would let the wrapper's report through and the witness pass on the
+        // code it exists to condemn (OCR, round 5). Only `EAGAIN` says there is no room at all.
         loop {
-            // SAFETY: a plain write of a live buffer to a valid descriptor. EAGAIN or a short
-            // write means the pipe is full, which is the state this harness needs.
+            // SAFETY: a plain write of a live buffer to a valid descriptor.
             let written = unsafe {
                 libc::write(
                     std::os::fd::AsRawFd::as_raw_fd(&filler),
@@ -1153,10 +1157,44 @@ fn fill_pipe(write_end: &std::fs::File) {
                     chunk.len(),
                 )
             };
-            if written < chunk.len() as isize {
+            if written < 0 {
+                // `last_os_error` rather than a compared constant: a non-blocking pipe with no
+                // room answers EAGAIN or EWOULDBLOCK depending on the platform, and this harness
+                // has to know which rather than assume it.
+                let e = std::io::Error::last_os_error();
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "the fill failed for a reason other than a full pipe: {e}"
+                );
                 break;
             }
+            assert!(
+                written > 0,
+                "a full pipe must refuse the write, not accept zero bytes"
+            );
         }
+        // Proof, not an assumption: the filler is non-blocking and the pipe is still full, so a
+        // one-byte probe from this same descriptor must be refused. Without this the harness
+        // could be exercising a pipe with room in it and the test would not mean anything.
+        let probe = b".";
+        // SAFETY: a one-byte write from the same live non-blocking descriptor.
+        let refused = unsafe {
+            libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&filler),
+                probe.as_ptr().cast(),
+                1,
+            )
+        };
+        assert!(
+            refused < 0,
+            "the pipe still accepted a byte, so the wrapper's report would not block"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the pipe refused the probe for a reason other than being full"
+        );
     }
     // Clear the flag the fill set on the shared description, so the wrapper inherits a blocking
     // descriptor. SAFETY: `write_end` is live and the only file-status flags it carries are the

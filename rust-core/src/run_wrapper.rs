@@ -336,21 +336,37 @@ fn write_best_effort(line: String) {
     if sender.try_send(Report { line, ack: false }).is_err() {
         // Never silent: a line lost to a full queue means the operator is missing a decision,
         // and the count is what makes that visible rather than merely possible (codex-spec,
-        // round 5). Counting is not blocking, so the watcher still cannot be held up.
+        // round 5).
+        //
+        // The notice goes to the same reporter, never to `eprintln!` from here. This function
+        // runs on the watcher thread, and a queue that is full means the reporter is behind — so
+        // writing the notice synchronously reintroduces the very defect the reporter exists to
+        // remove: if stderr itself is what is stuck, this `eprintln!` parks the watcher and every
+        // later signal goes unforwarded (OCR, round 5).
+        //
+        // If even the notice cannot be queued it is counted and nothing is written, which is the
+        // honest end of it: the count stays in `DROPPED_REPORTS` and `dropped_reports` reports it
+        // to a caller that is not the watcher.
         let lost = DROPPED_REPORTS.fetch_add(1, Ordering::SeqCst) + 1;
-        // One line per burst, not one per drop, and this line is written with `eprintln!` on the
-        // caller's own stderr — a full queue means the reporter is behind, not that stderr is
-        // broken, so this write is the one thing that still reaches an operator.
         if REPORTED_DROPS.swap(lost, Ordering::SeqCst) != lost {
-            eprintln!("xmustard run: {lost} decision report(s) dropped: the stderr reader is slow");
+            let notice = format!(
+                "xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n"
+            );
+            let _ = sender.try_send(Report { line: notice, ack: false });
         }
     }
 }
 
 /// How many decision reports the queue has refused, and how many of those the operator has been
-/// told about.
+/// told about. A caller that is not the watcher can read the first to report a loss the queue
+/// could not carry.
 static DROPPED_REPORTS: AtomicU64 = AtomicU64::new(0);
 static REPORTED_DROPS: AtomicU64 = AtomicU64::new(0);
+
+/// How many decision reports have been dropped for want of queue space.
+pub fn dropped_reports() -> u64 {
+    DROPPED_REPORTS.load(Ordering::Relaxed)
+}
 
 /// Starts the reporter thread and returns the two ends the watcher needs.
 fn spawn_reporter() -> (mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>) {
@@ -408,6 +424,35 @@ const REPORT_QUEUE: usize = 32;
 /// How long the wrapper waits for queued reports on its way out. Long enough for a write to a
 /// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
 const REPORT_DRAIN: Duration = Duration::from_millis(50);
+
+/// `kill(2)` to the child, retrying a signal that arrived before the syscall ran.
+///
+/// The watcher thread has every forwarded signal's handler installed while it makes this call, so
+/// `kill_process` can return `EINTR` with the child untouched. Treating that as a failed delivery
+/// would report a child as running that has merely not been signalled yet, which is the wrong
+/// diagnostic in the direction that matters (OCR, round 5).
+///
+/// Bounded, because an unbounded retry here is a spin on a signal that keeps arriving. A signal
+/// every millisecond for this long is not a client timeout.
+fn kill_retrying_interrupt(
+    child: rustix::process::Pid,
+    sig: rustix::process::Signal,
+) -> rustix::io::Result<()> {
+    let give_up = std::time::Instant::now() + KILL_RETRY_WINDOW;
+    loop {
+        match rustix::process::kill_process(child, sig) {
+            Err(rustix::io::Errno::INTR) if std::time::Instant::now() < give_up => {
+                thread::sleep(KILL_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How long `kill_retrying_interrupt` keeps retrying `EINTR`, and how long it waits between
+/// attempts.
+const KILL_RETRY_WINDOW: Duration = Duration::from_millis(200);
+const KILL_RETRY_INTERVAL: Duration = Duration::from_millis(5);
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
 /// reaches it too. `false` on any error (the child is gone, or its group cannot be read):
@@ -541,14 +586,16 @@ impl Forwarder {
                     // but never the signal: reporting first would let a full pipe swallow a
                     // client's timeout and orphan the child (WS-FIX-20c-r1-1).
                     //
-                    // ESRCH is the normal race at exit and is not a delivery. Anything else
-                    // means the child was NOT signalled — EPERM after it changed credentials, or
-                    // an EINTR the watcher loop will not retry — and reporting that as forwarded
-                    // would tell an operator the opposite of what happened (codex-spec, round 5).
-                    let delivered = match rustix::process::kill_process(child, sig) {
+                    // ESRCH is the normal race at exit and is not a delivery. EINTR is the
+                    // syscall being interrupted before it ran — the child is untouched and the
+                    // signal has not been delivered — so it is retried rather than reported as
+                    // a failure, because reporting it as one would tell an operator the child
+                    // kept running when it simply has not been signalled yet (OCR, round 5).
+                    // Anything else means the child will NOT be signalled, EPERM after it
+                    // changed credentials being the case that matters, and reporting that as
+                    // forwarded would tell an operator the opposite (codex-spec, round 5).
+                    let delivered = match kill_retrying_interrupt(child, sig) {
                         Ok(()) => true,
-                        // The child is gone, which is the ordinary end of a run rather than a
-                        // failure to relay.
                         Err(rustix::io::Errno::SRCH) => false,
                         Err(e) => {
                             eprintln!(
