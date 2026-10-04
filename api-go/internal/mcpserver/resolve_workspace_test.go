@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -618,6 +620,61 @@ func TestPathCacheIsBounded(t *testing.T) {
 	defer s.mu.Unlock()
 	if len(s.byPath) > maxPathCache {
 		t.Fatalf("path cache holds %d entries, over %d", len(s.byPath), maxPathCache)
+	}
+}
+
+// The opt-in registers the working directory's OWN repository. When that repository is
+// nested inside an already-registered workspace, the ancestor match runs first and used
+// to win, so the opt-in silently did nothing in exactly the monorepo and worktree case it
+// exists for.
+func TestTheOptInRegistersTheCwdRepoInsideARegisteredAncestor(t *testing.T) {
+	outer := tempRepo(t)
+	inner := filepath.Join(outer, "vendor", "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", inner, "init", "--quiet").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "outer-ws", Root: outer}}}
+	s := newSession(t, api, Options{Cwd: inner, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, _ := call(t, s, "ground", map[string]any{})
+	if res["isError"] != false {
+		t.Fatalf("the opt-in must register the cwd's own repository: %s", text(res))
+	}
+	ws := wsOf(t, res)
+	if ws.Source != SourceCWD || !ws.Registered || ws.Root != inner || ws.ID != WorkspaceIDForPath(inner) {
+		t.Fatalf("resolved %+v, want the nested cwd repository %s registered, not the registered ancestor", ws, inner)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 1 {
+		t.Fatalf("registered %d times, want 1", n)
+	}
+}
+
+// The same nested cwd with auto-registration off: pinning the cwd to its own repository
+// must not lose the registered ancestor that already contains it, which is the answer the
+// caller had before the opt-in existed.
+func TestTheOptInKeepsTheRegisteredAncestorWhenRegistrationIsRefused(t *testing.T) {
+	outer := tempRepo(t)
+	inner := filepath.Join(outer, "vendor", "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", inner, "init", "--quiet").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "outer-ws", Root: outer}}}
+	s := newSession(t, api, Options{Cwd: inner, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, _ := call(t, s, "ground", map[string]any{})
+	if res["isError"] != false {
+		t.Fatalf("a refused nested registration must still resolve the ancestor: %s", text(res))
+	}
+	ws := wsOf(t, res)
+	if ws.ID != "outer-ws" || ws.Root != outer || ws.Registered {
+		t.Fatalf("resolved %+v, want the registered ancestor and no new registration", ws)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("registered %d times with auto-registration off", n)
 	}
 }
 

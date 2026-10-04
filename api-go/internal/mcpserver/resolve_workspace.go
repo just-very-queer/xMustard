@@ -216,31 +216,60 @@ func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string
 		s.mu.Unlock()
 		return ws
 	}
+	// A cwd signal that registers is asked for the working directory's OWN repository. If
+	// that repository sits inside an already-registered workspace, the ancestor match below
+	// would win and the registration would never happen, which is the one case the
+	// WS-FIX-15b opt-in exists for, so ownRepo pins the signal to its own repository. Every
+	// other signal keeps the ancestor match, and a cwd whose repository IS the ancestor is
+	// unaffected (the two roots are then equal).
+	ownRepo := ""
+	if source == SourceCWD && s.srv.opts.RegisterCwdWhenRootsUnknown {
+		ownRepo = repoRoot(p)
+	}
 	for refresh := false; ; refresh = true {
 		list, fresh, err := s.listWorkspaces(ctx, refresh)
 		if err != nil {
 			return Workspace{}, err
 		}
-		if w, ok := match(list, p); ok {
+		if w, ok := match(list, p); ok && !(ownRepo != "" && canonicalPath(w.Root) != ownRepo) {
 			return remember(Workspace{ID: w.ID, Root: w.Root, Source: source}), nil
 		}
 		if fresh { // a miss on a just-read listing is final
 			break
 		}
 	}
-	repo := repoRoot(p)
+	repo := ownRepo
+	if repo == "" {
+		repo = repoRoot(p)
+	}
+	// With the cwd pinned to its own repository, a registration refused above would
+	// otherwise fail a cwd that a registered ancestor already contains. The ancestor is
+	// then the answer the caller actually had, so it is offered rather than lost.
+	ancestor := func(err error) (Workspace, error) {
+		if ownRepo == "" {
+			return Workspace{}, err
+		}
+		list, _, lerr := s.listWorkspaces(ctx, false)
+		if lerr != nil {
+			return Workspace{}, err
+		}
+		if w, ok := match(list, p); ok {
+			return remember(Workspace{ID: w.ID, Root: w.Root, Source: source}), nil
+		}
+		return Workspace{}, err
+	}
 	switch {
 	case repo == "":
 		return Workspace{}, errors.New("not inside a registered workspace or a git repository")
 	case repo == "/" || (s.srv.opts.HomeDir != "" && repo == canonicalPath(s.srv.opts.HomeDir)):
-		return Workspace{}, fmt.Errorf("git repository %s is not registered, and a home or root directory is never auto-registered", repo)
+		return ancestor(fmt.Errorf("git repository %s is not registered, and a home or root directory is never auto-registered", repo))
 	case noRegister != "":
-		return Workspace{}, fmt.Errorf("git repository %s is not registered (%s)", repo, noRegister)
+		return ancestor(fmt.Errorf("git repository %s is not registered (%s)", repo, noRegister))
 	case !s.srv.opts.AutoRegister:
-		return Workspace{}, fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo)
+		return ancestor(fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo))
 	}
 	if err := s.register(ctx, repo); err != nil {
-		return Workspace{}, err
+		return ancestor(err)
 	}
 	list, _, err := s.listWorkspaces(ctx, true)
 	if err != nil {
