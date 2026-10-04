@@ -740,6 +740,12 @@ fn search(args: Args) -> CmdResult {
             scan_lines: max_lines,
             scan_bytes: max_bytes,
             scan_timeout_ms: timeout_ms,
+            // The read size is the core's own; only a test forces a smaller one. Spelled
+            // out rather than left to `..Default::default()` because this literal is the
+            // one place a new `SearchOptions` field can break the CLI: a field added to
+            // the struct and to the library tests left THIS binary uncompilable, and only
+            // a `--lib` test run had been green.
+            scan_slice: None,
         },
     ))
 }

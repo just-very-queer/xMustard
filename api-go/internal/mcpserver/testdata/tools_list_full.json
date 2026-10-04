@@ -519,7 +519,7 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line, reasons. RRF (K=60) of BM25 over bodies, names, paths and docs; identifier match; trigram typo tolerance; reference degree; proximity to seed; pattern: ast-grep (`$A \u0026\u0026 $A()`); exact/regex: spans.",
+      "description": "Code search: path:line, reasons. RRF (K=60) of BM25 over function bodies, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed; pattern: ast-grep (`$A \u0026\u0026 $A()`); exact/regex: spans.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -577,7 +577,7 @@
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default); see xmustard://docs/tools",
+            "description": "hybrid (default); see DocsURI",
             "enum": [
               "hybrid",
               "text",

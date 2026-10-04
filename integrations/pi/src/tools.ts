@@ -411,7 +411,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the query" },
-			{ name: "mode", type: "string", enum: ["hybrid", "text", "exact", "regex", "pattern", "symbol"], desc: "hybrid (default); see xmustard://docs/tools" },
+			{ name: "mode", type: "string", enum: ["hybrid", "text", "exact", "regex", "pattern", "symbol"], desc: "hybrid (default); see DocsURI" },
 			{ name: "lang", type: "string", maxLength: 256, desc: "pattern: ast-grep hint; else a filter" },
 			{ name: "seed", type: "string", desc: "proximity seed" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits" },

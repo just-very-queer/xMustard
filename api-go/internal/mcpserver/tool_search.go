@@ -30,7 +30,7 @@ var searchTool = &Tool{
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
-		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "exact", "regex", "pattern", "symbol"}, Desc: "hybrid (default); see xmustard://docs/tools"},
+		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "exact", "regex", "pattern", "symbol"}, Desc: "hybrid (default); see DocsURI"},
 		{Name: "lang", Type: typeString, MaxLen: 256, Desc: "pattern: ast-grep hint; else a filter"},
 		{Name: "seed", Type: typeString, Desc: "proximity seed"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits"},
