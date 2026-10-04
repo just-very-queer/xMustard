@@ -177,35 +177,36 @@ func readAtRiskFor(t *testing.T, dir, ws, caller string) ([]AtRiskMemory, bool, 
 }
 
 // WS-29b-r4-6, half one of codex-review:1: a verifier who knows a private proposal's
-// id could call VerifyContextOutcome and get its ContextEntry back. The response is
-// projected metadata (projectEntries renders no content), so the vote records itself
-// and the peer learns the entry's state, revision and tally — never the author's words.
-// A peer is also REQUIRED here: a private proposal is verified by peers or it can
-// never be promoted, so the vote itself cannot be the thing refused.
-func TestAVerifierResponseCarriesNoAnotherPrincipalsContent(t *testing.T) {
+// id could call VerifyContextOutcome and get its ContextEntry back, prose included. A
+// peer is REQUIRED here — a private proposal is verified by peers or it can never be
+// promoted — so the verdict is allowed and must be. Content is never in the projection,
+// but Title, Description and Topic ARE agent-written, and a private proposal's title
+// crossing to the peer that approves it is the same disclosure as its body.
+func TestAVerifierResponseCarriesNoAnotherPrincipalsText(t *testing.T) {
 	dir := multiAgentDir(t)
 	trustRunKeys(t, dir, "agent-a", "verifier-c")
+	const title = "agent-a private plan for the migration"
 	const body = "a proposal only its author may read"
-	theirs := propose(t, dir, "ws-1", "agent-a", "agent-a private proposal", body,
-		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate })
+	theirs := propose(t, dir, "ws-1", "agent-a", title, body,
+		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate; r.Description = "their own notes" })
 
 	got, err := VerifyContextOutcome(dir, "ws-1", theirs.ID, ContextActor{ID: "verifier-c"},
 		VerifyRequest{Outcome: OutcomeApprove, Revision: 1})
 	if err != nil {
 		t.Fatalf("a peer must be able to verify a private proposal, or it can never be promoted: %v", err)
 	}
-	// contextEntryFrom fills Title and Description from the row but never Content, so
-	// the peer reads the entry's identity and its vote tally and not the author's body.
-	// A title is metadata the approval queue needs to exist at all; the words an agent
-	// wrote are the content, and that is what is not here.
-	if got.Content != "" {
-		t.Fatalf("the verify response carried another principal's content: %q", got.Content)
+	if got.Content != "" || got.Title != "" || got.Description != "" || got.Topic != "" {
+		t.Fatalf("the verify response carried another principal's text: content=%q title=%q description=%q topic=%q",
+			got.Content, got.Title, got.Description, got.Topic)
 	}
+	// The vote itself is recorded, and everything a peer needs to record it honestly
+	// stays: without these the answer is not usable and the refusal would have been the
+	// wrong thing to return.
 	if got.ID != theirs.ID || len(got.Verifications) == 0 {
 		t.Fatalf("the verdict was not recorded: %+v", got)
 	}
-	if got.Title != theirs.Title {
-		t.Fatalf("the entry's identity was not returned: title=%q, want %q", got.Title, theirs.Title)
+	if got.Source != "agent-a" || got.Status == "" || got.Revision == 0 {
+		t.Fatalf("the entry's state was withheld from the peer that must vote on it: %+v", got)
 	}
 }
 
