@@ -846,44 +846,6 @@ fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: 
     ack()
 }
 
-/// Writes `byte` to the pty master and returns how many lines the child's log holds after a
-/// **settled** observation, not after the first plateau.
-///
-/// A plateau is not a settle: the wrapper's signal watcher is an ordinary thread, and under
-/// load it can be descheduled for longer than any short quiet interval, so stopping at the
-/// first unchanged count returns before a duplicate relay has been processed — which is the
-/// false green this function exists to avoid. The bound is instead an observation window with
-/// its own convergence rule: the count must hold steady across `SETTLE_QUIET` consecutive
-/// polls, and the window is long enough that a watcher cannot sit on a signal through all of
-/// it, while still ending on a live count so a busy child is not waited on forever. A count
-/// that grows during the window is returned as grown, never as the earlier value.
-const SETTLE_QUIET: usize = 25;
-const SETTLE_POLLS: usize = 300;
-const SETTLE_INTERVAL: Duration = Duration::from_millis(40);
-
-fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: &[u8]) -> usize {
-    master.write_all(byte).unwrap();
-    master.flush().unwrap();
-    let count = || seen(dir).lines().filter(|l| !l.trim().is_empty()).count();
-    let mut stable = 0usize;
-    let mut last = count();
-    for _ in 0..SETTLE_POLLS {
-        thread::sleep(SETTLE_INTERVAL);
-        let now = count();
-        if now == last {
-            stable += 1;
-            if last > 0 && stable >= SETTLE_QUIET {
-                return last;
-            }
-        } else {
-            // It grew (or is still empty), so the previous reading was not the settled one.
-            stable = 0;
-        }
-        last = now;
-    }
-    count()
-}
-
 /// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
 /// terminal is a fresh pty, and returns the wrapper, the pty master and the slave fd. The
 /// child inherits the wrapper's process group, so wrapper and child are the pty's one
