@@ -2066,108 +2066,135 @@ fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
 ///
 /// A caller edge is the DENOMINATOR of a symbol's score, so a score moves when that symbol's
 /// callers change even though nothing about the symbol's own file did. Before this row the
-/// freshness envelope was built from the selected seeds' files and the walked steps, so an
-/// edit to an unselected caller's file left the answer reading `current` while the scores it
-/// reports were computed against the old call graph.
+/// freshness envelope was built from the seeds' files and the walked steps, so an edit to
+/// the file of a caller that never became a seed left the answer claiming `current` while
+/// the scores it reports were computed against the old call graph.
 ///
-/// The mutation that kills this test is precise: remove `candidate_paths` from the dispatch's
-/// path set and the envelope loses the caller's file while every other assertion here still
-/// holds — the seeds, the scores and the flows are unchanged by the edit, because the edit
-/// adds an unrelated symbol. That is what makes this test about the ENVELOPE and not about
-/// the answer: the only thing that can see the difference is the dirty-path list.
+/// **Which callers the envelope was already missing, and how that was found.** The first
+/// version of this fixture used `--limit=1` to drop the caller, and its mutation SURVIVED:
+/// removing `candidate_paths` from the dispatch's path set left the test green
+/// (`logs/ws-38c-b-run-20261004T154624Z.log`, M1). The reason is in `flows.rs`:
+/// `total_paths` is built from `ranked`, which is the scored pool AFTER the
+/// `MAX_CANDIDATES` (200) cut, so a candidate dropped by `--limit` — which lowers that same
+/// cap — is still inside the pool and its file is already in `total_paths`. The test was
+/// asserting something the old code already did.
 ///
-/// So the caller must be a SCORED candidate that was dropped, or it is already in the answer
-/// for another reason. Two things make it one, and both are measured rather than assumed
-/// (`logs/ws-38c-b-run-20261004T151959Z.log`):
+/// What `candidate_paths` actually adds is the callers of scored candidates that fell
+/// OUTSIDE the 200-cap and so never became seeds at all. The fixture below is that shape,
+/// measured before it was written (`logs/ws-38c-b-run-20261004T154824Z.log`):
 ///
-/// 1. **It must IMPORT the package it calls.** A symbol is scored only when it has at least
-///    one RESOLVED callee, and a cross-package call does not resolve without an import. The
-///    earlier draft of this fixture built the caller with [`gofuncs_ref`], which emits
-///    `package pkg` and no import, so `caller/entry.go`'s edge to `pkg/target.go` never bound:
-///    the answer reported `candidates: 1`, `Caller` was never scored, its file never entered
-///    `candidate_paths`, and the test failed on correct code. The defect was the fixture's.
-/// 2. **`--limit=1` must actually drop it.** `Target` has three resolved callees and one
-///    caller (ratio 1.5, exported, score 3.0); `Caller` has one callee and no callers (ratio
-///    1.0, exported, score 2.0). The cap therefore keeps `Target`, and `dropped_candidates`
-///    is 1.
+/// - 261 symbols score equally at 1.0 (`M0..M260`, a chain), so the 200-cap drops 61 of them
+///   and `dropped_candidates` is 63 in total;
+/// - `Low1` (four resolved callees, no callers, exported: score 8.0) stays a SEED, in
+///   `seed/seed.go`, so the answer reports a score this caller shaped;
+/// - `CallerLow` is the only CALLER of `Low1`. It lives in `caller/entry.go`, has no
+///   resolved callee of its own, and is reached by no walk, because a walk follows CALLEES.
+///
+/// The three properties matter together, and two earlier drafts got them wrong in ways only
+/// a mutation exposed. With `--limit=1`, the caller is still inside the 200-candidate pool,
+/// so `total_paths` already named its file (…T154624Z.log, M1 survived). With the caller and
+/// its own callers sharing `caller/entry.go`, the caller was a seed and `total_paths` named
+/// the file again (…T155419Z.log). With the caller's callers seeded from `bulk/bulk.go`, the
+/// flow seeded at them walked straight into the caller — walks follow CALLEES — and
+/// `total_paths` named it a third time (…T161855Z.log). What `candidate_paths` adds is a
+/// file that is neither a seed's file nor a walked step: reachable only as the CALLER of a
+/// reported seed.
 #[test]
 fn an_unselected_callers_file_marks_the_answer_stale() {
+    // 261 mid symbols, each scoring ABOVE the caller, so the 200-seed cap fills with them
+    // and the caller's own candidacy loses. Two callees per symbol: ratio 2.0, ×2 for
+    // exported = 4.0, against `CallerLow`'s single callee at 2.0.
+    let mut mid = String::from("package pkg\n\n");
+    for i in 0..260 {
+        mid.push_str(&format!(
+            "func M{i}() {{ M{}(); M{}() }}\n",
+            i + 1,
+            i + 2
+        ));
+    }
+    mid.push_str("func M260() {}\nfunc M261() {}\n");
     let d = repo(&[
         GO_MOD,
-        // The import is the load-bearing line: without it `pkg.Target()` does not resolve and
-        // `Caller` is not a candidate at all.
+        ("pkg/mid.go", &mid),
+        // The SEED, in its own file: it is the score whose caller edge is under test. Four
+        // resolved callees and no callers puts it at ratio 4.0, ×2 for exported = 8.0, which
+        // is the top score in the fixture by a wide margin — an earlier draft gave `Low1` a
+        // single callee (score 2.0) and it lost the 200-slot tiebreak to the equally-scored
+        // mid chain, so it was never a seed and the premise assertion failed
+        // (`logs/ws-38c-b-run-20261004T160544Z.log`).
+        (
+            "seed/seed.go",
+            "package seed\n\nfunc Low1() { A(); B(); C(); D() }\nfunc A() {}\nfunc B() {}\nfunc C() {}\nfunc D() {}\n",
+        ),
+        // The CALLER, in its own file, and the ONLY symbol in it. It calls the seed and
+        // nothing else, which is what keeps it out of `total_paths` by BOTH routes:
+        //
+        //  - no seed lives in this file (asserted below), and
+        //  - no walk can reach it, because a walk follows CALLEES from a seed. An earlier
+        //    draft gave the caller's own callers (`C1..C3`) a home in `bulk/bulk.go`, and
+        //    `C1..C3` seed; the flow seeded at them walks straight into `CallerLow`, so
+        //    `caller/entry.go` came back through `total_paths`' flow steps and the mutation
+        //    survived (`logs/ws-38c-b-run-20261004T161855Z.log`, `KILLED=False`).
+        //
+        // So the caller's callers must themselves be non-seeds, or live where no seed points
+        // at them. Three extra callers in a file whose symbols are all unseeded is the shape
+        // that works: `CallerLow` is the only symbol that can call the seed, and nothing
+        // calls `CallerLow` except those unseeded callers.
         (
             "caller/entry.go",
-            "package caller\n\nimport \"example/pkg\"\n\nfunc Caller() { pkg.Target() }\n",
+            "package caller\n\nimport \"example/seed\"\n\nfunc CallerLow() { seed.Low1() }\n",
         ),
+        // The caller's own callers. Each is given many callees of its own so it scores well
+        // BELOW the 200-cap's fill, which is what keeps `caller/entry.go` seed-free: score is
+        // `callees / (callers + 1)` x 2 for exported, so one callee and four callers is 0.4
+        // against the mid chain's 4.0. Making the caller the low-scoring side is not a
+        // workaround: a caller edge IS the denominator, so the symbol that shapes a score
+        // without being one is exactly the case r4-4 is about.
         (
-            "pkg/target.go",
-            &gofuncs_ref(&[
-                go_func("Target", &["T1", "T2", "T3"]),
-                go_func("T1", &[]),
-                go_func("T2", &[]),
-                go_func("T3", &[]),
-            ]),
+            "bulk/bulk.go",
+            "package bulk\n\nimport \"example/caller\"\n\nfunc C1() { caller.CallerLow(); D1(); D2(); D3(); D4() }\nfunc C2() { caller.CallerLow(); E1(); E2(); E3(); E4() }\nfunc C3() { caller.CallerLow(); F1(); F2(); F3(); F4() }\nfunc D1() {}\nfunc D2() {}\nfunc D3() {}\nfunc D4() {}\nfunc E1() {}\nfunc E2() {}\nfunc E3() {}\nfunc E4() {}\nfunc F1() {}\nfunc F2() {}\nfunc F3() {}\nfunc F4() {}\n",
         ),
     ]);
     build(d.path());
-    // Both are scored before the cap, which is the premise the whole test rests on: if
-    // `Caller` were not a candidate its file would never be in `candidate_paths` and the
-    // envelope assertion below would prove nothing.
-    let all = flows(d.path(), &[]);
-    assert_eq!(
-        all["candidates"].as_u64(),
-        Some(2),
-        "both Target and Caller are scored candidates: {all:#}"
-    );
-    // One seed only: the cap keeps the higher-scoring candidate and drops the caller —
-    // asserted, because if both were seeds the test would prove nothing.
-    let seeded = flows(d.path(), &["--limit=1"]);
-    let names: Vec<String> = read_seeds(&seeded).into_iter().map(|s| s.name).collect();
-    assert_eq!(
-        names,
-        vec!["Target".to_string()],
-        "the cap keeps the higher-scoring candidate and drops the caller: {seeded:#}"
-    );
-    assert_eq!(
-        truncation(&seeded).get("dropped_candidates").copied(),
-        Some(1),
-        "the caller really is the dropped candidate: {seeded:#}"
-    );
     let before = flows(d.path(), &[]);
-    // The envelope has no `stale` boolean: staleness is `freshness.status`, and a result that
-    // says `"status": "current"` is the honest reading of a freshly built answer. Asserting a
-    // field that does not exist would compare `None` against `Some(false)` and fail on a
-    // correct answer, so the status string is the field under test.
+    // The premises, asserted because without any one of them the envelope assertion below
+    // would hold for a reason this row's code is not responsible for.
+    let t = truncation(&before);
+    assert!(
+        t.get("dropped_candidates").copied().unwrap_or(0) > 0,
+        "the 200-seed cap really dropped candidates: {before:#}"
+    );
+    assert!(
+        read_seeds(&before).iter().any(|s| s.name == "Low1"),
+        "Low1 is a reported seed, so the answer has a score this caller shaped: {before:#}"
+    );
+    assert!(
+        !read_seeds(&before).iter().any(|s| s.path == "caller/entry.go"),
+        "no seed lives in the caller's file, which is what makes the file envelope-only: {before:#}"
+    );
+    // The envelope has no `stale` boolean and `status` describes the indexed commit's
+    // relation to HEAD, so it stays `current` across an uncommitted edit. Dirtiness is
+    // reported by NAMING the path, and that list is the field r4-4 widens.
     assert_eq!(
         before["freshness"]["status"].as_str(),
         Some("current"),
         "a freshly built answer is current: {before:#}"
     );
-    // Edit the CALLER's file only: `Target` itself is untouched, and the added symbol has no
-    // edge at all, so nothing about any score changes — only which files shaped them. The
-    // import stays, so the caller keeps its one resolved callee and its score.
+    // Edit the CALLER's file only: `Low1` is untouched and the added symbol has no edge at
+    // all, so nothing about any score changes — only which files shaped them.
     write(
         d.path(),
         "caller/entry.go",
-        "package caller\n\nimport \"example/pkg\"\n\nfunc Caller() { pkg.Target() }\nfunc CallerUnrelated() {}\n",
+        "package caller\n\nimport \"example/seed\"\n\nfunc CallerLow() { seed.Low1() }\nfunc CallerX() {}\n",
     );
     let after = flows(d.path(), &[]);
-    // The envelope reports a dirty result PATH, not a boolean: `status` describes the indexed
-    // commit's relation to HEAD and stays `current` for an uncommitted edit, so the envelope
-    // names the caller's file instead. That list is the field r4-4 widens, and naming the
-    // caller here is what a mutation on `candidate_paths` removes.
-    assert_eq!(
-        after["freshness"]["status"].as_str(),
-        Some("current"),
-        "an uncommitted edit does not move the indexed commit, so status stays current: {after:#}"
-    );
     let dirty = after["freshness"]["dirty_paths_touching_result"]
         .as_array()
         .unwrap_or_else(|| panic!("{after:#}"));
     assert!(
         dirty.iter().any(|p| p == "caller/entry.go"),
-        "the caller's own file is named in the envelope: {dirty:?} in {after:#}"
+        "the caller's own file is named in the envelope, and nothing but `candidate_paths` \
+         puts it there: {dirty:?} in {after:#}"
     );
     // The scores are unchanged, which is the point: the envelope reports that files these
     // scores were computed against moved, not that the scores moved.
