@@ -285,6 +285,17 @@ cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \
 	&& cmp "$PRISTINE/delivery.ts" "$DLV" && cmp "$PRISTINE/index.ts" "$IDX" \
 	&& cmp "$PRISTINE/run_wrapper.rs" "$RUST" \
 	&& echo "TREE_CLEAN=yes" || echo "TREE_CLEAN=no"
+
+# The restored sources are byte-identical to the ones this run started from, but the
+# COMPILED artefacts are not: cargo judged them fresh by mtime while they were built
+# from mutated sources, so a later gate in the same box copy would run the mutated
+# binary and report a defect that is not in the tree. Measured on the box: two BOXALLs
+# on this row failed `the_wrapper_default_api_is_the_one_the_adapter_refuses_against`
+# with `left: "http://127.0.0.1:9999"` — the M43 mutation value — while the worktree
+# read 8042 and `git status` was clean. Touching the sources forward is enough; the
+# next build recompiles from the restored bytes.
+touch "$SRC" "$CFG" "$DLV" "$IDX" "$RUST"
+echo "BUILD_CACHE_INVALIDATED=yes"
 rm -rf "$PRISTINE"
 echo "=== SUMMARY applied=$APPLIED survived=$SURVIVORS not_applied=$NOT_APPLIED"
 # The runner fails when any mutation was skipped or survived, so "all killed" cannot
