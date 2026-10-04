@@ -239,11 +239,15 @@ verification needs distinct principals, and `verify` needs the `verifier` role.
   (reads refresh the index themselves), and the Claude Code hooks add no index hits
   and no syntax report. After the worker's 2-minute idle exit nothing is watched
   until the next call starts a worker.
-- **Each refresh batch scans the tree.** A batch's `index update --paths` still runs
-  `git ls-files -s` and stats every tracked file: 16 to 23 ms at 5,000 tracked
-  files and 114 to 153 ms at 50,000 on the Linux build box
-  ([WS-15 record](plans/2026-09-25-parity-build-plan.md#ws-15--watcher-incremental-refresh-loop-and-identity-unification)).
-  The Go identity cache still validates with its own stat walk.
+- **Some refresh batches still list the tree.** A batch's `index update --paths`
+  reads only the named paths and their stored rows when it can prove the result equals
+  a full build's (WS-RT6). On the build box's 1M-path fixture, a one-file batch took
+  0.02 to 0.34 s with no listing, against 3.0 to 3.8 s before
+  ([WS-RT6 record](plans/2026-09-25-parity-build-plan.md#ws-rt6--paths-only-update-no-full-listing-on-refresh)).
+  It still runs `git ls-files -s` and stats every tracked file after a HEAD move or a
+  Git index change, for a full batch, with untracked indexing on, for a renamed or
+  deleted directory, and when a named path moves the envelope's boundary; the report's
+  `listing` says which. The Go identity cache still validates with its own stat walk.
 - **Two packaged client adapters in v0.1.1.** `integrations/pi` and the Claude Code
   plugin (`integrations/claude-code`). After v0.1.1, Codex also gets hooks
   (`integrations/codex`, WS-40a) and OpenCode a plugin (`integrations/opencode`,
