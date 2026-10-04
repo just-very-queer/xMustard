@@ -3,7 +3,8 @@
 # tracked repository (t1m). Per call: the exit code, wall time, xmustard-core's own peak
 # RSS and the tree's peak (Git children included, own_rss.py), and the report fields
 # RT6 reads (mode, listing, pass counters, timing). Box only. The edited files get their
-# bytes back at the end; the index is rebuilt at the start of every run.
+# bytes back on exit, and the run stops at the first call that fails; the code index is
+# rebuilt at the start of every run.
 #
 # usage: rt6_measure.sh <t1m_repo> <out_dir> <label>
 # env:   XMUSTARD_CORE_BIN (release binary of the build being measured)
@@ -26,6 +27,10 @@ c() {
   local o=$OUT/$LABEL.$call.json
   local m
   m=$(python3 "$HERE/own_rss.py" "$o" 300 "$@")
+  case $m in
+    *'"rc": 0,'*) ;;
+    *) echo "call_failed $LABEL $call: $m" >&2; exit 1 ;;
+  esac
   python3 - "$LABEL" "$call" "$m" "$o" >> "$ROWS" <<'PY'
 import json, sys
 label, call, m, path = sys.argv[1:5]
@@ -47,7 +52,15 @@ for f in "$INSIDE" "$PAST" "$DOC"; do
   mkdir -p "$SAVE/$(dirname "$f")"
   cp "$R/$f" "$SAVE/$f"
 done
-rm -rf "$R/.git/xmustard-cache" "$R/$NEW"
+restore() {
+  for f in "$INSIDE" "$PAST" "$DOC"; do
+    cp "$SAVE/$f" "$R/$f"
+  done
+  rm -f "$R/$NEW"
+}
+trap restore EXIT
+# only the code index this script measures; other caches under the Git dir stay
+rm -rf "$R/.git/xmustard-cache/index-v3" "$R/$NEW"
 c build "$CORE" index build "$R"
 c update-tree "$CORE" index update "$R"
 printf '// rt6 edit\n' >> "$R/$INSIDE"
@@ -60,8 +73,4 @@ c paths-doc "$CORE" index update "$R" --paths "$DOC"
 printf 'package p\n\nfunc RT6New() int { return 6 }\n' > "$R/$NEW"
 c paths-untracked "$CORE" index update "$R" --paths "$NEW"
 c update-tree-after "$CORE" index update "$R"
-for f in "$INSIDE" "$PAST" "$DOC"; do
-  cp "$SAVE/$f" "$R/$f"
-done
-rm -f "$R/$NEW"
 echo "run_done $LABEL"
