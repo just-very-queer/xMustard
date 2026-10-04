@@ -542,14 +542,14 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 //
 // The copy guard's two windows are warm, and that is measured rather than assumed: an
 // unwarmed Apply also pays for the heap's growth into this working set, and that cost
-// lands on whichever fixture is measured first. Cold, over 12 runs, the difference spans
-// -14,688 to +2,456 bytes (logs/ws-flk-09-run-20261003T213617Z.log); warm, over 12 runs
-// it spans 41 to 1,637 (logs/ws-flk-09-run-20261003T214246Z.log). So the earliest Apply
-// here is measured separately and held to WorkingSet, because WorkingSet is what a
-// caller admits before its own first call. It is the earliest call in this test, not the
-// earliest in the process: the package's other tests call Apply before it, so under a
-// full run the figure is a warmed one wearing a colder label. Both readings stay inside
-// the same line, which is the point.
+// lands on whichever fixture is measured first. Cold, over 12 runs, the steady-state
+// difference spans wider than warm (logs/ws-flk-09-run-20261003T213617Z.log and
+// -20261003T214246Z.log). The earliest Apply is measured separately and its copying is
+// checked by the same differential, so the first call is held to a measured band rather
+// than to the absolute len(raw)/4 line it used to be held to: that line read one
+// process-wide counter and went red under load on an unchanged tree. It is the earliest
+// call in this test, not the earliest in the process: the package's other tests call
+// Apply first, so under a full run the figure is a warmed one wearing a colder label.
 const (
 	allocPadBytes  = 400
 	allocProbeRuns = 8
@@ -587,6 +587,22 @@ func steadyOf(t *testing.T, raw []byte, req Request) int64 {
 	return sum / allocProbeRuns
 }
 
+// pairedOf is the first-call copy guard's measurement: it allocates for the wide result
+// and for the narrow one allocProbeRuns times and returns the average of the per-pair
+// differences. A copy is proportional to the result's bytes, so it lands in every pair's
+// difference; an unrelated allocation inside one window lands in one pair only, which is
+// what averaging is for. A single pair per fixture (one narrow sample, one wide sample)
+// is not enough: on a loaded host one allocation of more than copyAllowance inside the
+// wide window alone can push a single-sample difference over the line on unchanged code.
+func pairedOf(t *testing.T, narrow, wide []byte, req Request) int64 {
+	t.Helper()
+	var sum int64
+	for i := 0; i < allocProbeRuns; i++ {
+		sum += allocOf(t, wide, req, false) - allocOf(t, narrow, req, false)
+	}
+	return sum / allocProbeRuns
+}
+
 func TestApplyDoesNotCopyTheResult(t *testing.T) {
 	req := Request{MaxChars: DefaultMaxChars}
 	narrow := mustJSON(groundResult(2000, 20000, 50, 5))
@@ -596,35 +612,52 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 			len(wide), len(narrow))
 	}
 
-	// The first Apply this test makes is the one a caller's WorkingSet has to cover, so
-	// it is read before this test's own copy measurement and asserted on its own: the
-	// result plus that call's allocations must fit in what the API admits. Its line is
-	// the one Apply has always had to meet for a single call, len(raw)/4, unchanged by
-	// this row.
-	coldAlloc := allocOf(t, narrow, req, false)
-	if coldAlloc > int64(len(narrow))/4 {
-		t.Fatalf("this test's first Apply call allocated %d bytes for a %d-byte result; it must not copy the result",
-			coldAlloc, len(narrow))
-	}
-	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+coldAlloc {
-		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d)",
-			ws, len(narrow), coldAlloc)
-	}
-
 	// A copy is bytes; the element tables and the output are not. Everything the wide
 	// result adds is padding inside elements Apply never copies, so its allocation must
 	// stay within the same small allowance as the narrow one's. The allowance covers what
 	// the two windows do not have in common, not the copy: a copy of either result is
 	// about 8.8 MB (the slop audit's S5 rows).
 	const copyAllowance = 8 << 10
+
+	// A caller's first Apply must be covered by WorkingSet, so the very first Apply this
+	// test makes is measured on its own, before anything else in the test calls Apply.
+	firstNarrow := allocOf(t, narrow, req, false)
+
+	// The first call's allocation is not held to the absolute len(raw)/4 line: that reads
+	// the process-wide counter across one call, and under box load that window crosses
+	// the line on an unchanged tree (the flake this row replaces). Instead the first
+	// call's *copying* is what is checked, by the same difference the steady-state guard
+	// uses: the same result budgeted narrow and wide, which have identical structure and
+	// element counts and differ only in element bytes. A copy is proportional to the
+	// result's bytes and so lands in the difference; the element tables and the output do
+	// not. pairedOf averages the differences so that one unrelated allocation inside one
+	// window cannot decide the check on a loaded host; the first pair it takes is the
+	// coldest, which keeps the cold first-call coverage the steady-state guard lacks.
+	firstCopied := pairedOf(t, narrow, wide, req)
+	if firstCopied > copyAllowance {
+		t.Fatalf("Apply allocated %d more bytes on its first calls for a %d-byte result than for a %d-byte one with the same %d list elements;"+
+			" it must not copy the result", firstCopied, len(wide), len(narrow), 40050)
+	}
+	// The same process-wide counter must not appear on its own anywhere in this test, so
+	// the WorkingSet coverage check reads it through the same measured allowance the copy
+	// guard admits: the admitted set has to cover the result plus what one call allocates,
+	// and one call's allocation is read here with copyAllowance of measured noise rather
+	// than against an absolute limit a loaded box can cross. The headroom this leaves is
+	// about 43 KB, so the allowance is a tenth of it and does not blunt what the check is
+	// for: that WorkingSet covers a real call's allocations and not just its own formula.
+	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+firstNarrow+copyAllowance {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d) within the %d-byte allowance",
+			ws, len(narrow), firstNarrow, copyAllowance)
+	}
+
 	copied := steadyOf(t, wide, req) - steadyOf(t, narrow, req)
 	if copied > copyAllowance {
 		t.Fatalf("Apply allocated %d more bytes for a %d-byte result than for a %d-byte one with the same %d list elements;"+
 			" it must not copy the result", copied, len(wide), len(narrow), 40050)
 	}
-	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: %d bytes apart steady-state (allowance %d);"+
-		" first call %d bytes against its %d-byte line; WorkingSet %d",
-		len(narrow), len(wide), copied, copyAllowance, coldAlloc, len(narrow)/4, WorkingSet(narrow, req))
+	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: first call %d bytes apart, steady-state %d bytes apart (allowance %d);"+
+		" first call on the narrow result %d bytes; WorkingSet %d",
+		len(narrow), len(wide), firstCopied, copied, copyAllowance, firstNarrow, WorkingSet(narrow, req))
 }
 
 // Result bytes are copied through exactly, whitespace and escapes included.

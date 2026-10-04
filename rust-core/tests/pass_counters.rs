@@ -182,7 +182,7 @@ fn the_cli_reports_the_calls_counters_last() {
 fn an_array_result_carries_no_counters() {
     let r = three_go_files();
     let out = Command::new(BIN)
-        .args(["scan-signals", r.path().to_str().unwrap()])
+        .args(["ownership", "subsystems", r.path().to_str().unwrap(), "ws"])
         .output()
         .unwrap();
     assert!(out.status.success());

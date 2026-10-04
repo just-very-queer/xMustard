@@ -161,7 +161,7 @@ fn main() {
 fn scan_signals(mut args: Args) -> CmdResult {
     let root = need(&mut args, "xmustard-core scan-signals <root_path>")?;
     match xmustard_core::scanner::scan_repo_signals(&PathBuf::from(root)) {
-        Ok(signals) => json(&signals),
+        Ok(scan) => json(&scan),
         Err(err) => Err(CmdError::failed(format!("scan-signals failed: {err}"))),
     }
 }

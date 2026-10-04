@@ -46,6 +46,33 @@ func replyRefused(err error) (map[string]any, *rpcError) { return mcpserver.Repl
 
 func mcpText(text string, isError bool) map[string]any { return mcpserver.TextResult(text, isError) }
 
+// registerCwdWhenRootsUnknown reads the WS-FIX-15b opt-in. It is off unless the
+// variable is set to 1: an unset or empty value must not register, which is why
+// this is `== "1"` and not the `!= "0"` its neighbours use.
+func registerCwdWhenRootsUnknown() bool {
+	return strings.TrimSpace(os.Getenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN")) == "1"
+}
+
+// stdioOptions is the shim's one Options value. It is a function rather than an
+// inline literal in the package-level var below because the WS-FIX-15b opt-in must be
+// observable end to end: a test that only exercised the parse and the resolver could not
+// fail if this wiring were deleted, which is the one way the env variable could stop
+// reaching the server while every other test stayed green.
+func stdioOptions() mcpserver.Options {
+	return mcpserver.Options{
+		Backend:                     backend,
+		Delivery:                    evidence,
+		Resources:                   evidence,
+		Cwd:                         workingDir(),
+		AutoRegister:                strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
+		RegisterCwdWhenRootsUnknown: registerCwdWhenRootsUnknown(),
+		HomeDir:                     homeDir(),
+		Schema:                      schemaProfile,
+		// initialize appends the workspace's standing memory (WS-31)
+		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
+	}
+}
+
 // One stdio process is one MCP session.
 var (
 	backend = &mcpserver.HTTPBackend{}
@@ -53,17 +80,7 @@ var (
 	// XMUSTARD_MCP_SCHEMA=full also lists the advanced arguments (default lean);
 	// an invalid value stops the server in main.
 	schemaProfile, schemaErr = mcpserver.ParseSchemaProfile(os.Getenv("XMUSTARD_MCP_SCHEMA"))
-	session                  = mcpserver.New(mcpserver.Options{
-		Backend:      backend,
-		Delivery:     evidence,
-		Resources:    evidence,
-		Cwd:          workingDir(),
-		AutoRegister: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_AUTO_REGISTER")) != "0",
-		HomeDir:      homeDir(),
-		Schema:       schemaProfile,
-		// initialize appends the workspace's standing memory (WS-31)
-		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
-	}).NewSession(client)
+	session                  = mcpserver.New(stdioOptions()).NewSession(client)
 )
 
 func workingDir() string {

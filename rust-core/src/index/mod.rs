@@ -60,6 +60,7 @@ pub mod meta;
 pub mod namepath;
 pub mod names;
 pub mod overview;
+pub mod paths_scope;
 pub mod reader;
 pub mod refresh_queue;
 pub mod rerank;
@@ -82,7 +83,8 @@ use sha2::{Digest, Sha256};
 
 use config::{ContentRetention, IndexConfig};
 use facts::{FileFacts, file_flag};
-use scan::{Candidate, Scan};
+use paths_scope::{Listing, ListingReason};
+use scan::{Candidate, Layout, Scan};
 use writer::{FileRecord, Writer};
 
 pub const INDEX_DIR_NAME: &str = "index-v3";
@@ -168,6 +170,9 @@ pub struct IndexReport {
     pub content_retention: String,
     pub counters: Counters,
     pub coverage: meta::Coverage,
+    /// Whether the run listed the tree or decided a batch from its paths, and why
+    /// (WS-RT6).
+    pub listing: Listing,
     /// Wall-clock timings; the only nondeterministic fields of the report.
     pub timing: Timing,
 }
@@ -593,6 +598,13 @@ fn set_meta_common(
 fn set_scan_meta(conn: &Connection, scan: &Scan) -> rusqlite::Result<()> {
     let beyond = serde_json::to_string(&scan.beyond).unwrap_or_default();
     let sample = serde_json::to_string(&scan.beyond_sample).unwrap_or_default();
+    let nested = serde_json::to_string(&scan.nested_repos).unwrap_or_default();
+    if let Some(state) = &scan.listing_state {
+        let state = serde_json::to_string(state).unwrap_or_default();
+        if meta::get(conn, meta::LISTING_STATE)?.as_deref() != Some(state.as_str()) {
+            meta::set(conn, meta::LISTING_STATE, &state)?;
+        }
+    }
     for (k, v) in [
         ("last_commit", scan.head.clone()),
         ("ignored_files", scan.ignored.to_string()),
@@ -604,6 +616,7 @@ fn set_scan_meta(conn: &Connection, scan: &Scan) -> rusqlite::Result<()> {
         ("worktree_deleted", scan.worktree_deleted.to_string()),
         (meta::BEYOND, beyond),
         (meta::BEYOND_SAMPLE, sample),
+        (meta::NESTED_REPOS, nested),
     ] {
         if meta::get(conn, k)?.as_deref() != Some(v.as_str()) {
             meta::set(conn, k, &v)?;
@@ -653,6 +666,7 @@ fn report(
         content_retention: cfg.content_retention.as_str().into(),
         counters,
         coverage,
+        listing: Listing::tree(ListingReason::Rebuild),
         timing,
     }
 }
@@ -984,26 +998,37 @@ struct Existing {
 
 /// `index update [--paths ...]`: bring the index to the working tree, incrementally
 /// when possible. With `paths` (a watcher's batch), only those files are read for
-/// changes; files the envelope admits or drops and rows the scan no longer lists are
-/// handled either way, so the result equals a full build whenever the batch names every
-/// changed file.
+/// changes, and the result equals a full build whenever the batch names every changed
+/// file. A batch is decided from its paths and their stored rows alone when
+/// `paths_scope` proves that equality (WS-RT6); otherwise the tree is listed, files the
+/// envelope admits or drops and rows the listing no longer has are handled whatever the
+/// batch names, and `listing` says why.
 pub fn update(
     root: &Path,
     cfg: &IndexConfig,
     paths: Option<&[String]>,
 ) -> Result<IndexReport, String> {
     let t0 = Instant::now();
-    let (scan, dir, _lock, scan_ms) = locked_scan(root, cfg)?;
-    let final_path = dir.join(DB_FILE);
-    let full = |scan: Scan, reason: &str, counters: Counters| {
+    let layout = scan::layout(root, cfg)?;
+    let dir = index_dir(&layout.root, layout.git_dir.as_deref(), cfg);
+    // a writer that waited for the lock reads the tree as the previous writer left it
+    let _lock = lock(&dir, cfg.index_dir.is_some())?;
+    let list = || -> Result<(Scan, u64), String> {
+        let t = Instant::now();
+        let scan = scan::scan(&layout, cfg)?;
+        Ok((scan, t.elapsed().as_millis() as u64))
+    };
+    let rebuild = |reason: &str, counters: Counters| {
+        let (scan, scan_ms) = list()?;
         full_build(scan, cfg, &dir, "update", reason, counters, t0, scan_ms)
     };
+    let final_path = dir.join(DB_FILE);
     if !final_path.exists() {
-        return full(scan, "no_index", Counters::default());
+        return rebuild("no_index", Counters::default());
     }
     let conn = match Connection::open(&final_path) {
         Ok(c) => c,
-        Err(_) => return full(scan, "unreadable_index", Counters::default()),
+        Err(_) => return rebuild("unreadable_index", Counters::default()),
     };
     let reason =
         match schema::configure_durable(&conn).and_then(|_| full_rebuild_reason(&conn, cfg)) {
@@ -1013,16 +1038,55 @@ pub fn update(
         };
     if let Some(reason) = reason {
         drop(conn);
-        return full(scan, reason, Counters::default());
+        return rebuild(reason, Counters::default());
     }
-    // a damaged page found mid-update (the dirty flag is still set) is replaced by a
-    // full rebuild rather than failing every later update.
-    match incremental(conn, &scan, cfg, &dir, paths, t0, scan_ms) {
-        Ok(Step::Done(r)) => Ok(*r),
-        Ok(Step::Rebuild(reason, counters)) => full(scan, reason, *counters),
-        Err(e) if e.starts_with(CORRUPT_ERROR) => full(scan, "corrupt_index", Counters::default()),
-        Err(e) => Err(e),
+    let mut decided = match paths {
+        Some(p) => scoped_or_listing(&conn, &layout, cfg, p)?,
+        None => Err(ListingReason::NoPaths),
+    };
+    loop {
+        let (scan, scan_ms, rows, listing) = match decided {
+            Ok((scoped, scan_ms)) => (scoped.scan, scan_ms, Some(scoped.rows), Listing::paths()),
+            Err(reason) => {
+                let (scan, scan_ms) = list()?;
+                (scan, scan_ms, None, Listing::tree(reason))
+            }
+        };
+        // a damaged page found mid-update (the dirty flag is still set) is replaced by a
+        // full rebuild rather than failing every later update.
+        match incremental(&conn, &scan, cfg, &dir, paths, rows, t0, scan_ms) {
+            Ok(Step::Done(mut r)) => {
+                r.listing = listing;
+                return Ok(*r);
+            }
+            Ok(Step::Relist(reason)) => decided = Err(reason),
+            Ok(Step::Rebuild(reason, counters)) => {
+                drop(conn);
+                return match scan.only {
+                    None => full_build(scan, cfg, &dir, "update", reason, *counters, t0, scan_ms),
+                    Some(_) => rebuild(reason, *counters),
+                };
+            }
+            Err(e) if e.starts_with(CORRUPT_ERROR) => {
+                drop(conn);
+                return rebuild("corrupt_index", Counters::default());
+            }
+            Err(e) => return Err(e),
+        }
     }
+}
+
+/// A batch decided from its paths (with the time that took), or why the tree must be
+/// listed (WS-RT6).
+fn scoped_or_listing(
+    conn: &Connection,
+    layout: &Layout,
+    cfg: &IndexConfig,
+    paths: &[String],
+) -> Result<Result<(paths_scope::Scoped, u64), ListingReason>, String> {
+    let t = Instant::now();
+    let scoped = paths_scope::scope(conn, layout, cfg, paths)?;
+    Ok(scoped.map(|s| (s, t.elapsed().as_millis() as u64)))
 }
 
 fn normalize_paths(root: &Path, paths: &[String]) -> HashSet<String> {
@@ -1042,10 +1106,12 @@ fn normalize_paths(root: &Path, paths: &[String]) -> HashSet<String> {
         .collect()
 }
 
-/// Outcome of the in-place path: finished, or a full rebuild is needed.
+/// Outcome of the in-place path: finished, a full rebuild is needed, or a batch decided
+/// from its paths turned out to need the tree listed (nothing was written for it).
 enum Step {
     Done(Box<IndexReport>),
     Rebuild(&'static str, Box<Counters>),
+    Relist(ListingReason),
 }
 
 /// One file in the symbol-budget plan.
@@ -1118,11 +1184,12 @@ fn symbol_count(
 
 #[allow(clippy::too_many_arguments)]
 fn incremental(
-    conn: Connection,
+    conn: &Connection,
     scan: &Scan,
     cfg: &IndexConfig,
     dir: &Path,
     paths: Option<&[String]>,
+    rows: Option<HashMap<String, Existing>>,
     t0: Instant,
     scan_ms: u64,
 ) -> Result<Step, String> {
@@ -1130,38 +1197,19 @@ fn incremental(
     let filter = paths.map(|p| normalize_paths(&scan.root, p));
     let considered = |p: &str| filter.as_ref().is_none_or(|f| f.contains(p));
 
-    // every stored row: bounded by the scan's row bound (max_files + MAX_LOSS_ROWS).
-    let mut existing: HashMap<String, Existing> = HashMap::new();
-    {
-        let mut st = conn
-            .prepare(
-                "SELECT id, path, content_hash, parse_status, lang, stat_key, flags, fact_symbols
-                 FROM files",
-            )
-            .map_err(sql_err)?;
-        let rows = st
-            .query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(1)?,
-                    Existing {
-                        id: r.get(0)?,
-                        content_hash: r.get(2)?,
-                        parse_status: r.get(3)?,
-                        lang: r.get(4)?,
-                        stat_key: r.get(5)?,
-                        flags: r.get(6)?,
-                        fact_symbols: r.get(7)?,
-                    },
-                ))
-            })
-            .map_err(sql_err)?;
-        for row in rows {
-            let (p, e) = row.map_err(sql_err)?;
-            existing.insert(p, e);
-        }
-    }
-    let db_total = existing.len();
-    crate::passcount::note(crate::passcount::Pass::RowsLoaded, db_total as u64);
+    // a listed tree compares every stored row (bounded by the scan's row bound,
+    // max_files + MAX_LOSS_ROWS); a batch decided alone brings its own rows.
+    let partial = scan.only.is_some();
+    let existing = match rows {
+        Some(rows) => rows,
+        None => load_rows(conn)?,
+    };
+    let db_total = if partial {
+        conn.query_row("SELECT count(*) FROM files", [], |r| r.get::<_, i64>(0))
+            .map_err(sql_err)? as usize
+    } else {
+        existing.len()
+    };
 
     // ---- classify without extracting: trusted unchanged stat keys skip the read; other
     // files are identified by hashing (or by the same read failure as before). Envelope
@@ -1241,7 +1289,7 @@ fn incremental(
     }
     // docs are compared by stat key whatever the batch names: they have no edges, so a
     // doc change rewrites only its own rows and never needs a new generation.
-    counters.docs = docs::sync(&conn, scan, cfg.content_retention).map_err(sql_err)?;
+    counters.docs = docs::sync(conn, scan, cfg.content_retention).map_err(sql_err)?;
     // a row the scan no longer lists is gone from the tree or past the envelope; either
     // way it goes, batch or not.
     let mut deleted: Vec<(String, i64)> = existing
@@ -1252,9 +1300,9 @@ fn incremental(
     deleted.sort();
 
     if changed.is_empty() && deleted.is_empty() {
-        set_scan_meta(&conn, scan).map_err(sql_err)?;
-        let segment_ms = ensure_segment_locked(&conn, dir)?;
-        let coverage = meta::coverage(&conn, cfg).map_err(sql_err)?;
+        set_scan_meta(conn, scan).map_err(sql_err)?;
+        let segment_ms = ensure_segment_locked(conn, dir)?;
+        let coverage = meta::coverage(conn, cfg).map_err(sql_err)?;
         let timing = Timing {
             elapsed_ms: t0.elapsed().as_millis() as u64,
             scan_ms,
@@ -1272,13 +1320,13 @@ fn incremental(
         ))));
     }
 
-    let generation = meta::get(&conn, "generation")
+    let generation = meta::get(conn, "generation")
         .map_err(sql_err)?
         .and_then(|g| g.parse::<i64>().ok())
         .unwrap_or(0)
         + 1;
     let cache = FactCache {
-        conn: &conn,
+        conn,
         old: None,
         generation,
         reuse: cfg.use_fact_cache,
@@ -1291,14 +1339,35 @@ fn incremental(
     // push the total past it. ----
     let changed_paths: HashSet<&str> = changed.iter().map(|c| c.path.as_str()).collect();
     let deleted_paths: HashSet<&str> = deleted.iter().map(|(p, _)| p.as_str()).collect();
-    let retained = existing.iter().filter(|(p, _)| {
-        !changed_paths.contains(p.as_str()) && !deleted_paths.contains(p.as_str())
-    });
-    let (mut stored_total, mut any_stripped) = (0usize, false);
-    for (_, e) in retained.clone() {
-        if meta::INDEXED_STATUSES.contains(&e.parse_status.as_str()) {
-            stored_total += e.fact_symbols.max(0) as usize;
-            any_stripped |= e.flags & file_flag::SYMBOL_BUDGET != 0;
+    let rewritten = |p: &str| changed_paths.contains(p) || deleted_paths.contains(p);
+    let symbols_of = |e: &Existing| {
+        let indexed = meta::INDEXED_STATUSES.contains(&e.parse_status.as_str());
+        (
+            if indexed {
+                e.fact_symbols.max(0) as usize
+            } else {
+                0
+            },
+            indexed && e.flags & file_flag::SYMBOL_BUDGET != 0,
+        )
+    };
+    // the retained rows' symbols: every row's (from SQL when only the batch's rows are
+    // loaded) less the rewritten ones. A rewritten row's strip flag still counts in the
+    // partial case, which only makes the exact plan below run.
+    let (mut stored_total, mut any_stripped) = if partial {
+        stored_symbol_totals(conn).map_err(sql_err)?
+    } else {
+        (0, false)
+    };
+    for (p, e) in &existing {
+        let (n, stripped) = symbols_of(e);
+        match (partial, rewritten(p)) {
+            (true, true) => stored_total = stored_total.saturating_sub(n),
+            (false, false) => {
+                stored_total += n;
+                any_stripped |= stripped;
+            }
+            _ => {}
         }
     }
     let worst_case = changed
@@ -1307,7 +1376,15 @@ fn incremental(
         .saturating_add(stored_total);
     let mut keep_of: HashMap<String, bool> = HashMap::new();
     let mut rebudget: Vec<&Candidate> = Vec::new();
+    let all_rows;
     if any_stripped || worst_case > cfg.max_symbols {
+        let every = if partial {
+            all_rows = load_rows(conn)?;
+            &all_rows
+        } else {
+            &existing
+        };
+        let retained = every.iter().filter(|(p, _)| !rewritten(p));
         let mut entries: BTreeMap<&str, PlanEntry> = BTreeMap::new();
         for (p, e) in retained {
             entries.insert(
@@ -1344,10 +1421,15 @@ fn incremental(
                     keep_of.insert(path.to_string(), keep);
                 }
                 Some(stored) if stored != keep && e.symbols > 0 => {
-                    // the boundary moved over an unchanged file: rewrite it too.
-                    if let Some(c) = cand_of.get(path) {
-                        keep_of.insert(path.to_string(), keep);
-                        rebudget.push(c);
+                    // the boundary moved over an unchanged file: rewrite it too (a batch
+                    // decided alone has no candidate for it, so the tree is listed).
+                    match cand_of.get(path) {
+                        Some(c) => {
+                            keep_of.insert(path.to_string(), keep);
+                            rebudget.push(c);
+                        }
+                        None if partial => return Ok(Step::Relist(ListingReason::SymbolBudget)),
+                        None => {}
                     }
                 }
                 Some(_) => {}
@@ -1359,7 +1441,6 @@ fn incremental(
     let write_set = changed.len() + rebudget.len() + deleted.len();
     let total = db_total.max(scan.candidates.len());
     if write_set * 2 > total && write_set >= ESCALATE_MIN_FILES {
-        drop(conn);
         let c = Counters {
             escalated: true,
             ..Default::default()
@@ -1368,7 +1449,7 @@ fn incremental(
     }
 
     // ---- apply in place under the dirty flag ----
-    meta::set(&conn, meta::DIRTY_FLAG, "1").map_err(sql_err)?;
+    meta::set(conn, meta::DIRTY_FLAG, "1").map_err(sql_err)?;
     // what other files' edges read from the rewritten files: export signatures (their
     // difference names the dependents) and symbol ids (remapped by UID).
     let mut deps = resolve::Dependents::default();
@@ -1379,7 +1460,7 @@ fn incremental(
     let mut writes: Vec<&Candidate> = changed.iter().chain(rebudget.iter()).copied().collect();
     writes.sort_by(|a, b| a.path.cmp(&b.path));
     {
-        let mut w = Writer::new(&conn, cfg.content_retention).map_err(sql_err)?;
+        let mut w = Writer::new(conn, cfg.content_retention).map_err(sql_err)?;
         conn.execute_batch("BEGIN").map_err(sql_err)?;
         let mut into_file = conn
             .prepare_cached(
@@ -1387,8 +1468,8 @@ fn incremental(
             )
             .map_err(sql_err)?;
         for (path, id) in &deleted {
-            let before = resolve::signature(&conn, *id).map_err(sql_err)?;
-            deps.note_change(&conn, *id, path, &before, &resolve::Signature::new())
+            let before = resolve::signature(conn, *id).map_err(sql_err)?;
+            deps.note_change(conn, *id, path, &before, &resolve::Signature::new())
                 .map_err(sql_err)?;
             for f in into_file
                 .query_map([id], |r| r.get::<_, i64>(0))
@@ -1396,7 +1477,7 @@ fn incremental(
             {
                 orphaned.insert(f.map_err(sql_err)?);
             }
-            writer::delete_file_rows(&conn, *id, false).map_err(sql_err)?;
+            writer::delete_file_rows(conn, *id, false).map_err(sql_err)?;
             counters.deleted += 1;
             touched_paths.push(path.clone());
         }
@@ -1405,9 +1486,9 @@ fn incremental(
             let prior = existing.get(&cand.path).map(|e| e.id);
             let (before, old_ids) = match prior {
                 Some(id) => {
-                    let before = resolve::signature(&conn, id).map_err(sql_err)?;
-                    let old_ids = resolve::symbol_ids(&conn, id).map_err(sql_err)?;
-                    writer::delete_file_rows(&conn, id, true).map_err(sql_err)?;
+                    let before = resolve::signature(conn, id).map_err(sql_err)?;
+                    let old_ids = resolve::symbol_ids(conn, id).map_err(sql_err)?;
+                    writer::delete_file_rows(conn, id, true).map_err(sql_err)?;
                     (before, old_ids)
                 }
                 None => {
@@ -1430,10 +1511,10 @@ fn incremental(
                 .map_err(sql_err)?;
             counters.written += 1;
             changed_ids.push(fid);
-            let after = resolve::signature(&conn, fid).map_err(sql_err)?;
-            deps.note_change(&conn, fid, &cand.path, &before, &after)
+            let after = resolve::signature(conn, fid).map_err(sql_err)?;
+            deps.note_change(conn, fid, &cand.path, &before, &after)
                 .map_err(sql_err)?;
-            orphaned.extend(resolve::remap_symbol_ids(&conn, fid, &old_ids).map_err(sql_err)?);
+            orphaned.extend(resolve::remap_symbol_ids(conn, fid, &old_ids).map_err(sql_err)?);
             if (i + 1) % BATCH_FILES == 0 {
                 conn.execute_batch("COMMIT; BEGIN").map_err(sql_err)?;
             }
@@ -1462,15 +1543,15 @@ fn incremental(
         }
     }
     for p in &touched_paths {
-        affected.extend(resolve::importers_of(&conn, p).map_err(sql_err)?);
+        affected.extend(resolve::importers_of(conn, p).map_err(sql_err)?);
     }
     let resolve_ids: Vec<i64> = affected.iter().copied().collect();
-    writer::resolve_imports(&conn, Some(&resolve_ids)).map_err(sql_err)?;
-    affected.extend(edges::files_referencing(&conn, &deps.names).map_err(sql_err)?);
+    writer::resolve_imports(conn, Some(&resolve_ids)).map_err(sql_err)?;
+    affected.extend(edges::files_referencing(conn, &deps.names).map_err(sql_err)?);
     affected.extend(&deps.files);
     affected.extend(&orphaned);
-    let defs_after = edges::Definers::load(&conn).map_err(sql_err)?;
-    let mut resolver = resolve::Resolver::new(&conn, &scan.root);
+    let defs_after = edges::Definers::load(conn).map_err(sql_err)?;
+    let mut resolver = resolve::Resolver::new(conn, &scan.root);
     let mut path_of = conn
         .prepare_cached("SELECT path, parse_status FROM files WHERE id = ?1")
         .map_err(sql_err)?;
@@ -1488,7 +1569,7 @@ fn incremental(
             continue;
         }
         counters.edges_written +=
-            edges::rebuild_file_edges(&conn, &defs_after, *fid, &path).map_err(sql_err)?;
+            edges::rebuild_file_edges(conn, &defs_after, *fid, &path).map_err(sql_err)?;
         counters.edges_written += resolver.resolve_file(*fid).map_err(sql_err)?;
         counters.reresolved += 1;
     }
@@ -1497,27 +1578,26 @@ fn incremental(
     drop(path_of);
     let edges_ms = te.elapsed().as_millis() as u64;
 
-    set_meta_common(&conn, scan, cfg, generation).map_err(sql_err)?;
-    let coverage = meta::coverage(&conn, cfg).map_err(sql_err)?;
+    set_meta_common(conn, scan, cfg, generation).map_err(sql_err)?;
+    let coverage = meta::coverage(conn, cfg).map_err(sql_err)?;
     meta::set(
-        &conn,
+        conn,
         "coverage",
         &serde_json::to_string(&coverage).unwrap_or_default(),
     )
     .map_err(sql_err)?;
     meta::set(
-        &conn,
+        conn,
         "last_run",
         &serde_json::to_string(&counters).unwrap_or_default(),
     )
     .map_err(sql_err)?;
-    meta::set(&conn, meta::DIRTY_FLAG, "0").map_err(sql_err)?;
+    meta::set(conn, meta::DIRTY_FLAG, "0").map_err(sql_err)?;
     // the new generation's segment exists before the generation commits
-    let (segment, segment_ms) = write_graph_segment(&conn, dir)?;
+    let (segment, segment_ms) = write_graph_segment(conn, dir)?;
     conn.execute_batch("COMMIT").map_err(sql_err)?;
     csr::sweep_segments(dir, &segment);
-    gc_fact_cache(&conn).map_err(sql_err)?;
-    drop(conn);
+    gc_fact_cache(conn).map_err(sql_err)?;
     let timing = Timing {
         elapsed_ms: t0.elapsed().as_millis() as u64,
         scan_ms,
@@ -1533,6 +1613,54 @@ fn incremental(
         coverage,
         timing,
     ))))
+}
+
+/// Every stored `files` row by path (bounded by the scan's row bound).
+fn load_rows(conn: &Connection) -> Result<HashMap<String, Existing>, String> {
+    let mut st = conn
+        .prepare(
+            "SELECT id, path, content_hash, parse_status, lang, stat_key, flags, fact_symbols
+             FROM files",
+        )
+        .map_err(sql_err)?;
+    let rows = st
+        .query_map([], |r| {
+            Ok((
+                r.get::<_, String>(1)?,
+                Existing {
+                    id: r.get(0)?,
+                    content_hash: r.get(2)?,
+                    parse_status: r.get(3)?,
+                    lang: r.get(4)?,
+                    stat_key: r.get(5)?,
+                    flags: r.get(6)?,
+                    fact_symbols: r.get(7)?,
+                },
+            ))
+        })
+        .map_err(sql_err)?;
+    let existing = rows
+        .collect::<rusqlite::Result<HashMap<_, _>>>()
+        .map_err(sql_err)?;
+    crate::passcount::note(crate::passcount::Pass::RowsLoaded, existing.len() as u64);
+    Ok(existing)
+}
+
+/// Symbols the indexed rows hold, and whether any had them dropped by the budget.
+fn stored_symbol_totals(conn: &Connection) -> rusqlite::Result<(usize, bool)> {
+    let statuses = meta::INDEXED_STATUSES
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",");
+    conn.query_row(
+        &format!(
+            "SELECT coalesce(sum(max(fact_symbols, 0)), 0), coalesce(max(flags & ?1 != 0), 0)
+             FROM files WHERE parse_status IN ({statuses})"
+        ),
+        [file_flag::SYMBOL_BUDGET],
+        |r| Ok((r.get::<_, i64>(0)? as usize, r.get::<_, bool>(1)?)),
+    )
 }
 
 /// Drop fact-cache entries no file uses, keeping the most recently used superseded ones.
@@ -1752,27 +1880,51 @@ const USAGE: &str = "xmustard-core index <build|update|stats|impact|areas|flows>
     [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
-    [--identity-key KEY] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
+    [--identity-key KEY [--identity-limitations N]] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
     [--relation-types=A,B] [--min-confidence=C] [--include-tests=B] [--limit=N] [--offset=N] \
     [--summary-only=B] [--timeout-ms=N] [--seed=N]\n\
     index flows takes --limit; index areas takes --seed. Neither takes the other's.";
 
-/// Record the repository identity key a build or update was run for (`meta::IDENTITY_KEY`),
-/// under the writer lock; written only when it changed.
-fn stamp_identity(report: &IndexReport, key: &str, cfg: &IndexConfig) -> Result<(), String> {
+/// The repository identity a build or update was run for: its key and, when the
+/// caller says, how many limitations it carried.
+struct IdentityStamp {
+    key: String,
+    limitations: Option<usize>,
+}
+
+/// Record the identity a build or update was run for (`meta::IDENTITY_KEY` and
+/// `meta::IDENTITY_LIMITATIONS`, removed when the caller gave no count), under the
+/// writer lock; each written only when it changed.
+fn stamp_identity(
+    report: &IndexReport,
+    id: &IdentityStamp,
+    cfg: &IndexConfig,
+) -> Result<(), String> {
     let db = Path::new(&report.index_path);
     let dir = db.parent().ok_or("index store has no directory")?;
     let _lock = lock(dir, cfg.index_dir.is_some())?;
     let conn = Connection::open(db).map_err(sql_err)?;
     schema::configure(&conn).map_err(sql_err)?;
-    if meta::get(&conn, meta::IDENTITY_KEY)
-        .map_err(sql_err)?
-        .as_deref()
-        != Some(key)
-    {
-        meta::set(&conn, meta::IDENTITY_KEY, key).map_err(sql_err)?;
+    let count = id.limitations.map(|n| n.to_string());
+    // one transaction: a reader never sees a new key beside the previous count
+    let tx = conn.unchecked_transaction().map_err(sql_err)?;
+    for (k, v) in [
+        (meta::IDENTITY_KEY, Some(id.key.clone())),
+        (meta::IDENTITY_LIMITATIONS, count),
+    ] {
+        let stored = meta::get(&tx, k).map_err(sql_err)?;
+        match v {
+            Some(v) if stored.as_deref() != Some(v.as_str()) => {
+                meta::set(&tx, k, &v).map_err(sql_err)?
+            }
+            None if stored.is_some() => {
+                tx.execute("DELETE FROM meta WHERE key = ?1", [k])
+                    .map_err(sql_err)?;
+            }
+            _ => {}
+        }
     }
-    Ok(())
+    tx.commit().map_err(sql_err)
 }
 
 /// `xmustard-core index <build|update|stats> <root> [flags]`: the subcommand-table
@@ -1790,6 +1942,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut paths: Option<Vec<String>> = None;
     let mut digest = false;
     let mut identity: Option<String> = None;
+    let mut limitations: Option<usize> = None;
     let mut symbol: Option<String> = None;
     let mut impact_flags: Vec<String> = Vec::new();
     let mut flow_limit = flows::MAX_CANDIDATES;
@@ -1814,6 +1967,22 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
             }
             "--identity-key" => {
                 identity = args.get(i + 1).cloned();
+                2
+            }
+            "--identity-limitations" if identity.is_none() => {
+                return Err(CmdError::new(
+                    2,
+                    "index: --identity-limitations needs --identity-key before it",
+                ));
+            }
+            "--identity-limitations" => {
+                let n = args
+                    .get(i + 1)
+                    .and_then(|n| n.parse().ok())
+                    .ok_or_else(|| {
+                        CmdError::new(2, "index: --identity-limitations needs a count")
+                    })?;
+                limitations = Some(n);
                 2
             }
             "--symbol" => {
@@ -1865,8 +2034,9 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let to_value = |r: Result<IndexReport, String>| {
         r.and_then(|r| serde_json::to_value(r).map_err(|e| e.to_string()))
     };
-    let stamped = |r: Result<IndexReport, String>| match &identity {
-        Some(key) => r.and_then(|r| stamp_identity(&r, key, &cfg).map(|()| r)),
+    let stamp = identity.map(|key| IdentityStamp { key, limitations });
+    let stamped = |r: Result<IndexReport, String>| match &stamp {
+        Some(id) => r.and_then(|r| stamp_identity(&r, id, &cfg).map(|()| r)),
         None => r,
     };
     let out = match sub.as_str() {

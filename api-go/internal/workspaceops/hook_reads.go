@@ -125,7 +125,7 @@ func codeIndexReady(root string) bool {
 	codeIndex.Lock()
 	defer codeIndex.Unlock()
 	st := codeIndex.roots[root]
-	return st != nil && st.indexed != ""
+	return st != nil && st.indexed.key != ""
 }
 
 // HookSyntaxCheck returns the tree-sitter syntax errors of files under the root

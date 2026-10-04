@@ -230,13 +230,15 @@ func TestGroundFitsDefaultBudgetAndPagesSections(t *testing.T) {
 	if sig["contract_breaks"] != 150.0 || sig["drift.stale"] != true || sig["broken_contracts"] != 150.0 || sig["principal.open_mode"] != true {
 		t.Fatalf("unrequested sections must keep their signals: %v", sig)
 	}
-	if !slices.Equal(anyStrings(rep["not_requested"]), []string{"index", "memory", "drift", "principal"}) {
+	// consolidation is WS-32a's section and is unrequested here like the others: the list is
+	// the report of which sections a caller did not ask for, so a new section joins it.
+	if !slices.Equal(anyStrings(rep["not_requested"]), []string{"index", "memory", "consolidation", "drift", "principal"}) {
 		t.Fatalf("not_requested: %v", rep["not_requested"])
 	}
 	// a repeated parameter selects each value; sections alone opts in with the default
 	_, _, m = getGround(t, base+"?sections=runs&sections=memory")
 	rep = m[groundbudget.ReportMember].(map[string]any)
-	if !slices.Equal(anyStrings(rep["not_requested"]), []string{"index", "drift", "principal"}) || m["stale_memory"] == nil ||
+	if !slices.Equal(anyStrings(rep["not_requested"]), []string{"index", "consolidation", "drift", "principal"}) || m["stale_memory"] == nil ||
 		rep["max_chars"] != float64(groundbudget.DefaultMaxChars) {
 		t.Fatalf("repeated sections: %v", rep)
 	}
