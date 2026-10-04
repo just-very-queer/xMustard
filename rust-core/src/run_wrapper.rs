@@ -592,7 +592,7 @@ impl Forwarder {
                     // a failure, because reporting it as one would tell an operator the child
                     // kept running when it simply has not been signalled yet (OCR, round 5).
                     // Anything else means the child will NOT be signalled, EPERM after it
-                    // changed credentials being the case that matters, and reporting that as
+                    // set its credentials being the case that matters, and reporting that as
                     // forwarded would tell an operator the opposite (codex-spec, round 5).
                     let delivered = match kill_retrying_interrupt(child, sig) {
                         Ok(()) => true,
