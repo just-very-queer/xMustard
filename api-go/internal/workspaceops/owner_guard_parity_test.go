@@ -80,21 +80,18 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	}
 	cases = append(cases, guardCase{"own earlier verdict", own.ID, 0})
 
-	// the recordedOwner fallback on the REVISION arm. The workspaceops write path always
-	// records an owner (storeActor fills it), so the fallback is only reachable for a
-	// write made through the store API with no owner on the actor. The token store's
-	// answer is then the only thing that ties that revision to bob, so a guard that
-	// skipped the fallback would admit the row (mutation M2).
+	// the recordedOwner fallback on the REVISION arm. The entry is authored by a stranger,
+	// so the entry-author arm admits it; only the revision's author ties it to bob, and
+	// it does so through the token store: the workspaceops write path always records an
+	// owner (storeActor fills it), so a revision that records none is only reachable
+	// through the store API with no owner on the actor. A guard that skipped the
+	// fallback would admit this row (mutation M2).
 	mintPrincipal(t, dir, "bob-token-only", "bob")
-	viaStore := proposeUnrecordedOwner(t, dir, ws, "bob-token-only")
-	if got := entryRecordedOwner(t, dir, ws, viaStore); got != "" {
-		t.Fatalf("the fixture recorded owner %q on %s, so the fallback is not needed on this arm",
-			got, viaStore)
-	}
+	viaStore := promotedUnrecordedRevision(t, dir, ws, "dave", "bob-token-only")
 	if got := PrincipalOwner(dir, "bob-token-only"); got != "bob" {
 		t.Fatalf("the token store answers %q, want bob, so the arm was not built", got)
 	}
-	cases = append(cases, guardCase{"revision author through the token store", viaStore, 0})
+	cases = append(cases, guardCase{"revision author through the token store", viaStore, headRevision(t, dir, ws, viaStore)})
 
 	// a verdict cast in a superseded epoch is not a voice: the entry is retracted and
 	// restored, which starts a new epoch, so the old approve must not refuse bob.
@@ -150,19 +147,56 @@ func proposeUnrecordedOwner(t *testing.T, dir, ws, principal string) string {
 	return id
 }
 
-// entryRecordedOwner is the owner the entry's own write recorded, empty when it
-// recorded none.
-func entryRecordedOwner(t *testing.T, dir, ws, entryID string) string {
+// promotedUnrecordedRevision promotes an entry written by author and then appends a
+// second revision by editor through the store API with no owner on the actor, which is
+// the only way a revision records none. The second revision is pending (Activate
+// false), so it is the entry's head revision and the queue's edit candidate.
+func promotedUnrecordedRevision(t *testing.T, dir, ws, author, editor string) string {
+	t.Helper()
+	entry := promoted(t, dir, ws, author, "the build uses make")
+	base := headRevision(t, dir, ws, entry.ID)
+	err := memoryUpdate(context.Background(), dir, ws, func(tx govstore.Tx) error {
+		_, err := tx.AppendRevision(context.Background(), govstore.RevisionInput{
+			EntryID: entry.ID, BaseRevision: base, Op: "edit",
+			Content: "the build uses make and go", Reason: "add go",
+		}, govstore.Actor{Principal: editor})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("append an unrecorded-owner revision: %v", err)
+	}
+	// the token store is the only answer, and it must answer bob for this arm to be the
+	// one it claims to be
+	if got := revisionOwnerForTest(t, dir, ws, entry.ID, headRevision(t, dir, ws, entry.ID)); got != "bob" {
+		t.Fatalf("the revision's owner resolved to %q, want bob from the token store, so the arm is not the one described", got)
+	}
+	if got := PrincipalOwner(dir, editor); got != "bob" {
+		t.Fatalf("the token store answers %q for %s, want bob, so the fallback cannot fire",
+			got, editor)
+	}
+	return entry.ID
+}
+
+// revisionOwnerForTest is the owner revisionOwner resolves for a revision: the owner its
+// edit event recorded, or the token store's answer for its author. A revision written
+// through the store API with no owner on the actor carries no edit-event owner, so the
+// token store is the only answer.
+func revisionOwnerForTest(t *testing.T, dir, ws, entryID string, rev int64) string {
 	t.Helper()
 	var owner string
-	if err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
+	err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
 		e, err := r.GetEntry(context.Background(), entryID)
 		if err != nil {
 			return err
 		}
-		owner = e.SourceOwner
-		return nil
-	}); err != nil {
+		rv, err := r.GetRevision(context.Background(), entryID, rev)
+		if err != nil {
+			return err
+		}
+		owner, err = revisionOwner(context.Background(), r, dir, e, rv)
+		return err
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
 	return owner
