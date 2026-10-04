@@ -452,15 +452,43 @@ func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 				t.Fatalf("%s was not served entry %s, which the fixture table admits", reader.name, id)
 			}
 		}
-		var leaks []string
-		for id := range served {
-			if !admitted[id] {
-				leaks = append(leaks, id)
+		if leaks := scopeLeaked(served, admitted); len(leaks) != 0 {
+			if n := ScopeLeaks(len(leaks), 0); n != 0 {
+				t.Fatalf("%s: scope leak metric = %d over %d served: %v", reader.name, n, len(served), leaks)
 			}
 		}
-		if n := ScopeLeaks(len(leaks), 0); n != 0 {
-			t.Fatalf("%s: scope leak metric = %d over %d served: %v", reader.name, n, len(served), leaks)
+	}
+}
+
+// scopeLeaked is the ids a reader was SERVED its scope does not admit. It reads the id
+// SETS rather than the two totals: the totals can be equal while the sets differ, and a
+// count form over equal totals reports no leak at all (round 4, r4-7).
+func scopeLeaked(served, admitted map[string]bool) []string {
+	var out []string
+	for id := range served {
+		if !admitted[id] {
+			out = append(out, id)
 		}
+	}
+	slices.Sort(out)
+	return out
+}
+
+// The metric has to be able to fail, which the count form over two totals could not do:
+// this fixes served and admitted to the same size and moves one id across, so a count
+// reads zero leaks and the set form reads one.
+func TestTheScopeLeakMetricFindsAMovedEntryAtEqualCounts(t *testing.T) {
+	served := map[string]bool{"a": true, "b": true}
+	admitted := map[string]bool{"a": true, "b": true}
+	if got := scopeLeaked(served, admitted); len(got) != 0 {
+		t.Fatalf("identical sets reported leaks %v", got)
+	}
+	if n := ScopeLeaks(len(served), len(admitted)); n != 0 {
+		t.Fatalf("equal totals reported %d leaks", n)
+	}
+	delete(admitted, "b")
+	if got := scopeLeaked(served, admitted); !slices.Equal(got, []string{"b"}) {
+		t.Fatalf("one id moved out of admitted: leaks = %v, want [b]", got)
 	}
 }
 

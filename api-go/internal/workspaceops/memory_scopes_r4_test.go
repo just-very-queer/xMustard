@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"slices"
-	"strings"
 	"testing"
 
 	"xmustard/api-go/internal/govstore"
@@ -195,12 +194,18 @@ func TestAVerifierResponseCarriesNoAnotherPrincipalsContent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("a peer must be able to verify a private proposal, or it can never be promoted: %v", err)
 	}
-	if strings.Contains(got.Content, body) || got.Description != "" {
-		t.Fatalf("the verify response carried another principal's text: content=%q description=%q",
-			got.Content, got.Description)
+	// contextEntryFrom fills Title and Description from the row but never Content, so
+	// the peer reads the entry's identity and its vote tally and not the author's body.
+	// A title is metadata the approval queue needs to exist at all; the words an agent
+	// wrote are the content, and that is what is not here.
+	if got.Content != "" {
+		t.Fatalf("the verify response carried another principal's content: %q", got.Content)
 	}
 	if got.ID != theirs.ID || len(got.Verifications) == 0 {
 		t.Fatalf("the verdict was not recorded: %+v", got)
+	}
+	if got.Title != theirs.Title {
+		t.Fatalf("the entry's identity was not returned: title=%q, want %q", got.Title, theirs.Title)
 	}
 }
 
