@@ -188,7 +188,8 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 				return err
 			}
 		}
-		scan.atRisk, scan.atRiskTruncated, err = readAtRisk(ctx, r, workspaceID)
+		scan.atRisk, scan.atRiskTruncated, err = readAtRisk(ctx, r, workspaceID, caller,
+			ScopeRequest{Dir: opts.scopeDir, RunID: opts.scopeRunID, SessionID: opts.scopeSessionID})
 		return err
 	})
 	if err != nil {

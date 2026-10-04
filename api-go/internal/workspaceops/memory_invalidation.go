@@ -474,12 +474,19 @@ type AtRiskMemory struct {
 }
 
 // readAtRisk lists the served memories marked needs_reverify, the longest at risk first.
-func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID string) ([]AtRiskMemory, bool, error) {
+// The caller's own narrowing keys apply here as they do on the ranking: an entry the
+// caller's scope does not admit is not listed at all, because an id, title, path or
+// anchor in at_risk_memories discloses the entry it names (round 3, r3-1). The keys
+// narrow which entries are EXAMINED, so the listing is read with the store's unbounded
+// page and capped afterwards, rather than limiting the query and reporting a
+// truncated list of entries that were never candidates.
+func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller string, req ScopeRequest) ([]AtRiskMemory, bool, error) {
 	entries, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
-		LongestStaleFirst: true, Limit: maxAtRisk + 1})
+		LongestStaleFirst: true, Limit: maxAtRisk * atRiskScanFactor})
 	if err != nil {
 		return nil, false, err
 	}
+	entries = visibleEntries(entries, caller, req)
 	truncated := len(entries) > maxAtRisk
 	entries = entries[:min(len(entries), maxAtRisk)]
 	ids := make([]string, len(entries))

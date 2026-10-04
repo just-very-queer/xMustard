@@ -3,6 +3,8 @@ package workspaceops
 import (
 	"fmt"
 	"strings"
+
+	"xmustard/api-go/internal/govstore"
 )
 
 // Memory scopes (PAR-SHARE-01). A memory's scope is DERIVED from the writing
@@ -210,6 +212,58 @@ func ScopeLeaks(served, admitted int) int {
 		return served - admitted
 	}
 	return 0
+}
+
+// checkRunKeyTrust refuses a run- or session-scoped write whose asserting principal the
+// operator has not listed, and audits the refusal. A key alone is not authority: the run
+// id comes from a query parameter or a request field, so a later run that supplies an
+// earlier run's id would otherwise read that run's memory. Whether an assertion is
+// allowed is an operator setting (owner decision 2026-10-03) and its default trusts
+// nobody, which is the fail-closed direction; a principal that IS listed is served
+// normally. A workspace-scoped write is untouched, so citing a run as provenance stays
+// free.
+func checkRunKeyTrust(dataDir, workspaceID, principal string, scoped Scoped) error {
+	if scoped.Scope != ScopeRun && scoped.Scope != ScopeSession {
+		return nil
+	}
+	settings, err := loadSettings(dataDir)
+	if err != nil {
+		return err
+	}
+	if trustsRunKey(settings, principal) {
+		return nil
+	}
+	// The audit record is best-effort: the refusal stands whether or not it is written,
+	// because a failed write must not turn into a permitted run key.
+	_ = recordAuditEventNoGuard(dataDir, workspaceID, AuditEvent{
+		Actor: principal, Action: AuditRunKeyRefused, TargetType: "memory_scope",
+		TargetID: scoped.Scope + ":" + scoped.Key,
+		Details:  "principal " + ledgerPrincipal(principal) + " is not a trusted run key principal",
+	})
+	return fmt.Errorf("%w: run key %q needs a trusted run key principal (set trusted_run_key_principals)",
+		ErrInvalidInput, scoped.Key)
+}
+
+// atRiskScanFactor bounds how many at-risk rows readAtRisk examines before the scope
+// filter, so a workspace with many stale entries the caller may not read still yields a
+// full page of the ones it may. 4 pages of maxAtRisk against the store's 1000-row cap.
+const atRiskScanFactor = 4
+
+// visibleEntries is the one list-side filter: entries is what a query returned, and the
+// result is the ones reader's scope admits. Every surface that LISTS entries passes
+// through it rather than reading the store directly, because a listing is a disclosure
+// of the same class as a read: an id, title, path or anchor returned for an entry the
+// reader may not see leaks exactly what the content would have (round 3: the ranking,
+// readAtRisk, the settle-and-report path and the handoff projection each listed entries
+// on their own, and each was found by a separate round).
+func visibleEntries(entries []govstore.Entry, reader string, req ScopeRequest) []govstore.Entry {
+	out := entries[:0]
+	for _, e := range entries {
+		if ScopesVisible(e.Scope, e.ScopeKey, e.Source, reader, req) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // scopeRequestOf is the reader's own narrowing keys, so a recall that names a run,
