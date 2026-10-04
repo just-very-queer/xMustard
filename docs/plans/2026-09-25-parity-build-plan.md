@@ -3256,6 +3256,33 @@ areas` takes `--seed` and `index flows` takes `--limit`, and neither takes the o
   right in principle, but no fixture isolates it because such a seed either has no flow at all
   or shares an edge with the caller. Proposed owner: whichever row adds the caller-side check.
 
+**PARKED (2026-10-04).** Last sha `d988fa42` on `parity/ws-38c`, not merged. Round 4 is
+§4.6's cap for code and it ended with three majors open, so the row parks and no fifth round is
+opened.
+
+- **What works and is committed.** `f1f7ba2f` — the walk re-queues a symbol a shorter route
+  reaches, so a symbol first listed nine hops out no longer loses the children the short route
+  can still reach (RED `logs/ws-38c-run-20261004T021704Z.log`, GREEN 32 pass
+  `…-20261004T050616Z.log`). `73b5fda0` — the truncation counters no longer claim a re-queue was
+  stopped. `47c8722c` — a re-queue past the cap no longer raises the reported depth above the
+  cap printed beside it. `0c8012ff` — `USAGE` says which subcommand takes which flag.
+  `d988fa42` — the two clippy warnings this branch added, so the count is back to the base's 6.
+- **Open ids.** `WS-38c-r4-2` (retained flow data is bounded by seeds × per-walk — reported by
+  three channels across three rounds and still unmeasured), `WS-38c-r4-3` (the exported flags can
+  come from a newer generation than the segment), `WS-38c-r4-5` (PAR-SYM-09 asks for persisted
+  truncation stats and this read-only path persists none — an owner question, since §5.1 rule 5
+  forbids touching the budget ledger). Minor and deferred: `WS-38c-r4-4`, `WS-38c-r3-5`,
+  `WS-38c-r3-6`, `WS-38c-r3-8`. All are written up with their evidence and a proposed owner in
+  `followups.md`.
+- **Next step.** Unpark by taking the two decidable items in order. `r4-5` first, because it is
+  an owner question and everything else waits on the answer: either `index flows` persists, or
+  persistence belongs to the caller and this row's Acceptance text is corrected. Then `r4-3`,
+  which is a snapshot-contract fix in `reader.rs` and touches no file another lane owns. `r4-2`
+  last and not by this row: it needs the `BUD` measurement, which belongs to WS-55, and until
+  that number exists neither a refactor nor a `MAX_FLOWS` change can be justified. Fix any of
+  them on a fresh branch off `feat/parity-v2` rather than reopening this one — it has spent its
+  four rounds, and the defects it carries are in code that is otherwise green.
+
 ### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
 
 **Goal.** The areas half of the WS-38 row above, closing PAR-SYM-08. Communities over the **resolved symbol** projection (CALLS, EXTENDS, IMPLEMENTS), not the file projection WS-38a measured:
