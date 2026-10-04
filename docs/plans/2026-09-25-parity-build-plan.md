@@ -4919,3 +4919,102 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 - **Review** rounds 1-3 (`reviews/ws-rt6/r1..r3`): r1 2 majors fixed (symlink mode, directories), 4 minors fixed, 3 majors rejected with AGREE adjudications, 2 minors rejected; r2 2 majors fixed (deleted symlink mode, source-named directory), 1 minor fixed, 3 majors rejected with AGREE adjudications, 1 minor rejected; r3 2 minors fixed, 1 deferred (WS-RT6-r3-1). 28 mutations, all killed (`logs/ws-rt6-run-20261004T064826Z.log`, `-075811Z`, `-082334Z`).
 - **Checks.** Red `logs/ws-rt6-run-20261004T055051Z.log` (13/13), `-071825Z` and `-074310Z` (the review regressions, 2 each); BOXALL green at 9521248d, 77224b66 and 666f23b8 (`logs/ws-rt6-check-20261004T070744Z.log`, `-073410Z`, `-080405Z`; the first BOXALL at 9521248d, `-062715Z`, was red only on `refresh::the_directory_watch_count_follows_the_tree`, a pre-existing flake measured at the merge base by WS-HYG-01, 6/6 solo after, `logs/ws-rt6-run-20261004T064547Z.log`). Not run: RET, BUD, PI, CAPS, SECDOC, GOLD (no ranking, resident line, Pi, route, gate row, projection or tools/list change).
 - **Follow-ups.** WS-RT6-r3-1 (WS-RT7); Git index rewrites by user tools force a listing (WS-RT7's catalogue with an index-extension check, or WS-RT5's heavy listing).
+
+### WS-59c — `search mode=exact|regex`, a bounded pread lane
+
+**Goal.** Close PAR-RET-09. `mode=exact` and `mode=regex` read the working tree's bytes
+directly through the existing pread primitive and match them against the query, instead of
+ranking indexed chunks. The lane is bounded by three independent caps — reported lines,
+scanned bytes and elapsed time — and reports what it did NOT scan, so a partial answer never
+reads as a complete one. `regex` uses the crate the core already depends on
+(`rust-core/Cargo.toml:39`, `regex = "1.12"`), whose automata are linear-time, so no new
+dependency and no NOTICE entry is owed.
+
+**Requirements.** PAR-RET-09 whole (`search(mode='exact'|'regex')` → spans,
+`bytes_scanned`, truncated), with its two constraints carried into the design: the scan is
+pread-based and never mmap-resident (a corpus-resident map needs ~1.2× the corpus in RAM, and
+§5.1 rule 8 keeps nothing proportional to repository size in a heap), and `mode=pattern`
+(ast-grep) is untouched. It does not touch `search`'s other lanes, `impact`, or G§5.3's
+`impact path=`.
+
+**Files.** `rust-core/src/search.rs` (`SearchMode::Exact`/`Regex`, the lane and its caps,
+`bytes_scanned`/`truncated` on the result), `rust-core/src/exactscan.rs` (new: the pread
+scan, its caps and its linear-time matcher), `rust-core/src/lib.rs` (the new module),
+`rust-core/src/bin/xmustard-core.rs` (the `--mode=exact|regex` arms and the usage line),
+`api-go/internal/workspaceops/knowledge.go` (the two mode constants, the request fields, the
+argv and the cursor ranking key), `api-go/cmd/xmustard-api/tool_routes.go` (the dispatch
+allow-list), `api-go/internal/mcpserver/tool_search.go` (the enum, the Advanced budget
+arguments and the docs), `api-go/internal/toolbudget/ladders.go` (a ladder for the `spans`
+shape), the two `tools/list` goldens, the Pi mirror, and this plan file.
+
+**Tests required.** (1) `mode=exact` returns a span per occurrence with `path`, `line`,
+`byte` and `column`, and a term that appears twice on one line yields two spans, not one.
+(2) `mode=exact` is case-sensitive and matches inside a line rather than only at a line
+start. (3) `mode=regex` matches a pattern the exact lane cannot express (`\d+`), and a
+pattern that does not compile is refused with the parser's message rather than silently
+matching nothing. (4) The line cap is honoured: past it the result reports `truncated: true`
+and names the cap. (5) The byte cap is honoured and `bytes_scanned` reports what was read,
+never more than the cap. (6) The time cap is honoured: a scan that would exceed it stops and
+reports `truncated` with the reason, rather than running to completion. (7) A secret path is
+never read and never appears in `spans`, and it is counted as an explicit loss rather than
+skipped silently. (8) `mode=exact|regex` composed with `path_glob` and `lang` returns the
+intersection and invents nothing. (9) A cursor is bound to the mode, so a cursor signed for
+the hybrid is refused by the exact lane. (10) `mode=exact` on a workspace with no code index
+answers from the working tree and does not report an index degradation, because it did not
+read one.
+
+**Acceptance.** (1) `RET` is ≥21/21 and never below the merge base, so the new lane does not
+disturb the retrieval gate's existing paths. (2) `CAPS` passes with the lean caps unchanged:
+the two new enum members are paid for by shortening `mode`'s existing description, not by
+raising a cap (§5.1 rule 9, and the enum's own headroom is measured, not assumed). (3)
+`BOXALL` is green with `clippy_warnings` at or below the merge base's 6 and `rss_lines=ok`,
+and the lane's own pass counters (`pass_count.rs`) show the scan reads each admitted file
+once, which is the claim that keeps it inside the memory line. (4) No new argument is
+advertised in the lean schema: the three caps are Advanced arguments documented at
+`xmustard://docs/tools`. (5) `go-calls.txt` still holds `called search` and no new subcommand
+appears, because the lane rides the existing `search` subcommand. (6) The `spans` result
+shape has its own budget ladder, so a trimmed exact-lane answer degrades through named
+rungs instead of being cut blind.
+
+**Boundary.** 59d/59e/59f do not touch `search`, so this row owns `search`'s `mode`
+dispatch for the two new values and the reading of `lang` as a filter for them, per 59a's
+ruling. It adds no subcommand, no route and no gate row.
+
+**Verified facts this section rests on** (`rg` on this branch's base `497a95f3`):
+
+- The Go side already refuses `mode=exact|regex` so the lane cannot answer silently as the
+  hybrid before it lands: `api-go/cmd/xmustard-api/tool_routes.go:58` and
+  `api-go/internal/workspaceops/knowledge.go:115-119`, both
+  `mode %q is not a search mode: invalid input`. `TestSearchRefusesAnUnknownMode`
+  (`search_mode_routes_test.go:151-171`) and `TestSearchRefusesAnUnknownModeBelowTheRoute`
+  (`search_mode_test.go:152-173`) both name `exact` and `regex` explicitly, so this row
+  replaces those two cases with acceptance tests rather than deleting the guard.
+- `regex` is already a direct dependency used the same way this lane needs it:
+  `rust-core/src/index/lexical.rs:15` imports `regex::bytes::Regex` and builds it with
+  `RegexBuilder` at `:41-44`, including `.unicode(false)` and `.dfa_size_limit(DFA_CACHE_BYTES)`
+  (64 KiB, `lexical.rs:30`) — the precedent for bounding regex automaton memory, which
+  `lexical.rs:36-37` documents as necessary because Unicode classes compile to ~4 MiB
+  automata.
+- The pread primitive exists and is the one §5.1 rule 8 prefers over mmap:
+  `rust-core/src/index/fts.rs:476-483` (`read_exact_at` behind an `openat`+`O_NOFOLLOW`
+  fd-walk, so no symlink component is followed), and the opening primitive is
+  `symbolgraph::open_repo_regular_file_with_meta` (`symbolgraph.rs:430-444`), which
+  fstat-verifies a REGULAR file so a fifo or device cannot hang the scan. Its per-file
+  ceiling is `MAX_REPO_FILE_BYTES` = 8 MiB (`symbolgraph.rs:415`).
+- The time-cap idiom is `impact.rs`'s: `let started = Instant::now()` (`:548`) then
+  `if started.elapsed() > q.timeout { … }` (`:562-565`), with the flag surfaced in the
+  envelope. This lane uses the same shape rather than inventing a second one.
+- `CAPS` currently prints no "under the cap" line, so the lean caps equal the measured sizes
+  and have zero headroom (`logs/api-go-run-20261004T164029Z.log`, `--- PASS`). The lean
+  `search` entry is 1,401 bytes and `mode`'s enum is
+  `["hybrid","text","pattern","symbol"]` (`testdata/tools_list.json`), so the two new members
+  must be paid for.
+- `SearchResult` (`search.rs:368-391`) has no scan-budget members today, and
+  `SearchHit` (`:341-366`) is declaration-shaped; the lane therefore returns `spans` as its
+  own list rather than bending a chunk hit into a span, which is also what PAR-RET-09's
+  surface names.
+
+**Collision risk.** `tool_search.go`, `knowledge.go` and `tool_routes.go` (WS-52a, WS-52b/52c
+also touch `tool_search.go`, and WS-52 is ordered after WS-38). The plan file (every lane
+appends its section here).
+
