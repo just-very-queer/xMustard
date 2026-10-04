@@ -300,10 +300,36 @@ impl Snapshot {
     /// doubling) reads the one column out of `symbols`. The dense order is `symbols.id`
     /// order, which is how the segment numbers symbols, so the row lines up with
     /// `SymRow` indices. Read once and cached beside the other lazily computed views.
+    ///
+    /// The read is pinned to the snapshot's own generation (WS-38c-b, decision r4-3). The
+    /// segment in `self.seg` was loaded when the snapshot was taken, while this connection
+    /// is opened lazily on first use, so a build that committed in between has replaced the
+    /// `symbols` rows the flags are read from: the flags would then be a NEWER generation's,
+    /// and ordering them by id cannot repair a row that was changed or deleted. Both reads
+    /// therefore happen inside ONE deferred read transaction, and the transaction re-reads
+    /// `meta.generation` and refuses if it is not the generation the segment was loaded
+    /// from. A deferred transaction starts with the read snapshot at its first statement, so
+    /// the generation check and the flag query see the same store.
     pub fn exported_by_symbol(&self) -> Result<&[bool], String> {
         self.exported
             .get_or_init(|| {
                 self.with_text(|conn| {
+                    // A deferred read transaction pins the store view the check and the
+                    // query share. `query_row` on `meta` is the first statement, so the
+                    // snapshot is taken there; a concurrent build cannot move it afterwards.
+                    conn.execute_batch("BEGIN DEFERRED").map_err(sql)?;
+                    let read_generation: String = conn
+                        .query_row("SELECT value FROM meta WHERE key = 'generation'", [], |r| {
+                            r.get(0)
+                        })
+                        .map_err(sql)?;
+                    if read_generation != self.generation.to_string() {
+                        conn.execute_batch("ROLLBACK").map_err(sql)?;
+                        return Err(format!(
+                            "store generation {read_generation} does not match the snapshot's {}",
+                            self.generation
+                        ));
+                    }
                     // The segment holds a SUBSET of the store's symbols — a file the
                     // retention envelope skipped has no segment row — so a symbol's
                     // position in a plain `SELECT ... ORDER BY id` is NOT its dense segment
@@ -328,12 +354,16 @@ impl Snapshot {
                     ))?;
                     let mut rows = st.query([])?;
                     let mut i = 0usize;
-                    while let Some(row) = rows.next()? {
+                    let result = while let Some(row) = rows.next()? {
                         let Some(slot) = out.get_mut(i) else { break };
                         *slot = row.get(0)?;
                         i += 1;
-                    }
-                    Ok(out)
+                        Ok(())
+                    };
+                    drop(rows);
+                    drop(st);
+                    conn.execute_batch("COMMIT").map_err(sql)?;
+                    result
                 })
             })
             .as_deref()
