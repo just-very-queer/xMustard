@@ -163,6 +163,51 @@ func TestAnAtRiskPageIsFullEvenWhenTheFirstRowsAreAnotherPrincipals(t *testing.T
 	if !truncated {
 		t.Fatalf("truncated=false with %d visible at-risk rows and a page of %d", atRiskPage+13, maxAtRisk)
 	}
+	// The page is a SET: widening the window re-reads everything the last read covered,
+	// so an entry that fits must not appear twice.
+	seen := map[string]bool{}
+	for _, m := range full {
+		if seen[m.ID] {
+			t.Fatalf("entry %s appears twice in one page of %d rows", m.ID, len(full))
+		}
+		seen[m.ID] = true
+	}
+}
+
+// The one-more probe cannot look at one extra RAW row: a hidden row at the boundary
+// says nothing about whether a visible row sits behind it. The flag has to come from a
+// wider read of the whole order, so this puts a hidden row exactly where a raw probe
+// would have stopped and a visible row behind it.
+func TestTruncatedIsNotDecidedByOneRawRowPastThePage(t *testing.T) {
+	dir := multiAgentDir(t)
+	trustRunKeys(t, dir, "agent-a", "agent-b")
+	// Exactly maxAtRisk of the caller's own, so the page fills.
+	mine := make([]string, 0, maxAtRisk)
+	for i := range maxAtRisk {
+		mine = append(mine, proposeAtRisk(t, dir, "ws-1", "agent-a",
+			fmt.Sprintf("agent-a boundary note %d", i), fmt.Sprintf("my own boundary note %d", i), ""))
+	}
+	// One hidden row and then one more visible row, both created last so they sit at the
+	// end of the longest-stale-first order.
+	proposeAtRisk(t, dir, "ws-1", "agent-b", "agent-b hidden row", "another principal's row", ScopePrivate)
+	proposeAtRisk(t, dir, "ws-1", "agent-a", "agent-a row past the boundary", "my own row past the boundary", "")
+
+	got, truncated, err := readAtRiskFor(t, dir, "ws-1", "agent-a")
+	if err != nil {
+		t.Fatalf("readAtRisk: %v", err)
+	}
+	if len(got) != maxAtRisk {
+		t.Fatalf("got %d rows, want the capped page of %d", len(got), maxAtRisk)
+	}
+	if !truncated {
+		t.Fatalf("truncated=false with %d of the caller's own at-risk rows and a page of %d: "+
+			"a hidden row at the boundary hid the visible row behind it", maxAtRisk+1, maxAtRisk)
+	}
+	for _, id := range mine {
+		if !slices.Contains(atRiskIDs(got), id) {
+			t.Fatalf("the caller's own at-risk row %s is missing from a full page", id)
+		}
+	}
 }
 
 // readAtRiskFor runs readAtRisk over the store and returns its answer.

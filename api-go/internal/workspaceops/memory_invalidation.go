@@ -487,52 +487,33 @@ type AtRiskMemory struct {
 func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller string, req ScopeRequest) ([]AtRiskMemory, bool, error) {
 	f := govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
 		LongestStaleFirst: true, Limit: atRiskPage}
+	// Each read REPLACES the last rather than extending it: the window widens, so every
+	// read covers everything the previous one did. Appending would count the same row
+	// twice on every doubling (round 4, r4-5, after three triage checks).
 	var visible []govstore.Entry
-	// full records that the scan stopped because the caller's page is full rather than
-	// because the store ran out, which is the other way this answer can be short: more
-	// of the caller's rows may sit past the window this read happened to cover. Reading
-	// one row past a full page is what turns that into a flag instead of a silence
-	// (round 4, r4-5, after two triage checks).
-	full := false
+	// exhausted records that the store ended inside the window, which is the only case
+	// where "the page is full" also means "the store is empty".
+	exhausted := false
 	for {
 		page, err := r.ListEntries(ctx, f)
 		if err != nil {
 			return nil, false, err
 		}
-		visible = append(visible, visibleEntries(page, caller, req)...)
-		if len(visible) > maxAtRisk {
+		visible = visibleEntries(page, caller, req)
+		if len(visible) > maxAtRisk || len(page) < f.Limit {
+			exhausted = len(page) < f.Limit
 			break
 		}
-		if len(page) < f.Limit {
-			break
-		}
-		if len(visible) == maxAtRisk {
-			// One more row decides it, and the only way to reach "one more" is a WIDER
-			// read of the same order: LongestStaleFirst orders by stale_since while
-			// AfterCursor pages by pk, so the window and not the cursor is the boundary
-			// both orders share. Filter the wider read and look at what falls PAST the
-			// page: a visible row there is the store holding more, which is the flag.
-			more := f
-			more.Limit++
-			rows, err := r.ListEntries(ctx, more)
-			if err != nil {
-				return nil, false, err
-			}
-			beyond := visibleEntries(rows, caller, req)
-			full = len(beyond) > maxAtRisk
-			break
-		}
-		// The window WIDENS rather than pages: a cursor cannot express "the rest of this
-		// order", so a page boundary would skip and repeat rows (round 4, r4-5).
 		if f.Limit >= atRiskScanCeiling {
-			full = true
 			break
 		}
 		f.Limit = min(f.Limit*2, atRiskScanCeiling)
 	}
 	// truncated is the STORE holding more of this caller's at-risk rows than the answer
-	// lists: either the scan found them, or it stopped without being able to say.
-	truncated := len(visible) > maxAtRisk || full
+	// lists. It is decidable only from the scan: either the window held more visible
+	// rows than the page, or the window ended before the store did and this caller may
+	// still have rows in it. When the store ended inside the window the answer is whole.
+	truncated := len(visible) > maxAtRisk || !exhausted
 	entries := visible[:min(len(visible), maxAtRisk)]
 	ids := make([]string, len(entries))
 	for i, e := range entries {
