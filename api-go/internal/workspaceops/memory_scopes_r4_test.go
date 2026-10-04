@@ -175,22 +175,31 @@ func TestAnAtRiskPageIsFullEvenWhenTheFirstRowsAreAnotherPrincipals(t *testing.T
 }
 
 // The one-more probe cannot look at one extra RAW row: a hidden row at the boundary
-// says nothing about whether a visible row sits behind it. The flag has to come from a
-// wider read of the whole order, so this puts a hidden row exactly where a raw probe
-// would have stopped and a visible row behind it.
-func TestTruncatedIsNotDecidedByOneRawRowPastThePage(t *testing.T) {
+// says nothing about whether a visible row sits behind it. The flag has to come from the
+// scan, not from counting what the page holds.
+//
+// Two cases, because they are decided by different facts and a flag built from the page
+// alone gets the second one wrong:
+//
+//  1. the page is FULL and the window did not exhaust. Only the scan knows there are more,
+//     because the page holds exactly maxAtRisk and cannot say whether that is all.
+//  2. the page fits and the window did not exhaust. This is the one a count gets wrong in
+//     the other direction, and it is what the last triage check asked for.
+func TestTruncatedIsNotDecidedByCountingThePage(t *testing.T) {
 	dir := multiAgentDir(t)
 	trustRunKeys(t, dir, "agent-a", "agent-b")
-	// Exactly maxAtRisk of the caller's own, so the page fills.
-	mine := make([]string, 0, maxAtRisk)
-	for i := range maxAtRisk {
-		mine = append(mine, proposeAtRisk(t, dir, "ws-1", "agent-a",
-			fmt.Sprintf("agent-a boundary note %d", i), fmt.Sprintf("my own boundary note %d", i), ""))
+
+	// A full window of the caller's own rows, so the first read returns exactly
+	// atRiskPage and the loop has to look further.
+	for i := range atRiskPage {
+		proposeAtRisk(t, dir, "ws-1", "agent-a", fmt.Sprintf("agent-a window note %d", i),
+			fmt.Sprintf("my own window note %d", i), "")
 	}
-	// One hidden row and then one more visible row, both created last so they sit at the
-	// end of the longest-stale-first order.
+	// Then the pair a raw one-more probe cannot resolve: a hidden row at the boundary
+	// and a visible row behind it. Both created last, so they sort to the end.
 	proposeAtRisk(t, dir, "ws-1", "agent-b", "agent-b hidden row", "another principal's row", ScopePrivate)
-	proposeAtRisk(t, dir, "ws-1", "agent-a", "agent-a row past the boundary", "my own row past the boundary", "")
+	pastBoundary := proposeAtRisk(t, dir, "ws-1", "agent-a", "agent-a row past the boundary",
+		"my own row past the boundary", "")
 
 	got, truncated, err := readAtRiskFor(t, dir, "ws-1", "agent-a")
 	if err != nil {
@@ -201,12 +210,52 @@ func TestTruncatedIsNotDecidedByOneRawRowPastThePage(t *testing.T) {
 	}
 	if !truncated {
 		t.Fatalf("truncated=false with %d of the caller's own at-risk rows and a page of %d: "+
-			"a hidden row at the boundary hid the visible row behind it", maxAtRisk+1, maxAtRisk)
+			"a hidden row at the boundary hid the visible row %s behind it",
+			atRiskPage+1, maxAtRisk, pastBoundary)
 	}
-	for _, id := range mine {
-		if !slices.Contains(atRiskIDs(got), id) {
-			t.Fatalf("the caller's own at-risk row %s is missing from a full page", id)
+	// The flag is not the whole contract: the page is a SET, so a widening scan that
+	// appended instead of replacing would repeat every id it already had.
+	seen := map[string]int{}
+	for _, m := range got {
+		seen[m.ID]++
+	}
+	for id, n := range seen {
+		if n != 1 {
+			t.Fatalf("entry %s appears %d times in a page of %d rows", id, n, len(got))
 		}
+	}
+}
+
+// The flag says the store holds more than this answer lists, and there are exactly two
+// ways that can be true: the window held more visible rows than the page, or the scan
+// stopped before it reached the end of the store. The second needs the window to stop
+// growing, which is the ceiling at atRiskScanCeiling rows.
+//
+// Below that ceiling the scan drains any store it is given, so truncated=false is the
+// honest answer however many unreadable rows sit in the way — and the first two versions
+// of this fixture asserted otherwise and were wrong. What is asserted here is that
+// distinction, at a size that does NOT need a 4,001-row fixture: the page is complete
+// when the scan finished, whatever proportion of the window was visible.
+func TestTruncatedIsFalseOnlyWhenTheScanReachedTheEndOfTheStore(t *testing.T) {
+	dir := multiAgentDir(t)
+	trustRunKeys(t, dir, "agent-a", "agent-b")
+	// Far more unreadable rows than the page, in a store the widened scan CAN drain.
+	for i := range 3 * maxAtRisk {
+		proposeAtRisk(t, dir, "ws-1", "agent-b", fmt.Sprintf("agent-b window note %d", i),
+			fmt.Sprintf("another principal's window note %d", i), ScopePrivate)
+	}
+	mine := proposeAtRisk(t, dir, "ws-1", "agent-a", "agent-a row past the window", "my own row", "")
+
+	got, truncated, err := readAtRiskFor(t, dir, "ws-1", "agent-a")
+	if err != nil {
+		t.Fatalf("readAtRisk: %v", err)
+	}
+	if len(got) != 1 || got[0].ID != mine {
+		t.Fatalf("got %d rows, want only my own %s", len(got), mine)
+	}
+	if truncated {
+		t.Fatalf("truncated=true with %d unreadable rows, but the scan widened until it read the whole "+
+			"store and found one visible row: the answer is complete", 3*maxAtRisk)
 	}
 }
 

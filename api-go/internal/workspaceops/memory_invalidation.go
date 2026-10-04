@@ -478,12 +478,19 @@ type AtRiskMemory struct {
 // caller's scope does not admit is not listed at all, because an id, title, path or
 // anchor in at_risk_memories discloses the entry it names (round 3, r3-1).
 //
-// The filter runs per page rather than once over a bounded scan window, because a
-// window applied before the filter drops the caller's own entry whenever the rows
-// ahead of it are unreadable, and reports truncated=false for a page that is not
-// complete (round 4, r4-5, found by two channels). Paging until the page is full or
-// the store is exhausted makes truncated mean what it says: the store holds more
-// at-risk rows than this answer lists.
+// The filter runs per read rather than once over a fixed scan window, because a window
+// applied before the filter drops the caller's own entry whenever the rows ahead of it
+// are unreadable, and reports truncated=false for a page that is not complete (round 4,
+// r4-5, found by three channels). Each read REPLACES the last, so the window can widen
+// without counting a row twice, and it widens until it holds more visible rows than the
+// page or the store ends inside it.
+//
+// truncated then means one thing only: the store holds more of this caller's at-risk rows
+// than this answer lists. It is true when the window overflowed the page, or when the
+// window stopped growing at atRiskScanCeiling with the store undrained. Below that
+// ceiling the scan reads any store to the end, so a page of one row out of ten thousand
+// is a COMPLETE page and says so — the unreadable rows in front of it were read and
+// dropped, not skipped.
 func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller string, req ScopeRequest) ([]AtRiskMemory, bool, error) {
 	f := govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
 		LongestStaleFirst: true, Limit: atRiskPage}
