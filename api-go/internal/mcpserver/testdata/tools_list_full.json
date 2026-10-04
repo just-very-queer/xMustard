@@ -519,7 +519,7 @@
         "readOnlyHint": true,
         "title": "Search code"
       },
-      "description": "Code search: path:line, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=\u003csymbol\u003e; pattern: ast-grep (`$A \u0026\u0026 $A()`); symbol: name path; text: body.",
+      "description": "Code search: path:line, reasons. RRF (K=60) of BM25 over bodies, names, paths and docs; identifier match; trigram typo tolerance; reference degree; proximity to seed; pattern: ast-grep (`$A \u0026\u0026 $A()`); exact/regex: spans.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
@@ -548,13 +548,19 @@
             "type": "string"
           },
           "lang": {
-            "description": "pattern: ast-grep hint; else filter, not symbol",
+            "description": "pattern: ast-grep hint; else a filter",
             "maxLength": 256,
             "type": "string"
           },
           "limit": {
-            "description": "max hits (default 10)",
+            "description": "max hits",
             "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_bytes": {
+            "description": "exact/regex: bytes to scan",
+            "maximum": 4194304,
             "minimum": 1,
             "type": "integer"
           },
@@ -564,11 +570,19 @@
             "minimum": 2000,
             "type": "integer"
           },
+          "max_lines": {
+            "description": "exact/regex: spans to report",
+            "maximum": 200,
+            "minimum": 1,
+            "type": "integer"
+          },
           "mode": {
-            "description": "hybrid (default), text (body)",
+            "description": "hybrid (default); see xmustard://docs/tools",
             "enum": [
               "hybrid",
               "text",
+              "exact",
+              "regex",
               "pattern",
               "symbol"
             ],
@@ -584,12 +598,18 @@
             "type": "string"
           },
           "seed": {
-            "description": "proximity seed symbol",
+            "description": "proximity seed",
             "type": "string"
           },
           "substring": {
             "description": "mode=symbol: substring",
             "type": "boolean"
+          },
+          "timeout_ms": {
+            "description": "exact/regex: time budget",
+            "maximum": 2000,
+            "minimum": 1,
+            "type": "integer"
           },
           "workspace_id": {
             "description": "workspace id; auto-resolved if omitted",
@@ -606,6 +626,9 @@
         "properties": {
           "_xmustard": {
             "type": "object"
+          },
+          "bytes_scanned": {
+            "type": "integer"
           },
           "generated_at": {
             "type": "string"
@@ -624,6 +647,9 @@
           },
           "query": {
             "type": "string"
+          },
+          "spans": {
+            "type": "array"
           },
           "total": {
             "type": "integer"

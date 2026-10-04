@@ -146,7 +146,7 @@ func TestSearchRerankDoesNotBypassTheLexicalFilters(t *testing.T) {
 	}
 }
 
-// An unknown mode is refused: the tool advertises four, and a fifth is a 400, not the
+// An unknown mode is refused: the tool advertises six, and a seventh is a 400, not the
 // hybrid by default.
 func TestSearchRefusesAnUnknownMode(t *testing.T) {
 	dir := t.TempDir()
@@ -156,8 +156,9 @@ func TestSearchRefusesAnUnknownMode(t *testing.T) {
 	// blocks forever.
 	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core})
 
-	// mode=exact belongs to WS-59c; until it lands it must not silently answer hybrid.
-	for _, m := range []string{"exact", "regex", "semantic"} {
+	// `exact` and `regex` were on this list until WS-59c landed them; what is left is a
+	// mode no surface answers, and it must not silently answer hybrid.
+	for _, m := range []string{"semantic", "exacts", "Exact", "task", "commits"} {
 		q := url.Values{"mode": {m}, "q": {"x"}}
 		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + q.Encode())
 		if err != nil {
@@ -166,6 +167,33 @@ func TestSearchRefusesAnUnknownMode(t *testing.T) {
 		resp.Body.Close()
 		if resp.StatusCode != 400 {
 			t.Fatalf("mode=%s must be refused with 400, got %d", m, resp.StatusCode)
+		}
+	}
+}
+
+// The two scan modes reach the route and are answered, not refused (WS-59c): a mode the
+// tool advertises must not be a 400, and the answer carries the scan's own shape.
+func TestSearchRoutesTheScanModes(t *testing.T) {
+	dir := t.TempDir()
+	seedCoreWorkspace(t, dir, "ws")
+	spans := `{"workspace_id":"ws","query":"x","total":1,"offset":0,"omitted":0,"hits":[],` +
+		`"spans":[{"path":"a.go","line":3,"column":2,"byte":10,"len":1}],"bytes_scanned":42}`
+	core := writeScript(t, "cat <<'EOF'\n"+spans+"\nEOF\n")
+	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core})
+
+	for _, m := range []string{"exact", "regex"} {
+		q := url.Values{"mode": {m}, "q": {"x"}, "max_lines": {"5"}, "max_bytes": {"1024"}}
+		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("mode=%s must be answered, got %d: %s", m, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), `"spans"`) {
+			t.Errorf("mode=%s must carry the scan's spans: %s", m, body)
 		}
 	}
 }

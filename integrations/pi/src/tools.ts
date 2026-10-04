@@ -103,7 +103,7 @@ const recallQueryArgs: readonly string[] = RECALL_QUERY_ARGS;
 // searchQueryArgs is searchQueryArgs in tool_search.go: the arguments search sends as
 // query parameters under their own names, in Go's order.
 const searchQueryArgs: readonly string[] = [
-	"q", "mode", "lang", "seed", "limit", "cursor", "path_glob", "kinds", "depth", "include_body", "include_info", "substring",
+	"q", "mode", "lang", "seed", "limit", "cursor", "path_glob", "kinds", "depth", "include_body", "include_info", "substring", "max_lines", "max_bytes", "timeout_ms",
 ];
 // explainQueryArgs is explainQueryArgs in tool_explain.go.
 const explainQueryArgs: readonly string[] = ["path", "symbol", "uid", "depth", "chain_depth", "include_content"];
@@ -407,14 +407,14 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line, snippets, reasons. RRF (K=60) of BM25 over function bodies, comments, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed=<symbol>; pattern: ast-grep (`$A && $A()`); symbol: name path; text: body.",
+			"Code search: path:line, reasons. RRF (K=60) of BM25 over bodies, names, paths and docs; identifier match; trigram typo tolerance; reference degree; proximity to seed; pattern: ast-grep (`$A && $A()`); exact/regex: spans.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the query" },
-			{ name: "mode", type: "string", enum: ["hybrid", "text", "pattern", "symbol"], desc: "hybrid (default), text (body)" },
-			{ name: "lang", type: "string", maxLength: 256, desc: "pattern: ast-grep hint; else filter, not symbol" },
-			{ name: "seed", type: "string", desc: "proximity seed symbol" },
-			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits (default 10)" },
+			{ name: "mode", type: "string", enum: ["hybrid", "text", "exact", "regex", "pattern", "symbol"], desc: "hybrid (default); see xmustard://docs/tools" },
+			{ name: "lang", type: "string", maxLength: 256, desc: "pattern: ast-grep hint; else a filter" },
+			{ name: "seed", type: "string", desc: "proximity seed" },
+			{ name: "limit", type: "integer", minimum: 1, maximum: 50, desc: "max hits" },
 		],
 		// searchTool.Advanced in tool_search.go: the symbol lookup's options, the path
 		// filter, paging and the output budget.
@@ -427,6 +427,9 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "include_body", type: "boolean", desc: "mode=symbol: add bodies" },
 			{ name: "include_info", type: "boolean", desc: "mode=symbol: add signatures, docs" },
 			{ name: "substring", type: "boolean", desc: "mode=symbol: substring" },
+			{ name: "max_lines", type: "integer", minimum: 1, maximum: 200, desc: "exact/regex: spans to report" },
+			{ name: "max_bytes", type: "integer", minimum: 1, maximum: 4194304, desc: "exact/regex: bytes to scan" },
+			{ name: "timeout_ms", type: "integer", minimum: 1, maximum: 2000, desc: "exact/regex: time budget" },
 		],
 		build: (a) => ({
 			method: "GET",

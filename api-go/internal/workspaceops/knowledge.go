@@ -35,12 +35,47 @@ const maxSearchPathGlobLen = 256
 // core's SQL as a parameter.
 const maxSearchLangLen = maxSearchPathGlobLen
 
+// The scan modes' three caps, as the Go side sees them (WS-59c). Each is the core's own
+// default AND its ceiling, re-declared here so the MCP argument's `maximum` can advertise
+// it: a schema-valid value is therefore never refused by the route, and the core refuses
+// an over-ceiling one rather than clamping it. The constants are asserted against the
+// core's in `TestTheScanCapsMatchTheCoreCeilings`, so the two cannot drift.
+const (
+	// SearchScanMaxLines bounds the spans one scan reports.
+	SearchScanMaxLines = 200
+	// SearchScanMaxBytes bounds the bytes one scan reads (4 MiB).
+	SearchScanMaxBytes = 4 << 20
+	// SearchScanTimeoutMS bounds one scan's wall clock (2 s).
+	SearchScanTimeoutMS = 2000
+)
+
 // The lexical modes of search, the closed set the tool advertises and the route accepts
-// (WS-59b). `pattern` and `symbol` answer from other surfaces and are listed with them.
+// (WS-59b, WS-59c). `pattern` and `symbol` answer from other surfaces and are listed
+// with them. The two scan modes read the working tree's bytes and report spans; the two
+// ranked modes read the index. One closed set, one predicate, so the route, the request
+// validator and the core's flag all agree on which values exist.
 const (
 	SearchModeHybrid = "hybrid"
 	SearchModeText   = "text"
+	SearchModeExact  = "exact"
+	SearchModeRegex  = "regex"
 )
+
+// searchModes is the closed set, as one table: §5.1 rule 10 (a closed set gets a table,
+// not an if/else ladder), and a mode added here is a mode the route accepts.
+var searchModes = map[string]bool{
+	SearchModeHybrid: true,
+	SearchModeText:   true,
+	SearchModeExact:  true,
+	SearchModeRegex:  true,
+}
+
+// IsSearchMode reports whether mode is one this search advertises. The empty string is
+// not: a search that names no mode means the default one, and the route treats the two
+// differently (an absent mode is the hybrid, a wrong one is bad input).
+func IsSearchMode(mode string) bool {
+	return searchModes[mode]
+}
 
 // SearchRequest is one hybrid search call.
 type SearchRequest struct {
@@ -52,18 +87,25 @@ type SearchRequest struct {
 	// Lang keeps only files of this language (the index's pack name, `go` or `rust`).
 	// Empty admits every file; a name no file carries matches nothing.
 	Lang string
-	// Mode is `hybrid` (the default fusion) or `text` (the body lane alone). It is a
-	// name here, not an enum, so the route decides which value reaches the core.
+	// Mode is `hybrid` (the default fusion), `text` (the body lane alone), `exact` (the
+	// query as written) or `regex` (the query as a pattern). It is a name here, not an
+	// enum, so the route decides which value reaches the core.
 	Mode string
 	// Cursor continues a previous page (next_cursor).
 	Cursor string
 	Limit  int
+	// The scan modes' three caps (WS-59c). Zero takes each default; a value past its
+	// ceiling is refused by the core, never clamped.
+	ScanLines     int
+	ScanBytes     int
+	ScanTimeoutMS int
 }
 
 // rankingKey names the ranking a cursor pages: the workspace and every argument that
 // orders or filters it. The page size may change between pages.
 func (r SearchRequest) rankingKey(workspaceID string) []byte {
-	b, _ := json.Marshal([]string{workspaceID, r.Query, r.Seed, r.PathGlob, r.Lang, r.Mode})
+	b, _ := json.Marshal([]string{workspaceID, r.Query, r.Seed, r.PathGlob, r.Lang, r.Mode,
+		strconv.Itoa(r.ScanLines), strconv.Itoa(r.ScanBytes), strconv.Itoa(r.ScanTimeoutMS)})
 	return b
 }
 
@@ -109,12 +151,11 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if utf8.RuneCountInString(req.Lang) > maxSearchLangLen {
 		return nil, fmt.Errorf("lang is longer than %d characters: %w", maxSearchLangLen, ErrInvalidInput)
 	}
-	// Only `text` is ever sent to the core, which is `hybrid` when the flag is absent, so
-	// an unrecognised mode would be answered by the hybrid. The route validates before it
-	// gets here, but this function is exported and its other callers do not.
-	switch req.Mode {
-	case "", SearchModeHybrid, SearchModeText:
-	default:
+	// The mode is forwarded to the core as written once it is one of the four the tool
+	// advertises. An unrecognised mode would otherwise be answered by the core's default,
+	// which is the hybrid, so it is refused here — this function is exported and its other
+	// callers do not pass through the route's guard.
+	if req.Mode != "" && !IsSearchMode(req.Mode) {
 		return nil, fmt.Errorf("mode %q is not a search mode: %w", req.Mode, ErrInvalidInput)
 	}
 	ranking := req.rankingKey(workspaceID)
@@ -144,9 +185,25 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if req.Lang != "" {
 		coreArgs = append(coreArgs, "--lang="+req.Lang)
 	}
-	// `hybrid` is the core's default, so only `text` is sent.
-	if req.Mode == SearchModeText {
-		coreArgs = append(coreArgs, "--mode="+SearchModeText)
+	// `hybrid` is the core's default, so only the other three are sent.
+	if req.Mode != "" && req.Mode != SearchModeHybrid {
+		coreArgs = append(coreArgs, "--mode="+req.Mode)
+	}
+	// The scan modes' three caps ride the same flag loop. Only a cap the caller actually
+	// set is sent, so an unset cap is the core's own default rather than a zero the core
+	// would have to interpret. The table is a slice, not a map: Go randomizes map
+	// iteration, and the argv must be byte-identical for the same request.
+	for _, cap := range []struct {
+		flag  string
+		value int
+	}{
+		{"--max-lines=", req.ScanLines},
+		{"--max-bytes=", req.ScanBytes},
+		{"--timeout-ms=", req.ScanTimeoutMS},
+	} {
+		if cap.value > 0 {
+			coreArgs = append(coreArgs, cap.flag+strconv.Itoa(cap.value))
+		}
 	}
 	coreArgs = append(coreArgs, root, workspaceID, req.Query, strconv.Itoa(limit))
 	if req.Seed != "" {

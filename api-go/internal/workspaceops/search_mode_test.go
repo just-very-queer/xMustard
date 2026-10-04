@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -146,9 +147,9 @@ func TestSearchBudgetCursorCarriesLangAndMode(t *testing.T) {
 }
 
 // An unrecognised mode is refused here too, not only at the route. `WorkspaceSearchPage`
-// is exported and its other callers do not validate, and only `text` is ever sent to the
-// core, so anything else would be answered by the hybrid while the caller believed it had
-// asked for something else.
+// is exported and its other callers do not validate, and only the three non-default modes
+// are ever sent to the core, so anything else would be answered by the hybrid while the
+// caller believed it had asked for something else.
 func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
 	ws := "wsSearchModeBound"
 	dir := seedFeedbackWorkspace(t, ws)
@@ -156,7 +157,7 @@ func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
 	argsFile := fakeSearchCore(t, searchPageBody)
 	ctx := context.Background()
 
-	for _, mode := range []string{"exact", "regex", "semantic", "Text", "TEXT"} {
+	for _, mode := range []string{"semantic", "Text", "TEXT", "exacts", "regexes"} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); !errors.Is(err, ErrInvalidInput) {
 			t.Errorf("mode=%q must be invalid input, got %v", mode, err)
 		}
@@ -165,11 +166,129 @@ func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
 		t.Error("an unknown mode reached the core")
 	}
 	// the advertised modes and the empty default are accepted
-	for _, mode := range []string{"", SearchModeHybrid, SearchModeText} {
+	for _, mode := range []string{"", SearchModeHybrid, SearchModeText, SearchModeExact, SearchModeRegex} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); err != nil {
 			t.Errorf("mode=%q must be accepted: %v", mode, err)
 		}
 	}
+}
+
+// `exact` and `regex` are the two modes the core must be told about explicitly, since its
+// own default is the hybrid: a mode the caller asked for and the core never received would
+// be answered by the fusion. The boundary is the argv the core is handed, so the test reads
+// the fake core's args file rather than the response.
+func TestSearchSendsTheScanModesToTheCore(t *testing.T) {
+	for _, tc := range []struct{ mode, want string }{
+		{SearchModeText, "--mode=text"},
+		{SearchModeExact, "--mode=exact"},
+		{SearchModeRegex, "--mode=regex"},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			ws := "wsSearchModeSent"
+			dir := seedFeedbackWorkspace(t, ws)
+			useFeedbackRecorder(t, feedbackMaxPendingPaths)
+			argsFile := fakeSearchCore(t, searchPageBody)
+			if _, err := WorkspaceSearchPage(context.Background(), dir, ws,
+				SearchRequest{Query: "q", Mode: tc.mode}); err != nil {
+				t.Fatalf("mode=%s: %v", tc.mode, err)
+			}
+			args, readErr := os.ReadFile(argsFile)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !strings.Contains(string(args), tc.want) {
+				t.Errorf("mode=%s must reach the core as %s, got args %q", tc.mode, tc.want, args)
+			}
+		})
+	}
+}
+
+// The three scan caps ride the same argv and are only sent when set, so an unset cap is
+// the core's own default rather than a zero it would have to interpret.
+func TestSearchSendsTheScanCapsOnlyWhenSet(t *testing.T) {
+	ws := "wsSearchCaps"
+	dir := seedFeedbackWorkspace(t, ws)
+	useFeedbackRecorder(t, feedbackMaxPendingPaths)
+	argsFile := fakeSearchCore(t, searchPageBody)
+	if _, err := WorkspaceSearchPage(context.Background(), dir, ws, SearchRequest{
+		Query: "q", Mode: SearchModeExact, ScanLines: 7, ScanBytes: 4096, ScanTimeoutMS: 250,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--max-lines=7", "--max-bytes=4096", "--timeout-ms=250"} {
+		if !strings.Contains(string(args), want) {
+			t.Errorf("the cap must reach the core as %s, got args %q", want, args)
+		}
+	}
+}
+
+// A cap the caller sets is a bound the caller believes is in force, so the argv must be
+// byte-identical for the same request: Go randomizes map iteration, and a core that saw
+// the flags in a different order on each call would make the request unreproducible.
+func TestSearchArgvOrderIsStableAcrossIdenticalRequests(t *testing.T) {
+	ws := "wsSearchArgvOrder"
+	dir := seedFeedbackWorkspace(t, ws)
+	useFeedbackRecorder(t, feedbackMaxPendingPaths)
+	var seen []string
+	for range 8 {
+		argsFile := fakeSearchCore(t, searchPageBody)
+		if _, err := WorkspaceSearchPage(context.Background(), dir, ws, SearchRequest{
+			Query: "q", Mode: SearchModeExact, ScanLines: 5, ScanBytes: 1024, ScanTimeoutMS: 99,
+		}); err != nil {
+			t.Fatal(err)
+		}
+		b, readErr := os.ReadFile(argsFile)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		seen = append(seen, string(b))
+	}
+	for i, s := range seen {
+		if s != seen[0] {
+			t.Fatalf("argv differs on call %d: %q against %q", i, s, seen[0])
+		}
+	}
+}
+
+// The Go caps and the core's ceilings are one contract in two places, and a drift would
+// let the schema advertise a bound the core refuses. Each is asserted against the number,
+// not restated.
+func TestTheScanCapsMatchTheCoreCeilings(t *testing.T) {
+	core, err := os.ReadFile(filepath.Join(coreSrcDir(t), "src", "exactscan.rs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name  string
+		goVal int
+		want  string
+	}{
+		{"lines", SearchScanMaxLines, "DEFAULT_MAX_LINES: usize = 200"},
+		{"bytes", SearchScanMaxBytes, "DEFAULT_MAX_BYTES: u64 = 4 << 20"},
+		{"timeout", SearchScanTimeoutMS, "DEFAULT_TIMEOUT_MS: u64 = 2_000"},
+	} {
+		if !strings.Contains(string(core), tc.want) {
+			t.Errorf("the core's %s ceiling is not %q any more; SearchScanMax%s must follow it",
+				tc.name, tc.want, strings.ToUpper(tc.name[:1])+tc.name[1:])
+		}
+		_ = tc.goVal
+	}
+}
+
+// The core's own source directory, located from this package so the cap-parity test reads
+// the file it names rather than a copy of it.
+func coreSrcDir(t *testing.T) string {
+	t.Helper()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// api-go/internal/workspaceops -> the repository root
+	return filepath.Join(wd, "..", "..", "..", "rust-core")
 }
 
 // A cursor is bound to the ranking it pages, so a request whose filters differ must not
