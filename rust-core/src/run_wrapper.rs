@@ -263,11 +263,8 @@ fn name_of(sig: i32) -> &'static str {
 /// instead of for a period in which nothing happened (WS-FIX-20c). A signal that ended the
 /// wrapper keeps the wrapper's own disposition and needs no line.
 fn report(sig: i32, relayed: bool) {
-    eprintln!(
-        "xmustard run: {} {} to the child",
-        name_of(sig),
-        if relayed { "forwarded" } else { "not forwarded" }
-    );
+    let decision = if relayed { "forwarded" } else { "not forwarded" };
+    eprintln!("xmustard run: {} {decision} to the child", name_of(sig));
 }
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal

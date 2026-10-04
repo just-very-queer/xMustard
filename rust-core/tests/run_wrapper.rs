@@ -796,7 +796,17 @@ fn one_terminal_keystroke_reaches_the_child_once() {
         let dir = tempfile::tempdir().unwrap();
         let (mut wrapper, mut master) = terminal_job(dir.path());
         await_child(&dir.path().join("ready"), dir.path());
-        let counted = keystroke_and_count(dir.path(), &mut master, byte);
+        let (counted, decided) = keystroke_and_count(dir.path(), &mut master, byte);
+        // The wrapper's own report of the decision it took, read after the wait above has
+        // seen it. For a terminal keystroke with the child in the wrapper's group that
+        // decision is to decline, so the line says so: it asserts the wrapper's reason for
+        // the count, and it fails when the report is missing or unreadable, which the count
+        // alone cannot do (measured: both report mutations survived the count on its own).
+        assert_eq!(
+            decided,
+            format!("SIG{name} not forwarded to the child"),
+            "{name}: the wrapper's report of its decision"
+        );
         release(dir.path());
         // The wrapper must also END: it declines to relay, not to report. Asserting the exit
         // is what keeps a hung wrapper from passing this test on the count alone.
@@ -810,7 +820,8 @@ fn one_terminal_keystroke_reaches_the_child_once() {
     }
 }
 
-/// Writes `byte` to the pty master and returns how many deliveries the child acknowledged.
+/// Writes `byte` to the pty master and returns how many deliveries the child acknowledged,
+/// with what the wrapper reported it decided about that signal.
 ///
 /// The wait has two stages and both are synchronised, neither on a timer.
 ///
@@ -838,7 +849,11 @@ fn one_terminal_keystroke_reaches_the_child_once() {
 const SETTLE_INTERVAL: Duration = Duration::from_millis(40);
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
-fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: &[u8]) -> usize {
+fn keystroke_and_count(
+    dir: &std::path::Path,
+    master: &mut std::fs::File,
+    byte: &[u8],
+) -> (usize, String) {
     master.write_all(byte).unwrap();
     master.flush().unwrap();
     let ack = || {
@@ -856,29 +871,37 @@ fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: 
     // Stage 2: the watcher's report of what it decided about this signal. The report is the
     // decision, so a delayed watcher extends the wait rather than letting it pass early.
     await_report(dir, deadline);
-    ack()
+    let decided = decision(dir);
+    (ack(), decided)
 }
 
 /// Blocks until the wrapper's watcher has reported the keystroke's signal. `dir/wrapper-err`
 /// is the wrapper's stderr, which `terminal_job` points at a file, so the report is a line
 /// in a file this test can read.
 fn await_report(dir: &std::path::Path, deadline: std::time::Instant) {
-    while std::time::Instant::now() < deadline {
-        if wrapper_reported(dir) {
-            return;
-        }
+    while std::time::Instant::now() < deadline && decision(dir).is_empty() {
         thread::sleep(SETTLE_INTERVAL);
     }
 }
 
-/// Whether the wrapper has reported its decision about a signal: one `forwarded`/`not
-/// forwarded` line. Any signal counts, because a wrapper that reports one signal has reported
-/// the decision the watcher makes for every signal it handles.
-fn wrapper_reported(dir: &std::path::Path) -> bool {
+/// What the wrapper reported about the signals it handled, in order, as the operator reads
+/// them. Reading the lines rather than a boolean is what lets the caller assert the decision
+/// and not only its existence: a wait that recognised nothing and a wait that recognised a
+/// report both return, and only the lines tell them apart.
+fn decisions(dir: &std::path::Path) -> Vec<String> {
     std::fs::read_to_string(dir.join("wrapper-err"))
         .unwrap_or_default()
         .lines()
-        .any(|l| l.contains("forwarded") && l.starts_with("xmustard run:"))
+        .filter_map(|l| l.strip_prefix("xmustard run: "))
+        .filter(|l| l.ends_with("to the child"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The one decision the wrapper reported, which is the one this keystroke caused. Empty when
+/// the report was never written or could not be read, which is the case the caller asserts.
+fn decision(dir: &std::path::Path) -> String {
+    decisions(dir).last().cloned().unwrap_or_default()
 }
 
 /// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
