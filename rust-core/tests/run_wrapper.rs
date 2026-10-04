@@ -796,7 +796,7 @@ fn one_terminal_keystroke_reaches_the_child_once() {
         let dir = tempfile::tempdir().unwrap();
         let (mut wrapper, mut master) = terminal_job(dir.path());
         await_child(&dir.path().join("ready"), dir.path());
-        let (counted, decided) = keystroke_and_count(dir.path(), &mut master, byte);
+        let (_sampled, decided) = keystroke_and_count(dir.path(), &mut master, byte);
         // The wrapper's own report of the decision it took, read after the wait above has
         // seen it. For a terminal keystroke with the child in the wrapper's group that
         // decision is to decline, so the line says so: it asserts the wrapper's reason for
@@ -811,6 +811,13 @@ fn one_terminal_keystroke_reaches_the_child_once() {
         // The wrapper must also END: it declines to relay, not to report. Asserting the exit
         // is what keeps a hung wrapper from passing this test on the count alone.
         let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
+        // Re-read the count AFTER the wrapper has ended. `keystroke_and_count` sampled it when
+        // the report appeared, which proves the terminal's copy landed but says nothing about a
+        // duplicate the wrapper might still have been about to relay: the relay happens on the
+        // watcher thread and the report is written by the same thread after it, so a relay that
+        // raced the report would land after the sample and go uncounted (codex-spec 3). With
+        // the wrapper ended, every delivery it was ever going to make has been made.
+        let counted = ack_count(dir.path());
         assert_eq!(
             counted, 1,
             "{name}: the child recorded {counted} copies of the operator's keystroke, so the \
@@ -818,6 +825,16 @@ fn one_terminal_keystroke_reaches_the_child_once() {
         );
         assert_eq!(status.code(), Some(0), "{name}: wrapper status {status:?}");
     }
+}
+
+/// How many deliveries the pty child has acknowledged, from its `ack` file. One line per
+/// handled signal, `fsync`ed by the child, so a line means the child has run its handler.
+fn ack_count(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("ack"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
 }
 
 /// Writes `byte` to the pty master and returns how many deliveries the child acknowledged,
@@ -856,13 +873,7 @@ fn keystroke_and_count(
 ) -> (usize, String) {
     master.write_all(byte).unwrap();
     master.flush().unwrap();
-    let ack = || {
-        std::fs::read_to_string(dir.join("ack"))
-            .unwrap_or_default()
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .count()
-    };
+    let ack = || ack_count(dir);
     let deadline = std::time::Instant::now() + ACK_TIMEOUT;
     // Stage 1: the terminal's own copy, which the line discipline delivers to the group.
     while std::time::Instant::now() < deadline && ack() == 0 {
