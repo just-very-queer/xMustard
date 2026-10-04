@@ -261,7 +261,7 @@ fn the_signal_scan_reads_a_bounded_number_of_files_in_name_order() {
     fs::create_dir(&src).unwrap();
     for i in 0..10_010 {
         let body = match i {
-            0 | 10_009 => "x = 1  # TODO: seen\n",
+            0 | 10_009 => "raise NotImplementedError()\n",
             _ => "x = 1\n",
         };
         fs::write(src.join(format!("f{i:05}.py")), body).unwrap();

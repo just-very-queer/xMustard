@@ -22,7 +22,7 @@ func TestTheWorkspaceScanReportsTheSignalScanBound(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	write("a.py", "# TODO: fix export\n")
+	write("a.py", "raise NotImplementedError()\n")
 	write("b.py", "x = 1\n")
 	snapshot, err := LoadWorkspace(dataDir, WorkspaceLoadRequest{
 		RootPath:             filepath.Dir(src),

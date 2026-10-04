@@ -303,7 +303,7 @@ mod tests {
     fn the_byte_bound_stops_before_a_file_that_does_not_fit() {
         let dir = tempfile::TempDir::new().unwrap();
         for i in 0..9 {
-            let mut body = format!("# TODO marker {i}\n").into_bytes();
+            let mut body = b"raise NotImplementedError()\n".to_vec();
             body.resize(8_000_000, b' ');
             fs::write(dir.path().join(format!("f{i}.py")), body).unwrap();
         }
