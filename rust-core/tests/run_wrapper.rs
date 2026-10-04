@@ -39,29 +39,34 @@ static TERMINAL: Mutex<()> = Mutex::new(());
 /// The lock existed for the `ulimit -n 4` test but covered only the pty tests, while the two
 /// report tests hold a FILLED stderr pipe for as long as the wrapper runs - which is the
 /// contention the lock was meant to remove. So the coverage is checked here against this file's
-/// own source rather than trusted: `report_job` and `report_file_job` are the constructors that
-/// fill or hold that pipe, and a new descriptor-hungry test that forgets the lock fails here
-/// rather than as a flake on someone else's box.
+/// own source rather than trusted: `report_job`, `report_file_job` and `terminal_job` are the
+/// constructors that fill or hold a descriptor, and a new descriptor-hungry test that forgets
+/// the lock fails here rather than as a flake on someone else's box.
+///
+/// This test skips itself, so the hog-name literals above and the `serial_terminal()` call here
+/// are not counted as coverage of themselves.
 #[test]
 fn every_test_that_holds_a_descriptor_takes_the_terminal_lock() {
+    const SELF: &str = "every_test_that_holds_a_descriptor_takes_the_terminal_lock";
     let source = include_str!("run_wrapper.rs");
-    let hogs = ["report_job(", "report_file_job(", "pty_session("];
+    let hogs = ["report_job(", "report_file_job(", "terminal_job("];
     let mut checked = 0;
     let mut offenders = Vec::new();
-    let mut rest = source;
-    while let Some(at) = rest.find("#[test]") {
-        let after = &rest[at..];
-        let end = after[1..]
-            .find("\n#[test]")
-            .map(|i| i + 1)
-            .unwrap_or(after.len());
-        let body = &after[..end];
-        rest = &after[end..];
+    // Split on `#[test]` and scan each SEGMENT: a test's body runs from its own marker to the
+    // next one, so the helpers between two tests belong to neither. The first version scanned
+    // forward from each marker to the next, which handed the helpers and the following test to
+    // whichever test preceded them (codex-spec, round 7).
+    let mut segments: Vec<&str> = source.split("#[test]").collect();
+    segments.remove(0);
+    for body in segments {
         let name = body
             .lines()
             .find_map(|l| l.trim().strip_prefix("fn "))
             .and_then(|l| l.split('(').next())
             .unwrap_or("");
+        if name == SELF {
+            continue;
+        }
         if !hogs.iter().any(|h| body.contains(h)) {
             continue;
         }
@@ -75,6 +80,10 @@ fn every_test_that_holds_a_descriptor_takes_the_terminal_lock() {
         "these tests hold a descriptor for an observation window but do not take the \
          terminal lock, so they run beside `ulimit -n 4`: {offenders:?}"
     );
+    // 1 pty test (which also holds a report job), the process-sent signal test, and the two
+    // report tests: 4 at this head, measured by this scan rather than assumed. A floor below the
+    // true count would let a rename hide a contender, which is how `pty_session` - a name no test
+    // calls - hid the pty tests while this check still counted itself (codex-spec, round 7).
     assert!(
         checked >= 4,
         "only {checked} descriptor-holding tests were found"
@@ -854,7 +863,7 @@ fn one_terminal_keystroke_reaches_the_child_once() {
         // alone cannot do (measured: both report mutations survived the count on its own).
         assert_eq!(
             decided,
-            format!("SIG{name} not forwarded to the child"),
+            format!("SIG{name} not forwarded (the child already has this signal)"),
             "{name}: the wrapper's report of its decision"
         );
         release(dir.path());
@@ -954,7 +963,11 @@ fn decisions(dir: &std::path::Path) -> Vec<String> {
         .unwrap_or_default()
         .lines()
         .filter_map(|l| l.strip_prefix("xmustard run: "))
-        .filter(|l| l.ends_with("to the child"))
+        // A per-signal decision line, not a delivery error and not a drop notice. Keyed on the
+        // signal name rather than on a phrase: the three decision phrasings changed at round 7,
+        // and a filter pinned to one of them silently returns nothing when they do
+        // (codex-spec, round 7).
+        .filter(|l| l.starts_with("SIG") || l.starts_with("xmustard-core"))
         .map(str::to_string)
         .collect()
 }

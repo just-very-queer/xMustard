@@ -296,19 +296,39 @@ fn name_of(sig: i32) -> &'static str {
 /// the open file description, so the flag applied to the wrapper's own stderr and to the
 /// child's inherited one, and it stayed changed after the write (codex-review P1). A reporter
 /// thread needs neither, so the trap has nowhere to appear.
-/// States what the watcher decided about one signal and whether the child actually got it.
+/// States what the watcher decided about one signal, and whether the child actually got it.
 ///
 /// Three outcomes, not two, because a decision to relay is not the same as a delivery
 /// (codex-spec, round 5): the decision can be to relay, the delivery can still fail, and an
 /// operator reading "forwarded" for a child that kept running is told the opposite of the truth.
-fn report(sig: i32, relayed: bool) {
-    let decision = match relayed {
-        true => "forwarded",
-        false => "not forwarded",
-    };
+/// A **fourth** case exists because "not forwarded" cannot describe both a deliberate decline and
+/// a failed delivery - an operator deciding whether to re-signal needs those apart
+/// (codex-spec, round 7).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// The relay rule declined, by design: the child already has this signal.
+    Declined,
+    /// The rule relayed it and the child received it.
+    Forwarded,
+    /// The rule relayed it and the delivery failed. The reason is a separate line.
+    Undeliverable,
+}
+
+impl Decision {
+    fn phrase(self) -> &'static str {
+        match self {
+            Decision::Declined => "not forwarded (the child already has this signal)",
+            Decision::Forwarded => "forwarded to the child",
+            Decision::Undeliverable => "NOT forwarded (delivery failed)",
+        }
+    }
+}
+
+fn report(sig: i32, outcome: Decision) {
     write_best_effort(format!(
-        "xmustard run: {} {decision} to the child\n",
-        name_of(sig)
+        "xmustard run: {} {}\n",
+        name_of(sig),
+        outcome.phrase()
     ));
 }
 
@@ -347,15 +367,25 @@ fn write_best_effort(line: String) {
         // If even the notice cannot be queued it is counted and nothing is written, which is the
         // honest end of it: the count stays in `DROPPED_REPORTS` and `dropped_reports` reports it
         // to a caller that is not the watcher.
+        //
+        // `REPORTED_DROPS` advances only when the notice was QUEUED. It used to `swap` first,
+        // which marked the loss as announced before anyone knew the line had been accepted, so a
+        // rejected notice was never retried and a single lost burst could go unannounced forever
+        // (codex-spec and OCR, round 7). Compare first, store on success.
         let lost = DROPPED_REPORTS.fetch_add(1, Ordering::SeqCst) + 1;
-        if REPORTED_DROPS.swap(lost, Ordering::SeqCst) != lost {
+        if REPORTED_DROPS.load(Ordering::SeqCst) != lost {
             let notice = format!(
                 "xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n"
             );
-            let _ = sender.try_send(Report {
-                line: notice,
-                ack: false,
-            });
+            if sender
+                .try_send(Report {
+                    line: notice,
+                    ack: false,
+                })
+                .is_ok()
+            {
+                REPORTED_DROPS.store(lost, Ordering::SeqCst);
+            }
         }
     }
 }
@@ -377,9 +407,12 @@ fn spawn_reporter() -> (mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>) {
     let (ack_tx, ack_rx) = mpsc::channel::<()>();
     thread::spawn(move || {
         for report in rx {
-            let _ = io::stderr().write_all(report.line.as_bytes());
-            if report.ack {
-                // Sent only after the write above returned, so a received ack means the line
+            // An ack means the line reached stderr. A failed write must not claim it did, or
+            // `drain_reports` returns as though a diagnostic were handled when it was not
+            // (OCR, round 7).
+            let written = io::stderr().write_all(report.line.as_bytes()).is_ok();
+            if report.ack && written {
+                // Sent only after the write above returned Ok, so a received ack means the line
                 // has already been handed to stderr.
                 let _ = ack_tx.send(());
             }
@@ -597,21 +630,26 @@ impl Forwarder {
                     // Anything else means the child will NOT be signalled, EPERM after it
                     // set its credentials being the case that matters, and reporting that as
                     // forwarded would tell an operator the opposite (codex-spec, round 5).
-                    let delivered = match kill_retrying_interrupt(child, sig) {
-                        Ok(()) => true,
-                        Err(rustix::io::Errno::SRCH) => false,
+                    let outcome = match kill_retrying_interrupt(child, sig) {
+                        Ok(()) => Decision::Forwarded,
+                        Err(rustix::io::Errno::SRCH) => Decision::Undeliverable,
                         Err(e) => {
-                            eprintln!(
-                                "xmustard run: could not signal the child ({} {}): {e}",
+                            // Through the reporter, never `eprintln!` here: this is the sole
+                            // signal watcher and a synchronous write on a full stderr parks it,
+                            // so every LATER signal goes unforwarded. That is the defect the
+                            // reporter thread exists to prevent, reintroduced by the round-5
+                            // error path (codex-spec, round 7).
+                            write_best_effort(format!(
+                                "xmustard run: could not signal the child ({} {}): {e}\n",
                                 name_of(raw),
                                 if shares_group { "grouped" } else { "single" },
-                            );
-                            false
+                            ));
+                            Decision::Undeliverable
                         }
                     };
-                    report(raw, relayed && delivered);
+                    report(raw, if relayed { outcome } else { Decision::Declined });
                 } else {
-                    report(raw, false);
+                    report(raw, Decision::Declined);
                 }
             }
         });
