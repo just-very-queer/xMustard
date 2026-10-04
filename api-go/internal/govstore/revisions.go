@@ -300,6 +300,12 @@ func (r *reader) editEventOwners(ctx context.Context, keys []PendingKey) (map[Pe
 		if err != nil {
 			return nil, err
 		}
+		// the first edit event for a revision is the one revisionOwner reads, whether
+		// or not it decodes: the per-row path takes that event and falls back to the
+		// revision author's token owner, so an undecodable first event must leave the
+		// owner empty rather than let a later event's owner answer for the revision
+		// (reviews/ws-fix-22b/r1, codex-review [P2]).
+		seen := make(map[PendingKey]bool, len(keys))
 		for rows.Next() {
 			var k PendingKey
 			var data []byte
@@ -307,10 +313,10 @@ func (r *reader) editEventOwners(ctx context.Context, keys []PendingKey) (map[Pe
 				rows.Close()
 				return nil, err
 			}
-			// the first edit event for a revision is the one revisionOwner reads
-			if _, seen := out[k]; seen {
+			if seen[k] {
 				continue
 			}
+			seen[k] = true
 			var parsed struct {
 				Provenance struct {
 					Owner string `json:"owner"`

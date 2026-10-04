@@ -193,4 +193,40 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 	if second.Owner != wantOwner {
 		t.Fatalf("revision 2's recorded owner = %q, want the first edit event's %q", second.Owner, wantOwner)
 	}
+
+	// The first edit event for a revision is the one revisionOwner reads, so it decides
+	// the owner even when it cannot be decoded: the batched read must leave the owner
+	// empty rather than let a later event answer for the revision, or it disagrees with
+	// Verify about who owns the row. This is the shape a caller-authored AppendEvent
+	// produces, since it does not check the event it is about to duplicate.
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.AppendRevision(ctx, RevisionInput{EntryID: "ctx_edit", BaseRevision: 2, Op: "edit",
+			Content: "the build uses make and go and make", Reason: "add make", Activate: true}, carol)
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
+			Revision: 3, Data: "not an object"}, carol)
+	})
+	mustUpdate(t, s, func(tx Tx) error {
+		return tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
+			Revision: 3, Data: map[string]any{"provenance": map[string]any{"owner": "ops"}}}, carol)
+	})
+
+	var third RevisionOwner
+	err = s.View(ctx, func(r Reader) error {
+		m, err := r.RevisionOwners(ctx, []PendingKey{{EntryID: "ctx_edit", Revision: 3}})
+		if err != nil {
+			return err
+		}
+		third = m[PendingKey{EntryID: "ctx_edit", Revision: 3}]
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.Owner != "" {
+		t.Fatalf("revision 3's recorded owner = %q, want empty: a later edit event answered for a "+
+			"revision whose first event could not be decoded, which is how the batched read "+
+			"disagreed with the per-row one", third.Owner)
+	}
 }
