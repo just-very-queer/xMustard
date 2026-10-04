@@ -487,13 +487,19 @@ func RecallWith(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		return nil, err
 	}
 	// The reader's narrowing keys pass the same operator setting a write's do, here on
-	// the read path: a run or session key arrives in the request, so an unlisted
-	// principal naming an earlier run's id must not read that run's memory (WS-29b
-	// round 4, r4-2). An untrusted key narrows by nothing, so the answer is the
-	// workspace's and no confined entry is in it.
-	if req.RunID != "" || req.SessionID != "" {
+	// the READ path: a run id arrives in the request, so an unlisted principal naming an
+	// earlier run's id must not read that run's memory (WS-29b round 4, r4-2). An
+	// untrusted key narrows by nothing, so the answer is the workspace's and no confined
+	// entry is in it.
+	//
+	// Only RunID is checked, and deliberately: SessionID is ALSO this request's
+	// session-seen key, so clearing it would switch off suppression for every recall that
+	// names a session. The scope side of that field is read through
+	// scopeRequestOf and is left alone; the session key is not an assertion about another
+	// execution, it is this one.
+	if req.RunID != "" {
 		keys := dropUntrustedRunKey(dataDir, workspaceID, req.Caller, scopeRequestOf(req))
-		req.RunID, req.SessionID = keys.RunID, keys.SessionID
+		req.RunID = keys.RunID
 	}
 	var res map[string]any
 	var page recallPage

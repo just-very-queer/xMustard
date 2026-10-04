@@ -254,15 +254,20 @@ const (
 	atRiskScanCeiling = 4000
 )
 
-// dropUntrustedRunKey narrows the READER's keys with the same operator setting that
-// guards a write. A run or session key arrives as a query parameter or a request
-// field, so a later run under the same principal could name an earlier run's id and
-// read that run's memory; checking only the write left the read unguarded (round 4,
-// r4-2). An untrusted key is DROPPED rather than refused: the read still answers, and
-// narrowing by nothing serves no confined entry, which is the fail-closed direction.
-// The attempt is audited exactly as the write refusal is, so an operator can see it.
+// dropUntrustedRunKey narrows the READER's run key with the same operator setting that
+// guards a write. A run id arrives as a query parameter or a request field, so a later
+// run under the same principal could name an earlier run's id and read that run's
+// memory; checking only the write left the read unguarded (round 4, r4-2). An untrusted
+// key is DROPPED rather than refused: the read still answers, and narrowing by nothing
+// serves no confined entry, which is the fail-closed direction. The attempt is audited
+// exactly as the write refusal is, so an operator can see it.
+//
+// Only the RUN key is dropped. A recall request's SessionID is also its session-seen
+// key, so clearing it would switch suppression off rather than narrow a scope; see the
+// call site in RecallWith.
 func dropUntrustedRunKey(dataDir, workspaceID, principal string, req ScopeRequest) ScopeRequest {
-	if strings.TrimSpace(req.RunID) == "" && strings.TrimSpace(req.SessionID) == "" {
+	run := strings.TrimSpace(req.RunID)
+	if run == "" {
 		return req
 	}
 	settings, err := loadSettings(dataDir)
@@ -274,10 +279,10 @@ func dropUntrustedRunKey(dataDir, workspaceID, principal string, req ScopeReques
 	// permitted key.
 	_ = recordAuditEventNoGuard(dataDir, workspaceID, AuditEvent{
 		Actor: principal, Action: AuditRunKeyRefused, TargetType: "memory_scope",
-		TargetID: strings.TrimSpace(req.RunID) + "/" + strings.TrimSpace(req.SessionID),
-		Details:  "principal " + ledgerPrincipal(principal) + " named an untrusted run or session key on a read",
+		TargetID: run,
+		Details:  "principal " + ledgerPrincipal(principal) + " named an untrusted run key on a read",
 	})
-	req.RunID, req.SessionID = "", ""
+	req.RunID = ""
 	return req
 }
 

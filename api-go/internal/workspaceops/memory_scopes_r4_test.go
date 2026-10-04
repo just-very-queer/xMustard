@@ -230,25 +230,31 @@ func TestAnApprovalQueueHoldsNoAnotherPrincipalsPrivateEntry(t *testing.T) {
 	}
 }
 
-// WS-29b-r4-7: the scope-leak metric was computed from two counts the assertions
-// above had already forced to be equal, so it could never be non-zero.
-func TestTheScopeLeakMetricFindsAnEntryTheScopeRuleDoesNotAdmit(t *testing.T) {
-	served := map[string]bool{"a": true, "b": true}
-	admitted := map[string]bool{"a": true, "b": true}
-	delete(admitted, "b")
-	if n := ScopeLeaks(len(served), len(admitted)); n != 0 {
-		t.Fatalf("the count form reported %d for equal counts", n)
+// A recall request's SessionID is TWO things: this execution's session-seen key, and the
+// session scope key. Clearing it to refuse an untrusted key would switch suppression off
+// for every recall that names a session, which is a silent behaviour loss rather than a
+// refusal. The run-key check therefore touches RunID only, and this pins that.
+func TestTheRunKeyCheckLeavesTheSessionSeenKeyAlone(t *testing.T) {
+	dir := singleAgentDir(t)
+	propose(t, dir, "ws-1", "me", "the api listens on 8042", "a note about the api")
+	req := RecallRequest{Query: "api", SessionID: "s1", Caller: "me"}
+	first := recallWith(t, dir, "ws-1", req)
+	if n := len(entriesOf(first)); n != 1 {
+		t.Fatalf("first recall served %d entries, want 1", n)
 	}
-	var leaks []string
-	for id := range served {
-		if !admitted[id] {
-			leaks = append(leaks, id)
-		}
+	again := recallWith(t, dir, "ws-1", req)
+	if n := len(entriesOf(again)); n != 0 {
+		t.Fatalf("session-seen suppression did not apply: %d entries on the second recall", n)
 	}
-	if !slices.Contains(leaks, "b") {
-		t.Fatalf("the set form did not find the leak: %v", leaks)
+	if again["already_shown"] != 1 {
+		t.Fatalf("already_shown = %v, want 1", again["already_shown"])
 	}
 }
+
+// The scope-leak metric is exercised in memory_scopes_test.go, against the fixture
+// suite that collects it: TestScopeLeaksOverTheFixtureSuiteIsZero and
+// TestTheScopeLeakMetricFindsAMovedEntryAtEqualCounts. It is not restated here, because
+// a second copy of a metric's arithmetic is a second copy to get wrong.
 
 // WS-29b-r4-4: the served set came from the scope-filtered ranking, but the delta was
 // folded from every workspace event, so a confined entry the caller cannot see was
