@@ -205,12 +205,14 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 		return err
 	})
 	mustUpdate(t, s, func(tx Tx) error {
-		return tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
+		_, err := tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
 			Revision: 3, Data: "not an object"}, carol)
+		return err
 	})
 	mustUpdate(t, s, func(tx Tx) error {
-		return tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
+		_, err := tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
 			Revision: 3, Data: map[string]any{"provenance": map[string]any{"owner": "ops"}}}, carol)
+		return err
 	})
 
 	var third RevisionOwner
