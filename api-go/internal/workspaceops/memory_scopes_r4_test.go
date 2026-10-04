@@ -237,7 +237,9 @@ func TestAnApprovalQueueHoldsNoAnotherPrincipalsPrivateEntry(t *testing.T) {
 func TestTheRunKeyCheckLeavesTheSessionSeenKeyAlone(t *testing.T) {
 	dir := singleAgentDir(t)
 	propose(t, dir, "ws-1", "me", "the api listens on 8042", "a note about the api")
-	req := RecallRequest{Query: "api", SessionID: "s1", Caller: "me"}
+	// Both keys are named, so the run-key check actually runs; a request with only a
+	// SessionID returns early and would pass whatever the function did to it.
+	req := RecallRequest{Query: "api", SessionID: "s1", RunID: "run-1", Caller: "me"}
 	first := recallWith(t, dir, "ws-1", req)
 	if n := len(entriesOf(first)); n != 1 {
 		t.Fatalf("first recall served %d entries, want 1", n)
