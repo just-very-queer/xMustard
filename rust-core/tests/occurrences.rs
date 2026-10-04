@@ -205,7 +205,8 @@ fn refs_snippet_is_the_referencing_line_and_its_neighbours_numbered_and_masked()
         "the snippet does not number the reference's own line: {snippet:?}"
     );
     assert!(
-        snippet.contains(&format!("{}: ", line - 1)) && snippet.contains(&format!("{}: ", line + 1)),
+        snippet.contains(&format!("{}: ", line - 1))
+            && snippet.contains(&format!("{}: ", line + 1)),
         "the snippet is not a ±1-line window: {snippet:?}"
     );
     assert!(
@@ -227,7 +228,9 @@ fn refs_snippet_is_the_referencing_line_and_its_neighbours_numbered_and_masked()
     let row = masked
         .iter()
         .find(|o| o["path"].as_str().unwrap_or("").ends_with("b.go"))
-        .unwrap_or_else(|| panic!("no occurrence in b.go, so the mask check proves nothing: {masked:#?}"));
+        .unwrap_or_else(|| {
+            panic!("no occurrence in b.go, so the mask check proves nothing: {masked:#?}")
+        });
     let snippet = row["snippet"].as_str().expect("no snippet on the row");
     assert!(
         snippet.contains("F()"),
@@ -329,7 +332,8 @@ fn implementations_keeps_only_the_type_relations_and_names_the_implementing_type
 }
 
 #[test]
-fn a_reference_outside_a_symbol_is_reported_as_a_file_and_a_used_name_is_never_resolved_by_accident() {
+fn a_reference_outside_a_symbol_is_reported_as_a_file_and_a_used_name_is_never_resolved_by_accident()
+ {
     let r = repo(&[
         ("go.mod", GO_MOD),
         (
@@ -358,7 +362,8 @@ fn a_reference_outside_a_symbol_is_reported_as_a_file_and_a_used_name_is_never_r
     assert_eq!(call["provenance"].as_str(), Some("resolved"));
     // and b.go holds no row at all: a declaration is not a use of itself
     assert!(
-        !got.iter().any(|o| o["path"].as_str().unwrap_or("").ends_with("b.go")),
+        !got.iter()
+            .any(|o| o["path"].as_str().unwrap_or("").ends_with("b.go")),
         "the declaration counted as a reference: {got:#?}"
     );
 }
@@ -366,8 +371,14 @@ fn a_reference_outside_a_symbol_is_reported_as_a_file_and_a_used_name_is_never_r
 #[test]
 fn a_lexical_language_reports_its_references_as_leads_and_never_as_resolved() {
     let r = repo(&[
-        ("lib/a.rb", "class Widget\n  def initialize\n    @name = 'x'\n  end\nend\n"),
-        ("lib/b.rb", "class Other\n  def use\n    Widget.new\n  end\nend\n"),
+        (
+            "lib/a.rb",
+            "class Widget\n  def initialize\n    @name = 'x'\n  end\nend\n",
+        ),
+        (
+            "lib/b.rb",
+            "class Other\n  def use\n    Widget.new\n  end\nend\n",
+        ),
     ]);
     build(r.path());
     let v = occ(r.path(), "refs", "Widget", &[]);
@@ -422,7 +433,10 @@ fn limit_pages_the_occurrences_and_the_cursor_continues_the_same_list() {
         }
         // the cursor advances: a next_cursor equal to the one just used would page the
         // same row forever
-        assert_ne!(cursor, previous, "the cursor did not advance past {previous}");
+        assert_ne!(
+            cursor, previous,
+            "the cursor did not advance past {previous}"
+        );
         assert!(seen.len() < 50, "the cursor never ended the list");
     }
     assert_eq!(
@@ -447,9 +461,19 @@ fn a_bad_cursor_or_op_is_refused_and_the_usage_line_names_the_operation() {
         "Store",
     ]);
     assert!(!ok, "a malformed cursor was accepted: {err}");
-    let (ok, err) = run(&["symbolgraph", "occurrences", "--op=sideways", root, "ws", "Store"]);
+    let (ok, err) = run(&[
+        "symbolgraph",
+        "occurrences",
+        "--op=sideways",
+        root,
+        "ws",
+        "Store",
+    ]);
     assert!(!ok, "an unknown op was accepted: {err}");
-    assert!(err.contains("refs"), "the refusal does not name the operations: {err}");
+    assert!(
+        err.contains("refs"),
+        "the refusal does not name the operations: {err}"
+    );
     let (ok, err) = run(&["symbolgraph", "occurrences", root, "ws"]);
     assert!(!ok, "occurrences without a symbol was accepted: {err}");
     assert!(
@@ -470,7 +494,9 @@ fn the_epistemic_envelope_reports_whether_the_list_is_a_lower_bound() {
     );
     if completeness == "lower_bound" {
         assert!(
-            v["epistemic"]["causes"].as_object().is_some_and(|c| !c.is_empty()),
+            v["epistemic"]["causes"]
+                .as_object()
+                .is_some_and(|c| !c.is_empty()),
             "a lower bound with no cause: {v:#}"
         );
     }
@@ -487,8 +513,14 @@ fn the_epistemic_envelope_reports_whether_the_list_is_a_lower_bound() {
 fn a_lexical_only_list_is_a_lower_bound_naming_the_lexical_occurrences() {
     let r = repo(&[
         ("lib/a.rb", "class Alpha\n  def run\n    1\n  end\nend\n"),
-        ("lib/b.rb", "class Beta\n  def use\n    Alpha.new\n  end\nend\n"),
-        ("lib/c.rb", "class Gamma\n  def use\n    Alpha.new\n  end\nend\n"),
+        (
+            "lib/b.rb",
+            "class Beta\n  def use\n    Alpha.new\n  end\nend\n",
+        ),
+        (
+            "lib/c.rb",
+            "class Gamma\n  def use\n    Alpha.new\n  end\nend\n",
+        ),
     ]);
     build(r.path());
     let v = occ(r.path(), "refs", "Alpha", &[]);
@@ -515,7 +547,10 @@ fn a_uid_and_a_name_path_resolve_to_the_bare_names_occurrences() {
     build(r.path());
     let by_name = occ(r.path(), "refs", "NewStore", &[]);
     let total = by_name["total"].as_u64().unwrap();
-    assert!(total > 0, "the fixture has no occurrence, so resolution proves nothing");
+    assert!(
+        total > 0,
+        "the fixture has no occurrence, so resolution proves nothing"
+    );
 
     // the UID the index itself reports for the same symbol
     let uid = uid_of(r.path(), "NewStore");
@@ -570,7 +605,10 @@ fn each_row_names_the_kind_of_reference_that_produced_it() {
     );
 
     let r2 = repo(&[
-        ("web/base.ts", "export interface Getter { get(k: string): number }\n"),
+        (
+            "web/base.ts",
+            "export interface Getter { get(k: string): number }\n",
+        ),
         (
             "web/c.ts",
             "import { Getter } from './base';\n\
@@ -582,7 +620,11 @@ fn each_row_names_the_kind_of_reference_that_produced_it() {
     ]);
     build(r2.path());
     let impls = rows(&occ(r2.path(), "implementations", "Getter", &[]));
-    assert_eq!(impls.len(), 1, "the fixture produced no implementation: {impls:#?}");
+    assert_eq!(
+        impls.len(),
+        1,
+        "the fixture produced no implementation: {impls:#?}"
+    );
     assert_eq!(impls[0]["kind_of_reference"].as_str(), Some("implements"));
 }
 
@@ -633,7 +675,11 @@ fn a_name_a_name_path_and_a_uid_read_the_same_namesakes_because_the_table_keys_t
     // both uses come back, and each row's snippet names the receiver, so a caller tells
     // the two apart without the answer guessing which declaration was meant
     let got = rows(&by_name);
-    assert_eq!(got.len(), 2, "the fixture must give both call sites: {got:#?}");
+    assert_eq!(
+        got.len(),
+        2,
+        "the fixture must give both call sites: {got:#?}"
+    );
     // The snippet is a ±1 window, so two neighbouring rows can share a line. The
     // reference's own line is the one the window is centred on, which is what
     // distinguishes one use from the other.

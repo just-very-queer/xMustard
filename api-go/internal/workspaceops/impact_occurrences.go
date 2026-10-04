@@ -210,20 +210,20 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 // and signing a cursor onto an emptied list would tell a client to keep paging a list that
 // is gone.
 func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut bool) {
+	// The map came from a decoded object, so re-marshalling it cannot fail, and reading
+	// it into one typed struct is what makes the empty-list case distinguishable from a
+	// member the answer never had.
+	raw, err := json.Marshal(res)
+	if err != nil {
+		return 0, false
+	}
 	var page struct {
 		Offset      *int               `json:"offset"`
 		Occurrences *[]json.RawMessage `json:"occurrences"`
 	}
-	if json.Unmarshal(mustJSON(res), &page) != nil || page.Offset == nil || page.Occurrences == nil {
+	if json.Unmarshal(raw, &page) != nil || page.Offset == nil || page.Occurrences == nil {
 		return 0, false
 	}
 	_, counted := res["occurrences_by_path"]
 	return *page.Offset + len(*page.Occurrences), counted
-}
-
-// mustJSON re-marshals a decoded member so it can be read into a typed struct; the map
-// came from a decoded object, so this cannot fail.
-func mustJSON(res map[string]json.RawMessage) []byte {
-	b, _ := json.Marshal(res)
-	return b
 }
