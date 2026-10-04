@@ -94,9 +94,13 @@ fn tracked_files(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// `git status --porcelain=v1 -z` parsed into (status_code, path), untrimmed; a rename
-/// reports its new path.
+/// reports its new path. Submodules are compared as `source_identity` compares them
+/// (`--ignore-submodules=none`), whatever `submodule.<name>.ignore` says.
 fn dirty_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
-    let out = git_listing(root, &["status", "--porcelain=v1", "-z"])?;
+    let out = git_listing(
+        root,
+        &["status", "--porcelain=v1", "-z", "--ignore-submodules=none"],
+    )?;
     Ok(crate::indexcache::parse_porcelain_v1_z(&out)
         .into_iter()
         .map(|e| {
@@ -224,7 +228,7 @@ fn changed_from_head(
             "--no-abbrev",
             "--no-ext-diff",
             "--no-color",
-            "--ignore-submodules=all",
+            "--ignore-submodules=none",
             head,
             "--",
         ],
@@ -908,7 +912,10 @@ fn comparable_hash(content: &crate::indexcache::DirtyContent) -> Option<Option<S
     use crate::indexcache::DirtyContent as C;
     match content {
         C::Sha256(x) => Some(Some(x.clone())),
-        C::Deleted | C::Symlink(_) | C::Incomplete(SourceReadFailure::NotRegular) => Some(None),
+        C::Deleted
+        | C::Symlink(_)
+        | C::NestedRepo { .. }
+        | C::Incomplete(SourceReadFailure::NotRegular) => Some(None),
         C::Incomplete(SourceReadFailure::Oversized(n)) if *n > MAX_REPO_FILE_BYTES => Some(None),
         C::Incomplete(_) | C::Unhashed => None,
     }

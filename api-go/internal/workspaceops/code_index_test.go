@@ -38,12 +38,12 @@ func TestCodeIndexRefreshRecordsOutcomePerIdentityKey(t *testing.T) {
 	t.Cleanup(func() { codeIndexRunner = prev })
 	run := func(root, key string, out string, err error) *refreshFlight {
 		codeIndexRunner = func(_ context.Context, gotRoot string, args ...string) ([]byte, error) {
-			if gotRoot != root || len(args) != 2 || args[0] != "--identity-key" || args[1] != key {
+			if gotRoot != root || !slices.Equal(args, []string{"--identity-key", key, "--identity-limitations", "0"}) {
 				t.Fatalf("runner got %s %v", gotRoot, args)
 			}
 			return []byte(out), err
 		}
-		f := &refreshFlight{key: key, done: make(chan struct{})}
+		f := &refreshFlight{identityStamp: identityStamp{key: key}, done: make(chan struct{})}
 		runCodeIndexRefresh(root, f)
 		<-f.done
 		return f
@@ -58,19 +58,19 @@ func TestCodeIndexRefreshRecordsOutcomePerIdentityKey(t *testing.T) {
 	if f := run(root, "k1", "", errors.New("index update failed")); f.report != nil {
 		t.Fatal("a failed update has no report")
 	}
-	if st := state(root); st.failed != "k1" || st.indexed != "" || st.flight != nil {
+	if st := state(root); st.failed.key != "k1" || st.indexed.key != "" || st.flight != nil {
 		t.Fatalf("failed key not recorded: %+v", st)
 	}
 	if f := run(root, "k2", `{"mode":"full","reason":"no_index"}`, nil); f.report == nil || f.report.Mode != "full" {
 		t.Fatalf("report not decoded: %+v", f.report)
 	}
-	if st := state(root); st.indexed != "k2" || st.failed != "" {
+	if st := state(root); st.indexed.key != "k2" || st.failed.key != "" {
 		t.Fatalf("successful key not recorded: %+v", st)
 	}
 	if f := run(root, "k3", `{}`, nil); f.report != nil {
 		t.Fatal("an undecodable report counts as a failure")
 	}
-	if st := state(root); st.indexed != "k2" || st.failed != "k3" {
+	if st := state(root); st.indexed.key != "k2" || st.failed.key != "k3" {
 		t.Fatalf("an undecodable report must not replace the indexed key: %+v", st)
 	}
 }
@@ -111,20 +111,60 @@ func TestRefreshArgsNameTheBatchPathsOnlyWhenTheBatchIsComplete(t *testing.T) {
 		forced bool
 		want   []string
 	}{
-		{"no watcher", nil, true, []string{"--identity-key", "k"}},
-		{"a synced batch", &rustcore.RefreshBatch{Paths: paths, Synced: true}, false, []string{"--identity-key", "k", "--paths", "a.go", "b/c.ts"}},
-		{"a Git state change only", &rustcore.RefreshBatch{Git: true, Synced: true}, false, []string{"--identity-key", "k", "--paths"}},
-		{"a full refresh", &rustcore.RefreshBatch{Full: "ignore_file", Synced: true}, false, []string{"--identity-key", "k"}},
-		{"an unsynced batch", &rustcore.RefreshBatch{Paths: paths}, false, []string{"--identity-key", "k"}},
-		{"a read found nothing pending", &rustcore.RefreshBatch{Synced: true}, true, []string{"--identity-key", "k"}},
-		{"a read took pending paths", &rustcore.RefreshBatch{Paths: paths, Synced: true}, true, []string{"--identity-key", "k", "--paths", "a.go", "b/c.ts"}},
+		{"no watcher", nil, true, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"a synced batch", &rustcore.RefreshBatch{Paths: paths, Synced: true}, false, []string{"--identity-key", "k", "--identity-limitations", "0", "--paths", "a.go", "b/c.ts"}},
+		{"a Git state change only", &rustcore.RefreshBatch{Git: true, Synced: true}, false, []string{"--identity-key", "k", "--identity-limitations", "0", "--paths"}},
+		{"a full refresh", &rustcore.RefreshBatch{Full: "ignore_file", Synced: true}, false, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"an unsynced batch", &rustcore.RefreshBatch{Paths: paths}, false, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"a read found nothing pending", &rustcore.RefreshBatch{Synced: true}, true, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"a read took pending paths", &rustcore.RefreshBatch{Paths: paths, Synced: true}, true, []string{"--identity-key", "k", "--identity-limitations", "0", "--paths", "a.go", "b/c.ts"}},
 	}
 	for _, c := range cases {
-		if got := refreshArgs("k", c.batch, c.forced); !slices.Equal(got, c.want) {
+		if got := refreshArgs(identityStamp{key: "k"}, c.batch, c.forced); !slices.Equal(got, c.want) {
 			t.Errorf("%s: %v, want %v", c.name, got, c.want)
 		}
 	}
-	if got := refreshArgs("", nil, false); len(got) != 0 {
+	if got := refreshArgs(identityStamp{}, nil, false); len(got) != 0 {
 		t.Errorf("no identity and no batch: %v", got)
+	}
+}
+
+// The update is stamped with how many limitations the identity it ran for carried, so
+// a reader reports that identity as complete only when it had none (WS-RT2).
+func TestRefreshStampsTheIdentityLimitationCount(t *testing.T) {
+	cases := []struct {
+		name string
+		id   RepoIdentity
+		want []string
+	}{
+		{"complete", RepoIdentity{Key: "k", Complete: true}, []string{"--identity-key", "k", "--identity-limitations", "0"}},
+		{"two limitations", RepoIdentity{Key: "k", Limitations: []IdentityLimitation{{Reason: "oversized"}, {Reason: "unreadable"}}},
+			[]string{"--identity-key", "k", "--identity-limitations", "2"}},
+		{"incomplete with none listed", RepoIdentity{Key: "k"}, []string{"--identity-key", "k", "--identity-limitations", "1"}},
+	}
+	for _, c := range cases {
+		if got := refreshArgs(stampOf(c.id), nil, false); !slices.Equal(got, c.want) {
+			t.Errorf("%s: %v, want %v", c.name, got, c.want)
+		}
+	}
+}
+
+// A root is settled for an identity only at the same key and limitation count, so an
+// identity whose completeness changed under the same key is stamped again.
+func TestARootIsSettledOnlyForTheSameStamp(t *testing.T) {
+	st := codeIndexRoot{indexed: identityStamp{key: "k"}, failed: identityStamp{key: "f", limitations: 1}}
+	cases := []struct {
+		id   identityStamp
+		want bool
+	}{
+		{identityStamp{key: "k"}, true},
+		{identityStamp{key: "k", limitations: 1}, false},
+		{identityStamp{key: "f", limitations: 1}, true},
+		{identityStamp{key: "f"}, false},
+	}
+	for _, c := range cases {
+		if got := st.settled(c.id); got != c.want {
+			t.Errorf("settled(%+v) = %v, want %v", c.id, got, c.want)
+		}
 	}
 }
