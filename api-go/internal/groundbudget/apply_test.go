@@ -587,6 +587,22 @@ func steadyOf(t *testing.T, raw []byte, req Request) int64 {
 	return sum / allocProbeRuns
 }
 
+// pairedOf is the first-call copy guard's measurement: it allocates for the wide result
+// and for the narrow one allocProbeRuns times and returns the average of the per-pair
+// differences. A copy is proportional to the result's bytes, so it lands in every pair's
+// difference; an unrelated allocation inside one window lands in one pair only, which is
+// what averaging is for. A single pair per fixture (one narrow sample, one wide sample)
+// is not enough: on a loaded host one allocation of more than copyAllowance inside the
+// wide window alone can push a single-sample difference over the line on unchanged code.
+func pairedOf(t *testing.T, narrow, wide []byte, req Request) int64 {
+	t.Helper()
+	var sum int64
+	for i := 0; i < allocProbeRuns; i++ {
+		sum += allocOf(t, wide, req, false) - allocOf(t, narrow, req, false)
+	}
+	return sum / allocProbeRuns
+}
+
 func TestApplyDoesNotCopyTheResult(t *testing.T) {
 	req := Request{MaxChars: DefaultMaxChars}
 	narrow := mustJSON(groundResult(2000, 20000, 50, 5))
@@ -603,21 +619,23 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 	// about 8.8 MB (the slop audit's S5 rows).
 	const copyAllowance = 8 << 10
 
-	// A caller's first Apply must be covered by WorkingSet, so the first call this test
-	// makes is measured on its own and held to the admitted set below. Its allocation is
-	// not held to the absolute len(raw)/4 line: that reads the process-wide counter across
-	// one call, and under box load that window crosses the line on an unchanged tree (the
-	// flake this row replaces). Instead the first call's *copying* is what is checked, by
-	// the same difference the steady-state guard uses: the first call is measured on the
-	// narrow result and on the wide one, which have identical structure and element counts
-	// and differ only in element bytes. A copy is proportional to the result's bytes and so
-	// lands in the difference; the element tables and the output are not. The difference is
-	// held to the same measured copyAllowance.
+	// A caller's first Apply must be covered by WorkingSet, so the very first Apply this
+	// test makes is measured on its own, before anything else in the test calls Apply.
 	firstNarrow := allocOf(t, narrow, req, false)
-	firstWide := allocOf(t, wide, req, false)
-	firstCopied := firstWide - firstNarrow
+
+	// The first call's allocation is not held to the absolute len(raw)/4 line: that reads
+	// the process-wide counter across one call, and under box load that window crosses
+	// the line on an unchanged tree (the flake this row replaces). Instead the first
+	// call's *copying* is what is checked, by the same difference the steady-state guard
+	// uses: the same result budgeted narrow and wide, which have identical structure and
+	// element counts and differ only in element bytes. A copy is proportional to the
+	// result's bytes and so lands in the difference; the element tables and the output do
+	// not. pairedOf averages the differences so that one unrelated allocation inside one
+	// window cannot decide the check on a loaded host; the first pair it takes is the
+	// coldest, which keeps the cold first-call coverage the steady-state guard lacks.
+	firstCopied := pairedOf(t, narrow, wide, req)
 	if firstCopied > copyAllowance {
-		t.Fatalf("Apply allocated %d more bytes on its first call for a %d-byte result than for a %d-byte one with the same %d list elements;"+
+		t.Fatalf("Apply allocated %d more bytes on its first calls for a %d-byte result than for a %d-byte one with the same %d list elements;"+
 			" it must not copy the result", firstCopied, len(wide), len(narrow), 40050)
 	}
 	// The same process-wide counter must not appear on its own anywhere in this test, so
