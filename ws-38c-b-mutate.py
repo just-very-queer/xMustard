@@ -53,7 +53,7 @@ SUBJECTS = [
     ),
     (
         "M6", READER_RS,
-        '                    conn.execute_batch("BEGIN DEFERRED").map_err(sql)?;\n',
+        '                    conn.execute_batch("BEGIN DEFERRED")?;\n',
         "",
         "a_store_generation_that_moved_past_the_segment_is_refused_rather_than_mixed",
     ),
