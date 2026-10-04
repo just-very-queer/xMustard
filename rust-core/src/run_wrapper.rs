@@ -32,6 +32,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -273,43 +274,52 @@ fn name_of(sig: i32) -> &'static str {
 /// It runs after `kill_process` on purpose (WS-FIX-20c-r1-1): a write to a blocked stderr must
 /// not cost the relay, and once the signal has gone out a blocked write costs only the line.
 ///
-/// The write must not BLOCK either, and that is a second requirement the reordering alone does
-/// not meet. There is exactly one watcher thread, so a `stderr` that blocks parks it for good
-/// and every LATER signal goes unforwarded — the child keeps running after a second client
-/// timeout, which is the outcome forwarding exists to prevent (codex-review P1). So the line is
-/// written through a descriptor that is the wrapper's own file description made non-blocking
-/// for this write only: a full or closed stderr costs this one line and the watcher returns to
-/// the signals still queued for it.
+/// The write must not BLOCK the watcher either, and that is a second requirement the reordering
+/// alone does not meet. There is exactly one watcher thread, so a `stderr` that blocks parks it
+/// for good and every LATER signal goes unforwarded — the child keeps running after a second
+/// client timeout, which is the outcome forwarding exists to prevent (codex-review P1). So the
+/// line is handed to a reporter thread that owns the write and may block on it, while the
+/// watcher only ever enqueues.
 ///
-/// The flag is set on a `dup`, which is its own open file description, so it applies here and
-/// not to the wrapper's stderr or the child's — the same trap the r1-1 witness test fell into
-/// (codex-review P2), which is why it is set after the `dup` and never on the original.
+/// The reporter gets stderr **as it is**. An earlier attempt `dup`ed stderr and set
+/// `O_NONBLOCK` on the copy, which is wrong twice over and was found in round 3: `dup` shares
+/// the open file description, so the flag applied to the wrapper's own stderr and to the
+/// child's inherited one, and it stayed changed after the write (codex-review P1). A reporter
+/// thread needs neither, so the trap has nowhere to appear.
 fn report(sig: i32, relayed: bool) {
     let decision = match relayed {
         true => "forwarded",
         false => "not forwarded",
     };
-    let line = format!("xmustard run: {} {decision} to the child\n", name_of(sig));
-    // Nothing is gained by falling back to a blocking write when the descriptor cannot be
-    // prepared: that is the hazard this function exists to remove, and a missing diagnostic
-    // costs an operator one line while a blocked watcher costs a child its second signal.
-    write_best_effort(line.as_bytes());
+    write_best_effort(format!("xmustard run: {} {decision} to the child\n", name_of(sig)));
 }
 
-/// Writes `bytes` to the wrapper's stderr without ever blocking.
+/// The channel the watcher enqueues reports on; the writer thread is started with it.
+static REPORTS: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+
+/// Hands `line` to the reporter thread, never blocking the watcher.
 ///
-/// `rustix`'s `dup` and `fcntl_setfl` keep this free of `unsafe`, which the crate's
-/// `#![forbid(unsafe_code)]` requires; the crate already depends on `rustix` with `fs` for
-/// exactly this descriptor work (the capture pipe in `capture`).
-fn write_best_effort(bytes: &[u8]) {
-    let Ok(out) = rustix::io::dup(std::io::stderr()) else {
-        return;
-    };
-    if rustix::fs::fcntl_setfl(&out, rustix::fs::OFlags::NONBLOCK).is_ok() {
-        let mut out: File = out.into();
-        let _ = out.write_all(bytes);
-    }
+/// `try_send` on a bounded channel is what keeps the watcher free: a full queue drops the line
+/// rather than waiting, and a dropped diagnostic costs an operator one line while a blocked
+/// watcher costs a child its next signal. The reporter may sit in a blocked write for as long
+/// as the wrapper lives, which is the point — it is a thread nobody is waiting on.
+fn write_best_effort(line: String) {
+    let sender = REPORTS.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<String>(REPORT_QUEUE);
+        thread::spawn(move || {
+            for line in rx {
+                let _ = io::stderr().write_all(line.as_bytes());
+            }
+        });
+        tx
+    });
+    let _ = sender.try_send(line);
 }
+
+/// How many reports may be waiting before the queue drops the newest. Bounded so a watcher
+/// cannot grow memory against a stderr nobody drains; deep enough that a burst of signals all
+/// get their line.
+const REPORT_QUEUE: usize = 32;
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
 /// reaches it too. `false` on any error (the child is gone, or its group cannot be read):

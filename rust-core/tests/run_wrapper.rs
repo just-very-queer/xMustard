@@ -1112,43 +1112,77 @@ fn pipe() -> Option<(std::fs::File, std::fs::File)> {
     })
 }
 
-/// Writes into the pipe until it is full.
+/// Writes into the pipe until it is full, then leaves the descriptor BLOCKING.
 ///
 /// The fill must not block THIS process (the test would hang before spawning anything) and the
 /// wrapper's descriptor must stay BLOCKING (a non-blocking full pipe answers `EAGAIN`, which is
-/// a different hazard than the one r1-1 is about). `dup` cannot give both: it shares the open
-/// file description, so `F_SETFL(O_NONBLOCK)` on the copy sets the flag for the wrapper too —
-/// three review channels found that independently (codex-review P2, codex-spec, OCR), and it
+/// a different hazard than the one r1-1 is about). One `dup` cannot give both: it shares the
+/// open file description, so `F_SETFL(O_NONBLOCK)` on the copy sets the flag for the wrapper too
+/// — three review channels found that independently (codex-review P2, codex-spec, OCR), and it
 /// would have made this test pass on the ordering it exists to condemn.
 ///
-/// So the fill writes the pipe's own capacity in **one** blocking write, which cannot block
-/// because the pipe is empty and that is exactly the room it has. `F_GETPIPE_SZ` supplies the
-/// number rather than a hard-coded 64 KiB, so the test does not depend on the default.
+/// So the flag is set on a copy for the fill and then **cleared on the descriptor the wrapper
+/// inherits**. Dropping the copy is not enough, and that is measured rather than assumed: the
+/// flag lives on the shared open file description, which survives while any descriptor refers to
+/// it, so a closed filler leaves `write_end` non-blocking and the report `EAGAIN`s (the
+/// assertion below caught it, logs/ws-fix-20c-run-20261004T163930Z.log). `F_GETPIPE_SZ` is
+/// deliberately not used: it is Linux-only and the repository's checks run on macOS too
+/// (codex-review P1, round 3). The loop stops on the short write the kernel returns when the
+/// pipe has no room.
 fn fill_pipe(write_end: &std::fs::File) {
-    // SAFETY: `F_GETPIPE_SZ` takes no argument and returns the pipe's capacity, so the variadic
-    // `fcntl` is called with no third argument at all.
-    let size = unsafe {
-        libc::fcntl(
-            std::os::fd::AsRawFd::as_raw_fd(write_end),
-            libc::F_GETPIPE_SZ,
-        )
-    };
-    assert!(size > 0, "the pipe's size could not be read: {size}");
-    let chunk = vec![b'x'; size as usize];
-    // A second write would block, and blocking is the wrapper's job here, not this function's.
-    // SAFETY: a plain write of a live buffer of `chunk.len()` bytes to a valid descriptor.
-    let written = unsafe {
-        libc::write(
-            std::os::fd::AsRawFd::as_raw_fd(write_end),
-            chunk.as_ptr().cast(),
-            chunk.len(),
-        )
-    };
+    {
+        // SAFETY: `dup` of a live descriptor; `fcntl(F_SETFL)` on this copy only.
+        let filler = unsafe {
+            let copy = libc::dup(std::os::fd::AsRawFd::as_raw_fd(write_end));
+            assert!(copy >= 0, "the fill descriptor could not be duplicated");
+            assert_eq!(
+                libc::fcntl(copy, libc::F_SETFL, libc::O_NONBLOCK),
+                0,
+                "the fill descriptor could not be made non-blocking"
+            );
+            std::fs::File::from_raw_fd(copy)
+        };
+        let chunk = vec![b'x'; 64 * 1024];
+        loop {
+            // SAFETY: a plain write of a live buffer to a valid descriptor. EAGAIN or a short
+            // write means the pipe is full, which is the state this harness needs.
+            let written = unsafe {
+                libc::write(
+                    std::os::fd::AsRawFd::as_raw_fd(&filler),
+                    chunk.as_ptr().cast(),
+                    chunk.len(),
+                )
+            };
+            if written < chunk.len() as isize {
+                break;
+            }
+        }
+    }
+    // Clear the flag the fill set on the shared description, so the wrapper inherits a blocking
+    // descriptor. SAFETY: `write_end` is live and the only file-status flags it carries are the
+    // ones this function just set.
     assert_eq!(
-        written,
-        chunk.len() as isize,
-        "the pipe did not take its own capacity, so a later write would not block"
+        unsafe {
+            libc::fcntl(
+                std::os::fd::AsRawFd::as_raw_fd(write_end),
+                libc::F_SETFL,
+                0,
+            )
+        },
+        0,
+        "the fill could not restore the wrapper's descriptor to blocking"
     );
+    assert!(
+        !is_nonblocking(write_end),
+        "the fill left the wrapper's descriptor non-blocking"
+    );
+}
+
+/// Whether `fd` carries `O_NONBLOCK`, read back from the descriptor rather than assumed.
+fn is_nonblocking(fd: &std::fs::File) -> bool {
+    // SAFETY: `F_GETFL` takes no argument and returns the descriptor's flags.
+    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL) };
+    flags & libc::O_NONBLOCK != 0
 }
 
 /// WS-FIX-20c-r1-1: the signal reaches the child even when the wrapper cannot report it.
