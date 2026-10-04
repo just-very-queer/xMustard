@@ -280,7 +280,7 @@ fn statement(q: &Query) -> String {
             };
             format!(
                 "SELECT r.start_byte, f.path, f.lang, f.id, f.content_hash, r.line, r.kind, \
-                        s.qualified_name, s.kind, r.line \
+                        s.qualified_name, s.kind, s.start_line \
                  FROM refs r JOIN names n ON n.id = r.name_id JOIN files f ON f.id = r.file_id \
                  LEFT JOIN symbols s ON s.id = r.symbol_id \
                  WHERE n.name = ?1 AND r.kind IN ({})",
