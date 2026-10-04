@@ -230,6 +230,43 @@ fn git_unavailable_coverage(why: &str) -> IndexCoverage {
     }
 }
 
+/// Why the index listing of a Git worktree produced nothing: its `loss_counts` row and
+/// what happened.
+fn listing_cause(e: &crate::indexcache::GitRunError) -> (&'static str, &'static str) {
+    use crate::indexcache::GitRunError as E;
+    match e {
+        E::Overflow(_) => (
+            "git_listing_cap",
+            "the index listing passed the Git output cap",
+        ),
+        E::TimedOut(_) => ("git_listing_timeout", "the index listing timed out"),
+        E::Spawn(_) | E::Failed => ("git_listing_failed", "the index listing failed"),
+    }
+}
+
+/// The `loss_counts` rows `listing_failed_coverage` writes.
+const LISTING_CAUSES: [&str; 3] = [
+    "git_listing_cap",
+    "git_listing_timeout",
+    "git_listing_failed",
+];
+
+/// Coverage of a Git worktree whose index listing failed: Git mode, with the cause as
+/// a loss row, never `git-unavailable`.
+fn listing_failed_coverage(e: &crate::indexcache::GitRunError) -> IndexCoverage {
+    let (cause, what) = listing_cause(e);
+    IndexCoverage {
+        repo_mode: "git".into(),
+        max_files: crate::index::config::DEFAULT_MAX_FILES,
+        truncated: matches!(e, crate::indexcache::GitRunError::Overflow(_)),
+        loss_counts: BTreeMap::from([(cause.to_string(), 1)]),
+        degraded_reason: Some(format!(
+            "{cause}: {what} (git ls-files -s -z: {e}); the symbol graph is EMPTY, not authoritative"
+        )),
+        ..Default::default()
+    }
+}
+
 /// repo_role is the SINGLE canonical classification of a tracked file, so code /
 /// tests / docs / guidance / config are decided in ONE place instead of the five
 /// divergent per-subsystem extension lists the review flagged (XM-PRO-012). "code"
@@ -1527,14 +1564,17 @@ fn build_graph(
     use crate::indexcache::{DirtyContent, source_identity};
 
     let (max_files, max_symbols) = graph_envelope(root);
-    let listing = match id.layout {
-        Some(_) => ls_files_stage(root).map_err(|e| e.to_string()),
-        None => Err("no .git / git missing / unsafe directory".to_string()),
+    let listing = match id.layout.as_ref() {
+        Some(layout) => ls_files_stage(root)
+            .map(|listing| (layout, listing))
+            .map_err(|e| listing_failed_coverage(&e)),
+        None => Err(git_unavailable_coverage(
+            "no .git / git missing / unsafe directory",
+        )),
     };
-    let (layout, listing) = match (id.layout.as_ref(), listing) {
-        (Some(layout), Ok(listing)) => (layout, listing),
-        (_, res) => {
-            let mut cov = git_unavailable_coverage(&res.err().unwrap_or_default());
+    let (layout, listing) = match listing {
+        Ok(found) => found,
+        Err(mut cov) => {
             cov.source_identity = identity_summary(id, false);
             work.elapsed_ms = started.elapsed().as_millis() as u64;
             cov.work = work;
@@ -2390,7 +2430,7 @@ pub fn blast_radius(root: &Path, workspace_id: &str, symbol: &str) -> BlastRadiu
             .filter(|p| is_source(p))
             .collect(),
         Err(e) => {
-            lose("", "git_unavailable", e.to_string());
+            lose("", listing_cause(&e).0, e.to_string());
             Vec::new()
         }
     };
@@ -2612,7 +2652,9 @@ pub fn query_source(root: &Path, workspace_id: &str) -> QuerySource {
 /// last brought to another identity is behind the working tree: its refresh was
 /// refused, failed or is still running. The legacy graph, built for the tree as it is
 /// now and bounded by the same envelope, answers that read instead, so edits never
-/// drop out of search, explain and impact while the index catches up.
+/// drop out of search, explain and impact while the index catches up. When that graph
+/// is empty because Git could not list the tree, the behind index answers, labelled
+/// (`behind_index_answers`).
 pub fn query_source_for(
     root: &Path,
     workspace_id: &str,
@@ -2626,10 +2668,16 @@ pub fn query_source_for(
                 answered: Answered::Index(opened),
             };
         }
-        Some(opened) => Some(opened.snapshot.generation),
-        None => None,
+        opened => opened,
     };
     let (graph, mut coverage) = symbol_graph_with_coverage(root, workspace_id);
+    let listing_failure = LISTING_CAUSES
+        .into_iter()
+        .find(|c| coverage.loss_counts.contains_key(*c));
+    let behind = match (behind, listing_failure) {
+        (Some(opened), Some(cause)) => return behind_index_answers(opened, cause),
+        (behind, _) => behind.map(|o| o.snapshot.generation),
+    };
     if let Some(generation) = behind {
         coverage.work.graph_cache_detail = format!(
             "code index generation {generation} is behind this read's repository identity; \
@@ -2666,6 +2714,31 @@ pub fn query_source_for(
         graph,
         coverage,
         answered: Answered::Legacy(relation, root.to_path_buf()),
+    }
+}
+
+/// The behind code index `opened` answers a read whose working-tree graph is empty
+/// because its index listing failed (`cause`): an answer from an older generation,
+/// labelled, beats an empty one. The commit relation is not vouched for (status
+/// `unknown`) and the coverage is not complete.
+fn behind_index_answers(mut opened: crate::index::reader::Opened, cause: &str) -> QuerySource {
+    opened.relation.status = Status::Unknown;
+    let mut coverage = opened.coverage();
+    let why = format!(
+        "code index generation {} is behind this read's repository identity and answered: \
+         the graph for the current identity is empty ({cause})",
+        opened.snapshot.generation
+    );
+    coverage.complete = false;
+    coverage.degraded_reason = Some(match coverage.degraded_reason.take() {
+        Some(r) => format!("{why}; {r}"),
+        None => why.clone(),
+    });
+    coverage.work.graph_cache_detail = why;
+    QuerySource {
+        graph: opened.snapshot.clone(),
+        coverage,
+        answered: Answered::Index(opened),
     }
 }
 

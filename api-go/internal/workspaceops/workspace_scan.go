@@ -87,11 +87,15 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 	issues = applyIssueDrift(root, issues)
 	issues = normalizeIssueSlices(issues)
 
-	rustSignals, err := rustcore.ScanSignals(context.Background(), root)
+	signalScan, err := rustcore.ScanSignals(context.Background(), root)
 	if err != nil {
 		return nil, err
 	}
-	signals := convertDiscoverySignals(rustSignals)
+	signals := convertDiscoverySignals(signalScan.Signals)
+	signalsTruncated := 0
+	if signalScan.Truncated {
+		signalsTruncated = 1
+	}
 	sources, err := buildSourceRecords(ledgerPath, issues, verdictPaths, signals)
 	if err != nil {
 		return nil, err
@@ -136,6 +140,8 @@ func ScanWorkspace(dataDir string, workspaceID string) (*workspaceSnapshot, erro
 			"review_ready_total":          countReviewReady(issues),
 			"review_queue_total":          countReviewQueue(issues),
 			"signals_total":               len(signals),
+			"signals_files_read":          signalScan.FilesRead,
+			"signals_truncated":           signalsTruncated,
 			"signals_promoted":            countSignalsPromoted(signals),
 			"drift_total":                 countDriftFlags(issues),
 			"sources_total":               len(sources),

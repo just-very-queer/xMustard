@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log"
 	"slices"
+	"strconv"
 	"sync"
 	"time"
 
@@ -79,8 +80,26 @@ type indexRefresh struct {
 // from a new generation).
 func (r *indexRefresh) changed() bool { return r != nil && r.Mode != "noop" }
 
+// identityStamp is the repository identity an update runs for: its key and how many
+// limitations it carried. The core stamps both, and its readers report the identity
+// complete only when the count is 0 (WS-RT2).
+type identityStamp struct {
+	key         string
+	limitations int
+}
+
+// stampOf is the stamp of id. An incomplete identity counts at least one limitation,
+// so it never reads as complete.
+func stampOf(id RepoIdentity) identityStamp {
+	n := len(id.Limitations)
+	if !id.Complete && n == 0 {
+		n = 1
+	}
+	return identityStamp{key: id.Key, limitations: n}
+}
+
 type refreshFlight struct {
-	key string
+	identityStamp
 	// forced: a read started it, and takes the watcher's pending changes at once.
 	forced bool
 	done   chan struct{}
@@ -88,8 +107,8 @@ type refreshFlight struct {
 }
 
 type codeIndexRoot struct {
-	indexed string // identity key of the last successful refresh
-	failed  string // identity key whose refresh failed (not retried)
+	indexed identityStamp // identity of the last successful refresh
+	failed  identityStamp // identity whose refresh failed (not retried)
 	flight  *refreshFlight
 	used    time.Time
 }
@@ -125,24 +144,31 @@ func onRefreshDue(root string) {
 	if st.flight != nil || budget.HeavyBusy() {
 		return
 	}
-	f := &refreshFlight{key: id.Key, done: make(chan struct{})}
+	f := &refreshFlight{identityStamp: stampOf(id), done: make(chan struct{})}
 	st.flight = f
 	go runCodeIndexRefresh(root, f)
 }
 
-// refreshArgs are an update's flags: the identity it is run for, and the batch's paths
-// when the watcher's batch accounts for every change; otherwise the whole tree is
-// checked. A read's refresh with an empty batch found the index behind its identity
-// although the watcher saw nothing, so it checks the whole tree too.
-func refreshArgs(key string, b *rustcore.RefreshBatch, forced bool) []string {
+// refreshArgs are an update's flags: the identity it is run for (key and limitation
+// count), and the batch's paths when the watcher's batch accounts for every change;
+// otherwise the whole tree is checked. A read's refresh with an empty batch found the
+// index behind its identity although the watcher saw nothing, so it checks the whole
+// tree too.
+func refreshArgs(id identityStamp, b *rustcore.RefreshBatch, forced bool) []string {
 	var args []string
-	if key != "" {
-		args = append(args, "--identity-key", key)
+	if id.key != "" {
+		args = append(args, "--identity-key", id.key, "--identity-limitations", strconv.Itoa(id.limitations))
 	}
 	if b == nil || b.Whole() || (forced && b.Empty()) {
 		return args
 	}
 	return append(append(args, "--paths"), b.Paths...)
+}
+
+// settled reports whether the index was brought to id, or failed for it: both key and
+// limitation count, so the completeness the index was stamped with stays current.
+func (st *codeIndexRoot) settled(id identityStamp) bool {
+	return st.indexed == id || st.failed == id
 }
 
 func codeIndexState(root string) *codeIndexRoot {
@@ -214,7 +240,7 @@ func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 	}
 	codeIndex.Lock()
 	st := codeIndexState(root)
-	if st.indexed == id.Key || st.failed == id.Key {
+	if st.settled(stampOf(id)) {
 		codeIndex.Unlock()
 		return read
 	}
@@ -225,12 +251,12 @@ func ensureCodeIndex(ctx context.Context, root string) codeIndexRead {
 		return read
 	}
 	if f == nil {
-		f = &refreshFlight{key: id.Key, forced: true, done: make(chan struct{})}
+		f = &refreshFlight{identityStamp: stampOf(id), forced: true, done: make(chan struct{})}
 		st.flight = f
 		go runCodeIndexRefresh(root, f)
 	}
 	wait := codeIndexWait
-	if st.indexed == "" {
+	if st.indexed.key == "" {
 		wait = codeIndexFirstWait
 	}
 	codeIndex.Unlock()
@@ -277,9 +303,9 @@ func runCodeIndexRefresh(root string, f *refreshFlight) {
 		st.flight = nil
 		switch outcome {
 		case refreshDone:
-			st.indexed, st.failed = f.key, ""
+			st.indexed, st.failed = f.identityStamp, identityStamp{}
 		case refreshFailed:
-			st.failed = f.key
+			st.failed = f.identityStamp
 		}
 		codeIndex.Unlock()
 	}()
@@ -292,7 +318,7 @@ func runCodeIndexRefresh(root string, f *refreshFlight) {
 	// `index update` takes the governor's heavy slot inside rustcore (WS-06B); a
 	// refused slot comes back as budget.ErrOverloaded and is retried on the next read
 	// (and by the watcher, with backoff).
-	out, err := codeIndexRunner(ctx, root, refreshArgs(f.key, batch, f.forced)...)
+	out, err := codeIndexRunner(ctx, root, refreshArgs(f.identityStamp, batch, f.forced)...)
 	fctx, fcancel := context.WithTimeout(context.Background(), codeIndexFinishTimeout)
 	rustcore.FinishRefresh(fctx, root, batch, err == nil, out)
 	fcancel()

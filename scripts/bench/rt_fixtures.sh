@@ -8,6 +8,7 @@
 #           s1-sub-dirty s2-sub-uninit s3-sub-ignall
 #   t100k   t100k: 100,000 tracked paths
 #   t1m     t1m: 1,000,000 tracked paths
+#   t1m80   t1m80: 1,000,000 tracked paths of about 80 bytes (monorepo depth, WS-RT3)
 #   u200k   u200k: 3 tracked files plus 200,000 untracked .go files
 set -eu
 B=$1
@@ -91,15 +92,18 @@ nested() {
   printf 'package sub\n\nfunc SubOnly() int { return 9 }\n' > "$B/s3-sub-ignall/mod/x.go"
 }
 
-# tracked <dir> <paths>: a repo of <paths> tracked files (a.go, b.go, then
-# dNNNN/fNNNN.{go,txt,md,py} 1,000 per directory) written by fast-import and checked out
+# tracked <dir> <paths> [long]: a repo of <paths> tracked files (a.go, b.go, then
+# dNNNN/fNNNN.{go,txt,md,py} 1,000 per directory, or with `long` the same under an
+# 80-byte monorepo path) written by fast-import and checked out
 tracked() {
-  local d=$1 n=$2
+  local d=$1 n=$2 long=${3:-}
   rm -rf "$d"
   g init -q "$d"
-  python3 - "$n" <<'PY' | g -C "$d" fast-import --quiet
+  python3 - "$n" "$long" <<'PY' | g -C "$d" fast-import --quiet
 import sys
 total = int(sys.argv[1])
+form = (b"src/services/team-platform/component-runtime/internal/pkg%04d/handler_f%04d.%s"
+        if sys.argv[2] == "long" else b"d%04d/f%04d.%s")
 w = sys.stdout.buffer.write
 bodies = {
     "go": [b"package p%d\n\nfunc F%d() int { return %d }\n" % (i, i, i) for i in range(16)],
@@ -123,7 +127,7 @@ w(b"M 100644 :1000 a.go\nM 100644 :1001 b.go\n")
 exts = ("go", "txt", "md", "py")
 for n in range(total - 2):
     ext = exts[n % 4]
-    w(b"M 100644 :%d d%04d/f%04d.%s\n" % (marks[(ext, n % 16)], n // 1000, n % 1000, ext.encode()))
+    w(b"M 100644 :%d " % marks[(ext, n % 16)] + form % (n // 1000, n % 1000, ext.encode()) + b"\n")
 w(b"\n")
 PY
   g -C "$d" symbolic-ref HEAD refs/heads/main
@@ -150,6 +154,7 @@ for set in "$@"; do
     nested) nested ;;
     t100k) tracked "$B/t100k" 100000 ;;
     t1m) tracked "$B/t1m" 1000000 ;;
+    t1m80) tracked "$B/t1m80" 1000000 long ;;
     u200k) untracked ;;
     *) echo "unknown set: $set" >&2; exit 2 ;;
   esac

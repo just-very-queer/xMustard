@@ -3,11 +3,18 @@
 //! `source_identity` is the one content identity for a working tree: canonical root +
 //! `HEAD` + every `git status --porcelain=v1 -z --untracked-files=all` entry (status,
 //! byte-exact path, rename origin) + the full SHA-256 of each dirty or untracked
-//! file's bytes, read through the bounded no-follow reader. Files that cannot be hashed
-//! in full (oversized, unreadable, not regular, over the identity byte budget) add a
-//! metadata token and an explicit limitation, so `identity_complete` is false: a
-//! bounded read never claims identity for bytes it did not read. The same key drives
-//! graph-cache invalidation and `xmustard-core repo-key`.
+//! file's bytes, read through the bounded no-follow reader. The status and the hidden
+//! entry listings are streamed, never held whole (WS-RT3), and untracked entries past
+//! `MAX_IDENTITY_UNTRACKED` enter the key by path only, with a limitation. Files that
+//! cannot be hashed in full (oversized, unreadable, not regular, over the identity
+//! byte budget) add a metadata token and an explicit limitation, so
+//! `identity_complete` is false: a bounded read never claims identity for bytes it
+//! did not read. A status entry that
+//! is a nested repository (a directory with its own `.git`: an untracked `sub/`, a
+//! submodule, a gitlink without a module entry) is not read: its token is the nested
+//! HEAD, ref and Git index stat key, it is listed in `nested_repos`, and it leaves the
+//! identity complete (WS-RT2). The same key drives graph-cache invalidation and
+//! `xmustard-core repo-key`.
 //!
 //! Dirty and untracked files are hashed through a stat cache of their own
 //! (`hashcache::identity_cache_file_for`, PAR-FRESH-01), so an unchanged dirty file is
@@ -29,7 +36,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::symbolgraph::{
@@ -293,27 +300,51 @@ impl StatusEntry {
     }
 }
 
+/// Incremental `git status --porcelain=v1 -z` parser: records in, entries out. A rename
+/// or copy waits for the record after it, its origin.
+#[derive(Default)]
+pub(crate) struct PorcelainParser {
+    pending: Option<StatusEntry>,
+}
+
+impl PorcelainParser {
+    /// The entry `rec` completes, if any. Malformed records are skipped.
+    pub(crate) fn push(&mut self, rec: &[u8]) -> Option<StatusEntry> {
+        if let Some(mut e) = self.pending.take() {
+            e.orig_path = Some(rec.to_vec());
+            return Some(e);
+        }
+        if rec.len() < 4 || rec[2] != b' ' {
+            return None;
+        }
+        let xy = [rec[0], rec[1]];
+        let e = StatusEntry {
+            xy,
+            path: rec[3..].to_vec(),
+            orig_path: None,
+        };
+        if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
+            self.pending = Some(e);
+            return None;
+        }
+        Some(e)
+    }
+
+    /// A rename or copy the output ended before the origin of.
+    pub(crate) fn finish(self) -> Option<StatusEntry> {
+        self.pending
+    }
+}
+
 /// Parse `git status --porcelain=v1 -z` output: `XY SP path NUL`, followed by
 /// `orig NUL` for renames and copies. Malformed records are skipped.
 pub fn parse_porcelain_v1_z(out: &[u8]) -> Vec<StatusEntry> {
-    let mut records = out.split(|b| *b == 0);
-    let mut entries = Vec::new();
-    while let Some(rec) = records.next() {
-        if rec.len() < 4 || rec[2] != b' ' {
-            continue;
-        }
-        let xy = [rec[0], rec[1]];
-        let orig_path = if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
-            records.next().map(<[u8]>::to_vec)
-        } else {
-            None
-        };
-        entries.push(StatusEntry {
-            xy,
-            path: rec[3..].to_vec(),
-            orig_path,
-        });
-    }
+    let mut parser = PorcelainParser::default();
+    let mut entries: Vec<StatusEntry> = out
+        .split(|b| *b == 0)
+        .filter_map(|rec| parser.push(rec))
+        .collect();
+    entries.extend(parser.finish());
     entries
 }
 
@@ -384,7 +415,29 @@ pub enum DirtyContent {
     Incomplete(SourceReadFailure),
     /// Skipped because the identity byte budget was spent.
     Unhashed,
+    /// A nested repository (see [`NestedRepo`]) of `kind`: not read; `token` covers
+    /// its HEAD, its ref and its Git index stat key, so it is complete for this
+    /// repository's identity.
+    NestedRepo { kind: &'static str, token: String },
 }
+
+/// A directory inside the worktree with a Git dir of its own (`.git` as a directory
+/// or a `gitdir:` file). It is a repository of its own: never read as a file, outside
+/// this repository's identity and index, and reported instead of being dropped.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+pub struct NestedRepo {
+    /// Top-level relative, without a trailing `/`.
+    pub path: String,
+    /// [`NESTED_SUBMODULE`], [`NESTED_GITLINK_UNREGISTERED`] or [`NESTED_UNTRACKED`].
+    pub kind: String,
+}
+
+/// A tracked gitlink with a `.gitmodules` entry.
+pub const NESTED_SUBMODULE: &str = "submodule";
+/// A tracked gitlink with no `.gitmodules` entry (Git cannot clone it).
+pub const NESTED_GITLINK_UNREGISTERED: &str = "gitlink_unregistered";
+/// An untracked directory Git reports as a repository of its own (`?? sub/`).
+pub const NESTED_UNTRACKED: &str = "nested_repo";
 
 /// The repository source identity. Serialized as the `repo-key` JSON contract.
 #[derive(Debug, Clone, Serialize)]
@@ -403,6 +456,10 @@ pub struct SourceIdentity {
     pub root: String,
     pub dirty_entries: usize,
     pub untracked_entries: usize,
+    /// Untracked entries past `MAX_IDENTITY_UNTRACKED`: counted in `untracked_entries`,
+    /// keyed by path, absent from the entries a `RepoState` carries.
+    #[serde(skip)]
+    pub untracked_beyond: usize,
     /// Assume-unchanged / skip-worktree index entries hashed directly because
     /// `git status` does not report their worktree edits.
     pub hidden_entries: usize,
@@ -411,6 +468,10 @@ pub struct SourceIdentity {
     pub bytes_hashed: u64,
     /// Dirty or untracked files whose hash the stat cache vouched for (not read).
     pub files_reused: usize,
+    /// Status entries that are nested repositories, by path; omitted when none. They
+    /// are covered by their own token, so they never make the identity incomplete.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub nested_repos: Vec<NestedRepo>,
     #[serde(skip)]
     pub dirty: BTreeMap<Vec<u8>, DirtyContent>,
     #[serde(skip)]
@@ -423,8 +484,8 @@ pub struct SourceIdentity {
     /// ignored as a whole (top-level relative, trailing `/`). Git never descends into
     /// them, so nothing inside can change the key; the Go identity cache skips them
     /// when it fingerprints the working tree. None when not requested or not fully
-    /// reportable (a non-UTF-8 path, more than `MAX_IGNORED_DIRS`, or a status that
-    /// had to be re-run without the listing). Never part of the key.
+    /// reportable (a non-UTF-8 path, or more than `MAX_IGNORED_DIRS` or
+    /// `MAX_IGNORED_DIR_BYTES`). Never part of the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored_dirs: Option<Vec<String>>,
 }
@@ -495,6 +556,223 @@ pub const MAX_IGNORED_DIR_BYTES: usize = 256 << 10;
 fn push_field(h: &mut Sha256, bytes: &[u8]) {
     h.update((bytes.len() as u64).to_le_bytes());
     h.update(bytes);
+}
+
+/// Bytes read from a Git dir's small files (`HEAD`, a loose ref, a `gitdir:` pointer).
+const GIT_POINTER_BYTES: u64 = 4 << 10;
+/// Bytes of `.gitmodules` read to tell a submodule from an unregistered gitlink.
+const MAX_GITMODULES_BYTES: u64 = 1 << 20;
+
+fn read_small(path: &Path, cap: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    fs::File::open(path)
+        .ok()?
+        .take(cap)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(buf)
+}
+
+/// The stat key of `path` for a key token, `absent` when it cannot be stat'ed.
+fn stat_token(path: &Path) -> String {
+    fs::symlink_metadata(path).map_or_else(|_| "absent".into(), |m| change_token(&m))
+}
+
+/// Whether the directory `dir` holds a `.git` of its own (a directory or a file).
+pub(crate) fn has_own_git(dir: &Path) -> bool {
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
+    fs::symlink_metadata(dir.join(".git")).is_ok_and(|m| m.is_dir() || m.is_file())
+}
+
+/// The Git dir of the repository whose worktree is `dir`: `dir/.git`, or the target of
+/// a `gitdir:` file there (relative to `dir`). None when neither leads to a directory.
+fn nested_git_dir(dir: &Path) -> Option<PathBuf> {
+    let dot = dir.join(".git");
+    let meta = fs::symlink_metadata(&dot).ok()?;
+    if meta.is_dir() {
+        return Some(dot);
+    }
+    let text = read_small(&dot, GIT_POINTER_BYTES)?;
+    let target = text.strip_prefix(b"gitdir:")?.trim_ascii();
+    let git_dir = dir.join(path_from_bytes(target));
+    git_dir.is_dir().then_some(git_dir)
+}
+
+/// Bytes of a nested repository's `packed-refs` scanned for one ref.
+const MAX_PACKED_REFS_BYTES: u64 = 64 << 20;
+
+/// The object id `packed-refs` at `path` holds for ref `name`: Some(None) when the file
+/// is absent or does not name it (an unborn branch), None when it cannot be opened or
+/// read to its end within MAX_PACKED_REFS_BYTES. Read in lines of at most
+/// GIT_POINTER_BYTES (a longer line names no ref and is skipped); nothing else is kept.
+fn packed_ref(path: &Path, name: &[u8]) -> Option<Option<Vec<u8>>> {
+    use std::io::{BufRead, Read};
+    let f = match fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(None),
+        Err(_) => return None,
+    };
+    let mut r = std::io::BufReader::new(f.take(MAX_PACKED_REFS_BYTES));
+    let (mut line, mut total, mut long) = (Vec::new(), 0u64, false);
+    loop {
+        line.clear();
+        let n = (&mut r)
+            .take(GIT_POINTER_BYTES)
+            .read_until(b'\n', &mut line)
+            .ok()?;
+        if n == 0 {
+            return (total < MAX_PACKED_REFS_BYTES).then_some(None);
+        }
+        total += n as u64;
+        let ended = line.last() == Some(&b'\n');
+        // the rest of an over-long line, or its head, is not a ref line
+        let skip = std::mem::replace(&mut long, !ended) || !ended;
+        let l = line.trim_ascii_end();
+        if !skip
+            && let Some(sp) = l.iter().position(|b| *b == b' ')
+            && &l[sp + 1..] == name
+        {
+            return Some(Some(l[..sp].to_vec()));
+        }
+    }
+}
+
+/// The token of a nested repository at `dir`, read without a Git child: its HEAD, the
+/// object id of the ref HEAD names (the loose ref, else its `packed-refs` line) and
+/// the stat key of its Git index. A commit, a checkout or staging inside it changes the token; an
+/// unstaged edit in its worktree belongs to that repository and does not. None when
+/// its Git dir does not resolve or its HEAD cannot be read: then nothing keys it.
+fn nested_repo_token(dir: &Path) -> Option<String> {
+    let mut h = Sha256::new();
+    match nested_git_dir(dir) {
+        None => return None,
+        Some(git_dir) => {
+            let head =
+                read_small(&git_dir.join("HEAD"), GIT_POINTER_BYTES).filter(|h| !h.is_empty())?;
+            push_field(&mut h, &head);
+            let common = read_small(&git_dir.join("commondir"), GIT_POINTER_BYTES).map_or_else(
+                || git_dir.clone(),
+                |c| git_dir.join(path_from_bytes(c.trim_ascii())),
+            );
+            let named = head
+                .strip_prefix(b"ref: ")
+                .map(<[u8]>::trim_ascii)
+                .filter(|r| {
+                    r.starts_with(b"refs/") && !r.split(|b| *b == b'/').any(|c| c == b"..")
+                });
+            if let Some(name) = named {
+                let rel = path_from_bytes(name);
+                let loose = read_small(&git_dir.join(&rel), GIT_POINTER_BYTES)
+                    .or_else(|| read_small(&common.join(&rel), GIT_POINTER_BYTES));
+                let oid = match loose {
+                    Some(oid) => Some(oid),
+                    None => packed_ref(&common.join("packed-refs"), name)?,
+                };
+                push_field(&mut h, oid.as_deref().unwrap_or(b"unborn"));
+            }
+            push_field(&mut h, stat_token(&git_dir.join("index")).as_bytes());
+        }
+    }
+    Some(format!("nested_repo:{:x}", h.finalize()))
+}
+
+/// The `path` values of the `[submodule "..."]` sections of `<toplevel>/.gitmodules`
+/// within its first MAX_GITMODULES_BYTES (a gitlink named only past them reads as
+/// unregistered); empty when absent. A value is decoded
+/// as Git config does: quotes removed, `\"`, `\\`, `\t` and `\n` unescaped, and an
+/// unquoted `#` or `;` starts a comment.
+pub(crate) fn submodule_paths(toplevel: &Path) -> std::collections::BTreeSet<String> {
+    use std::io::BufRead;
+    let mut paths = std::collections::BTreeSet::new();
+    let Ok(f) = fs::File::open(toplevel.join(".gitmodules")) else {
+        return paths;
+    };
+    let f = std::io::Read::take(f, MAX_GITMODULES_BYTES);
+    let mut in_submodule = false;
+    for line in std::io::BufReader::new(f).lines().map_while(Result::ok) {
+        let line = line.trim();
+        if let Some(section) = line.strip_prefix('[') {
+            // Git section names are case-insensitive: `[Submodule "a"]` counts
+            let s = section.trim_start();
+            let n = "submodule".len();
+            in_submodule = s
+                .get(..n)
+                .is_some_and(|p| p.eq_ignore_ascii_case("submodule"))
+                && s[n..].starts_with([' ', '\t', '"', ']']);
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if in_submodule && key.trim().eq_ignore_ascii_case("path") {
+            paths.insert(config_value(value));
+        }
+    }
+    paths
+}
+
+/// A Git config value as Git reads it (see `submodule_paths`).
+fn config_value(raw: &str) -> String {
+    let mut out = String::new();
+    let (mut quoted, mut chars) = (false, raw.trim().chars());
+    while let Some(c) = chars.next() {
+        match (c, quoted) {
+            ('"', _) => quoted = !quoted,
+            ('\\', _) => match chars.next() {
+                Some('t') => out.push('\t'),
+                Some('n') => out.push('\n'),
+                Some(other) => out.push(other),
+                None => {}
+            },
+            ('#' | ';', false) => break,
+            _ => out.push(c),
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// The kind of the nested repository at top-level relative `rel`: an untracked one,
+/// or a tracked gitlink with or without its `.gitmodules` entry.
+pub(crate) fn nested_kind(
+    tracked: bool,
+    rel: &str,
+    modules: &std::collections::BTreeSet<String>,
+) -> &'static str {
+    match (tracked, modules.contains(rel)) {
+        (false, _) => NESTED_UNTRACKED,
+        (true, true) => NESTED_SUBMODULE,
+        (true, false) => NESTED_GITLINK_UNREGISTERED,
+    }
+}
+
+/// A status entry that is a directory, classified without reading it: a nested
+/// repository, or `not_regular`. None for anything else (a file, a symlink, a path
+/// gone from the worktree).
+fn directory_entry(
+    toplevel: &Path,
+    e: &StatusEntry,
+    modules: &mut Option<std::collections::BTreeSet<String>>,
+) -> Option<DirtyContent> {
+    let trimmed = e.path.strip_suffix(b"/").unwrap_or(&e.path);
+    let dir = toplevel.join(path_from_bytes(trimmed));
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
+    if !fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) {
+        return None;
+    }
+    if !has_own_git(&dir) {
+        return Some(DirtyContent::Incomplete(SourceReadFailure::NotRegular));
+    }
+    // a `.git` whose Git dir or HEAD cannot be read has no state to key
+    let Some(token) = nested_repo_token(&dir) else {
+        return Some(DirtyContent::Incomplete(SourceReadFailure::Unreadable(
+            "nested repository: its Git dir or HEAD cannot be read".into(),
+        )));
+    };
+    let rel = String::from_utf8_lossy(trimmed);
+    let modules = modules.get_or_insert_with(|| submodule_paths(toplevel));
+    let kind = nested_kind(!e.is_untracked(), &rel, modules);
+    Some(DirtyContent::NestedRepo { kind, token })
 }
 
 /// Compute the source identity of the working tree at `root` (see module docs).
@@ -572,6 +850,91 @@ pub(crate) fn ignored_dir_listing(entries: &[StatusEntry]) -> Option<Vec<String>
     Some(dirs)
 }
 
+/// Untracked status entries identified per call, in Git's order (PAR-RT-11). Each one
+/// past the bound enters the key by its path only and is counted in one
+/// `identity_untracked_budget` limitation.
+pub const MAX_IDENTITY_UNTRACKED: usize = 10_000;
+
+/// One streamed `git status` listing: the entries the identity keeps, the untracked
+/// ones past `MAX_IDENTITY_UNTRACKED` folded into a digest of their paths, and (for
+/// `repo-key`) the whole-directory ignored entries within the listing's bounds.
+struct StatusWalk {
+    parser: PorcelainParser,
+    entries: Vec<StatusEntry>,
+    untracked_kept: usize,
+    beyond: usize,
+    beyond_paths: Sha256,
+    list_ignored: bool,
+    ignored: Vec<StatusEntry>,
+    ignored_bytes: usize,
+    ignored_overflow: bool,
+}
+
+impl StatusWalk {
+    fn new(list_ignored: bool) -> Self {
+        StatusWalk {
+            parser: PorcelainParser::default(),
+            entries: Vec::new(),
+            untracked_kept: 0,
+            beyond: 0,
+            beyond_paths: Sha256::new(),
+            list_ignored,
+            ignored: Vec::new(),
+            ignored_bytes: 0,
+            ignored_overflow: false,
+        }
+    }
+
+    fn record(&mut self, rec: &[u8]) {
+        if let Some(e) = self.parser.push(rec) {
+            self.entry(e);
+        }
+    }
+
+    fn entry(&mut self, e: StatusEntry) {
+        match (e.xy == *b"!!", e.is_untracked()) {
+            // ignored entries are not working state: they never enter the key
+            (true, _) => self.ignored_dir(e),
+            (false, true) if self.untracked_kept >= MAX_IDENTITY_UNTRACKED => {
+                self.beyond += 1;
+                push_field(&mut self.beyond_paths, &e.path);
+            }
+            (false, true) => {
+                self.untracked_kept += 1;
+                self.entries.push(e);
+            }
+            (false, false) => self.entries.push(e),
+        }
+    }
+
+    /// Keep a whole-directory ignored entry for `ignored_dir_listing` while the listing
+    /// stays within its bounds; past them the listing is not reportable.
+    fn ignored_dir(&mut self, e: StatusEntry) {
+        if !self.list_ignored || self.ignored_overflow || e.path.last() != Some(&b'/') {
+            return;
+        }
+        self.ignored_bytes += e.path.len();
+        self.ignored_overflow =
+            self.ignored.len() >= MAX_IGNORED_DIRS || self.ignored_bytes > MAX_IGNORED_DIR_BYTES;
+        if !self.ignored_overflow {
+            self.ignored.push(e);
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        if let Some(e) = std::mem::take(&mut self.parser).finish() {
+            self.entry(e);
+        }
+        self
+    }
+
+    fn ignored_dirs(&self) -> Option<Vec<String>> {
+        (!self.ignored_overflow)
+            .then(|| ignored_dir_listing(&self.ignored))
+            .flatten()
+    }
+}
+
 fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec<StatusEntry>) {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let root_str = canonical.to_string_lossy().into_owned();
@@ -585,10 +948,12 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         root: root_str.clone(),
         dirty_entries: 0,
         untracked_entries: 0,
+        untracked_beyond: 0,
         hidden_entries: 0,
         files_hashed: 0,
         bytes_hashed: 0,
         files_reused: 0,
+        nested_repos: Vec::new(),
         dirty: BTreeMap::new(),
         layout: None,
         tracked_unhashed: Vec::new(),
@@ -625,43 +990,33 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         "--untracked-files=all",
         "--ignore-submodules=none",
     ];
-    let mut listed_ignored = list_ignored;
-    let mut status = if list_ignored {
+    let mut args = status_args.to_vec();
+    if list_ignored {
         // `matching` lists a directory that matches an ignore pattern without
         // descending into it, so the listing costs no extra traversal.
-        let mut args = status_args.to_vec();
         args.push("--ignored=matching");
-        run_git_bounded(root, &args, MAX_GIT_OUTPUT_BYTES, git_timeout())
-    } else {
-        run_git_bounded(root, &status_args, MAX_GIT_OUTPUT_BYTES, git_timeout())
-    };
-    if list_ignored && matches!(status, Err(GitRunError::Overflow(_))) {
-        // many individually ignored files: identify without the listing rather
-        // than lose the identity to the output cap
-        listed_ignored = false;
-        status = run_git_bounded(root, &status_args, MAX_GIT_OUTPUT_BYTES, git_timeout());
     }
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => {
-            id.identity_complete = false;
-            id.limitations.push(IdentityLimitation {
-                path: None,
-                reason: "git_status_failed".into(),
-                detail: format!("{e}; dirty content is not identified"),
-            });
-            h.update(b"status-failed");
-            id.key = format!("{:x}", h.finalize());
-            id.layout = Some(layout);
-            return (id, Vec::new());
-        }
-    };
-    let mut entries = parse_porcelain_v1_z(&status);
-    if listed_ignored {
-        id.ignored_dirs = ignored_dir_listing(&entries);
+    // streamed record by record: no Git output is held whole, so no listing size fails
+    // the identity; only the kept entries stay
+    let mut walk = StatusWalk::new(list_ignored);
+    let streamed = crate::index::scan::stream_git_records(root, &args, |rec| walk.record(rec));
+    if let Err(e) = streamed {
+        id.identity_complete = false;
+        id.limitations.push(IdentityLimitation {
+            path: None,
+            reason: "git_status_failed".into(),
+            detail: format!("{e}; dirty content is not identified"),
+        });
+        h.update(b"status-failed");
+        id.key = format!("{:x}", h.finalize());
+        id.layout = Some(layout);
+        return (id, Vec::new());
     }
-    // ignored entries are not working state: they never enter the key
-    entries.retain(|e| e.xy != *b"!!");
+    let walk = walk.finish();
+    if list_ignored {
+        id.ignored_dirs = walk.ignored_dirs();
+    }
+    let (mut entries, beyond) = (walk.entries, (walk.beyond, walk.beyond_paths));
     // `git status` hides worktree edits to assume-unchanged / skip-worktree entries;
     // identify their bytes directly so no known working-state content is omitted.
     match hidden_index_entries(&layout.toplevel) {
@@ -685,8 +1040,11 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
     // Regular files come from the identity's stat cache: only new, changed or racy ones
     // are read. Tracked entries claim the byte budget first (the entries' order), and
     // reused files are charged too, so the key does not depend on the cache.
+    // `sub/` (Git's form for an untracked nested repository) is a directory: it never
+    // reaches the hasher.
     let rels: Vec<String> = entries
         .iter()
+        .filter(|e| e.path.last() != Some(&b'/'))
         .filter_map(|e| std::str::from_utf8(&e.path).ok().map(str::to_string))
         .collect();
     let cache = crate::hashcache::identity_cache_file_for(&layout);
@@ -700,6 +1058,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
     id.bytes_hashed = pass.bytes_hashed;
     id.files_reused = pass.reused;
     let mut budget = MAX_IDENTITY_BYTES.saturating_sub(pass.bytes_hashed + pass.bytes_reused);
+    let mut modules = None;
     for e in &entries {
         if e.is_untracked() {
             id.untracked_entries += 1;
@@ -714,6 +1073,8 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
             .and_then(|p| cached.get(p));
         let content = if let Some(hex) = from_cache {
             DirtyContent::Sha256(hex.clone())
+        } else if let Some(dir) = directory_entry(&layout.toplevel, e, &mut modules) {
+            dir
         } else if budget == 0 {
             DirtyContent::Unhashed
         } else {
@@ -750,6 +1111,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
             DirtyContent::Sha256(x) => format!("sha256:{x}"),
             DirtyContent::Deleted => "deleted".into(),
             DirtyContent::Symlink(x) => format!("symlink:{x}"),
+            DirtyContent::NestedRepo { kind, token } => format!("{kind}:{token}"),
             DirtyContent::Incomplete(_) | DirtyContent::Unhashed => {
                 // metadata only: changes on most edits, but never claimed as identity.
                 let what = match &content {
@@ -783,11 +1145,35 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
                     ),
                 })
             }
+            DirtyContent::NestedRepo { kind, .. } => {
+                let trimmed = e.path.strip_suffix(b"/").unwrap_or(&e.path);
+                id.nested_repos.push(NestedRepo {
+                    path: String::from_utf8_lossy(trimmed).into_owned(),
+                    kind: (*kind).to_string(),
+                })
+            }
             _ => {}
         }
         id.dirty.insert(e.path.clone(), content);
     }
+    let (beyond, beyond_paths) = beyond;
+    if beyond > 0 {
+        h.update(b"untracked-beyond");
+        push_field(&mut h, &(beyond as u64).to_le_bytes());
+        push_field(&mut h, &beyond_paths.finalize());
+        id.untracked_entries += beyond;
+        id.untracked_beyond = beyond;
+        id.limitations.push(IdentityLimitation {
+            path: None,
+            reason: "identity_untracked_budget".into(),
+            detail: format!(
+                "{beyond} untracked entries past the first {MAX_IDENTITY_UNTRACKED} are keyed by \
+                 path only; their content is not identified"
+            ),
+        });
+    }
     id.identity_complete = id.limitations.is_empty();
+    id.nested_repos.sort();
     id.key = format!("{:x}", h.finalize());
     id.layout = Some(layout);
     (id, entries)
@@ -802,32 +1188,24 @@ pub fn cheap_key(root: &Path) -> String {
 /// (`git ls-files -v` tag in lower case) and skip-worktree (`S`/`s`). Returned as
 /// status entries with `xy = ['!', tag]`, a marker no porcelain status uses, so the
 /// key distinguishes them. `toplevel` must be the worktree top (paths are relative).
-fn hidden_index_entries(toplevel: &Path) -> Result<Vec<StatusEntry>, GitRunError> {
-    let out = run_git_bounded(
-        toplevel,
-        &["ls-files", "-v", "-z"],
-        MAX_GIT_OUTPUT_BYTES,
-        git_timeout(),
-    )?;
+/// The listing is streamed and only the hidden entries are kept.
+fn hidden_index_entries(toplevel: &Path) -> Result<Vec<StatusEntry>, String> {
     let mut hidden: Vec<StatusEntry> = Vec::new();
-    for rec in out.split(|b| *b == 0) {
+    crate::index::scan::stream_git_records(toplevel, &["ls-files", "-v", "-z"], |rec| {
         if rec.len() < 3 || rec[1] != b' ' {
-            continue;
+            return;
         }
         let tag = rec[0];
-        if !(tag.is_ascii_lowercase() || tag == b'S') {
-            continue;
-        }
         // unmerged entries repeat a path; keep one.
-        if hidden.last().is_some_and(|e| e.path == rec[2..]) {
-            continue;
+        let repeated = hidden.last().is_some_and(|e| e.path == rec[2..]);
+        if (tag.is_ascii_lowercase() || tag == b'S') && !repeated {
+            hidden.push(StatusEntry {
+                xy: [b'!', tag],
+                path: rec[2..].to_vec(),
+                orig_path: None,
+            });
         }
-        hidden.push(StatusEntry {
-            xy: [b'!', tag],
-            path: rec[2..].to_vec(),
-            orig_path: None,
-        });
-    }
+    })?;
     Ok(hidden)
 }
 
@@ -1253,9 +1631,10 @@ mod tests {
     }
 
     // A submodule configured `ignore = all` is hidden from plain `git status`; its dirty
-    // worktree must still surface (as an explicit `not_regular` limitation).
+    // worktree must still surface, as a nested repository that changes the key and
+    // leaves the identity complete (WS-RT2; before it, a `not_regular` limitation).
     #[test]
-    fn ignored_dirty_submodule_is_not_complete() {
+    fn ignored_dirty_submodule_is_a_nested_repository() {
         let inner = repo_with(&[("lib.rs", b"fn inner() {}\n")]);
         let outer = repo_with(&[("a.rs", b"fn a() {}\n")]);
         let url = inner.path().to_str().unwrap();
@@ -1273,18 +1652,115 @@ mod tests {
         );
         git(outer.path(), &["commit", "-qm", "sub"]);
         git(outer.path(), &["config", "submodule.sub.ignore", "all"]);
-        assert!(source_identity(outer.path()).identity_complete);
+        let clean = source_identity(outer.path());
+        assert!(clean.identity_complete && clean.nested_repos.is_empty());
         fs::write(outer.path().join("sub/lib.rs"), b"fn inner_edited() {}\n").unwrap();
         let id = source_identity(outer.path());
-        assert!(
-            !id.identity_complete,
-            "ignored dirty submodule reported complete"
+        assert!(id.identity_complete, "{:?}", id.limitations);
+        assert_eq!(
+            id.nested_repos,
+            vec![NestedRepo {
+                path: "sub".into(),
+                kind: NESTED_SUBMODULE.into()
+            }]
         );
-        assert!(
-            id.limitations
-                .iter()
-                .any(|l| l.path.as_deref() == Some("sub"))
-        );
+        assert_ne!(id.key, clean.key, "the dirty submodule is part of the key");
+    }
+
+    // WS-RT2: a directory entry is classified without a read; a `.git` that does not
+    // resolve to a Git dir leaves nothing to key, so it is `not_regular`, not nested.
+    #[test]
+    fn a_directory_entry_is_nested_only_with_a_resolvable_git_dir() {
+        let top = tempfile::TempDir::new().unwrap();
+        let entry = |path: &str| StatusEntry {
+            xy: *b" M",
+            path: path.as_bytes().to_vec(),
+            orig_path: None,
+        };
+        fs::create_dir_all(top.path().join("good/.git")).unwrap();
+        fs::write(top.path().join("good/.git/HEAD"), b"ref: refs/heads/main\n").unwrap();
+        fs::create_dir_all(top.path().join("broken")).unwrap();
+        fs::write(top.path().join("broken/.git"), b"gitdir: /nonexistent/xm\n").unwrap();
+        fs::create_dir_all(top.path().join("headless/.git")).unwrap();
+        fs::create_dir_all(top.path().join("plain")).unwrap();
+        fs::write(top.path().join("file.rs"), b"fn f() {}\n").unwrap();
+        let mut modules = None;
+        let mut kind = |p: &str| match directory_entry(top.path(), &entry(p), &mut modules) {
+            Some(DirtyContent::NestedRepo { kind, .. }) => kind.to_string(),
+            Some(DirtyContent::Incomplete(f)) => f.reason().to_string(),
+            Some(_) => "other".into(),
+            None => "none".into(),
+        };
+        assert_eq!(kind("good"), NESTED_GITLINK_UNREGISTERED);
+        assert_eq!(kind("broken"), "unreadable");
+        assert_eq!(kind("headless"), "unreadable");
+        assert_eq!(kind("plain"), "not_regular");
+        assert_eq!(kind("file.rs"), "none");
+        assert_eq!(kind("gone"), "none");
+    }
+
+    // A ref kept only in `packed-refs` keys the nested repository by its object id, so
+    // a rewrite that keeps the file's size changes the token.
+    #[test]
+    fn a_packed_ref_keys_the_nested_repository_by_its_object_id() {
+        let top = tempfile::TempDir::new().unwrap();
+        let git = top.path().join("sub/.git");
+        fs::create_dir_all(&git).unwrap();
+        fs::write(git.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let packed = |oid: &str| {
+            fs::write(
+                git.join("packed-refs"),
+                format!("# pack-refs with: peeled\n{oid} refs/heads/main\n"),
+            )
+            .unwrap()
+        };
+        let dir = top.path().join("sub");
+        packed("aaaa");
+        let a = nested_repo_token(&dir).unwrap();
+        packed("bbbb");
+        let b = nested_repo_token(&dir).unwrap();
+        assert_ne!(a, b);
+        // a ref line inside an over-long line is not read as one
+        let long = format!("{} {}\naaaa refs/heads/main\n", "x".repeat(8 << 10), "y");
+        fs::write(git.join("packed-refs"), long).unwrap();
+        assert_eq!(nested_repo_token(&dir).unwrap(), a);
+        fs::write(
+            git.join("packed-refs"),
+            format!("{}aaaa refs/heads/main\n", "z".repeat(8 << 10)),
+        )
+        .unwrap();
+        let tail = nested_repo_token(&dir).unwrap();
+        // a packed-refs that exists but cannot be opened (a symlink loop) keys nothing
+        fs::remove_file(git.join("packed-refs")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("packed-refs", git.join("packed-refs")).unwrap();
+            assert_eq!(nested_repo_token(&dir), None);
+            fs::remove_file(git.join("packed-refs")).unwrap();
+        }
+        let unborn = nested_repo_token(&dir).unwrap();
+        assert!(unborn != a && unborn != b);
+        assert_eq!(tail, unborn, "the tail of an over-long line names no ref");
+    }
+
+    #[test]
+    fn submodule_paths_reads_only_submodule_sections_as_git_does() {
+        let top = tempfile::TempDir::new().unwrap();
+        fs::write(
+            top.path().join(".gitmodules"),
+            concat!(
+                "[core]\n\tpath = not/a/module\n",
+                "[submodule \"a\"]\n\tpath = libs/a ; comment\n\turl = ../a\n",
+                "[submodule \"b\"]\n\tPath = \"with space/b\"\n",
+                "[submodule \"c\"]\n\tpath = \"quote\\\"d\" # trailing\n",
+                "[submodule-extra \"x\"]\n\tpath = not/either\n",
+                "[SubModule \"d\"]\n\tpath = mixed/case\n",
+            ),
+        )
+        .unwrap();
+        let got: Vec<String> = submodule_paths(top.path()).into_iter().collect();
+        assert_eq!(got, ["libs/a", "mixed/case", "quote\"d", "with space/b"]);
+        assert!(submodule_paths(&top.path().join("absent")).is_empty());
     }
 
     #[test]

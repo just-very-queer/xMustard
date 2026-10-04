@@ -168,6 +168,12 @@ type Options struct {
 	// AutoRegister lets a git repository found from roots, cwd or a path argument be
 	// registered with the API when no registered workspace contains it.
 	AutoRegister bool
+	// RegisterCwdWhenRootsUnknown lets the cwd signal register its own git repository
+	// while the client's roots are unknown (its roots/list failed, backed off, or was
+	// never delivered), which the default refuses because the roots the client declared
+	// may name a different repository. XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1 sets
+	// it in the shims; AutoRegister above still applies.
+	RegisterCwdWhenRootsUnknown bool
 	// HomeDir is never auto-registered, even when it is a git repository.
 	HomeDir string
 	// StandingMemory appends the workspace's standing-memory projection to

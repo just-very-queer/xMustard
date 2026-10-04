@@ -16,6 +16,11 @@ const maxRevision = 1 << 30
 // maxSessionKey bounds a session_id naming a session row (an execution key).
 const maxSessionKey = 200
 
+// maxJobDecision bounds the decision recorded on an answered consolidation job. It matches
+// the verify note's bound: a decision is a verdict in prose, and a verdict long enough to
+// need a document belongs in the evidence it cites.
+const maxJobDecision = maxVerifyNote
+
 var rememberTool = &Tool{
 	Name:        "remember",
 	Description: "Propose a durable memory (fact/decision/gotcha); pending until enough distinct agents verify it (open mode: promoted at once as self_asserted_open_mode). Pass content; optional title, paths (comma-separated files it is about, so recall flags it stale when they change).",
@@ -28,7 +33,7 @@ var rememberTool = &Tool{
 	// Lifecycle writes (WS-19A): accepted on every call, listed only in the full schema
 	// profile, documented at DocsURI.
 	Advanced: []Arg{
-		{Name: "op", Type: typeString, Enum: []string{"propose", "supersede", "edit", "retire", "restore", "tier"},
+		{Name: "op", Type: typeString, Enum: []string{"propose", "supersede", "edit", "retire", "restore", "tier", "job"},
 			Desc: "default propose"},
 		{Name: "entry_id", Type: typeString, Desc: "target of edit/retire/restore/tier"},
 		{Name: "base_revision", Type: typeInteger, Min: 1, Max: maxRevision, Desc: "edit: revision read (CAS)"},
@@ -52,6 +57,11 @@ var rememberTool = &Tool{
 		{Name: "relations", Type: typeString, List: true, MaxLen: 1024},
 		// Tiers (WS-31): core is pushed into every session; a protected field.
 		{Name: "tier", Type: typeString, Enum: []string{"core", "deferred"}, Desc: "core needs a human approver"},
+		// Consolidation jobs (WS-32a, PAR-GOV-13): op=job answers a question ground listed under
+		// consolidation_jobs; the write it implies is proposed like any other and still waits for
+		// a distinct verifier.
+		{Name: "job_id", Type: typeString, Desc: "op=job: the job answered"},
+		{Name: "decision", Type: typeString, MaxLen: maxJobDecision, Desc: "op=job: what you concluded"},
 	},
 	Doc: "### Handoff capsules\n\n`kind=handoff` stores a handoff capsule for the next session, in any client, instead of " +
 		"proposing a memory: session evidence, never verified or pushed as memory. `content` is one JSON object " +
@@ -104,7 +114,7 @@ var rememberTool = &Tool{
 		// content goes in the JSON BODY, not the URL, so durable memory text is not
 		// exposed in access logs / error strings (XM-NEW-018).
 		payload := map[string]any{}
-		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id", "kind", "topic", "tier", "session_id"} {
+		for _, k := range []string{"content", "title", "op", "entry_id", "reason", "old_string", "new_string", "description", "expires", "run_id", "kind", "topic", "tier", "session_id", "job_id", "decision"} {
 			if a[k] != "" {
 				payload[k] = a[k]
 			}
