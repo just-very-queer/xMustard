@@ -330,9 +330,9 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 // against a fixture where that arm is the ONLY reason the row is refused. The parity
 // test cannot do this on its own: it compares the batched guard with
 // checkOwnerDistinct, and the per-row guard keeps every arm, so a batched arm that is
-// removed still agrees whenever a later arm would have refused the same row. That is
+// absent still agrees whenever a later arm would have refused the same row. That is
 // mutation M4, and it survived the parity test on correct code for exactly that
-// reason. Here each arm is exercised alone, so removing one is red.
+// reason. Here each arm is exercised alone, so losing one is red.
 func TestTheBatchedOwnerGuardRefusesEachArmOnItsOwn(t *testing.T) {
 	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
 	h := humanApprover("bob", "bob")
