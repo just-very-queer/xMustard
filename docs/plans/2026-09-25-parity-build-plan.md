@@ -2100,13 +2100,13 @@ principal but the author. The scope-leak metric over this sub-task's fixture sui
 **Collision risk.** `memory_propose.go` and `memory_recall.go` are shared with WS-28C
 (the outline cache), WS-32 and WS-FIX-13.
 
-**PARKED (2026-10-03).** Branch `parity/ws-29b`, head `97338ac`, three review rounds
-(run 4 of the cap for a code task), no merge. What works: the derivation and its refusals,
-the visibility rule on ranked recall, the by-id and listing read paths, ground's ranking
-filter, the standing-memory projection filter, and the keys on the HTTP transport, all
-green (`logs/ws-29b-run-20261003T092405Z.log`, BOXALL `remote_exit=0` clippy 6
-`rss_lines=ok` at `logs/ws-29b-check-20261003T093301Z.log`). What is open, from round 3
-(`reviews/ws-29b/r3`): **WS-29b-r3-1** `readAtRisk` lists every entry marked
+**PARKED (2026-10-03), unparked 2026-10-03 by owner decision.** Branch `parity/ws-29b`,
+head `97338ac`, three review rounds (run 4 of the cap for a code task), no merge. What works:
+the derivation and its refusals, the visibility rule on ranked recall, the by-id and listing
+read paths, ground's ranking filter, the standing-memory projection filter, and the keys on
+the HTTP transport, all green (`logs/ws-29b-run-20261003T092405Z.log`, BOXALL `remote_exit=0`
+clippy 6 `rss_lines=ok` at `logs/ws-29b-check-20261003T093301Z.log`). What was open, from
+round 3 (`reviews/ws-29b/r3`): **WS-29b-r3-1** `readAtRisk` lists every entry marked
 `needs_reverify` without the scope filter, so a private entry still reaches another
 principal's `at_risk_memories` with its id, title, paths and anchors; **WS-29b-r3-2** the
 HTTP `remember` decode populates `RememberRequest`'s own `run_id`/`session_id`, so
@@ -2115,10 +2115,40 @@ build the embedded fields directly, pass; **WS-29b-r3-3** a run or session key i
 caller-asserted, so a later run that supplies an earlier run's id reads that run's
 memory, which needs the key from verified execution context; **WS-29b-r3-4** the SQL
 predicate admits run, session and dir by key alone, without the author condition that
-recall applies on top. Next step: fix r3-1 and r3-4 first (both are filters, both are
-local), then r3-2 (a decode-path gap with a failing HTTP test to write), and treat r3-3
-as the owner question it is — a caller-asserted run key is provenance, not authority, and
-deciding which is which belongs to whoever owns run identity (WS-59's fold of run scope).
+recall applies on top. The owner decided r3-3 on 2026-10-03: it is a setup/configuration
+choice, so `trusted_run_key_principals` in settings names the principals that may assert
+a run key and the unset default trusts nobody. r3-3-5's precedence question (run over
+session over dir, and `visibility=workspace` discarding the keys) stays deferred to FU:
+it is a small product choice and this row's remaining budget went to the disclosure
+paths.
+
+**Implementation record (branch parity/ws-29b, 2026-10-04).**
+
+- `memory_scopes.go`: `visibleEntries` is the one list-side filter and `checkRunKeyTrust`
+  the one asserted-key check; `atRiskScanFactor` bounds the rows the at-risk page scans.
+- `govstore/ranking.go`: `scopeWhere` gained the author condition on the run, session and
+  dir branches, so the predicate is the whole rule rather than a pre-filter recall
+  strengthens.
+- `memory_invalidation.go`, `grounding_memory.go`: `readAtRisk` takes the caller and its
+  keys and filters before the page is built.
+- `memory_dedupe.go`, `memory_propose.go`: `reviewInput.author`; the review compares a
+  proposal only against its own author's entries of that scope, and `applySupersession`
+  refuses to retire an entry the proposer may not replace.
+- `memory_propose.go`, `run_control.go`: `ScopeRunID`/`ScopeSessionID`/`ScopeDir` are
+  distinct request fields from the provenance `RunID`/`SessionID`, and
+  `trusted_run_key_principals` is the operator setting.
+- `session_snapshot.go`, `grounding_session.go`: the pending view and the snapshot's
+  decision titles are scoped to the session's own principal.
+- Measured: see the ledger entry for WS-29b (2026-10-04) and `logs/ws-29b-*`.
+- Deviations: (1) the run-key check audits on refusal rather than refusing and ignoring
+  silently, so an operator can see the attempt; (2) `readAtRisk` scans
+  `maxAtRisk * atRiskScanFactor` rows before filtering, because the keys narrow which
+  entries are candidates and a query-level limit would report a truncated page of rows
+  that were never candidates.
+- Review rounds and the gate line: see `reviews/ws-29b/` and the ledger.
+- Follow-ups: the MCP recall surface still carries no scope key (WS-29b-r2-6, owed by
+  whoever owns `tools_list_budget.json`), and the derivation's precedence question
+  (r3-5) is in FU.
 
 ### WS-30 — Cross-workspace code query, residency LRU, worktree identity and path rewriting
 
