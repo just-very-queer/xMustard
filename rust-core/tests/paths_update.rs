@@ -344,3 +344,34 @@ fn a_renamed_directory_lists_the_tree() {
     let up = update_paths(r.path(), &[], &["empty"]);
     assert_paths_only(&up, 1, "new directory");
 }
+
+#[test]
+#[cfg(unix)]
+fn a_tracked_symlink_replaced_by_a_file_lists_the_tree() {
+    let r = repo();
+    std::os::unix::fs::symlink("m0.ts", r.path().join("link.ts")).unwrap();
+    git(r.path(), &["add", "link.ts"]);
+    git(r.path(), &["commit", "-qm", "link"]);
+    index("build", r.path(), &[]);
+    // the Git index still records a symlink, so a full listing keeps the symlink loss
+    fs::remove_file(r.path().join("link.ts")).unwrap();
+    write(r.path(), "link.ts", &body(30));
+    let up = update_paths(r.path(), &[], &["link.ts"]);
+    assert_listed(&up, "symlink_mode", "symlink replaced");
+    assert_matches_full_build(r.path(), &[], &up, "symlink replaced");
+}
+
+#[test]
+fn a_directory_recreated_without_its_files_named_lists_the_tree() {
+    let r = repo();
+    write(r.path(), "src/a.ts", &body(20));
+    write(r.path(), "src/b.ts", &body(21));
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-qm", "src"]);
+    index("build", r.path(), &[]);
+    fs::remove_dir_all(r.path().join("src")).unwrap();
+    fs::create_dir(r.path().join("src")).unwrap();
+    let up = update_paths(r.path(), &[], &["src"]);
+    assert_listed(&up, "directory", "recreated directory");
+    assert_matches_full_build(r.path(), &[], &up, "recreated directory");
+}
