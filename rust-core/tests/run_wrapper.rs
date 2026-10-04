@@ -16,20 +16,70 @@ use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_xmustard-core");
 
-/// One terminal-driven test at a time.
+/// One descriptor-hungry test at a time.
 ///
 /// `without_forwarding_the_wrapper_becomes_the_command` runs the wrapper under
-/// `ulimit -n 4`, so it passes only when the descriptors it needs are free. The pty tests
-/// hold a pty master, a slave and a piped stderr for the whole of a several-second
-/// observation window, and this binary runs its tests in parallel by default, so a pty test
-/// beside it starves the low-limit one: measured on the box, 2 failures in 10 full-binary
-/// runs with the pty tests in the same binary and 0 in 10 at the merge base, which has no pty
-/// test. Serialized, it is 6 of 6. The same shape as `tests/refresh.rs`'s `serial()`.
+/// `ulimit -n 4`, so it passes only when the descriptors it needs are free: measured failing
+/// with status 127 and empty output, which is `sh` unable to exec, not the wrapper taking the
+/// forwarding path. Any test that holds an fd for the length of an observation window starves
+/// it — the pty tests hold a master, a slave and a piped stderr, and the two report tests hold
+/// a FILLED stderr pipe while the wrapper runs. Measured on the box: 2 failures in 10
+/// full-binary runs with those two unguarded, 0 in 10 once they take the lock, 20 of 20 serial,
+/// and 0 in 10 at the merge base. `every_test_that_holds_a_descriptor_takes_the_terminal_lock`
+/// enforces that coverage against this file's own source, so a new descriptor-hungry test
+/// cannot reintroduce it silently. Same shape as `tests/refresh.rs`'s `serial()`.
 ///
-/// The lock covers only the terminal-driven tests; the rest of the binary is unaffected, and
+/// The lock covers only the descriptor-hungry tests; the rest of the binary is unaffected, and
 /// nothing here bounds or skips a test — it removes parallel-load contention, which is the
 /// first acceptable fix class in goal §3.3.
 static TERMINAL: Mutex<()> = Mutex::new(());
+
+/// Every test that holds an fd for the length of an observation window takes `TERMINAL`.
+///
+/// The lock existed for the `ulimit -n 4` test but covered only the pty tests, while the two
+/// report tests hold a FILLED stderr pipe for as long as the wrapper runs - which is the
+/// contention the lock was meant to remove. So the coverage is checked here against this file's
+/// own source rather than trusted: `report_job` and `report_file_job` are the constructors that
+/// fill or hold that pipe, and a new descriptor-hungry test that forgets the lock fails here
+/// rather than as a flake on someone else's box.
+#[test]
+fn every_test_that_holds_a_descriptor_takes_the_terminal_lock() {
+    let source = include_str!("run_wrapper.rs");
+    let hogs = ["report_job(", "report_file_job(", "pty_session("];
+    let mut checked = 0;
+    let mut offenders = Vec::new();
+    let mut rest = source;
+    while let Some(at) = rest.find("#[test]") {
+        let after = &rest[at..];
+        let end = after[1..]
+            .find("\n#[test]")
+            .map(|i| i + 1)
+            .unwrap_or(after.len());
+        let body = &after[..end];
+        rest = &after[end..];
+        let name = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("fn "))
+            .and_then(|l| l.split('(').next())
+            .unwrap_or("");
+        if !hogs.iter().any(|h| body.contains(h)) {
+            continue;
+        }
+        checked += 1;
+        if !body.contains("serial_terminal()") {
+            offenders.push(name.to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these tests hold a descriptor for an observation window but do not take the \
+         terminal lock, so they run beside `ulimit -n 4`: {offenders:?}"
+    );
+    assert!(
+        checked >= 4,
+        "only {checked} descriptor-holding tests were found"
+    );
+}
 
 fn serial_terminal() -> MutexGuard<'static, ()> {
     TERMINAL.lock().unwrap_or_else(|e| e.into_inner())
@@ -1237,6 +1287,7 @@ fn is_nonblocking(fd: &std::fs::File) -> bool {
 /// SECOND signal still arrives afterwards, which a blocked watcher could not deliver.
 #[test]
 fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
+    let _g = serial_terminal();
     let dir = tempfile::tempdir().unwrap();
     let mut job = report_job(dir.path());
     await_file(&dir.path().join("ready"));
@@ -1305,6 +1356,7 @@ fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
 /// construction, so the drain is what decides whether the line lands.
 #[test]
 fn the_wrapper_states_what_it_decided_for_each_signal() {
+    let _g = serial_terminal();
     let dir = tempfile::tempdir().unwrap();
     let mut job = report_file_job(dir.path(), LATE_CHILD);
     await_file(&dir.path().join("ready"));
