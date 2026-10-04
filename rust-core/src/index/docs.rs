@@ -74,6 +74,7 @@ fn stored_docs(
             out.insert(p, d);
         }
     }
+    crate::passcount::note(crate::passcount::Pass::RowsLoaded, out.len() as u64);
     Ok(out)
 }
 

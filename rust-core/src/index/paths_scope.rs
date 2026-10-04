@@ -355,8 +355,16 @@ impl Plan {
     }
 
     /// The effect of a source path that went from `before` to `after`. `beyond`: the
-    /// path sorts past the cut, so it can have no row.
-    fn source(&mut self, path: &str, before: &Before, after: After, beyond: bool) -> Decided {
+    /// path sorts past the cut, so it can have no row. `deleted`: the exception a missing
+    /// file gets (`deleted_symlink` when it was last seen as a symlink).
+    fn source(
+        &mut self,
+        path: &str,
+        before: &Before,
+        after: After,
+        beyond: bool,
+        deleted: &'static str,
+    ) -> Decided {
         use After::{Gone, Loss, Readable};
         use ListingReason::{EnvelopeShift, LossRows, UnknownPrior};
         let cut = self.cut;
@@ -373,7 +381,7 @@ impl Plan {
             (Before::Kept(old), Gone, _) => {
                 self.unkeep(*old);
                 self.worktree_deleted += 1;
-                self.except(path, Some(DELETED));
+                self.except(path, Some(deleted));
             }
             (Before::LossRow, Readable(_), _) if cut => return Err(EnvelopeShift),
             (Before::LossRow, Readable(size), _) => {
@@ -384,7 +392,7 @@ impl Plan {
             (Before::LossRow, Gone, _) => {
                 self.loss_row(-1);
                 self.worktree_deleted += 1;
-                self.except(path, Some(DELETED));
+                self.except(path, Some(deleted));
             }
             (Before::Deleted, Gone, _) => {}
             (Before::Deleted, Readable(_), true) => {
@@ -422,7 +430,7 @@ impl Plan {
             (Before::BeyondLoss(old), Gone, true) => {
                 self.beyond_remove(path, old)?;
                 self.worktree_deleted += 1;
-                self.except(path, Some(DELETED));
+                self.except(path, Some(deleted));
             }
             (Before::Unknown, Loss(_) | Gone, true) => return Err(UnknownPrior),
             (Before::Unknown, _, _) => {}
@@ -431,8 +439,15 @@ impl Plan {
     }
 
     /// The effect of a doc path; `exists`: it is listed now. `beyond`: the docs lane is
-    /// full and the path sorts past its last row.
-    fn doc(&mut self, path: &str, before: DocBefore, exists: bool, beyond: bool) -> Decided {
+    /// full and the path sorts past its last row. `deleted`: as for `source`.
+    fn doc(
+        &mut self,
+        path: &str,
+        before: DocBefore,
+        exists: bool,
+        beyond: bool,
+        deleted: &'static str,
+    ) -> Decided {
         use ListingReason::{DocsShift, UnknownPrior};
         let full = self.doc_full;
         match (before, exists, beyond) {
@@ -440,7 +455,7 @@ impl Plan {
             (DocBefore::Row, false, _) if full => return Err(DocsShift),
             (DocBefore::Row, false, _) => {
                 self.doc_rows -= 1;
-                self.except(path, Some(DOC_DELETED));
+                self.except(path, Some(deleted));
             }
             (DocBefore::Deleted, true, true) => {
                 self.state.docs_beyond += 1;
@@ -486,14 +501,20 @@ impl Plan {
     }
 }
 
-/// The effect of a named path that is not a source or doc file. Stored rows or
-/// exceptions under it mean it is, or was, a directory whose files the batch may not
-/// name (a rename names only the two directories, a directory replaced by a file names
-/// the file); a directory that is gone or new past the cut may have held or now hold
-/// files past it, whose counts nothing stores. Both list the tree.
-fn other_effect(kind: Other, held: bool, past: bool) -> Decided {
-    match (kind, held, past) {
-        (_, true, _) | (Other::Dir | Other::Gone, _, true) => Err(ListingReason::Directory),
+/// Whether stored rows or exceptions sort under `path/`: then it is, or was, a directory
+/// whose files the batch may not name (a rename names only the two directories, a
+/// directory replaced by a file names the file), whatever its name looks like.
+fn holds_files(conn: &Connection, state: &ListingState, path: &str) -> rusqlite::Result<bool> {
+    let (lo, hi) = (format!("{path}/"), format!("{path}0"));
+    Ok(rows_under(conn, path)? || state.exceptions.range(lo..hi).next().is_some())
+}
+
+/// The effect of a named path that is not a source or doc file and holds no stored
+/// files: a directory that is gone or new past the cut may have held or now hold files
+/// past it, whose counts nothing stores, so it lists the tree.
+fn other_effect(kind: Other, past: bool) -> Decided {
+    match (kind, past) {
+        (Other::Dir | Other::Gone, true) => Err(ListingReason::Directory),
         _ => Ok(()),
     }
 }
@@ -592,8 +613,10 @@ fn scope_inner(
     let mut rows: HashMap<String, Existing> = HashMap::new();
     for path in &named {
         let exception = plan.state.exceptions.get(path).cloned();
-        let decided = match (Lang::for_path(path), scan::doc_role(path)) {
-            (Some(lang), _) => {
+        let held = holds_files(conn, &plan.state, path)?;
+        let decided = match (held, Lang::for_path(path), scan::doc_role(path)) {
+            (true, ..) => Err(Directory),
+            (false, Some(lang), _) => {
                 let row = named_row(conn, cfg, path)?;
                 crate::passcount::note(crate::passcount::Pass::RowsLoaded, row.is_some() as u64);
                 let was_symlink = match (&row, exception.as_deref()) {
@@ -621,7 +644,11 @@ fn scope_inner(
                     return Ok(Err(SymlinkMode));
                 }
                 let beyond = plan.cut && *path > facts.last_path;
-                let decided = plan.source(path, &before, after, beyond);
+                let deleted = match was_symlink {
+                    true => DELETED_SYMLINK,
+                    false => DELETED,
+                };
+                let decided = plan.source(path, &before, after, beyond, deleted);
                 let listed = matches!(
                     (&before, after, beyond),
                     (
@@ -643,7 +670,7 @@ fn scope_inner(
                 }
                 decided
             }
-            (None, Some(role)) => {
+            (false, None, Some(role)) => {
                 // a doc path only ever carries a doc_deleted exception
                 let status = doc_status(conn, path)?;
                 let was_symlink = status.as_deref() == Some("symlink")
@@ -665,21 +692,22 @@ fn scope_inner(
                     return Ok(Err(SymlinkMode));
                 }
                 let beyond = plan.doc_full && *path > facts.last_doc;
-                let decided = plan.doc(path, before, doc.is_ok(), beyond);
+                let deleted = match was_symlink {
+                    true => DOC_DELETED_SYMLINK,
+                    false => DOC_DELETED,
+                };
+                let decided = plan.doc(path, before, doc.is_ok(), beyond, deleted);
                 let listed = before == DocBefore::Row || (before == DocBefore::Deleted && !beyond);
                 if let (Ok(d), true) = (doc, listed) {
                     plan.docs.push(d);
                 }
                 decided
             }
-            (None, None) => {
-                let kind = other_kind(&layout.root, path);
-                let (lo, hi) = (format!("{path}/"), format!("{path}0"));
+            (false, None, None) => {
+                let hi = format!("{path}0");
                 let past =
                     (plan.cut && hi > facts.last_path) || (plan.doc_full && hi > facts.last_doc);
-                let held =
-                    rows_under(conn, path)? || plan.state.exceptions.range(lo..hi).next().is_some();
-                other_effect(kind, held, past)
+                other_effect(other_kind(&layout.root, path), past)
             }
         };
         if let Err(reason) = decided {
@@ -744,12 +772,12 @@ mod tests {
     fn a_kept_file_cannot_leave_a_cut_envelope_alone() {
         let mut p = plan(true);
         assert_eq!(
-            p.source("a.ts", &Before::Kept(4), After::Gone, false),
+            p.source("a.ts", &Before::Kept(4), After::Gone, false, DELETED),
             Err(ListingReason::EnvelopeShift)
         );
         let mut p = plan(false);
         assert_eq!(
-            p.source("a.ts", &Before::Kept(4), After::Gone, false),
+            p.source("a.ts", &Before::Kept(4), After::Gone, false, DELETED),
             Ok(())
         );
         assert_eq!((p.kept, p.kept_bytes, p.worktree_deleted), (-1, -4, 1));
@@ -765,7 +793,7 @@ mod tests {
         p.worktree_deleted = 1;
         p.state.exceptions.insert("z.ts".into(), DELETED.into());
         assert_eq!(
-            p.source("z.ts", &Before::Deleted, After::Readable(9), true),
+            p.source("z.ts", &Before::Deleted, After::Readable(9), true, DELETED),
             Ok(())
         );
         assert_eq!(p.worktree_deleted, 0);
@@ -786,7 +814,8 @@ mod tests {
                 "z0000.ts",
                 &Before::BeyondLoss("symlink".into()),
                 After::Gone,
-                true
+                true,
+                DELETED
             ),
             Err(ListingReason::SampleRefill)
         );
@@ -796,15 +825,15 @@ mod tests {
     fn an_unknown_path_past_the_cut_is_decided_only_while_readable() {
         let mut p = plan(true);
         assert_eq!(
-            p.source("z.ts", &Before::Unknown, After::Readable(3), true),
+            p.source("z.ts", &Before::Unknown, After::Readable(3), true, DELETED),
             Ok(())
         );
         assert_eq!(
-            p.source("z.ts", &Before::Unknown, After::Gone, true),
+            p.source("z.ts", &Before::Unknown, After::Gone, true, DELETED),
             Err(ListingReason::UnknownPrior)
         );
         assert_eq!(
-            p.source("a.ts", &Before::Unknown, After::Gone, false),
+            p.source("a.ts", &Before::Unknown, After::Gone, false, DELETED),
             Ok(())
         );
     }
@@ -814,31 +843,27 @@ mod tests {
         let mut p = plan(false);
         p.doc_full = true;
         assert_eq!(
-            p.doc("a.md", DocBefore::Row, false, false),
+            p.doc("a.md", DocBefore::Row, false, false, DOC_DELETED),
             Err(ListingReason::DocsShift)
         );
-        assert_eq!(p.doc("z.md", DocBefore::Deleted, true, true), Ok(()));
+        assert_eq!(
+            p.doc("z.md", DocBefore::Deleted, true, true, DOC_DELETED),
+            Ok(())
+        );
         assert_eq!(p.state.docs_beyond, 1);
     }
 
     #[test]
-    fn a_path_that_held_files_or_a_directory_past_the_cut_lists_the_tree() {
+    fn a_directory_past_the_cut_lists_the_tree() {
         use ListingReason::Directory;
-        for (kind, held, past, want) in [
-            (Other::File, false, true, Ok(())),
-            (Other::File, true, false, Err(Directory)),
-            (Other::Dir, false, false, Ok(())),
-            (Other::Dir, true, false, Err(Directory)),
-            (Other::Dir, false, true, Err(Directory)),
-            (Other::Gone, false, false, Ok(())),
-            (Other::Gone, true, false, Err(Directory)),
-            (Other::Gone, false, true, Err(Directory)),
+        for (kind, past, want) in [
+            (Other::File, true, Ok(())),
+            (Other::Dir, false, Ok(())),
+            (Other::Dir, true, Err(Directory)),
+            (Other::Gone, false, Ok(())),
+            (Other::Gone, true, Err(Directory)),
         ] {
-            assert_eq!(
-                other_effect(kind, held, past),
-                want,
-                "{kind:?} {held} {past}"
-            );
+            assert_eq!(other_effect(kind, past), want, "{kind:?} {past}");
         }
     }
 
