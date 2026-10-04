@@ -9,6 +9,15 @@ import (
 	"xmustard/api-go/internal/govstore"
 )
 
+// parityFixtureArms is how many candidates parityFixture builds, and
+// parityFixtureRefused how many of them checkOwnerDistinct refuses. Both are asserted so
+// a fixture that stopped reaching an arm, or one whose arm stopped being a refusal,
+// fails here rather than weakening the parity assertion to nothing.
+const (
+	parityFixtureArms    = 8
+	parityFixtureRefused = 5
+)
+
 // guardCase is one candidate of the owner-distinct parity fixture, named after the arm
 // of checkOwnerDistinct it is built to reach.
 type guardCase struct {
@@ -24,9 +33,10 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	t.Helper()
 	var cases []guardCase
 
-	// the entry's author arm: bob owns alice-bot's proposal, so only that arm can
-	// refuse it.
-	mine := proposeAs(t, dir, ws, ContextActor{ID: "alice-bot", Owner: "alice"}, "from bob's agent")
+	// the entry's author arm: bob owns bob-bot's proposal, so only that arm can
+	// refuse it. The writer's id differs from bob's, so the entry-author arm is
+	// reached before the verdict arm could be.
+	mine := proposeAs(t, dir, ws, ContextActor{ID: "bob-bot", Owner: "bob"}, "from bob's agent")
 	cases = append(cases, guardCase{"entry author", mine.ID, 0})
 
 	// the revision's author arm, reached through the edit event's recorded owner
@@ -70,7 +80,120 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	}
 	cases = append(cases, guardCase{"own earlier verdict", own.ID, 0})
 
+	// the recordedOwner fallback on the REVISION arm. The workspaceops write path always
+	// records an owner (storeActor fills it), so the fallback is only reachable for a
+	// write made through the store API with no owner on the actor. The token store's
+	// answer is then the only thing that ties that revision to bob, so a guard that
+	// skipped the fallback would admit the row (mutation M2).
+	mintPrincipal(t, dir, "bob-token-only", "bob")
+	viaStore := proposeUnrecordedOwner(t, dir, ws, "bob-token-only")
+	if got := entryRecordedOwner(t, dir, ws, viaStore); got != "" {
+		t.Fatalf("the fixture recorded owner %q on %s, so the fallback is not needed on this arm",
+			got, viaStore)
+	}
+	if got := PrincipalOwner(dir, "bob-token-only"); got != "bob" {
+		t.Fatalf("the token store answers %q, want bob, so the arm was not built", got)
+	}
+	cases = append(cases, guardCase{"revision author through the token store", viaStore, 0})
+
+	// a verdict cast in a superseded epoch is not a voice: the entry is retracted and
+	// restored, which starts a new epoch, so the old approve must not refuse bob.
+	stale := proposeAs(t, dir, ws, ContextActor{ID: "erin"}, "erin retracted me")
+	if _, err := VerifyContextAs(dir, ws, stale.ID, ContextActor{ID: "bob-bot", Owner: "bob"}, true, ""); err != nil {
+		t.Fatal(err)
+	}
+	by := ContextActor{ID: "erin", Admin: true}
+	if _, err := RetractContext(dir, ws, stale.ID, "fixture: supersede the epoch", by); err != nil {
+		t.Fatal(err)
+	}
+	if err := transitionEntry(t, dir, ws, stale.ID, govstore.LifecycleActive, by); err != nil {
+		t.Fatal(err)
+	}
+	if epoch := entryVoteEpoch(t, dir, ws, stale.ID); epoch == 0 {
+		t.Fatalf("%s is still in epoch 0, so its earlier verdict still counts and the "+
+			"superseded-epoch arm was not reached", stale.ID)
+	}
+	cases = append(cases, guardCase{"superseded epoch verdict", stale.ID, 0})
+
 	return cases
+}
+
+// mintPrincipal records a principal whose owner is owner, so a write that recorded no
+// owner of its own can still be tied to one by the token store.
+func mintPrincipal(t *testing.T, dir, id, owner string) {
+	t.Helper()
+	if _, err := MintIdentityToken(dir, id, RoleReader, 0, nil, TokenIdentity{Owner: owner, Kind: PrincipalAgent}); err != nil {
+		t.Fatalf("mint %s: %v", id, err)
+	}
+	if got := PrincipalOwner(dir, id); got != owner {
+		t.Fatalf("the token store answers %s's owner as %q, want %q, so the arm was not built",
+			id, got, owner)
+	}
+}
+
+// proposeUnrecordedOwner writes an entry through the store API with no owner on the
+// actor, which is the only way a write records none: every workspaceops write fills the
+// owner from the actor's own id.
+func proposeUnrecordedOwner(t *testing.T, dir, ws, principal string) string {
+	t.Helper()
+	id := "ctx_unrecorded_" + principal
+	err := memoryUpdate(context.Background(), dir, ws, func(tx govstore.Tx) error {
+		_, err := tx.InsertEntry(context.Background(), govstore.NewEntry{
+			ID: id, WorkspaceID: ws, Title: "t", Content: "the build uses make",
+			RequiredVerifications: 2, RequireVerification: true,
+		}, govstore.Actor{Principal: principal})
+		return err
+	})
+	if err != nil {
+		t.Fatalf("propose without a recorded owner: %v", err)
+	}
+	return id
+}
+
+// entryRecordedOwner is the owner the entry's own write recorded, empty when it
+// recorded none.
+func entryRecordedOwner(t *testing.T, dir, ws, entryID string) string {
+	t.Helper()
+	var owner string
+	if err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
+		e, err := r.GetEntry(context.Background(), entryID)
+		if err != nil {
+			return err
+		}
+		owner = e.SourceOwner
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return owner
+}
+
+// entryVoteEpoch is the entry's vote epoch, which the guard's votes query joins on.
+func entryVoteEpoch(t *testing.T, dir, ws, entryID string) int64 {
+	t.Helper()
+	var epoch int64
+	if err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
+		e, err := r.GetEntry(context.Background(), entryID)
+		if err != nil {
+			return err
+		}
+		epoch = e.VoteEpoch
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	return epoch
+}
+
+// transitionEntry moves an entry to a lifecycle state, which is what starts a new
+// vote epoch on the way back from retracted.
+func transitionEntry(t *testing.T, dir, ws, entryID, to string, by ContextActor) error {
+	t.Helper()
+	return memoryUpdate(context.Background(), dir, ws, func(tx govstore.Tx) error {
+		_, err := tx.Transition(context.Background(), entryID,
+			govstore.TransitionInput{To: to, Reason: "fixture: epoch"}, by.storeActor(""))
+		return err
+	})
 }
 
 // headRevision is the entry's pending head revision, which ContextEntry does not
@@ -120,8 +243,8 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 	h := humanApprover("bob", "bob")
 	voter := h.actor()
 	cases := parityFixture(t, dir, ws, h.Principal.ID)
-	if len(cases) != 6 {
-		t.Fatalf("fixture arms: %d, want 6", len(cases))
+	if len(cases) != parityFixtureArms {
+		t.Fatalf("fixture arms: %d, want %d", len(cases), parityFixtureArms)
 	}
 
 	err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
@@ -135,16 +258,19 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 		}
 
 		refused, allowed := 0, 0
+		var verdicts []string
 		for i, c := range guarded {
 			perRow := checkOwnerDistinct(context.Background(), r, dir, c.entry,
 				govstore.VoteInput{EntryID: c.entry.ID, Revision: c.revision, Verdict: govstore.VerdictApprove}, voter)
 			switch {
 			case errors.Is(perRow, ErrSameOwner):
 				refused++
+				verdicts = append(verdicts, "refused "+cases[i].name)
 			case perRow != nil:
 				return fmt.Errorf("%s: checkOwnerDistinct failed on a readable store: %v", cases[i].name, perRow)
 			default:
 				allowed++
+				verdicts = append(verdicts, "allowed "+cases[i].name)
 			}
 			if errors.Is(batched[i], ErrSameOwner) != errors.Is(perRow, ErrSameOwner) {
 				return fmt.Errorf("%s: the batched guard said %v, checkOwnerDistinct said %v",
@@ -153,8 +279,9 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 		}
 		// The arms are asserted by count, so a guard that agreed with a per-row guard
 		// because neither reached anything would fail here instead of passing quietly.
-		if refused != 3 || allowed != 3 {
-			return fmt.Errorf("the fixture reached %d refused and %d allowed arms, want 3 and 3", refused, allowed)
+		if refused != parityFixtureRefused || allowed != parityFixtureArms-parityFixtureRefused {
+			return fmt.Errorf("the fixture reached %d refused and %d allowed arms, want %d and %d: %v",
+				refused, allowed, parityFixtureRefused, parityFixtureArms-parityFixtureRefused, verdicts)
 		}
 		return nil
 	})
