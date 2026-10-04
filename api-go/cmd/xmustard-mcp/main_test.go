@@ -3,6 +3,8 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
+	"os"
 	"strings"
 	"testing"
 
@@ -80,6 +82,60 @@ func TestDispatchToolsCallUnknownToolIsProtocolError(t *testing.T) {
 	}
 	if m, _ := res.(map[string]any); m["isError"] != true {
 		t.Fatalf("expected an isError tool result for an unknown argument, got %v", res)
+	}
+}
+
+// The WS-FIX-15b opt-in registers a repository and scans it without the operator
+// asking, so an unset variable must read as off. This is the line two review
+// channels found written as `!= "0"`, where an unset variable meant on.
+func TestRegisterCwdWhenRootsUnknownIsOffUnlessSetToOne(t *testing.T) {
+	cases := []struct {
+		name string
+		set  bool
+		val  string
+		want bool
+	}{
+		{"unset", false, "", false},
+		{"zero", true, "0", false},
+		{"empty", true, "", false},
+		{"true is not one", true, "true", false},
+		{"yes is not one", true, "yes", false},
+		{"one", true, "1", true},
+		{"one with spaces", true, " 1 ", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if c.set {
+				t.Setenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN", c.val)
+			} else {
+				unset := "XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN"
+				t.Setenv(unset, c.val)
+				os.Unsetenv(unset)
+			}
+			if got := registerCwdWhenRootsUnknown(); got != c.want {
+				t.Fatalf("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=%q set=%v: got %v, want %v", c.val, c.set, got, c.want)
+			}
+		})
+	}
+}
+
+// The parse's value has to reach the server, not stop at the parse. Deleting
+// RegisterCwdWhenRootsUnknown from stdioOptions leaves the parse test green and the
+// resolver tests green, so this is the only assertion that fails when the wiring is gone.
+func TestStdioOptionsCarriesTheRegisterCwdOptIn(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opt-in %v reaches the server", want), func(t *testing.T) {
+			if want {
+				t.Setenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN", "1")
+			} else {
+				unset := "XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN"
+				t.Setenv(unset, "")
+				os.Unsetenv(unset)
+			}
+			if got := stdioOptions().RegisterCwdWhenRootsUnknown; got != want {
+				t.Fatalf("stdioOptions().RegisterCwdWhenRootsUnknown=%v, want %v: the shim does not pass the variable to the server", got, want)
+			}
+		})
 	}
 }
 

@@ -12,19 +12,26 @@ import (
 )
 
 // groundResult builds a ground result shaped like the API's: failed runs, broken
-// contracts, drift reasons and unknown fields scale with the arguments.
-func groundResult(runs, breaks, reasons, unknown int) map[string]any {
+// contracts, drift reasons and unknown fields scale with the arguments. pad widens
+// every list element without adding one, so a caller can grow the result in bytes
+// while its element count, and what Apply has to budget, stay the same.
+func groundResult(runs, breaks, reasons, unknown int, pad ...int) map[string]any {
+	width := 0
+	if len(pad) > 0 {
+		width = pad[0]
+	}
+	fat := strings.Repeat("x", width)
 	failed := make([]string, runs)
 	for i := range failed {
-		failed[i] = fmt.Sprintf("run_%04d_newest_first", i)
+		failed[i] = fmt.Sprintf("run_%04d_newest_first", i) + fat
 	}
 	broken := make([]string, breaks)
 	for i := range broken {
-		broken[i] = fmt.Sprintf("pkg.Func%04d in internal/pkg/file_%04d.go (fn(a int) -> fn(a, b int))", i, i)
+		broken[i] = fmt.Sprintf("pkg.Func%04d in internal/pkg/file_%04d.go (fn(a int) -> fn(a, b int))", i, i) + fat
 	}
 	why := make([]string, reasons)
 	for i := range why {
-		why[i] = fmt.Sprintf("tracked file %04d changed since the baseline", i)
+		why[i] = fmt.Sprintf("tracked file %04d changed since the baseline", i) + fat
 	}
 	g := map[string]any{
 		"workspace_id": "ws1",
@@ -511,9 +518,54 @@ func TestRecoveryIsNamedOnlyWhenReduced(t *testing.T) {
 
 // Budgeting does not copy the result: Apply allocates its element tables and the
 // output, and WorkingSet (what the API admits) covers that plus the result itself.
-func TestApplyDoesNotCopyTheResult(t *testing.T) {
-	raw := mustJSON(groundResult(2000, 20000, 50, 5)) // about 2 MB, most of it list elements
-	req := Request{MaxChars: DefaultMaxChars}
+//
+// The guard is a difference of two measurements, not a reading of a counter. Apply is
+// asked to budget the same result twice, once with every list element narrow and once
+// with each element widened by allocPadBytes: the second result is about six times
+// the bytes but holds exactly the same 40,050 list elements, so the tables Apply
+// builds and the output it writes are the same size. A copy is proportional to the
+// result's bytes, so it lands in the difference; the tables and the output are not, so
+// they do not.
+//
+// What the difference does not do is cancel the process. Both windows still read a
+// process-wide counter, and unrelated allocation inside either is not guaranteed to
+// appear in both. That is why the guard carries a measured allowance rather than
+// asserting a zero difference: 8,192 bytes, against a steady-state band of 7 to 2,169
+// bytes over 12 runs on a loaded box and about 8.8 MB for a copy. The gap between those
+// two figures is the signal; the allowance is the noise the measurement admits, and it
+// is three orders of magnitude smaller than the defect.
+//
+// That matters because runtime.MemStats.TotalAlloc is process-wide. Read across one
+// call on a loaded build box it ranged 381,792-398,888 bytes over 20 runs of one
+// unchanged tree, and reached 410,824-423,592 under WS-32a's load against a
+// 402,909-byte line: the flake this test is.
+//
+// The copy guard's two windows are warm, and that is measured rather than assumed: an
+// unwarmed Apply also pays for the heap's growth into this working set, and that cost
+// lands on whichever fixture is measured first. Cold, over 12 runs, the difference spans
+// -14,688 to +2,456 bytes (logs/ws-flk-09-run-20261003T213617Z.log); warm, over 12 runs
+// it spans 41 to 1,637 (logs/ws-flk-09-run-20261003T214246Z.log). So the earliest Apply
+// here is measured separately and held to WorkingSet, because WorkingSet is what a
+// caller admits before its own first call. It is the earliest call in this test, not the
+// earliest in the process: the package's other tests call Apply before it, so under a
+// full run the figure is a warmed one wearing a colder label. Both readings stay inside
+// the same line, which is the point.
+const (
+	allocPadBytes  = 400
+	allocProbeRuns = 8
+)
+
+// allocOf returns the bytes Apply allocates for raw in one call, after an untimed warm-up
+// call when warm is set. It reads a process-wide counter, so it carries whatever the
+// runtime allocates inside its window; the caller's allowance is sized for that, and it
+// is never read alone as a copy guard.
+func allocOf(t *testing.T, raw []byte, req Request, warm bool) int64 {
+	t.Helper()
+	if warm {
+		if _, err := Apply(raw, req); err != nil {
+			t.Fatal(err)
+		}
+	}
 	var before, after runtime.MemStats
 	runtime.GC()
 	runtime.ReadMemStats(&before)
@@ -521,14 +573,58 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 		t.Fatal(err)
 	}
 	runtime.ReadMemStats(&after)
-	alloc := int64(after.TotalAlloc - before.TotalAlloc)
-	if alloc > int64(len(raw))/4 {
-		t.Fatalf("Apply allocated %d bytes for a %d-byte result; it must not copy the result", alloc, len(raw))
+	return int64(after.TotalAlloc - before.TotalAlloc)
+}
+
+// steadyOf is allocOf averaged over allocProbeRuns warm calls, which is the figure the
+// copy guard's difference is read off.
+func steadyOf(t *testing.T, raw []byte, req Request) int64 {
+	t.Helper()
+	var sum int64
+	for i := 0; i < allocProbeRuns; i++ {
+		sum += allocOf(t, raw, req, true)
 	}
-	if ws := WorkingSet(raw, req); ws < int64(len(raw))+alloc {
-		t.Fatalf("WorkingSet %d does not cover the result (%d) plus Apply's allocations (%d)", ws, len(raw), alloc)
+	return sum / allocProbeRuns
+}
+
+func TestApplyDoesNotCopyTheResult(t *testing.T) {
+	req := Request{MaxChars: DefaultMaxChars}
+	narrow := mustJSON(groundResult(2000, 20000, 50, 5))
+	wide := mustJSON(groundResult(2000, 20000, 50, 5, allocPadBytes))
+	if len(wide) < 3*len(narrow) {
+		t.Fatalf("the wide result is %d bytes against %d; allocPadBytes must at least triple it for the difference to mean anything",
+			len(wide), len(narrow))
 	}
-	t.Logf("result %d bytes: Apply allocated %d bytes; WorkingSet %d", len(raw), alloc, WorkingSet(raw, req))
+
+	// The first Apply this test makes is the one a caller's WorkingSet has to cover, so
+	// it is read before this test's own copy measurement and asserted on its own: the
+	// result plus that call's allocations must fit in what the API admits. Its line is
+	// the one Apply has always had to meet for a single call, len(raw)/4, unchanged by
+	// this row.
+	coldAlloc := allocOf(t, narrow, req, false)
+	if coldAlloc > int64(len(narrow))/4 {
+		t.Fatalf("this test's first Apply call allocated %d bytes for a %d-byte result; it must not copy the result",
+			coldAlloc, len(narrow))
+	}
+	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+coldAlloc {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d)",
+			ws, len(narrow), coldAlloc)
+	}
+
+	// A copy is bytes; the element tables and the output are not. Everything the wide
+	// result adds is padding inside elements Apply never copies, so its allocation must
+	// stay within the same small allowance as the narrow one's. The allowance covers what
+	// the two windows do not have in common, not the copy: a copy of either result is
+	// about 8.8 MB (the slop audit's S5 rows).
+	const copyAllowance = 8 << 10
+	copied := steadyOf(t, wide, req) - steadyOf(t, narrow, req)
+	if copied > copyAllowance {
+		t.Fatalf("Apply allocated %d more bytes for a %d-byte result than for a %d-byte one with the same %d list elements;"+
+			" it must not copy the result", copied, len(wide), len(narrow), 40050)
+	}
+	t.Logf("result %d bytes -> %d bytes at the same 40,050 elements: %d bytes apart steady-state (allowance %d);"+
+		" first call %d bytes against its %d-byte line; WorkingSet %d",
+		len(narrow), len(wide), copied, copyAllowance, coldAlloc, len(narrow)/4, WorkingSet(narrow, req))
 }
 
 // Result bytes are copied through exactly, whitespace and escapes included.

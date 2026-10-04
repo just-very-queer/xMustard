@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -621,6 +623,61 @@ func TestPathCacheIsBounded(t *testing.T) {
 	}
 }
 
+// The opt-in registers the working directory's OWN repository. When that repository is
+// nested inside an already-registered workspace, the ancestor match runs first and used
+// to win, so the opt-in silently did nothing in exactly the monorepo and worktree case it
+// exists for.
+func TestTheOptInRegistersTheCwdRepoInsideARegisteredAncestor(t *testing.T) {
+	outer := tempRepo(t)
+	inner := filepath.Join(outer, "vendor", "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", inner, "init", "--quiet").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "outer-ws", Root: outer}}}
+	s := newSession(t, api, Options{Cwd: inner, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, _ := call(t, s, "ground", map[string]any{})
+	if res["isError"] != false {
+		t.Fatalf("the opt-in must register the cwd's own repository: %s", text(res))
+	}
+	ws := wsOf(t, res)
+	if ws.Source != SourceCWD || !ws.Registered || ws.Root != inner || ws.ID != WorkspaceIDForPath(inner) {
+		t.Fatalf("resolved %+v, want the nested cwd repository %s registered, not the registered ancestor", ws, inner)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 1 {
+		t.Fatalf("registered %d times, want 1", n)
+	}
+}
+
+// The same nested cwd with auto-registration off: pinning the cwd to its own repository
+// must not lose the registered ancestor that already contains it, which is the answer the
+// caller had before the opt-in existed.
+func TestTheOptInKeepsTheRegisteredAncestorWhenRegistrationIsRefused(t *testing.T) {
+	outer := tempRepo(t)
+	inner := filepath.Join(outer, "vendor", "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", inner, "init", "--quiet").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "outer-ws", Root: outer}}}
+	s := newSession(t, api, Options{Cwd: inner, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, _ := call(t, s, "ground", map[string]any{})
+	if res["isError"] != false {
+		t.Fatalf("a refused nested registration must still resolve the ancestor: %s", text(res))
+	}
+	ws := wsOf(t, res)
+	if ws.ID != "outer-ws" || ws.Root != outer || ws.Registered {
+		t.Fatalf("resolved %+v, want the registered ancestor and no new registration", ws)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("registered %d times with auto-registration off", n)
+	}
+}
+
 // A refused registration reports the API's message, not its JSON envelope, so the
 // rule that refused it (and XMUSTARD_REGISTER_ROOTS) survives the clip.
 func TestRefusedRegistrationReportsTheAPIMessage(t *testing.T) {
@@ -639,4 +696,152 @@ func TestRefusedRegistrationReportsTheAPIMessage(t *testing.T) {
 	if res["isError"] != true || !strings.Contains(out, "(403 Forbidden: non-admin registration is off") || !strings.Contains(out, "XMUSTARD_REGISTER_ROOTS") || strings.Contains(out, `"reason"`) {
 		t.Fatalf("refusal must carry the API's message: %s", out)
 	}
+}
+
+// rootsUnknownClient answers roots/list with a failure, so the client's roots are
+// unknown rather than absent on every call.
+func rootsUnknownClient(err error) *scriptedRoots {
+	return &scriptedRoots{steps: []func() (json.RawMessage, error){fail(err)}}
+}
+
+// The default is the merged tip's rule: an unknown roots/list never registers the
+// working directory, and the refusal names that rule.
+func TestCwdIsNotRegisteredWhileRootsAreUnknownByDefault(t *testing.T) {
+	repo := tempRepo(t)
+	api := &fakeAPI{}
+	// RegisterCwdWhenRootsUnknown unset is the zero value the shims pass when the
+	// variable is unset or "0"; registerCwdWhenRootsUnknown reads `== "1"`, the
+	// opposite of the `!= "0"` rule XMUSTARD_MCP_AUTO_REGISTER uses, because an unset
+	// variable here must not register a repository.
+	s := newSession(t, api, Options{Cwd: filepath.Join(repo, "src"), AutoRegister: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, _ := call(t, s, "ground", map[string]any{})
+	out := text(res)
+	if res["isError"] != true || !strings.Contains(out, "not auto-registered while the client's roots are unavailable") {
+		t.Fatalf("%s", out)
+	}
+	if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+		t.Fatalf("the cwd was registered (%d loads)", n)
+	}
+}
+
+// The opt-in registers exactly the working directory's own repository, once, and the
+// answer reports it.
+func TestTheOptInRegistersTheCwdWhileRootsAreUnknown(t *testing.T) {
+	repo := tempRepo(t)
+	api := &fakeAPI{}
+	opts := Options{Cwd: filepath.Join(repo, "src", "pkg"), AutoRegister: true, RegisterCwdWhenRootsUnknown: true}
+	client := rootsUnknownClient(errors.New("client error -32603: busy"))
+	s := newSession(t, api, opts, client, "2025-06-18")
+	res, rerr := call(t, s, "ground", map[string]any{})
+	if rerr != nil || res["isError"] != false {
+		t.Fatalf("the opt-in must register the cwd: %v %v", rerr, text(res))
+	}
+	ws := wsOf(t, res)
+	if ws.Source != SourceCWD || ws.Root != repo || !ws.Registered || ws.ID != WorkspaceIDForPath(repo) {
+		t.Fatalf("resolved %+v, want the cwd's own repository registered", ws)
+	}
+	// The registration is cached like any other resolved path, so the next call does not
+	// register again. roots/list is still asked on the second call: resolveWorkspace
+	// consults the client's roots before the cwd signal, so the cache spares the load and
+	// not the request. The load count is the assertion; the request count is pinned at two
+	// so a future change that skips the roots request would show up here rather than pass
+	// unnoticed.
+	if _, _ = call(t, s, "ground", map[string]any{}); api.count("POST", "/api/workspaces/load") != 1 {
+		t.Fatalf("registered %d times", api.count("POST", "/api/workspaces/load"))
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("asked roots/list %d times over two calls, want one per call", n)
+	}
+}
+
+// The opt-in changes the cwd signal and nothing else: it is not a wider
+// auto-registration, and auto-registration itself still wins.
+func TestTheOptInRefusesNothingElse(t *testing.T) {
+	t.Run("auto-registration off still refuses", func(t *testing.T) {
+		repo := tempRepo(t)
+		api := &fakeAPI{}
+		s := newSession(t, api, Options{Cwd: repo, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+		res, _ := call(t, s, "ground", map[string]any{})
+		out := text(res)
+		if res["isError"] != true || !strings.Contains(out, "auto-registration is off") || strings.Contains(out, "roots are unavailable") {
+			t.Fatalf("XMUSTARD_MCP_AUTO_REGISTER=0 must win: %s", out)
+		}
+		if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+			t.Fatalf("registered %d times with auto-registration off", n)
+		}
+	})
+	t.Run("answering roots still win over the cwd", func(t *testing.T) {
+		project, other := tempRepo(t), tempRepo(t)
+		api := &fakeAPI{workspaces: []registeredWorkspace{{ID: "project-ws", Root: project}}}
+		s := newSession(t, api, Options{Cwd: other, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, &rootsClient{roots: []string{project}}, "2025-06-18")
+		res, _ := call(t, s, "ground", map[string]any{})
+		ws := wsOf(t, res)
+		if ws.Source != SourceRoots || ws.ID != "project-ws" || ws.Registered {
+			t.Fatalf("the opt-in must not apply once the client's roots are known: %+v", ws)
+		}
+		if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+			t.Fatalf("registered %d times with a registered root", n)
+		}
+	})
+	for _, optedIn := range []bool{false, true} {
+		t.Run(fmt.Sprintf("several client roots none containing the cwd register it (opt-in %v)", optedIn), func(t *testing.T) {
+			project, other := tempRepo(t), tempRepo(t)
+			api := &fakeAPI{}
+			// Several roots and none contains the working directory, so resolution falls
+			// through to the cwd signal. That signal has never refused registration when the
+			// client's roots are KNOWN, so it registers here too; this row changes only the
+			// unknown-roots case. Both settings of the opt-in are run, so the case pins that
+			// it is the successful answer and not this row's flag that allows the
+			// registration.
+			client := &rootsClient{roots: []string{project, filepath.Join(project, "src")}}
+			s := newSession(t, api, Options{Cwd: other, AutoRegister: true, RegisterCwdWhenRootsUnknown: optedIn}, client, "2025-06-18")
+			res, _ := call(t, s, "ground", map[string]any{})
+			if res["isError"] != false {
+				t.Fatalf("known roots that do not contain the cwd have always fallen back to it: %s", text(res))
+			}
+			ws := wsOf(t, res)
+			if ws.Source != SourceCWD || !ws.Registered || ws.Root != other {
+				t.Fatalf("resolved %+v, want the cwd registered as it always was", ws)
+			}
+		})
+	}
+	t.Run("a path argument still never registers", func(t *testing.T) {
+		repo := tempRepo(t)
+		// the working directory is outside every git repository, so the path argument
+		// is the only signal that could register anything
+		outside := t.TempDir()
+		api := &fakeAPI{}
+		s := newSession(t, api, Options{Cwd: outside, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+		res, _ := call(t, s, "explain", map[string]any{"path": filepath.Join(repo, "src", "a.go")})
+		if res["isError"] != true || !strings.Contains(text(res), "a path argument never registers a repository") {
+			t.Fatalf("a model-supplied path stays unregistering: %s", text(res))
+		}
+		if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+			t.Fatalf("registered %d times for a path argument", n)
+		}
+	})
+	t.Run("a timed-out roots/list is the same unknown case", func(t *testing.T) {
+		repo := tempRepo(t)
+		api := &fakeAPI{}
+		s := newSession(t, api, Options{Cwd: repo, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(fmt.Errorf("waiting for roots/list: %w", context.DeadlineExceeded)), "2025-06-18")
+		res, _ := call(t, s, "ground", map[string]any{})
+		if res["isError"] != false {
+			t.Fatalf("the opt-in covers every unknown-roots failure, not one error string: %s", text(res))
+		}
+		if ws := wsOf(t, res); ws.Source != SourceCWD || !ws.Registered {
+			t.Fatalf("resolved %+v", ws)
+		}
+	})
+	t.Run("a session with no working directory never registers", func(t *testing.T) {
+		api := &fakeAPI{}
+		s := newSession(t, api, Options{AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+		res, _ := call(t, s, "ground", map[string]any{})
+		out := text(res)
+		if res["isError"] != true || !strings.Contains(out, "the server has no working directory") {
+			t.Fatalf("the opt-in must not invent a working directory: %s", out)
+		}
+		if n := api.count("POST", "/api/workspaces/load"); n != 0 {
+			t.Fatalf("registered %d times with no working directory", n)
+		}
+	})
 }
