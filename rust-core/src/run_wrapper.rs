@@ -678,6 +678,17 @@ fn subcommand(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     words.next().filter(|w| plain(w)).map(str::to_string)
 }
 
+// The script word, read without `plain`. `plain` is the disclosure rule and it is
+// still the right one for everything the hint sends, but the script's own name is
+// never sent — only the family word `family_of` derives from it — so a name that
+// `plain` would refuse may still be classified. npm's own naming uses a colon for
+// a variant (`test:unit`, `lint:fix`, `build:prod`), the registry classifies all
+// three by prefix, and reading them through `plain` sent a bare `npm run`, which
+// is the generic package-manager reducer: the capture landed in no family at all.
+fn script_name(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
+    words.next().filter(|w| !w.is_empty()).map(str::to_string)
+}
+
 fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     let sub = subcommand(words)?;
     if sub != "run" {
@@ -687,7 +698,7 @@ fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     // `HasPrefix(script, "test")`, and the same for lint and build), so the family
     // word is what it needs and the name itself may be anything — a script called
     // after a credential would otherwise put that word in the capture URL.
-    Some(match subcommand(words).as_deref().and_then(family_of) {
+    Some(match script_name(words).as_deref().and_then(family_of) {
         Some(family) => format!("run {family}"),
         None => sub,
     })
@@ -893,6 +904,13 @@ mod tests {
             // while `jest` is a test there.
             ("npm run jest", "npm run test"),
             ("npm run tscheck", "npm run"),
+            // npm's own variant naming uses a colon, and the registry classifies these
+            // by prefix (`registry.go`: `HasPrefix(script, "test")`). Reading the script
+            // through `plain`, which refuses a colon, sent a bare `npm run` for all
+            // three — the generic package-manager reducer, so the capture landed in no
+            // family at all.
+            ("npm run build:prod", "npm run build"),
+            ("npm run lint:fix", "npm run lint"),
             // A script in none of the registry's families sends nothing, because the
             // registry's own fallback for an unknown script is the generic reducer.
             ("npm run deploy", "npm run"),

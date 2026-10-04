@@ -237,6 +237,11 @@ mutate M37 'if (!isRecord(event) || event.toolName !== "bash") return false;
 	const input' 'if (!isRecord(event)) return false;
 	const input' || true
 
+# M38: the script word is read through `plain` again, which refuses npm's own colon
+# variant naming (`test:unit`, `lint:fix`, `build:prod`), so all three fall to the
+# generic reducer and the capture lands in no family.
+mutate M38 'Some(match script_name(words).as_deref().and_then(family_of) {' 'Some(match subcommand(words).as_deref().and_then(family_of) {' "$RUST" || true
+
 restore ALL
 echo "=== final byte-compare"
 cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \
