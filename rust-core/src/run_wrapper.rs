@@ -182,26 +182,42 @@ const FORWARDED: &[i32] = &[
     signal_hook::consts::signal::SIGTERM,
 ];
 
-/// Whether a signal the wrapper caught should be relayed to the child, from the sender
-/// `siginfo` reports (`None` when the signal names no sender).
+/// Whether a signal the wrapper caught should be relayed to the child.
 ///
-/// A terminal delivers SIGINT/SIGQUIT (and SIGHUP at logout) to **every** process in the
-/// foreground process group, so the child already has the operator's keystroke. Relaying
-/// the wrapper's own copy gives the child a second one, and a child that traps the signal
-/// runs its handler twice per keystroke (WS-FIX-20b). A terminal-generated signal names
-/// no sender — Linux fills `si_code` with `SI_TTY` (job control) or `SI_KERNEL`, both with
-/// `si_pid == 0` — while `kill(2)` and `sigqueue(3)` fill the sender, so the sender is the
-/// discriminator and needs no per-platform `si_code` table.
+/// Two facts decide it. `sender` is the process the signal names (`None` when it names none),
+/// and `shares_group` is whether the child is in the wrapper's own process group, which is
+/// what makes a terminal's group-wide delivery reach the child as well.
 ///
-/// Only `None` skips the relay. A sender of 0 is a *filled* field that happens to name pid 0,
-/// which is not a pid a `kill(2)` can come from and is what a kernel that ignores `si_code`
-/// leaves behind; treating it as "no sender" would drop a client's timeout on any platform
-/// where the exfiltrator cannot tell the two apart, so it is relayed. The asymmetry is
-/// deliberate and is the safe direction: a duplicated Ctrl-C is a command that re-runs its
-/// cleanup, while a swallowed timeout orphans the child, which is what forwarding exists to
-/// prevent (WS-41 deviation (2)).
-pub fn relay_origin(sender: Option<i32>) -> bool {
-    sender.is_some()
+/// A signal a **process** sent is always relayed: `kill(2)` and `sigqueue(3)` fill the sender,
+/// and a client timeout or an operator's `kill <pid>` arrives this way with the wrapper as
+/// its only target (WS-41 deviation (2)).
+///
+/// A signal the **terminal or the kernel** generated is relayed only when the child is not in
+/// the wrapper's group. A terminal delivers SIGINT/SIGQUIT to every process in the foreground
+/// group, so the child already has the operator's keystroke and relaying gives it a second one
+/// (WS-FIX-20-r4-1). When the child has left the group that delivery would not reach it, and
+/// the same is true of a SIGHUP on pty disconnect, which the kernel sends to the session
+/// leader alone — relaying there is what stops the wrapper orphaning a live child.
+///
+/// The skip is therefore never taken on the absence of a sender alone: an unfilled or
+/// zero-valued field is not evidence that the child already has the signal, and treating it as
+/// such is what would drop a timeout. A sender of 0 is a filled field naming pid 0, which no
+/// `kill(2)` can come from, and it is relayed for the same reason.
+pub fn relay_origin(sender: Option<i32>, shares_group: bool) -> bool {
+    sender.is_some() || !shares_group
+}
+
+/// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
+/// reaches it too. `false` on any error (the child is gone, or its group cannot be read):
+/// an unknown group is treated as "not shared", which relays rather than skips.
+fn same_process_group(child: rustix::process::Pid) -> bool {
+    match (
+        rustix::process::getpgid(Some(child)),
+        rustix::process::getpgid(None),
+    ) {
+        (Ok(child_group), Ok(own_group)) => child_group == own_group,
+        _ => false,
+    }
 }
 
 /// Forwards a termination signal to the child while the wrapper runs.
@@ -305,11 +321,16 @@ impl Forwarder {
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
                 }
-                // A signal the terminal or the kernel generated for the whole foreground
-                // group: the child already has this one, so relaying it would be the second
-                // copy (WS-FIX-20b). Nothing else is skipped — a signal a process sent is
-                // relayed below.
-                if !relay_origin(origin.process.map(|p| p.pid)) {
+                // A signal the terminal or the kernel generated for a whole process group:
+                // the child may already have this one, and relaying it would be the second
+                // copy (WS-FIX-20b). "May have" is not enough to skip on, because a pty
+                // disconnect delivers SIGHUP to the session leader alone, and a child that
+                // has left the wrapper's group would not get a terminal's signal either.
+                // Skipping therefore requires the child to be in the wrapper's own group,
+                // which is what makes the terminal's group delivery reach it; anything else
+                // is relayed, so an orphan is not possible at the price of a duplicate Ctrl-C.
+                let shares_group = same_process_group(child);
+                if !relay_origin(origin.process.map(|p| p.pid), shares_group) {
                     continue;
                 }
                 // ESRCH: the child is already gone, which is the normal race at exit.

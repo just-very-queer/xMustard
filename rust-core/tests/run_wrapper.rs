@@ -779,10 +779,12 @@ fn without_forwarding_the_wrapper_becomes_the_command() {
 /// shell-based version of this test passes on the broken code, which is how the first
 /// version of it did.
 ///
-/// Linux only. The test asserts the wrapper does NOT relay, and on macOS `signal-hook`
-/// reports a populated sender for a terminal-generated signal, so the double delivery is
-/// there by design and the assertion would be false rather than revealing. `AGENTS.md` runs
-/// `cargo test` on macOS, so the gate is an attribute and not a skip inside the test.
+/// Linux only. The test asserts the wrapper does NOT relay, which holds when the terminal's
+/// own group delivery reached the child — the case `#[cfg]` below is the one measured
+/// (`AGENTS.md` runs `cargo test` on macOS, so the gate is an attribute rather than a skip).
+/// On macOS `Origin::extract` reports a terminal-generated signal as no sender as well (pid
+/// and uid both 0), so the same rule applies there; the test is gated because its discriminator
+/// was measured on Linux, not because the behaviour is known to differ.
 #[cfg(target_os = "linux")]
 #[test]
 fn one_terminal_keystroke_reaches_the_child_once() {
@@ -792,7 +794,7 @@ fn one_terminal_keystroke_reaches_the_child_once() {
     // child and its log behind and the first run's child is released before the next starts.
     for (name, byte) in [("INT", b"\x03"), ("QUIT", b"\x1c")] {
         let dir = tempfile::tempdir().unwrap();
-        let (mut wrapper, mut master, _slave) = terminal_job(dir.path());
+        let (mut wrapper, mut master) = terminal_job(dir.path());
         await_child(&dir.path().join("ready"), dir.path());
         let counted = keystroke_and_count(dir.path(), &mut master, byte);
         release(dir.path());
@@ -870,10 +872,11 @@ fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: 
 }
 
 /// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
-/// terminal is a fresh pty, and returns the wrapper, the pty master and the slave fd. The
-/// child inherits the wrapper's process group, so wrapper and child are the pty's one
-/// foreground group, exactly as a shell runs a job.
-fn terminal_job(dir: &std::path::Path) -> (std::process::Child, std::fs::File, i32) {
+/// terminal is a fresh pty, and returns the wrapper and the pty master. The child inherits
+/// the wrapper's process group, so wrapper and child are the pty's one foreground group,
+/// exactly as a shell runs a job. The slave is closed here and not returned: a caller that
+/// held its number would be holding an fd that is no longer open and could be reused.
+fn terminal_job(dir: &std::path::Path) -> (std::process::Child, std::fs::File) {
     let master =
         rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
             .unwrap();
@@ -918,7 +921,7 @@ fn terminal_job(dir: &std::path::Path) -> (std::process::Child, std::fs::File, i
     });
     // The parent's copy of the slave must close, or the master never sees EOF.
     drop(unsafe { std::fs::File::from_raw_fd(slave) });
-    (wrapper, master, slave)
+    (wrapper, master)
 }
 
 /// `Stdio` for an inherited copy of `fd`. The dup is deliberate: three stdio slots need three
@@ -946,7 +949,7 @@ const COUNTER_CHILD: &str = concat!(
 fn a_signal_a_process_sent_still_reaches_the_child() {
     let _g = serial_terminal();
     let dir = tempfile::tempdir().unwrap();
-    let (mut wrapper, _master, _slave) = terminal_job(dir.path());
+    let (mut wrapper, _master) = terminal_job(dir.path());
     await_child(&dir.path().join("ready"), dir.path());
     Command::new("kill")
         .args(["-TERM", &wrapper.id().to_string()])
@@ -964,20 +967,38 @@ fn a_signal_a_process_sent_still_reaches_the_child() {
 
 /// The rule that decides the tests above, as one decision with a refusal case on each side
 /// and no process or timing in it, so it is auditable without a terminal.
+///
+/// The two axes are independent and both are exercised: a sender decides on its own, and a
+/// shared group decides on its own. The refusal — the one combination that does NOT relay —
+/// is terminal-origin plus a child in the wrapper's group, which is the only case where the
+/// child provably already has the signal.
 #[test]
-fn only_a_signal_with_a_sender_is_relayed() {
+fn only_a_signal_the_child_already_has_is_not_relayed() {
+    let relayed = xmustard_core::run_wrapper::relay_origin;
+    // A signal a process sent is relayed, group or no group: that is the client's timeout.
     assert!(
-        xmustard_core::run_wrapper::relay_origin(Some(4321)),
+        relayed(Some(4321), true),
         "a signal a process sent must be relayed"
     );
     assert!(
-        !xmustard_core::run_wrapper::relay_origin(None),
-        "a terminal-generated signal has no sender and must not be relayed"
+        relayed(Some(4321), false),
+        "a signal a process sent must be relayed whatever the group"
+    );
+    // A filled field naming pid 0 cannot come from `kill(2)`, so it is relayed rather than
+    // treated as a sender-less terminal signal: dropping it would orphan the child.
+    assert!(
+        relayed(Some(0), true),
+        "an unfilled sender is not evidence the child already has the signal"
+    );
+    // A terminal-generated signal is skipped ONLY when the child is in the wrapper's group,
+    // so the terminal's own group-wide delivery is the one the child already has.
+    assert!(
+        !relayed(None, true),
+        "a terminal-generated signal must not be relayed to a child already in the group"
     );
     assert!(
-        xmustard_core::run_wrapper::relay_origin(Some(0)),
-        "a filled field naming pid 0 cannot be distinguished from a sender on a platform \
-         that ignores si_code, so it is relayed: a dropped timeout orphans the child, which \
-         is worse than a duplicated Ctrl-C"
+        relayed(None, false),
+        "a child outside the wrapper's group never got the terminal's signal, so relaying is \
+         what keeps the wrapper from orphaning it"
     );
 }
