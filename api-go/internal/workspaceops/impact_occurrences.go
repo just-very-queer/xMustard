@@ -202,17 +202,20 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 	if _, ok := res["occurrences"]; !ok {
 		return out
 	}
-	next, cut, more := occurrencePageOffset(res)
+	next, cut, more, trimmed := occurrencePageOffset(res)
 	delete(res, "next_cursor")
 	switch {
 	case cut:
 		// the budget replaced the rows with counts, so the list cannot be continued
 		// from here and the cut is named instead of being papered over
 		res["truncated"] = json.RawMessage(strconv.Quote("occurrences_removed"))
-	case more:
-		// only a page the core said had more gets a cursor. Signing one onto the last
-		// page would send a client back for rows that are not there: it would follow the
-		// cursor, read an empty page, and be handed the same offset again (WS-59e-r4-3).
+	case more || trimmed:
+		// A cursor is signed when the core had more rows OR when the budget cut this
+		// page's rows. The second case is the one a page's own next_cursor cannot
+		// express: if the LAST page lost rows to max_chars, the core had no more to
+		// offer, so the client would stop holding rows it never received and had no way
+		// back to them (WS-59d-r5-1). The position is where the budget's cut reached, so
+		// following it resumes exactly where the client's list ended.
 		cursor, err := json.Marshal(signOffset(occurrenceRanking(workspaceID, symbol, op), next))
 		if err != nil {
 			return out
@@ -232,23 +235,38 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 // from — an empty list is otherwise indistinguishable from a page that delivered nothing,
 // and signing a cursor onto an emptied list would tell a client to keep paging a list that
 // is gone. more is the core's own next_cursor: the core sends it only while rows remain, so
-// its absence is the last page and must not be papered over with a cursor of our own.
-func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut, more bool) {
+// its absence is the last page. trimmed is the budget's own report that it dropped rows
+// from this page, which the last page needs as much as a middle one: the ladder promises
+// that next_cursor continues at the first occurrence not returned, and on a trimmed last
+// page that row is the one the core had already counted as beyond the list.
+func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut, more, trimmed bool) {
 	// The map came from a decoded object, so re-marshalling it cannot fail, and reading
 	// it into one typed struct is what makes the empty-list case distinguishable from a
 	// member the answer never had.
 	raw, err := json.Marshal(res)
 	if err != nil {
-		return 0, false, false
+		return 0, false, false, false
 	}
 	var page struct {
 		Offset      *int               `json:"offset"`
 		Occurrences *[]json.RawMessage `json:"occurrences"`
 		NextCursor  *string            `json:"next_cursor"`
+		Budget      *struct {
+			Stage string `json:"degraded_stage"`
+			Lists map[string]struct {
+				Kept  int `json:"kept"`
+				Total int `json:"total"`
+			} `json:"lists"`
+		} `json:"output_budget"`
 	}
 	if json.Unmarshal(raw, &page) != nil || page.Offset == nil || page.Occurrences == nil {
-		return 0, false, false
+		return 0, false, false, false
 	}
 	_, counted := res["occurrences_by_path"]
-	return *page.Offset + len(*page.Occurrences), counted, page.NextCursor != nil
+	if page.Budget != nil && page.Budget.Stage == "trimmed" {
+		if l, ok := page.Budget.Lists["occurrences"]; ok {
+			trimmed = l.Kept < l.Total
+		}
+	}
+	return *page.Offset + len(*page.Occurrences), counted, page.NextCursor != nil, trimmed
 }

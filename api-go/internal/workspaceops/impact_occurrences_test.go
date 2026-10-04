@@ -167,6 +167,49 @@ func TestTheLastOccurrencePageKeepsNoCursor(t *testing.T) {
 	}
 }
 
+// The last occurrence page carries no cursor, because the core had no more rows to
+// offer. But if the budget cut rows off that page the client is still missing them, and
+// the ladder promises that next_cursor continues at the first occurrence not returned, so
+// a trimmed last page keeps a cursor at the position the cut reached
+// (WS-59d-r5-1). Without the budget report the case is indistinguishable from an uncut
+// last page, which is why the report is read rather than guessed.
+func TestATrimmedLastOccurrencePageStillCarriesACursor(t *testing.T) {
+	const ws, symbol, op = "ws", "Store", "refs"
+	trimmedLast := `{"total":9,"offset":6,"occurrences":[{"path":"a.go"}],` +
+		`"output_budget":{"max_chars":200,"used_chars":180,"degraded_stage":"trimmed",` +
+		`"lists":{"occurrences":{"state":"trimmed","kept":1,"total":3}}}}`
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(ReconcileOccurrencePaging(ws, symbol, op, []byte(trimmedLast)), &page); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := page["next_cursor"]
+	if !ok {
+		t.Fatalf("a trimmed last page dropped its cursor, so 2 rows are unreachable: %s", trimmedLast)
+	}
+	var cursor string
+	if err := json.Unmarshal(raw, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeOccurrenceCursor(ws, symbol, op, cursor)
+	if err != nil {
+		t.Fatalf("the cursor does not decode: %v", err)
+	}
+	// the page held one row of the three the budget counted, so it resumes at 7
+	if got != 7 {
+		t.Fatalf("the cursor continues at %d, want the page offset 6 plus the 1 row delivered: %s", got, raw)
+	}
+	// and a budget report that did not cut this list leaves the last page alone
+	full := `{"total":9,"offset":6,"occurrences":[{"path":"a.go"}],` +
+		`"output_budget":{"degraded_stage":"full","lists":{"occurrences":{"kept":1,"total":1}}}}`
+	page = nil
+	if err := json.Unmarshal(ReconcileOccurrencePaging(ws, symbol, op, []byte(full)), &page); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := page["next_cursor"]; ok {
+		t.Fatalf("an uncut last page grew a cursor %s: %s", c, full)
+	}
+}
+
 // The page the core answers carries a bare offset; what a client receives is a signed
 // cursor, and the last page carries none at all. This is the only place the core's own
 // next_cursor becomes a cursor, so it is tested directly rather than only through the
