@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 
 	"xmustard/api-go/internal/govstore"
@@ -187,6 +188,15 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 			if events, err = readDeltaEvents(ctx, r, workspaceID, since); err != nil {
 				return err
 			}
+			// The ranking above filters what was SERVED, but the delta folds every
+			// workspace event after since, so a confined entry this caller cannot see
+			// was still named by id (and its replacement by id) in memory_delta
+			// (round 4, r4-4). The served set alone cannot decide this: an entry removed
+			// inside the window is not in it, which is exactly the case the delta
+			// exists to report, so each named entry's own scope is read and checked.
+			if events, err = restrictDeltaToVisible(ctx, r, events, caller, opts); err != nil {
+				return err
+			}
 		}
 		scan.atRisk, scan.atRiskTruncated, err = readAtRisk(ctx, r, workspaceID, caller,
 			ScopeRequest{Dir: opts.scopeDir, RunID: opts.scopeRunID, SessionID: opts.scopeSessionID})
@@ -232,6 +242,33 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 		scan.delta = events.delta(since, scan.revision, served, staleNow)
 	}
 	return scan, nil
+}
+
+// restrictDeltaToVisible drops the delta's entries the caller's scope does not admit,
+// so ground's memory_delta names no entry another principal wrote privately. An entry
+// the store no longer holds is dropped too: it discloses nothing, and a name it no
+// longer resolves is not a disclosure either.
+func restrictDeltaToVisible(ctx context.Context, r govstore.Reader, events deltaEvents, caller string,
+	opts groundMemoryOptions) (deltaEvents, error) {
+	if len(events.byEntry) == 0 {
+		return events, nil
+	}
+	req := ScopeRequest{Dir: opts.scopeDir, RunID: opts.scopeRunID, SessionID: opts.scopeSessionID}
+	keep := make(map[string]*deltaChange, len(events.byEntry))
+	for id, c := range events.byEntry {
+		e, err := r.GetEntry(ctx, id)
+		if err != nil {
+			if errors.Is(err, govstore.ErrNotFound) {
+				continue
+			}
+			return events, err
+		}
+		if ScopesVisible(e.Scope, e.ScopeKey, e.Source, caller, req) {
+			keep[id] = c
+		}
+	}
+	events.byEntry = keep
+	return events, nil
 }
 
 // --- onboarding (PAR-GOV-15) ----------------------------------------------------------

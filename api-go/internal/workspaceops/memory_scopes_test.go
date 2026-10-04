@@ -452,9 +452,14 @@ func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 				t.Fatalf("%s was not served entry %s, which the fixture table admits", reader.name, id)
 			}
 		}
-		if n := ScopeLeaks(len(served), len(admitted)); n != 0 {
-			t.Fatalf("%s: scope leak metric = %d over %d served and %d admitted",
-				reader.name, n, len(served), len(admitted))
+		var leaks []string
+		for id := range served {
+			if !admitted[id] {
+				leaks = append(leaks, id)
+			}
+		}
+		if n := ScopeLeaks(len(leaks), 0); n != 0 {
+			t.Fatalf("%s: scope leak metric = %d over %d served: %v", reader.name, n, len(served), leaks)
 		}
 	}
 }

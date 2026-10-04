@@ -476,19 +476,43 @@ type AtRiskMemory struct {
 // readAtRisk lists the served memories marked needs_reverify, the longest at risk first.
 // The caller's own narrowing keys apply here as they do on the ranking: an entry the
 // caller's scope does not admit is not listed at all, because an id, title, path or
-// anchor in at_risk_memories discloses the entry it names (round 3, r3-1). The keys
-// narrow which entries are EXAMINED, so the listing is read with the store's unbounded
-// page and capped afterwards, rather than limiting the query and reporting a
-// truncated list of entries that were never candidates.
+// anchor in at_risk_memories discloses the entry it names (round 3, r3-1).
+//
+// The filter runs per page rather than once over a bounded scan window, because a
+// window applied before the filter drops the caller's own entry whenever the rows
+// ahead of it are unreadable, and reports truncated=false for a page that is not
+// complete (round 4, r4-5, found by two channels). Paging until the page is full or
+// the store is exhausted makes truncated mean what it says: the store holds more
+// at-risk rows than this answer lists.
 func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller string, req ScopeRequest) ([]AtRiskMemory, bool, error) {
-	entries, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
-		LongestStaleFirst: true, Limit: maxAtRisk * atRiskScanFactor})
-	if err != nil {
-		return nil, false, err
+	f := govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
+		LongestStaleFirst: true, Limit: atRiskPage}
+	var visible []govstore.Entry
+	for {
+		page, err := r.ListEntries(ctx, f)
+		if err != nil {
+			return nil, false, err
+		}
+		visible = append(visible, visibleEntries(page, caller, req)...)
+		if len(visible) >= maxAtRisk {
+			break
+		}
+		// LongestStaleFirst orders by stale_since and AfterCursor pages by pk, so a
+		// cursor cannot express "the rest of this order" and paging on it would skip and
+		// repeat rows. The window is therefore WIDENED until the caller's page is full
+		// or the store runs out, so a page is never short while more of the caller's rows
+		// remain (round 4, r4-5).
+		if len(page) < f.Limit || f.Limit >= atRiskScanCeiling {
+			break
+		}
+		f.Limit = min(f.Limit*2, atRiskScanCeiling)
 	}
-	entries = visibleEntries(entries, caller, req)
-	truncated := len(entries) > maxAtRisk
-	entries = entries[:min(len(entries), maxAtRisk)]
+	// truncated is the STORE holding more of this caller's at-risk rows than the answer
+	// lists, which is exactly len(visible) > maxAtRisk once the scan has stopped. Before
+	// the fix the same expression was applied to a single fixed window, so a page cut
+	// short by rows the caller may not read reported a complete answer (round 4, r4-5).
+	truncated := len(visible) > maxAtRisk
+	entries := visible[:min(len(visible), maxAtRisk)]
 	ids := make([]string, len(entries))
 	for i, e := range entries {
 		ids[i] = e.ID

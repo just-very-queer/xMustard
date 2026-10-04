@@ -118,6 +118,13 @@ type RankQuery struct {
 // hold the same dir or the same run id, and admitting by key alone would serve one
 // principal's entry to the other. This predicate is therefore the whole rule, not a
 // pre-filter a caller is expected to strengthen (round 3, r3-4).
+//
+// The directory prefix is matched with GLOB, not LIKE: a dir key is a plain
+// repo-relative path, and % and _ are ordinary characters in one, while LIKE reads
+// both as wildcards. A memory confined to api_go would then be served for apiXgo,
+// which the Go rule (ScopesVisible) refuses, so the two halves of the same rule
+// disagreed (round 4, r4-3). GLOB's own metacharacters are * and ?, which a valid
+// dir key cannot contain, so it needs no escaping.
 const scopeWhere = `(
 	e.scope IN ('', 'workspace')
 	OR (e.scope = 'private' AND ?3 <> '' AND lower(e.scope_key) = ?3)
@@ -125,7 +132,7 @@ const scopeWhere = `(
 	OR (e.scope = 'run' AND ?3 <> '' AND e.source_key = ?3 AND e.scope_key = ?5)
 	OR (e.scope = 'session' AND ?3 <> '' AND e.source_key = ?3 AND e.scope_key = ?6)
 	OR (e.scope = 'dir' AND ?3 <> '' AND e.source_key = ?3
-		AND (?7 <> '' AND (?7 = e.scope_key OR ?7 LIKE e.scope_key || '/%')))
+		AND (?7 <> '' AND (?7 = e.scope_key OR ?7 GLOB e.scope_key || '/*')))
 )`
 
 // RankingReader reads the ranking view of a workspace.

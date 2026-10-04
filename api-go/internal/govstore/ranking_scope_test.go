@@ -73,6 +73,50 @@ func TestScopeWhereAdmitsNoOtherAuthorsScopedEntry(t *testing.T) {
 	}
 }
 
+// A dir key is a plain repo-relative path, and % and _ are ordinary characters in
+// one. The predicate matched it with LIKE, where they are wildcards, so a memory
+// confined to api_go entered the ranking for apiXgo/subdir: an entry the Go rule
+// (ScopesVisible) refuses, served because the two halves disagreed on what a
+// directory prefix is (round 4, r4-3).
+func TestScopeWhereDoesNotTreatAWildcardInADirKeyAsAPattern(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	for _, e := range []struct{ id, key string }{
+		{"under_score", "api_go"},
+		{"under_pct", "api%go"},
+		{"plain", "api-go"},
+	} {
+		mustUpdate(t, s, func(tx Tx) error {
+			_, err := tx.InsertEntry(ctx, NewEntry{ID: e.id, WorkspaceID: "ws1", Title: e.id,
+				Content: e.id + " body", Scope: "dir", ScopeKey: e.key}, alice)
+			return err
+		})
+		vote(t, s, e.id, bob, VerdictApprove)
+		vote(t, s, e.id, carol, VerdictApprove)
+		promotePeer(t, s, e.id)
+	}
+
+	// The _ in api_go is a wildcard under LIKE and one character under GLOB, so a
+	// memory confined to api_go must not enter the ranking for apiXgo. api%go is the
+	// other way round and stays a literal prefix, which is the rule: the metacharacter
+	// is only a metacharacter to the matcher that reads it as one.
+	if served := rankingIDs(t, s, RankQuery{WorkspaceID: "ws1", Caller: "alice", ScopeDir: "apiXgo/subdir"}); len(served) != 0 {
+		t.Fatalf("Ranking for dir apiXgo/subdir served %v, want nothing: api_go is not a prefix of it",
+			slices.Sorted(maps.Keys(served)))
+	}
+	if served := rankingIDs(t, s, RankQuery{WorkspaceID: "ws1", Caller: "alice", ScopeDir: "api%go/subdir"}); !served["under_pct"] {
+		t.Fatalf("Ranking for dir api%%go/subdir served %v, want the entry confined to api%%go",
+			slices.Sorted(maps.Keys(served)))
+	}
+	// The keys still confine their own author, so the escaping did not widen them.
+	for _, e := range []struct{ key, id string }{{"api_go", "under_score"}, {"api%go", "under_pct"}} {
+		served := rankingIDs(t, s, RankQuery{WorkspaceID: "ws1", Caller: "alice", ScopeDir: e.key})
+		if !served[e.id] {
+			t.Fatalf("a memory confined to %q was refused to its own author: %v", e.key, slices.Sorted(maps.Keys(served)))
+		}
+	}
+}
+
 func rankingIDs(t *testing.T, s *SQLStore, q RankQuery) map[string]bool {
 	t.Helper()
 	view, err := s.Ranking(context.Background(), q)

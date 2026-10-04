@@ -244,10 +244,42 @@ func checkRunKeyTrust(dataDir, workspaceID, principal string, scoped Scoped) err
 		ErrInvalidInput, scoped.Key)
 }
 
-// atRiskScanFactor bounds how many at-risk rows readAtRisk examines before the scope
-// filter, so a workspace with many stale entries the caller may not read still yields a
-// full page of the ones it may. 4 pages of maxAtRisk against the store's 1000-row cap.
-const atRiskScanFactor = 4
+// atRiskPage is the first window readAtRisk reads per store call, and
+// atRiskScanCeiling the widest it will widen to. The window grows by doubling until the
+// caller's page is full or the store runs out, because the store orders at-risk rows by
+// staleness while its cursor pages by insertion, so the two cannot be combined to read
+// "the rest of this order".
+const (
+	atRiskPage        = 100
+	atRiskScanCeiling = 4000
+)
+
+// dropUntrustedRunKey narrows the READER's keys with the same operator setting that
+// guards a write. A run or session key arrives as a query parameter or a request
+// field, so a later run under the same principal could name an earlier run's id and
+// read that run's memory; checking only the write left the read unguarded (round 4,
+// r4-2). An untrusted key is DROPPED rather than refused: the read still answers, and
+// narrowing by nothing serves no confined entry, which is the fail-closed direction.
+// The attempt is audited exactly as the write refusal is, so an operator can see it.
+func dropUntrustedRunKey(dataDir, workspaceID, principal string, req ScopeRequest) ScopeRequest {
+	if strings.TrimSpace(req.RunID) == "" && strings.TrimSpace(req.SessionID) == "" {
+		return req
+	}
+	settings, err := loadSettings(dataDir)
+	if err != nil || trustsRunKey(settings, principal) {
+		return req
+	}
+	// The audit record is best-effort, for the same reason the write's is: a failed
+	// write of the event must not fail the read, and a failed read must not become a
+	// permitted key.
+	_ = recordAuditEventNoGuard(dataDir, workspaceID, AuditEvent{
+		Actor: principal, Action: AuditRunKeyRefused, TargetType: "memory_scope",
+		TargetID: strings.TrimSpace(req.RunID) + "/" + strings.TrimSpace(req.SessionID),
+		Details:  "principal " + ledgerPrincipal(principal) + " named an untrusted run or session key on a read",
+	})
+	req.RunID, req.SessionID = "", ""
+	return req
+}
 
 // visibleEntries is the one list-side filter: entries is what a query returned, and the
 // result is the ones reader's scope admits. Every surface that LISTS entries passes
