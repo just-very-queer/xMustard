@@ -287,15 +287,20 @@ cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \
 	&& echo "TREE_CLEAN=yes" || echo "TREE_CLEAN=no"
 
 # The restored sources are byte-identical to the ones this run started from, but the
-# COMPILED artefacts are not: cargo judged them fresh by mtime while they were built
-# from mutated sources, so a later gate in the same box copy would run the mutated
-# binary and report a defect that is not in the tree. Measured on the box: two BOXALLs
-# on this row failed `the_wrapper_default_api_is_the_one_the_adapter_refuses_against`
-# with `left: "http://127.0.0.1:9999"` — the M43 mutation value — while the worktree
-# read 8042 and `git status` was clean. Touching the sources forward is enough; the
-# next build recompiles from the restored bytes.
-touch "$SRC" "$CFG" "$DLV" "$IDX" "$RUST"
-echo "BUILD_CACHE_INVALIDATED=yes"
+# COMPILED artefacts are not: cargo judged them fresh by fingerprint while they had
+# been built from mutated sources, so a later gate in the same box copy would run the
+# mutated binary and report a defect that is not in the tree. Measured on the box: four
+# BOXALLs on this row failed `the_wrapper_default_api_is_the_one_the_adapter_refuses_against`
+# while the box copy's own source read 8042 on both sides of the assertion. Touching
+# the sources forward is NOT enough — cargo's fingerprint is content-derived, not
+# mtime-derived, so the restored bytes fingerprint the same as the mutated build's
+# inputs did not. `cargo clean -p` is what actually clears it, measured by the same
+# command failing and then passing across the clean
+# (logs/ws-44e-run-20261004T093609Z.log).
+if [[ -d rust-core ]]; then
+	(cd rust-core && cargo clean -p xmustard-core 2>/dev/null || true)
+fi
+echo "BUILD_CACHE_CLEARED=yes"
 rm -rf "$PRISTINE"
 echo "=== SUMMARY applied=$APPLIED survived=$SURVIVORS not_applied=$NOT_APPLIED"
 # The runner fails when any mutation was skipped or survived, so "all killed" cannot
