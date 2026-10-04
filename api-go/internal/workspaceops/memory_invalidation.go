@@ -488,37 +488,51 @@ func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller stri
 	f := govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
 		LongestStaleFirst: true, Limit: atRiskPage}
 	var visible []govstore.Entry
-	// capped records that the scan hit its ceiling with the page not yet full, so rows
-	// this caller may read can still exist beyond it. That is NOT a complete answer and
-	// the flag has to say so: reporting truncated=false there would repeat the defect
-	// this round is fixing, one level down (round 4, r4-5, after the triage check).
-	capped := false
+	// full records that the scan stopped because the caller's page is full rather than
+	// because the store ran out, which is the other way this answer can be short: more
+	// of the caller's rows may sit past the window this read happened to cover. Reading
+	// one row past a full page is what turns that into a flag instead of a silence
+	// (round 4, r4-5, after two triage checks).
+	full := false
 	for {
 		page, err := r.ListEntries(ctx, f)
 		if err != nil {
 			return nil, false, err
 		}
 		visible = append(visible, visibleEntries(page, caller, req)...)
-		if len(visible) >= maxAtRisk {
+		if len(visible) > maxAtRisk {
 			break
 		}
-		// LongestStaleFirst orders by stale_since and AfterCursor pages by pk, so a
-		// cursor cannot express "the rest of this order" and paging on it would skip and
-		// repeat rows. The window is therefore WIDENED until the caller's page is full
-		// or the store runs out, so a page is never short while more of the caller's rows
-		// remain (round 4, r4-5).
 		if len(page) < f.Limit {
 			break
 		}
+		if len(visible) == maxAtRisk {
+			// One more row decides it, and the only way to reach "one more" is a WIDER
+			// read of the same order: LongestStaleFirst orders by stale_since while
+			// AfterCursor pages by pk, so the window and not the cursor is the boundary
+			// both orders share. Filter the wider read and look at what falls PAST the
+			// page: a visible row there is the store holding more, which is the flag.
+			more := f
+			more.Limit++
+			rows, err := r.ListEntries(ctx, more)
+			if err != nil {
+				return nil, false, err
+			}
+			beyond := visibleEntries(rows, caller, req)
+			full = len(beyond) > maxAtRisk
+			break
+		}
+		// The window WIDENS rather than pages: a cursor cannot express "the rest of this
+		// order", so a page boundary would skip and repeat rows (round 4, r4-5).
 		if f.Limit >= atRiskScanCeiling {
-			capped = true
+			full = true
 			break
 		}
 		f.Limit = min(f.Limit*2, atRiskScanCeiling)
 	}
 	// truncated is the STORE holding more of this caller's at-risk rows than the answer
-	// lists: either the scan found them, or it ran out of window before it could say.
-	truncated := len(visible) > maxAtRisk || capped
+	// lists: either the scan found them, or it stopped without being able to say.
+	truncated := len(visible) > maxAtRisk || full
 	entries := visible[:min(len(visible), maxAtRisk)]
 	ids := make([]string, len(entries))
 	for i, e := range entries {
