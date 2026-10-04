@@ -402,3 +402,34 @@ func mustCursor(t *testing.T, page map[string]json.RawMessage) []byte {
 	}
 	return raw
 }
+
+// The core emits a page's next_cursor only while its end is below maxOccurrenceOffset,
+// so an offset outside that window is a page this build cannot have produced. It is
+// refused rather than signed: signing it hands a client a position the next request's own
+// flag parser rejects, so the client pages once and gets an error instead of the rows
+// (ocr-review:2).
+func TestSignOccurrencePageRefusesACursorOutsideTheReadableWindow(t *testing.T) {
+	const ws, symbol, op = "ws", "Store", "refs"
+	ranking := occurrenceRanking(ws, symbol, op)
+	for _, bad := range []string{"-1", "5000", "5001", "99999"} {
+		raw := []byte(`{"total":9,"offset":4,"occurrences":[{"path":"a.go"}],"next_cursor":"` + bad + `"}`)
+		out, err := signOccurrencePage(raw, ranking)
+		if !IsInvalidInput(err) {
+			t.Fatalf("next_cursor %q was signed as %s instead of refused: %v", bad, out, err)
+		}
+	}
+	// the highest position the core can actually emit is accepted
+	last := []byte(`{"total":9,"offset":4,"occurrences":[{"path":"a.go"}],"next_cursor":"4999"}`)
+	out, err := signOccurrencePage(last, ranking)
+	if err != nil || !strings.Contains(string(out), "next_cursor") {
+		t.Fatalf("the highest reachable offset was refused: %v %s", err, out)
+	}
+	// zero is the core's "nothing follows" and drops the cursor, not a refusal
+	zero, err := signOccurrencePage([]byte(`{"total":9,"offset":9,"occurrences":[{"path":"a.go"}],"next_cursor":"0"}`), ranking)
+	if err != nil {
+		t.Fatalf("a zero next_cursor was refused rather than dropped: %v", err)
+	}
+	if strings.Contains(string(zero), "next_cursor") {
+		t.Fatalf("a zero next_cursor was signed onto the page: %s", zero)
+	}
+}

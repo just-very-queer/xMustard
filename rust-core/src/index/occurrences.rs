@@ -425,7 +425,11 @@ pub fn read(
     }
     let end = q.offset + occurrences.len();
     let total = if more { end + 1 } else { end };
-    let truncated = more || q.offset + q.limit >= MAX_OCCURRENCES;
+    // Reaching the offset ceiling is only truncation when the list actually continues
+    // past it. A page whose window ends exactly at the ceiling and which the core says
+    // has no more rows is the whole list, and calling it truncated would add a cause to
+    // the envelope and turn a complete answer into a lower_bound one (ocr-review:3).
+    let truncated = more || (end >= MAX_OCCURRENCES && q.offset + q.limit >= MAX_OCCURRENCES);
     // A row is one of three claims, and only a bound edge is `resolved`. A same-language
     // name match is counted separately because it is not one, and it is a lower-bound
     // cause of its own: without it a list holding only namesakes would report

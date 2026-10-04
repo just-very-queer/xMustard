@@ -157,6 +157,17 @@ func signOccurrencePage(raw []byte, ranking []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("occurrence next_cursor %q is not an offset: %w", text, err)
 	}
+	// The core emits this cursor only while its end is strictly below
+	// maxOccurrenceOffset, so an offset at or past the ceiling is a position this build
+	// cannot have produced and is refused rather than signed: signing it would hand a
+	// client a position the next request's own flag parser rejects, so the client would
+	// page once and get an error instead of the rows (ocr-review:2). A zero offset is
+	// not in that class: the core sends it to mean "nothing follows", and the signer
+	// already drops it below, so it is left alone.
+	if offset < 0 || offset >= maxOccurrenceOffset {
+		return nil, fmt.Errorf("occurrence next_cursor %d is outside the readable window 0..%d: %w",
+			offset, maxOccurrenceOffset-1, ErrInvalidInput)
+	}
 	delete(page, "next_cursor")
 	signed := signOffset(ranking, offset)
 	if signed == "" {

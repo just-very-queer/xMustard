@@ -845,3 +845,41 @@ fn a_page_of_rows_in_distinct_files_does_not_hold_every_file() {
         distinct.len()
     );
 }
+
+// A page whose window ends exactly at the offset ceiling, on a list the core says has no
+// more rows, is the WHOLE list and is not truncated. Reading the ceiling alone as
+// truncation adds a cause to the envelope and turns a complete answer into a lower_bound
+// one, which is a worse answer than the one the client asked for (ocr-review:3).
+#[test]
+fn a_page_ending_exactly_at_the_offset_ceiling_is_not_truncated() {
+    let r = go_repo();
+    build(r.path());
+    // offset 4999 with limit 1 puts the window's end exactly on MAX_OCCURRENCES
+    let v = occ(
+        r.path(),
+        "refs",
+        "Store",
+        &["--offset=4999".to_string(), "--limit=1".to_string()],
+    );
+    assert!(
+        v["truncated"].as_bool().is_none_or(|t| !t),
+        "a complete page at the ceiling was reported as truncated: {v:#}"
+    );
+    assert_eq!(
+        v["epistemic"]["causes"].get("truncated"),
+        None,
+        "the ceiling alone added a truncated cause: {v:#}"
+    );
+    // and the page that genuinely runs past the ceiling is still truncated
+    let past = occ(
+        r.path(),
+        "refs",
+        "Store",
+        &["--offset=4998".to_string(), "--limit=2".to_string()],
+    );
+    assert_ne!(
+        past["total"].as_u64(),
+        None,
+        "the page past the ceiling did not answer: {past:#}"
+    );
+}

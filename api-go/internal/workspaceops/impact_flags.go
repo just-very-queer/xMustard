@@ -128,6 +128,14 @@ var cursorParam = impactParam{"cursor", "cursor", func(string) error { return ni
 // constant, so the two can never disagree (WS-59e-r5-2).
 const MaxImpactOffset = 50_000
 
+// maxOccurrenceOffset is the last occurrence page position the core can report. It is
+// the core's own bound (index::occurrences::MAX_OCCURRENCES), and the signer refuses to
+// name a position beyond it, for the reason MaxImpactOffset gives: a cursor the next
+// request's flag parser would refuse is worse than none. The core emits next_cursor only
+// while its end is strictly below this, so a position equal to it is unreachable and is
+// refused too (ocr-review:2).
+const maxOccurrenceOffset = 5_000
+
 var (
 	walkParams = []impactParam{
 		{"relation_types", "relation-types", listOf(RelationTypes...)},
