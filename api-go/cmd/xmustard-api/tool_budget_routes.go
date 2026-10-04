@@ -105,7 +105,16 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 			const maxImpactSettlePasses = 4
 			for pass := 0; pass < maxImpactSettlePasses; pass++ {
 				before := out
+				// The two forms page differently, so each has its own reconciler: the
+				// tier walk's cursor continues at the core's next_offset across every
+				// tier, while an occurrence page (op=, WS-59d) is one flat list whose
+				// cursor continues at its own offset. Each ignores a result that is not
+				// its own form, so calling both is safe and neither can re-sign the
+				// other's cursor.
 				out = workspaceops.ReconcileImpactPaging(ws, q, out)
+				if op := q.Get("op"); op != "" {
+					out = workspaceops.ReconcileOccurrencePaging(ws, q.Get("symbol"), op, out)
+				}
 				settled, serr := spec.Settle(out, req, page)
 				if serr != nil {
 					// Settle fails only on a result that is not valid JSON, which the

@@ -59,6 +59,7 @@ pub mod lexical;
 pub mod meta;
 pub mod namepath;
 pub mod names;
+pub mod occurrences;
 pub mod overview;
 pub mod paths_scope;
 pub mod reader;

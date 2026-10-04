@@ -989,7 +989,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
 
     let sub = need(
         &mut args,
-        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|trace|changes|resolve|blast-radius|find-symbol|overview|context> [--identity-key=K] [--name=value ...] ...",
+        "xmustard-core symbolgraph <build|hotspots|clusters|cluster-of|coverage|impact|impact-file|occurrences|trace|changes|resolve|blast-radius|find-symbol|overview|context> [--identity-key=K] [--name=value ...] ...",
     )?;
     let (key, args) = identity_flag(args);
     let mut rest: Vec<String> = args.collect();
@@ -1006,7 +1006,7 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
     let bad_flag = |e: String| CmdError::new(2, format!("symbolgraph {sub}: {e}"));
     let takes_flags = matches!(
         sub.as_str(),
-        "impact" | "trace" | "changes" | "find-symbol" | "overview" | "context"
+        "impact" | "trace" | "changes" | "find-symbol" | "overview" | "context" | "occurrences"
     );
     if !takes_flags && !flags.is_empty() {
         return Err(bad_flag(format!(
@@ -1227,6 +1227,18 @@ fn run_symbolgraph_command(mut args: Args) -> CmdResult {
                 )
                 .map_err(|e| CmdError::new(2, e))?,
             )
+        }
+        "occurrences" => {
+            // impact op= (WS-59d, PAR-IMP-03): the symbol-level occurrences of a name
+            use xmustard_core::index::occurrences;
+            let u = usage(" <name_path|uid> (flags: op, limit, cursor)");
+            let root = need(&mut args, &u)?;
+            let ws = need(&mut args, &u)?;
+            let target = need(&mut args, &u)?;
+            let mut q = occurrences::Query::new(&target, "refs");
+            q.apply_flags(flags).map_err(bad_flag)?;
+            let src = source(&root, &ws);
+            json(&occurrences::answer(&src, &ws, &q).map_err(|e| CmdError::new(2, e))?)
         }
         "resolve" => {
             // memory anchors (WS-27): the declarations of the names a memory mentions,

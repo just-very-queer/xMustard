@@ -4254,6 +4254,8 @@ PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operatio
 
 **Acceptance.** (1) `search(mode="text", lang="go")` returns chunk-text matches in Go files only, checked against an independent oracle: a term planted in a Go and a Rust function body, and a term planted in a Go and a Rust file path. (2) `search(mode="hybrid", lang="go")` narrows the hybrid's hits to Go files and invents none: every hit it returns is a hit of the unfiltered query. (3) The retrieval gate does not regress: `RET` is ≥21/21 and never below the merge base. (4) `CAPS` passes with both caps unchanged and `instructions` unchanged: no new argument is added, so §5.1 rule 9 is satisfied by construction. (5) `go-calls.txt` still holds `called search` and no new subcommand appears, so the manifest test is untouched. (6) Every `mode` value the tool advertises is one the route accepts, and an unknown `mode` is a 400 rather than the hybrid.
 
+**Design.** The `lang` filter is one SQL predicate added to the existing `CODE_SQL` (`AND (?5 = '' OR f.lang = ?5)`), not a post-filter in Go: filtering in SQL keeps the lane's `k` meaningful, so a filter that removes most rows widens the pool it draws from instead of truncating the answer. The empty-`lang` disjunct is required, because a bare `f.lang = ?5` with an absent `lang` matches no row and would silently empty the whole bm25 lane. The graph-side name and file lanes have no `files.lang` to read, so they go through the same `admit` closure `path_glob` uses, keyed on `Lang::for_path` — the same mapping the writer stored in `files.lang`. The body lane reuses the same `chunk_fts` table with a column-scoped FTS5 expression (`body:"term"`), which is why no new table and no index migration is needed. The text lane reuses the existing `TextHit` shape and the existing AND-then-OR fallback; it differs only in that it reads the `body` column, drops the docs lane, and drops the name and file candidates, so the fusion, paging, snippets and feedback boost are unchanged code paths.
+
 **Boundary.** 59c adds `mode=exact|regex` beside this one and 59d/59e/59f do not touch `search`; 59b therefore owns the `mode` dispatch and the `lang` semantics, and a later row reads them. G§5.3 is untouched: `impact path=` is neither replaced nor renamed here. No new argument, no new subcommand and no new `tools/list` property. Two existing `search` properties do change in `tools_list.json`: `mode`'s enum gains `text` and `lang`'s gains `maxLength`, and the full-profile byte caps in `tools_list_budget.json` are reduced by the saving, never raised.
 
 **Verified facts this section rests on** (`rg` on this branch's base `4dd9164`):
@@ -4758,7 +4760,6 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
   - **Open-mode records.** A cited record written in open mode is refused, since its author cannot be shown distinct from the approver. This goes beyond "distinct from the approver". For the same reason an open-mode record cannot name producer `human`.
   - **Named lineages are bound to a repository and base ref, not to a branch.** Ancestry keeps an unrelated head from outdating a lineage's findings. A descendant head recorded under an explicit `--lineage` can still outdate them, which is true on that line of history.
   - **Budget.** REV-06's figure is met by live heap (+0.06 MiB; +0.07 to +0.12 MiB after review round 1), not by RSS: the RSS growth of +0.60 MiB (+0.59 to +0.71 MiB after round 1) for three times the rows is above 0.5 MiB and is recorded, not asserted. The ledger note makes WS-67 assert it, with a tolerance, once the daemon serves review rows. A lineage page sorts and reads the JSON of every finding in the lineage, so its cost grows with the lineage: 51 to 62 ms for a page of 500 from a 5,000-finding lineage.
-
 ### WS-32a — Consolidation work queue: deterministic candidate preparation, watermarks and CAS leases
 **Implementation record (branch parity/ws-32a, 2026-10-04).** What follows is what was built and measured. The unpark, the review gate and all three rule-4 merges are done; the allocation line that stopped the first two merges is fixed by WS-FLK-09b and the row merges on the third. The parked-state paragraphs below are left as written and describe the tree as it stood at each park.
 
@@ -5063,3 +5064,161 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 - **Review** rounds 1-3 (`reviews/ws-rt6/r1..r3`): r1 2 majors fixed (symlink mode, directories), 4 minors fixed, 3 majors rejected with AGREE adjudications, 2 minors rejected; r2 2 majors fixed (deleted symlink mode, source-named directory), 1 minor fixed, 3 majors rejected with AGREE adjudications, 1 minor rejected; r3 2 minors fixed, 1 deferred (WS-RT6-r3-1). 28 mutations, all killed (`logs/ws-rt6-run-20261004T064826Z.log`, `-075811Z`, `-082334Z`).
 - **Checks.** Red `logs/ws-rt6-run-20261004T055051Z.log` (13/13), `-071825Z` and `-074310Z` (the review regressions, 2 each); BOXALL green at 9521248d, 77224b66 and 666f23b8 (`logs/ws-rt6-check-20261004T070744Z.log`, `-073410Z`, `-080405Z`; the first BOXALL at 9521248d, `-062715Z`, was red only on `refresh::the_directory_watch_count_follows_the_tree`, a pre-existing flake measured at the merge base by WS-HYG-01, 6/6 solo after, `logs/ws-rt6-run-20261004T064547Z.log`). Not run: RET, BUD, PI, CAPS, SECDOC, GOLD (no ranking, resident line, Pi, route, gate row, projection or tools/list change).
 - **Follow-ups.** WS-RT6-r3-1 (WS-RT7); Git index rewrites by user tools force a listing (WS-RT7's catalogue with an index-extension check, or WS-RT5's heavy listing).
+### WS-29b — Principal-derived scopes: private, dir, run and global
+
+**Goal.** A memory's scope is derived from the writing principal and the request, never
+from a payload field or entry metadata. This sub-task adds the derivation and the
+visibility rule that reads it, and nothing else: WS-29c adds grant-driven visibility and
+the applicability labels, WS-29d the routes, WS-29e the ops subcommands, WS-29f the
+scope-leak fixture suite.
+
+**Requirements.** PAR-SHARE-01
+
+**Files.** `api-go/internal/workspaceops/memory_scopes.go`,
+`api-go/internal/workspaceops/memory_propose.go`,
+`api-go/internal/workspaceops/memory_recall.go`,
+`api-go/internal/workspaceops/memory_scopes_test.go`
+
+**Tests required.**
+- The derivation is a table: every principal kind and run/session/dir input maps to one
+  scope, and an unknown combination is refused rather than defaulted
+- A request cannot choose its own scope: a `scope` field on the payload, in the entry
+  metadata or on a caller-supplied `ContextActor` is ignored, and the stored entry
+  carries the derived scope (the identity smuggling test)
+- `private` scope: served to its own author and to nobody else, whatever another
+  principal's roles are; an admin is not an exception
+- `run` and `session` scope: served only inside the matching run or session key, and
+  invisible to a later one
+- `dir` scope: served inside the directory prefix it was derived from and refused
+  outside it
+- An entry whose derivation is refused is not written at all (no partial row)
+
+**Acceptance.** Every stored entry's scope equals `DeriveScope(principal, request)`,
+which no caller-supplied field can influence, and `private` is invisible to every
+principal but the author. The scope-leak metric over this sub-task's fixture suite is
+0; the full suite is WS-29f.
+
+**Collision risk.** `memory_propose.go` and `memory_recall.go` are shared with WS-28C
+(the outline cache), WS-32 and WS-FIX-13.
+
+**PARKED (2026-10-03), unparked 2026-10-03 by owner decision.** Branch `parity/ws-29b`,
+head `97338ac`, three review rounds (run 4 of the cap for a code task), no merge. What works:
+the derivation and its refusals, the visibility rule on ranked recall, the by-id and listing
+read paths, ground's ranking filter, the standing-memory projection filter, and the keys on
+the HTTP transport, all green (`logs/ws-29b-run-20261003T092405Z.log`, BOXALL `remote_exit=0`
+clippy 6 `rss_lines=ok` at `logs/ws-29b-check-20261003T093301Z.log`). What was open, from
+round 3 (`reviews/ws-29b/r3`): **WS-29b-r3-1** `readAtRisk` lists every entry marked
+`needs_reverify` without the scope filter, so a private entry still reaches another
+principal's `at_risk_memories` with its id, title, paths and anchors; **WS-29b-r3-2** the
+HTTP `remember` decode populates `RememberRequest`'s own `run_id`/`session_id`, so
+`visibility=run` and `visibility=session` are refused over HTTP while the tests, which
+build the embedded fields directly, pass; **WS-29b-r3-3** a run or session key is
+caller-asserted, so a later run that supplies an earlier run's id reads that run's
+memory, which needs the key from verified execution context; **WS-29b-r3-4** the SQL
+predicate admits run, session and dir by key alone, without the author condition that
+recall applies on top. The owner decided r3-3 on 2026-10-03: it is a setup/configuration
+choice, so `trusted_run_key_principals` in settings names the principals that may assert
+a run key and the unset default trusts nobody. r3-3-5's precedence question (run over
+session over dir, and `visibility=workspace` discarding the keys) stays deferred to FU:
+it is a small product choice and this row's remaining budget went to the disclosure
+paths.
+
+**Implementation record (branch parity/ws-29b, 2026-10-04).**
+
+- `memory_scopes.go`: `visibleEntries` is the one list-side filter and `checkRunKeyTrust`
+  the one asserted-key check; `atRiskScanFactor` bounds the rows the at-risk page scans.
+- `govstore/ranking.go`: `scopeWhere` gained the author condition on the run, session and
+  dir branches, so the predicate is the whole rule rather than a pre-filter recall
+  strengthens.
+- `memory_invalidation.go`, `grounding_memory.go`: `readAtRisk` takes the caller and its
+  keys and filters before the page is built.
+- `memory_dedupe.go`, `memory_propose.go`: `reviewInput.author`; the review compares a
+  proposal only against its own author's entries of that scope, and `applySupersession`
+  refuses to retire an entry the proposer may not replace.
+- `memory_propose.go`, `run_control.go`: `ScopeRunID`/`ScopeSessionID`/`ScopeDir` are
+  distinct request fields from the provenance `RunID`/`SessionID`, and
+  `trusted_run_key_principals` is the operator setting.
+- `session_snapshot.go`, `grounding_session.go`: the pending view and the snapshot's
+  decision titles are scoped to the session's own principal.
+- Measured: see the ledger entry for WS-29b (2026-10-04) and `logs/ws-29b-*`.
+- Deviations: (1) the run-key check audits on refusal rather than refusing and ignoring
+  silently, so an operator can see the attempt; (2) `readAtRisk` scans
+  `maxAtRisk * atRiskScanFactor` rows before filtering, because the keys narrow which
+  entries are candidates and a query-level limit would report a truncated page of rows
+  that were never candidates.
+- Review rounds and the gate line: see `reviews/ws-29b/` and the ledger.
+- Follow-ups: the MCP recall surface still carries no scope key (WS-29b-r2-6, owed by
+  whoever owns `tools_list_budget.json`), and the derivation's precedence question
+  (r3-5) is in FU.
+
+**Mutation coverage (2026-10-04, owner unpark).** The 36 tests the r3/r4 audits inherited
+without a mutation row each have one now: 32 KILLED, 4 SURVIVED as equivalent mutants with
+a measured two-layer FAIL line (`reviews/ws-29b/r4/slop-audit.md` S5, runner
+`logs/ws-29b-rows-B.py`, run `logs/ws-29b-run-20261004T154924Z.log`). Measured on the box:
+CAPS PASS (no cap rise), BOXALL `remote_exit=0`, `clippy_warnings=6`, `rss_lines=ok`, 24 Go
+packages and 23 Rust binaries ok, 0 FAILED. One comment reworded for the gate's S2 rerun; no
+behaviour, assertion or bound changed. Gate `reviews/ws-29b/r4`:
+`gate=PASS changed=24 covered=24 channel_findings=8 triaged=9 reviewer=gpt-6-sol`, no fifth
+round opened.
+
+
+**PARKED (2026-10-04).** Round 4 is the fourth and last for a code task, and its gate is RED:
+`gate=FAIL changed=24 covered=24 channel_findings=8 triaged=9`, on 23 round-1 tests that have
+no mutation row. `reviews/ws-29b/r1/` and `r2/` have no `slop-audit.md` at all and `r3`'s S5 is
+a bare list, so the parked session's claim that its 23 rows live in r1/r2 S5 points at files that do
+not exist. Writing 23 FAIL lines to pass the gate is what §6 A4 forbids, so the gate stays red.
+
+- Works and is committed: the run-key trust check on BOTH read keys (run and session) without
+  disturbing session-seen suppression; the private-text withhold on a peer's verify response;
+  the approval-queue scope guard; the GLOB directory prefix; ground's delta filter; the
+  session-handoff text drop; the at-risk window that widens until it drains the store.
+- Round 4 findings: all eight channel findings triaged, six FIXED, two (r4-5, r4-9) corrected
+  more than once by the triage check, one (r4-8) rejected as verified-not-a-defect.
+- Open ids: none deferred to FU. Five triage checks ran; every objection they raised was upheld.
+- Next step: whoever continues this row writes the 23 missing mutation rows against the tests as
+  they stand, or the owner accepts the round-1 tests on `go test` and the fixture suite alone.
+  After that, re-run the gate and merge; BOXALL is green on this head
+  (`logs/ws-29b-check-20261004T060234Z.log`, remote_exit=0 clippy=6 rss_lines=ok) and re-runs
+  green on the final head.
+### WS-59d — `impact op=refs|definition|implementations`, symbol-level occurrences
+
+**Goal.** Close PAR-IMP-03, which 59a assigned here whole: `impact symbol=<name> op=refs` lists every reference to the symbol, `op=definition` where it is defined, `op=implementations` the types that implement or extend it. Each occurrence carries the containing symbol's name path, kind and line, a ±1-line snippet, and the edge's own provenance and confidence. `op=` is a new argument on the blast form, not a new form: it selects what the blast `symbol=` names are read for and never changes which argument picks the form (59a's ruling, inherited and not re-decided).
+
+Three operations map onto one disk-backed read. `refs` is the reference table's rows for the name; the index records a row only for a *use*, so a declaration is already absent and no span filter is needed. `definition` is the symbols that declare the name, so `definition Store` is `Store` and not `Store.Put`. `implementations` is the `refs` rows of kind EXTENDS or IMPLEMENTS.
+
+Each occurrence is a row, not a graph node: the ±1-line snippet comes from the referencing file at the reference's own line, not the node's declaration line. A row is `name_match` when its language has a scope resolver and `lexical` otherwise, and never `resolved` (deviation 1). A file-scope reference is reported as `kind: "File"`.
+
+**Requirements.** PAR-IMP-03 only. Its target surface is `impact(symbol|uid, op='refs'|'definition'|'implementations', limit?, cursor?, max_chars?)` (`docs/research/PARITY_REQUIREMENTS_2026-09-25.md:162`). PAR-IMP-04, PAR-IMP-05 and PAR-CTX-05 stay with their own rows.
+
+**Files.** `api-go/internal/workspaceops/impact_flags.go` (`op` in the blast table, its check, the form constant), `symbolgraph.go` (`SymbolOccurrencesCtx`), `api-go/cmd/xmustard-api/tool_routes.go` (the `op=` dispatch), `api-go/internal/mcpserver/tool_impact.go` (the Advanced `op` argument, the query list, the docs paragraph and the output members), `api-go/internal/toolbudget/ladders.go`, `rust-core/src/index/occurrences.rs`, `index/mod.rs`, `bin/xmustard-core.rs` (the dispatch arm and usage line), `rust-core/go-calls.txt`, `rust-core/tests/occurrences.rs` and this plan file.
+
+**Tests required.** Rust, over a real built index on a disposable Go repository and a Rust one: each operation returns the occurrences it names; the containing symbol's name path, kind and line are the referencing symbol's; a reference inside the target's own span is absent from `refs`; a file-scope reference is `kind: "File"`; the snippet is numbered, masked and bounded; `implementations` keeps only the type relations; an unknown name is an empty list; tied rows page without repeating or skipping; a page holds one file's text at a time; and no row is ever `resolved`. Go: `ImpactFlags` refuses `op` outside the blast form, refuses an unknown value, and every operation refuses a tier-walk argument and a cursor beside an offset. Every new test gets one mutation row.
+
+**Acceptance.** (1) `op=refs|definition|implementations` answers one occurrence list whose rows carry `name`, `kind`, `path`, `line`, `snippet`, `provenance` and `confidence`; a snippet is absent only when the file cannot be read, and then the answer says why. (2) `op` is Advanced: documented at `xmustard://docs/tools`, absent from the lean schema, no lean cap rising. (3) The page is `limit`/`cursor`, not `offset`; an invalid cursor is refused and the last page carries no cursor. (4) Degradation is staged: snippets, then per-file counts, then a total, each rung reporting what it kept of how many. (5) A row is `name_match` or `lexical`, never `resolved`, and `completeness` is `exact` only for a list of bound edges. (6) `op=` is refused with any other form and with an unknown value, by the same `ErrInvalidInput` shape. (7) The read adds no in-heap structure proportional to the repository: rows come in pages, a page holds one file's text at a time, and `BUD` is owed. (8) The self-audit names its logs and S5 has one mutation row per new test.
+
+**Boundary this row inherits and does not re-decide.** `impact path=` is not replaced, renamed or absorbed (G§5.3), so `op=` never applies to the file form. `limit`/`offset` page the blast tiers and `limit`/`cursor` the occurrences; a request carrying both is refused rather than silently paging one of them. The mutation caller is the Go side, so `go-calls.txt` gains its `called symbolgraph occurrences` line and `xmustard-core.rs` its dispatch arm (§4 step 5).
+
+**Collision risk.** `tool_impact.go` and `impact_flags.go` (59e and 52a/52b/52c touch impact's paging), and the plan file.
+
+### WS-59d implementation record (branch parity/ws-59d, 2026-10-04)
+
+- **Built.** `occurrences.rs` (three operations over one SQL projection, a page read at the cursor's offset with `LIMIT limit+1`, a unique-key order and a per-file snippet cache) with its module, dispatch and `go-calls.txt` entries; `impact_occurrences.go` (one helper refusing the cursor/offset pair and the walk arguments, `ReconcileOccurrencePaging`); `impact_flags.go`, `cursor.go`; the `op=` dispatch in `tool_routes.go`; `tool_impact.go`, `tools.ts`, `ladders.go` and the two cap files.
+- **Measured** (box, Linux). `BOXALL` on 342dacdb: `remote_exit=0`, 24 Go packages, 22 Rust binaries, 0 failures, clippy 6 (the base count), `rss_lines=ok`. `occurrences` 15 passed 0 failed (`-054253Z`). `CAPS` PASS (`-050554Z`): each full cap rose by exactly the 250 bytes the two Advanced arguments cost and equals its own re-measurement, every lean cap unchanged. `cargo fmt --check` clean; `gofmt -l` silent (local).
+- **Deviations.** (1) **No occurrence is a resolved edge: a row in a language the resolver owns is `name_match`, not `resolved`** (`adjudication-WS-59d-r4-3`, AGREE against an earlier rejection). The reference table has no binding from a reference to the declaration it uses, so a same-language name match carries the matcher's confidence, counts as its own `name_match_occurrences` lower-bound cause, and makes `graph` report `lexical`; only a bound edge is `resolved`. A uid, a name path and a name therefore return every namesake's use (`-030854Z`), and closing that needs a reference-row binding: WS-52. (2) `has_more`/`next_cursor` stay in the lean schema (WS-59e's call). (3) `total` is what the page can know.
+- **Deviations, continued.** (4) **Three defects a predecessor session left open were found by running this row's own tests:** a cursor carrying no `op=` was refused (`-044308Z`); the full-profile golden predated `op=` (`-044742Z`); and `TestReconcileOccurrencePaging` unmarshalled into a map it had already filled (`-044330Z`). (5) **A page's snippet cache retained every file it touched** (`Texts` is an unbounded map, a file up to 8 MiB, a page up to `impact::MAX_LIMIT` rows), the shape §5.1 rule 8 forbids; a file's text is now dropped as soon as its last row is converted and the answer reports `peak_files_held`. (6) The page order gained the row's unique key (`s.id`, or `(file_id, start_byte)`), because two uses on one line tie on every other column; **M14 survived, so this is insurance against a plan change rather than an observed repeat.** (7) The earlier claim that the golden's sha256 was identical either side was **wrong**; (4) corrects it.
+- **Merge recheck.** `reviews/ws-59d/r4/merge-recheck.md`; rounds and findings, `reviews/ws-59d/` and the lane A ledger.
+- **Checks.** `BOXALL` on 342dacdb, `CAPS`, `GOLD` (the golden moved +10/-1 for `op`). **Not run: `BUD` — OWED, not taken**; the read is resident-affecting and no budget line was measured, the same unmet prerequisite as WS-38b/38c. `RET`, `PI`, `SECDOC` not named by 3.0.
+- **Follow-ups.** The reference-row binding (WS-52). A new impact enum must be added to `nextValue` or its parameter is silently unproven. `go build -tags review` does not compile on darwin, so the review anchor step is skipped (lane B's `memory_outline_stat_unix.go`).
+
+- **Round 5 closed what five rounds of review left open.** The round-5 triage check returned DISAGREE and was right on three counts, and fixing them is this record's second half. (8) **The gate reads only the round it is given.** `xm-review-gate.py` extracts every test name from the current round's S5 block and demands a mutation row naming it, so a round inheriting five rounds of tests sees none of their rows; r5's audit now carries all 31, each pointing at the log that saved its FAIL line. (9) **A signed cursor was not bound to what the core can emit**: `signOccurrencePage` trusted the core's `next_cursor` offset, so an offset at or past the core's `MAX_OCCURRENCES` became a cursor the next request's flag parser refuses (ocr-review:2; fixed in 20225e13, `maxOccurrenceOffset`). (10) **`truncated` was set by reaching the ceiling**, even on a complete list, adding a cause and reporting `lower_bound` over a whole list (ocr-review:3; the RED log shows `coverage.truncated false` beside `epistemic.causes.truncated 1`; fixed in 20225e13). (11) **PAR-IMP-03's containing-symbol line was missing from every row** — the query selected it and the conversion discarded it; raised twice (r4-5, r5-3) and deferred, and the triage check's objection to that deferral was right, so the row now carries `symbol_line` (e2b519e9).
+- **Deviation, continued.** (12) **Two mutations survive and are recorded rather than hidden.** M14 (the page order's unique key) passes when dropped: SQLite walks the tied rows in B-tree order on this build, so it is insurance against a plan change, not a fix for an observed bug. M29b (`read`'s own `OPERATIONS` guard) also passes when removed, because the flag parser is the guard the CLI exercises and no test calls the library entry point with a bad `op`; the guard is a deliberate fail-closed redundancy and is currently unwitnessed. (13) **ocr-review:1 was reviewed and rejected on the code**: the counts rung renders the list under `leaf + "_by_" + GroupBy` (`toolbudget/apply.go:360`), so a response cannot carry both `occurrences` and `occurrences_by_path` and the state the finding describes does not exist.
+- **PARKED, second time (2026-10-04 11:07Z, box outage).** Last sha `8de9ba91`, which is the §1.7 rule-4 re-merge of `feat/parity-v2` (`854ad51e`, 22 files, three of them this row's own: the plan file, `index/mod.rs`, `bin/xmustard-core.rs`). The merge was ort with zero conflicts, the row's own code is byte-identical across it (`git diff --name-only 1baa80d6 8de9ba91 -- occurrences.rs tests/occurrences.rs impact_occurrences.go impact_flags.go cursor.go tool_impact.go` is empty) and its `occurrences` wiring survives in all three overlapping files, but **rule 4's conditional re-gate is OWED because the tip moved files outside the row**, and nothing was gated. `gate=PASS` is still held on `a69089b4` only, and four commits plus the merge sit above it. Plan-file integrity checked by script, the way lane B and lane D each had to: ours 126 headings, theirs 126, union 128, merged 128 unique, nothing missing, nothing invented, no duplicate, zero conflict markers; the two extra headings are this section and its implementation record, both the row's own. Open: (a) M35, the `symbol_line` mutation; (b) `BOXALL` on `8de9ba91`; (c) the gate re-run on that head; (d) the merge. The box went down again at 10:56Z, 14 minutes after it answered the smoke test (`logs/ws-59d-run-20261004T105619Z.log` helper_exit=90, `logs/integration-probe-20261004T105634Z.log`, `-105719Z`, `-110746Z` box=down), so §1.7 rule 5's ten-minute wait and its one retry were both spent for nothing.
+- **Checks.** No gate result is claimed on any head above `a69089b4`: **not run — the box is down.** Everything cited earlier in this record comes from the saved logs named beside it.
+- **Follow-ups.** A direct `read` test for the second `op` guard (FU, proposed owner WS-52a). The reference-row binding (WS-52). `go build -tags review` does not compile on darwin, so the review anchor step is skipped (lane B's `memory_outline_stat_unix.go`).
+
+- **Round 6 (2026-10-04).** (14) **`symbol_line` was the reference's own line.** e2b519e9 changed the tenth projected column from `s.start_line` to `r.line`, so the member this row added equalled `line` on every row; the file's own two doc comments and the `definition` arm of the same `statement()` still said `s.start_line`. **M35 survived — the mutation passed — and the correct response was to run the unmutated head, which FAILED** (`no row had a container above the reference`), and failed again after `cargo clean -p xmustard-core` so no stale box artifact explains it. The commit under review was the defect; the GREEN log cited for its test was a debug-profile run against a tree predating the commit (edc88d8f, `-133550Z`, `-133832Z`, `-134002Z`). (15) **A renamed or dropped occurrence list kept a cursor for rows it never sent**: the reconciler recognised a page only by the `occurrences` member and returned before clearing `next_cursor`, while the counts rung RENAMES that member and the total rung DROPS it; the counts case in the existing test used `"occurrences":[]` beside `occurrences_by_path`, a shape no rung produces (codex-spec:1, codex-review:1; 00835d56, `-144235Z`, `-145823Z`). (16) **The reconciler signed its own offset without the ceiling check** it enforces on the core's cursor, so offset 4999 with two rows kept signed 5001 (codex-spec:5; same commit, `-150947Z`). (17) **Pagination was reported as truncation**: `truncated` was `more || ceiling`, so every nonfinal page claimed a loss it could still page past; it now reports `page_bound`, and `truncated` is left to the bounded read (codex-spec:4, codex-review:2; 78eb1eeb, `-152257Z`, `-154145Z`). (18) **`total` on a paged read is a lower bound** (`end + 1`), which reads as 51 for a 5,000-row name; counting the rest is the one thing this path exists not to do, so the envelope carries the claim as `page_bound` (codex-spec:2; same commit).
+- **Measured** (box, Linux, release profile). `BOXALL` on `78eb1eeb`: `remote_exit=0`, 24 Go packages, 24 Rust binaries, 0 failures, clippy 6 (the base count), `rss_lines=ok` (`logs/ws-59d-check-20261004T151028Z.log`; the same on `edc88d8f` at `-135453Z`). `occurrences` 20/20 (`-153616Z`). `CAPS` PASS (`-140536Z`). **`BUD` run, which the earlier rounds owed and did not take**: peak 87.3 MiB against the 95.4 line on `v1-workload` and 65.1 MiB on `agents-2-relay`, baseline measured on the same machine at the merge base 83.6/71.6 MiB (`-142507Z` against `-141937Z`); the +3.7 MiB is run-to-run variation in `rust_core_per_call`, which a one-line column change cannot cause, and `ledger_check=BELOW_RESOLUTION` on a CI suite rather than the parity scale.
+- **Review round 6.** `reviews/ws-59d/r6`, `gate=PASS changed=21 covered=21 channel_findings=10 triaged=8 reviewer=gpt-6-sol`. Channels: ocr_preview 0, ocr_rules 0, **ocr_review 1** (aborted: `background content is 12037 characters, exceeding the hard limit of 8000`, so the delegate contract was performed by hand per §4.6 B3 and `ocr-delegate.findings.json` carries one verbatim quote per changed file), codex_review 0, codex_spec 0 (7 findings: 2 high, 3 medium, 2 low), opencode unavailable, anchor skipped (`go build -tags review` does not compile on darwin). Three majors, all fixed (15, 16 and 17/18 at 78eb1eeb); the triage check DISAGREE'd on r6-2 being deferred while `codex-spec` rated it high and on r6-4 being stale, and both objections were right.
+- **Deviations, continued.** (19) **Four minors are deferred to FU, each with a proposed owner**: the `refs` allowlist excludes IMPORT/EXPORT (WS-59e, it widens the goldens); the past-ceiling test cannot reach the ceiling with a small fixture (WS-59e); the module header says `resolved` where `rows` says `name_match` (owner — it is a contract question about the whole index); an explicitly empty cursor (owner — a test deliberately asserts the opposite). (20) **`ocr review` hit the 8,000-character background limit**, the second OCR channel on this goal to do so; the runner's own background is what grew and trimming it is owner tooling.
+- **Checks.** `BOXALL` on `edc88d8f` and on `78eb1eeb`; `CAPS`; `BUD` against a baseline measured on the same machine. **Not run: `GOLD`** — the goldens did not move in this round (`git diff` over both json fixtures and the hook testdata is empty outside the pre-reviewed row diff), so the projection the GOLD gate owns is unchanged by rounds 6's four commits. `RET`, `PI`, `SECDOC` not named by 3.0; no index format, Pi source, route or gate row changed in this round.
+

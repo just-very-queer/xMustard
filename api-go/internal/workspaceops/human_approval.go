@@ -239,6 +239,10 @@ const (
 	skipOwn       = "own"
 	skipVoted     = "voted"
 	skipSameOwner = "same_owner"
+	// skipNotVisible is a scope refusal, not an approval rule: the entry exists and this
+	// approver could vote on it, but its scope names it as someone else's content
+	// (WS-29b round 4, r4-6).
+	skipNotVisible = "not_visible"
 )
 
 // queueCandidate is one pending revision of an entry; rv and votes are filled once it
@@ -260,7 +264,7 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 	limit, baselines = positiveOr(limit, 50), positiveOr(baselines, 10)
 	ctx := context.Background()
 	q := &ApprovalQueue{WorkspaceID: workspaceID, Approver: h.Principal.ID, Items: []ApprovalItem{},
-		Skipped: map[string]int{skipOwn: 0, skipVoted: 0, skipSameOwner: 0}, IndexBaselines: []IndexBaselineRecord{}}
+		Skipped: map[string]int{skipOwn: 0, skipVoted: 0, skipSameOwner: 0, skipNotVisible: 0}, IndexBaselines: []IndexBaselineRecord{}}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var eligible []queueCandidate
 		f := govstore.EntryFilter{WorkspaceID: workspaceID, Limit: storeListPage}
@@ -323,6 +327,15 @@ func pendingRevisions(e govstore.Entry) []queueCandidate {
 // why not.
 func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir string, h HumanApprover, c *queueCandidate) (bool, error) {
 	e, me := c.entry, h.Principal.ID
+	// An approver is deliberately a principal OTHER than the author, so the scope rule
+	// is the only thing that keeps a private proposal's content out of its queue: an id
+	// in the listing is a disclosure, and so is the rendered body (round 4, r4-6). The
+	// check runs before the revision and its votes are read, so nothing about an entry
+	// this approver may not see is even loaded.
+	if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, me, ScopeRequest{}) {
+		q.Skipped[skipNotVisible]++
+		return false, nil
+	}
 	rv, err := r.GetRevision(ctx, e.ID, c.revision)
 	if err != nil {
 		return false, err

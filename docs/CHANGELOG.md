@@ -10,6 +10,13 @@ Merged into `feat/parity-v2` after v0.1.1 and not yet released. Branches still u
 review are listed in [Status](STATUS.md#in-progress).
 
 ### Added
+- Memory scopes (WS-29b, PAR-SHARE-01). A memory's scope is derived from the writing
+  principal and the request, never from a payload field or entry metadata: `private` is
+  served to its author and nobody else whatever roles the reader holds, `dir` inside the
+  directory it was derived from, and `run` or `session` inside that key. Every listing
+  surface is filtered by the same rule, not only ranked recall. Which principals may
+  assert a run or session key is the operator setting `trusted_run_key_principals`
+  (unset trusts nobody; an unlisted principal is refused and audited).
 - Impact v2 (WS-35). `impact(symbol=)` takes a name, `Container.name`, a UID or a path
   and groups dependents by depth (1 will break, 2 likely affected, 3+ may need
   testing) with a risk level from a rule table and a completeness envelope (`exact`, or
