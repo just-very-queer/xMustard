@@ -498,10 +498,16 @@ pub fn flows_of(
         // The cap is checked BEFORE the dedup lookup so the retained set cannot exceed it even
         // for a set that would have been folded into an existing flow: the walk's vector is
         // already allocated by then, and the point of the cap is what stays resident.
+        //
+        // The walk is SKIPPED and counted, not `break`-ed out of. A break would leave
+        // `dropped_retained` holding only the first walk that tripped the cap while every
+        // later seed was dropped uncounted, so the counter would read as one drop under a
+        // name that counts them. Continuing keeps the walk's steps out of `keyed` — which is
+        // what bounds the retained set — and reports every step the cap excluded. It costs
+        // the same walking the uncapped code already did and retains nothing.
         if retained + walk.visited.len() as u64 > limits.max_retained_steps {
-            truncation.dropped_retained = walk.visited.len() as u64;
-            retained = limits.max_retained_steps;
-            break;
+            truncation.dropped_retained += walk.visited.len() as u64;
+            continue;
         }
         retained += walk.visited.len() as u64;
         let key: Vec<u32> = {

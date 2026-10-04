@@ -2074,31 +2074,54 @@ fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
 /// path set and the envelope loses the caller's file while every other assertion here still
 /// holds — the seeds, the scores and the flows are unchanged by the edit, because the edit
 /// adds an unrelated symbol. That is what makes this test about the ENVELOPE and not about
-/// the answer: the only thing that can see the difference is `freshness.stale`.
+/// the answer: the only thing that can see the difference is the dirty-path list.
 ///
 /// So the caller must be a SCORED candidate that was dropped, or it is already in the answer
-/// for another reason. `--limit=1` keeps one seed, and `Caller` is outranked by `Target`:
-/// `Target` has two callees and no callers (score 2.0), `Caller` has one (score 1.0).
+/// for another reason. Two things make it one, and both are measured rather than assumed
+/// (`logs/ws-38c-b-run-20261004T151959Z.log`):
+///
+/// 1. **It must IMPORT the package it calls.** A symbol is scored only when it has at least
+///    one RESOLVED callee, and a cross-package call does not resolve without an import. The
+///    earlier draft of this fixture built the caller with [`gofuncs_ref`], which emits
+///    `package pkg` and no import, so `caller/entry.go`'s edge to `pkg/target.go` never bound:
+///    the answer reported `candidates: 1`, `Caller` was never scored, its file never entered
+///    `candidate_paths`, and the test failed on correct code. The defect was the fixture's.
+/// 2. **`--limit=1` must actually drop it.** `Target` has three resolved callees and one
+///    caller (ratio 1.5, exported, score 3.0); `Caller` has one callee and no callers (ratio
+///    1.0, exported, score 2.0). The cap therefore keeps `Target`, and `dropped_candidates`
+///    is 1.
 #[test]
 fn an_unselected_callers_file_marks_the_answer_stale() {
     let d = repo(&[
         GO_MOD,
+        // The import is the load-bearing line: without it `pkg.Target()` does not resolve and
+        // `Caller` is not a candidate at all.
         (
             "caller/entry.go",
-            &gofuncs_ref(&[go_func("Caller", &["Target"])]),
+            "package caller\n\nimport \"example/pkg\"\n\nfunc Caller() { pkg.Target() }\n",
         ),
         (
             "pkg/target.go",
             &gofuncs_ref(&[
-                go_func("Target", &["TargetLeafA", "TargetLeafB"]),
-                go_func("TargetLeafA", &[]),
-                go_func("TargetLeafB", &[]),
+                go_func("Target", &["T1", "T2", "T3"]),
+                go_func("T1", &[]),
+                go_func("T2", &[]),
+                go_func("T3", &[]),
             ]),
         ),
     ]);
     build(d.path());
-    // One seed only. `Target` scores 2.0 and `Caller` 1.0, so the cap keeps `Target` and
-    // drops `Caller` — asserted, because if both were seeds the test would prove nothing.
+    // Both are scored before the cap, which is the premise the whole test rests on: if
+    // `Caller` were not a candidate its file would never be in `candidate_paths` and the
+    // envelope assertion below would prove nothing.
+    let all = flows(d.path(), &[]);
+    assert_eq!(
+        all["candidates"].as_u64(),
+        Some(2),
+        "both Target and Caller are scored candidates: {all:#}"
+    );
+    // One seed only: the cap keeps the higher-scoring candidate and drops the caller —
+    // asserted, because if both were seeds the test would prove nothing.
     let seeded = flows(d.path(), &["--limit=1"]);
     let names: Vec<String> = read_seeds(&seeded).into_iter().map(|s| s.name).collect();
     assert_eq!(
@@ -2106,27 +2129,38 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
         vec!["Target".to_string()],
         "the cap keeps the higher-scoring candidate and drops the caller: {seeded:#}"
     );
-    let before = flows(d.path(), &[]);
     assert_eq!(
-        before["freshness"]["stale"].as_bool(),
-        Some(false),
+        truncation(&seeded).get("dropped_candidates").copied(),
+        Some(1),
+        "the caller really is the dropped candidate: {seeded:#}"
+    );
+    let before = flows(d.path(), &[]);
+    // The envelope has no `stale` boolean: staleness is `freshness.status`, and a result that
+    // says `"status": "current"` is the honest reading of a freshly built answer. Asserting a
+    // field that does not exist would compare `None` against `Some(false)` and fail on a
+    // correct answer, so the status string is the field under test.
+    assert_eq!(
+        before["freshness"]["status"].as_str(),
+        Some("current"),
         "a freshly built answer is current: {before:#}"
     );
     // Edit the CALLER's file only: `Target` itself is untouched, and the added symbol has no
-    // edge at all, so nothing about any score changes — only which files shaped them.
+    // edge at all, so nothing about any score changes — only which files shaped them. The
+    // import stays, so the caller keeps its one resolved callee and its score.
     write(
         d.path(),
         "caller/entry.go",
-        &gofuncs_ref(&[
-            go_func("Caller", &["Target"]),
-            go_func("CallerUnrelated", &[]),
-        ]),
+        "package caller\n\nimport \"example/pkg\"\n\nfunc Caller() { pkg.Target() }\nfunc CallerUnrelated() {}\n",
     );
     let after = flows(d.path(), &[]);
+    // The envelope reports a dirty result PATH, not a boolean: `status` describes the indexed
+    // commit's relation to HEAD and stays `current` for an uncommitted edit, so the envelope
+    // names the caller's file instead. That list is the field r4-4 widens, and naming the
+    // caller here is what a mutation on `candidate_paths` removes.
     assert_eq!(
-        after["freshness"]["stale"].as_bool(),
-        Some(true),
-        "an edit to the file that contributed the caller edge must mark the answer stale: {after:#}"
+        after["freshness"]["status"].as_str(),
+        Some("current"),
+        "an uncommitted edit does not move the indexed commit, so status stays current: {after:#}"
     );
     let dirty = after["freshness"]["dirty_paths_touching_result"]
         .as_array()
@@ -2155,58 +2189,69 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
 /// The SEED's community joins the flow's community count.
 ///
 /// WS-38c did not count the seed, on the reading that no fixture isolated the case, and
-/// recorded the finding for the row that could. This is that row, and the fixture that
-/// finally isolates it is the CROSS one above: `alpha` holds a ring and `beta` holds a ring,
-/// joined by a single call from `AlphaOne` into `BetaOne`. `AlphaOne` is therefore a seed
-/// whose own community is `alpha` while every step its walk reaches is in `beta` — the seed
-/// is the ONLY step-shaped thing on the other side of that boundary.
+/// recorded the finding for the row that could. This is that row.
 ///
-/// So the assertion is the one the seed's area makes true and the steps' areas cannot: the
-/// flow seeded at `AlphaOne` spans two communities while every one of its LISTED steps is a
-/// `beta` symbol. Remove the seed from the count and that flow drops to one community and
-/// reads `intra`; keep it and the flow reads `cross`. The step list is asserted too, so the
-/// test cannot pass by the seed's community arriving through a step.
+/// The fixture is three packages: `alpha` holds a ring that calls into `beta`, `beta` holds a
+/// ring of its own, and `gamma` holds a two-symbol chain whose head `GammaOne` calls straight
+/// into the `beta` ring. `gamma/gamma.go` is its own area, so `GammaOne` and `GammaTwo` are
+/// `gamma` while every symbol its walk reaches is `beta` — the seed's community is the ONLY
+/// thing on the far side of that boundary.
+///
+/// The fixture is the shape MEASURED on the box rather than one designed by reading the
+/// propagation: three candidates were built against the real binary (`probe-r3-5.sh`) and this
+/// is the one whose `GammaOne` flow reports two communities with every step in one file
+/// (`logs/ws-38c-b-run-20261004T145145Z.log`, candidate C). The earlier draft of this test
+/// reused the CROSS fixture, where the seed's walk also reaches steps in the seed's own
+/// community, so the count was one whatever the seed contributed and the test failed on
+/// correct code — the defect was the fixture's, not the classifier's.
+///
+/// So the assertions are the ones the seed's area makes true and the steps' areas cannot: the
+/// flow seeded at `GammaOne` spans two communities while every one of its steps is a `beta`
+/// symbol, and it reads `cross`. Remove the seed from the count and that flow drops to one
+/// community and reads `intra`; keep it and it reads `cross`. The step list is asserted first,
+/// so the test cannot pass by the seed's community arriving through a step.
 #[test]
 fn the_seeds_own_community_counts_toward_the_class() {
     let d = repo(&[
         GO_MOD,
         (
             "alpha/alpha.go",
-            "package alpha\n\nimport \"example/beta\"\n\nfunc AlphaOne() { AlphaTwo(); AlphaThree(); beta.BetaOne() }\nfunc AlphaTwo() { AlphaFour() }\nfunc AlphaThree() { AlphaFour() }\nfunc AlphaFour() {}\n",
+            "package alpha\n\nimport \"example/beta\"\n\nfunc AlphaOne() { AlphaTwo(); AlphaThree(); beta.BetaOne() }\nfunc AlphaTwo() { AlphaThree() }\nfunc AlphaThree() { AlphaOne() }\n",
         ),
         (
             "beta/beta.go",
             "package beta\n\nfunc BetaOne() { BetaTwo() }\nfunc BetaTwo() { BetaThree() }\nfunc BetaThree() { BetaOne() }\n",
+        ),
+        (
+            "gamma/gamma.go",
+            "package gamma\n\nimport \"example/beta\"\n\nfunc GammaOne() { beta.BetaTwo(); beta.BetaThree() }\nfunc GammaTwo() { GammaOne() }\nfunc GammaThree() { GammaTwo() }\n",
         ),
     ]);
     build(d.path());
     let v = flows(d.path(), &[]);
     let seeds = read_seeds(&v);
     assert_eq!(
-        seeds
-            .iter()
-            .find(|s| s.name == "AlphaOne")
-            .map(|s| s.callees),
-        Some(3),
-        "AlphaOne's three calls resolve, one across the package boundary: {v:#}"
+        seeds.iter().find(|s| s.name == "GammaOne").map(|s| s.callees),
+        Some(2),
+        "GammaOne's two calls into the beta package resolve: {v:#}"
     );
     let fs = read_flows(&v);
     let flow = fs
         .iter()
-        .find(|f| f.seeds.iter().any(|s| s == "AlphaOne"))
-        .unwrap_or_else(|| panic!("the flow seeded at AlphaOne in {fs:?} in {v:#}"));
-    // The seed is `alpha`. If every step it reaches were also `alpha`, the flow would be one
-    // community whatever the seed contributed, and this test would prove nothing. Asserted
-    // first: the seed must be the only thing on its side of the boundary.
+        .find(|f| f.seeds == vec!["GammaOne".to_string()])
+        .unwrap_or_else(|| panic!("the flow seeded at GammaOne alone in {fs:?} in {v:#}"));
+    // Every step it reaches is in ONE file, so the communities the STEPS alone can span are
+    // exactly one. Asserted first: without it the count below could be satisfied by a step.
     assert!(
-        flow.steps.len() >= 3,
-        "AlphaOne's walk reaches three or more steps: {flow:?}"
+        flow.steps.len() >= 2,
+        "GammaOne's walk reaches the beta ring, so the flow is not empty: {flow:?}"
     );
     assert!(
         flow.steps
             .iter()
-            .any(|(_, p)| p.starts_with("beta/beta.go")),
-        "the walk reaches the other community, so the two areas are genuinely apart: {flow:?}"
+            .all(|(_, p)| p == "beta/beta.go"),
+        "every step GammaOne reaches is a beta symbol, so the seed's own community is the \
+         only second one: {flow:?}"
     );
     assert_eq!(
         flow.communities, 2,

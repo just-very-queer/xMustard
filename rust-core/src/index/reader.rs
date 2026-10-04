@@ -316,22 +316,34 @@ impl Snapshot {
     pub fn exported_by_symbol(&self) -> Result<&[bool], String> {
         self.exported
             .get_or_init(|| {
-                self.with_text(|conn| {
+                // `with_text` takes a closure over `rusqlite::Result`, so the refusal below
+                // cannot be a `String` error of its own without every statement in the closure
+                // losing its `?`. It is carried as a NESTED `Result` instead: the closure's
+                // `R` is `Result<Vec<bool>, String>`, so `with_text` reports a real SQLite
+                // failure through its own `index store: {e}` prefix, while a generation
+                // mismatch arrives here as the operator-facing message, unhijacked by a
+                // variant name that describes a SQLite condition this is not.
+                // The outer `Result` is this function's own error type already (that is what
+                // `with_text` returns), so the SQLite layer is what is flattened here, and
+                // only it.
+                self.with_text(|conn: &rusqlite::Connection| {
                     // A deferred read transaction pins the store view the check and the
                     // query share. `query_row` on `meta` is the first statement, so the
                     // snapshot is taken there; a concurrent build cannot move it afterwards.
-                    conn.execute_batch("BEGIN DEFERRED").map_err(sql)?;
+                    conn.execute_batch("BEGIN DEFERRED")?;
                     let read_generation: String = conn
                         .query_row("SELECT value FROM meta WHERE key = 'generation'", [], |r| {
                             r.get(0)
-                        })
-                        .map_err(sql)?;
+                        })?;
                     if read_generation != self.generation.to_string() {
-                        conn.execute_batch("ROLLBACK").map_err(sql)?;
-                        return Err(format!(
+                        // Roll the read transaction back before refusing: leaving it open on a
+                        // shared text connection would pin the store view for the next reader
+                        // of this snapshot, and the refusal is an answer, not a retry.
+                        let _ = conn.execute_batch("ROLLBACK");
+                        return Ok(Err(format!(
                             "store generation {read_generation} does not match the snapshot's {}",
                             self.generation
-                        ));
+                        )));
                     }
                     // The segment holds a SUBSET of the store's symbols — a file the
                     // retention envelope skipped has no segment row — so a symbol's
@@ -366,9 +378,10 @@ impl Snapshot {
                     // commit while a statement is still stepping.
                     drop(rows);
                     drop(st);
-                    conn.execute_batch("COMMIT").map_err(sql)?;
-                    Ok(out)
+                    conn.execute_batch("COMMIT")?;
+                    Ok(Ok(out))
                 })
+                .and_then(|inner| inner)
             })
             .as_deref()
             .map_err(Clone::clone)
