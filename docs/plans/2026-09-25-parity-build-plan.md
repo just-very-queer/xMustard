@@ -3283,6 +3283,48 @@ opened.
   them on a fresh branch off `feat/parity-v2` rather than reopening this one — it has spent its
   four rounds, and the defects it carries are in code that is otherwise green.
 
+### WS-38c-b — `flows.rs` follow-on: the six open findings of WS-38c, decided
+
+**Goal.** WS-38c parked at its round cap with six open findings. Goal §3.5j decides all six, and
+this row carries each decision out. The branch is cut from `parity/ws-38c`, not from
+`feat/parity-v2`, so every commit WS-38c made comes forward and no closed work is repeated. Round
+numbers are fresh (r1..r4); WS-38c's rounds are not reopened.
+
+**Requirements.** PAR-SYM-09 (the flow projection's completeness and its snapshot contract) and
+PAR-SYM-08 (the community layer the classification reads). No new PAR row.
+
+**Files.** `rust-core/src/index/flows.rs`, `rust-core/src/index/reader.rs` (the exported-flags
+read, decision r4-3), `rust-core/src/index/mod.rs` (only the freshness input, decision r4-4, and
+`USAGE` if a cap is published), `rust-core/tests/flows.rs`, `rust-core/tests/flows_race.rs` (new,
+decision r4-3's regression), this plan file.
+
+**Tests required.**
+
+- **r4-2 (retained flow data is bounded by the caps, not by seeds x per-walk).** One global cap on
+  the retained steps and flows across ALL seeds, reusing the existing caps' constants — none is
+  raised. When the cap bites, the answer carries a truncated flag and the count that hit it. A box
+  test at the described worst shape (many seeds x long walks) asserts peak RSS against the same
+  literal MiB line the rest of the flows path meets, measured and not inferred.
+- **r4-3 (the exported flags cannot come from a newer generation than the segment).** The flags are
+  read through the same snapshot, connection and generation as the segment read, in one read
+  transaction, so a build committing between the two reads cannot mix generations. A regression test
+  drives a build against the read.
+- **r4-4 (freshness covers the files contributing resolved CALLS to every scored candidate).** The
+  envelope's path set widens from the selected seeds to every scored candidate's callers, so editing
+  an unselected caller's file marks the answer stale.
+- **r3-5 (the seed counts toward intra/cross).** A fixture isolates a seed called from one
+  community into a chain lying entirely inside another, and the flow reads `cross`.
+- **r3-6 (the depth cap of 10 wins).** A chain of 12 yields 10 steps and `truncated=true`; the
+  section's test line is corrected.
+- **r3-8 (symbol-level areas are the classification partition).** The WS-38c section text is
+  amended to say symbol-level, with the reason.
+
+**Acceptance.** `xmustard-core index flows <root>` answers with the global retention cap applied
+and reported, its exported flags read inside the segment's generation, a freshness envelope that
+covers every scored candidate's callers, and a class that counts the seed. Every bound in `USAGE`
+is a constant in `flows.rs` and none was raised. The read path stays read-only like `impact`: no
+writer, no schema migration, no `go-calls.txt` line.
+
 ### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
 
 **Goal.** The areas half of the WS-38 row above, closing PAR-SYM-08. Communities over the **resolved symbol** projection (CALLS, EXTENDS, IMPLEMENTS), not the file projection WS-38a measured:
