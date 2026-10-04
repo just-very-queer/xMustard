@@ -712,21 +712,22 @@ fn build_graph(
     // The same edges transposed, in the CSR's own buffers: a counting pass then a prefix sum
     // then a fill in ascending `from` order, so each node's caller slice is ascending too and
     // the freshness set built from it is in a deterministic order.
-    //
-    // The prefix sum and the fill cursor are built in ONE pass: `fill[i]` is where node `i`'s
-    // caller slice starts, which is `callers_off[i]`, so reading that entry before adding it
-    // forward gives both without copying the array element-wise — which is what clippy's
-    // `needless_range_loop` reads as a manual slice copy.
     let mut callers_off = vec![0u32; nodes.len() + 1];
     let mut callers_dst: Vec<u32> = vec![0u32; dst.len()];
-    let mut fill = vec![0u32; nodes.len()];
     for to in &dst {
         callers_off[*to as usize + 1] += 1;
     }
+    // The prefix sum runs first, so `callers_off[i]` is node `i`'s caller-slice START for
+    // every `i` below the last entry. The fill cursor is that array's prefix, taken BEFORE
+    // the last entry is accumulated — hence the slice, not the whole vector.
+    //
+    // `clone_from_slice` rather than an index loop because the copy is whole-array, which is
+    // what `needless_range_loop` asks for.
     for i in 0..nodes.len() {
-        fill[i] = callers_off[i];
-        callers_off[i + 1] += fill[i];
+        callers_off[i + 1] += callers_off[i];
     }
+    let mut fill = vec![0u32; nodes.len()];
+    fill.clone_from_slice(&callers_off[..nodes.len()]);
     for from in 0..nodes.len() {
         for &to in &dst[off[from] as usize..off[from + 1] as usize] {
             callers_dst[fill[to as usize] as usize] = from as u32;
