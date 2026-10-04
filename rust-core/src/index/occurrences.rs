@@ -428,12 +428,24 @@ pub fn read(
         }
     }
     let end = q.offset + occurrences.len();
+    // `total` is what this read can say without counting the rows it deliberately did not
+    // read, which is the whole point of a paged read. While more rows exist it is a LOWER
+    // BOUND: one more than this page delivered, because at least one more exists. Reporting
+    // `end + 1` as if it were the size of the list is what made a 5,000-row name read as 51
+    // (WS-59d-r6-2), and the envelope below is what says so rather than the number itself.
     let total = if more { end + 1 } else { end };
     // Reaching the offset ceiling is only truncation when the list actually continues
     // past it. A page whose window ends exactly at the ceiling and which the core says
     // has no more rows is the whole list, and calling it truncated would add a cause to
     // the envelope and turn a complete answer into a lower_bound one (ocr-review:3).
-    let truncated = more || (end >= MAX_OCCURRENCES && q.offset + q.limit >= MAX_OCCURRENCES);
+    //
+    // Pagination is NOT truncation: a middle page has more rows after it, and every one of
+    // them is still reachable through next_cursor, so reporting `truncated` on every page
+    // of a long list told the client it had lost rows it could simply ask for
+    // (WS-59d-r6-4). `truncated` is the bounded read; `page_bound` is the paged one, and
+    // the envelope carries whichever is real.
+    let truncated = end >= MAX_OCCURRENCES && q.offset + q.limit >= MAX_OCCURRENCES;
+    let page_bound = more && end < MAX_OCCURRENCES;
     // A row is one of three claims, and only a bound edge is `resolved`. A same-language
     // name match is counted separately because it is not one, and it is a lower-bound
     // cause of its own: without it a list holding only namesakes would report
@@ -460,6 +472,11 @@ pub fn read(
     }
     if truncated {
         causes.insert("truncated".to_string(), 1);
+    }
+    if page_bound {
+        // the list continues past this page and every further row is reachable through the
+        // cursor, so this is a page of a longer list rather than a loss
+        causes.insert("page_bound".to_string(), 1);
     }
     for (reason, n) in losses {
         *causes.entry(format!("coverage:{reason}")).or_default() += *n as u64;

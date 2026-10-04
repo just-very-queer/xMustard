@@ -884,6 +884,52 @@ fn a_page_ending_exactly_at_the_offset_ceiling_is_not_truncated() {
     );
 }
 
+// A page that is not the last one is PAGINATED, not truncated, and its `total` cannot be
+// the number of rows in the whole list without counting them all — which is the one thing
+// this path is built not to do. The two claims are separate: `truncated` says rows were
+// dropped by a bound, and `total` says how many the list holds. A middle page reports one
+// row more than it delivered and calls it truncated, so a client reading `truncated` sees a
+// loss on every page of a long list and a client reading `total` sees 51 for a name with
+// thousands of uses (WS-59d-r6-2, WS-59d-r6-4).
+#[test]
+fn a_middle_page_reports_a_lower_bound_total_and_is_not_truncated() {
+    let r = go_repo();
+    build(r.path());
+    // limit 1 on a name with two rows: the first page holds one of them
+    let first = occ(r.path(), "refs", "Store", &["--limit=1".to_string()]);
+    let delivered = rows(&first).len();
+    assert_eq!(delivered, 1, "the fixture did not page: {first:#}");
+    assert!(
+        first["truncated"].as_bool().is_none_or(|t| !t),
+        "a page that simply has more rows after it was reported as truncated: {first:#}"
+    );
+    assert_eq!(
+        first["epistemic"]["causes"].get("truncated"),
+        None,
+        "pagination added a truncated cause to the envelope: {first:#}"
+    );
+    // the last page still reports the whole list, because by then every row has been seen
+    let last = occ(r.path(), "refs", "Store", &["--offset=1".to_string()]);
+    let total = last["total"].as_u64().expect("the last page reports no total");
+    assert_eq!(
+        total as usize,
+        rows(&last).len() + 1,
+        "the last page does not report the whole list: {last:#}"
+    );
+    // and the envelope names the paged read on the page that has more rows after it
+    assert_eq!(
+        first["epistemic"]["causes"].get("page_bound").and_then(|c| c.as_u64()),
+        Some(1),
+        "a page with rows after it does not say it is one page of a longer list: {first:#}"
+    );
+    // a last page has nothing after it, so the cause is absent and the list reads whole
+    assert_eq!(
+        last["epistemic"]["causes"].get("page_bound"),
+        None,
+        "the last page of a list claims it is bounded: {last:#}"
+    );
+}
+
 // PAR-IMP-03 asks each hit for the containing symbol's "name path, kind, line". The
 // reference's own line is `line`; the containing symbol's own start line is `symbol_line`,
 // and the two differ whenever a reference sits below its container's declaration. At file
