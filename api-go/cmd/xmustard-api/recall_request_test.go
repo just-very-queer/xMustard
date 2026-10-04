@@ -77,6 +77,171 @@ func TestRecallVerificationQueueOverHTTP(t *testing.T) {
 	}
 }
 
+// entryList reads a response's entries, treating an absent field as none: a recall
+// that served nothing omits the key rather than returning an empty array, and an
+// assertion that indexes it would panic instead of reporting the miss.
+func entryList(t *testing.T, got map[string]any) []map[string]any {
+	t.Helper()
+	raw, _ := got["entries"].([]any)
+	out := make([]map[string]any, 0, len(raw))
+	for _, e := range raw {
+		m, ok := e.(map[string]any)
+		if !ok {
+			t.Fatalf("recall entry is not an object: %v", e)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// A private memory proposed over HTTP is served to its author and to nobody else on
+// any of the three read paths, admin included, and the by-id refusal is the
+// not-found shape. The reader's own keys reach the by-id path as query parameters,
+// so the author reads a directory-scoped memory from inside its directory (WS-29b).
+func TestAPrivateMemoryIsNotDisclosedOnAnyHTTPReadPath(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	base := srv.URL + "/api/workspaces/wsPrivateHTTP"
+	tok := map[string]string{}
+	for id, role := range map[string]string{"alice": "agent", "bob": "agent", "op": "admin"} {
+		raw, err := workspaceops.MintToken(dir, id, role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok[id] = raw
+	}
+	call := func(who, method, path, body string) (int, map[string]any) {
+		t.Helper()
+		return sendJSON(t, method, base+path, tok[who], body)
+	}
+	code, out := call("alice", "POST", "/context",
+		`{"content":"the staging credentials live in vault omega","visibility":"private"}`)
+	if code != http.StatusOK {
+		t.Fatalf("propose: %d %v", code, out)
+	}
+	id := out["id"].(string)
+	if out["scope"] != "private" {
+		t.Fatalf("the stored scope must be reported as private: %v", out)
+	}
+	// ranked recall
+	for _, who := range []string{"bob", "op"} {
+		code, got := call(who, "GET", "/context/active?query=omega", "")
+		if code != http.StatusOK {
+			t.Fatalf("recall as %s: %d %v", who, code, got)
+		}
+		for _, e := range entryList(t, got) {
+			if e["id"] == id {
+				t.Errorf("%s was served another principal's private memory over ranked recall", who)
+			}
+		}
+	}
+	// by id, including the reviewer and admin paths
+	for _, who := range []string{"bob", "op"} {
+		code, got := call(who, "GET", "/context/active?entry_id="+id, "")
+		if code != http.StatusNotFound {
+			t.Errorf("by-id fetch as %s: want 404, got %d %v", who, code, got)
+		}
+		if code, got = call(who, "GET", "/context/active?entry_id="+id+"&history=true", ""); code != http.StatusOK &&
+			code != http.StatusNotFound {
+			t.Errorf("by-id history fetch as %s: %d %v", who, code, got)
+		}
+	}
+	if code, got := call("alice", "GET", "/context/active?entry_id="+id, ""); code != http.StatusOK {
+		t.Fatalf("the author must fetch its own private entry by id: %d %v", code, got)
+	}
+	// the listing paths
+	for _, who := range []string{"bob", "op"} {
+		for _, filter := range []string{"", "?filter=all", "?filter=promoted", "?filter=pending"} {
+			code, got := call(who, "GET", "/context"+filter, "")
+			if code != http.StatusOK {
+				continue // the admin-only listing refuses a non-admin reader; that is its own gate
+			}
+			list := entryList(t, got)
+			for _, e := range list {
+				if e["id"] == id {
+					t.Errorf("%s was served the private memory through the listing %q", who, filter)
+				}
+			}
+		}
+	}
+	// the author's keys reach the by-id path, so a directory-scoped memory is
+	// readable inside its directory and refused outside it
+	code, out = call("alice", "POST", "/context",
+		`{"content":"the resolver drops unexported edges omega","visibility":"dir","dir":"api-go/internal"}`)
+	if code != http.StatusOK || out["scope_key"] != "api-go/internal" {
+		t.Fatalf("propose a dir-scoped memory: %d %v", code, out)
+	}
+	dirID := out["id"].(string)
+	for _, c := range []struct {
+		query string
+		want  int
+	}{
+		{"?entry_id=" + dirID + "&dir=api-go/internal", http.StatusOK},
+		{"?entry_id=" + dirID + "&dir=api-go/internal/govstore", http.StatusOK},
+		{"?entry_id=" + dirID + "&dir=api-go/cmd", http.StatusNotFound},
+		{"?entry_id=" + dirID, http.StatusNotFound},
+	} {
+		if code, got := call("alice", "GET", "/context/active"+c.query, ""); code != c.want {
+			t.Errorf("author reading its dir-scoped entry %q: want %d, got %d %v", c.query, c.want, code, got)
+		}
+	}
+	// The same key has to reach RANKED recall, not only the by-id path: a parser that
+	// read dir for one route and not the other would leave a dir-scoped memory
+	// unreachable from the tool an agent actually calls. include_pending is needed
+	// because these proposals are still pending in single-agent-free mode, and the
+	// route requires a reviewer for it, which alice holds as an agent.
+	for _, c := range []struct {
+		query string
+		want  bool
+	}{
+		{"?query=omega&dir=api-go/internal&include_pending=true", true},
+		{"?query=omega&dir=api-go/cmd&include_pending=true", false},
+	} {
+		code, got := call("alice", "GET", "/context/active"+c.query, "")
+		if code != http.StatusOK {
+			t.Errorf("ranked recall %q: want 200, got %d %v", c.query, code, got)
+			continue
+		}
+		served := false
+		for _, e := range entryList(t, got) {
+			if e["id"] == dirID {
+				served = true
+			}
+		}
+		if served != c.want {
+			t.Errorf("ranked recall %q served the dir-scoped entry: %v, want %v", c.query, served, c.want)
+		}
+	}
+	// path_prefix must NOT narrow the scope: it filters by declared path anchors, and a
+	// dir-scoped memory need not declare one, so deriving the directory key from it
+	// would silently exclude exactly the memories it was meant to reach.
+	for _, c := range []struct {
+		query string
+		want  bool
+	}{
+		{"?query=omega&path_prefix=api-go/cmd&include_pending=true", false},
+	} {
+		code, got := call("alice", "GET", "/context/active"+c.query, "")
+		if code != http.StatusOK {
+			t.Errorf("ranked recall by path_prefix %q: want 200, got %d %v", c.query, code, got)
+			continue
+		}
+		served := false
+		for _, e := range entryList(t, got) {
+			if e["id"] == dirID {
+				served = true
+			}
+		}
+		if served != c.want {
+			t.Errorf("ranked recall by path_prefix %q served the dir-scoped entry: %v, want %v",
+				c.query, served, c.want)
+		}
+	}
+	// the directory key still works on its own parameter
+	if code, got := call("alice", "GET", "/context/active?query=omega&dir=api-go/internal&include_pending=true", ""); code != http.StatusOK {
+		t.Errorf("ranked recall by dir: %d %v", code, got)
+	}
+}
+
 // include_superseded serves a superseded entry only if it was once promoted: a pending
 // or rejected proposal that a promoted entry replaced is still unverified text, and a
 // reader never receives it (review round 2, M1).

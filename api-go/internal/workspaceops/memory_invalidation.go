@@ -555,14 +555,54 @@ type AtRiskMemory struct {
 }
 
 // readAtRisk lists the served memories marked needs_reverify, the longest at risk first.
-func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID string) ([]AtRiskMemory, bool, error) {
-	entries, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
-		LongestStaleFirst: true, Limit: maxAtRisk + 1})
-	if err != nil {
-		return nil, false, err
+// The caller's own narrowing keys apply here as they do on the ranking: an entry the
+// caller's scope does not admit is not listed at all, because an id, title, path or
+// anchor in at_risk_memories discloses the entry it names (round 3, r3-1).
+//
+// The filter runs per read rather than once over a fixed scan window, because a window
+// applied before the filter drops the caller's own entry whenever the rows ahead of it
+// are unreadable, and reports truncated=false for a page that is not complete (round 4,
+// r4-5, found by three channels). Each read REPLACES the last, so the window can widen
+// without counting a row twice, and it widens until it holds more visible rows than the
+// page or the store ends inside it.
+//
+// truncated then means one thing only: the store holds more of this caller's at-risk rows
+// than this answer lists. It is true when the window overflowed the page, or when the
+// window stopped growing at atRiskScanCeiling with the store undrained. Below that
+// ceiling the scan reads any store to the end, so a page of one row out of ten thousand
+// is a COMPLETE page and says so — the unreadable rows in front of it were read and
+// dropped, not skipped.
+func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller string, req ScopeRequest) ([]AtRiskMemory, bool, error) {
+	f := govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
+		LongestStaleFirst: true, Limit: atRiskPage}
+	// Each read REPLACES the last rather than extending it: the window widens, so every
+	// read covers everything the previous one did. Appending would count the same row
+	// twice on every doubling (round 4, r4-5, after three triage checks).
+	var visible []govstore.Entry
+	// exhausted records that the store ended inside the window, which is the only case
+	// where "the page is full" also means "the store is empty".
+	exhausted := false
+	for {
+		page, err := r.ListEntries(ctx, f)
+		if err != nil {
+			return nil, false, err
+		}
+		visible = visibleEntries(page, caller, req)
+		if len(visible) > maxAtRisk || len(page) < f.Limit {
+			exhausted = len(page) < f.Limit
+			break
+		}
+		if f.Limit >= atRiskScanCeiling {
+			break
+		}
+		f.Limit = min(f.Limit*2, atRiskScanCeiling)
 	}
-	truncated := len(entries) > maxAtRisk
-	entries = entries[:min(len(entries), maxAtRisk)]
+	// truncated is the STORE holding more of this caller's at-risk rows than the answer
+	// lists. It is decidable only from the scan: either the window held more visible
+	// rows than the page, or the window ended before the store did and this caller may
+	// still have rows in it. When the store ended inside the window the answer is whole.
+	truncated := len(visible) > maxAtRisk || !exhausted
+	entries := visible[:min(len(visible), maxAtRisk)]
 	ids := make([]string, len(entries))
 	for i, e := range entries {
 		ids[i] = e.ID

@@ -416,6 +416,10 @@ func impactRanking(workspaceID string, q url.Values) []byte {
 		q.Get("base"), q.Get("head"), q.Get("worktree"), q.Get("direction"), q.Get("depth"),
 		q.Get("relation_types"), q.Get("min_confidence"), q.Get("include_tests"), q.Get("limit"),
 		q.Get("timeout_ms"), q.Get("summary_only"), q.Get("symbols"),
+		// op= (WS-59d) selects between the tier walk and the occurrence read, so a
+		// cursor from one must not page the other. The occurrence list has its own key
+		// and codec, so this only binds a tier cursor to the walk it was signed for.
+		q.Get("op"),
 	})
 	return b
 }

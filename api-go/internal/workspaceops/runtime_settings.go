@@ -39,6 +39,9 @@ type AppSettings struct {
 	// PrincipalDistinctness is the verifier distinctness policy (D-16): "token" (the
 	// default) or "owner".
 	PrincipalDistinctness string `json:"principal_distinctness,omitempty"`
+	// TrustedRunKeyPrincipals mirrors the internal setting: the principals that may assert
+	// a run or session scope key. Unset trusts nobody (WS-29b).
+	TrustedRunKeyPrincipals []string `json:"trusted_run_key_principals,omitempty"`
 }
 
 type LocalAgentCapabilities struct {
@@ -103,6 +106,7 @@ func GetSettings(dataDir string) (*AppSettings, error) {
 		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
 		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
 		PrincipalDistinctness:         settings.PrincipalDistinctness,
+		TrustedRunKeyPrincipals:       settings.TrustedRunKeyPrincipals,
 	}, nil
 }
 
@@ -111,6 +115,7 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 	if distinct != "" && distinct != DistinctToken && distinct != DistinctOwner {
 		return nil, fmt.Errorf("principal_distinctness %q is not token or owner: %w", settings.PrincipalDistinctness, ErrInvalidInput)
 	}
+	runKeys := cleanRunKeyPrincipals(settings.TrustedRunKeyPrincipals)
 	if settings.CodexArgs != nil {
 		// refused at save time as well as at run time: an admin sees the bad flag now
 		if _, err := sanitizeCodexArgs(*settings.CodexArgs); err != nil {
@@ -130,6 +135,7 @@ func UpdateSettings(dataDir string, settings AppSettings) (*AppSettings, error) 
 		RequireMultiAgentVerification: settings.RequireMultiAgentVerification,
 		ContextVerificationThreshold:  settings.ContextVerificationThreshold,
 		PrincipalDistinctness:         distinct,
+		TrustedRunKeyPrincipals:       runKeys,
 	}
 	if err := writeJSON(filepath.Join(dataDir, "settings.json"), next); err != nil {
 		return nil, err

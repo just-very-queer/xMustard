@@ -86,6 +86,44 @@ type appSettings struct {
 	// PrincipalDistinctness is the verifier distinctness policy (D-16): "token" (the
 	// default) or "owner".
 	PrincipalDistinctness string `json:"principal_distinctness,omitempty"`
+	// TrustedRunKeyPrincipals lists the principals that may ASSERT a run or session
+	// scope key (WS-29b). A run key is caller-supplied, so which principals may name one
+	// is an operator SETTING rather than a hard-coded rule (owner decision
+	// 2026-10-03): an unlisted principal is refused and the refusal is audited. Unset
+	// trusts nobody, so the default fails closed.
+	TrustedRunKeyPrincipals []string `json:"trusted_run_key_principals,omitempty"`
+}
+
+// AuditRunKeyRefused is the audit action recorded when a principal the operator did not
+// list asserts a run or session scope key.
+const AuditRunKeyRefused = "run_key_refused"
+
+// trustsRunKey reports whether principal may assert a run or session scope key. The
+// comparison is the same case-insensitive principal identity the store uses, so a
+// setting naming "Alice" matches the principal "alice".
+func trustsRunKey(settings *appSettings, principal string) bool {
+	for _, p := range settings.TrustedRunKeyPrincipals {
+		if strings.EqualFold(strings.TrimSpace(p), strings.TrimSpace(principal)) {
+			return true
+		}
+	}
+	return false
+}
+
+// cleanRunKeyPrincipals trims, lower-cases and de-duplicates the operator's list, so a
+// setting naming the same principal twice does not read as two entries and a stray
+// spacing does not make the list fail to match.
+func cleanRunKeyPrincipals(in []string) []string {
+	seen := map[string]bool{}
+	out := make([]string, 0, len(in))
+	for _, p := range in {
+		p = strings.ToLower(strings.TrimSpace(p))
+		if p != "" && !seen[p] {
+			seen[p] = true
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 type PlanApproveRequest struct {
