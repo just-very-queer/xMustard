@@ -57,6 +57,35 @@ SUBJECTS = [
         "",
         "a_store_generation_that_moved_past_the_segment_is_refused_rather_than_mixed",
     ),
+    (
+        # r1-1's fix: the envelope must name a scored candidate's OWN file, not only its
+        # callers'. Dropping the `set.insert(*i as usize)` line is that mutation.
+        #
+        # RECORDED AS SURVIVING, not killed. In the test's fixture `loser/loser.go` is named
+        # by `total_paths` as well: `CandidateLow`'s own file also appears as the CALLER side
+        # of `L1..L4`, which are themselves scored candidates, so `callers_of` inserts them
+        # and the same path is reached without `set.insert(*i as usize)`. The two halves of
+        # r4-4 (a candidate's own file, and a caller's file) share one `BTreeSet`, so in a
+        # fixture where both apply, removing either alone leaves the path reachable. Making
+        # them separable needs a candidate with NO callers of its own that is still scored,
+        # which needs `callees > 0` and `callers == 0` — and a symbol with callees but no
+        # callers whose file is not a seed's file is exactly the shape `mid.go` already
+        # provides 260 of. Left as owed rather than claimed.
+        "M7", FLOWS_RS,
+        "            set.insert(*i as usize);\n",
+        "",
+        "an_unselected_callers_file_marks_the_answer_stale",
+    ),
+    (
+        # r1-2's fix: a duplicate reachability set must be FOLDED rather than charged to the
+        # cap. The mutation moves the fold AFTER the cap, which is the order WS-38c-b first
+        # wrote — expressed as `false` rather than `None` so it still compiles, because the
+        # fold block dereferences `keyed[at]` and `None` leaves the type un-inferable.
+        "M8", FLOWS_RS,
+        "        if let Some(&at) = index.get(&key) {",
+        "        if let Some(&at) = index.get(&key).filter(|_| false) {",
+        "two_seeds_reaching_the_same_set_are_one_flow_naming_both",
+    ),
 ]
 
 
@@ -75,31 +104,42 @@ def run_one(row, rel, old, new, test):
     mutated = original.replace(old, new, 1)
     backup = os.path.join(SAVE, rel.replace("/", "_"))
     os.makedirs(SAVE, exist_ok=True)
-    with open(path, "w") as fh:
-        fh.write(mutated)
-    print(f"subject={row} applied={rel} bytes={len(original)}->{len(mutated)}")
+    with open(backup, "w") as fh:
+        fh.write(original)
 
-    # Force the rebuild. A survivor caused by a binary that never saw the change is worse
-    # than no row at all, and `cargo test`'s mtime check can miss an rsynced file.
-    os.utime(path, None)
-    built = subprocess.run(
-        ["cargo", "test", "--test", "flows", "--no-run"],
-        cwd=os.path.join(ROOT, "rust-core"),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=280,
-    )
-    if built.returncode != 0:
-        print(f"subject={row} test={test} BUILD_FAILED")
-        for ln in built.stdout.decode(errors="replace").splitlines()[-15:]:
-            print("    " + ln)
+    # The restore lives in a `finally`, not on the success paths. A timeout raises out of
+    # `subprocess.run` with the mutated file still on disk, and a mutation left in the tree
+    # is a worse outcome than a lost row: the next thing that builds reads it as the code.
+    try:
+        with open(path, "w") as fh:
+            fh.write(mutated)
+        print(f"subject={row} applied={rel} bytes={len(original)}->{len(mutated)}")
+
+        # Force the rebuild. A survivor caused by a binary that never saw the change is worse
+        # than no row at all, and `cargo test`'s mtime check can miss an rsynced file.
+        os.utime(path, None)
+        built = subprocess.run(
+            ["cargo", "test", "--test", "flows", "--no-run"],
+            cwd=os.path.join(ROOT, "rust-core"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=280,
+        )
+        if built.returncode != 0:
+            print(f"subject={row} test={test} BUILD_FAILED")
+            for ln in built.stdout.decode(errors="replace").splitlines()[-15:]:
+                print("    " + ln)
+            return None
+
+        proc = subprocess.run(
+            ["cargo", "test", "--test", "flows", "--", "--test-threads=1", test],
+            cwd=os.path.join(ROOT, "rust-core"),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=280,
+        )
+    finally:
         with open(path, "w") as fh:
             fh.write(original)
-        return None
+        restored = sha(path) == sha(backup)
+        print(f"subject={row} restored={'byte-identical' if restored else 'MISMATCH'}")
 
-    proc = subprocess.run(
-        ["cargo", "test", "--test", "flows", "--", "--test-threads=1", test],
-        cwd=os.path.join(ROOT, "rust-core"),
-        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=280,
-    )
     out = proc.stdout.decode(errors="replace")
     killed = proc.returncode != 0
     fail_lines = [ln for ln in out.splitlines() if "FAILED" in ln or "panicked at" in ln]
@@ -110,24 +150,19 @@ def run_one(row, rel, old, new, test):
     for ln in fail_lines[:4]:
         print(f"    {ln.strip()}")
 
-    with open(path, "w") as fh:
-        fh.write(original)
-    back = sha(path) == sha(backup) if os.path.exists(backup) else None
-    with open(backup, "w") as fh:
-        fh.write(original)
-    ok = sha(path) == sha(backup)
-    print(f"subject={row} restored={'byte-identical' if ok else 'MISMATCH'}")
-    return killed, ok
+    return killed, sha(path) == sha(backup)
 
 
-applied = killed_n = survived = broken = 0
+applied = killed_n = survived = broken = missed = 0
 for row, rel, old, new, test in SUBJECTS:
     try:
         res = run_one(row, rel, old, new, test)
     except subprocess.TimeoutExpired:
-        print(f"subject={row} test={test} TIMEOUT")
+        # `run_one` restores in its own `finally`, so the tree is clean here.
+        print(f"subject={row} test={test} TIMEOUT (tree restored by the finally)")
         res = None
     if res is None:
+        missed += 1
         continue
     applied += 1
     killed, ok = res
@@ -138,6 +173,8 @@ for row, rel, old, new, test in SUBJECTS:
     if not ok:
         broken += 1
 
+# A run where nothing was applied is NOT a pass. It reads like a completed mutation pass in
+# a SUMMARY line, and every anchor can miss at once when the source has moved.
 print(f"SUMMARY applied={applied} killed={killed_n} survived={survived} "
-      f"restore_mismatch={broken}")
-sys.exit(1 if survived or broken else 0)
+      f"restore_mismatch={broken} notrun={missed}")
+sys.exit(1 if survived or broken or applied == 0 else 0)

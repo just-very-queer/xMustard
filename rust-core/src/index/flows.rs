@@ -495,38 +495,40 @@ pub fn flows_of(
             truncation.dropped_under_min_steps += 1;
             continue;
         }
-        // The cap is checked BEFORE the dedup lookup so the retained set cannot exceed it even
-        // for a set that would have been folded into an existing flow: the walk's vector is
-        // already allocated by then, and the point of the cap is what stays resident.
-        //
-        // The walk is SKIPPED and counted, not `break`-ed out of. A break would leave
-        // `dropped_retained` holding only the first walk that tripped the cap while every
-        // later seed was dropped uncounted, so the counter would read as one drop under a
-        // name that counts them. Continuing keeps the walk's steps out of `keyed` — which is
-        // what bounds the retained set — and reports every step the cap excluded. It costs
-        // the same walking the uncapped code already did and retains nothing.
-        if retained + walk.visited.len() as u64 > limits.max_retained_steps {
-            truncation.dropped_retained += walk.visited.len() as u64;
-            continue;
-        }
-        retained += walk.visited.len() as u64;
+        // The reachability set, computed before either the dedup lookup or the cap, because both
+        // are about the SET rather than the walk.
         let key: Vec<u32> = {
             let mut set: Vec<u32> = walk.visited.iter().map(|&v| v as u32).collect();
             set.sort_unstable();
             set
         };
-        match index.get(&key) {
-            Some(&at) => {
-                keyed[at].1.push(rank);
-                // The folded seed is an origin too: the set is shared, so the flow's
-                // communities must count every seed that reaches it.
-                keyed[at].2.origins.push(seed as usize);
-            }
-            None => {
-                index.insert(key.clone(), keyed.len());
-                keyed.push((key, vec![rank], walk));
-            }
+        // A set that is ALREADY retained adds no resident step data: its steps are the steps
+        // the existing `Walk` holds, and folding it only records one more origin. So this is
+        // checked BEFORE the cap, and charged nothing. The order WS-38c-b first wrote charged
+        // the cap per WALK, which let a run of duplicate sets be dropped wholesale once the
+        // cap filled — changing which seeds a flow names and, through the seed's community,
+        // its intra/cross class, for a cap meant to bound memory alone.
+        if let Some(&at) = index.get(&key) {
+            keyed[at].1.push(rank);
+            // The folded seed is an origin too: the set is shared, so the flow's
+            // communities must count every seed that reaches it.
+            keyed[at].2.origins.push(seed as usize);
+            continue;
         }
+        // The cap is checked before a NEW set is retained, because retaining it is exactly
+        // what the cap bounds. The walk is SKIPPED and counted, not `break`-ed out of: a
+        // break would leave `dropped_retained` holding only the first walk that tripped the
+        // cap while every later seed was dropped uncounted, so the counter would read as one
+        // drop under a name that counts them. Continuing keeps the walk's steps out of
+        // `keyed` — which is what bounds the retained set — and reports every step the cap
+        // excluded.
+        if retained + walk.visited.len() as u64 > limits.max_retained_steps {
+            truncation.dropped_retained += walk.visited.len() as u64;
+            continue;
+        }
+        retained += walk.visited.len() as u64;
+        index.insert(key.clone(), keyed.len());
+        keyed.push((key, vec![rank], walk));
     }
     let mut flows: Vec<Flow> = keyed
         .into_iter()
@@ -768,12 +770,21 @@ fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Vec<String>, Tru
         let score = ratio * if node.exported { 2.0 } else { 1.0 } * rule.multiplier;
         scored.push((score, i as u32));
     }
-    // Every file that contributed a resolved CALL to any scored candidate, from the CSR's own
-    // caller side: the caller of a scored symbol, not the callee. Deduplicated through the
-    // adjacency the graph already holds rather than a second pass over the store.
+    // Every file that shaped a score: each SCORED CANDIDATE's own file, and the file of every
+    // caller of one. Deduplicated through the adjacency the graph already holds rather than a
+    // second pass over the store.
+    //
+    // The candidate's OWN file is not redundant with the seed set. `seeded` is `scored` after
+    // the `MAX_CANDIDATES` cut, so a candidate that loses that cut contributes its `callees`
+    // to the ranking — which decides WHICH 200 survive — while contributing no path of its
+    // own to the envelope. Editing such a file can change the reported entry points and the
+    // answer still reads `current`. Both sides are needed: the candidate's own file because
+    // its callee count shapes the ranking, the caller's because the caller count is the
+    // denominator of the score it shapes (WS-38c-b decision r4-4).
     let candidate_paths: Vec<String> = {
         let mut set: std::collections::BTreeSet<usize> = Default::default();
         for (_, i) in &scored {
+            set.insert(*i as usize);
             for &caller in graph.callers_of(*i) {
                 set.insert(caller as usize);
             }

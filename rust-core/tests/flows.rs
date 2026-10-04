@@ -2003,29 +2003,65 @@ fn the_retained_step_set_is_bounded_by_one_published_global_cap() {
     );
 }
 
+/// A duplicate reachability set is FOLDED, not charged against the retention cap.
+///
+/// Two seeds that reach the same set share ONE retained `Walk`; the second adds an origin and
+/// no resident step data. Charging the cap per WALK — the order WS-38c-b first wrote — spent
+/// budget on a set that was already resident, so a run of duplicate sets could be dropped
+/// wholesale once the cap filled. Dropping them changes which seeds a flow names and, through
+/// the seed's own community, whether it reads `intra` or `cross` — so a bound meant to cap
+/// memory changed an answer (codex-spec r1-2, OCR).
+///
+/// The fixture is deliberately the degenerate case: EVERY seed reaches the same set, so under
+/// the old order the second seed's walk was charged even though the set was already retained.
+/// The flow must still name both seeds and drop nothing.
+#[test]
+fn a_duplicate_reachability_set_is_folded_rather_than_charged_to_the_cap() {
+    // Two heads, one shared chain: both heads reach exactly {Shared1..Shared3}, so the two
+    // walks produce ONE key and dedup must fold the second.
+    let src = "package pkg\n\nfunc HeadA() { Shared1() }\nfunc HeadB() { Shared1() }\n\
+               func Shared1() { Shared2(); Shared3() }\nfunc Shared2() {}\nfunc Shared3() {}\n";
+    let d = repo(&[GO_MOD, ("pkg/dup.go", src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let fs = read_flows(&v);
+    let flow = fs
+        .iter()
+        .find(|f| f.seeds.len() >= 2)
+        .unwrap_or_else(|| panic!("the two heads share one set and name both seeds: {fs:?} in {v:#}"));
+    assert!(
+        flow.seeds.iter().any(|s| s == "HeadA") && flow.seeds.iter().any(|s| s == "HeadB"),
+        "one flow names both seeds, which is the fold: {flow:?}"
+    );
+    assert_eq!(
+        truncation(&v).get("dropped_retained").copied(),
+        Some(0),
+        "a set already retained is charged nothing, so nothing is dropped for it: {v:#}"
+    );
+}
+
 /// The global cap fires, and says so, when the walks really do exceed it.
 ///
-/// **MEASURED: it cannot, with the current caps, so this test pins the counter's plumbing
-/// and the verdict is recorded rather than papered over.** A walk is cut at `MAX_DEPTH` (10)
-/// and there are at most `MAX_CANDIDATES` (200) seeds, so the retained sum cannot exceed
-/// 2,000 — under a fifth of the 10,000 `MAX_RETAINED_STEPS` is set to. Measured on the box at
-/// four shapes (`logs/ws-38c-b-run-20261004T154513Z.log`), including 230 seeds each reaching
-/// 50 distinct steps: peak RSS 12.72 / 14.09 / 15.52 / 16.15 MiB against the 32 MiB line, and
-/// `dropped_retained: 0` on every one, because what stops them is the seed cap.
+/// **CORRECTION (codex-spec r1-4): the cap CAN bite, and this row's first claim that it
+/// could not was wrong arithmetic.** `MAX_DEPTH` (10) bounds a walk's DEPTH, not the number
+/// of steps it visits — `MAX_BRANCHING` is 4, so one walk can visit hundreds of nodes inside
+/// depth 10. WS-38c's own record measured 340 steps for a 4-ary walk, so at
+/// `MAX_CANDIDATES` (200) seeds the retained sum can reach ~68,000, well past the 10,000
+/// `MAX_RETAINED_STEPS`. An earlier version of this comment computed `200 x 10 = 2,000` and
+/// declared the cap unreachable; that multiplication used depth as a step count.
 ///
-/// Two fixture shapes were tried and failed before that, both recorded in the row's mutation
-/// table: suffixes DEDUP together (250 trunks reported `flows: 0`), and a 13,000-symbol single
-/// file sits past the Go extractor's budget (`call_edges: 0`), so the distinct sets have to
-/// come from branching rather than volume.
+/// What the four measured arms DID show is that CHAIN fixtures cannot reach it — a chain
+/// visits one step per level, so 230 seeds retain ~10 each
+/// (`logs/ws-38c-b-run-20261004T154513Z.log`). That is a property of the fixtures, not of the
+/// code.
 ///
-/// The mutation that would kill this test — replacing the cap comparison with `u64::MAX` —
-/// SURVIVES it (`logs/ws-38c-b-run-20261004T163307Z.log`, M4), because with the cap
-/// unreachable no run of this code can tell the comparison from its absence. `Limits` takes
-/// `max_retained_steps` so a unit test could drive it at a lowered value, but `flows_of` needs
-/// a real `csr::Segment` (it wraps serialized bytes), so the unit route would mean building a
-/// segment fixture for one assertion. The sibling test covers what IS observable — that the
-/// cap is published and equals the product of the two existing caps — and its mutation (M5,
-/// `retained` starting at the cap) IS killed.
+/// So this test still does not drive the cap to fire, and the mutation that would
+/// (`u64::MAX` for the comparison) still SURVIVES it
+/// (`logs/ws-38c-b-run-20261004T163307Z.log`, M4). Closing that needs a branching fixture of
+/// the shape this file already builds elsewhere — 200 seeds each reaching its own 340-step
+/// 4-ary subtree — which is recorded as owed to the next session rather than claimed here.
+/// The sibling test covers what IS observable, that the cap is published and equals the
+/// product of the two existing caps, and its mutation (M5) IS killed.
 #[test]
 fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
     // Two independent trunks of 40 steps each, so there are two reachability sets rather
@@ -2113,6 +2149,12 @@ fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
 /// `total_paths` named it a third time (…T161855Z.log). What `candidate_paths` adds is a
 /// file that is neither a seed's file nor a walked step: reachable only as the CALLER of a
 /// reported seed.
+///
+/// The second half — a scored candidate's OWN file — is asserted at the end of this test, and
+/// its mutation (M7, removing `set.insert(*i as usize)`) SURVIVES. Both halves write into one
+/// `BTreeSet`, so where a candidate's file is also reachable as some candidate's caller, the
+/// path survives either removal. Recorded rather than retargeted; the row's next step names
+/// the fixture shape that separates them.
 #[test]
 fn an_unselected_callers_file_marks_the_answer_stale() {
     // 261 mid symbols, each scoring ABOVE the caller, so the 200-seed cap fills with them
@@ -2167,6 +2209,24 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
         (
             "bulk/bulk.go",
             "package bulk\n\nimport \"example/caller\"\n\nfunc C1() { caller.CallerLow(); D1(); D2(); D3(); D4() }\nfunc C2() { caller.CallerLow(); E1(); E2(); E3(); E4() }\nfunc C3() { caller.CallerLow(); F1(); F2(); F3(); F4() }\nfunc D1() {}\nfunc D2() {}\nfunc D3() {}\nfunc D4() {}\nfunc E1() {}\nfunc E2() {}\nfunc E3() {}\nfunc E4() {}\nfunc F1() {}\nfunc F2() {}\nfunc F3() {}\nfunc F4() {}\n",
+        ),
+        // A SCORED candidate whose own file only reaches the envelope through `candidate_paths`
+        // (codex-spec r1-1, OCR). `CandidateLow` has one callee and four callers, so it is
+        // scored and low. Its callers live in a SEPARATE file: in the same file they became
+        // seeds themselves (each has one callee and no callers, scoring 2.0) and named the
+        // file through `total_paths`, which is why the mutation survived the first two
+        // attempts — the path was already on the list for a reason this code is not
+        // responsible for.
+        //
+        // Both files are in the fixture at BUILD time so the index records their stats: a
+        // file written after the build has no recorded stat and can never be reported dirty.
+        (
+            "loser/loser.go",
+            "package loser\n\nfunc CandidateLow() { Solo() }\nfunc Solo() {}\n",
+        ),
+        (
+            "loser/ring.go",
+            "package loser\n\nfunc L1() { CandidateLow() }\nfunc L2() { CandidateLow() }\nfunc L3() { CandidateLow() }\nfunc L4() { CandidateLow() }\nfunc L5() { L1() }\nfunc L6() { L1() }\nfunc L7() { L1() }\nfunc M1() { L2() }\nfunc M2() { L2() }\nfunc M3() { L2() }\nfunc M4() { L3() }\nfunc M5() { L3() }\nfunc M6() { L3() }\nfunc M7() { L4() }\nfunc M8() { L4() }\nfunc M9() { L4() }\n",
         ),
     ]);
     build(d.path());
@@ -2224,6 +2284,26 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
         before_scores, after_scores,
         "the added symbol changes no score, so only the envelope can tell the two answers \
          apart: {before_scores:?} vs {after_scores:?}"
+    );
+    // The candidate's OWN file is the second half of r4-4, and the half the caller case cannot
+    // see: `loser/loser.go` is a SCORED candidate whose own `callees` count is part of the
+    // ranking that decides which 200 survive, so editing it can change WHICH survive while
+    // nothing in the answer's rows moves. Nothing else names that file — its callers are in
+    // `loser/ring.go`, no walk reaches it, and it is not a seed — so only `candidate_paths`
+    // can put it in the envelope.
+    write(
+        d.path(),
+        "loser/loser.go",
+        "package loser\n\nfunc CandidateLow() { Solo(); Extra() }\nfunc Solo() {}\nfunc Extra() {}\n",
+    );
+    let loser_moved = flows(d.path(), &[]);
+    let dirty2 = loser_moved["freshness"]["dirty_paths_touching_result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{loser_moved:#}"));
+    assert!(
+        dirty2.iter().any(|p| p == "loser/loser.go"),
+        "a scored candidate's OWN file is named even when it is no seed and no walk reaches \
+         it: {dirty2:?} in {loser_moved:#}"
     );
 }
 

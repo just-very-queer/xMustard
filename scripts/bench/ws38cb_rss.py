@@ -80,30 +80,50 @@ def fixture(name, trunks, per_trunk, cap):
 
 
 def measure(root, args):
-    """Run one flows command, returning its own peak RSS in MiB via wait4 ru_maxrss."""
+    """Run one flows command, returning ITS OWN peak RSS in MiB.
+
+    `resource.getrusage(RUSAGE_CHILDREN).ru_maxrss` is the maximum over ALL reaped children,
+    so it attributes an earlier `index build` peak to a later `index flows` whenever the
+    flows process peaks lower — the fixtures here are built first, and a build peaks higher.
+    The fix is to fork and `wait4` the single child, whose `ru_maxrss` is that child's own
+    high-water mark and nothing else's.
+    """
     cmd = [CORE, "index", "flows", root] + args
-    before = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
     start = time.monotonic()
-    proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    rfd, wfd = os.pipe()
+    pid = os.fork()
+    if pid == 0:  # child
+        try:
+            os.close(rfd)
+            os.dup2(wfd, 1)
+            os.dup2(wfd, 2)
+            os.close(wfd)
+            os.execv(cmd[0], cmd)
+        finally:
+            os._exit(127)
+    os.close(wfd)
+    chunks = []
+    with os.fdopen(rfd, "rb") as pipe:
+        while True:
+            buf = pipe.read(65536)
+            if not buf:
+                break
+            chunks.append(buf)
+    _, status, usage = os.wait4(pid, 0)
     elapsed = time.monotonic() - start
-    after = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
-    # ru_maxrss is the high-water mark over ALL reaped children on Linux, so a rise is
-    # this run's peak and a flat reading means an earlier run already peaked higher.
-    own_kib = after if after > before else before
-    try:
-        out = json.loads(proc.stdout)
-    except Exception:
-        out = {}
-    if proc.returncode != 0:
+    exit_code = os.waitstatus_to_exitcode(status)
+    out = json.loads(b"".join(chunks)) if exit_code == 0 else {}
+    if exit_code != 0:
         raise SystemExit(
-            f"{' '.join(cmd)} failed ({proc.returncode}): "
-            f"{proc.stderr.decode(errors='replace').strip()}"
+            f"{' '.join(cmd)} failed ({exit_code}): "
+            f"{b''.join(chunks).decode(errors='replace').strip()[:400]}"
         )
     return {
         "cmd": " ".join(cmd),
-        "exit": proc.returncode,
+        "exit": exit_code,
         "wall_s": round(elapsed, 3),
-        "peak_mib": round(own_kib / 1024.0, 2),
+        # ru_maxrss is KiB on Linux, and this child's alone.
+        "peak_mib": round(usage.ru_maxrss / 1024.0, 2),
         "candidates": out.get("candidates"),
         "call_edges": out.get("call_edges"),
         "truncation": out.get("truncation"),
@@ -191,30 +211,33 @@ for label, r in results:
     rows.append({"label": label, **r})
     worst_peak = max(worst_peak, r["peak_mib"])
 
-# What the measured shapes establish, which is the row's actual answer.
+# What the measured shapes establish, and what they do NOT.
 #
-# NO arm reached MAX_RETAINED_STEPS, and the arithmetic says none can: the other two caps
-# bound the retained set first. A walk is cut at MAX_DEPTH (10) and there are at most
-# MAX_CANDIDATES (200) seeds, so the retained sum cannot exceed 2,000 — under a fifth of
-# the 10,000 this cap is set to. The branching arms confirm it empirically at 15.65 MiB
-# (180 seeds) and 15.87 MiB (230 seeds), both with `dropped_retained: 0` because the seed
-# cap, not the retention cap, is what stops them.
+# `MAX_DEPTH` bounds the depth of a walk, NOT the number of steps it visits: `MAX_BRANCHING`
+# is 4, so one walk can visit a 4-ary tree's worth of nodes inside depth 10 — hundreds of
+# steps, not 10. So the earlier "200 seeds x depth 10 = 2,000" was WRONG arithmetic on this
+# row's part (codex-spec r1-4), and the honest answer needs the measured per-walk maximum,
+# not a multiplication.
 #
-# So r4-2's cap is UNREACHABLE with the current depth and candidate caps, which means:
-#   - the worst shape stays far under the line (measured below), which is the RSS
-#     acceptance, and
-#   - the cap is a backstop that cannot bind yet, so `dropped_retained` reads 0 on every
-#     real run. That is worth stating plainly rather than leaving a test that looks like
-#     it is covering a fire it cannot reach — the same honest verdict WS-38c's own retention
-#     test records in its doc comment.
-unreachable = {"max_seeds": 200, "max_depth": 10, "max_retained_reachable": 2000,
-               "max_retained_steps": 10000, "reachable": False}
+# `the_retained_step_set_is_bounded_by_one_published_global_cap` builds a 4-ary fixture and
+# WS-38c's own record says that walk visits 340 steps, so the real ceiling on the retained sum
+# is 200 seeds x ~340 = ~68,000 — well ABOVE MAX_RETAINED_STEPS, which makes the cap
+# reachable and the "unreachable" claim false. The arms below are CHAIN fixtures, which visit
+# one step per level, so they retain ~10 steps per seed and cannot approach it.
+#
+# So: the RSS line below is measured and holds, and the cap's reachability is NOT settled by
+# this script. It needs a BRANCHING fixture of the shape the flow test already builds, which is
+# recorded as owed rather than answered here.
+unreachable = {"per_walk_max_steps_measured": 340, "max_seeds": 200,
+               "max_retained_reachable": 200 * 340,
+               "max_retained_steps": 10000,
+               "reachable": "unsettled: 200 x 340 = 68000 exceeds 10000, so a BRANCHING "
+                            "fixture can reach the cap; the chain arms here cannot"}
 
 with open(OUT, "w") as fh:
     json.dump({"line_mib": LINE_MIB, "worst_peak_mib": worst_peak, "rows": rows,
                "cap_analysis": unreachable}, fh, indent=2)
 
 print(f"LINE_MIB={LINE_MIB} worst_peak_mib={worst_peak} under_line={worst_peak < LINE_MIB}")
-print(f"retained_cap_reachable={unreachable['reachable']} "
-      f"(200 seeds x depth 10 = {unreachable['max_retained_reachable']} < 10000)")
+print(f"retained_cap_reachable={unreachable['reachable']}")
 sys.exit(0 if worst_peak < LINE_MIB else 1)
