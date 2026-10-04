@@ -195,7 +195,7 @@ func TestTruncatedIsNotDecidedByCountingThePage(t *testing.T) {
 		proposeAtRisk(t, dir, "ws-1", "agent-a", fmt.Sprintf("agent-a window note %d", i),
 			fmt.Sprintf("my own window note %d", i), "")
 	}
-	// Then the pair a raw one-more probe cannot resolve: a hidden row at the boundary
+	// The pair a raw one-more probe cannot resolve: a hidden row at the boundary
 	// and a visible row behind it. Both created last, so they sort to the end.
 	proposeAtRisk(t, dir, "ws-1", "agent-b", "agent-b hidden row", "another principal's row", ScopePrivate)
 	pastBoundary := proposeAtRisk(t, dir, "ws-1", "agent-a", "agent-a row past the boundary",
