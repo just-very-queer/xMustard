@@ -22,7 +22,7 @@ c() {
   shift 2
   local o=$OUT/$LABEL.$cs.$call.json
   local m
-  m=$(timeout 300 python3 "$HERE/own_rss.py" "$o" "$@")
+  m=$(python3 "$HERE/own_rss.py" "$o" 300 "$@")
   python3 - "$LABEL" "$cs" "$call" "$m" "$o" >> "$ROWS" <<'PY'
 import json, sys
 label, case, call, m, path = sys.argv[1:6]
@@ -66,7 +66,15 @@ for cs in "$@"; do
   XMUSTARD_DATA_DIR=$AD XMUSTARD_API_PORT=$PORT XMUSTARD_AUTH=off XMUSTARD_REGISTER_ROOTS=$B \
     XMUSTARD_CORE_BIN=$CORE "$API" > "$OUT/$LABEL.$cs.api.log" 2>&1 &
   APID=$!
-  for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health" && break; sleep 0.2; done
+  ready=0
+  for _ in $(seq 1 100); do curl -s -o /dev/null "http://127.0.0.1:$PORT/api/health" && { ready=1; break; }; sleep 0.2; done
+  if [ "$ready" = 0 ]; then
+    printf '{"label": "%s", "case": "%s", "call": "api-load", "error": "api not ready on port %s after 20 s"}\n' \
+      "$LABEL" "$cs" "$PORT" >> "$ROWS"
+    kill "$APID" 2>/dev/null
+    wait "$APID" 2>/dev/null
+    continue
+  fi
   r=$(curl -s -o "$OUT/$LABEL.$cs.api-load.json" -w '%{http_code} %{time_total}' -X POST --max-time 300 \
     -H 'Content-Type: application/json' \
     --data "{\"root_path\":\"$R\",\"auto_scan\":true,\"prefer_cached_snapshot\":true}" \
