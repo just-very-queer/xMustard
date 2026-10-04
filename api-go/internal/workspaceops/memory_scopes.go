@@ -254,36 +254,37 @@ const (
 	atRiskScanCeiling = 4000
 )
 
-// dropUntrustedRunKey narrows the READER's run key with the same operator setting that
-// guards a write. A run id arrives as a query parameter or a request field, so a later
-// run under the same principal could name an earlier run's id and read that run's
-// memory; checking only the write left the read unguarded (round 4, r4-2). An untrusted
-// key is DROPPED rather than refused: the read still answers, and narrowing by nothing
-// serves no confined entry, which is the fail-closed direction. The attempt is audited
-// exactly as the write refusal is, so an operator can see it.
+// dropUntrustedRunKey narrows the READER's run and session keys with the same operator
+// setting that guards a write. A key arrives as a query parameter or a request field,
+// so a later run under the same principal could name an earlier run's id and read that
+// run's memory; checking only the write left the read unguarded (round 4, r4-2). An
+// untrusted key is DROPPED rather than refused: the read still answers, and narrowing by
+// nothing serves no confined entry, which is the fail-closed direction. The attempt is
+// audited exactly as the write refusal is, so an operator can see it.
 //
-// Only the RUN key is dropped. A recall request's SessionID is also its session-seen
-// key, so clearing it would switch suppression off rather than narrow a scope; see the
-// call site in RecallWith.
-func dropUntrustedRunKey(dataDir, workspaceID, principal string, req ScopeRequest) ScopeRequest {
-	run := strings.TrimSpace(req.RunID)
-	if run == "" {
-		return req
+// It returns the narrowed request and whether anything was dropped, and touches nothing
+// else, because a recall request's SessionID is ALSO its session-seen key and clearing
+// that would switch suppression off rather than narrow a scope; the caller writes the
+// result to the separate scope view (RecallRequest.scopeSessionKey).
+func dropUntrustedRunKey(dataDir, workspaceID, principal string, req ScopeRequest) (ScopeRequest, bool) {
+	run, session := strings.TrimSpace(req.RunID), strings.TrimSpace(req.SessionID)
+	if run == "" && session == "" {
+		return req, false
 	}
 	settings, err := loadSettings(dataDir)
 	if err != nil || trustsRunKey(settings, principal) {
-		return req
+		return req, false
 	}
 	// The audit record is best-effort, for the same reason the write's is: a failed
 	// write of the event must not fail the read, and a failed read must not become a
 	// permitted key.
 	_ = recordAuditEventNoGuard(dataDir, workspaceID, AuditEvent{
 		Actor: principal, Action: AuditRunKeyRefused, TargetType: "memory_scope",
-		TargetID: run,
-		Details:  "principal " + ledgerPrincipal(principal) + " named an untrusted run key on a read",
+		TargetID: run + "/" + session,
+		Details:  "principal " + ledgerPrincipal(principal) + " named an untrusted run or session key on a read",
 	})
-	req.RunID = ""
-	return req
+	req.RunID, req.SessionID = "", ""
+	return req, true
 }
 
 // visibleEntries is the one list-side filter: entries is what a query returned, and the
@@ -307,5 +308,5 @@ func visibleEntries(entries []govstore.Entry, reader string, req ScopeRequest) [
 // a session or a directory reads inside it.
 func scopeRequestOf(req RecallRequest) ScopeRequest {
 	return ScopeRequest{Dir: strings.TrimSpace(req.Dir), RunID: strings.TrimSpace(req.RunID),
-		SessionID: strings.TrimSpace(req.SessionID)}
+		SessionID: req.sessionScopeKey()}
 }

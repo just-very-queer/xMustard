@@ -291,8 +291,25 @@ type RecallRequest struct {
 	// served none of the confined ones. SessionID above doubles as the session key.
 	Dir   string
 	RunID string
+	// scopeSessionKey is the SESSION SCOPE key after the run-key trust check, which is
+	// not the same value as SessionID: SessionID also drives seen-suppression and must
+	// survive an untrusted-key refusal, while this field is what ScopesVisible reads.
+	// scopeSessionChecked says the check ran, so an EMPTY key here means "no session key
+	// admitted", not "fall back to SessionID" — an unset field means the check never ran.
+	scopeSessionKey     string
+	scopeSessionChecked bool
 	// asOf is AsOf resolved against the repository, set while ranking.
 	asOf *asOfPoint
+}
+
+// sessionScopeKey is the session key the scope rule reads: the checked one when the
+// trust check ran, and SessionID otherwise. The two are separate because SessionID also
+// drives seen-suppression, which a refusal must not disturb.
+func (r RecallRequest) sessionScopeKey() string {
+	if r.scopeSessionChecked {
+		return strings.TrimSpace(r.scopeSessionKey)
+	}
+	return strings.TrimSpace(r.SessionID)
 }
 
 // Recall output budget bounds, in characters of the JSON result (Mem0's default).
@@ -487,19 +504,17 @@ func RecallWith(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 		return nil, err
 	}
 	// The reader's narrowing keys pass the same operator setting a write's do, here on
-	// the READ path: a run id arrives in the request, so an unlisted principal naming an
+	// the READ path: a key arrives in the request, so an unlisted principal naming an
 	// earlier run's id must not read that run's memory (WS-29b round 4, r4-2). An
 	// untrusted key narrows by nothing, so the answer is the workspace's and no confined
 	// entry is in it.
 	//
-	// Only RunID is checked, and deliberately: SessionID is ALSO this request's
-	// session-seen key, so clearing it would switch off suppression for every recall that
-	// names a session. The scope side of that field is read through
-	// scopeRequestOf and is left alone; the session key is not an assertion about another
-	// execution, it is this one.
-	if req.RunID != "" {
-		keys := dropUntrustedRunKey(dataDir, workspaceID, req.Caller, scopeRequestOf(req))
+	// RunID is written straight back. The SESSION key is not: SessionID also drives
+	// seen-suppression and has to survive a refusal, so the checked value lands in
+	// scopeSessionKey, which is the only key ScopesVisible and the ranking read.
+	if keys, dropped := dropUntrustedRunKey(dataDir, workspaceID, req.Caller, scopeRequestOf(req)); dropped {
 		req.RunID = keys.RunID
+		req.scopeSessionKey, req.scopeSessionChecked = keys.SessionID, true
 	}
 	var res map[string]any
 	var page recallPage
@@ -595,7 +610,7 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
 		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller,
-			ScopeDir: req.Dir, ScopeRunID: req.RunID, ScopeSessionID: req.SessionID}); err != nil {
+			ScopeDir: req.Dir, ScopeRunID: req.RunID, ScopeSessionID: req.sessionScopeKey()}); err != nil {
 			return err
 		}
 		if len(qtokens) > 0 {

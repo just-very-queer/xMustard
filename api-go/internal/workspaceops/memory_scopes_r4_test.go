@@ -2,8 +2,10 @@ package workspaceops
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"xmustard/api-go/internal/govstore"
@@ -188,16 +190,24 @@ func TestAVerifierResponseCarriesNoAnotherPrincipalsText(t *testing.T) {
 	const title = "agent-a private plan for the migration"
 	const body = "a proposal only its author may read"
 	theirs := propose(t, dir, "ws-1", "agent-a", title, body,
-		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate; r.Description = "their own notes" })
-
+		func(r *ProposeContextRequest) {
+			r.Visibility = ScopePrivate
+			r.Description = "their own notes"
+			r.Paths = []string{"internal/secret-plan.go"}
+		})
 	got, err := VerifyContextOutcome(dir, "ws-1", theirs.ID, ContextActor{ID: "verifier-c"},
 		VerifyRequest{Outcome: OutcomeApprove, Revision: 1})
 	if err != nil {
 		t.Fatalf("a peer must be able to verify a private proposal, or it can never be promoted: %v", err)
 	}
-	if got.Content != "" || got.Title != "" || got.Description != "" || got.Topic != "" {
-		t.Fatalf("the verify response carried another principal's text: content=%q title=%q description=%q topic=%q",
-			got.Content, got.Title, got.Description, got.Topic)
+	raw, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal the response: %v", err)
+	}
+	for _, leaked := range []string{title, body, "their own notes", "internal/secret-plan.go"} {
+		if strings.Contains(string(raw), leaked) {
+			t.Fatalf("the verify response carried another principal's %q: %s", leaked, raw)
+		}
 	}
 	// The vote itself is recorded, and everything a peer needs to record it honestly
 	// stays: without these the answer is not usable and the refusal would have been the
@@ -231,26 +241,45 @@ func TestAnApprovalQueueHoldsNoAnotherPrincipalsPrivateEntry(t *testing.T) {
 	}
 }
 
-// A recall request's SessionID is TWO things: this execution's session-seen key, and the
-// session scope key. Clearing it to refuse an untrusted key would switch suppression off
-// for every recall that names a session, which is a silent behaviour loss rather than a
-// refusal. The run-key check therefore touches RunID only, and this pins that.
+// A recall request's SessionID is TWO things: this execution's session-seen key, and
+// the session SCOPE key. A later run under the same principal naming an earlier
+// session's id must not read that session's memory (r4-2), so the scope key is checked;
+// but clearing SessionID to refuse it would switch seen-suppression off for every recall
+// that names a session, which is a silent behaviour loss rather than a refusal. Both
+// halves are asserted here.
 func TestTheRunKeyCheckLeavesTheSessionSeenKeyAlone(t *testing.T) {
 	dir := singleAgentDir(t)
-	propose(t, dir, "ws-1", "me", "the api listens on 8042", "a note about the api")
-	// Both keys are named, so the run-key check actually runs; a request with only a
-	// SessionID returns early and would pass whatever the function did to it.
-	req := RecallRequest{Query: "api", SessionID: "s1", RunID: "run-1", Caller: "me"}
-	first := recallWith(t, dir, "ws-1", req)
-	if n := len(entriesOf(first)); n != 1 {
-		t.Fatalf("first recall served %d entries, want 1", n)
+	// The write is allowed first, so the entry exists; the operator setting is then
+	// cleared, which is what a later run under the same principal meets.
+	trustRunKeys(t, dir, "me")
+	theirs, err := Remember(dir, "ws-1", RememberRequest{ProposeContextRequest: ProposeContextRequest{
+		Title: "a note for one session", Content: "confined to this session", Permission: "readwrite",
+		Visibility: ScopeSession, SessionID: "s1"}}, ContextActor{ID: "me"})
+	if err != nil {
+		t.Fatalf("propose: %v", err)
 	}
-	again := recallWith(t, dir, "ws-1", req)
-	if n := len(entriesOf(again)); n != 0 {
+	propose(t, dir, "ws-1", "me", "the api listens on 8042", "a note about the api")
+	trustRunKeys(t, dir) // the operator stops trusting "me" to assert a run or session key
+
+	// Untrusted: neither the run nor the session key narrows, so the session-scoped
+	// entry stays out — and seen-suppression still works, which is the half a blanket
+	// clear would have broken.
+	req := RecallRequest{Query: "note", SessionID: "s1", RunID: "run-1", Caller: "me"}
+	if got := ids(recallWith(t, dir, "ws-1", req)); slices.Contains(got, theirs.ID) {
+		t.Fatalf("an untrusted session key served the session-scoped entry %s: %v", theirs.ID, got)
+	}
+	if n := len(ids(recallWith(t, dir, "ws-1", req))); n != 0 {
 		t.Fatalf("session-seen suppression did not apply: %d entries on the second recall", n)
 	}
-	if again["already_shown"] != 1 {
-		t.Fatalf("already_shown = %v, want 1", again["already_shown"])
+	if again := recallWith(t, dir, "ws-1", req); again["already_shown"] != 1 {
+		t.Fatalf("already_shown = %v, want 1: the seen key was dropped with the scope key", again["already_shown"])
+	}
+
+	// Trusted: the session key is honoured, so the caller's own session-scoped entry is
+	// served. This is what an unconditional refusal would have broken.
+	trustRunKeys(t, dir, "me")
+	if got := ids(recallWith(t, dir, "ws-1", RecallRequest{Query: "note", SessionID: "s1", Caller: "me"})); !slices.Contains(got, theirs.ID) {
+		t.Fatalf("a trusted session key did not serve the caller's own session-scoped entry %s: %v", theirs.ID, got)
 	}
 }
 

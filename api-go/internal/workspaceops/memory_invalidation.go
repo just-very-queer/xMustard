@@ -488,6 +488,11 @@ func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller stri
 	f := govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, NeedsReverify: true,
 		LongestStaleFirst: true, Limit: atRiskPage}
 	var visible []govstore.Entry
+	// capped records that the scan hit its ceiling with the page not yet full, so rows
+	// this caller may read can still exist beyond it. That is NOT a complete answer and
+	// the flag has to say so: reporting truncated=false there would repeat the defect
+	// this round is fixing, one level down (round 4, r4-5, after the triage check).
+	capped := false
 	for {
 		page, err := r.ListEntries(ctx, f)
 		if err != nil {
@@ -502,16 +507,18 @@ func readAtRisk(ctx context.Context, r govstore.Reader, workspaceID, caller stri
 		// repeat rows. The window is therefore WIDENED until the caller's page is full
 		// or the store runs out, so a page is never short while more of the caller's rows
 		// remain (round 4, r4-5).
-		if len(page) < f.Limit || f.Limit >= atRiskScanCeiling {
+		if len(page) < f.Limit {
+			break
+		}
+		if f.Limit >= atRiskScanCeiling {
+			capped = true
 			break
 		}
 		f.Limit = min(f.Limit*2, atRiskScanCeiling)
 	}
 	// truncated is the STORE holding more of this caller's at-risk rows than the answer
-	// lists, which is exactly len(visible) > maxAtRisk once the scan has stopped. Before
-	// the fix the same expression was applied to a single fixed window, so a page cut
-	// short by rows the caller may not read reported a complete answer (round 4, r4-5).
-	truncated := len(visible) > maxAtRisk
+	// lists: either the scan found them, or it ran out of window before it could say.
+	truncated := len(visible) > maxAtRisk || capped
 	entries := visible[:min(len(visible), maxAtRisk)]
 	ids := make([]string, len(entries))
 	for i, e := range entries {

@@ -170,12 +170,14 @@ func VerifyContextOutcome(dataDir, workspaceID, entryID string, voter ContextAct
 	}
 	// A peer verifies an entry it may not otherwise read: a private proposal is verified
 	// BY peers or it could never be promoted, so the verdict is allowed and must be. What
-	// is not allowed is the author's TEXT coming back in the response. Title,
-	// Description and Topic are agent-written prose, so they are withheld from anyone but
-	// the author; the id, state, revision, tally and the verdict itself all stay, because
-	// the peer needs them to record an honest vote (round 4, r4-6).
+	// is not allowed is the author's OWN WORDS coming back. Title, Description, Topic,
+	// Tags and Paths are all author-supplied text, so they are withheld from anyone but
+	// the author; the id, state, revision, tally, kind and the verdict itself stay,
+	// because the peer needs them to record an honest vote and Kind is a closed set the
+	// store assigns rather than prose (round 4, r4-6, after the triage check).
 	if !samePrincipal(out.Source, voter.ID) {
 		out.Title, out.Description, out.Topic = "", "", ""
+		out.Tags, out.Paths, out.StalePaths, out.StaleAnchors = nil, nil, nil, nil
 		out.SearchTokens = nil
 	}
 	if promoted {
