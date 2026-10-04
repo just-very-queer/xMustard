@@ -41,9 +41,11 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	cases = append(cases, guardCase{"revision author", edited.ID, headRevision(t, dir, ws, edited.ID)})
 
 	// the owner-bound verdict arm: another of bob's principals already approved.
-	// bob-bot is not bob's id, so only the verdict arm can refuse this one.
+	// bob-bot is not bob's id, so only the verdict arm can refuse this one. The
+	// verdict is cast with bob's owner recorded, or the row would tie to bob-bot
+	// itself and the arm would not be reached.
 	cast := proposeAs(t, dir, ws, ContextActor{ID: "carol"}, "already cast")
-	if _, err := VerifyContext(dir, ws, cast.ID, "bob-bot", true, ""); err != nil {
+	if _, err := VerifyContextAs(dir, ws, cast.ID, ContextActor{ID: "bob-bot", Owner: "bob"}, true, ""); err != nil {
 		t.Fatal(err)
 	}
 	cases = append(cases, guardCase{"owner-bound verdict", cast.ID, 0})
@@ -51,7 +53,7 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	// the same arm through a rejection: the policy is about the owner having a voice,
 	// not about which way it voted.
 	refused := proposeAs(t, dir, ws, ContextActor{ID: "carol"}, "already refused")
-	if _, err := VerifyContext(dir, ws, refused.ID, "bob-bot", true, "disagree"); err != nil {
+	if _, err := VerifyContextAs(dir, ws, refused.ID, ContextActor{ID: "bob-bot", Owner: "bob"}, false, "disagree"); err != nil {
 		t.Fatal(err)
 	}
 	cases = append(cases, guardCase{"owner-bound rejection", refused.ID, 0})

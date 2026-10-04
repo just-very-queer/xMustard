@@ -2,6 +2,7 @@ package govstore
 
 import (
 	"context"
+	"encoding/json"
 	"testing"
 )
 
@@ -129,7 +130,8 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 			Content: "the build uses make and go", Reason: "add go", Activate: true}, carol)
 		return err
 	})
-	// the edit event records the editor's owner in its provenance
+	// AppendRevision already appended this revision's edit event, so the batched read
+	// sees that one first, exactly as revisionOwner does with Limit: 1
 	mustUpdate(t, s, func(tx Tx) error {
 		_, err := tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
 			Revision: 2, Data: map[string]any{"provenance": map[string]any{"owner": "ops"}}}, carol)
@@ -148,7 +150,6 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("keys returned: %d %+v", len(got), got)
 
 	first, ok := got[PendingKey{EntryID: "ctx_edit", Revision: 1}]
 	if !ok || first.Revision != 1 || first.Author != "alice" {
@@ -158,12 +159,38 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 	if !ok || second.Revision != 2 || second.Author != "carol" {
 		t.Fatalf("revision 2 = %+v (present %v), want revision 2 by carol", second, ok)
 	}
-	if second.Owner != "ops" {
-		t.Fatalf("revision 2's recorded owner = %q, want the edit event's ops", second.Owner)
-	}
 	// the entry's own recorded author fields ride along, because the revision-1 arm of
 	// revisionOwner reads them rather than the token store
-	if second.Source != "alice" || first.Source != "alice" {
-		t.Fatalf("entry source = %q, want alice", second.Source)
+	if first.Source != "alice" || second.Source != "alice" {
+		t.Fatalf("entry source = %q and %q, want alice on both", first.Source, second.Source)
+	}
+
+	// the recorded owner must be what the per-row read sees: revisionOwner takes the
+	// FIRST edit event for a revision, so the batched read must not read a later one
+	var wantOwner string
+	err = s.View(ctx, func(r Reader) error {
+		events, err := r.ListEvents(ctx, EventFilter{WorkspaceID: "ws1", EntryID: "ctx_edit",
+			Types: []string{EventEdit}, Revision: 2, Limit: 1})
+		if err != nil {
+			return err
+		}
+		if len(events) == 0 {
+			return nil
+		}
+		var parsed struct {
+			Provenance struct {
+				Owner string `json:"owner"`
+			} `json:"provenance"`
+		}
+		if err := json.Unmarshal(events[0].Data, &parsed); err == nil {
+			wantOwner = parsed.Provenance.Owner
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Owner != wantOwner {
+		t.Fatalf("revision 2's recorded owner = %q, want the first edit event's %q", second.Owner, wantOwner)
 	}
 }
