@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strconv"
+	"strings"
 	"testing"
 
 	"xmustard/api-go/internal/govstore"
@@ -322,6 +323,78 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTheBatchedOwnerGuardRefusesEachArmOnItsOwn pins each arm of the batched guard
+// against a fixture where that arm is the ONLY reason the row is refused. The parity
+// test cannot do this on its own: it compares the batched guard with
+// checkOwnerDistinct, and the per-row guard keeps every arm, so a batched arm that is
+// removed still agrees whenever a later arm would have refused the same row. That is
+// mutation M4, and it survived the parity test on correct code for exactly that
+// reason. Here each arm is exercised alone, so removing one is red.
+func TestTheBatchedOwnerGuardRefusesEachArmOnItsOwn(t *testing.T) {
+	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
+	h := humanApprover("bob", "bob")
+
+	arms := []struct {
+		name    string
+		build   func(t *testing.T) guardCase
+		wantWhy string
+	}{
+		{"the entry's author", func(t *testing.T) guardCase {
+			// bob owns bob-bot, and the row records no owner of its own, so only the
+			// entry-author arm can refuse it
+			e := proposeAs(t, dir, ws, ContextActor{ID: "bob-bot", Owner: "bob"}, "bob's agent")
+			return guardCase{"entry author", e.ID, 0}
+		}, "the entry's author"},
+		{"the revision's author", func(t *testing.T) guardCase {
+			// an admin editor holding no token of its own: only the owner its edit
+			// recorded ties this revision to bob
+			e := promoted(t, dir, ws, "carol", "the build uses make")
+			if _, err := EditContext(dir, ws, e.ID, EditRequest{BaseRevision: 1, Reason: "add go",
+				NewString: " and go"}, ContextActor{ID: "editor-2", Owner: "bob", Admin: true}); err != nil {
+				t.Fatal(err)
+			}
+			return guardCase{"revision author", e.ID, headRevision(t, dir, ws, e.ID)}
+		}, "the revision's author"},
+		{"a principal that already voted", func(t *testing.T) guardCase {
+			// carol's proposal, already approved by another of bob's principals; the
+			// entry author is a stranger, so only the verdict arm can refuse it
+			e := proposeAs(t, dir, ws, ContextActor{ID: "carol"}, "already cast, alone")
+			if _, err := VerifyContextAs(dir, ws, e.ID, ContextActor{ID: "bob-bot", Owner: "bob"}, true, ""); err != nil {
+				t.Fatal(err)
+			}
+			return guardCase{"owner-bound verdict", e.ID, 0}
+		}, "already voted"},
+	}
+
+	for _, arm := range arms {
+		t.Run(arm.name, func(t *testing.T) {
+			c := arm.build(t)
+			err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
+				guarded := candidatesOf(t, r, []guardCase{c})
+				got, err := batchOwnerVoices(context.Background(), r, dir, guarded, h)
+				if err != nil {
+					return err
+				}
+				if got[0] == nil {
+					return fmt.Errorf("the batched guard admitted %s, whose %s arm should have refused it",
+						c.name, arm.name)
+				}
+				if !errors.Is(got[0], ErrSameOwner) {
+					return fmt.Errorf("the batched guard refused %s with %v, want ErrSameOwner", c.name, got[0])
+				}
+				if !strings.Contains(got[0].Error(), arm.wantWhy) {
+					return fmt.Errorf("the batched guard refused %s with %q, which does not name the %s arm",
+						c.name, got[0], arm.wantWhy)
+				}
+				return nil
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
