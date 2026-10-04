@@ -1743,7 +1743,12 @@ pub fn flows(
         .iter()
         .cloned()
         .chain(result.candidate_paths.iter().cloned())
-        .chain(result.flows.iter().flat_map(|f| f.steps.iter().map(|s| s.path.clone())))
+        .chain(
+            result
+                .flows
+                .iter()
+                .flat_map(|f| f.steps.iter().map(|s| s.path.clone())),
+        )
         .collect();
     let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
     v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))

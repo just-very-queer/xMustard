@@ -653,7 +653,10 @@ fn seeds_with_equal_scores_keep_a_stable_declared_order() {
     let seeds = read_seeds(&first);
     let names: Vec<&str> = seeds.iter().map(|s| s.name.as_str()).collect();
     let expected: Vec<String> = (0..12).map(|i| format!("Entry{i}")).collect();
-    assert_eq!(names, expected, "equal scores fall to declared order: {names:?}");
+    assert_eq!(
+        names, expected,
+        "equal scores fall to declared order: {names:?}"
+    );
     // Two runs over one index answer the same, which is the property the tie-break exists
     // to provide. The freshness block is excluded: it carries the generation's identity age
     // and index timestamp, which differ between any two reads and are not part of "the same
@@ -833,14 +836,11 @@ fn a_flows_depth_is_its_deepest_step_and_not_its_step_count() {
         .unwrap_or_else(|| panic!("FanRoot's flow in {flows:?}"));
     // Four steps are listed (FanLong, FanMid, FanLeaf and FanShort), and the furthest is
     // three hops out. A depth reported as the step count would say four.
-    assert_eq!(
-        f.steps.len(),
-        4,
-        "the walk reaches four symbols: {f:?}"
-    );
+    assert_eq!(f.steps.len(), 4, "the walk reaches four symbols: {f:?}");
     assert_eq!(f.depth, 3, "the furthest step is three hops out: {f:?}");
     assert_ne!(
-        f.depth as usize, f.steps.len(),
+        f.depth as usize,
+        f.steps.len(),
         "the fixture must separate the two figures: {f:?}"
     );
 }
@@ -1326,10 +1326,7 @@ fn a_flow_that_really_spans_two_communities_is_reported_cross() {
         "both of AlphaOne's calls resolve, one of them across the package boundary: {v:#}"
     );
     let flows = read_flows(&v);
-    assert!(
-        !flows.is_empty(),
-        "the fixture must produce flows: {v:#}"
-    );
+    assert!(!flows.is_empty(), "the fixture must produce flows: {v:#}");
     let crossing = flows
         .iter()
         .find(|f| f.class == "cross")
@@ -1405,10 +1402,7 @@ fn a_cycle_that_returns_to_a_held_symbol_at_the_depth_cap_is_not_counted_as_trun
         root.depth, 10,
         "the furthest step is ten hops out, and not past the cap: {root:?}"
     );
-    assert!(
-        root.depth <= 10,
-        "depth never exceeds MAX_DEPTH: {root:?}"
-    );
+    assert!(root.depth <= 10, "depth never exceeds MAX_DEPTH: {root:?}");
     assert_eq!(
         root.steps_omitted, 0,
         "the cycle closes on a symbol the walk already holds, so nothing is omitted: {root:?}"
@@ -1861,9 +1855,15 @@ fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
     let d = repo(&[
         GO_MOD,
         // Before the gap: an UNEXPORTED entry point, so its expected score has no ×2.
-        ("aaa/first.go", "package aaa\n\nfunc alphaOne() { alphaTwo(); alphaThree() }\nfunc alphaTwo() {}\nfunc alphaThree() {}\n"),
+        (
+            "aaa/first.go",
+            "package aaa\n\nfunc alphaOne() { alphaTwo(); alphaThree() }\nfunc alphaTwo() {}\nfunc alphaThree() {}\n",
+        ),
         // After the gap: an EXPORTED entry point, which must keep its ×2.
-        ("ccc/last.go", "package ccc\n\nfunc DeltaOne() { DeltaTwo(); DeltaThree() }\nfunc DeltaTwo() {}\nfunc DeltaThree() {}\n"),
+        (
+            "ccc/last.go",
+            "package ccc\n\nfunc DeltaOne() { DeltaTwo(); DeltaThree() }\nfunc DeltaTwo() {}\nfunc DeltaThree() {}\n",
+        ),
     ]);
     // The gap is a file the scan marks `oversized`: above `max_file_size`, so the segment
     // does not cover it. That is the shape `exported_by_symbol` was fixed for — a positional
@@ -1932,15 +1932,12 @@ fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
     let delta = by_name("DeltaOne");
     // Two callees each, no callers, so the ratio is 2.0 and the name multiplier is 1.0
     // (`plain`): the whole score is the exported doubling, and nothing else.
+    assert_eq!(alpha.ratio, 2.0, "the unexported twin's ratio: {alpha:?}");
+    assert!(!alpha.exported, "alphaOne is unexported: {alpha:?}");
     assert_eq!(
-        alpha.ratio, 2.0,
-        "the unexported twin's ratio: {alpha:?}"
+        alpha.score, 2.0,
+        "no doubling for an unexported seed: {alpha:?}"
     );
-    assert!(
-        !alpha.exported,
-        "alphaOne is unexported: {alpha:?}"
-    );
-    assert_eq!(alpha.score, 2.0, "no doubling for an unexported seed: {alpha:?}");
     assert!(
         delta.exported,
         "DeltaOne is exported and the flag must survive the skipped file: {delta:?}"
@@ -2103,10 +2100,7 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
     // One seed only. `Target` scores 2.0 and `Caller` 1.0, so the cap keeps `Target` and
     // drops `Caller` — asserted, because if both were seeds the test would prove nothing.
     let seeded = flows(d.path(), &["--limit=1"]);
-    let names: Vec<String> = read_seeds(&seeded)
-        .into_iter()
-        .map(|s| s.name)
-        .collect();
+    let names: Vec<String> = read_seeds(&seeded).into_iter().map(|s| s.name).collect();
     assert_eq!(
         names,
         vec!["Target".to_string()],
@@ -2189,7 +2183,10 @@ fn the_seeds_own_community_counts_toward_the_class() {
     let v = flows(d.path(), &[]);
     let seeds = read_seeds(&v);
     assert_eq!(
-        seeds.iter().find(|s| s.name == "AlphaOne").map(|s| s.callees),
+        seeds
+            .iter()
+            .find(|s| s.name == "AlphaOne")
+            .map(|s| s.callees),
         Some(3),
         "AlphaOne's three calls resolve, one across the package boundary: {v:#}"
     );

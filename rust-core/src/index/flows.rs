@@ -642,7 +642,10 @@ fn build_graph(
             // of its steps — an artefact of the admission rule dressed up as a finding. So
             // the sentinel is dropped from the count, and the answer reports how many
             // symbols the partition did not cover.
-            area: areas_of.get(&seg.symbol_node(s)).copied().unwrap_or(UNCLASSIFIED),
+            area: areas_of
+                .get(&seg.symbol_node(s))
+                .copied()
+                .unwrap_or(UNCLASSIFIED),
             exported: exported.and_then(|f| f(s)).unwrap_or(false),
         });
     }
@@ -737,10 +740,7 @@ fn build_graph(
 /// symbol's `callers` count, which is the denominator of its score, so the file of a caller of
 /// an UNSELECTED candidate still shaped a score the answer reports (WS-38c-b decision r4-4).
 /// Those paths are the freshness input, and taking them before the cut is what makes it so.
-fn rank_seeds(
-    graph: &Graph,
-    limits: Limits,
-) -> (Vec<u32>, u64, Vec<String>, Truncation) {
+fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Vec<String>, Truncation) {
     let mut scored: Vec<(f64, u32)> = Vec::new();
     for i in 0..graph.nodes.len() {
         // A symbol with no resolved callee reaches nothing, so it is not an entry point
