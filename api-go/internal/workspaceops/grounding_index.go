@@ -53,6 +53,7 @@ type GroundBaseline struct {
 }
 
 func (s *groundingIndex) build(ctx context.Context, dataDir, workspaceID string) ([]GroundingUnknown, error) {
+	awaitRegistrationBaseline(ctx, dataDir, workspaceID)
 	drift, err := WorkspaceDriftCtx(ctx, dataDir, workspaceID)
 	if err != nil {
 		return nil, err

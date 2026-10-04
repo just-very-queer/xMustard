@@ -43,6 +43,17 @@ func registerMemoryRoutes(mux routeRegistrar) {
 			respondMemoryWrite(w, r, caller, result, err)
 			return
 		}
+		// op=job answers one consolidation job (WS-32a, PAR-GOV-13): the agent claims it under
+		// the store's compare-and-set lease and its answer is a proposal, like any other. It is
+		// routed before the human hold because a job's answer is ordinary proposal work, not a
+		// confirmation, and because the claim must not be held open waiting for a human.
+		if strings.EqualFold(strings.TrimSpace(req.Op), workspaceops.RememberOpJob) {
+			outcome, err := workspaceops.AnswerJob(r.Context(), dataDir(), r.PathValue("workspace_id"),
+				workspaceops.JobRequest{JobID: req.JobID, Actor: caller.actor(), Decision: req.Decision,
+					Proposal: &req, Skip: strings.TrimSpace(req.Title) == "" && strings.TrimSpace(req.Content) == ""})
+			respondMemoryWrite(w, r, caller, outcome, err)
+			return
+		}
 		if _, ok := holdForHuman(w, r, caller, func() (workspaceops.HumanConfirmation, error) {
 			return workspaceops.DescribeRemember(dataDir(), r.PathValue("workspace_id"), req)
 		}); !ok {
