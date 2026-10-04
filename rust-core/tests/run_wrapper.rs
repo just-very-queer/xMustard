@@ -1101,57 +1101,63 @@ fn pipe() -> Option<(std::fs::File, std::fs::File)> {
     })
 }
 
-/// Writes into the pipe until it is full, then closes the descriptor it wrote through.
+/// Writes into the pipe until it is full.
 ///
-/// The fill must not block THIS process or the test hangs before it spawns anything, and the
-/// wrapper's descriptor must stay blocking or its report returns EAGAIN instead of waiting.
-/// So the fill goes through a `dup` with `O_NONBLOCK`, writes until EAGAIN — which is the
-/// pipe's own statement that it is full — and closes; the descriptor the wrapper inherited is
-/// never touched.
+/// The fill must not block THIS process (the test would hang before spawning anything) and the
+/// wrapper's descriptor must stay BLOCKING (a non-blocking full pipe answers `EAGAIN`, which is
+/// a different hazard than the one r1-1 is about). `dup` cannot give both: it shares the open
+/// file description, so `F_SETFL(O_NONBLOCK)` on the copy sets the flag for the wrapper too —
+/// three review channels found that independently (codex-review P2, codex-spec, OCR), and it
+/// would have made this test pass on the ordering it exists to condemn.
+///
+/// So the fill writes the pipe's own capacity in **one** blocking write, which cannot block
+/// because the pipe is empty and that is exactly the room it has. `F_GETPIPE_SZ` supplies the
+/// number rather than a hard-coded 64 KiB, so the test does not depend on the default.
 fn fill_pipe(write_end: &std::fs::File) {
-    // SAFETY: `dup` of a live descriptor; `fcntl(F_SETFL)` only sets this copy's flags.
-    let filler = unsafe {
-        let copy = libc::dup(std::os::fd::AsRawFd::as_raw_fd(write_end));
-        assert!(copy >= 0, "the fill descriptor could not be duplicated");
-        assert_eq!(
-            libc::fcntl(copy, libc::F_SETFL, libc::O_NONBLOCK),
-            0,
-            "the fill descriptor could not be made non-blocking"
-        );
-        std::fs::File::from_raw_fd(copy)
+    // SAFETY: `F_GETPIPE_SZ` takes no argument and returns the pipe's capacity, so the variadic
+    // `fcntl` is called with no third argument at all.
+    let size = unsafe {
+        libc::fcntl(
+            std::os::fd::AsRawFd::as_raw_fd(write_end),
+            libc::F_GETPIPE_SZ,
+        )
     };
-    let chunk = vec![b'x'; 4096];
-    loop {
-        // SAFETY: a plain write of a live buffer to a valid descriptor. EAGAIN means the pipe
-        // is full, which is the state this harness needs and the loop's exit.
-        let written = unsafe {
-            libc::write(
-                std::os::fd::AsRawFd::as_raw_fd(&filler),
-                chunk.as_ptr().cast(),
-                chunk.len(),
-            )
-        };
-        if written <= 0 {
-            return;
-        }
-    }
+    assert!(size > 0, "the pipe's size could not be read: {size}");
+    let chunk = vec![b'x'; size as usize];
+    // A second write would block, and blocking is the wrapper's job here, not this function's.
+    // SAFETY: a plain write of a live buffer of `chunk.len()` bytes to a valid descriptor.
+    let written = unsafe {
+        libc::write(
+            std::os::fd::AsRawFd::as_raw_fd(write_end),
+            chunk.as_ptr().cast(),
+            chunk.len(),
+        )
+    };
+    assert_eq!(
+        written,
+        chunk.len() as isize,
+        "the pipe did not take its own capacity, so a later write would not block"
+    );
 }
 
-/// WS-FIX-20c-r1-1: the signal reaches the child even while the wrapper's report is stuck.
+/// WS-FIX-20c-r1-1: the signal reaches the child even when the wrapper cannot report it.
 ///
-/// The report is a diagnostic, so it must not be able to cost the relay. The witness is a
-/// BLOCKED report: `report_job` gives the wrapper a stderr pipe that is already at its buffer
-/// limit and that nobody ever drains, so the watcher's report write waits. On the correct order
-/// the signal has already gone out by the time the watcher reaches `report`, so the child has
-/// it while the watcher is stuck. On `report`-before-`kill_process` (the mutation that survived
-/// round 1) the watcher blocks BEFORE the delivery, so nothing ever reaches the child.
+/// The report is a diagnostic, so it must not be able to cost the relay. Two hazards, and
+/// `report_job` makes the second one real: the wrapper's stderr is a pipe already at its buffer
+/// limit that nobody ever drains, so **any** write the watcher makes there would wait.
 ///
-/// A wait, not a sample: the earlier version of this test read the child's log at the instant
-/// it saw the report, which also distinguishes the two orders but races the CHILD's own trap
-/// scheduling rather than the wrapper's ordering — measured on the box, green solo and 0 of 10
-/// under load, because a loaded box does not run the child's trap handler before the wrapper's
-/// next write. Blocking the report removes that race: the wrapper's own ordering decides when
-/// the child is signalled, and the child only has to record it afterwards.
+/// 1. **A report that blocks must never sit between the decision and the delivery.** The
+///    delivery is `kill_process`; the report only describes it. So the delivery goes out first.
+/// 2. **A report must not block at all** (codex-review P1), because there is one watcher
+///    thread: a blocked write parks it and every LATER signal goes unforwarded. So `report`
+///    writes through its own non-blocking descriptor.
+///
+/// A third hazard the earlier version of this test had: it read the child's log at the instant
+/// it saw the report, which races the CHILD's trap scheduling rather than the wrapper's
+/// ordering — measured on the box, green solo and 0 of 10 under load. This one waits for the
+/// child's log, so the wrapper's ordering decides the outcome and the child only records it
+/// afterwards. Both hazards are witnessed: the child is signalled with the pipe full, and a
+/// SECOND signal still arrives afterwards, which a blocked watcher could not deliver.
 #[test]
 fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
     let dir = tempfile::tempdir().unwrap();
@@ -1163,14 +1169,28 @@ fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
         .unwrap();
     assert!(sent.success(), "kill -TERM on the wrapper");
     // The child's log is awaited, not sampled. Correct order delivers the signal before the
-    // watcher blocks, so the line is already there or arrives immediately; broken order never
-    // delivers at all, so the wait runs out with an empty log. Nothing in this loop decides
-    // the outcome: the wrapper's ordering did, before this loop started.
+    // watcher reports, so the line is already there or arrives immediately; report-first
+    // blocks in the watcher before the delivery, so nothing ever arrives.
     let log = await_seen(dir.path(), "TERM");
     assert!(
         log.contains("TERM"),
-        "the wrapper's blocked report cost the relay: the child was never signalled, so the \
-         diagnostic could report before the delivery it describes: {log:?}"
+        "the wrapper's report cost the relay: the child was never signalled, so the diagnostic \
+         could report before the delivery it describes: {log:?}"
+    );
+    // The watcher is still running, so a second signal must still be relayed. With one watcher
+    // thread a report that blocked on this full pipe would park it forever and this line would
+    // never arrive: this is what codex-review P1 found, and the pipe being full is what makes
+    // it observable rather than theoretical.
+    let again = Command::new("kill")
+        .args(["-INT", &job.wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(again.success(), "kill -INT on the wrapper");
+    let log = await_seen(dir.path(), "INT");
+    assert!(
+        log.contains("INT"),
+        "the watcher was still blocked on the first report, so a later signal went unforwarded \
+         and the child kept running: {log:?}"
     );
     release(dir.path());
     let ended = wait_within(&mut job.wrapper, 10).expect("the wrapper never ended");

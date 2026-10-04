@@ -272,12 +272,43 @@ fn name_of(sig: i32) -> &'static str {
 ///
 /// It runs after `kill_process` on purpose (WS-FIX-20c-r1-1): a write to a blocked stderr must
 /// not cost the relay, and once the signal has gone out a blocked write costs only the line.
+///
+/// The write must not BLOCK either, and that is a second requirement the reordering alone does
+/// not meet. There is exactly one watcher thread, so a `stderr` that blocks parks it for good
+/// and every LATER signal goes unforwarded — the child keeps running after a second client
+/// timeout, which is the outcome forwarding exists to prevent (codex-review P1). So the line is
+/// written through a descriptor that is the wrapper's own file description made non-blocking
+/// for this write only: a full or closed stderr costs this one line and the watcher returns to
+/// the signals still queued for it.
+///
+/// The flag is set on a `dup`, which is its own open file description, so it applies here and
+/// not to the wrapper's stderr or the child's — the same trap the r1-1 witness test fell into
+/// (codex-review P2), which is why it is set after the `dup` and never on the original.
 fn report(sig: i32, relayed: bool) {
     let decision = match relayed {
         true => "forwarded",
         false => "not forwarded",
     };
-    eprintln!("xmustard run: {} {decision} to the child", name_of(sig));
+    let line = format!("xmustard run: {} {decision} to the child\n", name_of(sig));
+    // Nothing is gained by falling back to a blocking write when the descriptor cannot be
+    // prepared: that is the hazard this function exists to remove, and a missing diagnostic
+    // costs an operator one line while a blocked watcher costs a child its second signal.
+    write_best_effort(line.as_bytes());
+}
+
+/// Writes `bytes` to the wrapper's stderr without ever blocking.
+///
+/// `rustix`'s `dup` and `fcntl_setfl` keep this free of `unsafe`, which the crate's
+/// `#![forbid(unsafe_code)]` requires; the crate already depends on `rustix` with `fs` for
+/// exactly this descriptor work (the capture pipe in `capture`).
+fn write_best_effort(bytes: &[u8]) {
+    let Ok(out) = rustix::io::dup(std::io::stderr()) else {
+        return;
+    };
+    if rustix::fs::fcntl_setfl(&out, rustix::fs::OFlags::NONBLOCK).is_ok() {
+        let mut out: File = out.into();
+        let _ = out.write_all(bytes);
+    }
 }
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
