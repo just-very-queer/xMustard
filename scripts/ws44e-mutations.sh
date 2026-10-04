@@ -255,6 +255,30 @@ mutate M40 'if quote != 0 {' 'if false {' "$RUST" || true
 # (registry.go:311): `go test && git diff` would hint `git diff`.
 mutate M41 'rank > *best_rank' 'rank >= *best_rank' "$RUST" || true
 
+# M42: `shellQuote` returns the string unchanged instead of quoting it, so a command
+# holding a space or a quote splits into several argv words and the wrapper runs a
+# different command from the one the model wrote.
+mutate M42 'export function shellQuote(s: string): string {' 'export function shellQuote(s: string): string { if (s) return s; return' || true
+
+# M43: the wrapper's own default base drifts from the adapter's copy of it, so the two
+# constants in two languages disagree and every wrapped call captures somewhere the
+# adapter cannot spend the handle. The row targets the RUST constant, which is the one
+# the pin test asserts; mutating the TypeScript copy moves both the constant and its
+# readers together and is an equivalent mutation, not a kill.
+mutate M43 'const DEFAULT_API: &str = "http://127.0.0.1:8042";' 'const DEFAULT_API: &str = "http://127.0.0.1:9999";' "$RUST" || true
+
+# M44: the knob is ignored in shouldWrapBash, so a session that never asked for
+# wrapping has every bash command rewritten anyway.
+mutate M44 'if (!opts.enabled) return false;' 'if (!opts.enabled) return true;' || true
+
+# M45: the wrapper's own default is compared as if it were unset, so a session on the
+# default base reads as a mismatch and refuses to wrap.
+mutate M45 'return set ? normalizeApiBase(set) : normalizeApiBase(WRAPPER_DEFAULT_API);' 'return normalizeApiBase(set ?? "http://127.0.0.1:1");' || true
+
+# M46: the handle scan accepts any `[xmustard ...]` tag and any `xm1.` anywhere on the
+# line, so an ordinary result mentioning a handle name activates expansion.
+mutate M46 'const at = t.indexOf(HANDLE_MARK, m.index + m[0].length);' 'const at = t.indexOf(HANDLE_MARK);' "$DLV" || true
+
 restore ALL
 echo "=== final byte-compare"
 cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \

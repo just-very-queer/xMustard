@@ -856,6 +856,12 @@ describe("built-in tool projection through capture", () => {
 	test("the handle scan is per line and linear (r5)", () => {
 		assert.equal(carriesHandle(["[xmustard evidence] no\n[xmustard page] {\"h\":\"xm1.P\"}"]), true);
 		assert.equal(carriesHandle(["[xmustard evidence] no\nxm1.elsewhere"]), false, "a handle on another line is not the tag's");
+		// The mark must belong to the tag that follows it, not merely share its line:
+		// a result that prints someone's handle and then an unrelated `[xmustard
+		// evidence]` mention is not the wrapper's own projection, and treating it as
+		// one lets it skip capture. M46 drops the "after the tag" restriction and this
+		// is the row that sees it.
+		assert.equal(carriesHandle(['xm1.P then [xmustard evidence] mentions a handle']), false, "the mark precedes its tag");
 		// The `]` is what makes the tag a tag. This row's own first defect was a regex
 		// that could not match the footer it was written for; after round 5 rewrote the
 		// scan, the surviving form of that defect is a tag whose bracket is missing, and
