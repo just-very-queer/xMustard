@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"context"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -49,6 +50,22 @@ func atRiskWithPath(t *testing.T, dir, ws, author, title, content string, extra 
 	extra = append([]func(*ProposeContextRequest){
 		func(r *ProposeContextRequest) { r.Paths = []string{"srv.go"} }}, extra...)
 	return propose(t, dir, ws, author, title, content, extra...)
+}
+
+// trustRunKeys is the operator's answer to "which agents may assert a run key", written
+// through the settings file loadSettings reads. The visibility tests in
+// memory_scopes_test.go exercise the SCOPE rule, so they need the principal trusted to get
+// past the assertion check first; the trust rule itself has its own tests in this file.
+func trustRunKeys(t *testing.T, dir string, principals ...string) {
+	t.Helper()
+	settings, err := loadSettings(dir)
+	if err != nil {
+		t.Fatalf("load settings: %v", err)
+	}
+	settings.TrustedRunKeyPrincipals = cleanRunKeyPrincipals(principals)
+	if err := writeJSON(filepath.Join(dir, "settings.json"), settings); err != nil {
+		t.Fatalf("write settings: %v", err)
+	}
 }
 
 func atRiskIDs(atRisk []AtRiskMemory) []string {
@@ -213,7 +230,7 @@ func TestAnUnconfiguredRunKeyIsNotTrusted(t *testing.T) {
 func TestAListedPrincipalMayAssertARunKey(t *testing.T) {
 	dir := singleAgentDir(t)
 	writeRunForScope(t, dir, "ws-1", "run-1")
-	writeTrustedRunKeyPrincipals(t, dir, []string{"author-a"})
+	trustRunKeys(t, dir, "author-a")
 	e := propose(t, dir, "ws-1", "author-a", "run scoped note", "a note confined to one run",
 		func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" })
 	if e.Scope != ScopeRun || e.ScopeKey != "run-1" {
@@ -227,7 +244,7 @@ func TestAListedPrincipalMayAssertARunKey(t *testing.T) {
 func TestAnUnlistedPrincipalIsRefusedAndAudited(t *testing.T) {
 	dir := singleAgentDir(t)
 	writeRunForScope(t, dir, "ws-1", "run-1")
-	writeTrustedRunKeyPrincipals(t, dir, []string{"author-b"})
+	trustRunKeys(t, dir, "author-b")
 	if err := proposeRunScoped(t, dir, "ws-1", "author-a", "run-1"); err == nil {
 		t.Fatal("an unlisted principal named a run key: want a refusal")
 	}
@@ -266,11 +283,4 @@ func writeRunForScope(t *testing.T, dir, ws, runID string) {
 	if err := saveRunRecord(dir, runRecord{RunID: runID, WorkspaceID: ws, Status: "succeeded"}); err != nil {
 		t.Fatalf("write run %s: %v", runID, err)
 	}
-}
-
-// writeTrustedRunKeyPrincipals is the operator's answer to "which agents may assert a
-// run key", read through the same settings file loadSettings uses.
-func writeTrustedRunKeyPrincipals(t *testing.T, dir string, principals []string) {
-	t.Helper()
-	writeTestSettings(t, dir, appSettings{RequireMultiAgentVerification: new(bool), TrustedRunKeyPrincipals: principals})
 }

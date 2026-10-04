@@ -100,9 +100,10 @@ type reviewInput struct {
 	scope, scopeKey string
 	// author is the proposal's author. Scope and key alone are not authority: two
 	// principals legitimately hold the same directory or the same run id, so a
-	// proposal is compared only against its OWN AUTHOR's entries of that scope, or a
-	// scoped proposal's duplicate and conflict candidates can name another principal's
-	// private text (round 3, r3-7).
+	// candidate is one the proposer may READ, which is ScopesVisible over the
+	// proposal's own key rather than a bare author match — a workspace-scoped entry
+	// still deduplicates across principals, a confined one only against its author
+	// (round 3, r3-7).
 	author   string
 	declared []string
 	anchors  []govstore.AnchorInput
@@ -118,6 +119,18 @@ type reviewInput struct {
 	// Pending entries are its duplicates and neighbours only then, so a proposal is
 	// never an oracle for pending text its author may not read.
 	reviewer bool
+}
+
+// scopeRequest is the narrowing keys a candidate is read under: the proposal's own key,
+// so a dir-scoped proposal reads inside its directory and a run-scoped one inside its
+// run. A workspace-scoped proposal names none, which is the right rule because every
+// workspace entry is readable by everyone.
+func (in reviewInput) scopeRequest() ScopeRequest {
+	req := ScopeRequest{RunID: in.scopeKey, SessionID: in.scopeKey}
+	if in.scope == ScopeDir {
+		req.Dir = in.scopeKey
+	}
+	return req
 }
 
 // classifiedOtherwise reports whether the proposal asks for a classification or expiry
@@ -315,8 +328,12 @@ func loadReviewCandidates(ctx context.Context, r govstore.Reader, in reviewInput
 			return nil, err
 		}
 		content, ok := contents[id]
+		// The candidate must be one the PROPOSER may read, which is the scope rule and
+		// not a bare author comparison: a workspace-scoped entry is everyone's, so two
+		// principals' workspace memories still deduplicate against each other, while a
+		// confined entry is only ever its author's (round 3, r3-7).
 		inScope := e.WorkspaceID == in.workspaceID && e.Scope == in.scope && e.ScopeKey == in.scopeKey &&
-			samePrincipal(e.Source, in.author)
+			ScopesVisible(e.Scope, e.ScopeKey, e.Source, in.author, in.scopeRequest())
 		readable := e.Served(now) || in.reviewer
 		if !inScope || !readable || e.Lifecycle != govstore.LifecycleActive || !ok || content.Withheld != "" {
 			continue

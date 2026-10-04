@@ -169,6 +169,7 @@ func TestAPrivateMemoryIsNotServedThroughThePendingQueue(t *testing.T) {
 // does not see it, and neither does the same run read by another principal.
 func TestARunScopedMemoryIsInvisibleOutsideItsRun(t *testing.T) {
 	dir := singleAgentDir(t)
+	trustRunKeys(t, dir, "author-a", "author-b", "author-c")
 	e := propose(t, dir, "ws-1", "author-a", "run scoped", "the migration needs a lock",
 		func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" })
 	if e.Scope != ScopeRun {
@@ -375,6 +376,7 @@ func TestAConfinedEntryWithNoKeyIsServedToNobody(t *testing.T) {
 // cannot detect it being wrong.
 func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 	dir := singleAgentDir(t)
+	trustRunKeys(t, dir, "author-a", "author-b", "verifier-c")
 	type fixture struct {
 		id       string
 		servable map[string]bool // "caller|run|dir" -> may read it
@@ -463,6 +465,7 @@ func TestScopeLeaksOverTheFixtureSuiteIsZero(t *testing.T) {
 // everyone.
 func TestTheByIDReadServesTheAuthorInsideTheConfiningKey(t *testing.T) {
 	dir := singleAgentDir(t)
+	trustRunKeys(t, dir, "author-a", "author-b", "author-c")
 	run := propose(t, dir, "ws-1", "author-a", "by id run", "the run holds an open migration",
 		func(r *ProposeContextRequest) { r.Visibility = ScopeRun; r.RunID = "run-1" })
 	dirScoped := propose(t, dir, "ws-1", "author-a", "by id dir", "the resolver drops unexported edges",
@@ -503,6 +506,7 @@ func TestTheByIDReadServesTheAuthorInsideTheConfiningKey(t *testing.T) {
 // read refuses with the not-found shape, and the listing paths leave it out.
 func TestTheByIDAndListingReadPathsEnforceTheSameScope(t *testing.T) {
 	dir := singleAgentDir(t)
+	trustRunKeys(t, dir, "author-a", "author-b", "author-c")
 	private := propose(t, dir, "ws-1", "author-a", "by id", "the token rotation path mints a secret",
 		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate })
 	run := propose(t, dir, "ws-1", "author-a", "by id run", "the run holds an open migration",
@@ -649,6 +653,7 @@ func TestGlobalIsDerivedFromThePrincipalAndReadOnlyByItsAuthor(t *testing.T) {
 // its author cannot be told apart from anybody else there (WS-29b, review round 2).
 func TestTheStandingMemoryProjectionCarriesOnlyWorkspaceScopedEntries(t *testing.T) {
 	dir := singleAgentDir(t)
+	trustRunKeys(t, dir, "author-a", "author-b", "author-c")
 	workspace := propose(t, dir, "ws-1", "author-a", "projected", "the budget line is per build profile omega")
 	private := propose(t, dir, "ws-1", "author-a", "not projected", "the staging credentials live in vault omega",
 		func(r *ProposeContextRequest) { r.Visibility = ScopePrivate })
