@@ -696,16 +696,27 @@ fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
 /// The registry's own script families, in its precedence order (test before lint
 /// before build). A script matching none is not sent: the registry's fallback for
 /// an unknown npm script is the generic package-manager reducer, not a guess.
+///
+/// registry.go:491-495 verbatim, and the order is the registry's, because the
+/// classification has to agree with it exactly: a hint that disagrees routes the
+/// capture to a different reducer than the same command would have had unwrapped.
+/// Only `test`, `lint`, `build` and `e2e` are prefix tests there; `t`, `vitest`,
+/// `jest`, `eslint`, `compile`, `typecheck`, `tsc`, `install` and `ci` are exact
+/// matches, and `starts_with` on any of them would claim a family the registry does
+/// not (`tsc` is a build there, `jest` a test).
 fn family_of(script: &str) -> Option<&'static str> {
     let s = script.to_ascii_lowercase();
-    const TEST: [&str; 4] = ["test", "t", "e2e", "vitest"];
-    const LINT: [&str; 2] = ["lint", "eslint"];
-    const BUILD: [&str; 7] = ["build", "compile", "typecheck", "tsc", "install", "ci", "jest"];
-    if TEST.iter().any(|p| s.starts_with(p)) {
+    const TEST_PREFIX: [&str; 2] = ["test", "e2e"];
+    const TEST_EXACT: [&str; 3] = ["t", "vitest", "jest"];
+    const LINT_PREFIX: [&str; 1] = ["lint"];
+    const LINT_EXACT: [&str; 1] = ["eslint"];
+    const BUILD_PREFIX: [&str; 1] = ["build"];
+    const BUILD_EXACT: [&str; 5] = ["compile", "typecheck", "tsc", "install", "ci"];
+    if TEST_PREFIX.iter().any(|p| s.starts_with(p)) || TEST_EXACT.contains(&s.as_str()) {
         Some("test")
-    } else if LINT.iter().any(|p| s.starts_with(p)) {
+    } else if LINT_PREFIX.iter().any(|p| s.starts_with(p)) || LINT_EXACT.contains(&s.as_str()) {
         Some("lint")
-    } else if BUILD.iter().any(|p| s.starts_with(p)) {
+    } else if BUILD_PREFIX.iter().any(|p| s.starts_with(p)) || BUILD_EXACT.contains(&s.as_str()) {
         Some("build")
     } else {
         None
@@ -876,6 +887,12 @@ mod tests {
             ("npm run eslint", "npm run lint"),
             ("npm run build", "npm run build"),
             ("npm run tsc", "npm run build"),
+            // r7: only `test`, `e2e`, `lint` and `build` are prefix tests in the
+            // registry; the rest are exact, so a prefix match would claim a family the
+            // registry does not — `tsc` is a build there and `t` is not a prefix of it,
+            // while `jest` is a test there.
+            ("npm run jest", "npm run test"),
+            ("npm run tscheck", "npm run"),
             // A script in none of the registry's families sends nothing, because the
             // registry's own fallback for an unknown script is the generic reducer.
             ("npm run deploy", "npm run"),

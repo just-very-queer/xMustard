@@ -51,19 +51,37 @@ export function shellQuote(s: string): string {
 	return `'${s.replaceAll("'", `'"'"'`)}'`;
 }
 
-// mutateBashInput rewrites a bash tool call's command in place. It does nothing
-// unless the knob is on, the tool is `bash`, a workspace resolved and the command
-// is a non-blank string that is not already wrapped.
-export function mutateBashInput(event: unknown, workspaceId: string | undefined, enabled: boolean): void {
-	if (!enabled) return;
-	if (!isRecord(event) || event.toolName !== "bash") return;
+// mutateBashInput rewrites a bash tool call's command in place, and reports whether
+// it did. It does nothing unless the knob is on, the tool is `bash`, a workspace
+// resolved and the command is a non-blank string that is not already wrapped.
+//
+// The boolean is what the tool_call hook records as provenance, so it has to be the
+// rewrite's own answer rather than the hook's assumption: a command that was blank,
+// malformed or already wrapped ran natively, and recording it as wrapped would let
+// its result's text stand in for a capture that never happened.
+export function mutateBashInput(event: unknown, workspaceId: string | undefined, enabled: boolean): boolean {
+	if (!enabled) return false;
+	if (!isRecord(event) || event.toolName !== "bash") return false;
 	const input = event.input;
-	if (!isRecord(input) || typeof input.command !== "string") return;
+	if (!isRecord(input) || typeof input.command !== "string") return false;
 	const ws = workspaceId?.trim();
-	if (!ws) return;
+	if (!ws) return false;
 	const command = input.command;
-	if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return;
+	if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return false;
 	input.command = `${WRAPPER} --workspace ${shellQuote(ws)} -- ${SHELL} ${SHELL_FLAG} ${shellQuote(command)}`;
+	return true;
+}
+
+// The tool_call hook's own record step: rewrite the command, and record the call only
+// if the rewrite happened. The hook calls this rather than pairing mutateBashInput with
+// rememberWrapped at its call site, so the record follows the rewrite's answer in the
+// one place both are visible — a hook that recorded unconditionally would let a command
+// the rewrite declined skip capture on the strength of a footer-shaped line, and a test
+// that re-paired the two at its own call site could not see that.
+export function recordWrappedCall(calls: WrappedCalls, event: unknown, workspaceId: string | undefined, enabled: boolean): boolean {
+	if (!mutateBashInput(event, workspaceId, enabled)) return false;
+	rememberWrapped(calls, event);
+	return true;
 }
 
 // The tool_call hook records here that it rewrote a call, and the tool_result hook
@@ -160,10 +178,10 @@ export function wrapperEndpoint(raw: string | undefined): string {
 	return set ? normalizeApiBase(set) : normalizeApiBase(WRAPPER_DEFAULT_API);
 }
 
-// Whether the wrapper can reach this base at all: plain http, on loopback. Mirrors
-// run_wrapper.rs `is_loopback` and its refusal of every other scheme. The 127/8 test
-// is on the parsed address, not on the hostname's text: `127.0.0.1.example` parses
-// to a name, not an address, and is not loopback.
+// Whether the wrapper can reach this base at all: plain http, on loopback, and no
+// path, query or fragment. Mirrors run_wrapper.rs `split_api` and `is_loopback` and
+// its refusal of every other scheme. The 127/8 test is on the parsed address, not on
+// the hostname's text: `127.0.0.1.example` parses to a name, not an address.
 export function isLoopbackHttp(base: string): boolean {
 	let url: URL;
 	try {
@@ -172,6 +190,13 @@ export function isLoopbackHttp(base: string): boolean {
 		return false;
 	}
 	if (url.protocol !== "http:") return false;
+	// The wrapper's split_api keeps the authority and discards the path
+	// (run_wrapper.rs: `rest.split('/').next()`), so a base with a path prefix would
+	// have the adapter addressing /xm/api/... and the wrapper posting to /api/... on
+	// the same host. Equality on the two strings is not enough: the endpoints differ
+	// even though the strings match.
+	if (url.pathname !== "/" && url.pathname !== "") return false;
+	if (url.search !== "" || url.hash !== "") return false;
 	const host = url.hostname.replace(/^\[|\]$/g, "");
 	if (host === "localhost" || host === "::1") return true;
 	const octets = host.split(".");

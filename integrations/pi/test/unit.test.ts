@@ -31,7 +31,7 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
-import { isLoopbackHttp, mutateBashInput, newWrappedCalls, rememberWrapped, shellQuote, shouldActivateExpand, shouldWrapBash, wrapperEndpoint, wrapperOnPath, WRAPPER_DEFAULT_API } from "../src/commandwrap.ts";
+import { isLoopbackHttp, mutateBashInput, newWrappedCalls, recordWrappedCall, rememberWrapped, shellQuote, shouldActivateExpand, shouldWrapBash, wrapperEndpoint, wrapperOnPath, WRAPPER_DEFAULT_API } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -1565,9 +1565,55 @@ describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
 		assert.equal(isLoopbackHttp("http://127.0.0.1.evil.example:8077"), false, "loopback is the host, not a prefix of it");
 		assert.equal(isLoopbackHttp("not a url"), false);
 		assert.equal(isLoopbackHttp(""), false);
+		// r7: the wrapper's split_api keeps the authority and drops the path, so equal
+		// strings can still address different endpoints: the adapter would send
+		// /xm/api/... and the wrapper would post to /api/... on the same host.
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/"), true, "a bare trailing slash is no path");
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/xm"), false, "a path prefix the wrapper discards");
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/xm/"), false);
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/?a=b"), false, "a query is not part of the wrapper's endpoint");
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/#frag"), false);
 		// And the refusal reaches the decision, for both sides agreeing on the base.
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "https://box.example", apiBase: "https://box.example" }), false);
 		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "http://box.example", apiBase: "http://box.example" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "http://127.0.0.1:8077/xm", apiBase: "http://127.0.0.1:8077/xm" }), false, "r7: same string, different endpoint");
+	});
+
+	test("only a call the hook actually rewrote is recorded (r7)", () => {
+		// r7 (codex-spec high): the hook recorded the call unconditionally, so a
+		// command left alone — blank, malformed, or already wrapped — ran natively and
+		// its result's footer-shaped text was still trusted as a capture that never
+		// happened. mutateBashInput's own answer is the only honest record.
+		assert.equal(mutateBashInput(bash, "w1", true), true, "a real rewrite reports true");
+		assert.equal(mutateBashInput(bash, "w1", true), false, "the second pass sees it already wrapped");
+		assert.equal(mutateBashInput(bash, "   ", true), false, "no workspace resolved");
+		assert.equal(mutateBashInput(bash, undefined, true), false);
+		assert.equal(mutateBashInput(bash, "w1", false), false, "the knob is off");
+		const blank = { type: "tool_call" as const, toolCallId: "b", toolName: "bash", input: { command: "   " } };
+		assert.equal(mutateBashInput(blank, "w1", true), false, "a blank command is left native");
+		assert.equal(blank.input.command, "   ", "and is untouched");
+		const malformed = { type: "tool_call" as const, toolCallId: "m", toolName: "bash", input: { command: 7 } };
+		assert.equal(mutateBashInput(malformed, "w1", true), false, "a non-string command is left native");
+		const already = { type: "tool_call" as const, toolCallId: "a", toolName: "bash", input: { command: "xmustard-core run -- ls" } };
+		assert.equal(mutateBashInput(already, "w1", true), false, "an already wrapped command runs natively");
+		assert.equal(already.input.command, "xmustard-core run -- ls", "and is not wrapped twice");
+		// The record follows the hook's own rewrite answer, exercised through the
+		// function the hook calls rather than a re-pairing of the two at the test's
+		// own call site: a hook that recorded unconditionally would let a command the
+		// rewrite declined skip capture on a footer-shaped line, and M36 is the row
+		// that proves this assertion sees it.
+		const calls = newWrappedCalls();
+		assert.equal(recordWrappedCall(calls, blank, "w1", true), false, "nothing was rewritten");
+		assert.equal(calls.size, 0, "so nothing is recorded");
+		// A fresh fixture: the rewrite is in place, so the shared `bash` above is
+		// already wrapped by the time this line runs and would report false.
+		const fresh = { type: "tool_call" as const, toolCallId: "c2", toolName: "bash", input: { command: "ls" } };
+		assert.equal(recordWrappedCall(calls, fresh, "w1", true), true, "a real rewrite reports true");
+		assert.equal(calls.get("c2"), true, "and the call it rewrote is the one recorded");
+		assert.equal(calls.size, 1, "one rewrite, one record");
+		// The refused path never records, so its result is captured rather than trusted.
+		assert.equal(recordWrappedCall(calls, already, "w1", true), false, "already wrapped");
+		assert.equal(calls.size, 1, "a declined rewrite adds no record");
 	});
 
 	test("only a call the hook rewrote is treated as already captured (r6)", () => {

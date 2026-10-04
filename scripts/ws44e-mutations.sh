@@ -66,7 +66,11 @@ run() {
 	echo "=== MUTATION $id"
 	local out rc
 	if [[ $file == "$RUST" ]]; then
-		out="$(cd rust-core && cargo test --quiet --lib command_hint 2>&1)"
+		# Every hint test, not just the ones whose name starts command_hint: the
+		# run-script family test is named for what it asserts, and a filter that
+		# missed it left M32-M34 with no test to kill (measured: applied=33
+		# survived=0 while that test failed to compile and never ran).
+		out="$(cd rust-core && cargo test --quiet --lib run_wrapper::tests 2>&1)"
 	else
 		out="$(cd integrations/pi && node --test test/unit.test.ts 2>&1)"
 	fi
@@ -88,22 +92,24 @@ APPLIED=0
 NOT_APPLIED=0
 TAB=$'\t'
 
-mutate M1 "${TAB}if (!enabled) return;" "" || true
+mutate M1 "${TAB}if (!enabled) return false;" "" || true
 
 mutate M2 'command.trim() === "" || ALREADY_WRAPPED.test(command.trim())' 'ALREADY_WRAPPED.test(command.trim())' || true
 
-mutate M3 'if (!isRecord(event) || event.toolName !== "bash") return;' 'if (!isRecord(event)) return;'
+# M3: the input-shape guard is removed from the rewrite, so a non-string command is
+# offered to the wrap. (M15 drops the other guard's tool-name check; M1 drops the knob.)
+mutate M3 'if (!isRecord(input) || typeof input.command !== "string") return false;' 'if (!isRecord(input)) return false;' || true
 
-mutate M4 'if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return;' 'if (ALREADY_WRAPPED.test(command.trim())) return;' || true
+mutate M4 'if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return false;' 'if (ALREADY_WRAPPED.test(command.trim())) return false;' || true
 
-mutate M5 "${TAB}if (!ws) return;" "" || true
+mutate M5 "${TAB}if (!ws) return false;" "" || true
 
-mutate M6 'const ws = workspaceId?.trim();' 'const ws = "";' || true
+mutate M6 'const ws = workspaceId?.trim();' 'const ws = "w1";' || true
 
 # M7: mutateBashInput writes a copy instead of the caller's object. Pi applies the
 # in-place mutation, so a copy leaves the command the model wrote.
 LINE="${TAB}input.command = \`\${WRAPPER} --workspace \${shellQuote(ws)} -- \${SHELL} \${SHELL_FLAG} \${shellQuote(command)}\`;"
-mutate M7 "$LINE" "${TAB}{ const copy = { ...input }; copy.command = \`\${WRAPPER} --workspace \${shellQuote(ws)} -- \${SHELL} \${SHELL_FLAG} \${shellQuote(command)}\`; }" || true
+mutate M7 "$LINE" "${TAB}const copy = { ...input }; copy.command = \`\${WRAPPER} --workspace \${shellQuote(ws)} -- \${SHELL} \${SHELL_FLAG} \${shellQuote(command)}\`;" || true
 
 mutate M8 '!isRecord(input) || typeof input.command !== "string"' '!isRecord(input)' || true
 
@@ -127,8 +133,12 @@ mutate M13 'search)\]/g;' 'search)/g;' "$DLV" || true
 mutate M14 '(?:evidence|masked|page|search)' '(?:page|search)' "$DLV" || true
 
 # M15: the tool-name guard is removed, so every tool's input is offered to the wrap
-# and `read`/`edit`/`write` payloads are rewritten.
-mutate M15 'if (!isRecord(event) || event.toolName !== "bash") return false;' '' "$SRC" || true
+# and `read`/`edit`/`write` payloads are rewritten. This is shouldWrapBash's copy of the
+# guard, distinct from the rewrite's own (M37) because the two are separate refusals
+# reached on opposite sides of the workspace lookup.
+mutate M15 'if (!isRecord(event) || event.toolName !== "bash") return false;
+	// No executable wrapper means' 'if (!isRecord(event)) return false;
+	// No executable wrapper means' || true
 
 # M16: the token gate is removed, so the wrapper is handed an argv with no way to
 # authenticate and every wrapped call fails inside the wrapper instead of running
@@ -205,7 +215,27 @@ mutate M32 'Some(family) => format!("run {family}"),' 'Some(_family) => format!(
 
 # M33: the family mapping returns the script itself for every family, which is the
 # pre-r6 behaviour.
-mutate M33 'if TEST.iter().any(|p| s.starts_with(p)) {' 'if !s.is_empty() {' "$RUST" || true
+mutate M33 'if TEST_PREFIX.iter().any(|p| s.starts_with(p)) || TEST_EXACT.contains(&s.as_str()) {' 'if !s.is_empty() {' "$RUST" || true
+
+# M34: the exact-match lists become prefix tests, so `tsc` is claimed as a test by the
+# `t` prefix and `tscheck` by `tsc`, neither of which the registry does (r7).
+mutate M34 'TEST_EXACT.contains(&s.as_str())' 'TEST_EXACT.iter().any(|p| s.starts_with(p))' "$RUST" || true
+
+# M35: the path check is dropped, so a base the wrapper addresses at the host root is
+# accepted for an adapter serving the same host under a path prefix (r7).
+mutate M35 'if (url.pathname !== "/" && url.pathname !== "") return false;' '' || true
+
+# M36: the rewrite's own answer is ignored and every call is recorded as wrapped, so a
+# command left alone runs natively and its footer-shaped result is trusted anyway (r7).
+# The row targets recordWrappedCall's guard, which is the decision the hook now makes.
+mutate M36 'if (!mutateBashInput(event, workspaceId, enabled)) return false;' 'mutateBashInput(event, workspaceId, enabled);' || true
+
+# M37: the rewrite's own tool-name guard is removed, so a `read`/`edit`/`write` payload
+# that reached the hook is rewritten even though only `bash` commands can be wrapped.
+# M15 is the same guard in shouldWrapBash; this one is in mutateBashInput itself.
+mutate M37 'if (!isRecord(event) || event.toolName !== "bash") return false;
+	const input' 'if (!isRecord(event)) return false;
+	const input' || true
 
 restore ALL
 echo "=== final byte-compare"

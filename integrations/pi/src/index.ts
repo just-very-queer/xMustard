@@ -17,7 +17,7 @@ import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
-import { mutateBashInput, newWrappedCalls, rememberWrapped, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
+import { mutateBashInput, newWrappedCalls, recordWrappedCall, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
@@ -160,8 +160,10 @@ export default function xmustard(pi: ExtensionAPI): void {
 		})) return undefined;
 		await resolveWorkspace(ctx.cwd, ctx.signal).then(
 			(ws) => {
-				mutateBashInput(event, ws, true);
-				rememberWrapped(wrappedCalls, event);
+				// The record follows the rewrite's own answer: a command left alone
+				// (blank, malformed, already wrapped) ran natively, and its result must
+				// not be treated as the wrapper's projection (r7).
+				recordWrappedCall(wrappedCalls, event, ws, true);
 			},
 			() => mutateBashInput(event, undefined, true),
 		);
