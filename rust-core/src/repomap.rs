@@ -211,29 +211,13 @@ pub fn build_repo_map(
     let mut source_files = 0usize;
     let mut test_files = 0usize;
 
-    let walker = WalkDir::new(root_path)
-        .into_iter()
-        .filter_entry(|entry| !should_skip_entry(root_path, entry));
-
-    for entry in walker {
-        let entry = match entry {
-            Ok(entry) => entry,
-            Err(_) => continue,
-        };
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
-        let relative = match relative_path(root_path, entry.path()) {
-            Some(value) => value,
-            None => continue,
-        };
-        if should_ignore_relative_path(&relative) {
-            continue;
+    let mut visit = |relative: &str, path: &Path| {
+        if should_ignore_relative_path(relative) {
+            return;
         }
 
-        let Some(role) = repo_map_file_role(&relative) else {
-            continue;
+        let Some(role) = repo_map_file_role(relative) else {
+            return;
         };
         total_files += 1;
         let top_dir = relative
@@ -243,7 +227,7 @@ pub fn build_repo_map(
             .unwrap_or(".")
             .to_string();
 
-        let is_source = should_scan_file(&relative);
+        let is_source = should_scan_file(relative);
         let is_test = role == "test";
 
         {
@@ -273,12 +257,12 @@ pub fn build_repo_map(
 
         if is_source {
             source_files += 1;
-            let ext_key = PathBuf::from(&relative)
+            let ext_key = Path::new(relative)
                 .extension()
                 .and_then(|value| value.to_str())
                 .map(|ext| format!(".{ext}"))
                 .unwrap_or_else(|| {
-                    PathBuf::from(&relative)
+                    Path::new(relative)
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or_default()
@@ -291,26 +275,27 @@ pub fn build_repo_map(
         }
 
         crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
-        let size_bytes = fs::metadata(entry.path()).ok().map(|meta| meta.len());
+        let size_bytes = fs::metadata(path).ok().map(|meta| meta.len());
         for (pattern, role) in REPO_MAP_KEY_FILE_PATTERNS {
-            if relative == *pattern && !discovered_key_paths.contains(&relative) {
-                discovered_key_paths.insert(relative.clone());
+            if relative == *pattern && !discovered_key_paths.contains(relative) {
+                discovered_key_paths.insert(relative.to_string());
                 key_files.push(RustRepoMapFileRecord {
-                    path: relative.clone(),
+                    path: relative.to_string(),
                     role: (*role).to_string(),
                     size_bytes,
                 });
             }
         }
-        if is_test && !discovered_key_paths.contains(&relative) && key_files.len() < 12 {
-            discovered_key_paths.insert(relative.clone());
+        if is_test && !discovered_key_paths.contains(relative) && key_files.len() < 12 {
+            discovered_key_paths.insert(relative.to_string());
             key_files.push(RustRepoMapFileRecord {
-                path: relative.clone(),
+                path: relative.to_string(),
                 role: "test".to_string(),
                 size_bytes,
             });
         }
-    }
+    };
+    for_each_repo_map_file(root_path, &mut visit);
 
     let mut top_directories: Vec<RustRepoMapDirectoryRecord> = top_level.into_values().collect();
     top_directories.sort_by(|left, right| {
@@ -520,6 +505,80 @@ pub fn explain_path(
         warnings: symbols.warnings,
         generated_at: Utc::now().to_rfc3339(),
     })
+}
+
+/// Calls `visit` with each file the map counts (root-relative, and its path). In a Git
+/// worktree that is Git's own listing of tracked and untracked, not ignored files, so
+/// files inside a nested repository (listed by Git as `sub/`) and ignored files are not
+/// counted, as the index does not count them (WS-RT2). Outside Git, or when the
+/// listing fails, the tree is walked as the index walks a non-Git root: `.gitignore` and
+/// `.xmustardignore` files apply top-down, and no directory with its own `.git` is
+/// entered. A path the ignore rules cannot decide within their budget is not counted.
+fn for_each_repo_map_file(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) {
+    let listing = crate::indexcache::run_git_bounded(
+        root_path,
+        &[
+            "ls-files",
+            "-z",
+            "--cached",
+            "--others",
+            "--exclude-standard",
+        ],
+        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
+        crate::indexcache::git_timeout(),
+    );
+    let Ok(out) = listing else {
+        return walk_repo_map_files(root_path, visit);
+    };
+    let mut last: &[u8] = &[];
+    for rec in out.split(|b| *b == 0) {
+        // an unmerged path is listed once per stage
+        if rec.is_empty() || rec.ends_with(b"/") || rec == last {
+            continue;
+        }
+        last = rec;
+        let Ok(relative) = std::str::from_utf8(rec) else {
+            continue;
+        };
+        let path = root_path.join(relative);
+        crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
+            visit(relative, &path);
+        }
+    }
+}
+
+/// The fallback walk of `for_each_repo_map_file`.
+fn walk_repo_map_files(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) {
+    use crate::index::ignore::{DirMemo, Ignore, Verdict};
+    let mut ig = Ignore::with_defaults();
+    let mut memo = DirMemo::default();
+    crate::index::scan::load_dir_ignores(root_path, "", &mut ig);
+    let mut it = WalkDir::new(root_path)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(entry) = entry else { continue };
+        let Some(relative) = relative_path(root_path, entry.path()).filter(|r| !r.is_empty())
+        else {
+            continue;
+        };
+        let is_dir = entry.file_type().is_dir();
+        let admitted = !should_skip_entry(root_path, &entry)
+            && ig.check(&mut memo, &relative, is_dir) == Verdict::Included;
+        match (is_dir, admitted) {
+            (true, true) if !crate::indexcache::has_own_git(entry.path()) => {
+                crate::index::scan::load_dir_ignores(root_path, &relative, &mut ig)
+            }
+            (true, _) => it.skip_current_dir(),
+            (false, true) if entry.file_type().is_file() => {
+                crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
+                visit(&relative, entry.path());
+            }
+            (false, _) => {}
+        }
+    }
 }
 
 fn should_skip_entry(root_path: &Path, entry: &DirEntry) -> bool {
