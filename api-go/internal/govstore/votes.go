@@ -73,6 +73,9 @@ type VoteReader interface {
 	ListVotes(ctx context.Context, entryID string, revision int64) ([]Vote, error)
 	// ServedVotes returns ListVotes(id, 0) for many entries at once, keyed by entry id.
 	ServedVotes(ctx context.Context, ids []string) (map[string][]Vote, error)
+	// PendingOwnerVoices returns the verification-deciding verdicts on many named entry
+	// revisions at once, keyed by entry id and revision.
+	PendingOwnerVoices(ctx context.Context, keys []PendingKey) (map[PendingKey][]Vote, error)
 	Tally(ctx context.Context, entryID string, revision int64) (Tally, error)
 }
 
@@ -151,6 +154,66 @@ func (r *reader) ServedVotes(ctx context.Context, ids []string) (map[string][]Vo
 		}
 		if err != nil {
 			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// PendingKey names one entry revision a batched read covers. Revision 0 means the
+// served revision.
+type PendingKey struct {
+	EntryID  string
+	Revision int64
+}
+
+// PendingOwnerVoices reads, for many entry revisions at once, the verdicts that decide
+// verification (approve and reject) on each named revision, from the entries' current
+// vote epoch: the same rows ListVotes returns for one revision at a time. It is the
+// batched half of the owner-distinct guard (WS-FIX-22b), so a listing of many pending
+// rows costs a bounded number of queries instead of one per row.
+//
+// keys are entry ids and revisions (revision 0 means the served revision). Every key
+// gets an entry in the result; one with no counting verdict maps to an empty list.
+func (r *reader) PendingOwnerVoices(ctx context.Context, keys []PendingKey) (map[PendingKey][]Vote, error) {
+	out := make(map[PendingKey][]Vote, len(keys))
+	for start := 0; start < len(keys); start += maxInArgs / 2 {
+		chunk := keys[start:min(start+maxInArgs/2, len(keys))]
+		args := make([]any, 0, 2*len(chunk)+2)
+		clauses := make([]string, len(chunk))
+		args = append(args, VerdictApprove, VerdictReject)
+		for i, k := range chunk {
+			clauses[i] = "(v.entry_id = ? AND v.revision = ?)"
+			args = append(args, k.EntryID, k.Revision)
+		}
+		rows, err := r.query(ctx, `SELECT v.entry_id, v.revision, v.principal, v.principal_owner, v.principal_kind,
+			v.verdict, v.target, v.note, v.evidence_handle, v.content_digest, v.session_id, v.ordinal, v.epoch, v.at
+			FROM votes v JOIN entries e ON e.id = v.entry_id AND e.vote_epoch = v.epoch
+			WHERE v.verdict IN (`+placeholders(2)+`) AND (`+strings.Join(clauses, " OR ")+`)
+			ORDER BY v.entry_id, v.revision, v.ordinal, v.pk`, args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var v Vote
+			if err := rows.Scan(&v.EntryID, &v.Revision, &v.Principal, &v.PrincipalOwner, &v.PrincipalKind, &v.Verdict,
+				&v.Target, &v.Note, &v.EvidenceHandle, &v.ContentDigest, &v.SessionID, &v.Ordinal, &v.Epoch, &v.At); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			k := PendingKey{EntryID: v.EntryID, Revision: v.Revision}
+			out[k] = append(out[k], v)
+		}
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	for _, k := range keys {
+		if _, ok := out[k]; !ok {
+			out[k] = []Vote{}
 		}
 	}
 	return out, nil

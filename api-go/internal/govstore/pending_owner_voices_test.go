@@ -1,0 +1,165 @@
+package govstore
+
+import (
+	"context"
+	"testing"
+)
+
+// TestPendingOwnerVoicesReadsTheCountingVerdictsOfManyRevisions pins the batched read
+// the owner-distinct guard uses: it must return what ListVotes returns for one revision
+// at a time, for every key it was given, and nothing else (WS-FIX-22b).
+func TestPendingOwnerVoicesReadsTheCountingVerdictsOfManyRevisions(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "ctx_a", "a", "a's content")
+	propose(t, s, "ctx_b", "b", "b's content")
+	propose(t, s, "ctx_quiet", "q", "no verdicts here")
+
+	vote(t, s, "ctx_a", alice, VerdictApprove)
+	vote(t, s, "ctx_a", carol, VerdictReject)
+	// a verdict that does not decide verification is not an owner-bound voice
+	vote(t, s, "ctx_b", alice, VerdictDuplicateOf)
+	vote(t, s, "ctx_b", carol, VerdictRetract)
+
+	var got map[PendingKey][]Vote
+	if err := s.View(ctx, func(r Reader) error {
+		var err error
+		got, err = r.PendingOwnerVoices(ctx, []PendingKey{
+			{EntryID: "ctx_a", Revision: 1},
+			{EntryID: "ctx_b", Revision: 1},
+			{EntryID: "ctx_quiet", Revision: 1},
+		})
+		return err
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	if n := len(got[PendingKey{EntryID: "ctx_a", Revision: 1}]); n != 2 {
+		t.Fatalf("ctx_a voices = %d, want the approve and the reject: %+v", n, got)
+	}
+	for _, v := range got[PendingKey{EntryID: "ctx_a", Revision: 1}] {
+		if v.Verdict != VerdictApprove && v.Verdict != VerdictReject {
+			t.Fatalf("a verdict that does not decide verification came back: %+v", v)
+		}
+	}
+	if n := len(got[PendingKey{EntryID: "ctx_b", Revision: 1}]); n != 0 {
+		t.Fatalf("ctx_b voices = %d, want 0 (duplicate_of and retract do not decide): %+v", n, got)
+	}
+	// a key with no counting verdict is present and empty, so a caller can tell
+	// "checked, nothing there" from "not checked"
+	quiet, ok := got[PendingKey{EntryID: "ctx_quiet", Revision: 1}]
+	if !ok || len(quiet) != 0 {
+		t.Fatalf("ctx_quiet = %+v (present %v), want a present empty list", quiet, ok)
+	}
+	if len(got) != 3 {
+		t.Fatalf("the result has %d keys, want one per requested key", len(got))
+	}
+}
+
+// TestPendingOwnerVoicesAgreesWithListVotesRowForRow is the batched read's own parity
+// check: for every entry, the batched result must be exactly what ListVotes returns,
+// so the guard's batched path cannot see a different set of voices than Verify does.
+func TestPendingOwnerVoicesAgreesWithListVotesRowForRow(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	for _, id := range []string{"ctx_a", "ctx_b", "ctx_c", "ctx_d"} {
+		propose(t, s, id, id, id+" content")
+	}
+	vote(t, s, "ctx_a", alice, VerdictApprove)
+	vote(t, s, "ctx_b", carol, VerdictReject)
+	vote(t, s, "ctx_c", alice, VerdictApprove)
+	vote(t, s, "ctx_c", carol, VerdictReject)
+	// a superseding verdict replaces the principal's earlier one, as ListVotes shows
+	vote(t, s, "ctx_d", alice, VerdictApprove)
+	vote(t, s, "ctx_d", alice, VerdictReject)
+
+	var keys []PendingKey
+	for _, id := range []string{"ctx_a", "ctx_b", "ctx_c", "ctx_d"} {
+		keys = append(keys, PendingKey{EntryID: id, Revision: 1})
+	}
+	err := s.View(ctx, func(r Reader) error {
+		batched, err := r.PendingOwnerVoices(ctx, keys)
+		if err != nil {
+			return err
+		}
+		for _, k := range keys {
+			perRow, err := r.ListVotes(ctx, k.EntryID, k.Revision)
+			if err != nil {
+				return err
+			}
+			// ListVotes also lists the verdicts that do not decide verification, so
+			// compare against the owner-bound subset of it, which is what the guard reads
+			var want []Vote
+			for _, v := range perRow {
+				if v.Verdict == VerdictApprove || v.Verdict == VerdictReject {
+					want = append(want, v)
+				}
+			}
+			if len(batched[k]) != len(want) {
+				t.Fatalf("%s: batched %d voices, ListVotes %d: %+v vs %+v",
+					k.EntryID, len(batched[k]), len(want), batched[k], want)
+			}
+			for i := range want {
+				if batched[k][i].Principal != want[i].Principal || batched[k][i].Verdict != want[i].Verdict ||
+					batched[k][i].Revision != want[i].Revision || batched[k][i].PrincipalOwner != want[i].PrincipalOwner {
+					t.Fatalf("%s voice %d: batched %+v, ListVotes %+v", k.EntryID, i, batched[k][i], want[i])
+				}
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestRevisionOwnersReadsTheHeaderWithoutTheBody pins the other batched read: it
+// returns the revision number, the author and the owner the edit event recorded, and
+// it must never carry a revision body (the guard that reads it must stay off the
+// content path).
+func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
+	ctx := context.Background()
+	s := openTestStore(t, newClock())
+	propose(t, s, "ctx_edit", "e", "the build uses make")
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AppendRevision(ctx, RevisionInput{EntryID: "ctx_edit", BaseRevision: 1, Op: "edit",
+			Content: "the build uses make and go", Reason: "add go", Activate: true}, carol)
+		return err
+	})
+	// the edit event records the editor's owner in its provenance
+	mustUpdate(t, s, func(tx Tx) error {
+		_, err := tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
+			Revision: 2, Data: map[string]any{"provenance": map[string]any{"owner": "ops"}}}, carol)
+		return err
+	})
+
+	var got map[PendingKey]RevisionOwner
+	err := s.View(ctx, func(r Reader) error {
+		var err error
+		got, err = r.RevisionOwners(ctx, []PendingKey{
+			{EntryID: "ctx_edit", Revision: 1},
+			{EntryID: "ctx_edit", Revision: 2},
+		})
+		return err
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	first, ok := got[PendingKey{EntryID: "ctx_edit", Revision: 1}]
+	if !ok || first.Revision != 1 || first.Author != "alice" {
+		t.Fatalf("revision 1 = %+v (present %v), want revision 1 by alice", first, ok)
+	}
+	second, ok := got[PendingKey{EntryID: "ctx_edit", Revision: 2}]
+	if !ok || second.Revision != 2 || second.Author != "carol" {
+		t.Fatalf("revision 2 = %+v (present %v), want revision 2 by carol", second, ok)
+	}
+	if second.Owner != "ops" {
+		t.Fatalf("revision 2's recorded owner = %q, want the edit event's ops", second.Owner)
+	}
+	// the entry's own recorded author fields ride along, because the revision-1 arm of
+	// revisionOwner reads them rather than the token store
+	if second.Source != "alice" || first.Source != "alice" {
+		t.Fatalf("entry source = %q, want alice", second.Source)
+	}
+}

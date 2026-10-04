@@ -269,15 +269,26 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 			if err != nil {
 				return err
 			}
+			// One batched owner-distinct read over the page (WS-FIX-22b), instead of
+			// three queries per pending row.
+			candidates := make([]queueCandidate, 0, len(page))
 			for _, e := range page {
 				for _, c := range pendingRevisions(e) {
-					ok, err := q.consider(ctx, r, dataDir, h, &c)
-					if err != nil {
-						return err
-					}
-					if ok {
-						eligible = append(eligible, c)
-					}
+					candidates = append(candidates, c)
+				}
+			}
+			distinct, err := batchOwnerVoices(ctx, r, dataDir, candidates, h, "")
+			if err != nil {
+				return err
+			}
+			for i := range candidates {
+				c := candidates[i]
+				ok, err := q.consider(ctx, r, h, &c, distinct[i])
+				if err != nil {
+					return err
+				}
+				if ok {
+					eligible = append(eligible, c)
 				}
 			}
 			if len(page) < storeListPage {
@@ -320,8 +331,10 @@ func pendingRevisions(e govstore.Entry) []queueCandidate {
 }
 
 // consider reports whether h may vote on c, filling its revision and votes, or counts
-// why not.
-func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir string, h HumanApprover, c *queueCandidate) (bool, error) {
+// why not. distinct is the candidate's already-batched owner-distinct verdict
+// (WS-FIX-22b), so this reads nothing for it.
+func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, h HumanApprover,
+	c *queueCandidate, distinct error) (bool, error) {
 	e, me := c.entry, h.Principal.ID
 	rv, err := r.GetRevision(ctx, e.ID, c.revision)
 	if err != nil {
@@ -337,14 +350,10 @@ func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir
 		skip = skipOwn
 	case votedBy(votes, me):
 		skip = skipVoted
-	default:
-		err := checkOwnerDistinct(ctx, r, dataDir, e, govstore.VoteInput{EntryID: e.ID, Revision: c.revision,
-			Verdict: govstore.VerdictApprove}, h.actor())
-		if errors.Is(err, ErrSameOwner) {
-			skip = skipSameOwner
-		} else if err != nil {
-			return false, err
-		}
+	case errors.Is(distinct, ErrSameOwner):
+		skip = skipSameOwner
+	case distinct != nil:
+		return false, distinct
 	}
 	if skip != "" {
 		q.Skipped[skip]++

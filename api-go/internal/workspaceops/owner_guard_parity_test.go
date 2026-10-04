@@ -30,13 +30,15 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	cases = append(cases, guardCase{"entry author", mine.ID, 0})
 
 	// the revision's author arm, reached through the edit event's recorded owner
-	// rather than the proposal's.
+	// rather than the proposal's. The editor is an admin holding no token of its own,
+	// so only the owner its edit recorded ties this revision to bob.
 	edited := promoted(t, dir, ws, "carol", "the build uses make")
 	if _, err := EditContext(dir, ws, edited.ID, EditRequest{BaseRevision: 1, Reason: "add go", NewString: " and go"},
-		ContextActor{ID: "bob-bot", Owner: "bob"}); err != nil {
+		ContextActor{ID: "editor-1", Owner: "bob", Admin: true}); err != nil {
 		t.Fatal(err)
 	}
-	cases = append(cases, guardCase{"revision author", edited.ID, edited.HeadRevision})
+	// the pending edit is the entry's head revision, which ContextEntry does not carry
+	cases = append(cases, guardCase{"revision author", edited.ID, headRevision(t, dir, ws, edited.ID)})
 
 	// the owner-bound verdict arm: another of bob's principals already approved.
 	// bob-bot is not bob's id, so only the verdict arm can refuse this one.
@@ -67,6 +69,25 @@ func parityFixture(t *testing.T, dir, ws, voterID string) []guardCase {
 	cases = append(cases, guardCase{"own earlier verdict", own.ID, 0})
 
 	return cases
+}
+
+// headRevision is the entry's pending head revision, which ContextEntry does not
+// carry: a voter names it on the entry, the context view does not expose it.
+func headRevision(t *testing.T, dir, ws, entryID string) int64 {
+	t.Helper()
+	var head int64
+	err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
+		e, err := r.GetEntry(context.Background(), entryID)
+		if err != nil {
+			return err
+		}
+		head = e.HeadRevision
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("head revision of %s: %v", entryID, err)
+	}
+	return head
 }
 
 // candidatesOf reads the store's view of every fixture case, so both guards are
@@ -103,7 +124,7 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 
 	err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
 		guarded := candidatesOf(t, r, cases)
-		batched, err := batchOwnerVoices(context.Background(), r, dataDir(dir), guarded, h)
+		batched, err := batchOwnerVoices(context.Background(), r, dir, guarded, h)
 		if err != nil {
 			return err
 		}
@@ -113,7 +134,7 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 
 		refused, allowed := 0, 0
 		for i, c := range guarded {
-			perRow := checkOwnerDistinct(context.Background(), r, dataDir(dir), c.entry,
+			perRow := checkOwnerDistinct(context.Background(), r, dir, c.entry,
 				govstore.VoteInput{EntryID: c.entry.ID, Revision: c.revision, Verdict: govstore.VerdictApprove}, voter)
 			switch {
 			case errors.Is(perRow, ErrSameOwner):
@@ -153,7 +174,7 @@ func TestTheBatchedOwnerGuardExemptsTheGateAndPolicyThatThePerRowGuardExempts(t 
 		guarded := candidatesOf(t, r, cases)
 
 		// a verdict that does not decide verification is not owner-bound
-		got, err := batchOwnerVoices(context.Background(), r, dataDir(dir), guarded, h,
+		got, err := batchOwnerVoices(context.Background(), r, dir, guarded, h,
 			batchVerdict(govstore.VerdictRetract))
 		if err != nil {
 			return err
@@ -166,7 +187,7 @@ func TestTheBatchedOwnerGuardExemptsTheGateAndPolicyThatThePerRowGuardExempts(t 
 
 		// a single-assertion gate is the operator opting out of peers
 		guarded[0].entry.RequiredVerifications = 1
-		got, err = batchOwnerVoices(context.Background(), r, dataDir(dir), guarded[:1], h)
+		got, err = batchOwnerVoices(context.Background(), r, dir, guarded[:1], h)
 		if err != nil {
 			return err
 		}
@@ -189,7 +210,7 @@ func TestTheBatchedOwnerGuardSkipsEveryCheckUnderTheTokenPolicy(t *testing.T) {
 
 	err := memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
 		guarded := candidatesOf(t, r, cases)
-		got, err := batchOwnerVoices(context.Background(), r, dataDir(dir), guarded, h)
+		got, err := batchOwnerVoices(context.Background(), r, dir, guarded, h)
 		if err != nil {
 			return err
 		}

@@ -2,6 +2,7 @@ package govstore
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -89,6 +90,9 @@ type RevisionReader interface {
 	// EntryContents returns the served content for each id, re-hashed against the
 	// recorded digest.
 	EntryContents(ctx context.Context, ids []string) (map[string]EntryContent, error)
+	// RevisionOwners returns each named revision's author and recorded owner without
+	// reading its content.
+	RevisionOwners(ctx context.Context, keys []PendingKey) (map[PendingKey]RevisionOwner, error)
 }
 
 // RevisionWriter writes revisions.
@@ -188,6 +192,125 @@ func (r *reader) EntryContents(ctx context.Context, ids []string) (map[string]En
 			out[id] = c
 		}
 		// A failed step ends the loop early; report it instead of a partial result.
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// RevisionOwner is what a revision's author arm reads: the revision number, the
+// principal that wrote it, and the owner its edit event recorded (empty when the
+// revision was not written by an edit, or when the event recorded none). It carries no
+// content: the guard that reads it must never load a revision body.
+//
+// Source and SourceOwner are the entry's own recorded author fields, because the
+// revision-1 arm of revisionOwner reads them rather than the token store: a write that
+// recorded no owner still carries the owner it recorded at write time, which survives
+// the token being revoked.
+type RevisionOwner struct {
+	Revision    int64  `json:"revision"`
+	Author      string `json:"author"`
+	Owner       string `json:"owner,omitempty"`
+	Source      string `json:"source"`
+	SourceOwner string `json:"source_owner,omitempty"`
+}
+
+// RevisionOwners reads RevisionOwner for many entry revisions at once, the batched
+// half of revisionOwner (WS-FIX-22b). The owner column is the `provenance.owner` the
+// entry's edit event for that revision carries, which is the same row revisionOwner
+// reads one entry at a time.
+func (r *reader) RevisionOwners(ctx context.Context, keys []PendingKey) (map[PendingKey]RevisionOwner, error) {
+	out := make(map[PendingKey]RevisionOwner, len(keys))
+	for start := 0; start < len(keys); start += maxInArgs / 2 {
+		chunk := keys[start:min(start+maxInArgs/2, len(keys))]
+		args := make([]any, 0, 2*len(chunk))
+		clauses := make([]string, len(chunk))
+		for i, k := range chunk {
+			clauses[i] = "(r.entry_id = ? AND r.revision = ?)"
+			args = append(args, k.EntryID, k.Revision)
+		}
+		rows, err := r.query(ctx, "SELECT r.entry_id, r.revision, r.author, e.source, e.source_owner FROM revisions r "+
+			"JOIN entries e ON e.id = r.entry_id WHERE "+strings.Join(clauses, " OR ")+
+			" ORDER BY r.entry_id, r.revision", args...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var k PendingKey
+			var ro RevisionOwner
+			if err := rows.Scan(&k.EntryID, &ro.Revision, &ro.Author, &ro.Source, &ro.SourceOwner); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			out[k] = ro
+		}
+		err = rows.Err()
+		if cerr := rows.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// the owner each revision's edit event recorded, in one pass over the same keys
+	owners, err := r.editEventOwners(ctx, keys)
+	if err != nil {
+		return nil, err
+	}
+	for k, owner := range owners {
+		if ro, ok := out[k]; ok {
+			ro.Owner = owner
+			out[k] = ro
+		}
+	}
+	return out, nil
+}
+
+// editEventOwners reads the `provenance.owner` the entry's edit event for each named
+// revision carries, in bounded batches. It is the same row revisionOwner reads one
+// entry at a time; a revision with no edit event (a proposal, or an event that recorded
+// none) is absent from the result.
+func (r *reader) editEventOwners(ctx context.Context, keys []PendingKey) (map[PendingKey]string, error) {
+	out := make(map[PendingKey]string, len(keys))
+	for start := 0; start < len(keys); start += maxInArgs / 2 {
+		chunk := keys[start:min(start+maxInArgs/2, len(keys))]
+		args := make([]any, 0, 2*len(chunk))
+		clauses := make([]string, len(chunk))
+		for i, k := range chunk {
+			clauses[i] = "(entry_id = ? AND revision = ?)"
+			args = append(args, k.EntryID, k.Revision)
+		}
+		rows, err := r.query(ctx, "SELECT entry_id, revision, data FROM events WHERE type = ? AND ("+
+			strings.Join(clauses, " OR ")+") ORDER BY entry_id, revision, seq", append([]any{EventEdit}, args...)...)
+		if err != nil {
+			return nil, err
+		}
+		for rows.Next() {
+			var k PendingKey
+			var data []byte
+			if err := rows.Scan(&k.EntryID, &k.Revision, &data); err != nil {
+				rows.Close()
+				return nil, err
+			}
+			// the first edit event for a revision is the one revisionOwner reads
+			if _, seen := out[k]; seen {
+				continue
+			}
+			var parsed struct {
+				Provenance struct {
+					Owner string `json:"owner"`
+				} `json:"provenance"`
+			}
+			if json.Unmarshal(data, &parsed) == nil {
+				out[k] = parsed.Provenance.Owner
+			}
+		}
 		err = rows.Err()
 		if cerr := rows.Close(); err == nil {
 			err = cerr
