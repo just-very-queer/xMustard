@@ -1350,6 +1350,66 @@ fn a_flow_that_really_spans_two_communities_is_reported_cross() {
 
 // --- truncation stats and refusals ------------------------------------------
 
+/// A cycle back to a symbol the walk already holds is not a truncation.
+///
+/// The callee loop tests the depth and branching bounds before it knows whether the callee
+/// is new. A callee already in the step list is re-queued rather than counted — it cannot
+/// lose a step, because it is already in the answer — so a walk that runs to the depth cap
+/// and then closes a cycle would report `truncated=true` with every counter describing work
+/// the answer did not actually lose. The counters exist so a short answer is never read as a
+/// truncated one, so they may not claim truncation where nothing was dropped.
+///
+/// The fixture closes a cycle at exactly the cap: a chain of ten hops whose last symbol calls
+/// back to the head of the chain. The chain alone would be a clean ten-step flow; with the
+/// back-edge the walk is still ten steps, because every symbol on it is already held.
+#[test]
+fn a_cycle_that_returns_to_a_held_symbol_at_the_depth_cap_is_not_counted_as_truncated() {
+    // `Mid0..Mid9` is a ten-hop chain and `Mid9` calls back to `Mid0`, so the cycle closes
+    // at the depth cap. `Root` is the seed and reaches `Mid0`, so the walk is Root -> Mid0 ..
+    // Mid9 = ten steps, and the back-edge from Mid9 to Mid0 offers nothing new.
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/cycle.go",
+            gofuncs_ref(&[
+                go_func("Root", &["Mid0"]),
+                go_func("Mid0", &["Mid1"]),
+                go_func("Mid1", &["Mid2"]),
+                go_func("Mid2", &["Mid3"]),
+                go_func("Mid3", &["Mid4"]),
+                go_func("Mid4", &["Mid5"]),
+                go_func("Mid5", &["Mid6"]),
+                go_func("Mid6", &["Mid7"]),
+                go_func("Mid7", &["Mid8"]),
+                go_func("Mid8", &["Mid9"]),
+                // The back-edge, closing the cycle at the cap.
+                go_func("Mid9", &["Mid0"]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let fs = read_flows(&v);
+    let root = fs
+        .iter()
+        .find(|f| f.seeds.iter().any(|s| s == "Root"))
+        .unwrap_or_else(|| panic!("the flow seeded at Root in {fs:?}"));
+    assert_eq!(root.steps.len(), 10, "ten hops from the seed: {root:?}");
+    assert_eq!(
+        root.steps_omitted, 0,
+        "the cycle closes on a symbol the walk already holds, so nothing is omitted: {root:?}"
+    );
+    let t = truncation(&v);
+    assert_eq!(
+        t["truncated_at_depth"], 0,
+        "no step was lost to the depth cap: {t:?}"
+    );
+    assert_eq!(
+        t["truncated_at_branching"], 0,
+        "no step was lost to the branching cap: {t:?}"
+    );
+}
+
 #[test]
 fn a_small_repository_answers_with_every_cap_reported_and_nothing_but_min_steps_hit() {
     let d = repo(&[

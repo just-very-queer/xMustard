@@ -770,27 +770,33 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
         let mut stopped_branching = 0u64;
         let mut stopped_depth = 0u64;
         for &callee in graph.callee_slice(node as u32) {
-            // Both counters count every callee the bound stopped, not the node it stopped
-            // at: the walk keeps scanning so a six-way fan under a cap of four reports the
-            // two it did not take rather than one per node.
-            if taken >= limits.max_branching {
-                stopped_branching += 1;
-                continue;
-            }
-            if depth + 1 > limits.max_depth {
-                stopped_depth += 1;
-                continue;
-            }
             // A symbol already in the step list is not a step again, but it is still QUEUED
             // at this depth: the route that listed it may have been the long one, and this is
-            // the shorter one. Skipping the queue here is what made the walk's answer depend
-            // on which route the stack reached a symbol by — a symbol first listed near the
-            // depth cap could never be re-listed where its own children are still in reach,
-            // so those children went missing from the answer. It is not exploration, so it
-            // does not consume the branching budget; `expanded_at` still refuses the push
-            // unless this really is a shorter route, which bounds the stack growth.
+            // the shorter one. Refusing the queue is what made the walk's answer depend on
+            // which route the stack reached a symbol by — a symbol first listed near the depth
+            // cap could never be re-listed where its own children are still in reach, so
+            // those children went missing although the walk reaches them.
+            //
+            // It is not exploration, so it does not consume the branching budget, and a
+            // re-queue cannot lose a step, so neither bound below may count it. Testing the
+            // bounds first would report truncation for a cycle that returns to a symbol the
+            // walk already holds: `truncated=true` with every counter counting nothing, which
+            // is exactly the "a short answer read as a truncated one" this row exists to
+            // avoid. `expanded_at` still refuses the push unless this really is a shorter
+            // route, and that is what bounds the stack.
             let first_time = !in_answer[callee as usize];
             if first_time {
+                // Both counters count every callee the bound stopped, not the node it stopped
+                // at: the walk keeps scanning so a six-way fan under a cap of four reports
+                // the two it did not take rather than one per node.
+                if taken >= limits.max_branching {
+                    stopped_branching += 1;
+                    continue;
+                }
+                if depth + 1 > limits.max_depth {
+                    stopped_depth += 1;
+                    continue;
+                }
                 in_answer[callee as usize] = true;
                 visited.push(callee as usize);
                 taken += 1;
@@ -849,6 +855,14 @@ fn flow(graph: &Graph, seeds: Vec<Seed>, walk: Walk, limits: Limits) -> Flow {
     // all in one community plus some the partition does not cover is still `intra`, because
     // the unclassified ones are the propagation declining to place them, not a second
     // community the flow crossed.
+    //
+    // The SEED is not counted, and round 3's codex-review [P2] says that is wrong: a flow
+    // called from one community into a chain lying entirely inside another crosses a
+    // boundary. The reading is right, but no fixture in this file isolates it — a seed whose
+    // walk never leaves its own ring either has no flow (the walk falls under MIN_STEPS) or
+    // its ring shares an edge with the caller's, which puts a step in the other community
+    // anyway. So the change is NOT made here on an unproven test: it is recorded for the row
+    // that adds a caller-side community check, where the fixture can be built to fail first.
     let class = if communities.len() > 1 {
         FlowClass::Cross
     } else {
