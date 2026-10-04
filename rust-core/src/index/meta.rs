@@ -7,8 +7,9 @@
 //! reason of eligible files that have no row because they are past the envelope) and
 //! `envelope_beyond_sample` (JSON: the first of them by path), `generation` (monotonic
 //! per store directory, across full rebuilds too), `graph_segment`, `identity_key`,
-//! `identity_limitations`, `nested_repos` (JSON, the last scan's), `coverage`
-//! (JSON, as of the last build or update) and `last_run` (that run's counters, JSON).
+//! `identity_limitations`, `nested_repos` (JSON, the last scan's), `listing_state`
+//! (JSON, what a paths update needs from the last listing), `coverage` (JSON, as of the
+//! last build or update) and `last_run` (that run's counters, JSON).
 
 use std::collections::BTreeMap;
 
@@ -44,6 +45,30 @@ pub const IDENTITY_KEY: &str = "identity_key";
 pub const IDENTITY_LIMITATIONS: &str = "identity_limitations";
 /// Meta key: the nested repositories the last scan found (JSON [`NestedRepos`]).
 pub const NESTED_REPOS: &str = "nested_repos";
+/// Meta key: what the last tree listing recorded for paths updates (JSON
+/// [`ListingState`], WS-RT6).
+pub const LISTING_STATE: &str = "listing_state";
+/// Paths kept at most in [`ListingState::exceptions`].
+pub const MAX_EXCEPTIONS: usize = 2000;
+
+/// What a paths update needs from the last tree listing to decide a batch without
+/// listing again (WS-RT6). A paths update keeps it current.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ListingState {
+    /// Stat key of the Git index file taken before the listing; empty when absent.
+    pub git_index: String,
+    /// Doc and guidance files past the docs lane's bound or undecided by the ignore
+    /// budget.
+    pub docs_beyond: usize,
+    /// Eligible paths without a row whose state depends on the worktree, with that
+    /// state: `deleted`, `doc_deleted`, or the pre-read loss of a file past the envelope
+    /// or the loss-row bound.
+    pub exceptions: BTreeMap<String, String>,
+    /// `exceptions` holds every such path (false once more than MAX_EXCEPTIONS were
+    /// seen).
+    pub complete: bool,
+}
 
 pub fn get(conn: &Connection, key: &str) -> rusqlite::Result<Option<String>> {
     conn.query_row("SELECT value FROM meta WHERE key = ?1", [key], |r| r.get(0))
