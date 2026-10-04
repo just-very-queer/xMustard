@@ -200,8 +200,9 @@ func TestRevisionOwnersReadsTheHeaderWithoutTheBody(t *testing.T) {
 	// Verify about who owns the row. This is the shape a caller-authored AppendEvent
 	// produces, since it does not check the event it is about to duplicate.
 	mustUpdate(t, s, func(tx Tx) error {
-		return tx.AppendRevision(ctx, RevisionInput{EntryID: "ctx_edit", BaseRevision: 2, Op: "edit",
+		_, err := tx.AppendRevision(ctx, RevisionInput{EntryID: "ctx_edit", BaseRevision: 2, Op: "edit",
 			Content: "the build uses make and go and make", Reason: "add make", Activate: true}, carol)
+		return err
 	})
 	mustUpdate(t, s, func(tx Tx) error {
 		return tx.AppendEvent(ctx, EventInput{WorkspaceID: "ws1", EntryID: "ctx_edit", Type: EventEdit,
