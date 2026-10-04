@@ -806,7 +806,7 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
             // step — an answer whose reported depth contradicts the cap printed beside it.
             // `expanded_at` refuses the expansion anyway, so skipping the push changes no
             // step; it only keeps the reported depth honest.
-            if depth + 1 <= limits.max_depth {
+            if depth < limits.max_depth {
                 deepest = deepest.max(depth + 1);
                 stack.push((callee as usize, depth + 1));
             }

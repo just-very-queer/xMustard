@@ -1760,7 +1760,7 @@ fn a_repository_with_no_resolved_calls_answers_zero_flows_rather_than_failing() 
         0,
         "a leaf has no callees and is not a seed"
     );
-    assert_eq!(v["truncated"].as_bool().unwrap(), false, "{v:#}");
+    assert!(!v["truncated"].as_bool().unwrap(), "{v:#}");
     assert_eq!(v["symbols_considered"].as_u64().unwrap(), 1, "{v:#}");
 }
 
