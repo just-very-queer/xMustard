@@ -30,8 +30,8 @@ use super::extract::Lang;
 use super::ignore::XMUSTARD_IGNORE;
 use super::meta::{self, ListingState, MAX_EXCEPTIONS, MAX_LOSS_ENTRIES, NestedRepos};
 use super::scan::{
-    self, Candidate, DELETED, DOC_DELETED, DocCandidate, Layout, MAX_DOC_FILES, MAX_LOSS_ROWS,
-    Mode, Scan, StatKey,
+    self, Candidate, DELETED, DELETED_SYMLINK, DOC_DELETED, DOC_DELETED_SYMLINK, DocCandidate,
+    Layout, MAX_DOC_FILES, MAX_LOSS_ROWS, Mode, Scan, StatKey,
 };
 use super::{Existing, normalize_paths};
 
@@ -70,9 +70,12 @@ pub enum ListingReason {
     ExceptionsIncomplete,
     /// Re-planning the symbol budget rewrites a file outside the batch.
     SymbolBudget,
-    /// The batch names a directory that is gone, or that is new and may hold restored
-    /// files, so files it does not name may have changed.
+    /// The batch names a path that holds or held indexed files, or a directory past the
+    /// cut, so files it does not name may have changed.
     Directory,
+    /// A path last seen as a symlink is no longer one; whether Git tracks it as a symlink
+    /// (and a full listing keeps the `symlink` loss) only the Git index says.
+    SymlinkMode,
 }
 
 /// How an update found the files it compared (`IndexReport::listing`).
@@ -220,9 +223,11 @@ fn other_kind(root: &Path, path: &str) -> Other {
     }
 }
 
-fn has_doc_row(conn: &Connection, path: &str) -> rusqlite::Result<bool> {
-    conn.prepare_cached("SELECT 1 FROM docs WHERE path = ?1")?
-        .exists([path])
+/// The stored status of doc `path`, if it has a row.
+fn doc_status(conn: &Connection, path: &str) -> rusqlite::Result<Option<String>> {
+    conn.prepare_cached("SELECT status FROM docs WHERE path = ?1")?
+        .query_row([path], |r| r.get(0))
+        .optional()
 }
 
 fn meta_json<T: DeserializeOwned>(conn: &Connection, key: &str) -> rusqlite::Result<Option<T>> {
@@ -481,17 +486,15 @@ impl Plan {
     }
 }
 
-/// The effect of a named path that is not a source or doc file. A file needs
-/// nothing. A directory may stand for files the batch does not name: one that is gone
-/// held rows, or files past the cut or the docs lane's last row; one that is new (or
-/// replaced) may hold restored tracked files (exceptions under it).
-fn other_effect(kind: Other, rows_under: bool, exceptions_under: bool, past: bool) -> Decided {
-    match (kind, rows_under, exceptions_under, past) {
-        (Other::File, ..) => Ok(()),
-        (Other::Dir, _, true, _) | (Other::Gone, true, _, _) | (Other::Gone, _, _, true) => {
-            Err(ListingReason::Directory)
-        }
-        (Other::Dir, ..) | (Other::Gone, ..) => Ok(()),
+/// The effect of a named path that is not a source or doc file. Stored rows or
+/// exceptions under it mean it is, or was, a directory whose files the batch may not
+/// name (a rename names only the two directories, a directory replaced by a file names
+/// the file); a directory that is gone or new past the cut may have held or now hold
+/// files past it, whose counts nothing stores. Both list the tree.
+fn other_effect(kind: Other, held: bool, past: bool) -> Decided {
+    match (kind, held, past) {
+        (_, true, _) | (Other::Dir | Other::Gone, _, true) => Err(ListingReason::Directory),
+        _ => Ok(()),
     }
 }
 
@@ -593,10 +596,15 @@ fn scope_inner(
             (Some(lang), _) => {
                 let row = named_row(conn, cfg, path)?;
                 crate::passcount::note(crate::passcount::Pass::RowsLoaded, row.is_some() as u64);
+                let was_symlink = match (&row, exception.as_deref()) {
+                    (Some((ex, true, _)), _) => ex.parse_status == "symlink",
+                    (None, Some(state)) => matches!(state, "symlink" | DELETED_SYMLINK),
+                    _ => false,
+                };
                 let before = match (&row, exception.as_deref()) {
                     (Some((_, false, size)), _) => Before::Kept(*size),
                     (Some((_, true, _)), _) => Before::LossRow,
-                    (None, Some(DELETED)) => Before::Deleted,
+                    (None, Some(DELETED | DELETED_SYMLINK)) => Before::Deleted,
                     (None, Some(reason)) => Before::BeyondLoss(reason.to_string()),
                     (None, None) => Before::Unknown,
                 };
@@ -609,6 +617,9 @@ fn scope_inner(
                     Some((_, Some(loss))) => After::Loss(loss),
                     Some((st, None)) => After::Readable(st.size),
                 };
+                if was_symlink && !matches!(after, After::Gone | After::Loss("symlink")) {
+                    return Ok(Err(SymlinkMode));
+                }
                 let beyond = plan.cut && *path > facts.last_path;
                 let decided = plan.source(path, &before, after, beyond);
                 let listed = matches!(
@@ -633,8 +644,11 @@ fn scope_inner(
                 decided
             }
             (None, Some(role)) => {
-                // a doc path only ever carries the doc_deleted exception
-                let before = match (has_doc_row(conn, path)?, exception.is_some()) {
+                // a doc path only ever carries a doc_deleted exception
+                let status = doc_status(conn, path)?;
+                let was_symlink = status.as_deref() == Some("symlink")
+                    || exception.as_deref() == Some(DOC_DELETED_SYMLINK);
+                let before = match (status.is_some(), exception.is_some()) {
                     (true, _) => DocBefore::Row,
                     (false, true) => DocBefore::Deleted,
                     (false, false) => DocBefore::Unknown,
@@ -643,6 +657,13 @@ fn scope_inner(
                     return Ok(Err(ExceptionsIncomplete));
                 }
                 let doc = scan::doc_candidate(&layout.root, path.clone(), role, Mode::Regular, cfg);
+                let still = match &doc {
+                    Ok(d) => d.loss == Some("symlink"),
+                    Err(_) => true,
+                };
+                if was_symlink && !still {
+                    return Ok(Err(SymlinkMode));
+                }
                 let beyond = plan.doc_full && *path > facts.last_doc;
                 let decided = plan.doc(path, before, doc.is_ok(), beyond);
                 let listed = before == DocBefore::Row || (before == DocBefore::Deleted && !beyond);
@@ -653,13 +674,12 @@ fn scope_inner(
             }
             (None, None) => {
                 let kind = other_kind(&layout.root, path);
-                let hi = format!("{path}0");
+                let (lo, hi) = (format!("{path}/"), format!("{path}0"));
                 let past =
                     (plan.cut && hi > facts.last_path) || (plan.doc_full && hi > facts.last_doc);
-                let under = kind != Other::File && rows_under(conn, path)?;
-                let lo = format!("{path}/");
-                let exceptions_under = plan.state.exceptions.range(lo..hi).next().is_some();
-                other_effect(kind, under, exceptions_under, past)
+                let held =
+                    rows_under(conn, path)? || plan.state.exceptions.range(lo..hi).next().is_some();
+                other_effect(kind, held, past)
             }
         };
         if let Err(reason) = decided {
@@ -802,22 +822,24 @@ mod tests {
     }
 
     #[test]
-    fn a_gone_or_restored_directory_lists_the_tree() {
-        assert_eq!(other_effect(Other::File, true, true, true), Ok(()));
-        assert_eq!(other_effect(Other::Gone, false, true, false), Ok(()));
-        assert_eq!(
-            other_effect(Other::Gone, true, false, false),
-            Err(ListingReason::Directory)
-        );
-        assert_eq!(
-            other_effect(Other::Gone, false, false, true),
-            Err(ListingReason::Directory)
-        );
-        assert_eq!(other_effect(Other::Dir, true, false, true), Ok(()));
-        assert_eq!(
-            other_effect(Other::Dir, false, true, false),
-            Err(ListingReason::Directory)
-        );
+    fn a_path_that_held_files_or_a_directory_past_the_cut_lists_the_tree() {
+        use ListingReason::Directory;
+        for (kind, held, past, want) in [
+            (Other::File, false, true, Ok(())),
+            (Other::File, true, false, Err(Directory)),
+            (Other::Dir, false, false, Ok(())),
+            (Other::Dir, true, false, Err(Directory)),
+            (Other::Dir, false, true, Err(Directory)),
+            (Other::Gone, false, false, Ok(())),
+            (Other::Gone, true, false, Err(Directory)),
+            (Other::Gone, false, true, Err(Directory)),
+        ] {
+            assert_eq!(
+                other_effect(kind, held, past),
+                want,
+                "{kind:?} {held} {past}"
+            );
+        }
     }
 
     #[test]

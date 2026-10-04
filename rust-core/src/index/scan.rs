@@ -159,6 +159,10 @@ pub const SECRET_PATH: &str = "secret_path";
 pub const DELETED: &str = "deleted";
 /// Listing-state exception: a tracked doc or guidance file missing from the worktree.
 pub const DOC_DELETED: &str = "doc_deleted";
+/// Listing-state exceptions for a missing file the Git index records as a symlink: only
+/// the index knows that mode, so a paths update cannot judge what replaces it.
+pub const DELETED_SYMLINK: &str = "deleted_symlink";
+pub const DOC_DELETED_SYMLINK: &str = "doc_deleted_symlink";
 
 /// Tracked docs and guidance files the docs lane indexes at most (the smallest paths).
 pub const MAX_DOC_FILES: usize = 2000;
@@ -568,7 +572,13 @@ impl<'a> Collector<'a> {
     fn add_doc(&mut self, path: String, role: &'static str, mode: Mode) {
         let doc = match doc_candidate(self.root, path, role, mode, self.cfg) {
             Ok(doc) => doc,
-            Err(gone) => return self.note_exception(gone, DOC_DELETED),
+            Err(gone) => {
+                let state = match mode {
+                    Mode::Symlink => DOC_DELETED_SYMLINK,
+                    _ => DOC_DELETED,
+                };
+                return self.note_exception(gone, state);
+            }
         };
         self.docs.push(DocByPath(doc));
         if self.docs.len() > MAX_DOC_FILES {
@@ -581,7 +591,11 @@ impl<'a> Collector<'a> {
         match stat_file(self.root, &path, mode, self.cfg.max_file_size) {
             None => {
                 self.worktree_deleted += 1;
-                self.note_exception(path, DELETED);
+                let state = match mode {
+                    Mode::Symlink => DELETED_SYMLINK,
+                    _ => DELETED,
+                };
+                self.note_exception(path, state);
             }
             Some((stat, loss)) => self.push(Candidate {
                 path,
