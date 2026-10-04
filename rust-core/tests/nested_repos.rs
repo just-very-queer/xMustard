@@ -453,3 +453,52 @@ fn the_repo_map_walk_skips_nested_repositories() {
     let map = build_repo_map(r.path(), "ws").unwrap();
     assert_eq!(map.source_files, 1, "{map:?}");
 }
+
+// The key and its limitation count are one write: when the count cannot be stored the
+// key is not moved either, so no reader sees a new key beside the previous count.
+#[test]
+fn the_identity_stamp_is_written_whole_or_not_at_all() {
+    let r = outer();
+    let root = r.path().to_str().unwrap();
+    let v = run_json(&[
+        "index",
+        "update",
+        root,
+        "--identity-key",
+        "k1",
+        "--identity-limitations",
+        "1",
+    ]);
+    let db = v["index_path"].as_str().unwrap().to_string();
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute_batch(
+            "CREATE TRIGGER refuse_count_insert BEFORE INSERT ON meta \
+             WHEN NEW.key = 'identity_limitations' BEGIN SELECT RAISE(ABORT, 'refused'); END; \
+             CREATE TRIGGER refuse_count_update BEFORE UPDATE ON meta \
+             WHEN NEW.key = 'identity_limitations' BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+    let out = Command::new(BIN)
+        .args([
+            "index",
+            "update",
+            root,
+            "--identity-key",
+            "k2",
+            "--identity-limitations",
+            "0",
+        ])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "the refused count fails the update");
+    let key: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT value FROM meta WHERE key = 'identity_key'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(key, "k1", "the key moved without its count");
+}

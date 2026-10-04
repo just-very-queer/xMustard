@@ -1615,7 +1615,14 @@ mod tests {
         )
         .unwrap();
         let tail = nested_repo_token(&dir).unwrap();
+        // a packed-refs that exists but cannot be opened (a symlink loop) keys nothing
         fs::remove_file(git.join("packed-refs")).unwrap();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("packed-refs", git.join("packed-refs")).unwrap();
+            assert_eq!(nested_repo_token(&dir), None);
+            fs::remove_file(git.join("packed-refs")).unwrap();
+        }
         let unborn = nested_repo_token(&dir).unwrap();
         assert!(unborn != a && unborn != b);
         assert_eq!(tail, unborn, "the tail of an over-long line names no ref");
