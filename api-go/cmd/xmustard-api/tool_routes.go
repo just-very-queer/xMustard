@@ -122,9 +122,17 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	for name := range q {
 		params[name] = q.Get(name)
 	}
-	if err := workspaceops.ResolveImpactCursor(ws, q, params); err != nil {
-		respondError(w, err)
-		return
+	// impact's tier cursor is decoded here, before the form is known, because
+	// CheckImpactRequest must see one page position rather than two (WS-59e). An
+	// occurrence cursor (op=, WS-59d) is a different key over a different list and is
+	// signed and decoded by the occurrence read itself, so it is left for that call:
+	// decoding it here would refuse every valid occurrence cursor as one signed for
+	// another ranking.
+	if q.Get("op") == "" {
+		if err := workspaceops.ResolveImpactCursor(ws, q, params); err != nil {
+			respondError(w, err)
+			return
+		}
 	}
 	form, rest, err := workspaceops.CheckImpactRequest(params)
 	if err != nil {
@@ -136,10 +144,16 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	case workspaceops.ImpactTrace:
 		result, err = workspaceops.TraceSymbolsCtx(r.Context(), dd, ws, q.Get("from"), q.Get("to"), rest)
 	case workspaceops.ImpactBlast:
-		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
-		if err == nil {
-			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
-			result = workspaceops.WithImpactPaging(ws, q, result)
+		switch rest["op"] {
+		case "":
+			result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
+			if err == nil {
+				result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+				result = workspaceops.WithImpactPaging(ws, q, result)
+			}
+		default:
+			// op= is an occurrence read (WS-59d), not the tier walk
+			result, err = workspaceops.SymbolOccurrencesCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
 		}
 	case workspaceops.ImpactFile:
 		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
