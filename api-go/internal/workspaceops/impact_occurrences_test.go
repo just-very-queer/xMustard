@@ -81,6 +81,92 @@ func TestATierCursorIsBoundToTheOperationItWasSignedFor(t *testing.T) {
 	}
 }
 
+// No occurrence operation walks the graph, so a tier-walk argument is refused for all
+// three of them, refs included. The parameters a request carries are the whole set, and
+// the pair a cursor forms with an offset is refused before the cursor is dropped, so one
+// call cannot name two page positions.
+func TestEveryOccurrenceOperationRefusesAWalkArgument(t *testing.T) {
+	// the list read itself forwards no walk argument and is not refused
+	if _, err := occurrenceCoreParams(map[string]string{"op": "refs", "limit": "5"}); err != nil {
+		t.Fatalf("a plain occurrence read was refused: %v", err)
+	}
+	// a cursor beside an offset names two positions and is refused by the same check the
+	// tier path uses, for every operation and whether or not the cursor is signed
+	page, err := signOccurrencePage([]byte(`{"next_cursor":"6"}`), occurrenceRanking("ws", "Store", "refs"))
+	if err != nil {
+		t.Fatalf("sign a page for the walk-argument cases: %v", err)
+	}
+	var signedPage map[string]json.RawMessage
+	if err := json.Unmarshal(page, &signedPage); err != nil {
+		t.Fatal(err)
+	}
+	var signedCursor string
+	if err := json.Unmarshal(signedPage["next_cursor"], &signedCursor); err != nil {
+		t.Fatal(err)
+	}
+	for _, op := range OccurrenceOps {
+		for _, cursor := range []string{"abc", signedCursor} {
+			// through the helper the request actually takes, so the ordering it fixes is
+			// what is under test and not the check in isolation. The refusal is the
+			// contract: a request like this must never produce flags at all, because the
+			// caller's offset and the cursor's own would both reach the core as
+			// --offset and the second would silently win.
+			p := map[string]string{"op": op, "offset": "2", "cursor": cursor}
+			core, err := occurrenceCoreParams(p)
+			if !IsInvalidInput(err) {
+				t.Fatalf("op=%s took a cursor beside an offset (%q): %v", op, cursor, err)
+			}
+			if core != nil {
+				t.Fatalf("op=%s was refused but still handed parameters: %v", op, core)
+			}
+		}
+		// and the walk arguments are refused on the same path, for every operation
+		for _, arg := range walkArgs {
+			p := map[string]string{"op": op, arg: "1"}
+			switch arg {
+			case "direction", "relation_types", "summary_only", "include_tests":
+				p[arg] = "upstream"
+			}
+			if _, err := occurrenceCoreParams(p); !IsInvalidInput(err) {
+				t.Fatalf("op=%s took the walk argument %s: %v", op, arg, err)
+			}
+		}
+	}
+}
+
+// The core sends next_cursor only while rows remain, so the last page carries none and
+// the reconciler must not invent one: a client that follows a cursor onto the last page
+// reads an empty page and is handed the same offset again, and never terminates.
+func TestTheLastOccurrencePageKeepsNoCursor(t *testing.T) {
+	const ws, symbol, op = "ws", "Store", "refs"
+	last := `{"total":9,"offset":9,"occurrences":[]}`
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(ReconcileOccurrencePaging(ws, symbol, op, []byte(last)), &page); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := page["next_cursor"]; ok {
+		t.Fatalf("the last page grew a cursor %s, so a client would page it forever", c)
+	}
+	// a page the core said had more keeps one, at the offset it named
+	middle := `{"total":9,"offset":4,"occurrences":[{"path":"a.go"},{"path":"b.go"}],"next_cursor":"6"}`
+	page = nil
+	if err := json.Unmarshal(ReconcileOccurrencePaging(ws, symbol, op, []byte(middle)), &page); err != nil {
+		t.Fatal(err)
+	}
+	raw, ok := page["next_cursor"]
+	if !ok {
+		t.Fatalf("a page with more lost its cursor: %s", middle)
+	}
+	var cursor string
+	if err := json.Unmarshal(raw, &cursor); err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeOccurrenceCursor(ws, symbol, op, cursor)
+	if err != nil || got != 6 {
+		t.Fatalf("the cursor continues at %d, want the page offset 4 plus its 2 rows: %v", got, err)
+	}
+}
+
 // The page the core answers carries a bare offset; what a client receives is a signed
 // cursor, and the last page carries none at all. This is the only place the core's own
 // next_cursor becomes a cursor, so it is tested directly rather than only through the

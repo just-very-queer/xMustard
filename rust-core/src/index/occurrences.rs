@@ -60,6 +60,11 @@ pub const RESOLVED_CONFIDENCE: f64 = 1.0;
 /// A lexical name match's confidence, the same value the legacy graph's lexical edges
 /// carry (index::edges).
 pub const LEXICAL_CONFIDENCE: f64 = 0.5;
+/// The confidence a same-language name match carries. The reference table has no binding
+/// from a reference to the declaration it uses, so a row in a language the resolver owns
+/// is a name match and not a resolved edge, and it carries the matcher's own confidence
+/// rather than RESOLVED_CONFIDENCE.
+pub const NAME_MATCH_CONFIDENCE: f64 = LEXICAL_CONFIDENCE;
 
 /// Occurrences listed at most, so one call cannot stream a whole repository's rows.
 pub const MAX_OCCURRENCES: usize = 5000;
@@ -304,12 +309,14 @@ fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<(Vec<Row>,
         let (path, lang, file_id, blob, line, kind, qualified, skind, sline) = row?;
         let container = qualified.map(|q| (q, skind.unwrap_or_default(), sline.unwrap_or(line)));
         // The reference table records which symbol contains a reference, not that the
-        // reference binds to the queried symbol: `symbol_id` is the container, and a
-        // same-language name match carries it just as a bound one does. So the claim is
-        // the language's, and a caller reading it as proof that the reference resolves to
-        // the target would be reading more than the row knows. The epistemic envelope
-        // names the lexical rows for the same reason.
-        let resolved = resolves(&lang);
+        // reference binds to the queried symbol: `symbol_id` is the container, and the
+        // query matched `n.name`, so a same-language namesake is carried back exactly as
+        // a bound one is. The claim this row can support is the name match, never a
+        // resolved edge, so it is labelled `name_match` and carries the matcher's
+        // confidence: labelling it `resolved` would put a guess in the envelope's
+        // resolved count and let completeness read `exact` while a namesake's use is in
+        // the list (adjudication-WS-59d-r4-3).
+        let matched = resolves(&lang);
         out.push(Row {
             path,
             line,
@@ -317,9 +324,9 @@ fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<(Vec<Row>,
             container,
             file_id,
             blob,
-            provenance: if resolved { "resolved" } else { "lexical" },
-            confidence: if resolved {
-                RESOLVED_CONFIDENCE
+            provenance: if matched { "name_match" } else { "lexical" },
+            confidence: if matched {
+                NAME_MATCH_CONFIDENCE
             } else {
                 LEXICAL_CONFIDENCE
             },
@@ -396,16 +403,25 @@ pub fn read(
     let end = q.offset + occurrences.len();
     let total = if more { end + 1 } else { end };
     let truncated = more || q.offset + q.limit >= MAX_OCCURRENCES;
-    let (bound, lexical) = occurrences.iter().fold((0, 0), |(r, l), o| {
-        if o.provenance == "resolved" {
-            (r + 1, l)
-        } else {
-            (r, l + 1)
-        }
-    });
+    // A row is one of three claims, and only a bound edge is `resolved`. A same-language
+    // name match is counted separately because it is not one, and it is a lower-bound
+    // cause of its own: without it a list holding only namesakes would report
+    // completeness exact (adjudication-WS-59d-r4-3).
+    let (resolved, lexical, name_match) =
+        occurrences.iter().fold((0, 0, 0), |(r, l, m), o| match o.provenance {
+            "name_match" => (r, l, m + 1),
+            "resolved" => (r + 1, l, m),
+            _ => (r, l + 1, m),
+        });
     let mut causes: BTreeMap<String, u64> = BTreeMap::new();
     if lexical > 0 {
         causes.insert("lexical_occurrences".to_string(), lexical as u64);
+    }
+    // A name match is not a bound edge either, so it is a lower-bound cause of its own
+    // rather than being counted as resolved: without it a list holding only namesakes
+    // would report completeness exact (adjudication-WS-59d-r4-3).
+    if name_match > 0 {
+        causes.insert("name_match_occurrences".to_string(), name_match as u64);
     }
     let unresolved = unresolved_references(conn, &name)?;
     if unresolved > 0 {
@@ -434,7 +450,10 @@ pub fn read(
             .unwrap_or("refs"),
         resolved_name: name,
         found,
-        graph: match (bound > 0, lexical > 0) {
+        // The same vocabulary the blast form reports, over the same rows: a list of
+        // name matches is a lexical list, never a resolved one, because no row in it is
+        // a bound edge (adjudication-WS-59d-r4-3).
+        graph: match (resolved > 0, lexical + name_match > 0) {
             (true, true) => "mixed",
             (true, false) => "resolved",
             (false, true) => "lexical",

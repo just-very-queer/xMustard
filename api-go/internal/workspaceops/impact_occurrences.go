@@ -10,6 +10,35 @@ import (
 	"xmustard/api-go/internal/rustcore"
 )
 
+// occurrenceCoreParams reduces one occurrence request to the parameters the core is
+// given, refusing what no occurrence operation accepts. The order is the point, which is
+// why it is one function: the cursor and offset pair is refused while both are still
+// present, because checkOccurrenceArgs reads them together and dropping the cursor first
+// would hide the conflict and leave the decoded position to be appended after the
+// caller's own, which the core then reads as the last one. One page position per request,
+// or a refusal (5.1 rule 7).
+//
+// The cursor is dropped because it is this process's own signed position: it must never
+// become a --cursor flag, since the core's occurrences query reads that flag as a decimal
+// offset and a signed cursor would be refused by the flag parser before the offset beside
+// it was used, failing every page past the first.
+//
+// No occurrence operation walks the graph — refs reads the reference table — so a
+// tier-walk argument is refused here rather than forwarded and refused by the core as an
+// unknown flag, which is a different error shape for the same refusal (PAR-IMP-03, spec
+// rule 6).
+func occurrenceCoreParams(params map[string]string) (map[string]string, error) {
+	if err := checkOccurrenceArgs(ImpactBlast, params); err != nil {
+		return nil, err
+	}
+	core := maps.Clone(params)
+	delete(core, "cursor")
+	if err := checkNoWalkArgs(core); err != nil {
+		return nil, err
+	}
+	return core, nil
+}
+
 // SymbolOccurrencesCtx is impact op= (WS-59d, PAR-IMP-03): the symbol-level
 // occurrences of a name — its references, its definitions, or the types implementing
 // it — each row carrying the containing symbol's name path, kind and line, a ±1-line
@@ -24,19 +53,9 @@ func SymbolOccurrencesCtx(ctx context.Context, dataDir, workspaceID, symbol stri
 	if op == "" {
 		return nil, fmt.Errorf("op must be one of %v for an occurrence read: %w", OccurrenceOps, ErrInvalidInput)
 	}
-	// The cursor is this process's own signed position, decoded to an offset below. It
-	// must never become a --cursor flag: the core's occurrences query reads that flag as
-	// a decimal offset, so a signed cursor would be refused by the flag parser before the
-	// offset beside it was used, and every page past the first would fail.
-	core := maps.Clone(params)
-	delete(core, "cursor")
-	// The tier walk's own arguments describe a walk the occurrence read does not do, so
-	// with an operation that has no walk they are refused rather than forwarded and
-	// refused by the core as an unknown flag (PAR-IMP-03, and the spec's rule 6).
-	if op != "refs" {
-		if err := checkNoWalkArgs(core); err != nil {
-			return nil, err
-		}
+	core, err := occurrenceCoreParams(params)
+	if err != nil {
+		return nil, err
 	}
 	flags, err := ImpactFlags(ImpactBlast, core)
 	if err != nil {
@@ -183,13 +202,17 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 	if _, ok := res["occurrences"]; !ok {
 		return out
 	}
-	next, cut := occurrencePageOffset(res)
+	next, cut, more := occurrencePageOffset(res)
 	delete(res, "next_cursor")
-	if cut {
+	switch {
+	case cut:
 		// the budget replaced the rows with counts, so the list cannot be continued
 		// from here and the cut is named instead of being papered over
 		res["truncated"] = json.RawMessage(strconv.Quote("occurrences_removed"))
-	} else {
+	case more:
+		// only a page the core said had more gets a cursor. Signing one onto the last
+		// page would send a client back for rows that are not there: it would follow the
+		// cursor, read an empty page, and be handed the same offset again (WS-59e-r4-3).
 		cursor, err := json.Marshal(signOffset(occurrenceRanking(workspaceID, symbol, op), next))
 		if err != nil {
 			return out
@@ -208,22 +231,24 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 // replaced the rows with their counts, which is the one case with no position to continue
 // from — an empty list is otherwise indistinguishable from a page that delivered nothing,
 // and signing a cursor onto an emptied list would tell a client to keep paging a list that
-// is gone.
-func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut bool) {
+// is gone. more is the core's own next_cursor: the core sends it only while rows remain, so
+// its absence is the last page and must not be papered over with a cursor of our own.
+func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut, more bool) {
 	// The map came from a decoded object, so re-marshalling it cannot fail, and reading
 	// it into one typed struct is what makes the empty-list case distinguishable from a
 	// member the answer never had.
 	raw, err := json.Marshal(res)
 	if err != nil {
-		return 0, false
+		return 0, false, false
 	}
 	var page struct {
 		Offset      *int               `json:"offset"`
 		Occurrences *[]json.RawMessage `json:"occurrences"`
+		NextCursor  *string            `json:"next_cursor"`
 	}
 	if json.Unmarshal(raw, &page) != nil || page.Offset == nil || page.Occurrences == nil {
-		return 0, false
+		return 0, false, false
 	}
 	_, counted := res["occurrences_by_path"]
-	return *page.Offset + len(*page.Occurrences), counted
+	return *page.Offset + len(*page.Occurrences), counted, page.NextCursor != nil
 }

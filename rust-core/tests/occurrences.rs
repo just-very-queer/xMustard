@@ -254,8 +254,8 @@ fn definition_lists_the_symbols_that_declare_the_name_and_no_others() {
         "definition lists the symbols that declare the name itself, not its members"
     );
     assert!(
-        def.iter().all(|o| o["provenance"] == "resolved"),
-        "a declaration is not a resolved occurrence: {def:#?}"
+        def.iter().all(|o| o["provenance"] == "name_match"),
+        "a declaration is not a bound occurrence either: {def:#?}"
     );
     for o in &def {
         assert_eq!(
@@ -358,8 +358,10 @@ fn a_reference_outside_a_symbol_is_reported_as_a_file_and_a_used_name_is_never_r
         .find(|o| o["path"].as_str().unwrap_or("").ends_with("a.go") && o["line"] == 5)
         .expect("no occurrence inside Caller");
     assert_eq!(call["kind"].as_str(), Some("Function"));
-    // Go is a resolver language, so a bound reference is resolved, never lexical
-    assert_eq!(call["provenance"].as_str(), Some("resolved"));
+    // Go is a resolver language, so the row is a same-language name match: the
+    // reference table carries no binding from a reference to the declaration it uses,
+    // so nothing here is a resolved edge (adjudication-WS-59d-r4-3)
+    assert_eq!(call["provenance"].as_str(), Some("name_match"));
     // and b.go holds no row at all: a declaration is not a use of itself
     assert!(
         !got.iter()
@@ -500,10 +502,48 @@ fn the_epistemic_envelope_reports_whether_the_list_is_a_lower_bound() {
             "a lower bound with no cause: {v:#}"
         );
     }
-    // the same graph the walk reports: resolved for Go, never nothing
+    // the same vocabulary the blast form reports
     assert!(
         ["resolved", "mixed", "lexical", "none"].contains(&v["graph"].as_str().unwrap()),
         "no graph label: {v:#}"
+    );
+}
+
+// The reference table carries no binding from a reference to the declaration it uses,
+// so a Go list is a list of name matches and must never be reported as a resolved one
+// or as an exact one: an envelope that read exact over namesake uses would tell a caller
+// the list is complete when it is a lower bound (adjudication-WS-59d-r4-3).
+#[test]
+fn a_same_language_name_match_is_never_reported_as_a_resolved_or_exact_list() {
+    let r = go_repo();
+    build(r.path());
+    let v = occ(r.path(), "refs", "Store", &[]);
+    let rows = rows(&v);
+    assert!(!rows.is_empty(), "the fixture has no occurrences: {v:#}");
+    for o in &rows {
+        assert_eq!(
+            o["provenance"].as_str(),
+            Some("name_match"),
+            "a Go occurrence claims a bound edge: {o:#}"
+        );
+        assert!(
+            o["confidence"].as_f64().unwrap() < 1.0,
+            "a name match claims full confidence: {o:#}"
+        );
+    }
+    assert_eq!(
+        v["graph"].as_str(),
+        Some("lexical"),
+        "a list of name matches is not a resolved list: {v:#}"
+    );
+    assert_eq!(
+        v["epistemic"]["completeness"].as_str(),
+        Some("lower_bound"),
+        "a list of name matches is not complete: {v:#}"
+    );
+    assert!(
+        v["epistemic"]["causes"]["name_match_occurrences"].as_u64().unwrap_or(0) > 0,
+        "the lower bound does not name its cause: {v:#}"
     );
 }
 
