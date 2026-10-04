@@ -918,7 +918,7 @@ fn admit_doc(
     }
 }
 
-fn load_dir_ignores(root: &Path, rel_dir: &str, ig: &mut Ignore) {
+pub(crate) fn load_dir_ignores(root: &Path, rel_dir: &str, ig: &mut Ignore) {
     for name in [".gitignore", XMUSTARD_IGNORE] {
         let rel = if rel_dir.is_empty() {
             name.to_string()

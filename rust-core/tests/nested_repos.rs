@@ -440,7 +440,8 @@ fn the_repo_map_counts_the_files_git_lists() {
     assert_eq!(map.source_files, 4, "{map:?}");
 }
 
-// Outside Git the map walks the tree, and still does not enter a nested repository.
+// Outside Git (and when the Git listing fails) the map walks the tree as the index
+// walks a non-Git root: it does not enter a nested repository, and ignore files apply.
 #[test]
 fn the_repo_map_walk_skips_nested_repositories() {
     let r = TempDir::new().unwrap();
@@ -449,6 +450,8 @@ fn the_repo_map_walk_skips_nested_repositories() {
         "a.go",
         "package p\n\nfunc Alpha() int { return 1 }\n",
     );
+    write(r.path(), ".gitignore", "gen/\n");
+    write(r.path(), "gen/out.go", "package gen\n");
     sub_repo(&r.path().join("sub"));
     let map = build_repo_map(r.path(), "ws").unwrap();
     assert_eq!(map.source_files, 1, "{map:?}");

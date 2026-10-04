@@ -511,8 +511,9 @@ pub fn explain_path(
 /// worktree that is Git's own listing of tracked and untracked, not ignored files, so
 /// files inside a nested repository (listed by Git as `sub/`) and ignored files are not
 /// counted, as the index does not count them (WS-RT2). Outside Git, or when the
-/// listing fails, the tree is walked; the walk still does not enter a directory with
-/// its own `.git`.
+/// listing fails, the tree is walked as the index walks a non-Git root: `.gitignore` and
+/// `.xmustardignore` files apply top-down, and no directory with its own `.git` is
+/// entered. A path the ignore rules cannot decide within their budget is not counted.
 fn for_each_repo_map_file(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) {
     let listing = crate::indexcache::run_git_bounded(
         root_path,
@@ -527,23 +528,7 @@ fn for_each_repo_map_file(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) 
         crate::indexcache::git_timeout(),
     );
     let Ok(out) = listing else {
-        for entry in WalkDir::new(root_path)
-            .into_iter()
-            .filter_entry(|entry| {
-                let nested = entry.depth() > 0
-                    && entry.file_type().is_dir()
-                    && crate::indexcache::has_own_git(entry.path());
-                !nested && !should_skip_entry(root_path, entry)
-            })
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
-            if let Some(relative) = relative_path(root_path, entry.path()) {
-                visit(&relative, entry.path());
-            }
-        }
-        return;
+        return walk_repo_map_files(root_path, visit);
     };
     let mut last: &[u8] = &[];
     for rec in out.split(|b| *b == 0) {
@@ -559,6 +544,39 @@ fn for_each_repo_map_file(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) 
         crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
         if fs::symlink_metadata(&path).is_ok_and(|m| m.is_file()) {
             visit(relative, &path);
+        }
+    }
+}
+
+/// The fallback walk of `for_each_repo_map_file`.
+fn walk_repo_map_files(root_path: &Path, visit: &mut dyn FnMut(&str, &Path)) {
+    use crate::index::ignore::{DirMemo, Ignore, Verdict};
+    let mut ig = Ignore::with_defaults();
+    let mut memo = DirMemo::default();
+    crate::index::scan::load_dir_ignores(root_path, "", &mut ig);
+    let mut it = WalkDir::new(root_path)
+        .follow_links(false)
+        .sort_by_file_name()
+        .into_iter();
+    while let Some(entry) = it.next() {
+        let Ok(entry) = entry else { continue };
+        let Some(relative) = relative_path(root_path, entry.path()).filter(|r| !r.is_empty())
+        else {
+            continue;
+        };
+        let is_dir = entry.file_type().is_dir();
+        let admitted = !should_skip_entry(root_path, &entry)
+            && ig.check(&mut memo, &relative, is_dir) == Verdict::Included;
+        match (is_dir, admitted) {
+            (true, true) if !crate::indexcache::has_own_git(entry.path()) => {
+                crate::index::scan::load_dir_ignores(root_path, &relative, &mut ig)
+            }
+            (true, _) => it.skip_current_dir(),
+            (false, true) if entry.file_type().is_file() => {
+                crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
+                visit(&relative, entry.path());
+            }
+            (false, _) => {}
         }
     }
 }
