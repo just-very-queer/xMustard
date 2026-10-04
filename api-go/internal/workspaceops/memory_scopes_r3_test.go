@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"context"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -76,15 +77,6 @@ func atRiskIDs(atRisk []AtRiskMemory) []string {
 	return out
 }
 
-func contains(ids []string, id string) bool {
-	for _, got := range ids {
-		if got == id {
-			return true
-		}
-	}
-	return false
-}
-
 // A private entry marked needs_reverify must not reach another principal's
 // at_risk_memories with its id, title, paths and anchors (round 3, r3-1). The surface is
 // ground's memory scan, which is where at_risk_memories is built.
@@ -102,10 +94,10 @@ func TestAStalePrivateMemoryIsNotAnotherPrincipalsAtRisk(t *testing.T) {
 		t.Fatalf("ground scan: %v", err)
 	}
 	seen := atRiskIDs(scan.atRisk)
-	if contains(seen, private.ID) {
+	if slices.Contains(seen, private.ID) {
 		t.Fatalf("another principal's at_risk_memories named the private entry %s: %v", private.ID, seen)
 	}
-	if !contains(seen, open.ID) {
+	if !slices.Contains(seen, open.ID) {
 		t.Fatalf("at_risk_memories = %v, want the workspace entry %s among them", seen, open.ID)
 	}
 }
@@ -153,6 +145,13 @@ func TestGroundDoesNotListAnotherPrincipalsStalePrivateMemory(t *testing.T) {
 
 // A scoped proposal's duplicate and conflict candidates must not reach another
 // principal's entries of the same scope, and its report must not name them (r3-7).
+// A scoped proposal's duplicate and conflict candidates must not reach another
+// principal's entries of the same scope, and its report must not name them (r3-7).
+//
+// Both entries declare the SAME path, so they are anchor neighbours and the review really
+// compares them. Without the shared anchor the candidate list is empty and the filter is
+// never reached: a fixture that cannot fail, which is how this test was first written and
+// why its mutation survived.
 func TestAProposalIsNotComparedAgainstAnotherPrincipalsScopedEntries(t *testing.T) {
 	dir := singleAgentDir(t)
 	theirPrivate := propose(t, dir, "ws-1", "author-b", "their private parser refactor",
@@ -160,10 +159,12 @@ func TestAProposalIsNotComparedAgainstAnotherPrincipalsScopedEntries(t *testing.
 		func(r *ProposeContextRequest) {
 			r.Visibility = ScopePrivate
 			r.Description = "their private parser refactor"
+			r.Paths = []string{"parser.go"}
 		})
 	mine, err := Remember(dir, "ws-1", RememberRequest{ProposeContextRequest: ProposeContextRequest{
 		Title: "my private parser refactor", Content: "my private refactor of the request parser",
-		Permission: "readwrite", Visibility: ScopePrivate, Description: "my private parser refactor"}},
+		Permission: "readwrite", Visibility: ScopePrivate, Description: "my private parser refactor",
+		Paths: []string{"parser.go"}}},
 		scopeActor("author-a"))
 	if err != nil {
 		t.Fatalf("propose: %v", err)
@@ -174,11 +175,11 @@ func TestAProposalIsNotComparedAgainstAnotherPrincipalsScopedEntries(t *testing.
 		}
 	}
 	for _, c := range mine.PossibleConflicts {
-		if contains(c.EntryIDs, theirPrivate.ID) {
+		if slices.Contains(c.EntryIDs, theirPrivate.ID) {
 			t.Fatalf("possible_conflicts named another principal's private entry %s: %+v", theirPrivate.ID, mine.PossibleConflicts)
 		}
 	}
-	if contains(mine.SuggestedSupersedes, theirPrivate.ID) {
+	if slices.Contains(mine.SuggestedSupersedes, theirPrivate.ID) {
 		t.Fatalf("suggested_supersedes named another principal's private entry %s: %v",
 			theirPrivate.ID, mine.SuggestedSupersedes)
 	}
