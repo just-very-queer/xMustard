@@ -354,16 +354,17 @@ impl Snapshot {
                     ))?;
                     let mut rows = st.query([])?;
                     let mut i = 0usize;
-                    let result = while let Some(row) = rows.next()? {
+                    while let Some(row) = rows.next()? {
                         let Some(slot) = out.get_mut(i) else { break };
                         *slot = row.get(0)?;
                         i += 1;
-                        Ok(())
-                    };
+                    }
+                    // The prepared statement is dropped before the COMMIT: SQLite refuses to
+                    // commit while a statement is still stepping.
                     drop(rows);
                     drop(st);
                     conn.execute_batch("COMMIT").map_err(sql)?;
-                    result
+                    Ok(out)
                 })
             })
             .as_deref()

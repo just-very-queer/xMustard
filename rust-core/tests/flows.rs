@@ -2067,21 +2067,23 @@ fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
 
 /// An unselected CALLER's file marks the answer stale, because it shaped a score.
 ///
-/// A caller edge is the DENOMINATOR of a symbol's score, so a symbol's score moves when its
+/// A caller edge is the DENOMINATOR of a symbol's score, so a score moves when that symbol's
 /// callers change even though nothing about the symbol's own file did. Before this row the
 /// freshness envelope was built from the selected seeds' files and the walked steps, so an
 /// edit to an unselected caller's file left the answer reading `current` while the scores it
 /// reports were computed against the old call graph.
 ///
-/// The fixture puts the caller BEYOND the seed cap so it is genuinely unselected: 201
-/// candidates, and the caller of a dropped one is in a file no seed and no walk touches.
-/// Without the fix the answer stays `current` after the edit; with it the envelope names the
-/// caller's file and the answer reads stale.
+/// The mutation that kills this test is precise: remove `candidate_paths` from the dispatch's
+/// path set and the envelope loses the caller's file while every other assertion here still
+/// holds — the seeds, the scores and the flows are unchanged by the edit, because the edit
+/// adds an unrelated symbol. That is what makes this test about the ENVELOPE and not about
+/// the answer: the only thing that can see the difference is `freshness.stale`.
+///
+/// So the caller must be a SCORED candidate that was dropped, or it is already in the answer
+/// for another reason. `--limit=1` keeps one seed, and `Caller` is outranked by `Target`:
+/// `Target` has two callees and no callers (score 2.0), `Caller` has one (score 1.0).
 #[test]
 fn an_unselected_callers_file_marks_the_answer_stale() {
-    // `Caller` calls `Target`, and `Target` is the low-scoring candidate whose caller edge
-    // the answer's scores depend on. `Caller` itself has no callees beyond `Target`, so it
-    // is not a seed, and it is in its own file: nothing the answer LISTS comes from it.
     let d = repo(&[
         GO_MOD,
         (
@@ -2091,32 +2093,39 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
         (
             "pkg/target.go",
             &gofuncs_ref(&[
-                go_func("Target", &["TargetLeafA", "TargetLeafB", "TargetLeafC"]),
+                go_func("Target", &["TargetLeafA", "TargetLeafB"]),
                 go_func("TargetLeafA", &[]),
                 go_func("TargetLeafB", &[]),
-                go_func("TargetLeafC", &[]),
             ]),
         ),
     ]);
     build(d.path());
+    // One seed only. `Target` scores 2.0 and `Caller` 1.0, so the cap keeps `Target` and
+    // drops `Caller` — asserted, because if both were seeds the test would prove nothing.
+    let seeded = flows(d.path(), &["--limit=1"]);
+    let names: Vec<String> = read_seeds(&seeded)
+        .into_iter()
+        .map(|s| s.name)
+        .collect();
+    assert_eq!(
+        names,
+        vec!["Target".to_string()],
+        "the cap keeps the higher-scoring candidate and drops the caller: {seeded:#}"
+    );
     let before = flows(d.path(), &[]);
     assert_eq!(
         before["freshness"]["stale"].as_bool(),
         Some(false),
         "a freshly built answer is current: {before:#}"
     );
-    assert_eq!(
-        before["freshness"]["dirty_paths_touching_result"].as_array().map(Vec::len),
-        Some(0),
-        "nothing is dirty yet: {before:#}"
-    );
-    // Edit the CALLER's file only: `Target` itself is untouched.
+    // Edit the CALLER's file only: `Target` itself is untouched, and the added symbol has no
+    // edge at all, so nothing about any score changes — only which files shaped them.
     write(
         d.path(),
         "caller/entry.go",
         &gofuncs_ref(&[
             go_func("Caller", &["Target"]),
-            go_func("CallerTwo", &[]),
+            go_func("CallerUnrelated", &[]),
         ]),
     );
     let after = flows(d.path(), &[]);
@@ -2131,6 +2140,21 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
     assert!(
         dirty.iter().any(|p| p == "caller/entry.go"),
         "the caller's own file is named in the envelope: {dirty:?} in {after:#}"
+    );
+    // The scores are unchanged, which is the point: the envelope reports that files these
+    // scores were computed against moved, not that the scores moved.
+    let before_scores: Vec<(String, f64)> = by_score(&before)
+        .into_iter()
+        .map(|s| (s.name, s.score))
+        .collect();
+    let after_scores: Vec<(String, f64)> = by_score(&after)
+        .into_iter()
+        .map(|s| (s.name, s.score))
+        .collect();
+    assert_eq!(
+        before_scores, after_scores,
+        "the added symbol changes no score, so only the envelope can tell the two answers \
+         apart: {before_scores:?} vs {after_scores:?}"
     );
 }
 
