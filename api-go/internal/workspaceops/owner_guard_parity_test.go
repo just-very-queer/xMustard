@@ -329,39 +329,77 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 // the two guards in the approval queue. WS-29b round 4 (r4-6) put ScopesVisible ahead
 // of every per-row read, so nothing about an entry this approver may not see was even
 // loaded; batching the owner-distinct reads for a whole page moved those reads in front
-// of the scope check, so a page's revisions, edit events and votes are read for entries
+// of the scope check, so a page's revisions, edit events and votes were read for entries
 // the approver cannot see at all.
 //
-// The order is observable in the queue's own answer. batchOwnerVoices is given the whole
-// page, so an entry the approver may not see is handed to it and its revision, edit event
-// and votes are read, where the per-row path never loaded them. The fix is to filter the
-// page by scope before the batch; this test fails on the unfixed order because a private
-// proposal of a stranger is then guarded, and the guard reads it, rather than skipped.
+// The contract is the filter, so the filter is what is asserted: given a page, the
+// candidates handed to the batch are the visible ones and nothing else. Asserting the
+// queue's final answer instead cannot see the order at all, because consider holds the
+// same check and returns the same answer either way — the filter would have to be
+// deleted, not merely moved, and that is not the defect this finding is about.
 func TestTheBatchedOwnerGuardNeverAsksAboutAnEntryTheApproverCannotSee(t *testing.T) {
 	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
 	h := humanApprover("bob", "bob")
 
 	// a stranger's private proposal: visible to its author alone, so not to bob
-	e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{
+	private := proposeAs(t, dir, ws, ContextActor{ID: "carol"}, "carol's private")
+	entry, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{
 		Title: "carol's private", Content: "carol's private note", Permission: "readwrite",
 		Visibility: ScopePrivate}}, ContextActor{ID: "carol"})
 	if err != nil {
 		t.Fatalf("propose carol's private entry: %v", err)
 	}
-	if ScopesVisible(e.Scope, e.ScopeKey, e.Source, h.Principal.ID, ScopeRequest{}) {
-		t.Fatalf("%s is scope %q, so the fixture does not reach the scope check", e.ID, e.Scope)
+	if ScopesVisible(entry.Scope, entry.ScopeKey, entry.Source, h.Principal.ID, ScopeRequest{}) {
+		t.Fatalf("%s is scope %q, so the fixture does not reach the scope check", entry.ID, entry.Scope)
+	}
+	// a proposal bob may see, so the filter has to admit something
+	visible := proposeAs(t, dir, ws, ContextActor{ID: "dave"}, "dave's, visible to bob")
+
+	err = memoryView(context.Background(), dir, ws, func(r govstore.Reader) error {
+		page := make([]govstore.Entry, 0, 3)
+		for _, id := range []string{private.ID, entry.ID, visible.ID} {
+			e, err := r.GetEntry(context.Background(), id)
+			if err != nil {
+				return err
+			}
+			page = append(page, e)
+		}
+
+		q := &ApprovalQueue{Approver: h.Principal.ID,
+			Skipped: map[string]int{skipOwn: 0, skipVoted: 0, skipSameOwner: 0, skipNotVisible: 0}}
+		got := q.visibleCandidates(page)
+		for _, c := range got {
+			if c.entry.ID == entry.ID {
+				return fmt.Errorf("%s is a stranger's private proposal and reached the batched "+
+					"owner-distinct read, which loads its revision, edit event and votes", c.entry.ID)
+			}
+		}
+		if q.Skipped[skipNotVisible] != 1 {
+			return fmt.Errorf("skipped not_visible = %d, want 1: the private proposal was not counted",
+				q.Skipped[skipNotVisible])
+		}
+		if len(got) != 2 {
+			return fmt.Errorf("the filter kept %d of 3 candidates, want 2", len(got))
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 
+	// and the queue answers on the same terms
 	q, err := HumanApprovalQueue(dir, ws, h, 0, 0)
 	if err != nil {
 		t.Fatalf("the batched guard read an entry the approver cannot see: %v", err)
 	}
 	if got := q.Skipped[skipNotVisible]; got != 1 {
-		t.Fatalf("skipped not_visible = %d, want 1: the private proposal was counted by another "+
-			"reason, so the scope check did not run before the reads", got)
+		t.Fatalf("skipped not_visible = %d, want 1: the private proposal was counted by another reason",
+			got)
 	}
-	if len(q.Items) != 0 {
-		t.Fatalf("the queue listed %d items, want none: a private proposal reached an approver", len(q.Items))
+	for _, it := range q.Items {
+		if it.EntryID == entry.ID {
+			t.Fatalf("%s is carol's private proposal and was listed in bob's approval queue", entry.ID)
+		}
 	}
 }
 

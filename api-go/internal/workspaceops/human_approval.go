@@ -274,21 +274,8 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 				return err
 			}
 			// One batched owner-distinct read over the page (WS-FIX-22b), instead of
-			// three queries per pending row. The page is filtered by scope first, so the
-			// batch never reads a revision, edit event or vote of an entry this approver
-			// may not see: batching the guard for the page would otherwise move those
-			// reads in front of the scope check, which WS-29b round 4 (r4-6) put ahead
-			// of every per-row read on purpose.
-			candidates := make([]queueCandidate, 0, len(page))
-			for _, e := range page {
-				for _, c := range pendingRevisions(e) {
-					if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, h.Principal.ID, ScopeRequest{}) {
-						q.Skipped[skipNotVisible]++
-						continue
-					}
-					candidates = append(candidates, c)
-				}
-			}
+			// three queries per pending row, over the candidates the scope check admits.
+			candidates := q.visibleCandidates(page)
 			distinct, err := batchOwnerVoices(ctx, r, dataDir, candidates, h, "")
 			if err != nil {
 				return err
@@ -327,6 +314,26 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 		return nil, err
 	}
 	return q, nil
+}
+
+// visibleCandidates are the page's pending candidates this approver may see, and it
+// counts the ones it may not. The scope check runs here, BEFORE the batched
+// owner-distinct read, so the batch never loads a revision, an edit event or a vote of
+// an entry the approver cannot see. WS-29b round 4 (r4-6) put the check ahead of every
+// per-row read for exactly that reason, and batching the guard for a whole page would
+// otherwise have moved those reads in front of it.
+func (q *ApprovalQueue) visibleCandidates(page []govstore.Entry) []queueCandidate {
+	candidates := make([]queueCandidate, 0, len(page))
+	for _, e := range page {
+		for _, c := range pendingRevisions(e) {
+			if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, q.Approver, ScopeRequest{}) {
+				q.Skipped[skipNotVisible]++
+				continue
+			}
+			candidates = append(candidates, c)
+		}
+	}
+	return candidates
 }
 
 // pendingRevisions are the revisions of e that await verdicts: its served revision
