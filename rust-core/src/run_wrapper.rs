@@ -243,6 +243,15 @@ fn delivery_of(sig: i32) -> Delivery {
 /// alone and a POSIX timer reaches the wrapper alone, so neither reaches the group and a
 /// skipped one orphans a live child (WS-FIX-20c, WS-FIX-20c-r1-4).
 ///
+/// **Known limit, owner-decided (WS-FIX-20c-r5-4).** "Skipped only when the child shares the
+/// group" is not the same as "skipped only when a terminal sent it". A signal with no sender
+/// and a shared group is skipped, and a POSIX timer delivers SIGINT to the wrapper alone with
+/// no sender, so a timer-sent SIGINT or SIGQUIT with a grouped child is **not** forwarded. The
+/// ruling that fixes this is goal §3.5i, which keeps the WS-FIX-20b rule and rules out the
+/// `si_code` table that would be needed to tell a keystroke from a timer; the three options and
+/// their costs are in followups.md for the owner. Not fixed here, and the comment no longer
+/// claims a timer is never skipped.
+///
 /// The skip is never taken on the absence of a sender alone: an unfilled or zero-valued field
 /// is not evidence that the child already has the signal, and treating it as such is what
 /// would drop a timeout. A sender of 0 is a filled field naming pid 0, which no `kill(2)` can
