@@ -120,6 +120,8 @@ pub struct StoreMeta {
     /// The repository identity key the last update was run for (`index update
     /// --identity-key`, stamped by the Go orchestrator), or empty.
     pub identity_key: String,
+    /// The limitation count stamped with that key, None when none was given.
+    pub identity_limitations: Option<usize>,
     /// The last run's counters (meta `last_run`).
     pub last_run: Option<envelope::RefreshCounters>,
     /// Coverage as of the generation; taken by the snapshot at load.
@@ -142,6 +144,7 @@ fn read_meta(conn: &Connection) -> Result<StoreMeta, String> {
             "schema_version" => m.schema_version = v,
             "analyzer_version" => m.analyzer_version = v,
             meta::IDENTITY_KEY => m.identity_key = v,
+            meta::IDENTITY_LIMITATIONS => m.identity_limitations = v.parse().ok(),
             "last_run" => m.last_run = serde_json::from_str(&v).ok(),
             "coverage" => m.coverage = serde_json::from_str(&v).ok(),
             _ => {}
@@ -917,9 +920,10 @@ impl Opened {
             key: self.meta.identity_key.clone(),
             head: self.meta.last_commit.clone(),
             parser_version: self.meta.analyzer_version.clone(),
-            identity_complete: !self.meta.identity_key.is_empty(),
+            identity_complete: !self.meta.identity_key.is_empty()
+                && self.meta.identity_limitations == Some(0),
             stable: self.relation.status == envelope::Status::Current,
-            limitations: 0,
+            limitations: self.meta.identity_limitations.unwrap_or(0),
         };
         c
     }
