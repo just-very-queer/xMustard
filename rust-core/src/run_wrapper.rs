@@ -674,11 +674,11 @@ const HINT_RULES: [(&[&str], Hint); 3] = [
     ),
 ];
 
-fn subcommand<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
+fn subcommand(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     words.next().filter(|w| plain(w)).map(str::to_string)
 }
 
-fn run_script<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
+fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     let sub = subcommand(words)?;
     if sub != "run" {
         return Some(sub);
@@ -692,7 +692,7 @@ fn run_script<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
 /// The registry's own keywords, in its precedence order (test and check before lint).
 const FAMILY_KEYWORDS: [&str; 3] = ["test", "check", "lint"];
 
-fn keyword<'a>(words: &mut dyn Iterator<Item = &'a str>) -> Option<String> {
+fn keyword(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     let line: Vec<String> = words.map(str::to_ascii_lowercase).collect();
     FAMILY_KEYWORDS
         .iter()
