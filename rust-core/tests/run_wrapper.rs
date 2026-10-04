@@ -1037,16 +1037,19 @@ fn the_relay_rule_has_a_refusal_case_on_each_side() {
              is what keeps the wrapper from orphaning it"
         );
     }
-    // SIGHUP is the case the kernel delivers to the session leader ALONE, so a shared group
-    // says nothing about whether the child has it. Skipping it here is what left a live child
-    // unstopped behind a wrapper stuck in drain (WS-FIX-20c).
-    for group in [shared, apart] {
-        for from in [sender, none, Some(0)] {
-            assert!(
-                relayed(SIGHUP, from, group),
-                "a hangup reaches the session leader alone, so it must be relayed whatever \
-                 the sender ({from:?}) and whatever the group (shared: {group})"
-            );
+    // SIGHUP is the case the kernel delivers to the session leader ALONE, and SIGTERM the case a
+    // POSIX timer delivers to the wrapper alone with no sender at all: neither reaches the
+    // group, so a shared group says nothing about whether the child has it. Skipping either is
+    // what left a live child unstopped behind a wrapper stuck in drain (WS-FIX-20c).
+    for sig in [SIGHUP, SIGTERM] {
+        for group in [shared, apart] {
+            for from in [sender, none, Some(0)] {
+                assert!(
+                    relayed(sig, from, group),
+                    "{sig} reaches the wrapper alone, so it must be relayed whatever the sender \
+                     ({from:?}) and whatever the group (shared: {group})"
+                );
+            }
         }
     }
     // A filled field naming pid 0 cannot come from `kill(2)`, so it is relayed rather than

@@ -172,17 +172,7 @@ fn io_failed(what: &'static str) -> impl Fn(io::Error) -> CmdError {
     move |e| CmdError::failed(format!("run: {what}: {e}"))
 }
 
-/// The signals the wrapper forwards to its child, as the signal numbers `signal-hook`
-/// delivers. Only these: a signal the wrapper was not asked to forward keeps the
-/// disposition it had, so the wrapper neither swallows it nor dies from one.
-const FORWARDED: &[i32] = &[
-    signal_hook::consts::signal::SIGHUP,
-    signal_hook::consts::signal::SIGINT,
-    signal_hook::consts::signal::SIGQUIT,
-    signal_hook::consts::signal::SIGTERM,
-];
-
-/// How one forwarded signal reaches the child. One row per entry in `FORWARDED`, so a signal
+/// How one forwarded signal reaches the child. One row per forwarded signal, so a signal
 /// is added by a row rather than by another branch in a decision.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Delivery {
@@ -199,17 +189,33 @@ pub enum Delivery {
     UnlessGroup,
 }
 
-/// The decision table. `SIGHUP` is the one signal a terminal does not deliver to a whole
-/// group, and it is the one whose relay cannot be skipped.
+/// The decision table. One row per forwarded signal, and `FORWARDED` is derived from it, so a
+/// signal cannot be forwarded without a delivery decision to make about it.
+///
+/// `SIGHUP` and `SIGTERM` are `Always` because neither has a keystroke: a terminal delivers
+/// SIGINT and SIGQUIT to its foreground group and nothing else, so for those two a shared group
+/// means the child already has the operator's copy (WS-FIX-20-r4-1, WS-FIX-20b). A terminal
+/// disconnect hangs up the session leader alone (WS-FIX-20c) and a POSIX timer reaches the
+/// wrapper alone with no sender at all, so a group says nothing about either and skipping there
+/// is what leaves a live child unstopped behind a wrapper stuck in `drain`.
 const DELIVERIES: &[(i32, Delivery)] = &[
     (signal_hook::consts::signal::SIGHUP, Delivery::Always),
+    (signal_hook::consts::signal::SIGTERM, Delivery::Always),
     (signal_hook::consts::signal::SIGINT, Delivery::UnlessGroup),
     (signal_hook::consts::signal::SIGQUIT, Delivery::UnlessGroup),
-    (signal_hook::consts::signal::SIGTERM, Delivery::UnlessGroup),
 ];
 
-/// How `sig` is delivered. A signal with no row is relayed: a signal this table has never
-/// been asked about is not a signal whose relay has been argued for.
+/// The signals the wrapper forwards to its child, as the signal numbers `signal-hook`
+/// delivers, derived from `DELIVERIES` so the two cannot drift. Only these: a signal the
+/// wrapper was not asked to forward keeps the disposition it had, so the wrapper neither
+/// swallows it nor dies from one.
+fn forwarded() -> Vec<i32> {
+    DELIVERIES.iter().map(|(s, _)| *s).collect()
+}
+
+/// How `sig` is delivered. A signal with no row is relayed: this table is consulted only for a
+/// signal `forwarded` returned, which is derived from it, so the arm exists for a caller naming
+/// a signal directly rather than to paper over a missing row.
 fn delivery_of(sig: i32) -> Delivery {
     DELIVERIES
         .iter()
@@ -230,9 +236,10 @@ fn delivery_of(sig: i32) -> Delivery {
 ///
 /// A signal the **terminal or the kernel** generated is relayed according to `DELIVERIES`:
 /// SIGINT and SIGQUIT are skipped only when the child shares the wrapper's group, because
-/// that is the one case where the terminal's own group-wide delivery has already reached it;
-/// SIGHUP is never skipped, because a terminal disconnect reaches the session leader alone
-/// and a skipped SIGHUP there orphans a live child (WS-FIX-20c).
+/// those two are what a terminal sends to its whole foreground group and nothing else; SIGHUP
+/// and SIGTERM are never skipped, because a terminal disconnect hangs up the session leader
+/// alone and a POSIX timer reaches the wrapper alone, so neither reaches the group and a
+/// skipped one orphans a live child (WS-FIX-20c, WS-FIX-20c-r1-4).
 ///
 /// The skip is never taken on the absence of a sender alone: an unfilled or zero-valued field
 /// is not evidence that the child already has the signal, and treating it as such is what
@@ -257,13 +264,19 @@ fn name_of(sig: i32) -> &'static str {
 }
 
 /// Writes what the watcher decided about one signal the wrapper handled, on the wrapper's own
-/// stderr. The child cannot be told "I declined to relay that" and a quiet period says
-/// nothing, so the decision is stated rather than inferred: an operator reading a wrapper
-/// that did not stop its child can see why, and the pty regression waits for this line
-/// instead of for a period in which nothing happened (WS-FIX-20c). A signal that ended the
-/// wrapper keeps the wrapper's own disposition and needs no line.
+/// stderr, AFTER the decision has been acted on. The child cannot be told "I declined to relay
+/// that" and a quiet period says nothing, so the decision is stated rather than inferred: an
+/// operator reading a wrapper that did not stop its child can see why, and the pty regression
+/// waits for this line instead of for a period in which nothing happened (WS-FIX-20c). A signal
+/// that ended the wrapper keeps the wrapper's own disposition and needs no line.
+///
+/// It runs after `kill_process` on purpose (WS-FIX-20c-r1-1): a write to a blocked stderr must
+/// not cost the relay, and once the signal has gone out a blocked write costs only the line.
 fn report(sig: i32, relayed: bool) {
-    let decision = if relayed { "forwarded" } else { "not forwarded" };
+    let decision = match relayed {
+        true => "forwarded",
+        false => "not forwarded",
+    };
     eprintln!("xmustard run: {} {decision} to the child", name_of(sig));
 }
 
@@ -345,7 +358,7 @@ impl Forwarder {
     ) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
         let mut signals = signal_hook::iterator::SignalsInfo::<
             signal_hook::iterator::exfiltrator::WithOrigin,
-        >::new(FORWARDED)
+        >::new(&forwarded())
         .map_err(|e| io::Error::other(e.to_string()))
         .inspect_err(|e| {
             eprintln!("xmustard run: signals are not forwarded to the child: {e}");
@@ -383,20 +396,24 @@ impl Forwarder {
                 }
                 // Whether to relay is `DELIVERIES`' decision, not this loop's: a signal the
                 // terminal or the kernel generated is skipped only where a group delivery
-                // would already have reached the child, and SIGHUP is never skipped because
-                // a terminal disconnect reaches the session leader alone.
+                // would already have reached the child, and a hangup or a timer is never
+                // skipped because neither reaches the group.
                 let shares_group = same_process_group(child);
                 let relayed = relay(raw, origin.process.map(|p| p.pid), shares_group);
-                report(raw, relayed);
-                if !relayed {
-                    continue;
+                if relayed {
+                    // ESRCH: the child is already gone, which is the normal race at exit.
+                    // Signalling the PROCESS GROUP instead would need the child to lead its
+                    // own group (`CommandExt::process_group(0)`), which changes where an
+                    // interactive child sits relative to the terminal: that is WS-21B's
+                    // isolation policy, an owner decision (G§5.11), not this row's to take.
+                    //
+                    // BEFORE the report, always. The delivery is the contract and the line is a
+                    // diagnostic, so a stderr whose reader has stopped may cost the diagnostic
+                    // but never the signal: reporting first would let a full pipe swallow a
+                    // client's timeout and orphan the child (WS-FIX-20c-r1-1).
+                    let _ = rustix::process::kill_process(child, sig);
                 }
-                // ESRCH: the child is already gone, which is the normal race at exit.
-                // Signalling the PROCESS GROUP instead would need the child to lead its
-                // own group (`CommandExt::process_group(0)`), which changes where an
-                // interactive child sits relative to the terminal: that is WS-21B's
-                // isolation policy, an owner decision (G§5.11), not this row's to take.
-                let _ = rustix::process::kill_process(child, sig);
+                report(raw, relayed);
             }
         });
         Some((handle, watcher))
