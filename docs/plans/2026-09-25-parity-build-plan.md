@@ -3158,9 +3158,13 @@ product source, no bound, no timeout, no retry, no dependency, no route or dispa
 3. **Deduped and labeled.** A flow is identified by its sorted set of steps, so the same
    reachability set reached from two seeds is one flow; a flow's label is the shared name
    stem of its steps when one qualifies, otherwise the seed's name.
-4. **Classified intra- or cross-community**, against the file-level communities the reader
-   already computes (`Snapshot::clusters`, `PathCluster`), because this row's Files list does
-   not include `areas.rs` and 38b is not merged.
+4. **Classified intra- or cross-community**, against the **symbol-level** areas WS-38b
+   computes (`areas.rs`, `Area::member_nodes`). A resolved CALL needs an import to exist, so
+   its two ends always share a file component: the reader's file-level communities
+   (`Snapshot::clusters`, `PathCluster`) would classify every flow `intra` and the field would
+   carry no information. Areas are communities over resolved symbol edges, so a call from one
+   subsystem into another really does cross one. (Corrected by WS-38c-b decision r3-8; the
+   original text named the file-level layer and contradicted the code.)
 5. **Truncation stats**, reported in every answer and counted in the budget record, never
    silently.
 
@@ -3179,7 +3183,7 @@ layer; that is 38b's, and this row uses the file-level communities instead, belo
   one caller and three callees outranks an equal symbol with four callers; `exported` doubles
   it; a name multiplier that is a table, one row per multiplier class, with each row pinned.
 - Top 200: a repository with more than 200 scoring candidates answers exactly 200 seeds.
-- Depth 10, branching 4, minimum 3 steps: a chain of 12 gives a flow of 11 steps and not a
+- Depth 10, branching 4, minimum 3 steps: a chain of 12 gives a flow of 10 steps and not a
   12th; a fan of 5 siblings explores 4; a two-step reachability set produces **no** flow.
 - Dedup: two seeds with the same reachability set are one flow with two seeds listed.
 - Label: a shared name stem is the label; a set with no shared stem falls back to the seed's
@@ -3218,14 +3222,18 @@ areas` takes `--seed` and `index flows` takes `--limit`, and neither takes the o
   file, not the helper's stdout: `logs/ws-38c-check-20261004T042957Z.log`.
 - **Deviations, numbered.**
   1. **Classification uses symbol-level areas, not the file-level communities the section
-     names** (WS-38c-r3-8). A resolved CALL needs an import to exist, so both of its ends
+     named** (WS-38c-r3-8). A resolved CALL needs an import to exist, so both of its ends
      always sit in the same file-level component: every flow would classify `intra` and the
      field would carry no information. `flows.rs` states this where the partition is chosen.
      The section text is NOT edited to match — which partition the owner wants is theirs.
+     **Superseded by WS-38c-b decision r3-8 (owner-operator, 2026-10-04): symbol-level areas
+     are correct, and the section above has been amended to say so.**
   2. **A twelve-name chain answers 10 steps, not the 11 this section's Tests-required line
-     expects** (WS-38c-r3-6). The section's two halves disagree: deliverable 2 sets depth 10,
+     expected** (WS-38c-r3-6). The section's two halves disagreed: deliverable 2 sets depth 10,
      and with the seed counted as the origin rather than a step, a 12-chain reaches 10. The
-     code follows the stated bound.
+     code followed the stated bound. **Resolved by WS-38c-b decision r3-6 (owner-operator,
+     2026-10-04): the depth cap of 10 wins, and the Tests-required line above has been
+     corrected to 10 steps plus `truncated=true`.**
   3. **Two files outside the Files list.** `areas.rs` gains `Area::member_nodes`, the full
      membership beside the rows `MAX_MEMBERS` caps — without it a symbol past 200 has no area
      and the `u32::MAX` sentinel reads as a second community (round-1 blocker WS-38c-r1-1).
