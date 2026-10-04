@@ -352,7 +352,10 @@ fn write_best_effort(line: String) {
             let notice = format!(
                 "xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n"
             );
-            let _ = sender.try_send(Report { line: notice, ack: false });
+            let _ = sender.try_send(Report {
+                line: notice,
+                ack: false,
+            });
         }
     }
 }
