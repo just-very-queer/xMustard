@@ -98,9 +98,15 @@ type reviewInput struct {
 	// scope and scopeKey are the proposal's scope: only entries of the same scope are
 	// its duplicates or neighbours (every proposal is workspace-scoped until WS-29).
 	scope, scopeKey string
-	declared        []string
-	anchors         []govstore.AnchorInput
-	claims          []MemoryClaim
+	// author is the proposal's author. Scope and key alone are not authority: two
+	// principals legitimately hold the same directory or the same run id, so a
+	// proposal is compared only against its OWN AUTHOR's entries of that scope, or a
+	// scoped proposal's duplicate and conflict candidates can name another principal's
+	// private text (round 3, r3-7).
+	author   string
+	declared []string
+	anchors  []govstore.AnchorInput
+	claims   []MemoryClaim
 	// intent: the proposal names supersedes, claims or relations, so it is more than
 	// a restatement.
 	intent bool
@@ -309,7 +315,8 @@ func loadReviewCandidates(ctx context.Context, r govstore.Reader, in reviewInput
 			return nil, err
 		}
 		content, ok := contents[id]
-		inScope := e.WorkspaceID == in.workspaceID && e.Scope == in.scope && e.ScopeKey == in.scopeKey
+		inScope := e.WorkspaceID == in.workspaceID && e.Scope == in.scope && e.ScopeKey == in.scopeKey &&
+			samePrincipal(e.Source, in.author)
 		readable := e.Served(now) || in.reviewer
 		if !inScope || !readable || e.Lifecycle != govstore.LifecycleActive || !ok || content.Withheld != "" {
 			continue
