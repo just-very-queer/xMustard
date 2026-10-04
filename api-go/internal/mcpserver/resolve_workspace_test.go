@@ -653,8 +653,9 @@ func TestCwdIsNotRegisteredWhileRootsAreUnknownByDefault(t *testing.T) {
 	repo := tempRepo(t)
 	api := &fakeAPI{}
 	// RegisterCwdWhenRootsUnknown unset is the zero value the shims pass when the
-	// variable is unset or "0"; they read it with the same `!= "0"` rule
-	// XMUSTARD_MCP_AUTO_REGISTER uses.
+	// variable is unset or "0"; registerCwdWhenRootsUnknown reads `== "1"`, the
+	// opposite of the `!= "0"` rule XMUSTARD_MCP_AUTO_REGISTER uses, because an unset
+	// variable here must not register a repository.
 	s := newSession(t, api, Options{Cwd: filepath.Join(repo, "src"), AutoRegister: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
 	res, _ := call(t, s, "ground", map[string]any{})
 	out := text(res)
@@ -672,7 +673,8 @@ func TestTheOptInRegistersTheCwdWhileRootsAreUnknown(t *testing.T) {
 	repo := tempRepo(t)
 	api := &fakeAPI{}
 	opts := Options{Cwd: filepath.Join(repo, "src", "pkg"), AutoRegister: true, RegisterCwdWhenRootsUnknown: true}
-	s := newSession(t, api, opts, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	client := rootsUnknownClient(errors.New("client error -32603: busy"))
+	s := newSession(t, api, opts, client, "2025-06-18")
 	res, rerr := call(t, s, "ground", map[string]any{})
 	if rerr != nil || res["isError"] != false {
 		t.Fatalf("the opt-in must register the cwd: %v %v", rerr, text(res))
@@ -681,10 +683,17 @@ func TestTheOptInRegistersTheCwdWhileRootsAreUnknown(t *testing.T) {
 	if ws.Source != SourceCWD || ws.Root != repo || !ws.Registered || ws.ID != WorkspaceIDForPath(repo) {
 		t.Fatalf("resolved %+v, want the cwd's own repository registered", ws)
 	}
-	// The registration is cached like any other resolved path, so the next call neither
-	// registers again nor asks roots/list again.
+	// The registration is cached like any other resolved path, so the next call does not
+	// register again. roots/list is still asked on the second call: resolveWorkspace
+	// consults the client's roots before the cwd signal, so the cache spares the load and
+	// not the request. The load count is the assertion; the request count is pinned at two
+	// so a future change that skips the roots request would show up here rather than pass
+	// unnoticed.
 	if _, _ = call(t, s, "ground", map[string]any{}); api.count("POST", "/api/workspaces/load") != 1 {
 		t.Fatalf("registered %d times", api.count("POST", "/api/workspaces/load"))
+	}
+	if n := client.count(); n != 2 {
+		t.Fatalf("asked roots/list %d times over two calls, want one per call", n)
 	}
 }
 

@@ -4640,7 +4640,7 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 
 **Requirements.** No new PAR id. This closes the owner-decided option 2 of the WS-FIX-15 decision memo and keeps `XMUSTARD_MCP_AUTO_REGISTER=0` orthogonal: auto-registration must still be on for this key to have any effect, and with it off the refusal names the auto-registration rule as before.
 
-**Files.** `api-go/internal/mcpserver/resolve_workspace.go` (`Options`-driven registration policy at the cwd signal), `api-go/internal/mcpserver/server.go` (the `Options` field), `api-go/internal/mcpserver/resolve_workspace_test.go` (on/off tests and the reason-text tests), `api-go/cmd/xmustard-mcp/main.go` (the one `Options` builder with a working directory; the `/mcp` endpoint's builder leaves `Cwd` empty, so the variable is not read there), `docs/SECURITY.md` (the exposure-posture table row and the workspace-registration prose), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
+**Files.** `api-go/internal/mcpserver/resolve_workspace.go` (`Options`-driven registration policy at the cwd signal), `api-go/internal/mcpserver/server.go` (the `Options` field), `api-go/internal/mcpserver/resolve_workspace_test.go` (on/off tests and the reason-text tests), `api-go/cmd/xmustard-mcp/main.go` (the one `Options` builder with a working directory; the `/mcp` endpoint's builder leaves `Cwd` empty, so the variable is not read there), `api-go/cmd/xmustard-mcp/main_test.go` (the parse's own table; the shim builds its `Options` in a package-level `var`, so the parse is extracted into a function for this test to reach), `api-go/cmd/xmustard-api/mcp_routes.go` (one comment recording why the variable is not read at `/mcp`), `docs/SECURITY.md` (the exposure-posture table row and the workspace-registration prose), `docs/plans/2026-09-25-parity-build-plan.md` (this section and the record below it)
 
 **Tests required.**
 - `TestCwdIsNotRegisteredWhileRootsAreUnknownByDefault`: on a fresh session with `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN` unset, the cwd repository is not registered and the reason still names "not auto-registered while the client's roots are unavailable".
@@ -4652,7 +4652,7 @@ Store review findings on govstore's existing events, outcomes, jobs and anchors 
 
 **WS-48 note.** `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN` is a new environment variable; WS-48's single configuration struct must absorb it.
 
-**Owner decision.** `decisions/OWNER-DECISIONS.md` (2026-10-03T16:04:48Z) chose option 2 of `decisions/ws-fix-15.md`: a configuration option, off by default. Option 3 (capability-based auto-registration with no configuration) was not chosen and is not implemented here.
+**Owner decision.** `decisions/OWNER-DECISIONS.md` (2026-10-03T16:04:48Z) chose option 2 of `decisions/ws-fix-15.md`: a configuration option, off by default. Option 3 of that memo (capability-based auto-registration, with no configuration) was not chosen, and no part of this row depends on it.
 
 ### WS-RT1 — Scale fixtures and pass counters
 

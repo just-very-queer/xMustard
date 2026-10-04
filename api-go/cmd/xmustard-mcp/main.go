@@ -53,14 +53,13 @@ func registerCwdWhenRootsUnknown() bool {
 	return strings.TrimSpace(os.Getenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN")) == "1"
 }
 
-// One stdio process is one MCP session.
-var (
-	backend = &mcpserver.HTTPBackend{}
-	client  = newStdioClient()
-	// XMUSTARD_MCP_SCHEMA=full also lists the advanced arguments (default lean);
-	// an invalid value stops the server in main.
-	schemaProfile, schemaErr = mcpserver.ParseSchemaProfile(os.Getenv("XMUSTARD_MCP_SCHEMA"))
-	session                  = mcpserver.New(mcpserver.Options{
+// stdioOptions is the shim's one Options value. It is a function rather than an
+// inline literal in the package-level var below because the WS-FIX-15b opt-in must be
+// observable end to end: a test that only exercised the parse and the resolver could not
+// fail if this wiring were deleted, which is the one way the env variable could stop
+// reaching the server while every other test stayed green.
+func stdioOptions() mcpserver.Options {
+	return mcpserver.Options{
 		Backend:                     backend,
 		Delivery:                    evidence,
 		Resources:                   evidence,
@@ -71,7 +70,17 @@ var (
 		Schema:                      schemaProfile,
 		// initialize appends the workspace's standing memory (WS-31)
 		StandingMemory: strings.TrimSpace(os.Getenv("XMUSTARD_MCP_STANDING_MEMORY")) != "0",
-	}).NewSession(client)
+	}
+}
+
+// One stdio process is one MCP session.
+var (
+	backend = &mcpserver.HTTPBackend{}
+	client  = newStdioClient()
+	// XMUSTARD_MCP_SCHEMA=full also lists the advanced arguments (default lean);
+	// an invalid value stops the server in main.
+	schemaProfile, schemaErr = mcpserver.ParseSchemaProfile(os.Getenv("XMUSTARD_MCP_SCHEMA"))
+	session                  = mcpserver.New(stdioOptions()).NewSession(client)
 )
 
 func workingDir() string {

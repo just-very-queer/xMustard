@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -113,6 +114,26 @@ func TestRegisterCwdWhenRootsUnknownIsOffUnlessSetToOne(t *testing.T) {
 			}
 			if got := registerCwdWhenRootsUnknown(); got != c.want {
 				t.Fatalf("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=%q set=%v: got %v, want %v", c.val, c.set, got, c.want)
+			}
+		})
+	}
+}
+
+// The parse's value has to reach the server, not stop at the parse. Deleting
+// RegisterCwdWhenRootsUnknown from stdioOptions leaves the parse test green and the
+// resolver tests green, so this is the only assertion that fails when the wiring is gone.
+func TestStdioOptionsCarriesTheRegisterCwdOptIn(t *testing.T) {
+	for _, want := range []bool{false, true} {
+		t.Run(fmt.Sprintf("opt-in %v reaches the server", want), func(t *testing.T) {
+			if want {
+				t.Setenv("XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN", "1")
+			} else {
+				unset := "XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN"
+				t.Setenv(unset, "")
+				os.Unsetenv(unset)
+			}
+			if got := stdioOptions().RegisterCwdWhenRootsUnknown; got != want {
+				t.Fatalf("stdioOptions().RegisterCwdWhenRootsUnknown=%v, want %v: the shim does not pass the variable to the server", got, want)
 			}
 		})
 	}
