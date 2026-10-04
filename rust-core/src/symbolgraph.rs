@@ -395,6 +395,7 @@ pub(crate) fn open_repo_regular_file_with_meta(
     rel: &str,
 ) -> std::io::Result<(std::fs::File, std::fs::Metadata)> {
     let f = open_repo_file_beneath(root, rel)?;
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
     let meta = f.metadata()?;
     if !meta.is_file() {
         return Err(std::io::Error::new(
@@ -495,6 +496,7 @@ pub fn read_source_beneath(
 ) -> Result<Vec<u8>, SourceReadFailure> {
     use std::io::Read;
     let f = open_repo_path_beneath(root, rel).map_err(|e| classify_open_error(&e))?;
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
     let meta = f
         .metadata()
         .map_err(|e| SourceReadFailure::Unreadable(e.to_string()))?;
@@ -556,6 +558,7 @@ pub(crate) fn sha256_open_file(mut f: std::fs::File) -> Option<[u8; 32]> {
         }
         hasher.update(&buf[..n]);
     }
+    crate::passcount::hashed(total);
     Some(hasher.finalize().into())
 }
 

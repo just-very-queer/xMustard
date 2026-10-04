@@ -733,13 +733,18 @@
         "readOnlyHint": true,
         "title": "Estimate change impact"
       },
-      "description": "Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=\u0026to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+      "description": "Blast radius. symbol= → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=\u0026to= → shortest path, per-hop edges. No args → changes since baseline.",
       "inputSchema": {
         "additionalProperties": false,
         "properties": {
           "base": {
-            "description": "scope=compare|range: base revision",
+            "description": "scope=compare|range: base",
             "maxLength": 256,
+            "type": "string"
+          },
+          "cursor": {
+            "description": "next_cursor of the previous page",
+            "maxLength": 64,
             "type": "string"
           },
           "direction": {
@@ -751,11 +756,11 @@
             "type": "string"
           },
           "from": {
-            "description": "trace path from this symbol",
+            "description": "trace from here",
             "type": "string"
           },
           "head": {
-            "description": "scope=compare|commit|range: head revision",
+            "description": "scope=compare|commit|range: head",
             "maxLength": 256,
             "type": "string"
           },
@@ -788,7 +793,7 @@
             "type": "number"
           },
           "offset": {
-            "description": "items skipped per depth tier",
+            "description": "items skipped per tier",
             "maximum": 50000,
             "minimum": 0,
             "type": "integer"
@@ -799,12 +804,12 @@
             "type": "string"
           },
           "relation_types": {
-            "description": "edge kinds to walk (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)",
+            "description": "edge kinds (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)",
             "maxLength": 128,
             "type": "string"
           },
           "scope": {
-            "description": "symbols a diff touches, and their dependents",
+            "description": "symbols a diff touches, and dependents",
             "enum": [
               "unstaged",
               "staged",
@@ -817,11 +822,11 @@
             "type": "string"
           },
           "summary_only": {
-            "description": "counts, risk and envelope without items",
+            "description": "counts, risk, no items",
             "type": "boolean"
           },
           "symbol": {
-            "description": "symbol to compute blast radius for",
+            "description": "name, Container.name, UID or path",
             "type": "string"
           },
           "timeout_ms": {
@@ -831,7 +836,7 @@
             "type": "integer"
           },
           "to": {
-            "description": "trace path to this symbol",
+            "description": "trace to here",
             "type": "string"
           },
           "workspace_id": {
@@ -839,7 +844,7 @@
             "type": "string"
           },
           "worktree": {
-            "description": "another checkout of this repository to diff",
+            "description": "another checkout to diff",
             "maxLength": 4096,
             "type": "string"
           }
@@ -864,11 +869,17 @@
           "freshness": {
             "type": "object"
           },
+          "has_more": {
+            "type": "boolean"
+          },
           "impacted_count": {
             "type": "integer"
           },
           "length": {
             "type": "integer"
+          },
+          "next_cursor": {
+            "type": "string"
           },
           "risk": {
             "type": "string"

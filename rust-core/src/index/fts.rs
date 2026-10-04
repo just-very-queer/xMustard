@@ -467,6 +467,7 @@ fn stored_text(conn: &Connection, root: &Path, loc: &ChunkLoc) -> Option<String>
                 .optional()
         })
         .ok()??;
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
     let meta = std::fs::symlink_metadata(root.join(&loc.path)).ok()?;
     let current = meta.is_file() && super::scan::StatKey::of(&meta).encode() == key;
     (current && !key.starts_with(super::RACY_PREFIX)).then_some(text)
