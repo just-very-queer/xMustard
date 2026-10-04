@@ -13,7 +13,10 @@ import (
 //
 // The queue must still list every pending row. Asserting q.Total == n here is what
 // makes this benchmark also the row's no-cap guard: a future cap would fail the
-// benchmark rather than quietly make it faster.
+// benchmark rather than quietly make it faster. It also asserts that every row is
+// either listed or skipped for a named reason, so a batching change that altered which
+// rows were listed, or why one was skipped, fails the benchmark instead of only
+// changing its timings.
 func BenchmarkAwaitingMeOwnerGuard(b *testing.B) {
 	for _, policy := range []string{DistinctToken, DistinctOwner} {
 		for _, n := range []int{100, 1000, 10000} {
@@ -46,6 +49,18 @@ func BenchmarkAwaitingMeOwnerGuard(b *testing.B) {
 					if q.Total != n {
 						b.Fatalf("the queue listed %d of %d pending entries: a row was capped or withheld",
 							q.Total, n)
+					}
+					// Every pending row is somebody else's, so each is either listed
+					// (Items) or skipped, and the two must add up. Without this a guard
+					// that changed which reason a row was skipped by, or that guarded
+					// only part of a page, would still report Total == n: the last
+					// partial page is the case a page-boundary loop gets wrong, and a
+					// queue of 100 or 1000 rows is one.
+					if got := len(q.Items) + q.Skipped[skipOwn] + q.Skipped[skipVoted] +
+						q.Skipped[skipSameOwner] + q.Skipped[skipNotVisible]; got != n {
+						b.Fatalf("%d rows accounted for (%d items, skipped %v), want %d: batching "+
+							"changed which rows were listed or why they were skipped",
+							got, len(q.Items), q.Skipped, n)
 					}
 				}
 			})

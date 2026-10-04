@@ -274,20 +274,29 @@ func (r *reader) RevisionOwners(ctx context.Context, keys []PendingKey) (map[Pen
 
 // editEventOwners reads the `provenance.owner` the entry's edit event for each named
 // revision carries, in bounded batches. It is the same row revisionOwner reads one
-// entry at a time; a revision with no edit event (a proposal, or an event that recorded
-// none) is absent from the result.
+// entry at a time, which asks for one event (Limit: 1), so the query keeps only the
+// lowest seq per named revision and the rows it returns scale with the key count rather
+// than with the edit history of those revisions. A revision with no edit event (a
+// proposal, or an event that recorded none) is absent from the result.
 func (r *reader) editEventOwners(ctx context.Context, keys []PendingKey) (map[PendingKey]string, error) {
 	out := make(map[PendingKey]string, len(keys))
 	for start := 0; start < len(keys); start += maxInArgs / 2 {
 		chunk := keys[start:min(start+maxInArgs/2, len(keys))]
-		args := make([]any, 0, 2*len(chunk))
+		args := make([]any, 0, 2*len(chunk)+2)
 		clauses := make([]string, len(chunk))
 		for i, k := range chunk {
-			clauses[i] = "(entry_id = ? AND revision = ?)"
+			clauses[i] = "(ev.entry_id = ? AND ev.revision = ?)"
 			args = append(args, k.EntryID, k.Revision)
 		}
-		rows, err := r.query(ctx, "SELECT entry_id, revision, data FROM events WHERE type = ? AND ("+
-			strings.Join(clauses, " OR ")+") ORDER BY entry_id, revision, seq", append([]any{EventEdit}, args...)...)
+		// bind order follows the text: the outer type, then the chunk clauses, then the
+		// subquery's type
+		bound := make([]any, 0, len(args)+2)
+		bound = append(bound, EventEdit)
+		bound = append(bound, args...)
+		bound = append(bound, EventEdit)
+		rows, err := r.query(ctx, "SELECT ev.entry_id, ev.revision, ev.data FROM events ev WHERE ev.type = ? AND ("+
+			strings.Join(clauses, " OR ")+") AND ev.seq = (SELECT e2.seq FROM events e2 WHERE e2.type = ? AND e2.entry_id = ev.entry_id AND e2.revision = ev.revision ORDER BY e2.seq LIMIT 1)"+
+			" ORDER BY ev.entry_id, ev.revision, ev.seq", bound...)
 		if err != nil {
 			return nil, err
 		}

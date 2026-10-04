@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"testing"
 
 	"xmustard/api-go/internal/govstore"
@@ -321,6 +322,90 @@ func TestTheBatchedOwnerGuardAnswersExactlyWhatThePerRowGuardAnswers(t *testing.
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestTheBatchedOwnerGuardNeverAsksAboutAnEntryTheApproverCannotSee pins the order of
+// the two guards in the approval queue. WS-29b round 4 (r4-6) put ScopesVisible ahead
+// of every per-row read, so nothing about an entry this approver may not see was even
+// loaded; batching the owner-distinct reads for a whole page moved those reads in front
+// of the scope check, so a page's revisions, edit events and votes are read for entries
+// the approver cannot see at all.
+//
+// The order is observable in the queue's own answer. batchOwnerVoices is given the whole
+// page, so an entry the approver may not see is handed to it and its revision, edit event
+// and votes are read, where the per-row path never loaded them. The fix is to filter the
+// page by scope before the batch; this test fails on the unfixed order because a private
+// proposal of a stranger is then guarded, and the guard reads it, rather than skipped.
+func TestTheBatchedOwnerGuardNeverAsksAboutAnEntryTheApproverCannotSee(t *testing.T) {
+	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
+	h := humanApprover("bob", "bob")
+
+	// a stranger's private proposal: visible to its author alone, so not to bob
+	e, err := Remember(dir, ws, RememberRequest{ProposeContextRequest: ProposeContextRequest{
+		Title: "carol's private", Content: "carol's private note", Permission: "readwrite",
+		Visibility: ScopePrivate}}, ContextActor{ID: "carol"})
+	if err != nil {
+		t.Fatalf("propose carol's private entry: %v", err)
+	}
+	if ScopesVisible(e.Scope, e.ScopeKey, e.Source, h.Principal.ID, ScopeRequest{}) {
+		t.Fatalf("%s is scope %q, so the fixture does not reach the scope check", e.ID, e.Scope)
+	}
+
+	q, err := HumanApprovalQueue(dir, ws, h, 0, 0)
+	if err != nil {
+		t.Fatalf("the batched guard read an entry the approver cannot see: %v", err)
+	}
+	if got := q.Skipped[skipNotVisible]; got != 1 {
+		t.Fatalf("skipped not_visible = %d, want 1: the private proposal was counted by another "+
+			"reason, so the scope check did not run before the reads", got)
+	}
+	if len(q.Items) != 0 {
+		t.Fatalf("the queue listed %d items, want none: a private proposal reached an approver", len(q.Items))
+	}
+}
+
+// TestTheBatchedOwnerGuardCoversTheLastPartialPageOfAMultiPageQueue guards the case a
+// page-boundary loop gets wrong. The queue lists in pages of storeListPage and batches
+// the owner-distinct guard per page, so a candidate in the last, short page must be
+// guarded like any other; a loop that guarded a whole chunk but let the tail through
+// unguarded, or dropped it, would still pass a single-page fixture.
+//
+// The fixture is storeListPage proposals that bob may see, then one more bob cannot:
+// that last one is the tail, and it is refused because bob owns its author. Every row
+// before it is somebody else's, so it is the only same-owner row and the only one
+// counted as skipped rather than listed.
+func TestTheBatchedOwnerGuardCoversTheLastPartialPageOfAMultiPageQueue(t *testing.T) {
+	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
+	h := humanApprover("bob", "bob")
+
+	// enough rows that the queue needs a second page, so the tail is a partial one
+	for i := 0; i < storeListPage; i++ {
+		proposeAs(t, dir, ws, ContextActor{ID: "author-" + strconv.Itoa(i)}, "the build uses make")
+	}
+	// the tail: bob owns its author, so only the owner-distinct guard can refuse it
+	tail := proposeAs(t, dir, ws, ContextActor{ID: "bob-bot", Owner: "bob"}, "bob's own, in the last page")
+
+	q, err := HumanApprovalQueue(dir, ws, h, 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Total counts the rows listed for approval, so the refused tail is not in it: one
+	// of the storeListPage+1 rows is bob's own, and the rest are all listed.
+	if q.Total != storeListPage {
+		t.Fatalf("Total = %d, want %d: a row was capped, withheld or listed across the page "+
+			"boundary (skipped %v)", q.Total, storeListPage, q.Skipped)
+	}
+	if got := q.Skipped[skipSameOwner]; got != 1 {
+		t.Fatalf("skipped same_owner = %d, want 1: the last row of the last page was not guarded "+
+			"(the queue listed %d of %d)", got, q.Total, q.Total+q.Skipped[skipSameOwner])
+	}
+	// Items is the rendered page, bounded by limit, so it is not the row count; the tail
+	// must be absent from what is rendered, not merely uncounted
+	for _, it := range q.Items {
+		if it.EntryID == tail.ID {
+			t.Fatalf("%s is bob's own proposal and was listed in his own approval queue", tail.ID)
+		}
 	}
 }
 

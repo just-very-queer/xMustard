@@ -274,10 +274,18 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 				return err
 			}
 			// One batched owner-distinct read over the page (WS-FIX-22b), instead of
-			// three queries per pending row.
+			// three queries per pending row. The page is filtered by scope first, so the
+			// batch never reads a revision, edit event or vote of an entry this approver
+			// may not see: batching the guard for the page would otherwise move those
+			// reads in front of the scope check, which WS-29b round 4 (r4-6) put ahead
+			// of every per-row read on purpose.
 			candidates := make([]queueCandidate, 0, len(page))
 			for _, e := range page {
 				for _, c := range pendingRevisions(e) {
+					if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, h.Principal.ID, ScopeRequest{}) {
+						q.Skipped[skipNotVisible]++
+						continue
+					}
 					candidates = append(candidates, c)
 				}
 			}
@@ -343,8 +351,9 @@ func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, h Human
 	// An approver is deliberately a principal OTHER than the author, so the scope rule
 	// is the only thing that keeps a private proposal's content out of its queue: an id
 	// in the listing is a disclosure, and so is the rendered body (round 4, r4-6). The
-	// check runs before the revision and its votes are read, so nothing about an entry
-	// this approver may not see is even loaded.
+	// page is filtered by this check before the batched owner-distinct read, so a
+	// candidate reaching here is already visible; the check stands again so a caller
+	// that skips the filter still reads nothing about an entry the approver may not see.
 	if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, me, ScopeRequest{}) {
 		q.Skipped[skipNotVisible]++
 		return false, nil
