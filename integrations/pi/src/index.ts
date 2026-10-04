@@ -17,7 +17,7 @@ import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
 import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
-import { mutateBashInput, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
+import { mutateBashInput, newWrappedCalls, rememberWrapped, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
@@ -107,6 +107,10 @@ export default function xmustard(pi: ExtensionAPI): void {
 		if (!active.includes(EXPAND_TOOL)) pi.setActiveTools([...active, EXPAND_TOOL]);
 	};
 
+	// Which calls the tool_call hook rewrote, consumed once by tool_result. See
+	// commandwrap.ts for why the record and not the output text is the provenance.
+	const wrappedCalls = newWrappedCalls();
+
 	// Registered tools start active; expansion stays hidden until a handle is issued
 	// (or the resumed, reloaded or forked branch already names one), and xMustard tools
 	// this caller cannot use are deactivated, so they never reach the model
@@ -122,6 +126,11 @@ export default function xmustard(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		const meta = { sessionId: sessionIdOf(ctx), signal: ctx.signal };
 		if (TOOL_NAMES.has(event.toolName)) return projectResult(cfg, event, pending, meta, activateExpand);
+		// The tool_call hook's own record of which call it rewrote, consumed once.
+		// Output text cannot stand in for it: an untrusted result can print a
+		// footer-shaped line, and a handle inferred from text let such a result skip
+		// capture, redaction and the output budget.
+		const wrapped = wrappedCalls.delete(event.toolCallId) === true;
 		// A wrapper projection already carries its handle in the text and never reaches
 		// the capture path that would otherwise notice, so the rule is
 		// shouldActivateExpand's, applied before the built-ins guard: with
@@ -130,7 +139,7 @@ export default function xmustard(pi: ExtensionAPI): void {
 		// result is then projected remains that set's own decision.
 		if (shouldActivateExpand(event.content)) activateExpand();
 		if (cfg.builtins.has(event.toolName)) {
-			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand);
+			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand, wrapped);
 		}
 		return undefined; // other tools pass through untouched
 	});
@@ -150,7 +159,10 @@ export default function xmustard(pi: ExtensionAPI): void {
 			apiBase: cfg.apiBase,
 		})) return undefined;
 		await resolveWorkspace(ctx.cwd, ctx.signal).then(
-			(ws) => mutateBashInput(event, ws, true),
+			(ws) => {
+				mutateBashInput(event, ws, true);
+				rememberWrapped(wrappedCalls, event);
+			},
 			() => mutateBashInput(event, undefined, true),
 		);
 		return undefined;

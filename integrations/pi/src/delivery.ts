@@ -719,16 +719,23 @@ export async function projectBuiltin(
 	ev: BuiltinResultInput,
 	meta: { sessionId?: string; signal?: AbortSignal },
 	onHandle: () => void,
+	// Whether THIS call was rewritten to the run wrapper, recorded by the tool_call
+	// hook. It is the only trustworthy provenance for a handle: output text is not,
+	// because an untrusted built-in result can print a `[xmustard evidence]` line
+	// with an `xm1.` in it (a bash call catting a saved transcript), and inferring
+	// capture from the shape of the text let any such result skip capture, redaction
+	// and the output budget entirely.
+	wrapped: boolean,
 ): Promise<BuiltinResultOutput | undefined> {
 	if (!cfg.builtins.has(ev.toolName)) return undefined;
 	const texts = textBlocks(ev.content);
 	if (!texts) return undefined;
 	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
 	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
-	// A result that already names a handle (the run wrapper's projection) is the
-	// reduced form of an original already captured; capturing it again would point
-	// the visible handle at the projection instead of the command's own output.
-	if (carriesHandle(texts)) return undefined;
+	// A wrapped result (the run wrapper's projection) is the reduced form of an
+	// original the wrapper already captured; capturing it again would point the
+	// visible handle at the projection instead of the command's own output.
+	if (wrapped && carriesHandle(texts)) return undefined;
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });
 	const paused = capturer.paused;
 	if (paused) return passthrough(`capture paused: ${paused}`);

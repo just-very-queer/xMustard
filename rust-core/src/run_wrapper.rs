@@ -683,10 +683,33 @@ fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
     if sub != "run" {
         return Some(sub);
     }
-    Some(match subcommand(words) {
-        Some(script) => format!("run {script}"),
+    // The registry reads the script's name only to classify it (registry.go:
+    // `HasPrefix(script, "test")`, and the same for lint and build), so the family
+    // word is what it needs and the name itself may be anything — a script called
+    // after a credential would otherwise put that word in the capture URL.
+    Some(match subcommand(words).as_deref().and_then(family_of) {
+        Some(family) => format!("run {family}"),
         None => sub,
     })
+}
+
+/// The registry's own script families, in its precedence order (test before lint
+/// before build). A script matching none is not sent: the registry's fallback for
+/// an unknown npm script is the generic package-manager reducer, not a guess.
+fn family_of(script: &str) -> Option<&'static str> {
+    let s = script.to_ascii_lowercase();
+    const TEST: [&str; 4] = ["test", "t", "e2e", "vitest"];
+    const LINT: [&str; 2] = ["lint", "eslint"];
+    const BUILD: [&str; 7] = ["build", "compile", "typecheck", "tsc", "install", "ci", "jest"];
+    if TEST.iter().any(|p| s.starts_with(p)) {
+        Some("test")
+    } else if LINT.iter().any(|p| s.starts_with(p)) {
+        Some("lint")
+    } else if BUILD.iter().any(|p| s.starts_with(p)) {
+        Some("build")
+    } else {
+        None
+    }
 }
 
 /// The registry's own keywords, in its precedence order (test and check before lint).
@@ -834,6 +857,44 @@ mod tests {
         ] {
             assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
         }
+    }
+
+    #[test]
+    fn a_run_script_hint_carries_its_family_and_never_the_script_name() {
+        // r6 (codex-spec medium): the registry reads the script only to classify it
+        // (registry.go `HasPrefix(script, "test")`, and the same for lint and build), so
+        // the family word is all it needs. A script named after a secret must not reach
+        // the capture URL, which is what sending the name verbatim allowed.
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let hint = |command: &str| command_hint(&a(&["bash", "-c", command]));
+        for (command, want) in [
+            ("npm run test", "npm run test"),
+            ("npm run test:unit", "npm run test"),
+            ("npm run e2e", "npm run test"),
+            ("npm run vitest", "npm run test"),
+            ("npm run lint:fix", "npm run lint"),
+            ("npm run eslint", "npm run lint"),
+            ("npm run build", "npm run build"),
+            ("npm run tsc", "npm run build"),
+            // A script in none of the registry's families sends nothing, because the
+            // registry's own fallback for an unknown script is the generic reducer.
+            ("npm run deploy", "npm run"),
+            ("npm run hunter2", "npm run"),
+            ("npm run TEST", "npm run test"),
+        ] {
+            assert_eq!(hint(command), want, "{command}");
+        }
+        // The shape a secret takes: a plain word that is not a family name.
+        assert!(!hint("npm run hunter2").contains("hunter2"));
+        assert!(!hint("npm run s3cret-token").contains("s3cret"));
+    }
+
+    #[test]
+    fn the_wrapper_default_api_is_the_one_the_adapter_refuses_against() {
+        // commandwrap.ts WRAPPER_DEFAULT_API is a second constant in another language.
+        // If the two drift, the adapter compares against an endpoint the wrapper does
+        // not use and wraps a call the wrapper sends somewhere else.
+        assert_eq!(DEFAULT_API, "http://127.0.0.1:8042");
     }
 
     #[test]

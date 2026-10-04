@@ -66,6 +66,34 @@ export function mutateBashInput(event: unknown, workspaceId: string | undefined,
 	input.command = `${WRAPPER} --workspace ${shellQuote(ws)} -- ${SHELL} ${SHELL_FLAG} ${shellQuote(command)}`;
 }
 
+// The tool_call hook records here that it rewrote a call, and the tool_result hook
+// consumes that record once. It is how the result side knows a handle in the output
+// is the wrapper's own rather than a line any untrusted result could print.
+//
+// The id is Pi's, not ours, and a result can arrive for a call whose id was never
+// recorded (a resumed session, a hook registered mid-batch), which reads as unwrapped
+// and so captures. The map is therefore capped and prunes the oldest entry, rather
+// than growing with a long session.
+export type WrappedCalls = Map<string, true>;
+
+const WRAPPED_CALL_LIMIT = 256;
+
+export function newWrappedCalls(): WrappedCalls {
+	return new Map<string, true>();
+}
+
+// rememberWrapped records one rewritten call. It is a named function so the tool_call
+// hook stays a sequence of decisions and a unit test can reach the bookkeeping without
+// an ExtensionAPI.
+export function rememberWrapped(calls: WrappedCalls, event: unknown): void {
+	if (!isRecord(event) || typeof event.toolCallId !== "string") return;
+	if (calls.size >= WRAPPED_CALL_LIMIT) {
+		const oldest = calls.keys().next();
+		if (!oldest.done) calls.delete(oldest.value);
+	}
+	calls.set(event.toolCallId, true);
+}
+
 function isRecord(v: unknown): v is Record<string, unknown> {
 	return typeof v === "object" && v !== null && !Array.isArray(v);
 }
@@ -101,15 +129,53 @@ export function shouldWrapBash(
 	// No executable wrapper means the rewritten command would exit 127 and the
 	// model's own command would never run, so the call stays native.
 	if (!opts.wrapperAvailable) return false;
-	// A default base is what the wrapper uses when nothing is passed, so only a base
-	// that differs from the adapter's own needs reconciling.
-	if (opts.wrapperApiBase !== undefined && normalizeApiBase(opts.wrapperApiBase) !== opts.apiBase) return false;
+	// The wrapper's effective endpoint, not just an explicit one: with
+	// XMUSTARD_API_BASE unset it falls back to its own DEFAULT_API, so a session
+	// pointed at a different server would capture there and issue a handle this
+	// adapter cannot spend.
+	if (wrapperEndpoint(opts.wrapperApiBase) !== opts.apiBase) return false;
+	// The wrapper speaks plain http on loopback only (run_wrapper.rs: an upload to
+	// any other host is refused before it starts), so an https or remote adapter
+	// base can never be reached by it and the capture would fail open to native
+	// output instead of the promised projection.
+	if (!isLoopbackHttp(opts.apiBase)) return false;
 	// The handle the wrapper issues is spent through this adapter, so both sides must
 	// hold the same effective credential, including both holding none: a wrapper
 	// token with no adapter token captures fine and then fails xmustard_expand.
 	// Trimmed, because the adapter trims XMUSTARD_TOKEN and the wrapper's nonblank()
 	// ignores whitespace only.
 	return effectiveToken(opts.token) === effectiveToken(opts.wrapperToken);
+}
+
+// The wrapper's own default when XMUSTARD_API_BASE is unset or blank
+// (run_wrapper.rs DEFAULT_API). It is a second constant in a different language,
+// and the two can disagree without either test noticing, so the wrapper's value is
+// named here and the Rust one is asserted equal to it in the Rust test suite.
+export const WRAPPER_DEFAULT_API = "http://127.0.0.1:8042";
+
+// Where the wrapper would actually upload: its default when nothing is set, the
+// normalized value when something is.
+export function wrapperEndpoint(raw: string | undefined): string {
+	const set = raw?.trim();
+	return set ? normalizeApiBase(set) : normalizeApiBase(WRAPPER_DEFAULT_API);
+}
+
+// Whether the wrapper can reach this base at all: plain http, on loopback. Mirrors
+// run_wrapper.rs `is_loopback` and its refusal of every other scheme. The 127/8 test
+// is on the parsed address, not on the hostname's text: `127.0.0.1.example` parses
+// to a name, not an address, and is not loopback.
+export function isLoopbackHttp(base: string): boolean {
+	let url: URL;
+	try {
+		url = new URL(base);
+	} catch {
+		return false;
+	}
+	if (url.protocol !== "http:") return false;
+	const host = url.hostname.replace(/^\[|\]$/g, "");
+	if (host === "localhost" || host === "::1") return true;
+	const octets = host.split(".");
+	return octets.length === 4 && octets.every((o) => /^\d{1,3}$/.test(o) && Number(o) <= 255) && octets[0] === "127";
 }
 
 function effectiveToken(t: string | undefined): string | undefined {

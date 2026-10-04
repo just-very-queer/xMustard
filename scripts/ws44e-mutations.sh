@@ -142,9 +142,9 @@ mutate M22 'if (!opts.wrapperAvailable) return false;' '' || true
 # M23: a directory named xmustard-core counts as the wrapper.
 mutate M23 'return statSync(bin).isFile();' 'return true;' || true
 
-# M19: the API-base reconciliation is dropped, so a session pointed at one server
-# captures through the wrapper into another.
-mutate M19 'if (opts.wrapperApiBase !== undefined && normalizeApiBase(opts.wrapperApiBase) !== opts.apiBase) return false;' '' || true
+# M19: an explicit-but-different API base is accepted, so a session pointed at one
+# server captures through the wrapper into another.
+mutate M19 'if (wrapperEndpoint(opts.wrapperApiBase) !== opts.apiBase) return false;' '' || true
 
 # M20: every program gets a second word, so `echo hunter2` can put hunter2 in the
 # capture query.
@@ -174,12 +174,38 @@ mutate M17 'const SHELL = "bash";' 'const SHELL = "sh";' "$SRC" || true
 # is reduced by the generic shell reducer instead of the diff family.
 mutate M18 'Some(c) => Box::new(c.split_whitespace()),' 'Some(_) => Box::new(argv.iter().map(String::as_str)),' "$RUST" || true
 
-# M26: a result that already carries a handle is captured again by projectBuiltin.
-mutate M26 '	if (carriesHandle(texts)) return undefined;' '' "$DLV" || true
+# M26: the no-re-capture guard is removed, so the wrapper's own projection is captured a
+# second time and the visible handle points at the projection rather than the output.
+mutate M26 '	if (wrapped && carriesHandle(texts)) return undefined;' '' "$DLV" || true
 
 # M27: the handle scan stops at the first tag, so a handle after a second tag on a
 # later line is missed.
 mutate M27 '		HANDLE_TAG.lastIndex = nl + 1;' '		return false;' "$DLV" || true
+
+# M28: the no-re-capture guard drops the provenance requirement, so any result whose
+# text looks like the footer skips capture, redaction and the output budget (r6).
+mutate M28 'if (wrapped && carriesHandle(texts)) return undefined;' 'if (carriesHandle(texts)) return undefined;' "$DLV" || true
+
+# M29: the endpoint comparison is narrowed back to an explicit value, so a session on a
+# custom base with nothing set for the wrapper is allowed to wrap (r6 P1). M19 removes
+# the check; this one keeps it and makes it agree with anything explicit.
+mutate M29 'const set = raw?.trim();' 'const set = raw?.trim(); if (set !== undefined) return set;' || true
+
+# M30: the reachability check is dropped, so an https or remote adapter base is wrapped
+# even though the wrapper refuses every non-loopback host (r6).
+mutate M30 'if (!isLoopbackHttp(opts.apiBase)) return false;' '' || true
+
+# M31: the wrapper's own default is ignored again, so an unset base compares as empty
+# rather than as the endpoint the wrapper will actually use.
+mutate M31 'return set ? normalizeApiBase(set) : normalizeApiBase(WRAPPER_DEFAULT_API);' 'return set ? normalizeApiBase(set) : "";' || true
+
+# M32: the family mapping is bypassed and the script's own name is sent, so a script
+# named after a secret puts that word in the capture URL (r6).
+mutate M32 'Some(family) => format!("run {family}"),' 'Some(_family) => format!("run {}", subcommand(words).unwrap_or_default()),' "$RUST" || true
+
+# M33: the family mapping returns the script itself for every family, which is the
+# pre-r6 behaviour.
+mutate M33 'if TEST.iter().any(|p| s.starts_with(p)) {' 'if !s.is_empty() {' "$RUST" || true
 
 restore ALL
 echo "=== final byte-compare"
