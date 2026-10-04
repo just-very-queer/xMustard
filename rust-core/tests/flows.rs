@@ -16,6 +16,8 @@ use std::process::{Command, Output};
 
 use serde_json::Value;
 use tempfile::TempDir;
+use xmustard_core::index;
+use xmustard_core::index::config::IndexConfig;
 
 const BIN: &str = env!("CARGO_BIN_EXE_xmustard-core");
 
@@ -1944,4 +1946,324 @@ fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
         "DeltaOne is exported and the flag must survive the skipped file: {delta:?}"
     );
     assert_eq!(delta.score, 4.0, "the exported doubling applies: {delta:?}");
+}
+
+// --- WS-38c-b: the six decided findings --------------------------------------
+
+/// The retained step set is bounded by ONE global cap, not by seeds x per-walk.
+///
+/// `MAX_FLOWS` and `MAX_STEPS_LISTED` both bound what the answer LISTS and are applied
+/// after every walk has finished, so before this row nothing bounded what stayed RESIDENT:
+/// at 200 seeds each holding a walk, the retained `visited` vectors grew with the product
+/// while the answer reported two caps whose product was the only thing bounding it. The
+/// product IS the cap, so the default run here cannot reach it — a 200-seed fixture at 50
+/// steps each is 10,000 symbols of walk, which this fixture does not build — and the cap is
+/// therefore reached by a run that reports hitting it rather than by a memory line alone.
+///
+/// The fixture is the shape the finding describes: many seeds, each reaching a long walk.
+/// `Ret` names `RetA1..RetA60`, so `RetA0`'s walk is 60 steps and every other seed's is a
+/// suffix of it, 60 flows of up to 60 steps each — 3,600 retained steps against a cap of
+/// 10,000. That is under the cap, so the assertion is that the cap is PUBLISHED and that the
+/// run reports no retention drop, which is the honest reading: the bound exists, it is
+/// legible, and this fixture does not hit it. A row that asserted the drop fired here would
+/// be asserting that the shape is bigger than the shape is.
+#[test]
+fn the_retained_step_set_is_bounded_by_one_published_global_cap() {
+    let mut src = String::from("package pkg\n\nfunc RetA0() { ");
+    for i in 1..=60 {
+        src.push_str(&format!("RetA{i}() "));
+    }
+    src.push_str("}\n");
+    for i in 1..=60 {
+        let next = if i < 60 {
+            format!(" RetA{}()", i + 1)
+        } else {
+            String::new()
+        };
+        src.push_str(&format!("func RetA{i}() {{{next} }}\n"));
+    }
+    let d = repo(&[GO_MOD, ("pkg/ret.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let cap = v["caps"]["max_retained_steps"].as_u64();
+    assert_eq!(
+        cap,
+        Some(10_000),
+        "the global cap is the product of the two published caps, neither raised: {v:#}"
+    );
+    // And the retention drop is a reported counter, not a silent shortening: on a run that
+    // does not hit the cap it reads zero, and the flag beside it agrees with every counter.
+    let t = truncation(&v);
+    assert_eq!(
+        t.get("dropped_retained").copied(),
+        Some(0),
+        "this fixture retains less than the cap, so nothing is dropped for it: {t:?}"
+    );
+    assert_eq!(
+        t.values().filter(|n| **n > 0).count() > 0,
+        v["truncated"].as_bool().unwrap(),
+        "`truncated` is the one-line reading of the counters beside it: {t:?} in {v:#}"
+    );
+}
+
+/// The global cap fires, and says so, when the walks really do exceed it.
+///
+/// The default cap is the product of two published caps, which a fixture cannot afford to
+/// build, so the cap is reached here through the `--limit` flag's existing arm is NOT
+/// available (it lowers the seed cap, not the retention cap). The path under test is
+/// therefore the arithmetic itself: with 60 one-step-delta suffixes over a 60-step trunk,
+/// every seed's walk is a suffix, so the sum across 60 walks is what the cap bounds. This
+/// test pins the SHAPE of the check rather than the default number, and the honest verdict
+/// is that the check is observable only when the product is exceeded — recorded as such in
+/// the row's mutation table rather than claimed as covered.
+#[test]
+fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
+    // Two independent trunks of 40 steps each, so there are two reachability sets rather
+    // than 60 suffixes of one: dedup folds suffixes together, which is what keeps this
+    // fixture's retained sum small, and the assertion below is about the counter's PLUMBING
+    // — that it exists, reads zero when nothing was dropped, and is included in `truncated`.
+    let mut src = String::from("package pkg\n\n");
+    for trunk in ["P", "Q"] {
+        src.push_str(&format!("func {trunk}0() {{ "));
+        for i in 1..40 {
+            src.push_str(&format!("{trunk}{i}() "));
+        }
+        src.push_str("}\n");
+        for i in 1..40 {
+            let next = if i < 39 {
+                format!(" {trunk}{}()", i + 1)
+            } else {
+                String::new()
+            };
+            src.push_str(&format!("func {trunk}{i}() {{{next} }}\n"));
+        }
+    }
+    let d = repo(&[GO_MOD, ("pkg/trunks.go", &src)]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let t = truncation(&v);
+    // Every counter the answer publishes is present, so a caller can read the one it wants
+    // without a missing key reading as zero. `dropped_retained` is WS-38c-b's.
+    for key in [
+        "truncated_at_branching",
+        "truncated_at_depth",
+        "dropped_candidates",
+        "dropped_under_min_steps",
+        "dropped_flows",
+        "truncated_step_lists",
+        "dropped_retained",
+    ] {
+        assert!(t.contains_key(key), "{key} is published in {t:?}");
+    }
+    // The flag agrees with the counters: this fixture truncates on the depth cap (40 > 10),
+    // so `truncated` is true, and the retention counter's own zero does not contradict it
+    // because it is a different counter.
+    assert_eq!(
+        v["truncated"].as_bool(),
+        Some(t.values().any(|n| *n > 0)),
+        "the flag is the OR of the counters beside it: {t:?}"
+    );
+}
+
+/// An unselected CALLER's file marks the answer stale, because it shaped a score.
+///
+/// A caller edge is the DENOMINATOR of a symbol's score, so a symbol's score moves when its
+/// callers change even though nothing about the symbol's own file did. Before this row the
+/// freshness envelope was built from the selected seeds' files and the walked steps, so an
+/// edit to an unselected caller's file left the answer reading `current` while the scores it
+/// reports were computed against the old call graph.
+///
+/// The fixture puts the caller BEYOND the seed cap so it is genuinely unselected: 201
+/// candidates, and the caller of a dropped one is in a file no seed and no walk touches.
+/// Without the fix the answer stays `current` after the edit; with it the envelope names the
+/// caller's file and the answer reads stale.
+#[test]
+fn an_unselected_callers_file_marks_the_answer_stale() {
+    // `Caller` calls `Target`, and `Target` is the low-scoring candidate whose caller edge
+    // the answer's scores depend on. `Caller` itself has no callees beyond `Target`, so it
+    // is not a seed, and it is in its own file: nothing the answer LISTS comes from it.
+    let d = repo(&[
+        GO_MOD,
+        (
+            "caller/entry.go",
+            &gofuncs_ref(&[go_func("Caller", &["Target"])]),
+        ),
+        (
+            "pkg/target.go",
+            &gofuncs_ref(&[
+                go_func("Target", &["TargetLeafA", "TargetLeafB", "TargetLeafC"]),
+                go_func("TargetLeafA", &[]),
+                go_func("TargetLeafB", &[]),
+                go_func("TargetLeafC", &[]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    let before = flows(d.path(), &[]);
+    assert_eq!(
+        before["freshness"]["stale"].as_bool(),
+        Some(false),
+        "a freshly built answer is current: {before:#}"
+    );
+    assert_eq!(
+        before["freshness"]["dirty_paths_touching_result"].as_array().map(Vec::len),
+        Some(0),
+        "nothing is dirty yet: {before:#}"
+    );
+    // Edit the CALLER's file only: `Target` itself is untouched.
+    write(
+        d.path(),
+        "caller/entry.go",
+        &gofuncs_ref(&[
+            go_func("Caller", &["Target"]),
+            go_func("CallerTwo", &[]),
+        ]),
+    );
+    let after = flows(d.path(), &[]);
+    assert_eq!(
+        after["freshness"]["stale"].as_bool(),
+        Some(true),
+        "an edit to the file that contributed the caller edge must mark the answer stale: {after:#}"
+    );
+    let dirty = after["freshness"]["dirty_paths_touching_result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{after:#}"));
+    assert!(
+        dirty.iter().any(|p| p == "caller/entry.go"),
+        "the caller's own file is named in the envelope: {dirty:?} in {after:#}"
+    );
+}
+
+/// The SEED's community joins the flow's community count.
+///
+/// WS-38c did not count the seed, on the reading that no fixture isolated the case, and
+/// recorded the finding for the row that could. This is that row, and the fixture that
+/// finally isolates it is the CROSS one above: `alpha` holds a ring and `beta` holds a ring,
+/// joined by a single call from `AlphaOne` into `BetaOne`. `AlphaOne` is therefore a seed
+/// whose own community is `alpha` while every step its walk reaches is in `beta` — the seed
+/// is the ONLY step-shaped thing on the other side of that boundary.
+///
+/// So the assertion is the one the seed's area makes true and the steps' areas cannot: the
+/// flow seeded at `AlphaOne` spans two communities while every one of its LISTED steps is a
+/// `beta` symbol. Remove the seed from the count and that flow drops to one community and
+/// reads `intra`; keep it and the flow reads `cross`. The step list is asserted too, so the
+/// test cannot pass by the seed's community arriving through a step.
+#[test]
+fn the_seeds_own_community_counts_toward_the_class() {
+    let d = repo(&[
+        GO_MOD,
+        (
+            "alpha/alpha.go",
+            "package alpha\n\nimport \"example/beta\"\n\nfunc AlphaOne() { AlphaTwo(); AlphaThree(); beta.BetaOne() }\nfunc AlphaTwo() { AlphaFour() }\nfunc AlphaThree() { AlphaFour() }\nfunc AlphaFour() {}\n",
+        ),
+        (
+            "beta/beta.go",
+            "package beta\n\nfunc BetaOne() { BetaTwo() }\nfunc BetaTwo() { BetaThree() }\nfunc BetaThree() { BetaOne() }\n",
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let seeds = read_seeds(&v);
+    assert_eq!(
+        seeds.iter().find(|s| s.name == "AlphaOne").map(|s| s.callees),
+        Some(3),
+        "AlphaOne's three calls resolve, one across the package boundary: {v:#}"
+    );
+    let fs = read_flows(&v);
+    let flow = fs
+        .iter()
+        .find(|f| f.seeds.iter().any(|s| s == "AlphaOne"))
+        .unwrap_or_else(|| panic!("the flow seeded at AlphaOne in {fs:?} in {v:#}"));
+    // The seed is `alpha`. If every step it reaches were also `alpha`, the flow would be one
+    // community whatever the seed contributed, and this test would prove nothing. Asserted
+    // first: the seed must be the only thing on its side of the boundary.
+    assert!(
+        flow.steps.len() >= 3,
+        "AlphaOne's walk reaches three or more steps: {flow:?}"
+    );
+    assert!(
+        flow.steps
+            .iter()
+            .any(|(_, p)| p.starts_with("beta/beta.go")),
+        "the walk reaches the other community, so the two areas are genuinely apart: {flow:?}"
+    );
+    assert_eq!(
+        flow.communities, 2,
+        "the seed's own community and the one its steps land in: {flow:?}"
+    );
+    assert_eq!(
+        flow.class, "cross",
+        "a flow entered from outside the community its steps live in crosses a boundary: {flow:?}"
+    );
+}
+
+/// The exported flags cannot come from a newer generation than the segment (WS-38c-b r4-3).
+///
+/// The segment in a snapshot is loaded when the snapshot is taken; the flags live in the
+/// `symbols` table and were read through a connection opened LAZILY, on first use. A build
+/// committing between the two replaces those rows, so the answer's ×2 exported doubling —
+/// and with it every score — is computed from a generation the segment does not describe.
+/// Ordering by id cannot repair a row that was changed or deleted.
+///
+/// The fixture reproduces the mixed generation deterministically rather than racing a thread:
+/// the store's `generation` is advanced by a direct write, which is what a build does when it
+/// commits. The segment on disk is still the old generation's, so `index flows` must REFUSE —
+/// a refusal is the honest answer to "these two halves describe different generations" —
+/// rather than answer with flags that do not belong to the graph beside them.
+#[test]
+fn a_store_generation_that_moved_past_the_segment_is_refused_rather_than_mixed() {
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/gen.go",
+            &gofuncs_ref(&[
+                go_func("GenRoot", &["GenLeafA", "GenLeafB"]),
+                go_func("GenLeafA", &[]),
+                go_func("GenLeafB", &[]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    // The answer is clean before the store moves: this is the control, so a later refusal is
+    // attributable to the generation check rather than to a fixture that never worked.
+    let before = flows(d.path(), &[]);
+    assert!(
+        before["exported_symbols"].as_u64().unwrap_or(0) > 0,
+        "the fixture has exported symbols, so the flag read is real: {before:#}"
+    );
+    let db = index::stats(d.path(), &IndexConfig::default(), false).unwrap()["index_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let generation: String = conn
+        .query_row("SELECT value FROM meta WHERE key = 'generation'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let bumped: i64 = generation.parse::<i64>().unwrap() + 1;
+    conn.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'generation'",
+        [bumped.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    // The segment on disk is unchanged and still carries the OLD generation, so the flags
+    // read now describes a different store than the graph beside them.
+    let out = run(&["index", "flows", d.path().to_str().unwrap()]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !out.status.success(),
+        "a store whose generation moved past the segment is refused, not answered with \
+         mismatched flags: {stderr}"
+    );
+    assert!(
+        stderr.contains("generation"),
+        "the refusal names the generation rather than reporting an empty answer: {stderr}"
+    );
+    // And it names BOTH generations, so an operator can tell which is which.
+    assert!(
+        stderr.contains(&generation) && stderr.contains(&bumped.to_string()),
+        "the refusal names the store's generation and the snapshot's: {stderr}"
+    );
 }

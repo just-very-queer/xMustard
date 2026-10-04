@@ -48,6 +48,16 @@ pub const MAX_FLOWS: usize = 200;
 /// the depth, branching and re-expansion rules, so the retained step list stays small. The
 /// steps past this cap are counted in `truncated_step_lists` rather than dropped in silence.
 pub const MAX_STEPS_LISTED: usize = 50;
+/// Retained walked steps across EVERY seed's walk, summed, rather than per flow.
+///
+/// WS-38c-b decision r4-2. `MAX_FLOWS` and `MAX_STEPS_LISTED` both bound what the ANSWER
+/// reports and are applied after the walks finish, so before this cap the retained set grew
+/// with seeds x per-walk: at `MAX_CANDIDATES` seeds each holding a walk of up to
+/// `MAX_STEPS_LISTED` steps, the sum was an addressable 10,000 while the reported caps read
+/// 200 and 50. This cap is the sum, and it is the product of the two existing caps rather than
+/// a new line: neither constant is raised, and a run that hits it reports `dropped_retained`
+/// so the short answer is legible.
+pub const MAX_RETAINED_STEPS: u64 = (MAX_CANDIDATES * MAX_STEPS_LISTED) as u64;
 /// Steps that must share a name prefix before it is a flow's label.
 pub const LABEL_MIN_MEMBERS: usize = 2;
 /// The area of a symbol the community projection did not place: below the degree floor in
@@ -251,6 +261,8 @@ pub struct Truncation {
     pub dropped_flows: u64,
     /// Visited steps past [`MAX_STEPS_LISTED`] across every flow.
     pub truncated_step_lists: u64,
+    /// Steps the global retention cap kept out of the answer entirely (WS-38c-b r4-2).
+    pub dropped_retained: u64,
 }
 
 impl Truncation {
@@ -262,6 +274,7 @@ impl Truncation {
             || self.dropped_under_min_steps > 0
             || self.dropped_flows > 0
             || self.truncated_step_lists > 0
+            || self.dropped_retained > 0
     }
 }
 
@@ -279,6 +292,18 @@ pub struct Flows {
     /// with `total_paths` for the same reason.
     #[serde(skip)]
     pub total_paths: Vec<String>,
+    /// Every file that contributed a resolved CALL to a SCORED candidate, whether or not the
+    /// candidate became a seed, its walk reached the caller, or the flow survived
+    /// [`MAX_FLOWS`]. Not serialized: the dispatch reads it beside `total_paths`, for the
+    /// same reason.
+    ///
+    /// WS-38c-b decision r4-4. A caller edge raises a symbol's `callers` count, which is the
+    /// denominator of its score, so an unselected caller's file shaped every score the answer
+    /// reports — but the selected seeds' files did not include it, so editing it could leave
+    /// the answer claiming `current`. The candidate files are the widest honest input: a file
+    /// with no edge to any scored candidate did not shape any score.
+    #[serde(skip)]
+    pub candidate_paths: Vec<String>,
     /// Admitted symbols: not local to a function body, in a file with a resolver.
     pub symbols_considered: u64,
     /// Admitted symbols the community projection did not place, so a reader can tell an
@@ -312,6 +337,9 @@ pub struct Caps {
     pub min_steps: usize,
     pub max_flows: usize,
     pub max_steps_listed: usize,
+    /// The global retention cap, so a caller can see the bound the answer's retained set
+    /// answers under rather than having to multiply two published caps to find it.
+    pub max_retained_steps: u64,
 }
 
 /// One published row of the name-multiplier table.
@@ -330,6 +358,8 @@ pub struct Limits {
     pub max_candidates: usize,
     pub max_flows: usize,
     pub max_steps_listed: usize,
+    /// The global retention cap, summed across every walk (WS-38c-b r4-2).
+    pub max_retained_steps: u64,
     pub max_depth: u32,
     pub max_branching: usize,
     pub min_steps: usize,
@@ -341,6 +371,7 @@ impl Default for Limits {
             max_candidates: MAX_CANDIDATES,
             max_flows: MAX_FLOWS,
             max_steps_listed: MAX_STEPS_LISTED,
+            max_retained_steps: MAX_RETAINED_STEPS,
             max_depth: MAX_DEPTH,
             max_branching: MAX_BRANCHING,
             min_steps: MIN_STEPS,
@@ -355,6 +386,12 @@ struct Graph {
     /// `off[i]..off[i+1]` is node `i`'s callees, as node indices.
     off: Vec<u32>,
     dst: Vec<u32>,
+    /// The same edges transposed: `callers_off[i]..callers_off[i+1]` is node `i`'s callers,
+    /// in the ascending node order the transpose pass produced. Built once, because
+    /// `rank_seeds` needs the caller SIDE of an edge to build the freshness input
+    /// (WS-38c-b decision r4-4) and a downstream CSR cannot answer that.
+    callers_off: Vec<u32>,
+    callers_dst: Vec<u32>,
     /// Distinct resolved callees per node, which is the CSR's own degree.
     callees: Vec<u32>,
     /// Distinct resolved callers per node, counted in the same pass that built the CSR.
@@ -364,6 +401,12 @@ struct Graph {
 impl Graph {
     fn callee_slice(&self, i: u32) -> &[u32] {
         &self.dst[self.off[i as usize] as usize..self.off[i as usize + 1] as usize]
+    }
+
+    /// Node `i`'s callers, in ascending node order.
+    fn callers_of(&self, i: u32) -> &[u32] {
+        &self.callers_dst
+            [self.callers_off[i as usize] as usize..self.callers_off[i as usize + 1] as usize]
     }
 }
 
@@ -420,7 +463,7 @@ pub fn flows_of(
     exported: Option<&dyn Fn(u32) -> Option<bool>>,
 ) -> Result<Flows, String> {
     let graph = build_graph(seg, resolved, areas_of, exported)?;
-    let (ranked, pool, mut truncation) = rank_seeds(&graph, limits);
+    let (ranked, pool, candidates, mut truncation) = rank_seeds(&graph, limits);
     let mut seeds: Vec<Seed> = ranked.iter().map(|&i| seed_of(&graph, i)).collect();
     seeds.sort_by(|a, b| {
         b.score
@@ -434,21 +477,45 @@ pub fn flows_of(
     // One flow per distinct reachability set. The key is the sorted set of node indices,
     // so it is independent of the order the seeds were visited in and of the seeds'
     // scores.
+    //
+    // The retention budget is GLOBAL (WS-38c-b decision r4-2). `MAX_FLOWS` caps how many
+    // flows the ANSWER lists and `MAX_STEPS_LISTED` caps how many steps each flow lists, but
+    // both are applied after every walk has finished, so nothing bounded the memory the
+    // walks retained: at `MAX_CANDIDATES` seeds, each holding a `Walk` whose `visited` vector
+    // can run to the listing cap, the retained set grew with seeds x per-walk rather than with
+    // any published cap. `MAX_RETAINED_STEPS` bounds the sum across every walk, counted as
+    // each walk is admitted, so a seed that would push the run past it is dropped and COUNTED
+    // rather than silently shortening another flow's answer.
     let mut keyed: Vec<(Vec<u32>, Vec<usize>, Walk)> = Vec::new();
     let mut index: std::collections::BTreeMap<Vec<u32>, usize> = Default::default();
+    let mut retained: u64 = 0;
     for (rank, &seed) in ranked.iter().enumerate() {
         let walk = walk(&graph, seed, &limits, &mut truncation);
         if walk.visited.len() < limits.min_steps {
             truncation.dropped_under_min_steps += 1;
             continue;
         }
+        // The cap is checked BEFORE the dedup lookup so the retained set cannot exceed it even
+        // for a set that would have been folded into an existing flow: the walk's vector is
+        // already allocated by then, and the point of the cap is what stays resident.
+        if retained + walk.visited.len() as u64 > limits.max_retained_steps {
+            truncation.dropped_retained = walk.visited.len() as u64;
+            retained = limits.max_retained_steps;
+            break;
+        }
+        retained += walk.visited.len() as u64;
         let key: Vec<u32> = {
             let mut set: Vec<u32> = walk.visited.iter().map(|&v| v as u32).collect();
             set.sort_unstable();
             set
         };
         match index.get(&key) {
-            Some(&at) => keyed[at].1.push(rank),
+            Some(&at) => {
+                keyed[at].1.push(rank);
+                // The folded seed is an origin too: the set is shared, so the flow's
+                // communities must count every seed that reaches it.
+                keyed[at].2.origins.push(seed as usize);
+            }
             None => {
                 index.insert(key.clone(), keyed.len());
                 keyed.push((key, vec![rank], walk));
@@ -495,6 +562,7 @@ pub fn flows_of(
         entry_points: seeds,
         flows,
         total_paths,
+        candidate_paths: candidates,
         symbols_considered: graph.nodes.len() as u64,
         unclassified_symbols: graph
             .nodes
@@ -511,6 +579,7 @@ pub fn flows_of(
             min_steps: limits.min_steps,
             max_flows: limits.max_flows,
             max_steps_listed: limits.max_steps_listed,
+            max_retained_steps: limits.max_retained_steps,
         },
         truncated: truncation.any(),
         truncation,
@@ -631,19 +700,47 @@ fn build_graph(
     for i in 0..nodes.len() {
         off[i + 1] += off[i];
     }
+    // The same edges transposed, in the CSR's own buffers: a counting pass then a prefix sum
+    // then a fill in ascending `from` order, so each node's caller slice is ascending too and
+    // the freshness set built from it is in a deterministic order.
+    let mut callers_off = vec![0u32; nodes.len() + 1];
+    let mut callers_dst: Vec<u32> = vec![0u32; dst.len()];
+    let mut fill = vec![0u32; nodes.len()];
+    for to in &dst {
+        callers_off[*to as usize + 1] += 1;
+    }
+    for i in 0..nodes.len() {
+        callers_off[i + 1] += callers_off[i];
+        fill[i] = callers_off[i];
+    }
+    for from in 0..nodes.len() {
+        for &to in &dst[off[from] as usize..off[from + 1] as usize] {
+            callers_dst[fill[to as usize] as usize] = from as u32;
+            fill[to as usize] += 1;
+        }
+    }
     Ok(Graph {
         nodes,
         off,
         dst,
+        callers_off,
+        callers_dst,
         callees,
         callers,
     })
 }
 
 /// Score every symbol with at least one resolved callee, then keep the top
-/// [`MAX_CANDIDATES`] in rank order. The pool size is returned beside the kept seeds so
-/// the answer can report what the cap stopped.
-fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Truncation) {
+/// [`MAX_CANDIDATES`] in rank order.
+///
+/// The scored candidates are also collected in full, before the cap: a caller edge raises a
+/// symbol's `callers` count, which is the denominator of its score, so the file of a caller of
+/// an UNSELECTED candidate still shaped a score the answer reports (WS-38c-b decision r4-4).
+/// Those paths are the freshness input, and taking them before the cut is what makes it so.
+fn rank_seeds(
+    graph: &Graph,
+    limits: Limits,
+) -> (Vec<u32>, u64, Vec<String>, Truncation) {
     let mut scored: Vec<(f64, u32)> = Vec::new();
     for i in 0..graph.nodes.len() {
         // A symbol with no resolved callee reaches nothing, so it is not an entry point
@@ -659,6 +756,20 @@ fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Truncation) {
         let score = ratio * if node.exported { 2.0 } else { 1.0 } * rule.multiplier;
         scored.push((score, i as u32));
     }
+    // Every file that contributed a resolved CALL to any scored candidate, from the CSR's own
+    // caller side: the caller of a scored symbol, not the callee. Deduplicated through the
+    // adjacency the graph already holds rather than a second pass over the store.
+    let candidate_paths: Vec<String> = {
+        let mut set: std::collections::BTreeSet<usize> = Default::default();
+        for (_, i) in &scored {
+            for &caller in graph.callers_of(*i) {
+                set.insert(caller as usize);
+            }
+        }
+        set.into_iter()
+            .map(|i| graph.nodes[i].path.clone())
+            .collect()
+    };
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
             .expect("scores are finite")
@@ -679,6 +790,7 @@ fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Truncation) {
     (
         scored.into_iter().map(|(_, i)| i).collect(),
         pool as u64,
+        candidate_paths,
         truncation,
     )
 }
@@ -712,6 +824,11 @@ struct Walk {
     /// them: PAR-SYM-09's "at least 3 steps" counts steps taken from the entry point, so
     /// the seed is the origin of a flow rather than one of its steps.
     visited: Vec<usize>,
+    /// The node indices of the seeds whose walk produced this reachability set. One walk per
+    /// distinct set, so a set two seeds reach is one `Walk` carrying both origins: the
+    /// classification reads them because a flow called from one community into a chain inside
+    /// another crosses a boundary (WS-38c-b r3-5).
+    origins: Vec<usize>,
     /// The distance from the seed to the furthest visited node.
     depth: u32,
 }
@@ -816,6 +933,7 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
     }
     Walk {
         visited,
+        origins: vec![seed as usize],
         depth: deepest,
     }
 }
@@ -852,7 +970,7 @@ fn flow(graph: &Graph, seeds: Vec<Seed>, walk: Walk, limits: Limits) -> Flow {
             }
         })
         .collect();
-    let communities: BTreeSet<u32> = walk
+    let mut communities: BTreeSet<u32> = walk
         .visited
         .iter()
         .map(|&i| graph.nodes[i].area)
@@ -863,13 +981,18 @@ fn flow(graph: &Graph, seeds: Vec<Seed>, walk: Walk, limits: Limits) -> Flow {
     // the unclassified ones are the propagation declining to place them, not a second
     // community the flow crossed.
     //
-    // The SEED is not counted, and round 3's codex-review [P2] says that is wrong: a flow
-    // called from one community into a chain lying entirely inside another crosses a
-    // boundary. The reading is right, but no fixture in this file isolates it — a seed whose
-    // walk never leaves its own ring either has no flow (the walk falls under MIN_STEPS) or
-    // its ring shares an edge with the caller's, which puts a step in the other community
-    // anyway. So the change is NOT made here on an unproven test: it is recorded for the row
-    // that adds a caller-side community check, where the fixture can be built to fail first.
+    // The SEED counts (WS-38c-b, decision r3-5). WS-38c did not count it, on the reading that
+    // no fixture isolated it; round 3's codex-review [P2] said that is wrong, and this row is
+    // that row: a flow entered from a seed in one community whose steps all lie inside another
+    // crosses a boundary, and classified over the reached steps alone every such flow reads
+    // `intra`. The seed's own area joins the same set, under the same UNCLASSIFIED exclusion,
+    // so a seed the partition did not place still cannot manufacture a second community.
+    for &origin in &walk.origins {
+        let area = graph.nodes[origin].area;
+        if area != UNCLASSIFIED {
+            communities.insert(area);
+        }
+    }
     let class = if communities.len() > 1 {
         FlowClass::Cross
     } else {

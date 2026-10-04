@@ -1606,10 +1606,15 @@ pub fn flows(
     // and its reachability from every visited step, including the steps past the listing
     // cap and the flows dropped by MAX_FLOWS. Freshness computed from the listed rows alone
     // would claim `current` while a file that shaped the answer had changed.
+    //
+    // `candidate_paths` rides beside it (WS-38c-b decision r4-4): a caller edge is the
+    // DENOMINATOR of a symbol's score, so an unselected caller's file shaped a score this
+    // answer reports. Without it, editing such a file leaves the answer reading `current`.
     let paths: Vec<String> = result
         .total_paths
         .iter()
         .cloned()
+        .chain(result.candidate_paths.iter().cloned())
         .chain(result.flows.iter().flat_map(|f| f.steps.iter().map(|s| s.path.clone())))
         .collect();
     let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
