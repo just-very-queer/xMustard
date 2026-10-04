@@ -242,6 +242,18 @@ mutate M37 'if (!isRecord(event) || event.toolName !== "bash") return false;
 # generic reducer and the capture lands in no family.
 mutate M38 'Some(match script_name(words).as_deref().and_then(family_of) {' 'Some(match subcommand(words).as_deref().and_then(family_of) {' "$RUST" || true
 
+# M39: the shell line is not split, so only its first word decides the hint and
+# `cd sub && go test` sends `cd` — the generic family, losing the test reduction.
+mutate M39 'Some(line) => shell_line_hint(line).unwrap_or_else(|| name.to_string()),' 'Some(line) => hint_for(line.split_whitespace().next().unwrap_or(line), &mut line.split_whitespace().skip(1)),' "$RUST" || true
+
+# M40: a quote no longer protects a separator, so `echo 'a && go test'` splits into
+# three simple commands and the hinted word comes from inside the quoted string.
+mutate M40 'if quote != 0 {' 'if false {' "$RUST" || true
+
+# M41: the rank falls back to the first command whatever it is, so a line whose only
+# rule-carrying command is last is reduced by the generic command before it.
+mutate M41 '.rfind(|(rank, _)| *rank > 0)' '.rev().find(|(rank, _)| *rank > 0).or_else(|| hints.first())' "$RUST" || true
+
 restore ALL
 echo "=== final byte-compare"
 cmp "$PRISTINE/commandwrap.ts" "$SRC" && cmp "$PRISTINE/config.ts" "$CFG" \

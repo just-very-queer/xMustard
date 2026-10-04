@@ -611,36 +611,119 @@ fn command_hint(argv: &[String]) -> String {
     // hint describes the command and not the shell that every command shares. Only
     // a program the Go side treats as a shell (registry.go: bash, sh, zsh, dash,
     // ksh) is read that way: `python -c <script>` is a script, and none of its
-    // words may leave the process. The string is split lazily.
+    // words may leave the process.
     let script = SHELLS
         .contains(&name)
         .then(|| argv.get(1).filter(|f| *f == "-c").and(argv.get(2)))
         .flatten();
-    let mut words: Box<dyn Iterator<Item = &str>> = match script {
-        Some(c) => Box::new(c.split_whitespace()),
-        None => Box::new(argv.iter().map(String::as_str)),
-    };
-    // The program's name, reduced to its basename. Words are taken positionally,
-    // because dropping a non-plain word would pair a later one with an earlier one's
-    // role. `plain` is the disclosure rule: alphanumeric, `.`, `_` and `-`, never
-    // leading `-`; a quote, redirect, glob, substitution or path is never sent.
-    let Some(first) = words.next().map(basename).filter(|w| plain(w)) else {
-        return name.to_string();
-    };
+    match script {
+        // The registry classifies every simple command of the line
+        // (`commandFamily`: split on `;`, `&&`, `||`, `|`, most specific family
+        // wins), so `cd sub && go test ./...` is a test run there. Reading only the
+        // line's first word sent `cd`, which the registry also classifies — as the
+        // generic shell family — and the capture lost the test reduction entirely.
+        Some(line) => shell_line_hint(line).unwrap_or_else(|| name.to_string()),
+        None => match argv.first().map(|a| basename(a)).filter(|a| plain(a)) {
+            Some(first) => hint_for(first, &mut argv.iter().skip(1).map(String::as_str)),
+            None => name.to_string(),
+        },
+    }
+}
+
+// The hint over a shell line's simple commands. A command the rules carry wins
+// wherever it sits in the line, which is what the registry does: `commandFamily`
+// classifies every simple command and keeps the most specific, so `cd sub && go test`
+// is a test run there and a bare `ls` is the generic family. A line of only
+// rule-less commands names the first one, because the hint for a single command is
+// always its program (`echo hunter2` -> `echo`) and nothing else in the line is more
+// specific than that.
+fn shell_line_hint(line: &str) -> Option<String> {
+    let hints: Vec<(u8, String)> = split_simple_commands(line)
+        .into_iter()
+        .filter_map(|simple| {
+            let mut words = simple.split_whitespace();
+            let first = words.next().map(basename)?;
+            plain(first).then(|| (hint_rank(first), hint_for(first, &mut words)))
+        })
+        .collect();
+    hints
+        .iter()
+        .rfind(|(rank, _)| *rank > 0)
+        .or_else(|| hints.first())
+        .map(|(_, hint)| hint.clone())
+}
+
+// The registry's dispatch order, as a rank, with 0 for a program no rule carries.
+// The program set is `HINT_RULES`' own, and a package script outranks the rest
+// because the registry reads a script's own family (`npm run test`) where a plain
+// program's hint is only its subcommand.
+fn hint_rank(program: &str) -> u8 {
+    match HINT_RULES.iter().find(|(p, _)| p.contains(&program)) {
+        Some((_, Hint::RunScript)) => 3,
+        Some((_, Hint::Subcommand)) | Some((_, Hint::Keyword)) => 2,
+        None => 0,
+    }
+}
+
+// The hint for one simple command: its program, plus the one extra word the
+// registry's rule for that program reads. A program no rule carries is named
+// alone, which is what the registry's generic family reduces.
+fn hint_for(first: &str, words: &mut dyn Iterator<Item = &str>) -> String {
     let rule = HINT_RULES
         .iter()
         .find(|(programs, _)| programs.contains(&first))
         .map(|(_, rule)| *rule);
-    let rest = match rule {
-        Some(Hint::Subcommand) => subcommand(&mut words),
-        Some(Hint::RunScript) => run_script(&mut words),
-        Some(Hint::Keyword) => keyword(&mut words),
+    let tail = match rule {
+        Some(Hint::Subcommand) => subcommand(words),
+        Some(Hint::RunScript) => run_script(words),
+        Some(Hint::Keyword) => keyword(words),
         None => None,
     };
-    match rest {
-        Some(rest) => format!("{first} {rest}"),
+    match tail {
+        Some(tail) => format!("{first} {tail}"),
         None => first.to_string(),
     }
+}
+
+// Split a shell line the way `splitCommand` does, outside quotes: on `;`, `&&`,
+// `||` and `|`. A quote, a redirect or a substitution is left alone, so a `&&`
+// inside a string does not split the line and no word that fails `plain` reaches
+// the hint.
+fn split_simple_commands(line: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quote, mut escaped) = (0usize, 0u8, false);
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if quote != 0 {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' && quote == b'"' {
+                escaped = true;
+            } else if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b';' => {
+                parts.push(&line[start..i]);
+                start = i + 1;
+            }
+            b'&' | b'|' if bytes.get(i + 1) == Some(&c) => {
+                parts.push(&line[start..i]);
+                start = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&line[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
 }
 
 fn plain(s: &str) -> bool {
@@ -815,11 +898,39 @@ mod tests {
             command_hint(&a(&["bash", "-c", "git diff --stat"])),
             "git diff"
         );
-        // A leading cd is the program as far as the hint goes; the registry has no
-        // family for it and does not need one.
+        // The registry classifies EVERY simple command of the line
+        // (`commandFamily`: split on `;`, `&&`, `||`, `|`, most specific family
+        // wins), so a leading `cd` does not decide the hint. Reading only the first
+        // word sent `cd`, which has no family of its own, and the capture lost the
+        // reduction this whole path exists to enable.
         assert_eq!(
             command_hint(&a(&["bash", "-c", "cd sub && git diff"])),
-            "cd"
+            "git diff"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "cd sub && go test ./..."])),
+            "go test"
+        );
+        // Every separator the registry splits on, and the precedence between them.
+        assert_eq!(command_hint(&a(&["bash", "-c", "cd a; npm run test"])), "npm run test");
+        assert_eq!(command_hint(&a(&["bash", "-c", "ls || go build ./..."])), "go build");
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "git diff | head -50"])),
+            "git diff",
+            "a pipe is a separator too"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "echo hi && cd x"])),
+            "echo",
+            "a line of only rule-less commands names the first one, which is the \
+             same answer a single such command gets"
+        );
+        // A separator inside quotes is not a separator, so the line stays one
+        // command and no word that fails `plain` reaches the hint.
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "echo 'a && go test'"])),
+            "echo",
+            "a quoted && is text, not a separator"
         );
         assert_eq!(command_hint(&a(&["bash", "-c", "ls"])), "ls");
         assert_eq!(command_hint(&a(&["bash", "-c", ""])), "bash");
