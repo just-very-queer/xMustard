@@ -1749,7 +1749,8 @@ const USAGE: &str = "xmustard-core index <build|update|stats|impact|areas|flows>
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
     [--identity-key KEY] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
     [--relation-types=A,B] [--min-confidence=C] [--include-tests=B] [--limit=N] [--offset=N] \
-    [--summary-only=B] [--timeout-ms=N] [--seed=N]";
+    [--summary-only=B] [--timeout-ms=N] [--seed=N]\n\
+    index flows takes --limit; index areas takes --seed. Neither takes the other's.";
 
 /// Record the repository identity key a build or update was run for (`meta::IDENTITY_KEY`),
 /// under the writer lock; written only when it changed.
