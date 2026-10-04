@@ -801,8 +801,15 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
                 visited.push(callee as usize);
                 taken += 1;
             }
-            deepest = deepest.max(depth + 1);
-            stack.push((callee as usize, depth + 1));
+            // A re-queue is only worth making when this depth is inside the cap. Pushing
+            // beyond it would raise `deepest` past `max_depth` while admitting no eleventh
+            // step — an answer whose reported depth contradicts the cap printed beside it.
+            // `expanded_at` refuses the expansion anyway, so skipping the push changes no
+            // step; it only keeps the reported depth honest.
+            if depth + 1 <= limits.max_depth {
+                deepest = deepest.max(depth + 1);
+                stack.push((callee as usize, depth + 1));
+            }
         }
         truncation.truncated_at_branching += stopped_branching;
         truncation.truncated_at_depth += stopped_depth;

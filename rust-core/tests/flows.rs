@@ -1395,6 +1395,18 @@ fn a_cycle_that_returns_to_a_held_symbol_at_the_depth_cap_is_not_counted_as_trun
         .find(|f| f.seeds.iter().any(|s| s == "Root"))
         .unwrap_or_else(|| panic!("the flow seeded at Root in {fs:?}"));
     assert_eq!(root.steps.len(), 10, "ten hops from the seed: {root:?}");
+    // The reported DEPTH too, not only the step count. The back-edge from `Mid9` points at a
+    // symbol the walk already holds, so it is re-queued rather than listed — and a re-queue
+    // past the cap used to raise `deepest` to eleven while admitting no eleventh step, so an
+    // answer could print a depth above the cap it reports beside it.
+    assert_eq!(
+        root.depth, 10,
+        "the furthest step is ten hops out, and not past the cap: {root:?}"
+    );
+    assert!(
+        root.depth <= 10,
+        "depth never exceeds MAX_DEPTH: {root:?}"
+    );
     assert_eq!(
         root.steps_omitted, 0,
         "the cycle closes on a symbol the walk already holds, so nothing is omitted: {root:?}"
