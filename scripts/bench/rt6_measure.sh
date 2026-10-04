@@ -1,7 +1,8 @@
 #!/bin/bash
 # WS-RT6 measurements: one-file `index update --paths` batches on an rt_fixtures.sh
 # tracked repository (t1m). Per call: the exit code, wall time, xmustard-core's own peak
-# RSS and the tree's peak (Git children included, own_rss.py), and the report fields
+# RSS and the largest single peak among it and its Git children (own_rss.py; not a
+# summed tree), and the report fields
 # RT6 reads (mode, listing, pass counters, timing). Box only. The edited files get their
 # bytes back on exit, and the run stops at the first call that fails; the code index is
 # rebuilt at the start of every run.

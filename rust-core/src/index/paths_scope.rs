@@ -422,6 +422,7 @@ impl Plan {
                 self.beyond_add(path, "envelope_files");
                 self.except(path, None);
             }
+            (Before::BeyondLoss(old), Loss(reason), true) if old == reason => {}
             (Before::BeyondLoss(old), Loss(reason), true) => {
                 self.beyond_remove(path, old)?;
                 self.beyond_add(path, reason);
@@ -819,6 +820,21 @@ mod tests {
             ),
             Err(ListingReason::SampleRefill)
         );
+    }
+
+    #[test]
+    fn an_unchanged_loss_past_the_cut_keeps_a_truncated_sample() {
+        let mut p = plan(true);
+        p.beyond.insert("symlink".into(), MAX_LOSS_ENTRIES + 1);
+        p.sample = (0..MAX_LOSS_ENTRIES)
+            .map(|i| (format!("z{i:04}.ts"), "symlink".to_string()))
+            .collect();
+        let before = p.sample.clone();
+        let old = Before::BeyondLoss("symlink".into());
+        let after = After::Loss("symlink");
+        assert_eq!(p.source("z0000.ts", &old, after, true, DELETED), Ok(()));
+        assert_eq!(p.sample, before);
+        assert_eq!(p.beyond.get("symlink"), Some(&(MAX_LOSS_ENTRIES + 1)));
     }
 
     #[test]
