@@ -112,13 +112,20 @@ type RankQuery struct {
 // author's in whatever workspace this read reaches, which until WS-30e's
 // cross-workspace read means this workspace only; shared is never admitted, because
 // nothing derives or grants it yet.
+//
+// Every confined branch also carries the AUTHOR condition. A key alone is not authority:
+// run, session and dir keys are shared vocabulary, so two principals can legitimately
+// hold the same dir or the same run id, and admitting by key alone would serve one
+// principal's entry to the other. This predicate is therefore the whole rule, not a
+// pre-filter a caller is expected to strengthen (round 3, r3-4).
 const scopeWhere = `(
 	e.scope IN ('', 'workspace')
 	OR (e.scope = 'private' AND ?3 <> '' AND lower(e.scope_key) = ?3)
 	OR (e.scope = 'global' AND ?3 <> '' AND lower(e.scope_key) = ?3)
-	OR (e.scope = 'run' AND ?5 <> '' AND e.scope_key = ?5)
-	OR (e.scope = 'session' AND ?6 <> '' AND e.scope_key = ?6)
-	OR (e.scope = 'dir' AND ?7 <> '' AND (?7 = e.scope_key OR ?7 LIKE e.scope_key || '/%'))
+	OR (e.scope = 'run' AND ?3 <> '' AND e.source_key = ?3 AND e.scope_key = ?5)
+	OR (e.scope = 'session' AND ?3 <> '' AND e.source_key = ?3 AND e.scope_key = ?6)
+	OR (e.scope = 'dir' AND ?3 <> '' AND e.source_key = ?3
+		AND (?7 <> '' AND (?7 = e.scope_key OR ?7 LIKE e.scope_key || '/%')))
 )`
 
 // RankingReader reads the ranking view of a workspace.
