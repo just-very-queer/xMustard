@@ -125,6 +125,20 @@ var sections = []Section{
 			"after that revision (memory_delta: added, changed, superseded, stale and removed entry ids)",
 	},
 	{
+		// The consolidation queue is work waiting for an agent: it is a signal, because a job
+		// that is never noticed is work never done, and its count alone does not say which.
+		Name: "consolidation", Cap: 2048,
+		Members: []Member{
+			{Name: "consolidation_jobs", Signal: true, Keep: []string{"job_id", "kind", "candidate_ids"}},
+			{Name: "consolidation_jobs_total", Signal: true},
+			{Name: "consolidation_jobs_truncated", Signal: true},
+		},
+		Recover: "xmustard-ops memory jobs-list <workspace_id>; remember(job_id=) answers a job",
+		Doc: "the consolidation jobs queued for an agent (job_id, kind, candidate_ids, evidence_refs, instructions), " +
+			"each a question about memory that no job decides: the agent reads it and proposes, and promotion still " +
+			"needs distinct-principal verification",
+	},
+	{
 		Name: "session", Cap: 3072,
 		// a handoff carries open failures and the proposals waiting for a verifier; a
 		// capsule's stale_paths are a stale signal

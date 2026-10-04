@@ -35,12 +35,12 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
-use crate::indexcache::{git_timeout, run_git_bounded};
+use crate::indexcache::{NestedRepo, git_timeout, run_git_bounded};
 
 use super::config::IndexConfig;
 use super::extract::Lang;
 use super::ignore::{DirMemo, Ignore, Verdict, XMUSTARD_IGNORE};
-use super::meta::MAX_LOSS_ENTRIES;
+use super::meta::{MAX_LOSS_ENTRIES, NestedRepos};
 
 /// Candidates with a pre-read loss (symlink, oversized, envelope_bytes...) kept as rows;
 /// past this many they are only counted.
@@ -135,6 +135,7 @@ fn stat_file(
     mode: Mode,
     max_file_size: u64,
 ) -> Option<(StatKey, Option<&'static str>)> {
+    crate::passcount::note(crate::passcount::Pass::FilesStatted, 1);
     let meta = match std::fs::symlink_metadata(root.join(path)) {
         Ok(m) => m,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -228,6 +229,9 @@ pub struct Scan {
     pub docs: Vec<DocCandidate>,
     /// Doc and guidance files past MAX_DOC_FILES or undecided by the ignore budget.
     pub docs_beyond: usize,
+    /// Tracked gitlinks, and untracked nested repositories when untracked files are
+    /// listed (WS-RT2): not files of this repository, so neither eligible nor a loss.
+    pub nested_repos: NestedRepos,
 }
 
 fn now_ns() -> i64 {
@@ -241,6 +245,7 @@ fn now_ns() -> i64 {
 /// clean and dirty files alike.
 pub fn blob_id(bytes: &[u8]) -> String {
     use sha1::{Digest, Sha1};
+    crate::passcount::hashed(bytes.len() as u64);
     let mut h = Sha1::new();
     h.update(format!("blob {}\0", bytes.len()).as_bytes());
     h.update(bytes);
@@ -254,18 +259,22 @@ pub struct Layout {
     /// Canonical index root.
     pub root: PathBuf,
     pub git_dir: Option<PathBuf>,
+    /// The root relative to the worktree's top level (`a/b/`), empty at the top.
+    pub prefix: String,
 }
 
 pub fn layout(root: &Path, cfg: &IndexConfig) -> Result<Layout, String> {
     let root = std::fs::canonicalize(root).map_err(|e| format!("{}: {e}", root.display()))?;
     match git_layout(&root) {
-        Some(git_dir) => Ok(Layout {
+        Some((git_dir, prefix)) => Ok(Layout {
             root,
             git_dir: Some(git_dir),
+            prefix,
         }),
         None if cfg.allow_non_git => Ok(Layout {
             root,
             git_dir: None,
+            prefix: String::new(),
         }),
         None => Err(format!(
             "{} is not inside a Git work tree (set allow_non_git to index it anyway)",
@@ -276,15 +285,21 @@ pub fn layout(root: &Path, cfg: &IndexConfig) -> Result<Layout, String> {
 
 pub fn scan(layout: &Layout, cfg: &IndexConfig) -> Result<Scan, String> {
     match &layout.git_dir {
-        Some(g) => scan_git(&layout.root, g.clone(), cfg),
+        Some(g) => scan_git(&layout.root, g.clone(), &layout.prefix, cfg),
         None => Ok(scan_walk(&layout.root, cfg)),
     }
 }
 
-fn git_layout(root: &Path) -> Option<PathBuf> {
+/// The Git dir and the root's prefix below the top level, or None outside a worktree.
+fn git_layout(root: &Path) -> Option<(PathBuf, String)> {
     let out = run_git_bounded(
         root,
-        &["rev-parse", "--is-inside-work-tree", "--absolute-git-dir"],
+        &[
+            "rev-parse",
+            "--is-inside-work-tree",
+            "--absolute-git-dir",
+            "--show-prefix",
+        ],
         64 << 10,
         git_timeout(),
     )
@@ -294,7 +309,8 @@ fn git_layout(root: &Path) -> Option<PathBuf> {
     if lines.next()? != "true" {
         return None;
     }
-    Some(PathBuf::from(lines.next()?))
+    let git_dir = PathBuf::from(lines.next()?);
+    Some((git_dir, lines.next().unwrap_or("").to_string()))
 }
 
 fn head(root: &Path) -> String {
@@ -318,6 +334,21 @@ fn stream_git_records(
     root: &Path,
     args: &[&str],
     mut on_record: impl FnMut(&[u8]),
+) -> Result<(), String> {
+    let mut records = 0u64;
+    let mut on_record = |rec: &[u8]| {
+        records += 1;
+        on_record(rec);
+    };
+    let result = stream_git_records_inner(root, args, &mut on_record);
+    crate::passcount::note(crate::passcount::Pass::FilesListed, records);
+    result
+}
+
+fn stream_git_records_inner(
+    root: &Path,
+    args: &[&str],
+    on_record: &mut impl FnMut(&[u8]),
 ) -> Result<(), String> {
     let what = || format!("git {}", args.join(" "));
     crate::indexcache::note_git_spawn();
@@ -449,6 +480,7 @@ struct Collected {
     worktree_deleted: usize,
     docs: Vec<DocCandidate>,
     docs_beyond: usize,
+    nested_repos: NestedRepos,
 }
 
 /// Order doc candidates by path in their bounded heap (largest on top, evicted first).
@@ -488,6 +520,9 @@ struct Collector<'a> {
     /// The smallest doc paths: at most MAX_DOC_FILES.
     docs: BinaryHeap<DocByPath>,
     docs_beyond: usize,
+    nested_total: usize,
+    /// The smallest nested repository paths (max-heap of at most MAX_LOSS_ENTRIES).
+    nested: BinaryHeap<NestedRepo>,
 }
 
 impl<'a> Collector<'a> {
@@ -502,6 +537,20 @@ impl<'a> Collector<'a> {
             worktree_deleted: 0,
             docs: BinaryHeap::new(),
             docs_beyond: 0,
+            nested_total: 0,
+            nested: BinaryHeap::new(),
+        }
+    }
+
+    /// A nested repository: counted and sampled, never stat'ed or read as a file.
+    fn add_nested(&mut self, path: &str, kind: &str) {
+        self.nested_total += 1;
+        self.nested.push(NestedRepo {
+            path: path.to_string(),
+            kind: kind.to_string(),
+        });
+        if self.nested.len() > MAX_LOSS_ENTRIES {
+            self.nested.pop();
         }
     }
 
@@ -620,6 +669,10 @@ impl<'a> Collector<'a> {
             worktree_deleted: self.worktree_deleted,
             docs,
             docs_beyond: self.docs_beyond,
+            nested_repos: NestedRepos {
+                total: self.nested_total,
+                repos: self.nested.into_sorted_vec(),
+            },
         }
     }
 }
@@ -628,7 +681,12 @@ fn basename(path: &str) -> &str {
     path.rsplit('/').next().unwrap_or(path)
 }
 
-fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, String> {
+fn scan_git(
+    root: &Path,
+    git_dir: PathBuf,
+    prefix: &str,
+    cfg: &IndexConfig,
+) -> Result<Scan, String> {
     let started_ns = now_ns();
     // The ignore files first (a small listing), so the main listing is filtered as it
     // streams. Untracked ignore files count only when untracked files are indexed.
@@ -672,6 +730,10 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
     let mut memo = DirMemo::default();
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
+    // `.gitmodules` sits at the top level and names top-level paths
+    let depth = prefix.split('/').filter(|c| !c.is_empty()).count();
+    let toplevel = root.ancestors().nth(depth).unwrap_or(root);
+    let mut modules = None;
     let mut on_entry = |raw: &[u8], mode: Mode, col: &mut Collector<'_>| {
         let Ok(path) = std::str::from_utf8(raw) else {
             if Lang::for_path(&String::from_utf8_lossy(raw)).is_some() {
@@ -679,6 +741,23 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
             }
             return;
         };
+        // a gitlink, or the `sub/` an untracked listing gives a nested repository (a
+        // directory without its own `.git` is not one: its files are listed one by one)
+        if mode == Mode::Gitlink
+            || (path.ends_with('/')
+                && crate::indexcache::has_own_git(&root.join(path.trim_end_matches('/'))))
+        {
+            let rel = path.trim_end_matches('/');
+            let modules =
+                modules.get_or_insert_with(|| crate::indexcache::submodule_paths(toplevel));
+            let kind = crate::indexcache::nested_kind(
+                mode == Mode::Gitlink,
+                &format!("{prefix}{rel}"),
+                modules,
+            );
+            col.add_nested(rel, kind);
+            return;
+        }
         match (Lang::for_path(path), doc_role(path)) {
             (Some(lang), _) => {
                 if admit(&ig, &mut memo, path, &mut ignored, col) {
@@ -728,6 +807,7 @@ fn scan_git(root: &Path, git_dir: PathBuf, cfg: &IndexConfig) -> Result<Scan, St
         started_ns,
         docs: c.docs,
         docs_beyond: c.docs_beyond,
+        nested_repos: c.nested_repos,
     })
 }
 
@@ -757,6 +837,9 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
             continue;
         }
         let ft = entry.file_type();
+        if !ft.is_dir() {
+            crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
+        }
         if ft.is_dir() {
             // an undecided directory is entered: its files are then reported one by one
             if ig.check(&mut memo, &rel, true) == Verdict::Ignored {
@@ -792,6 +875,7 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
         started_ns,
         docs: c.docs,
         docs_beyond: c.docs_beyond,
+        nested_repos: c.nested_repos,
     }
 }
 
@@ -834,7 +918,7 @@ fn admit_doc(
     }
 }
 
-fn load_dir_ignores(root: &Path, rel_dir: &str, ig: &mut Ignore) {
+pub(crate) fn load_dir_ignores(root: &Path, rel_dir: &str, ig: &mut Ignore) {
     for name in [".gitignore", XMUSTARD_IGNORE] {
         let rel = if rel_dir.is_empty() {
             name.to_string()

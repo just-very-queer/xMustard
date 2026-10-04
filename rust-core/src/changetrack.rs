@@ -94,9 +94,13 @@ fn tracked_files(root: &Path) -> Result<Vec<String>, String> {
 }
 
 /// `git status --porcelain=v1 -z` parsed into (status_code, path), untrimmed; a rename
-/// reports its new path.
+/// reports its new path. Submodules are compared as `source_identity` compares them
+/// (`--ignore-submodules=none`), whatever `submodule.<name>.ignore` says.
 fn dirty_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
-    let out = git_listing(root, &["status", "--porcelain=v1", "-z"])?;
+    let out = git_listing(
+        root,
+        &["status", "--porcelain=v1", "-z", "--ignore-submodules=none"],
+    )?;
     Ok(crate::indexcache::parse_porcelain_v1_z(&out)
         .into_iter()
         .map(|e| {
@@ -132,8 +136,10 @@ fn file_hash_map_counted(
     root: &Path,
 ) -> Result<(BTreeMap<String, String>, crate::hashcache::HashPass), String> {
     // resolve the cache location (one `git rev-parse`) while `git ls-files` runs.
+    let call = crate::passcount::current();
     let (rels, cache) = std::thread::scope(|s| {
-        let cache = s.spawn(|| crate::hashcache::cache_file(root));
+        let cache =
+            s.spawn(|| crate::passcount::within(call, || crate::hashcache::cache_file(root)));
         (tracked_files(root), cache.join().ok().flatten())
     });
     Ok(crate::hashcache::hash_files(root, rels?, cache.as_deref()))
@@ -222,7 +228,7 @@ fn changed_from_head(
             "--no-abbrev",
             "--no-ext-diff",
             "--no-color",
-            "--ignore-submodules=all",
+            "--ignore-submodules=none",
             head,
             "--",
         ],
@@ -706,6 +712,7 @@ fn build_baseline(
         }
         let regular = uncommitted.iter().filter(|e| e.is_regular()).collect();
         for_each_head_blob(root, regular, |entry, bytes| {
+            crate::passcount::hashed(bytes.len() as u64);
             let digest = Sha256::digest(&bytes);
             file_hashes.insert(entry.path.clone(), crate::symbolgraph::hex_lower(&digest));
             if is_symbol_source(&entry.path) {
@@ -905,7 +912,10 @@ fn comparable_hash(content: &crate::indexcache::DirtyContent) -> Option<Option<S
     use crate::indexcache::DirtyContent as C;
     match content {
         C::Sha256(x) => Some(Some(x.clone())),
-        C::Deleted | C::Symlink(_) | C::Incomplete(SourceReadFailure::NotRegular) => Some(None),
+        C::Deleted
+        | C::Symlink(_)
+        | C::NestedRepo { .. }
+        | C::Incomplete(SourceReadFailure::NotRegular) => Some(None),
         C::Incomplete(SourceReadFailure::Oversized(n)) if *n > MAX_REPO_FILE_BYTES => Some(None),
         C::Incomplete(_) | C::Unhashed => None,
     }

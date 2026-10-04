@@ -144,7 +144,7 @@ fn main() {
         eprintln!("unknown command: {command}");
         std::process::exit(2);
     };
-    match (entry.run)(args.collect::<Vec<_>>().into_iter()) {
+    match dispatch::run_counted(entry, args.collect::<Vec<_>>().into_iter()) {
         Ok(Output::Json(body)) => println!("{body}"),
         Ok(Output::Text(body)) => print!("{body}"),
         Ok(Output::Exit(body, exit)) => {

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -81,6 +82,52 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 		if err != nil {
 			copyResponse(w, rec)
 			return
+		}
+		// impact's cursor continues at the core's next_offset, which describes the
+		// core's page; when the budget cut that page the cursor is re-signed to
+		// continue at the first item the caller did not receive, so the caller pages
+		// without computing an offset (WS-59e).
+		//
+		// Each pass reconciles the cursor against the page the budget actually wrote and
+		// settles the report over it. Settling can trim again, so the next pass
+		// re-derives the cursor from what survived.
+		//
+		// The loop stops when a pass leaves the bytes unchanged, which is the condition
+		// that matters: the answer is emitted only after a pass that re-settled it. A fixed
+		// count would be a claim that two passes always suffice, and M22 showed that claim
+		// is not provable through this route -- fitEach binary-searches the item count
+		// against max_chars, so a page cut in the first pass is already at the boundary and
+		// the second pass usually trims back to the count the first reconcile signed. What
+		// bounds the loop is that a pass either removes items or changes none, so each
+		// pass strictly shrinks the tier list and the fixed point is reached; the cap is a
+		// backstop, not the exit condition (WS-59e-r5-6).
+		if spec.Tool == "impact" {
+			const maxImpactSettlePasses = 4
+			for pass := 0; pass < maxImpactSettlePasses; pass++ {
+				before := out
+				// The two forms page differently, so each has its own reconciler: the
+				// tier walk's cursor continues at the core's next_offset across every
+				// tier, while an occurrence page (op=, WS-59d) is one flat list whose
+				// cursor continues at its own offset. Each ignores a result that is not
+				// its own form, so calling both is safe and neither can re-sign the
+				// other's cursor.
+				out = workspaceops.ReconcileImpactPaging(ws, q, out)
+				if op := q.Get("op"); op != "" {
+					out = workspaceops.ReconcileOccurrencePaging(ws, q.Get("symbol"), op, out)
+				}
+				settled, serr := spec.Settle(out, req, page)
+				if serr != nil {
+					// Settle fails only on a result that is not valid JSON, which the
+					// handler's own output cannot be. Refuse rather than write an answer
+					// whose report would describe something other than the body.
+					writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "impact result is too large to budget; narrow the call"})
+					return
+				}
+				out = settled
+				if bytes.Equal(before, out) {
+					break
+				}
+			}
 		}
 		writeJSON(w, http.StatusOK, json.RawMessage(out))
 	})

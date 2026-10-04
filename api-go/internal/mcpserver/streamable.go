@@ -463,7 +463,10 @@ type httpClient struct {
 
 func newHTTPClient() *httpClient { return &httpClient{pending: map[string]chan rpcMessage{}} }
 
-var errNoStream = errors.New("no event stream open on this request to ask the client")
+// errNotSent marks a server-to-client request that never reached the client.
+var errNotSent = errors.New("request not delivered")
+
+var errNoStream = fmt.Errorf("%w: no event stream open on this request to ask the client", errNotSent)
 
 func (c *httpClient) Request(ctx context.Context, method string, params any) (json.RawMessage, error) {
 	stream, _ := ctx.Value(streamKey{}).(*eventStream)
@@ -481,7 +484,7 @@ func (c *httpClient) Request(ctx context.Context, method string, params any) (js
 		c.mu.Unlock()
 	}()
 	if err := stream.send(map[string]any{"jsonrpc": "2.0", "id": id, "method": method, "params": params}); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("%w: %w", errNotSent, err)
 	}
 	select {
 	case m := <-ch:

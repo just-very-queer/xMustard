@@ -136,6 +136,9 @@ pub enum Class {
     IgnoreFile,
     /// This process's cookie number n came back.
     Cookie(u64),
+    /// Under a nested repository's Git dir: no path of this root changed, but its HEAD
+    /// (part of this root's identity) may have, so the observation is not reused.
+    NestedGit,
     /// Nothing the index or the identity reads.
     Skip,
 }
@@ -177,6 +180,15 @@ impl Layout {
         };
         let rel = rel.to_string_lossy().replace('\\', "/");
         let name = rel.rsplit('/').next().unwrap_or_default();
+        // A `.git` below the top is a nested repository's Git dir: its commits, fetches
+        // and GC are not source changes of this root (and nothing at all when Git
+        // ignores the nested repository).
+        if let Some(dir) = nested_repo_dir(&rel) {
+            return match self.ignored(dir) {
+                true => Class::Skip,
+                false => Class::NestedGit,
+            };
+        }
         // Git never reads an ignore file inside a directory it ignores
         match () {
             _ if rel.is_empty() || rel == ".git" || rel.starts_with(".git/") => Class::Skip,
@@ -185,6 +197,19 @@ impl Layout {
             _ => Class::Path(rel),
         }
     }
+}
+
+/// The nested repository `rel` lies in the Git dir of (`a/sub` for `a/sub/.git/HEAD`),
+/// or None when no component below the top is `.git`.
+fn nested_repo_dir(rel: &str) -> Option<&str> {
+    let mut at = 0;
+    for c in rel.split('/') {
+        if c == ".git" && at > 0 {
+            return Some(&rel[..at - 1]);
+        }
+        at += c.len() + 1;
+    }
+    None
 }
 
 /// `a/b/c` → `a`, `a/b`, `a/b/c`.
@@ -207,6 +232,8 @@ fn git_class(rel: &str) -> Class {
         "info/exclude" => Class::IgnoreFile,
         "index" => Class::Git { index: true },
         r if GIT_STATE_FILES.contains(&r) || r.starts_with("refs/") => Class::Git { index: false },
+        // a submodule's own Git dir: its commits move the HEAD this root's key covers
+        r if r.starts_with("modules/") => Class::NestedGit,
         _ => Class::Skip,
     }
 }
@@ -747,6 +774,11 @@ impl Root {
                     self.cookie_seen.notify_all();
                 }
                 Class::Skip => inner.counters.skipped += 1,
+                Class::NestedGit => {
+                    inner.counters.skipped += 1;
+                    drop(inner);
+                    self.bump(false);
+                }
                 Class::Git { index } => {
                     inner.counters.git_events += 1;
                     inner.recheck_ignored |= index;
@@ -1517,6 +1549,15 @@ pub fn git_epoch(root: &Path) -> Option<u64> {
     REGISTRY.get()?.git_epoch(root)
 }
 
+/// Whether the watcher sees every change to `state`'s key. A nested repository's HEAD is
+/// part of the key, and so is a submodule's once a commit inside it makes it dirty, but
+/// inotify watches no directory inside a Git dir (`walk_tree`, and a submodule's Git dir
+/// sits in this root's `.git/modules/`), so only a recursive native stream sees such a
+/// commit (WS-RT2). `submodules` says whether the Git dir has a `modules/` directory.
+fn memo_sees(state: &RepoState, recursive: bool, submodules: impl FnOnce() -> bool) -> bool {
+    recursive || (state.identity.nested_repos.is_empty() && !submodules())
+}
+
 /// `root`'s repository state: the watcher's last observation while it vouches that
 /// nothing changed since (its state is `ok`, it sees every path Git can report, and no
 /// event arrived since the observation began), else `observe()`, kept for the next
@@ -1530,7 +1571,15 @@ pub fn memo(root: &Path, observe: impl FnOnce() -> Arc<RepoState>) -> (Arc<RepoS
     {
         let mut inner = lock(&r.inner);
         match &inner.memo {
-            Some((at, state)) if vouches && *at == epoch => {
+            Some((at, state))
+                if vouches
+                    && *at == epoch
+                    && memo_sees(state, recursive_native(), || {
+                        lock(&r.layout)
+                            .git_dir()
+                            .is_some_and(|g| g.join("modules").is_dir())
+                    }) =>
+            {
                 let state = state.clone();
                 inner.counters.memo_hits += 1;
                 return (state, true);
@@ -1622,6 +1671,7 @@ mod tests {
             ("/r/.git/objects/ab/cdef", Class::Skip),
             ("/r/.git/index.lock", Class::Skip),
             ("/r/.git/xmustard-cache/index-v3/x/index.db", Class::Skip),
+            ("/r/.git/modules/mod/refs/heads/main", Class::NestedGit),
             ("/r", Class::Skip),
             ("/elsewhere/a.go", Class::Skip),
         ];
@@ -1634,6 +1684,70 @@ mod tests {
         if std::process::id() != 1 {
             assert_eq!(l.classify(Path::new(&foreign)), Class::Skip);
         }
+    }
+
+    // WS-RT2: a nested repository's Git dir (`sub/.git` as a directory or a `gitdir:`
+    // file) is that repository's state, not a source path of this root.
+    #[test]
+    fn nested_git_dirs_are_skipped_at_any_depth() {
+        let l = layout(Some(&["vendor"]));
+        for path in [
+            "/r/sub/.git",
+            "/r/sub/.git/index",
+            "/r/sub/.git/refs/heads/main",
+            "/r/a/b/sub/.git/objects/ab/cdef",
+        ] {
+            assert_eq!(l.classify(Path::new(path)), Class::NestedGit, "{path}");
+        }
+        assert_eq!(
+            l.classify(Path::new("/r/vendor/sub/.git/HEAD")),
+            Class::Skip
+        );
+        assert_eq!(
+            l.classify(Path::new("/r/sub/x.go")),
+            Class::Path("sub/x.go".into())
+        );
+        assert_eq!(
+            l.classify(Path::new("/r/a/.github/ci.yml")),
+            Class::Path("a/.github/ci.yml".into())
+        );
+    }
+
+    // A commit inside a nested repository queues no refresh path, but it moves the
+    // change epoch, so the memoised repository state (whose key covers the nested
+    // HEAD) is observed again.
+    #[test]
+    fn a_nested_git_event_queues_nothing_and_ends_the_memo() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (root, _rx) = Root::new(dir.path().to_path_buf(), None, MAX_WATCH_DIRS);
+        let before = root.change_epoch.load(Ordering::Acquire);
+        let ev = Event::new(EventKind::Modify(ModifyKind::Any))
+            .add_path(dir.path().join("sub/.git/refs/heads/main"));
+        root.on_event(Ok(ev));
+        assert!(root.change_epoch.load(Ordering::Acquire) > before);
+        let inner = lock(&root.inner);
+        assert_eq!((inner.counters.paths, inner.counters.git_events), (0, 0));
+    }
+
+    // On inotify a memo whose key covers a nested repository's HEAD is not reused: no
+    // watch sits inside that repository's Git dir.
+    #[test]
+    fn a_memo_with_nested_repositories_is_reused_only_by_a_recursive_stream() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let mut state = crate::indexcache::observe_repo_state(dir.path());
+        assert!(memo_sees(&state, false, || false) && memo_sees(&state, true, || false));
+        // a clean submodule is in no status entry, but its Git dir sits in .git/modules
+        assert!(!memo_sees(&state, false, || true));
+        assert!(memo_sees(&state, true, || true));
+        state
+            .identity
+            .nested_repos
+            .push(crate::indexcache::NestedRepo {
+                path: "sub".into(),
+                kind: crate::indexcache::NESTED_UNTRACKED.into(),
+            });
+        assert!(!memo_sees(&state, false, || false));
+        assert!(memo_sees(&state, true, || false));
     }
 
     #[test]

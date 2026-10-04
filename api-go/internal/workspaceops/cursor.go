@@ -32,6 +32,8 @@ var (
 	// from; they are bound to the symbol and the operation, so one symbol's cursor never
 	// continues another's.
 	occurrenceCursors = cursorCodec{kind: "o1", fields: 1, maxLen: maxSearchCursorLen}
+	// impactCursors carry the tier offset an impact page continues from.
+	impactCursors = cursorCodec{kind: "i2", fields: 1, maxLen: maxSearchCursorLen}
 )
 
 // cursorKey is the process's cursor-signing key.
