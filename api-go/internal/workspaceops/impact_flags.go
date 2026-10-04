@@ -36,6 +36,11 @@ const (
 // RelationTypes are the relation types impact walks (PAR-IMP-01's edge kinds).
 var RelationTypes = []string{"CALLS", "IMPORTS", "EXTENDS", "IMPLEMENTS", "USES", "ACCESSES", "HAS_METHOD", "HAS_PROPERTY"}
 
+// OccurrenceOps are the operations impact op= names on a symbol (PAR-IMP-03): the
+// references to it, the definitions of it, and the types implementing it. It refines
+// the blast form and never selects a form of its own.
+var OccurrenceOps = []string{"refs", "definition", "implementations"}
+
 // ChangeScopes are the scope names (gitdiff's vocabulary; workspace is all).
 var ChangeScopes = func() []string {
 	names := make([]string, len(gitdiff.Scopes))
@@ -93,6 +98,15 @@ func unitInterval(v string) error {
 
 func boolean(v string) error { return oneOf("true", "false")(v) }
 
+// notBlank refuses a blank value; a cursor's own shape is checked by the codec that
+// signs it, which names the cursor rather than this argument.
+func notBlank(v string) error {
+	if strings.TrimSpace(v) == "" {
+		return fmt.Errorf("must not be blank")
+	}
+	return nil
+}
+
 // checkoutPath takes an absolute path: a relative one would resolve against the core
 // process's working directory.
 func checkoutPath(v string) error {
@@ -114,6 +128,14 @@ var cursorParam = impactParam{"cursor", "cursor", func(string) error { return ni
 // constant, so the two can never disagree (WS-59e-r5-2).
 const MaxImpactOffset = 50_000
 
+// maxOccurrenceOffset is the last occurrence page position the core can report. It is
+// the core's own bound (index::occurrences::MAX_OCCURRENCES), and the signer refuses to
+// name a position beyond it, for the reason MaxImpactOffset gives: a cursor the next
+// request's flag parser would refuse is worse than none. The core emits next_cursor only
+// while its end is strictly below this, so a position equal to it is unreachable and is
+// refused too (ocr-review:2).
+const maxOccurrenceOffset = 5_000
+
 var (
 	walkParams = []impactParam{
 		{"relation_types", "relation-types", listOf(RelationTypes...)},
@@ -126,8 +148,15 @@ var (
 		{"summary_only", "summary-only", boolean},
 		{"timeout_ms", "timeout-ms", intIn(1, 60_000)},
 	}
+	// occurrenceParams (PAR-IMP-03): op= refines the blast form and the cursor pages
+	// the occurrence list it returns. Neither reaches the tier walk, and both come
+	// first so the core reads them before the walk's own arguments.
+	occurrenceParams = []impactParam{
+		{"op", "op", oneOf(OccurrenceOps...)},
+		{"cursor", "cursor", notBlank},
+	}
 	impactParams = map[ImpactForm][]impactParam{
-		ImpactBlast: concat(walkParams, pageParams, []impactParam{
+		ImpactBlast: concat(occurrenceParams, walkParams, pageParams, []impactParam{
 			{"depth", "max-depth", intIn(1, 32)},
 			{"direction", "direction", oneOf("upstream", "downstream")},
 			cursorParam,
@@ -270,6 +299,9 @@ func ImpactFlags(form ImpactForm, params map[string]string) ([]string, error) {
 			return nil, fmt.Errorf("%s does not apply to impact %s: %w", name, form, ErrInvalidInput)
 		}
 	}
+	if err := checkOccurrenceArgs(form, params); err != nil {
+		return nil, err
+	}
 	var out []string
 	for _, p := range table {
 		v := params[p.param]
@@ -287,4 +319,16 @@ func ImpactFlags(form ImpactForm, params map[string]string) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// checkOccurrenceArgs refuses a cursor beside the tier paging it would shadow. Both the
+// tiers and the occurrences page with a cursor (WS-59e gave the tiers one, WS-59d the
+// occurrences), and each is signed with its own key over its own ranking, so a cursor and
+// an offset on one request name two different lists and one of them would be ignored. A
+// refused pair is never silently resolved (§5.1 rule 7).
+func checkOccurrenceArgs(form ImpactForm, params map[string]string) error {
+	if form != ImpactBlast || params["cursor"] == "" || params["offset"] == "" {
+		return nil
+	}
+	return fmt.Errorf("cursor and offset page different lists; pass one: %w", ErrInvalidInput)
 }

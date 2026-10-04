@@ -3673,6 +3673,158 @@ PAR-CTX-05 is a nine-tool contract; 59e owns only the impact occurrence-operatio
 - *Checks.* As above. Not run, with reason: `BUD` (no resident-affecting change; the row adds no cache and no in-heap structure), `SECDOC` (no route or gate row changed), `GOLD` (no projection changed beyond the tools/list snapshot this row regenerates deliberately).
 - *Follow-ups.* `search` still returns 12-17 KB for five or six hits and ranks a name match above the code that names it; the workstream is named for that and this row touched the lane set, not the ranker. Proposed owner: WS-59c or WS-52. The mutation runner must be restored between rows or the box serves a mutated tree to the next gate — this row lost two gates and two mutation runs to it. Proposed owner: `$X/bin/xm-box.sh`, which the executor must not edit. The MCP index is pinned to the owner's `feat/product-v1`, so `explain` and `impact` answer for another revision; seventeenth row to report it. Proposed owner: WS-FIX-15.
 
+### WS-59d — `impact op=refs|definition|implementations`, symbol-level occurrences
+
+**Goal.** Close PAR-IMP-03, which 59a assigned here whole: `impact symbol=<name> op=refs` lists every reference to the symbol, `op=definition` where it is defined, `op=implementations` the types that implement or extend it. Each occurrence carries the containing symbol's name path, kind and line, a ±1-line snippet, and the edge's own provenance and confidence. `op=` is a new argument on the blast form, not a new form: it selects what the blast `symbol=` names are read for and never changes which argument picks the form (59a's ruling, inherited and not re-decided).
+
+Three operations map onto one disk-backed read. `refs` is the reference table's rows for the name; the index records a row only for a *use*, so a declaration is already absent and no span filter is needed. `definition` is the symbols that declare the name, so `definition Store` is `Store` and not `Store.Put`. `implementations` is the `refs` rows of kind EXTENDS or IMPLEMENTS.
+
+Each occurrence is a row, not a graph node: the ±1-line snippet comes from the referencing file at the reference's own line, not the node's declaration line. A row is `name_match` when its language has a scope resolver and `lexical` otherwise, and never `resolved` (deviation 1). A file-scope reference is reported as `kind: "File"`.
+
+**Requirements.** PAR-IMP-03 only. Its target surface is `impact(symbol|uid, op='refs'|'definition'|'implementations', limit?, cursor?, max_chars?)` (`docs/research/PARITY_REQUIREMENTS_2026-09-25.md:162`). PAR-IMP-04, PAR-IMP-05 and PAR-CTX-05 stay with their own rows.
+
+**Files.** `api-go/internal/workspaceops/impact_flags.go` (`op` in the blast table, its check, the form constant), `symbolgraph.go` (`SymbolOccurrencesCtx`), `api-go/cmd/xmustard-api/tool_routes.go` (the `op=` dispatch), `api-go/internal/mcpserver/tool_impact.go` (the Advanced `op` argument, the query list, the docs paragraph and the output members), `api-go/internal/toolbudget/ladders.go`, `rust-core/src/index/occurrences.rs`, `index/mod.rs`, `bin/xmustard-core.rs` (the dispatch arm and usage line), `rust-core/go-calls.txt`, `rust-core/tests/occurrences.rs` and this plan file.
+
+**Tests required.** Rust, over a real built index on a disposable Go repository and a Rust one: each operation returns the occurrences it names; the containing symbol's name path, kind and line are the referencing symbol's; a reference inside the target's own span is absent from `refs`; a file-scope reference is `kind: "File"`; the snippet is numbered, masked and bounded; `implementations` keeps only the type relations; an unknown name is an empty list; tied rows page without repeating or skipping; a page holds one file's text at a time; and no row is ever `resolved`. Go: `ImpactFlags` refuses `op` outside the blast form, refuses an unknown value, and every operation refuses a tier-walk argument and a cursor beside an offset. Every new test gets one mutation row.
+
+**Acceptance.** (1) `op=refs|definition|implementations` answers one occurrence list whose rows carry `name`, `kind`, `path`, `line`, `snippet`, `provenance` and `confidence`; a snippet is absent only when the file cannot be read, and then the answer says why. (2) `op` is Advanced: documented at `xmustard://docs/tools`, absent from the lean schema, no lean cap rising. (3) The page is `limit`/`cursor`, not `offset`; an invalid cursor is refused and the last page carries no cursor. (4) Degradation is staged: snippets, then per-file counts, then a total, each rung reporting what it kept of how many. (5) A row is `name_match` or `lexical`, never `resolved`, and `completeness` is `exact` only for a list of bound edges. (6) `op=` is refused with any other form and with an unknown value, by the same `ErrInvalidInput` shape. (7) The read adds no in-heap structure proportional to the repository: rows come in pages, a page holds one file's text at a time, and `BUD` is owed. (8) The self-audit names its logs and S5 has one mutation row per new test.
+
+**Boundary this row inherits and does not re-decide.** `impact path=` is not replaced, renamed or absorbed (G§5.3), so `op=` never applies to the file form. `limit`/`offset` page the blast tiers and `limit`/`cursor` the occurrences; a request carrying both is refused rather than silently paging one of them. The mutation caller is the Go side, so `go-calls.txt` gains its `called symbolgraph occurrences` line and `xmustard-core.rs` its dispatch arm (§4 step 5).
+
+**Collision risk.** `tool_impact.go` and `impact_flags.go` (59e and 52a/52b/52c touch impact's paging), and the plan file.
+
+### WS-59d implementation record (branch parity/ws-59d, 2026-10-04)
+
+- **Built.** `occurrences.rs` (three operations over one SQL projection, a page read at the cursor's offset with `LIMIT limit+1`, a unique-key order and a per-file snippet cache) with its module, dispatch and `go-calls.txt` entries; `impact_occurrences.go` (one helper refusing the cursor/offset pair and the walk arguments, `ReconcileOccurrencePaging`); `impact_flags.go`, `cursor.go`; the `op=` dispatch in `tool_routes.go`; `tool_impact.go`, `tools.ts`, `ladders.go` and the two cap files.
+- **Measured** (box, Linux). `BOXALL` on 342dacdb: `remote_exit=0`, 24 Go packages, 22 Rust binaries, 0 failures, clippy 6 (the base count), `rss_lines=ok`. `occurrences` 15 passed 0 failed (`-054253Z`). `CAPS` PASS (`-050554Z`): each full cap rose by exactly the 250 bytes the two Advanced arguments cost and equals its own re-measurement, every lean cap unchanged. `cargo fmt --check` clean; `gofmt -l` silent (local).
+- **Deviations.** (1) **No occurrence is a resolved edge: a row in a language the resolver owns is `name_match`, not `resolved`** (`adjudication-WS-59d-r4-3`, AGREE against an earlier rejection). The reference table has no binding from a reference to the declaration it uses, so a same-language name match carries the matcher's confidence, counts as its own `name_match_occurrences` lower-bound cause, and makes `graph` report `lexical`; only a bound edge is `resolved`. A uid, a name path and a name therefore return every namesake's use (`-030854Z`), and closing that needs a reference-row binding: WS-52. (2) `has_more`/`next_cursor` stay in the lean schema (WS-59e's call). (3) `total` is what the page can know.
+- **Deviations, continued.** (4) **Three defects a predecessor session left open were found by running this row's own tests:** a cursor carrying no `op=` was refused (`-044308Z`); the full-profile golden predated `op=` (`-044742Z`); and `TestReconcileOccurrencePaging` unmarshalled into a map it had already filled (`-044330Z`). (5) **A page's snippet cache retained every file it touched** (`Texts` is an unbounded map, a file up to 8 MiB, a page up to `impact::MAX_LIMIT` rows), the shape §5.1 rule 8 forbids; a file's text is now dropped as soon as its last row is converted and the answer reports `peak_files_held`. (6) The page order gained the row's unique key (`s.id`, or `(file_id, start_byte)`), because two uses on one line tie on every other column; **M14 survived, so this is insurance against a plan change rather than an observed repeat.** (7) The earlier claim that the golden's sha256 was identical either side was **wrong**; (4) corrects it.
+- **Merge recheck.** `reviews/ws-59d/r4/merge-recheck.md`; rounds and findings, `reviews/ws-59d/` and the lane A ledger.
+- **Checks.** `BOXALL` on 342dacdb, `CAPS`, `GOLD` (the golden moved +10/-1 for `op`). **Not run: `BUD` — OWED, not taken**; the read is resident-affecting and no budget line was measured, the same unmet prerequisite as WS-38b/38c. `RET`, `PI`, `SECDOC` not named by 3.0.
+- **Follow-ups.** The reference-row binding (WS-52). A new impact enum must be added to `nextValue` or its parameter is silently unproven. `go build -tags review` does not compile on darwin, so the review anchor step is skipped (lane B's `memory_outline_stat_unix.go`).
+
+- **Round 5 closed what five rounds of review left open.** The round-5 triage check returned DISAGREE and was right on three counts, and fixing them is this record's second half. (8) **The gate reads only the round it is given.** `xm-review-gate.py` extracts every test name from the current round's S5 block and demands a mutation row naming it, so a round inheriting five rounds of tests sees none of their rows; r5's audit now carries all 31, each pointing at the log that saved its FAIL line. (9) **A signed cursor was not bound to what the core can emit**: `signOccurrencePage` trusted the core's `next_cursor` offset, so an offset at or past the core's `MAX_OCCURRENCES` became a cursor the next request's flag parser refuses (ocr-review:2; fixed in 20225e13, `maxOccurrenceOffset`). (10) **`truncated` was set by reaching the ceiling**, even on a complete list, adding a cause and reporting `lower_bound` over a whole list (ocr-review:3; the RED log shows `coverage.truncated false` beside `epistemic.causes.truncated 1`; fixed in 20225e13). (11) **PAR-IMP-03's containing-symbol line was missing from every row** — the query selected it and the conversion discarded it; raised twice (r4-5, r5-3) and deferred, and the triage check's objection to that deferral was right, so the row now carries `symbol_line` (e2b519e9).
+- **Deviation, continued.** (12) **Two mutations survive and are recorded rather than hidden.** M14 (the page order's unique key) passes when dropped: SQLite walks the tied rows in B-tree order on this build, so it is insurance against a plan change, not a fix for an observed bug. M29b (`read`'s own `OPERATIONS` guard) also passes when removed, because the flag parser is the guard the CLI exercises and no test calls the library entry point with a bad `op`; the guard is a deliberate fail-closed redundancy and is currently unwitnessed. (13) **ocr-review:1 was reviewed and rejected on the code**: the counts rung renders the list under `leaf + "_by_" + GroupBy` (`toolbudget/apply.go:360`), so a response cannot carry both `occurrences` and `occurrences_by_path` and the state the finding describes does not exist.
+- **PARKED, second time (2026-10-04 11:07Z, box outage).** Last sha `8de9ba91`, which is the §1.7 rule-4 re-merge of `feat/parity-v2` (`854ad51e`, 22 files, three of them this row's own: the plan file, `index/mod.rs`, `bin/xmustard-core.rs`). The merge was ort with zero conflicts, the row's own code is byte-identical across it (`git diff --name-only 1baa80d6 8de9ba91 -- occurrences.rs tests/occurrences.rs impact_occurrences.go impact_flags.go cursor.go tool_impact.go` is empty) and its `occurrences` wiring survives in all three overlapping files, but **rule 4's conditional re-gate is OWED because the tip moved files outside the row**, and nothing was gated. `gate=PASS` is still held on `a69089b4` only, and four commits plus the merge sit above it. Plan-file integrity checked by script, the way lane B and lane D each had to: ours 126 headings, theirs 126, union 128, merged 128 unique, nothing missing, nothing invented, no duplicate, zero conflict markers; the two extra headings are this section and its implementation record, both the row's own. Open: (a) M35, the `symbol_line` mutation; (b) `BOXALL` on `8de9ba91`; (c) the gate re-run on that head; (d) the merge. The box went down again at 10:56Z, 14 minutes after it answered the smoke test (`logs/ws-59d-run-20261004T105619Z.log` helper_exit=90, `logs/integration-probe-20261004T105634Z.log`, `-105719Z`, `-110746Z` box=down), so §1.7 rule 5's ten-minute wait and its one retry were both spent for nothing.
+- **Checks.** No gate result is claimed on any head above `a69089b4`: **not run — the box is down.** Everything cited earlier in this record comes from the saved logs named beside it.
+- **Follow-ups.** A direct `read` test for the second `op` guard (FU, proposed owner WS-52a). The reference-row binding (WS-52). `go build -tags review` does not compile on darwin, so the review anchor step is skipped (lane B's `memory_outline_stat_unix.go`).
+
+- **Round 6 (2026-10-04).** (14) **`symbol_line` was the reference's own line.** e2b519e9 changed the tenth projected column from `s.start_line` to `r.line`, so the member this row added equalled `line` on every row; the file's own two doc comments and the `definition` arm of the same `statement()` still said `s.start_line`. **M35 survived — the mutation passed — and the correct response was to run the unmutated head, which FAILED** (`no row had a container above the reference`), and failed again after `cargo clean -p xmustard-core` so no stale box artifact explains it. The commit under review was the defect; the GREEN log cited for its test was a debug-profile run against a tree predating the commit (edc88d8f, `-133550Z`, `-133832Z`, `-134002Z`). (15) **A renamed or dropped occurrence list kept a cursor for rows it never sent**: the reconciler recognised a page only by the `occurrences` member and returned before clearing `next_cursor`, while the counts rung RENAMES that member and the total rung DROPS it; the counts case in the existing test used `"occurrences":[]` beside `occurrences_by_path`, a shape no rung produces (codex-spec:1, codex-review:1; 00835d56, `-144235Z`, `-145823Z`). (16) **The reconciler signed its own offset without the ceiling check** it enforces on the core's cursor, so offset 4999 with two rows kept signed 5001 (codex-spec:5; same commit, `-150947Z`). (17) **Pagination was reported as truncation**: `truncated` was `more || ceiling`, so every nonfinal page claimed a loss it could still page past; it now reports `page_bound`, and `truncated` is left to the bounded read (codex-spec:4, codex-review:2; 78eb1eeb, `-152257Z`, `-154145Z`). (18) **`total` on a paged read is a lower bound** (`end + 1`), which reads as 51 for a 5,000-row name; counting the rest is the one thing this path exists not to do, so the envelope carries the claim as `page_bound` (codex-spec:2; same commit).
+- **Measured** (box, Linux, release profile). `BOXALL` on `78eb1eeb`: `remote_exit=0`, 24 Go packages, 24 Rust binaries, 0 failures, clippy 6 (the base count), `rss_lines=ok` (`logs/ws-59d-check-20261004T151028Z.log`; the same on `edc88d8f` at `-135453Z`). `occurrences` 20/20 (`-153616Z`). `CAPS` PASS (`-140536Z`). **`BUD` run, which the earlier rounds owed and did not take**: peak 87.3 MiB against the 95.4 line on `v1-workload` and 65.1 MiB on `agents-2-relay`, baseline measured on the same machine at the merge base 83.6/71.6 MiB (`-142507Z` against `-141937Z`); the +3.7 MiB is run-to-run variation in `rust_core_per_call`, which a one-line column change cannot cause, and `ledger_check=BELOW_RESOLUTION` on a CI suite rather than the parity scale.
+- **Review round 6.** `reviews/ws-59d/r6`, `gate=PASS changed=21 covered=21 channel_findings=10 triaged=8 reviewer=gpt-6-sol`. Channels: ocr_preview 0, ocr_rules 0, **ocr_review 1** (aborted: `background content is 12037 characters, exceeding the hard limit of 8000`, so the delegate contract was performed by hand per §4.6 B3 and `ocr-delegate.findings.json` carries one verbatim quote per changed file), codex_review 0, codex_spec 0 (7 findings: 2 high, 3 medium, 2 low), opencode unavailable, anchor skipped (`go build -tags review` does not compile on darwin). Three majors, all fixed (15, 16 and 17/18 at 78eb1eeb); the triage check DISAGREE'd on r6-2 being deferred while `codex-spec` rated it high and on r6-4 being stale, and both objections were right.
+- **Deviations, continued.** (19) **Four minors are deferred to FU, each with a proposed owner**: the `refs` allowlist excludes IMPORT/EXPORT (WS-59e, it widens the goldens); the past-ceiling test cannot reach the ceiling with a small fixture (WS-59e); the module header says `resolved` where `rows` says `name_match` (owner — it is a contract question about the whole index); an explicitly empty cursor (owner — a test deliberately asserts the opposite). (20) **`ocr review` hit the 8,000-character background limit**, the second OCR channel on this goal to do so; the runner's own background is what grew and trimming it is owner tooling.
+- **Checks.** `BOXALL` on `edc88d8f` and on `78eb1eeb`; `CAPS`; `BUD` against a baseline measured on the same machine. **Not run: `GOLD`** — the goldens did not move in this round (`git diff` over both json fixtures and the hook testdata is empty outside the pre-reviewed row diff), so the projection the GOLD gate owns is unchanged by rounds 6's four commits. `RET`, `PI`, `SECDOC` not named by 3.0; no index format, Pi source, route or gate row changed in this round.
+
+### WS-59e — `impact` paging remainder: `has_more` / `next_cursor`
+
+**Goal.** Close the PAR-CTX-05 paging remainder 59a assigned here. The blast and
+diff-scope impact results already carry a per-tier `total`, `offset` and `next_offset`, but
+no cursor names a *ranking*, no `has_more`/`next_cursor` member reaches the client for
+those forms, and a budget-trimmed tier silently loses its remainder. This row adds them:
+the operation forms report `has_more`, and `next_cursor` continues them through the signed
+cursor helper 59a ruled this row owns. It reuses `cursorCodec` rather than writing a new
+signer; WS-52a later unifies the codec.
+
+**Requirements.** PAR-CTX-05's impact paging remainder only: `max_chars`, `limit`,
+`cursor` → `has_more`, `next_cursor` on impact's already-budgeted operation forms. It does
+not touch `search`/`explain` paging (WS-18, WS-20), does not add the PAR-IMP-03 occurrences
+form (59d), and does not replace or rename `impact path=` (G§5.3).
+
+**Files.** `api-go/internal/workspaceops/cursor.go` (the impact codec and its ranking
+key), `navigation.go` (`ImpactCursor`/`DecodeImpactCursor`, beside `ExplainCursor`),
+`symbolgraph.go` (`has_more`/`next_cursor` on the blast and scope results),
+`api-go/internal/mcpserver/tool_impact.go` (the `cursor` argument and the output members),
+and this plan file.
+
+**Tests required.** (1) A blast result whose tier was cut by `limit` reports
+`has_more: true` and a `next_cursor`, and taking that cursor with the same arguments
+returns the next tier page with no overlap. (2) `has_more` is false and no cursor is
+issued when the last item returned is the tier's last. (3) A cursor is bound to its
+ranking: two blast calls differing only in `symbol`, `direction`, `max_depth`,
+`relation_types`, `min_confidence`, `include_tests` or `scope` do not accept each other's
+cursor. (4) An edited or foreign cursor is refused with search's error shape. (5) An
+over-long `cursor` is refused at search's bound. (6) `offset` and `cursor` together are
+refused rather than one silently winning. (7) The two members appear on the blast and
+diff-scope forms and not on the trace (`from=&to=`) or no-argument forms.
+
+**Acceptance.** (1) `impact(symbol=…)` with a `limit` smaller than a tier returns
+`has_more: true` and a non-empty `next_cursor`; without a cut, `has_more` is absent-or-false
+and no cursor is issued. (2) Two successive `cursor=` pages cover the tier with no overlap
+and no gap, checked against the tier's own `total`. (3) `CAPS` passes with lean and full
+byte caps unchanged: the two members are output members and `cursor` is Advanced, so
+nothing enters the lean schema. (4) `instructions` is unchanged. (5) Every existing impact
+test is green and no member is renamed. (6) No member of `search` or `explain` changes.
+
+**Design.** The cursor is the existing `cursorCodec` with a new kind, `i2`, carrying the
+per-tier offset as one field, signed over a ranking key that is the workspace plus every
+argument that selects or shapes the tier page, so 52a's unification has one shape to fold.
+The key's names are the query's own: the walk's depth arrives as `depth`, not `max_depth`.
+`has_more` is computed where the page is, from the tier's own `next_offset` and `total`.
+This row adds the *reporting* and the cursor, not a second paging mechanism (`pageParams`
+owns `limit`/`offset` unchanged).
+
+**Boundary.** 59d adds the PAR-IMP-03 occurrences form and reuses this row's cursor
+helper; 59f adds read-only rename/delete plans. 59e owns the codec and the two members
+that 59d/59f read, and its `Files` list names only the existing blast/scope forms. 59c
+(`search mode=exact|regex`) and WS-52a (cursor unification) do not block this row and are
+not touched here.
+
+**Verified facts this section rests on** (`rg` on this branch's base `642106b`; the full
+list is in the round-1 record under `reviews/ws-59e/`):
+
+- The core already emits per-tier `total`, `offset` and `next_offset`, skipping
+  `next_offset` when a page reaches the tier's end; and `impact` is not a `Paged` budget
+  spec, so the budget layer adds no paging members and they must come from the result.
+- **The wire parameter for the walk's depth is `depth`, not the tool's `max_depth`**, so a
+  key reading `max_depth` would be empty on the wire and bind nothing — round 1's defect.
+- Every tier is paged by `skip(offset).take(limit)` and carries `next_offset` only when the
+  page misses `total`, so every unfinished tier at the same `(offset, limit)` ends in the
+  same place and one cursor serves them all — the premise `WS-59e-r2-5` adjudicates. The
+  budget then runs and can cut a tier's items after the cursor was signed; `total` survives
+  every rung and the report names the stage, so a trimmed page is detectable.
+
+**Collision risk.** `tool_impact.go` (59d, 59f also touch it), `cursor.go` /
+`navigation.go` (WS-52a unifies the codec), the plan file (every lane appends here).
+
+**Implementation record (branch parity/ws-59e, 2026-10-03).** Detail in
+`reviews/ws-59e/`.
+
+- **Built.** `cursor.go` the `i2` codec kind; `navigation.go` `ImpactCursor`/`DecodeImpactCursor` and
+  `impactRanking`, signed over the wire's names (`depth`, not `max_depth`); `symbolgraph.go`
+  `has_more`/`next_cursor`, a trimmed page's cursor re-signed to the first undelivered item, and a tier
+  decoder that counts items from raw bytes without materialising them; `impact_flags.go` refuses a cursor
+  on the trace and path forms, an empty cursor, and `cursor` with `offset`; `tool_impact.go` declares
+  `cursor` and the members; the Pi mirror forwards them.
+- **Round 5 (the owner's single extra round, 2026-10-03).** Seven findings, all fixed; fix, commit
+  and evidence for each in `reviews/ws-59e/r5/triage.json`. 1. `WS-59e-r4-3`: the `tiers_total` rung
+  removed the tier list while the answer kept `has_more`, so a client that followed it got the same
+  page; both fallbacks `adjudication-WS-59e-r4-3.md` names are worse, so `has_more=false` plus
+  `truncated:"tiers_removed"` -- one predicate: a cursor exists exactly when `has_more` is.
+  2. The ranking key omitted `symbols=`. 3. `ImpactCursor` could sign an offset past the 50,000 the
+  validator accepts (`MaxImpactOffset`, read by both). 4. The published tool text still described the
+  old contract. 5. This section's Design paragraph sat inside WS-59b's (from `1aac8070`); it is gone.
+  6. The route settled exactly twice on an unprovable claim; it settles until a pass changes nothing.
+  7. `Settle` rebuilt the report with every list entry empty; it carries the prior accounting forward.
+- **Measured** (Linux box, `e708fcd7`). `BOXALL` `remote_exit=0`, 24 Go packages, 19 Rust binaries,
+  `clippy_warnings=6` (base count), `rss_lines=ok`. `CAPS` PASS, all 16 changed caps **fell**
+  (−76/−14 lean, −64/−2 full). `PI` `remote_exit=0`.
+- **Deviations.** 1. Eleven files outside the row's `Files`, each with a reason in
+  `reviews/ws-59e/r5/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members
+  it wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same
+  ladder and carries the earlier stages, recovery and list accounting forward. 3. `countArray` reads
+  the member at its own level, so a symbol name holding `"items":[` cannot steer a paging decision.
+  4. `truncated` is in `impactDoc`, deliberately **not** in the `Output` map: it costs 30 rendered wire
+  bytes and the cap rule forbids raising a cap to fit one.
+- **Review.** r1-r5, gate `PASS` at r5. Twenty-one mutations; M22 survives honestly (the settle fixed
+  point is reached in one or two passes at every budget the route produces, so none distinguishes the
+  forms). `triage-check.md` DISAGREE'd twice and was right twice: `fix_commit` must name the commit
+  that adds the test, not only the one that changes the code.
+- **Checks.** `BOXALL`, `CAPS`, `PI`. Not run: `RET`, `BUD`, `SECDOC`, `GOLD`.
+- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`; next row that mutates a
+  budgeted result: call `spec.Settle`. Four FU notes on `fitEach`'s boundary-seeking, OCR's background
+  limit, the `git checkout --` hazard, and a case that passed against its own mutation.
+
+
 ### WS-60 — Framework entry-point extractors and extra language packs (critic addition)
 
 Route/DI extractors (Django, FastAPI, Next.js, Nest, Spring, Laravel, tRPC, Expo) seeding flow entry points; Vue, Dart, Objective-C packs; reimplemented from design (GitNexus is PolyForm NC).
@@ -4197,116 +4349,6 @@ before the row is claimed resident-affecting, as recorded in the follow-ups belo
 - **Follow-ups.** `BUD` for the row (owner of the unbounded-area-count question, with WS-38d); the stale-cargo-fingerprint defect in `xm-box.sh`, which makes a passing test fail and could make a surviving mutation look killed (FU, proposed owner the gate-tooling maintainer); `recall` returning `total_matches: 0` with no reason field and `explain` returning "Workspace or path not found" for files newer than the index (FU/WS-FIX-15, now 22 and 3 rows respectively).
 
 **PARKED (superseded 2026-10-03).** The record above replaces this bullet; the parked entry is kept for the §5.3 item 7 history it records.
-
-### WS-59e — `impact` paging remainder: `has_more` / `next_cursor`
-
-**Goal.** Close the PAR-CTX-05 paging remainder 59a assigned here. The blast and
-diff-scope impact results already carry a per-tier `total`, `offset` and `next_offset`, but
-no cursor names a *ranking*, no `has_more`/`next_cursor` member reaches the client for
-those forms, and a budget-trimmed tier silently loses its remainder. This row adds them:
-the operation forms report `has_more`, and `next_cursor` continues them through the signed
-cursor helper 59a ruled this row owns. It reuses `cursorCodec` rather than writing a new
-signer; WS-52a later unifies the codec.
-
-**Requirements.** PAR-CTX-05's impact paging remainder only: `max_chars`, `limit`,
-`cursor` → `has_more`, `next_cursor` on impact's already-budgeted operation forms. It does
-not touch `search`/`explain` paging (WS-18, WS-20), does not add the PAR-IMP-03 occurrences
-form (59d), and does not replace or rename `impact path=` (G§5.3).
-
-**Files.** `api-go/internal/workspaceops/cursor.go` (the impact codec and its ranking
-key), `navigation.go` (`ImpactCursor`/`DecodeImpactCursor`, beside `ExplainCursor`),
-`symbolgraph.go` (`has_more`/`next_cursor` on the blast and scope results),
-`api-go/internal/mcpserver/tool_impact.go` (the `cursor` argument and the output members),
-and this plan file.
-
-**Tests required.** (1) A blast result whose tier was cut by `limit` reports
-`has_more: true` and a `next_cursor`, and taking that cursor with the same arguments
-returns the next tier page with no overlap. (2) `has_more` is false and no cursor is
-issued when the last item returned is the tier's last. (3) A cursor is bound to its
-ranking: two blast calls differing only in `symbol`, `direction`, `max_depth`,
-`relation_types`, `min_confidence`, `include_tests` or `scope` do not accept each other's
-cursor. (4) An edited or foreign cursor is refused with search's error shape. (5) An
-over-long `cursor` is refused at search's bound. (6) `offset` and `cursor` together are
-refused rather than one silently winning. (7) The two members appear on the blast and
-diff-scope forms and not on the trace (`from=&to=`) or no-argument forms.
-
-**Acceptance.** (1) `impact(symbol=…)` with a `limit` smaller than a tier returns
-`has_more: true` and a non-empty `next_cursor`; without a cut, `has_more` is absent-or-false
-and no cursor is issued. (2) Two successive `cursor=` pages cover the tier with no overlap
-and no gap, checked against the tier's own `total`. (3) `CAPS` passes with lean and full
-byte caps unchanged: the two members are output members and `cursor` is Advanced, so
-nothing enters the lean schema. (4) `instructions` is unchanged. (5) Every existing impact
-test is green and no member is renamed. (6) No member of `search` or `explain` changes.
-
-**Design.** The cursor is the existing `cursorCodec` with a new kind, `i2`, carrying the
-per-tier offset as one field, signed over a ranking key that is the workspace plus every
-argument that selects or shapes the tier page, so 52a's unification has one shape to fold.
-The key's names are the query's own: the walk's depth arrives as `depth`, not `max_depth`.
-`has_more` is computed where the page is, from the tier's own `next_offset` and `total`.
-This row adds the *reporting* and the cursor, not a second paging mechanism (`pageParams`
-owns `limit`/`offset` unchanged).
-
-**Boundary.** 59d adds the PAR-IMP-03 occurrences form and reuses this row's cursor
-helper; 59f adds read-only rename/delete plans. 59e owns the codec and the two members
-that 59d/59f read, and its `Files` list names only the existing blast/scope forms. 59c
-(`search mode=exact|regex`) and WS-52a (cursor unification) do not block this row and are
-not touched here.
-
-**Verified facts this section rests on** (`rg` on this branch's base `642106b`; the full
-list is in the round-1 record under `reviews/ws-59e/`):
-
-- The core already emits per-tier `total`, `offset` and `next_offset`, skipping
-  `next_offset` when a page reaches the tier's end; and `impact` is not a `Paged` budget
-  spec, so the budget layer adds no paging members and they must come from the result.
-- **The wire parameter for the walk's depth is `depth`, not the tool's `max_depth`**, so a
-  key reading `max_depth` would be empty on the wire and bind nothing — round 1's defect.
-- Every tier is paged by `skip(offset).take(limit)` and carries `next_offset` only when the
-  page misses `total`, so every unfinished tier at the same `(offset, limit)` ends in the
-  same place and one cursor serves them all — the premise `WS-59e-r2-5` adjudicates. The
-  budget then runs and can cut a tier's items after the cursor was signed; `total` survives
-  every rung and the report names the stage, so a trimmed page is detectable.
-
-**Collision risk.** `tool_impact.go` (59d, 59f also touch it), `cursor.go` /
-`navigation.go` (WS-52a unifies the codec), the plan file (every lane appends here).
-
-**Implementation record (branch parity/ws-59e, 2026-10-03).** Detail in
-`reviews/ws-59e/`.
-
-- **Built.** `cursor.go` the `i2` codec kind; `navigation.go` `ImpactCursor`/`DecodeImpactCursor` and
-  `impactRanking`, signed over the wire's names (`depth`, not `max_depth`); `symbolgraph.go`
-  `has_more`/`next_cursor`, a trimmed page's cursor re-signed to the first undelivered item, and a tier
-  decoder that counts items from raw bytes without materialising them; `impact_flags.go` refuses a cursor
-  on the trace and path forms, an empty cursor, and `cursor` with `offset`; `tool_impact.go` declares
-  `cursor` and the members; the Pi mirror forwards them.
-- **Round 5 (the owner's single extra round, 2026-10-03).** Seven findings, all fixed; fix, commit
-  and evidence for each in `reviews/ws-59e/r5/triage.json`. 1. `WS-59e-r4-3`: the `tiers_total` rung
-  removed the tier list while the answer kept `has_more`, so a client that followed it got the same
-  page; both fallbacks `adjudication-WS-59e-r4-3.md` names are worse, so `has_more=false` plus
-  `truncated:"tiers_removed"` -- one predicate: a cursor exists exactly when `has_more` is.
-  2. The ranking key omitted `symbols=`. 3. `ImpactCursor` could sign an offset past the 50,000 the
-  validator accepts (`MaxImpactOffset`, read by both). 4. The published tool text still described the
-  old contract. 5. This section's Design paragraph sat inside WS-59b's (from `1aac8070`); it is gone.
-  6. The route settled exactly twice on an unprovable claim; it settles until a pass changes nothing.
-  7. `Settle` rebuilt the report with every list entry empty; it carries the prior accounting forward.
-- **Measured** (Linux box, `e708fcd7`). `BOXALL` `remote_exit=0`, 24 Go packages, 19 Rust binaries,
-  `clippy_warnings=6` (base count), `rss_lines=ok`. `CAPS` PASS, all 16 changed caps **fell**
-  (−76/−14 lean, −64/−2 full). `PI` `remote_exit=0`.
-- **Deviations.** 1. Eleven files outside the row's `Files`, each with a reason in
-  `reviews/ws-59e/r5/slop-audit.md` S9. 2. **`Apply`'s `used_chars` is a fixed point over the members
-  it wrote**, so reconciliation's members fell outside it; `toolbudget.Settle` re-fits through the same
-  ladder and carries the earlier stages, recovery and list accounting forward. 3. `countArray` reads
-  the member at its own level, so a symbol name holding `"items":[` cannot steer a paging decision.
-  4. `truncated` is in `impactDoc`, deliberately **not** in the `Output` map: it costs 30 rendered wire
-  bytes and the cap rule forbids raising a cap to fit one.
-- **Review.** r1-r5, gate `PASS` at r5. Twenty-one mutations; M22 survives honestly (the settle fixed
-  point is reached in one or two passes at every budget the route produces, so none distinguishes the
-  forms). `triage-check.md` DISAGREE'd twice and was right twice: `fix_commit` must name the commit
-  that adds the test, not only the one that changes the code.
-- **Checks.** `BOXALL`, `CAPS`, `PI`. Not run: `RET`, `BUD`, `SECDOC`, `GOLD`.
-- **Follow-ups.** `WS-59e-r2-6`'s follow-up withdrawn, replaced by `Settle`; next row that mutates a
-  budgeted result: call `spec.Settle`. Four FU notes on `fitEach`'s boundary-seeking, OCR's background
-  limit, the `git checkout --` hazard, and a case that passed against its own mutation.
-
 
 ### WS-FIX-08 — Resource reads pass the same gates a tool call passes
 
