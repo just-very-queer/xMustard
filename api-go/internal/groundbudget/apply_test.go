@@ -620,9 +620,16 @@ func TestApplyDoesNotCopyTheResult(t *testing.T) {
 		t.Fatalf("Apply allocated %d more bytes on its first call for a %d-byte result than for a %d-byte one with the same %d list elements;"+
 			" it must not copy the result", firstCopied, len(wide), len(narrow), 40050)
 	}
-	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+firstNarrow {
-		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d)",
-			ws, len(narrow), firstNarrow)
+	// The same process-wide counter must not appear on its own anywhere in this test, so
+	// the WorkingSet coverage check reads it through the same measured allowance the copy
+	// guard admits: the admitted set has to cover the result plus what one call allocates,
+	// and one call's allocation is read here with copyAllowance of measured noise rather
+	// than against an absolute limit a loaded box can cross. The headroom this leaves is
+	// about 43 KB, so the allowance is a tenth of it and does not blunt what the check is
+	// for: that WorkingSet covers a real call's allocations and not just its own formula.
+	if ws := WorkingSet(narrow, req); ws < int64(len(narrow))+firstNarrow+copyAllowance {
+		t.Fatalf("WorkingSet %d does not cover the result (%d) plus the first Apply's allocations (%d) within the %d-byte allowance",
+			ws, len(narrow), firstNarrow, copyAllowance)
 	}
 
 	copied := steadyOf(t, wide, req) - steadyOf(t, narrow, req)
