@@ -8,11 +8,32 @@ use std::net::TcpListener;
 use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_xmustard-core");
+
+/// One terminal-driven test at a time.
+///
+/// `without_forwarding_the_wrapper_becomes_the_command` runs the wrapper under
+/// `ulimit -n 4`, so it passes only when the descriptors it needs are free. The pty tests
+/// hold a pty master, a slave and a piped stderr for the whole of a several-second
+/// observation window, and this binary runs its tests in parallel by default, so a pty test
+/// beside it starves the low-limit one: measured on the box, 2 failures in 10 full-binary
+/// runs with the pty tests in the same binary and 0 in 10 at the merge base, which has no pty
+/// test. Serialized, it is 6 of 6. The same shape as `tests/refresh.rs`'s `serial()`.
+///
+/// The lock covers only the terminal-driven tests; the rest of the binary is unaffected, and
+/// nothing here bounds or skips a test — it removes parallel-load contention, which is the
+/// first acceptable fix class in goal §3.3.
+static TERMINAL: Mutex<()> = Mutex::new(());
+
+fn serial_terminal() -> MutexGuard<'static, ()> {
+    TERMINAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A run with no workspace configured: the API is never contacted.
 fn run(argv: &[&str]) -> Output {
@@ -713,6 +734,7 @@ fn a_child_that_exits_zero_on_term_makes_the_wrapper_exit_zero() {
 /// child's `$$` is the very pid the caller started, and its output is native.
 #[test]
 fn without_forwarding_the_wrapper_becomes_the_command() {
+    let _g = serial_terminal();
     let run = format!("ulimit -n 4 && exec '{BIN}' run -- sh -c 'echo \"pid=$$\"'");
     let mut wrapper = Command::new("sh")
         .args(["-c", &run])
@@ -764,6 +786,7 @@ fn without_forwarding_the_wrapper_becomes_the_command() {
 #[cfg(target_os = "linux")]
 #[test]
 fn one_terminal_keystroke_reaches_the_child_once() {
+    let _g = serial_terminal();
     // The keystrokes a terminal turns into SIGINT (INTR) and SIGQUIT (QUIT) for its
     // foreground group. Each keystroke gets its own wrapper, because a run is what leaves a
     // child and its log behind and the first run's child is released before the next starts.
@@ -921,6 +944,7 @@ const COUNTER_CHILD: &str = concat!(
 /// the wrapper alone, and the pty test above proves a terminal one no longer is.
 #[test]
 fn a_signal_a_process_sent_still_reaches_the_child() {
+    let _g = serial_terminal();
     let dir = tempfile::tempdir().unwrap();
     let (mut wrapper, _master, _slave) = terminal_job(dir.path());
     await_child(&dir.path().join("ready"), dir.path());
