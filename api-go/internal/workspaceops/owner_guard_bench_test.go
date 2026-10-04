@@ -50,17 +50,17 @@ func BenchmarkAwaitingMeOwnerGuard(b *testing.B) {
 						b.Fatalf("the queue listed %d of %d pending entries: a row was capped or withheld",
 							q.Total, n)
 					}
-					// Every pending row is somebody else's, so each is either listed
-					// (Items) or skipped, and the two must add up. Without this a guard
-					// that changed which reason a row was skipped by, or that guarded
-					// only part of a page, would still report Total == n: the last
-					// partial page is the case a page-boundary loop gets wrong, and a
-					// queue of 100 or 1000 rows is one.
-					if got := len(q.Items) + q.Skipped[skipOwn] + q.Skipped[skipVoted] +
+					// Every pending row is somebody else's, so each is either listed for approval
+					// (q.Total, which is the eligible count and is not bounded by limit) or
+					// skipped for a named reason, and the two must add up. Without this a
+					// guard that changed which reason a row was skipped by, or that guarded
+					// only part of a page, would still report Total == n. q.Items is NOT
+					// the row count: it is the rendered page, bounded by limit.
+					if got := q.Total + q.Skipped[skipOwn] + q.Skipped[skipVoted] +
 						q.Skipped[skipSameOwner] + q.Skipped[skipNotVisible]; got != n {
-						b.Fatalf("%d rows accounted for (%d items, skipped %v), want %d: batching "+
+						b.Fatalf("%d rows accounted for (%d listed, skipped %v), want %d: batching "+
 							"changed which rows were listed or why they were skipped",
-							got, len(q.Items), q.Skipped, n)
+							got, q.Total, q.Skipped, n)
 					}
 				}
 			})
