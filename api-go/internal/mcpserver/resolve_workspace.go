@@ -243,8 +243,9 @@ func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string
 		repo = repoRoot(p)
 	}
 	// With the cwd pinned to its own repository, a registration refused above would
-	// otherwise fail a cwd that a registered ancestor already contains. The ancestor is
-	// then the answer the caller actually had, so it is offered rather than lost.
+	// otherwise fail a cwd that a registered ancestor already contains. A registered
+	// ancestor stays the caller's answer on every refusal below, so it is offered
+	// rather than lost.
 	ancestor := func(err error) (Workspace, error) {
 		if ownRepo == "" {
 			return Workspace{}, err
