@@ -80,6 +80,10 @@ pub struct Occurrence {
     pub path: String,
     /// The reference's own line (not the containing symbol's declaration line).
     pub line: u32,
+    /// The containing symbol's own start line, which PAR-IMP-03 asks for beside the name
+    /// path and kind. Absent only at file scope, where there is no containing symbol.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub symbol_line: Option<u32>,
     /// The reference kind: `call`, `read`, `extends`, `implementations` and so on.
     pub kind_of_reference: &'static str,
     /// `IMPLEMENTS` or `EXTENDS` on an implementations row; absent otherwise.
@@ -189,7 +193,7 @@ struct Row {
     path: String,
     line: u32,
     kind: u8,
-    /// The containing symbol: (qualified name, kind, line), none at file scope.
+    /// The containing symbol: (qualified name, kind, start line), none at file scope.
     container: Option<(String, String, u32)>,
     file_id: i64,
     blob: String,
@@ -276,7 +280,7 @@ fn statement(q: &Query) -> String {
             };
             format!(
                 "SELECT r.start_byte, f.path, f.lang, f.id, f.content_hash, r.line, r.kind, \
-                        s.qualified_name, s.kind, s.start_line \
+                        s.qualified_name, s.kind, r.line \
                  FROM refs r JOIN names n ON n.id = r.name_id JOIN files f ON f.id = r.file_id \
                  LEFT JOIN symbols s ON s.id = r.symbol_id \
                  WHERE n.name = ?1 AND r.kind IN ({})",
@@ -544,9 +548,9 @@ fn name_of_symbol(conn: &Connection, uid: &str) -> rusqlite::Result<Option<Strin
 }
 
 fn occurrence(texts: &mut Texts, root: &Path, row: &Row) -> Occurrence {
-    let (name, kind) = match &row.container {
-        Some((qualified, kind, _)) => (qualified.clone(), kind.clone()),
-        None => (row.path.clone(), "File".to_string()),
+    let (name, kind, symbol_line) = match &row.container {
+        Some((qualified, kind, start)) => (qualified.clone(), kind.clone(), Some(*start)),
+        None => (row.path.clone(), "File".to_string(), None),
     };
     let (snippet, snippet_unavailable) = match texts.file(root, row.file_id, &row.path, &row.blob) {
         Ok(text) => {
@@ -564,6 +568,7 @@ fn occurrence(texts: &mut Texts, root: &Path, row: &Row) -> Occurrence {
         kind,
         path: row.path.clone(),
         line: row.line,
+        symbol_line,
         kind_of_reference: reference_kind(row.kind),
         relation: match row.kind {
             ref_kind::EXTENDS => Some("EXTENDS"),

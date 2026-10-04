@@ -883,3 +883,41 @@ fn a_page_ending_exactly_at_the_offset_ceiling_is_not_truncated() {
         "the page past the ceiling did not answer: {past:#}"
     );
 }
+
+// PAR-IMP-03 asks each hit for the containing symbol's "name path, kind, line". The
+// reference's own line is `line`; the containing symbol's own start line is `symbol_line`,
+// and the two differ whenever a reference sits below its container's declaration. At file
+// scope there is no containing symbol, so the member is absent rather than zero.
+#[test]
+fn each_row_carries_the_containing_symbols_own_start_line() {
+    let r = go_repo();
+    build(r.path());
+    let v = occ(r.path(), "refs", "Store", &[]);
+    let hits = rows(&v);
+    assert!(!hits.is_empty(), "no rows to read a symbol_line from: {v:#}");
+    let mut saw_a_line_differing_from_the_reference = false;
+    for h in &hits {
+        if h["kind"].as_str() == Some("File") {
+            assert!(
+                h["symbol_line"].is_null(),
+                "a file-scope row claims a containing symbol's line: {h:#}"
+            );
+            continue;
+        }
+        let sym = h["symbol_line"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("a row inside a symbol has no symbol_line: {h:#}"));
+        let line = h["line"].as_u64().unwrap();
+        assert!(
+            sym <= line,
+            "the containing symbol starts at {sym}, after the reference at {line}: {h:#}"
+        );
+        if sym < line {
+            saw_a_line_differing_from_the_reference = true;
+        }
+    }
+    assert!(
+        saw_a_line_differing_from_the_reference,
+        "no row had a container above the reference, so the two lines were never distinguished: {v:#}"
+    );
+}
