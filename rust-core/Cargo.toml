@@ -71,7 +71,9 @@ libc = "0.2"
 # tests/run_wrapper.rs gives the wrapper a real pty and its child a controlling terminal,
 # so the double Ctrl-C of WS-FIX-20b is produced by a line discipline rather than by
 # kill(2) (the same rustix the library already depends on; the feature is only enabled here).
-rustix = { version = "1", features = ["pty", "termios"] }
+# `termios` was removed in round 4: the tests call `rustix::pty` and `rustix::process` and
+# nothing calls `rustix::termios` (codex-spec, round 4).
+rustix = { version = "1", features = ["pty"] }
 
 [features]
 default = ["lang-all"]

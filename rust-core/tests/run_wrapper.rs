@@ -1240,6 +1240,103 @@ fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
     release(dir.path());
     let ended = wait_within(&mut job.wrapper, 10).expect("the wrapper never ended");
     assert_eq!(ended.code(), Some(0), "wrapper status {ended:?}");
+    // No assertion on the report line here, and that is deliberate: this job's stderr is full
+    // and undrained, so a correct wrapper CANNOT get the line out, and asserting that it did
+    // would condemn the code for working. That this pipe is full is also why the harness is
+    // about the relay rather than about the report.
+    //
+    // Reporting has its own witness, and it needs a stderr that is merely SLOW rather than
+    // permanently full: `the_wrapper_states_what_it_decided_for_each_signal` gives the wrapper a
+    // file for stderr and reads the decision back. Between them the two claims are covered,
+    // which codex-spec (round 4) was right that neither test managed alone.
+}
+
+/// The other half of the report's contract, on its own harness: the wrapper SAYS what it decided
+/// about each signal it handled.
+///
+/// `the_child_has_the_signal_before_the_wrapper_reports_it_did` gives the wrapper a stderr that
+/// is permanently full, which is the right shape for proving the relay is not delayed by a
+/// diagnostic and the wrong shape for reading the diagnostic back — so it witnesses the relay
+/// and this witnesses the report. Neither test covers both, which is what codex-spec (round 4)
+/// found.
+///
+/// A file for stderr, so the reporter's write always completes and `drain_reports` has something
+/// to wait for. That is the part the reporter thread exists for and the part a detached thread
+/// got wrong: a forwarded signal that promptly ends the child could otherwise end the wrapper
+/// before the line was ever written.
+///
+/// The child's exit is delayed until after the wrapper's own outcome is decided, so the wrapper's
+/// exit races the reporter rather than following it. A child that ended instantly would let the
+/// reporter usually win by luck, and `drain_reports` would be untested — measured: with an
+/// instant child, removing the drain from the exit path leaves all 24 tests green
+/// (logs/ws-fix-20c-run-20261004T172918Z.log). `LATE_CHILD` makes the reporter lose by
+/// construction, so the drain is what decides whether the line lands.
+#[test]
+fn the_wrapper_states_what_it_decided_for_each_signal() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = report_file_job(dir.path(), LATE_CHILD);
+    await_file(&dir.path().join("ready"));
+    let wrapper = job.wrapper.id().to_string();
+    for sig in ["-TERM", "-INT"] {
+        let sent = Command::new("kill").args([sig, &wrapper]).status().unwrap();
+        assert!(sent.success(), "kill {sig} on the wrapper");
+        let name = sig.trim_start_matches('-');
+        let log = await_seen(dir.path(), name);
+        assert!(log.contains(name), "the child never got {name}: {log:?}");
+    }
+    release(dir.path());
+    let ended = wait_within(&mut job.wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(ended.code(), Some(0), "wrapper status {ended:?}");
+    // Read AFTER the wrapper ended, so `drain_reports` has had its chance and the line is there
+    // whether the reporter ran early or was flushed on the way out.
+    let stated = std::fs::read_to_string(dir.path().join("wrapper-err")).unwrap_or_default();
+    for name in ["TERM", "INT"] {
+        assert!(
+            stated.contains(&format!("SIG{name} forwarded to the child")),
+            "the wrapper handled SIG{name} without stating the decision: {stated:?}"
+        );
+    }
+}
+
+/// The child `the_wrapper_states_what_it_decided_for_each_signal` runs: `WATCHDOG`, but it
+/// stays alive until `stop` appears instead of only sleeping, so the wrapper's own exit cannot
+/// overtake it and the race the drain exists to win is decided by the drain rather than by luck.
+const LATE_CHILD: &str = r#"WM_DIR="$1"
+note() { printf '%s\n' "$1" >> "$WM_DIR/log"; }
+trap 'note TERM' TERM
+trap 'note INT' INT
+trap 'note QUIT' QUIT
+trap 'note HUP' HUP
+trap 'note USR1' USR1
+printf '%s' "$$" > "$WM_DIR/pid"
+printf 'ready\n' > "$WM_DIR/ready"
+i=0
+while [ "$i" -lt 900 ]; do
+  i=$((i+1))
+  [ -f "$WM_DIR/stop" ] && sleep 0.5 && exit 0
+  sleep 0.05
+done
+exit 9"#;
+
+/// `watchdog_with_file_stderr` over a named child script, so the two harnesses differ only in
+/// the child and not in how the wrapper is started.
+fn report_file_job(dir: &std::path::Path, child: &str) -> Job {
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(child)
+        .arg("sh")
+        .arg(dir.to_str().unwrap());
+    c.env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stderr(std::fs::File::create(dir.join("wrapper-err")).unwrap());
+    Job {
+        wrapper: c.spawn().expect("the wrapper could not start"),
+        dir: dir.to_path_buf(),
+        _stderr_read: None,
+    }
 }
 
 /// The rule that decides the tests above, as one decision with a refusal case on each side

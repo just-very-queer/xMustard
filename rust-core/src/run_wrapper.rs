@@ -32,6 +32,7 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -294,32 +295,87 @@ fn report(sig: i32, relayed: bool) {
     write_best_effort(format!("xmustard run: {} {decision} to the child\n", name_of(sig)));
 }
 
-/// The channel the watcher enqueues reports on; the writer thread is started with it.
-static REPORTS: OnceLock<mpsc::SyncSender<String>> = OnceLock::new();
+/// The channel the watcher enqueues reports on, plus the acknowledgement the drain waits for.
+///
+/// The receiver is behind a `Mutex` because `mpsc::Receiver` is not `Sync` and a `static` must
+/// be. The lock is only ever held for the length of one `recv_timeout`, on the exit path, and
+/// `write_best_effort` never touches it.
+static REPORTS: OnceLock<(mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>)> = OnceLock::new();
+
+/// One line for the reporter to write, and — when `ack` is set — the signal that it did.
+struct Report {
+    line: String,
+    ack: bool,
+}
 
 /// Hands `line` to the reporter thread, never blocking the watcher.
 ///
 /// `try_send` on a bounded channel is what keeps the watcher free: a full queue drops the line
 /// rather than waiting, and a dropped diagnostic costs an operator one line while a blocked
-/// watcher costs a child its next signal. The reporter may sit in a blocked write for as long
+/// watcher costs a child its next signal. The reporter may sit in a blocking write for as long
 /// as the wrapper lives, which is the point — it is a thread nobody is waiting on.
 fn write_best_effort(line: String) {
-    let sender = REPORTS.get_or_init(|| {
-        let (tx, rx) = mpsc::sync_channel::<String>(REPORT_QUEUE);
-        thread::spawn(move || {
-            for line in rx {
-                let _ = io::stderr().write_all(line.as_bytes());
+    let (sender, _) = REPORTS.get_or_init(spawn_reporter);
+    let _ = sender.try_send(Report { line, ack: false });
+}
+
+/// Starts the reporter thread and returns the two ends the watcher needs.
+fn spawn_reporter() -> (mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>) {
+    let (tx, rx) = mpsc::sync_channel::<Report>(REPORT_QUEUE);
+    let (ack_tx, ack_rx) = mpsc::channel::<()>();
+    thread::spawn(move || {
+        for report in rx {
+            let _ = io::stderr().write_all(report.line.as_bytes());
+            if report.ack {
+                // Sent only after the write above returned, so a received ack means the line
+                // has already been handed to stderr.
+                let _ = ack_tx.send(());
             }
-        });
-        tx
+        }
     });
-    let _ = sender.try_send(line);
+    (tx, Mutex::new(ack_rx))
+}
+
+/// Waits for the reporter to write what is already queued, up to `REPORT_DRAIN`.
+///
+/// A spawned thread is detached, so a forwarded signal that promptly ends the child could end
+/// the wrapper before the reporter ever ran, and the decision this row promises to state would
+/// go missing exactly when it matters most (codex-spec, round 4). An empty line with `ack` set
+/// goes to the back of the queue, so receiving the ack means everything queued before it has
+/// been written.
+///
+/// Bounded, because the reporter may itself be parked in a write to a stderr nobody drains and
+/// the wrapper's own outcome must not wait on that: this narrows the gap to "stderr itself is
+/// stuck", which is what the report is for.
+fn drain_reports() {
+    let Some((sender, ack)) = REPORTS.get() else {
+        return;
+    };
+    if sender
+        .try_send(Report {
+            line: String::new(),
+            ack: true,
+        })
+        .is_err()
+    {
+        return;
+    }
+    // A poisoned lock would mean an earlier drain panicked, which this path cannot do; taking
+    // the inner value is cheaper than a second failure mode at the wrapper's exit.
+    if let Ok(received) = ack.lock() {
+        let _ = received.recv_timeout(REPORT_DRAIN);
+    }
 }
 
 /// How many reports may be waiting before the queue drops the newest. Bounded so a watcher
 /// cannot grow memory against a stderr nobody drains; deep enough that a burst of signals all
 /// get their line.
 const REPORT_QUEUE: usize = 32;
+
+/// How long the wrapper waits for queued reports on its way out. Long enough for a write to a
+/// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
+const REPORT_DRAIN: Duration = Duration::from_millis(50);
+
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
 /// reaches it too. `false` on any error (the child is gone, or its group cannot be read):
@@ -586,6 +642,9 @@ fn exit_of(status: ExitStatus) -> ChildExit {
 /// not restore the previous disposition, so a signal sent here after `Forwarder::stop` would
 /// find this process's handler still in place and do nothing.
 pub fn end_like(exit: ChildExit) -> i32 {
+    // Before anything that ends the process, so a queued decision report is written before the
+    // wrapper's outcome is decided (codex-spec, round 4). Bounded inside.
+    drain_reports();
     match exit {
         ChildExit::Code(c) => c,
         ChildExit::Signal(n) => {
