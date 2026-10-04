@@ -108,10 +108,12 @@ const searchQueryArgs: readonly string[] = [
 // explainQueryArgs is explainQueryArgs in tool_explain.go.
 const explainQueryArgs: readonly string[] = ["path", "symbol", "uid", "depth", "chain_depth", "include_content"];
 // impactQuery is impactQuery in tool_impact.go: every impact argument in the order the
-// API receives it.
+// API receives it. cursor= (WS-59e) is in the table so every declared argument is
+// forwarded by it; the budget layer does not page impact's tiers.
 const impactQuery: readonly string[] = [
 	"path", "symbol", "from", "to", "direction", "scope", "base", "head", "worktree",
 	"relation_types", "min_confidence", "include_tests", "max_depth", "limit", "offset", "summary_only", "timeout_ms",
+	"cursor",
 ];
 
 // How one member of a JSON request body travels: as the string the argument carries, as a
@@ -178,8 +180,9 @@ function bodyOf(a: ToolArgs, members: readonly BodyMember[]): Record<string, unk
 
 // rememberBody is rememberTool.Build's payload in sorted order (tool_remember.go).
 const rememberBody: readonly BodyMember[] = [
-	["base_revision", "number"], ["claims", "claims"], ["content", "string"], ["description", "string"],
-	["entry_id", "string"], ["evidence", "list"], ["expires", "string"], ["kind", "string"],
+	["base_revision", "number"], ["claims", "claims"], ["content", "string"], ["decision", "string"],
+	["description", "string"],
+	["entry_id", "string"], ["evidence", "list"], ["expires", "string"], ["job_id", "string"], ["kind", "string"],
 	["new_string", "string"], ["old_string", "string"], ["op", "string"], ["paths", "list"],
 	["reason", "string"], ["relations", "relations"], ["run_id", "string"], ["session_id", "string"],
 	["supersedes", "list"], ["tags", "list"], ["tier", "string"], ["title", "string"], ["topic", "string"],
@@ -340,7 +343,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 		// claim surface. Every member travels in the JSON body under its own name, as
 		// Go's Build sends it.
 		advanced: [
-			{ name: "op", type: "string", enum: ["propose", "supersede", "edit", "retire", "restore", "tier"], desc: "default propose" },
+			{ name: "op", type: "string", enum: ["propose", "supersede", "edit", "retire", "restore", "tier", "job"], desc: "default propose" },
 			{ name: "entry_id", type: "string", desc: "target of edit/retire/restore/tier" },
 			{ name: "base_revision", type: "integer", minimum: 1, maximum: 1073741824, desc: "edit: revision read (CAS)" },
 			{ name: "reason", type: "string", maxLength: 1000, desc: "required unless proposing" },
@@ -350,6 +353,8 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "supersedes", type: "string", maxLength: 1024, desc: "entries this replaces" },
 			{ name: "expires", type: "string", desc: "last UTC date served (YYYY-MM-DD)" },
 			{ name: "evidence", type: "string", maxLength: 1024, desc: "evidence handles it rests on" },
+			{ name: "job_id", type: "string", desc: "op=job: the job answered" },
+			{ name: "decision", type: "string", maxLength: 1000, desc: "op=job: what you concluded" },
 			{ name: "run_id", type: "string", desc: "run it came from" },
 			{
 				name: "kind",
@@ -421,7 +426,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 			{ name: "depth", type: "integer", minimum: 0, maximum: 3, desc: "mode=symbol: child levels" },
 			{ name: "include_body", type: "boolean", desc: "mode=symbol: add bodies" },
 			{ name: "include_info", type: "boolean", desc: "mode=symbol: add signatures, docs" },
-			{ name: "substring", type: "boolean", desc: "mode=symbol: substring match" },
+			{ name: "substring", type: "boolean", desc: "mode=symbol: substring" },
 		],
 		build: (a) => ({
 			method: "GET",
@@ -464,13 +469,13 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "impact",
 		description:
-			"Blast radius. symbol= (name, Container.name, UID, path) → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since the index baseline.",
+			"Blast radius. symbol= → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since baseline.",
 		args: [
 			workspaceArg,
-			{ name: "symbol", type: "string", desc: "symbol to compute blast radius for" },
+			{ name: "symbol", type: "string", desc: "name, Container.name, UID or path" },
 			{ name: "path", type: "string", maxLength: 4096, desc: "a repo-relative file" },
-			{ name: "from", type: "string", desc: "trace path from this symbol" },
-			{ name: "to", type: "string", desc: "trace path to this symbol" },
+			{ name: "from", type: "string", desc: "trace from here" },
+			{ name: "to", type: "string", desc: "trace to here" },
 			{ name: "max_depth", type: "integer", minimum: 1, maximum: 32, desc: "hops (default 3; path= 4)" },
 		],
 		// impactTool.Advanced in tool_impact.go: the diff scopes, the walk's filters and
@@ -484,18 +489,22 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 				name: "scope",
 				type: "string",
 				enum: ["unstaged", "staged", "all", "workspace", "compare", "commit", "range"],
-				desc: "symbols a diff touches, and their dependents",
+				desc: "symbols a diff touches, and dependents",
 			},
-			{ name: "base", type: "string", maxLength: 256, desc: "scope=compare|range: base revision" },
-			{ name: "head", type: "string", maxLength: 256, desc: "scope=compare|commit|range: head revision" },
-			{ name: "worktree", type: "string", maxLength: MAX_PATH_ARG, desc: "another checkout of this repository to diff" },
-			{ name: "relation_types", type: "string", maxLength: 128, desc: "edge kinds to walk (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)" },
+			{ name: "base", type: "string", maxLength: 256, desc: "scope=compare|range: base" },
+			{ name: "head", type: "string", maxLength: 256, desc: "scope=compare|commit|range: head" },
+			{ name: "worktree", type: "string", maxLength: MAX_PATH_ARG, desc: "another checkout to diff" },
+			{ name: "relation_types", type: "string", maxLength: 128, desc: "edge kinds (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)" },
 			{ name: "min_confidence", type: "number", minimum: 0, maximum: 1, desc: "skip edges below this confidence" },
 			{ name: "include_tests", type: "boolean", desc: "walk test files (default false)" },
 			{ name: "limit", type: "integer", minimum: 1, maximum: BUDGET_MAX_LIMIT, desc: "items per depth tier (default 50)" },
-			{ name: "offset", type: "integer", minimum: 0, maximum: 50000, desc: "items skipped per depth tier" },
-			{ name: "summary_only", type: "boolean", desc: "counts, risk and envelope without items" },
+			{ name: "offset", type: "integer", minimum: 0, maximum: 50000, desc: "items skipped per tier" },
+			{ name: "summary_only", type: "boolean", desc: "counts, risk, no items" },
 			{ name: "timeout_ms", type: "integer", minimum: 1, maximum: 60000, desc: "walk budget (default 10000)" },
+			// WS-59e: the tier cursor, Advanced like the rest and documented at
+			// xmustard://docs/tools. The budget layer does not page impact's tiers, so
+			// it is declared here rather than coming from maxCharsArg's set.
+			{ name: "cursor", type: "string", maxLength: 64, desc: "next_cursor of the previous page" },
 		],
 		build: (a) => ({
 			method: "GET",

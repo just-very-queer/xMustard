@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::symbolgraph::SourceReadFailure;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RustEvidenceRef {
     pub path: String,
@@ -34,11 +36,31 @@ struct SignalRule {
     patterns: Vec<Regex>,
 }
 
-pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, std::io::Error> {
+/// Files and bytes one signal scan reads (PAR-RT-11): the index envelope's default file
+/// count, and the identity's byte budget. The walk is in name order, so the cut is the
+/// same on every run.
+pub const MAX_SIGNAL_FILES: usize = crate::index::config::DEFAULT_MAX_FILES;
+pub const MAX_SIGNAL_BYTES: usize = 64 << 20;
+
+/// One signal scan: the signals found, the files read, and whether a bound stopped the
+/// walk before every scannable file was read (and which).
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SignalScan {
+    pub signals: Vec<RustDiscoverySignal>,
+    pub files_read: usize,
+    pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+pub fn scan_repo_signals(root_path: &Path) -> Result<SignalScan, std::io::Error> {
     let mut deduped: BTreeMap<String, RustDiscoverySignal> = BTreeMap::new();
     let rules = signal_rules();
+    let (mut files_read, mut bytes_read) = (0usize, 0usize);
+    let mut reason = None;
 
     let walker = WalkDir::new(root_path)
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(|entry| !should_skip_entry(root_path, entry));
 
@@ -50,6 +72,7 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, s
         if !entry.file_type().is_file() {
             continue;
         }
+        crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
         let relative = match relative_path(root_path, entry.path()) {
             Some(value) => value,
             None => continue,
@@ -57,12 +80,36 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, s
         if !should_scan_file(&relative) {
             continue;
         }
-        // shared bounded, no-follow, regular-file-checked reader: over-cap, symlinked,
-        // non-UTF-8 or vanished files are skipped rather than read raw.
-        let content = match crate::symbolgraph::read_repo_file_beneath(root_path, &relative) {
-            Ok(content) => content,
-            Err(_) => continue,
+        if files_read >= MAX_SIGNAL_FILES {
+            reason = Some(format!(
+                "read {files_read} files, the scan's file bound ({MAX_SIGNAL_FILES}); later files by name were not scanned"
+            ));
+            break;
+        }
+        // shared bounded, no-follow, regular-file-checked reader, capped at what is
+        // left of the byte bound: a file is sized before it is read, so the scan never
+        // reads past MAX_SIGNAL_BYTES. Over-cap, symlinked, non-UTF-8 or vanished files
+        // are skipped rather than read raw.
+        let left = (MAX_SIGNAL_BYTES - bytes_read) as u64;
+        let read = crate::symbolgraph::read_source_beneath(
+            root_path,
+            Path::new(&relative),
+            crate::symbolgraph::MAX_REPO_FILE_BYTES.min(left),
+        );
+        let content = match read.map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            Err(SourceReadFailure::Oversized(n))
+                if n <= crate::symbolgraph::MAX_REPO_FILE_BYTES =>
+            {
+                reason = Some(format!(
+                    "read {bytes_read} bytes; the next file ({n} bytes) passes the scan's byte bound ({MAX_SIGNAL_BYTES}); later files by name were not scanned"
+                ));
+                break;
+            }
+            _ => continue,
         };
+        files_read += 1;
+        bytes_read += content.len();
         for (index, line) in content.lines().enumerate() {
             let line_number = index + 1;
             for rule in &rules {
@@ -104,7 +151,12 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<Vec<RustDiscoverySignal>, s
             .then(left.file_path.cmp(&right.file_path))
             .then(left.line.cmp(&right.line))
     });
-    Ok(signals)
+    Ok(SignalScan {
+        signals,
+        files_read,
+        truncated: reason.is_some(),
+        reason,
+    })
 }
 
 fn signal_rules() -> Vec<SignalRule> {
@@ -220,7 +272,7 @@ mod tests {
         let dir = tempfile::TempDir::new().unwrap();
         fs::write(dir.path().join(" lead.py"), "# TODO real marker\n").unwrap();
         fs::write(dir.path().join("lead.py"), "x = 1\n").unwrap();
-        let signals = scan_repo_signals(dir.path()).unwrap();
+        let signals = scan_repo_signals(dir.path()).unwrap().signals;
         assert!(
             signals.iter().any(|s| s.file_path == " lead.py"),
             "whitespace-named file skipped or read as its trimmed decoy: {signals:?}"
@@ -237,12 +289,32 @@ mod tests {
         );
         fs::write(dir.path().join("big.py"), body).unwrap();
         fs::write(dir.path().join("small.py"), "# TODO small marker\n").unwrap();
-        let signals = scan_repo_signals(dir.path()).unwrap();
+        let signals = scan_repo_signals(dir.path()).unwrap().signals;
         assert!(signals.iter().any(|s| s.file_path == "small.py"));
         assert!(
             !signals.iter().any(|s| s.file_path == "big.py"),
             "an over-cap file was read without the shared bound"
         );
+    }
+
+    /// Nine 8,000,000-byte files: eight fit the 64 MiB byte bound, the ninth does not
+    /// and is never read.
+    #[test]
+    fn the_byte_bound_stops_before_a_file_that_does_not_fit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..9 {
+            let mut body = b"raise NotImplementedError()\n".to_vec();
+            body.resize(8_000_000, b' ');
+            fs::write(dir.path().join(format!("f{i}.py")), body).unwrap();
+        }
+        let scan = scan_repo_signals(dir.path()).unwrap();
+        assert_eq!((scan.files_read, scan.truncated), (8, true), "{scan:?}");
+        assert!(
+            scan.reason.as_deref().unwrap().contains("byte bound"),
+            "{:?}",
+            scan.reason
+        );
+        assert!(!scan.signals.iter().any(|s| s.file_path == "f8.py"));
     }
 
     #[test]
@@ -265,7 +337,7 @@ mod tests {
             "- TODO: documentation note\n",
         );
 
-        let signals = scan_repo_signals(root).unwrap();
+        let signals = scan_repo_signals(root).unwrap().signals;
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].file_path, "src/app.py");
         assert_eq!(signals[0].kind, "annotation");
@@ -298,7 +370,7 @@ mod tests {
             ),
         );
 
-        let signals = scan_repo_signals(root).unwrap();
+        let signals = scan_repo_signals(root).unwrap().signals;
         let observed: Vec<(String, String, usize)> = signals
             .into_iter()
             .map(|signal| (signal.kind, signal.file_path, signal.line))

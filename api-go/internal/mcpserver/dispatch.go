@@ -55,21 +55,87 @@ func (s *Session) callTool(ctx context.Context, params json.RawMessage) (any, *R
 	return res, nil
 }
 
+// readOnlyRefusal is the message a read-only connection owes a tool, "" when the
+// connection serves it. It is the one place the rule is written, because two surfaces
+// apply it and a resource read must refuse exactly as a named call does: callKnownTool
+// returns it as a plain tool result, and resourceToolRefusal returns it marked.
+func readOnlyRefusal(readOnly bool, t *Tool, args map[string]string) string {
+	if !readOnly {
+		return ""
+	}
+	if !t.servesReads() {
+		return fmt.Sprintf("tool %s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly)
+	}
+	if t.writes(args) {
+		return fmt.Sprintf("tool %s is served on a read-only connection (mode=%s) only without %s, which write",
+			t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", "))
+	}
+	return ""
+}
+
+// resourceToolRefusal reports the refusal a read-only connection owes a tool a
+// resource read stands for, or nil when the connection serves it. It is readOnlyRefusal's
+// rule and message, marked so a resource can tell its refusal from a refused API call and
+// surface it as the tool result it is. Without the marker the two are indistinguishable and
+// one of them has to be mislabelled. The return is any, not map[string]any, so the shape is
+// a property a test can observe rather than a property of the signature.
+func resourceToolRefusal(readOnly bool, t *Tool, args map[string]string) any {
+	text := readOnlyRefusal(readOnly, t, args)
+	if text == "" {
+		return nil
+	}
+	return markedRefusal(text)
+}
+
+// readOnlyRefusalMeta marks a refusal the read-only gate produced, so a resource can
+// tell it from a refused API call and surface it as the tool result it is. Without the
+// marker the two are indistinguishable and one of them has to be mislabelled.
+const readOnlyRefusalMeta = "xmustard/refused_read_only"
+
+// markedRefusal adds the marker to a refusal tool result.
+func markedRefusal(text string) map[string]any {
+	res := TextResult(text, true)
+	res["_meta"] = map[string]any{readOnlyRefusalMeta: true}
+	return res
+}
+
+// refusalMessage is the message of a refusal tool result, for a resource that reports
+// the refusal in its own error shape. (internal/rustcore's refusalText is unrelated: it
+// trims a subprocess's stderr, and the two are in different packages.)
+func refusalMessage(res map[string]any) string {
+	content, _ := res["content"].([]map[string]any)
+	if len(content) == 0 {
+		return ""
+	}
+	s, _ := content[0]["text"].(string)
+	return s
+}
+
+// serveResourceTool runs a tool a resource read stands for, refusing it on a read-only
+// connection first. RunTool alone would skip that gate, so a resource read would be a
+// way around the mode.
+func (s *Session) serveResourceTool(ctx context.Context, t *Tool, args map[string]string) (map[string]any, *RPCError) {
+	if refused := resourceToolRefusal(s.srv.opts.ReadOnly, t, args); refused != nil {
+		res, _ := refused.(map[string]any)
+		return res, nil
+	}
+	return s.RunTool(ctx, t, args, nil)
+}
+
 // callKnownTool refuses a write on a read-only connection (a write tool before its
 // arguments are read, a writing call of a reading tool after), validates (with the
 // toolcompat repair fallback) and runs the call. It returns how many arguments were
 // normalized, for usage accounting.
 func (s *Session) callKnownTool(ctx context.Context, t *Tool, raw map[string]any) (map[string]any, int, *RPCError) {
 	if s.srv.opts.ReadOnly && !t.servesReads() {
-		return TextResult(fmt.Sprintf("tool %s is not served on a read-only connection (mode=%s); it changes shared memory", t.Name, ModeReadOnly), true), 0, nil
+		return TextResult(readOnlyRefusal(true, t, nil), true), 0, nil
 	}
 	args, norms, aerr := buildArgsCompat(t, raw)
 	if aerr != nil {
 		return argErrorResult(t, aerr), 0, nil
 	}
-	if s.srv.opts.ReadOnly && t.writes(args) {
-		return TextResult(fmt.Sprintf("tool %s is served on a read-only connection (mode=%s) only without %s, which write",
-			t.Name, ModeReadOnly, strings.Join(t.WriteArgs, ", ")), true), 0, nil
+	if text := readOnlyRefusal(s.srv.opts.ReadOnly, t, args); text != "" {
+		return TextResult(text, true), 0, nil
 	}
 	res, rerr := s.runTool(ctx, t, args, norms)
 	return res, len(norms), rerr

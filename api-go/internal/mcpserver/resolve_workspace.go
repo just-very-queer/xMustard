@@ -1,6 +1,7 @@
 package mcpserver
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -11,9 +12,11 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"xmustard/api-go/internal/budget"
 )
@@ -53,9 +56,16 @@ func (w Workspace) echo() string {
 const (
 	// rootsTimeout bounds how long a tool call waits for the client's roots/list answer.
 	rootsTimeout = 5 * time.Second
-	// rootsRetryAfter is how long calls skip roots/list after a timed-out one, so a
-	// client that never answers does not cost every call rootsTimeout.
-	rootsRetryAfter = 15 * time.Second
+	// A failed roots/list is not asked again inside these windows, so a client
+	// that never answers does not cost every call a request. A timeout waits
+	// longer than a prompt failure: it already cost the caller rootsTimeout.
+	rootsRetryAfter        = 15 * time.Second
+	rootsRetryAfterFailure = time.Second
+	// rootsErrClip bounds a cached roots/list failure text. A failure is kept for
+	// the session even when it has no back-off window, and the client's message
+	// can be as large as one transport message (8 MiB by default), so it is clipped
+	// before it is stored.
+	rootsErrClip = 200
 	// listingMissRefresh is how old the cached listing must be before a workspace id
 	// missing from it triggers a re-read (to learn the root of a new workspace).
 	listingMissRefresh = 10 * time.Second
@@ -66,7 +76,8 @@ const (
 
 // rootsState is the session's view of the client's roots. A definitive answer (the
 // roots, an answer with no file roots, or method-not-found) is kept until
-// roots/list_changed; a failed or timed-out request is transient and asked again.
+// roots/list_changed; a failed or timed-out request is transient and asked again,
+// but not before retryAt.
 type rootsState struct {
 	paths     []string
 	err       string    // why the client's roots are unusable, for the resolution error
@@ -141,10 +152,11 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 		tried = append(tried, rootsWhy)
 	}
 	// While the client's roots are unknown (its roots/list failed), the working
-	// directory may still select a registered workspace, but it never registers one:
-	// the roots the client declared may name a different repository.
+	// directory may still select a registered workspace, but it registers one only when
+	// the operator opted in: the roots the client declared may name a different
+	// repository.
 	cwdRegister := ""
-	if rootsUnknown {
+	if rootsUnknown && !s.srv.opts.RegisterCwdWhenRootsUnknown {
 		cwdRegister = "not auto-registered while the client's roots are unavailable"
 	}
 	if cwd := s.srv.opts.Cwd; cwd != "" {
@@ -204,31 +216,61 @@ func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string
 		s.mu.Unlock()
 		return ws
 	}
+	// A cwd signal that registers is asked for the working directory's OWN repository. If
+	// that repository sits inside an already-registered workspace, the ancestor match below
+	// would win and the registration would never happen, which is the one case the
+	// WS-FIX-15b opt-in exists for, so ownRepo pins the signal to its own repository. Every
+	// other signal keeps the ancestor match, and a cwd whose repository IS the ancestor is
+	// unaffected (the two roots are then equal).
+	ownRepo := ""
+	if source == SourceCWD && s.srv.opts.RegisterCwdWhenRootsUnknown {
+		ownRepo = repoRoot(p)
+	}
 	for refresh := false; ; refresh = true {
 		list, fresh, err := s.listWorkspaces(ctx, refresh)
 		if err != nil {
 			return Workspace{}, err
 		}
-		if w, ok := match(list, p); ok {
+		if w, ok := match(list, p); ok && !(ownRepo != "" && canonicalPath(w.Root) != ownRepo) {
 			return remember(Workspace{ID: w.ID, Root: w.Root, Source: source}), nil
 		}
 		if fresh { // a miss on a just-read listing is final
 			break
 		}
 	}
-	repo := repoRoot(p)
+	repo := ownRepo
+	if repo == "" {
+		repo = repoRoot(p)
+	}
+	// With the cwd pinned to its own repository, a registration refused above would
+	// otherwise fail a cwd that a registered ancestor already contains. A registered
+	// ancestor stays the caller's answer on every refusal below, so it is offered
+	// rather than lost.
+	ancestor := func(err error) (Workspace, error) {
+		if ownRepo == "" {
+			return Workspace{}, err
+		}
+		list, _, lerr := s.listWorkspaces(ctx, false)
+		if lerr != nil {
+			return Workspace{}, err
+		}
+		if w, ok := match(list, p); ok {
+			return remember(Workspace{ID: w.ID, Root: w.Root, Source: source}), nil
+		}
+		return Workspace{}, err
+	}
 	switch {
 	case repo == "":
 		return Workspace{}, errors.New("not inside a registered workspace or a git repository")
 	case repo == "/" || (s.srv.opts.HomeDir != "" && repo == canonicalPath(s.srv.opts.HomeDir)):
-		return Workspace{}, fmt.Errorf("git repository %s is not registered, and a home or root directory is never auto-registered", repo)
+		return ancestor(fmt.Errorf("git repository %s is not registered, and a home or root directory is never auto-registered", repo))
 	case noRegister != "":
-		return Workspace{}, fmt.Errorf("git repository %s is not registered (%s)", repo, noRegister)
+		return ancestor(fmt.Errorf("git repository %s is not registered (%s)", repo, noRegister))
 	case !s.srv.opts.AutoRegister:
-		return Workspace{}, fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo)
+		return ancestor(fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo))
 	}
 	if err := s.register(ctx, repo); err != nil {
-		return Workspace{}, err
+		return ancestor(err)
 	}
 	list, _, err := s.listWorkspaces(ctx, true)
 	if err != nil {
@@ -334,6 +376,51 @@ func (s *Session) rootFor(ctx context.Context, id string) string {
 	return ""
 }
 
+// rootsBackoff is how long roots/list is not asked again after a failure, or zero
+// when it is asked again on the next call. timedOut is a failure that already cost
+// the caller rootsTimeout. followedFailure reports that this failure came after one
+// already cached, so it is the second in a row.
+//
+// A timeout backs off after one attempt because it already cost the caller
+// rootsTimeout. A prompt failure backs off once it has failed twice in a row, so a
+// client that fails once still recovers on the very next call. Both classes of
+// failure go through here, so they cannot drift apart.
+func rootsBackoff(cached *rootsState, timedOut bool) time.Duration {
+	switch {
+	case timedOut:
+		return rootsRetryAfter
+	case cached != nil && cached.transient:
+		return rootsRetryAfterFailure
+	}
+	return 0
+}
+
+// backOff opens the retry window rootsBackoff names, if any, and states it in the
+// error, so every failure class shares one window rule and one wording.
+func (st *rootsState) backOff(cached *rootsState, timedOut bool) {
+	if after := rootsBackoff(cached, timedOut); after > 0 {
+		st.retryAt = time.Now().Add(after)
+		st.err += fmt.Sprintf(" (asked again after %s)", after)
+	}
+}
+
+// unsentRootCause reports a roots/list request that was never delivered, so the
+// client's answer says nothing about its roots and nothing about its health. On a
+// Streamable HTTP session a plain JSON exchange has no event stream to ask on, and
+// every such call fails this way; treating that as a client failure would let two
+// streamless calls open a window that suppresses the next stream-capable call, which
+// would then resolve from the server's working directory instead of the client's
+// root. A stream write that fails is the same case. Such a failure is not cached.
+func unsentRootCause(err error) bool {
+	return errors.Is(err, errNotSent)
+}
+
+// isJSONArray reports whether raw is a JSON array (leading whitespace allowed).
+func isJSONArray(raw json.RawMessage) bool {
+	trimmed := bytes.TrimLeft(raw, " \t\r\n")
+	return len(trimmed) > 0 && trimmed[0] == '['
+}
+
 func rootOf(list []registeredWorkspace, id string) string {
 	for _, w := range list {
 		if w.ID == id {
@@ -346,7 +433,8 @@ func rootOf(list []registeredWorkspace, id string) string {
 // clientRoots returns the client's filesystem roots (roots/list), or why there are
 // none. unknown reports that the request failed, so the client's roots are unknown
 // rather than absent. Definitive answers are cached until roots/list_changed; a
-// failure is asked again on a later call (after rootsRetryAfter when it timed out).
+// failure is asked again on a later call, after rootsRetryAfterFailure when it has
+// failed twice in a row and after rootsRetryAfter when it timed out.
 func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, unknown bool) {
 	s.mu.Lock()
 	supported, ready, cached, gen := s.rootsCap, s.initialized, s.roots, s.rootsGen
@@ -370,11 +458,18 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 	case err != nil && errors.As(err, &rpcErr) && rpcErr.Code == CodeMethodNotFound:
 		st.err = "the client does not implement roots/list"
 	case err != nil:
-		st.err, st.transient = "roots/list failed: "+err.Error(), true
-		if errors.Is(err, context.DeadlineExceeded) {
-			st.retryAt = time.Now().Add(rootsRetryAfter)
-			st.err += fmt.Sprintf(" (asked again after %s)", rootsRetryAfter)
+		// The request was never delivered, so the client's roots are unknown for this
+		// call and nothing is kept: caching it would suppress the next request that
+		// could have carried an answer.
+		if unsentRootCause(err) {
+			return nil, "roots/list failed: " + err.Error(), true
 		}
+		// A failure is now kept even without a window, so its text outlives the call
+		// and is held for the session. The client's message can be as large as one
+		// transport message (8 MiB by default), so it is clipped before it is stored
+		// rather than after it is reported.
+		st.err, st.transient = "roots/list failed: "+clip(err.Error(), rootsErrClip), true
+		st.backOff(cached, errors.Is(err, context.DeadlineExceeded))
 	default:
 		var r struct {
 			Roots []struct {
@@ -382,7 +477,25 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			} `json:"roots"`
 		}
 		if err := json.Unmarshal(raw, &r); err != nil {
-			st.err = "roots/list answer is malformed: " + err.Error()
+			// The client answered, but the answer cannot be read: transient, so it is
+			// asked again rather than cached as "the client has no usable roots". The
+			// decoder fills array elements before it reports a later type error, so a
+			// rejected answer can still hold usable roots; r is not walked, which drops
+			// them.
+			st.err, st.transient = "roots/list answer is malformed: "+clip(err.Error(), rootsErrClip), true
+			st.backOff(cached, false)
+			break
+		}
+		// Every root must carry a uri; [null] and [{}] decode cleanly but describe
+		// nothing, so they are malformed rather than a definitive "no roots".
+		if slices.ContainsFunc(r.Roots, func(root struct {
+			URI string `json:"uri"`
+		}) bool {
+			return root.URI == ""
+		}) {
+			st.err, st.transient = "roots/list answer is malformed: a root carries no uri", true
+			st.backOff(cached, false)
+			break
 		}
 		for _, root := range r.Roots {
 			if u, err := url.Parse(root.URI); err == nil && u.Scheme == "file" && filepath.IsAbs(u.Path) {
@@ -390,13 +503,27 @@ func (s *Session) clientRoots(ctx context.Context) (paths []string, why string, 
 			}
 		}
 		if len(st.paths) == 0 && st.err == "" {
+			// An answer with no roots array at all ({} or {"roots":null}) decodes
+			// cleanly but does not carry the field the request asked for, so it is
+			// not a statement about the client's roots; caching it would hide a
+			// client that has them until roots/list_changed.
+			// Only a JSON array is a statement; a missing field and null are failures,
+			// and a repeated one backs off like any other client failure.
+			var shape struct {
+				Roots json.RawMessage `json:"roots"`
+			}
+			if json.Unmarshal(raw, &shape) != nil || !isJSONArray(shape.Roots) {
+				st.err, st.transient = "roots/list answer carries no roots array", true
+				st.backOff(cached, false)
+				break
+			}
 			st.err = "the client listed no file:// roots"
 		}
 	}
 	s.mu.Lock()
 	// An answer overtaken by roots/list_changed (or a new initialize) describes roots
 	// the client has since replaced: use it for this call, but do not keep it.
-	if s.rootsGen == gen && (!st.transient || !st.retryAt.IsZero()) {
+	if s.rootsGen == gen {
 		s.roots = st
 	}
 	s.mu.Unlock()
@@ -526,6 +653,9 @@ func clip(s string, n int) string {
 	s = strings.TrimSpace(s)
 	if len(s) <= n {
 		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n-- // back off to the start of the rune at n, so no sequence is split
 	}
 	return s[:n] + "…"
 }

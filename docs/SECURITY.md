@@ -375,6 +375,7 @@ gate and registers any directory.
 | why_failed command mode | `XMUSTARD_WHY_FAILED_COMMANDS=1` (default `0`: off on every bind, loopback included) | Read at startup. On, `why_failed` with `command` runs a test, build or lint command for an authenticated `admin` only; off, every command answers `403 commands_disabled`. Enabled command mode is trusted execution of the repository's code on the server host by admin credentials; the program allow-list is not a sandbox ([Commands why_failed runs](#commands-why_failed-runs-ws-21)). Logs and evidence handles are explained either way. Anything but `0` or `1` stops startup. |
 | Registration roots | `XMUSTARD_REGISTER_ROOTS=/srv/checkouts:/home/ci/src` (OS path list: `:` on Unix, `;` on Windows) | Where a non-admin token may register a git work tree. Empty (the default) means only `admin` registers. Each entry must be an absolute path and not a filesystem root, or the API stops at startup. See [Workspace registration](#workspace-registration). |
 | Registration limit | `XMUSTARD_REGISTER_LIMIT=50` (the default) | How many workspaces one non-admin principal may register. A load over the limit answers `403 registration_not_allowed`, refusal `register_limit`. Anything but a positive integer stops startup. |
+| cwd registration while the client's roots are unknown | `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1` (default off) | Read by the stdio MCP shim (`api-go/cmd/xmustard-mcp/main.go`), the only transport with a working directory. While the client's `roots/list` is unknown (it failed, backed off, or was never delivered) the working directory selects a registered workspace but does not register one, because the roots the client declared may name a different repository. On, the working directory's own enclosing git repository is registered and indexed through `POST /api/workspaces/load` like any other auto-registration, and the caller is still bound by its role, `XMUSTARD_REGISTER_ROOTS` and `XMUSTARD_REGISTER_LIMIT`. Off is the default, and `XMUSTARD_MCP_AUTO_REGISTER=0` refuses the registration whichever way this is set. Only `1` enables it; any other value, including unset, leaves it off. The `/mcp` endpoint has no working directory, so the variable does nothing there. See [Workspace registration](#workspace-registration). |
 
 Every `{wildcard}` in a route is checked before the handler runs. Values are read
 from the escaped path and decoded per segment, as `ServeMux` reads them, so an
@@ -417,6 +418,16 @@ unregistered git repository, on the `/mcp` endpoint and in the stdio shim alike
 `XMUSTARD_MCP_AUTO_REGISTER=0` turns it off), with the agent's own token. The code is
 `api-go/cmd/xmustard-api/workspace_register.go` (the HTTP policy) and
 `api-go/internal/workspaceops/register_roots.go` (the path checks).
+
+One case is narrower by default. While the client's `roots/list` is unknown (it
+failed, backed off, or was never delivered) the working directory still selects a
+registered workspace, but it does not register one: the roots the client declared
+may name a different repository. `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1`
+registers the working directory's own enclosing git repository in exactly that case,
+in the stdio shim (the `/mcp` endpoint has no working directory), and the table above
+still decides whether the caller's token may do it. The registration is the same
+`POST /api/workspaces/load` as any other, so it is the same scan and the same
+accounting; turning it on means trusting the server's working directory.
 
 | Caller | May register |
 |---|---|
@@ -887,6 +898,17 @@ below.
   given only when the answer that carries its frame, or the note that withheld it, was
   written. A memory that does not fit in the ~10,000-character context left is counted
   in the withheld note as `too_large`, with the `recall` call that shows it.
+- **A disabled `recall` disables pushed memory too.** A hook route names no `Tool` in the
+  gate table below, because naming one would make the route answer `403 tool_disabled`
+  and take `watchPaths`, the restored snapshot and the prior session's handoff away with
+  the memories. So the handler applies the switch itself, at the two places a hook
+  injects memory: the standing-memory projection and ground's memory section on
+  SessionStart and SubagentStart, and every candidate a UserPromptSubmit or PreToolUse
+  event pushes. It asks the same predicate `/api/auth/whoami` and `tools/list` ask, so a
+  hook can never reach memory a `recall` call would be refused, and it fails closed: no
+  frame, and no withheld note naming which memories the agent is not being shown. The
+  hook still answers, with its watch list, its restored session state and its run
+  failures (a failed run is an outcome, not memory).
 - **Processes.** The daemon starts no process for a hook: Rust work runs only on a
   resident worker that is already running. Claude Code itself starts the static client
   once per event for the two command hooks, SessionStart and WorktreeRemove; every
@@ -1102,7 +1124,7 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `GET /api/workspaces/{workspace_id}/evidence/{handle}` | core | reader | served |  | issuer-bound expansion |
 | `GET /api/workspaces/{workspace_id}/explain-path` | core | reader | served | explain |  |
 | `POST /api/workspaces/{workspace_id}/index` | core | indexer | refused |  | rebaseline the index; agents cannot reset it |
-| `GET /api/workspaces/{workspace_id}/memory/core` | core | reader | served |  | standing-memory projection: human-approved core tier and the deferred index |
+| `GET /api/workspaces/{workspace_id}/memory/core` | core | reader | served | recall | standing-memory projection: human-approved core tier and the deferred index; recall's gate row, so a deployment that disables recall serves neither |
 | `GET /api/workspaces/{workspace_id}/outcomes` | core | reader | served |  | run-independent outcomes, newest first; reads only |
 | `DELETE /api/workspaces/{workspace_id}/outcomes/{outcome_id}` | core | admin | refused |  | removes one outcome (a secret the redactor missed in its command or tail) |
 | `GET /api/workspaces/{workspace_id}/runs/{run_id}/why-failed` | core | reader | served | why_failed |  |

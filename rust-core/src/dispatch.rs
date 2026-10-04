@@ -102,6 +102,16 @@ impl Command {
     }
 }
 
+/// Run `command` inside a pass-counting call (`passcount`): a JSON object result gains
+/// a trailing `pass_counters` object holding what this call counted.
+pub fn run_counted(command: &Command, args: Args) -> CmdResult {
+    let call = crate::passcount::Call::begin();
+    match (command.run)(args)? {
+        Output::Json(body) => Ok(Output::Json(crate::passcount::attach(body, &call.counts()))),
+        other => Ok(other),
+    }
+}
+
 /// The table entry named `name`.
 pub fn find<'a>(table: &'a [Command], name: &str) -> Option<&'a Command> {
     table.iter().find(|c| c.name == name)

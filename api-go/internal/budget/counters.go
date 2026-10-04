@@ -6,9 +6,10 @@ import "sync/atomic"
 // and cost one atomic add per event. They count what THIS process did: the children it
 // spawned, the content it hashed (request bodies, tool results and file contents; short
 // fingerprints over ids and metadata are not counted), and the tool results it
-// captured. Work done inside a child is not visible here (a Rust core call's own git
-// spawns and file hashing, for example), and neither are agent runs, LSP servers or
-// terminals, which are external processes reported on their own lines.
+// captured. Work done inside a child is not in those counts; the Rust core reports its
+// own per call (git spawns, listings, stats, hashing, loaded rows), and core_passes sums
+// those reports. Agent runs, LSP servers and terminals are external processes reported
+// on their own lines.
 
 // SpawnKind classifies a child process this process started.
 type SpawnKind int
@@ -37,6 +38,47 @@ type dataCounters struct {
 	bytesHashed  atomic.Int64
 	captures     atomic.Int64
 	captureBytes atomic.Int64
+	corePasses   [corePassFields]atomic.Int64
+}
+
+// CorePasses sums the pass counters the Rust core reported per call (WS-RT1): what
+// core calls listed, statted, hashed, spawned and loaded. Calls counts every core result
+// Go read; Counted the ones that carried counters (an array result carries none).
+type CorePasses struct {
+	Calls        int64 `json:"calls"`
+	Counted      int64 `json:"counted"`
+	FilesListed  int64 `json:"files_listed"`
+	FilesStatted int64 `json:"files_statted"`
+	FilesHashed  int64 `json:"files_hashed"`
+	BytesHashed  int64 `json:"bytes_hashed"`
+	GitSpawns    int64 `json:"git_spawns"`
+	RowsLoaded   int64 `json:"rows_loaded"`
+}
+
+const corePassFields = 8
+
+func (p *CorePasses) fields() [corePassFields]*int64 {
+	return [corePassFields]*int64{&p.Calls, &p.Counted, &p.FilesListed, &p.FilesStatted,
+		&p.FilesHashed, &p.BytesHashed, &p.GitSpawns, &p.RowsLoaded}
+}
+
+// Minus is p less an earlier snapshot.
+func (p CorePasses) Minus(earlier CorePasses) CorePasses {
+	out := p
+	of, ef := out.fields(), earlier.fields()
+	for i := range of {
+		*of[i] -= *ef[i]
+	}
+	return out
+}
+
+// NoteCorePasses adds one core call's reported counters (zero when it reported none;
+// set Counted when it did).
+func NoteCorePasses(p CorePasses) {
+	p.Calls = 1
+	for i, f := range p.fields() {
+		counters.corePasses[i].Add(*f)
+	}
 }
 
 var counters dataCounters
@@ -70,10 +112,11 @@ type CounterSnapshot struct {
 	BytesHashed  int64            `json:"bytes_hashed"`
 	Captures     int64            `json:"captures"`
 	CaptureBytes int64            `json:"capture_bytes"`
+	CorePasses   CorePasses       `json:"core_passes"`
 	Scope        string           `json:"scope"`
 }
 
-const counterScope = "this process since start; bytes_hashed covers content Go hashes (request bodies, tool results, file contents), not short fingerprints over ids or metadata; work inside children (Rust core git spawns and hashing) and external processes (agent runs, LSP servers, terminals) are not counted here"
+const counterScope = "this process since start; bytes_hashed covers content Go hashes (request bodies, tool results, file contents), not short fingerprints over ids or metadata; work inside children is not counted in spawns or bytes_hashed: core_passes sums what each Rust core call reported of its own git spawns, listings, stats, hashing and loaded rows; external processes (agent runs, LSP servers, terminals) are not counted here"
 
 // Counters returns the current counter values.
 func Counters() CounterSnapshot {
@@ -86,5 +129,8 @@ func Counters() CounterSnapshot {
 	s.BytesHashed = counters.bytesHashed.Load()
 	s.Captures = counters.captures.Load()
 	s.CaptureBytes = counters.captureBytes.Load()
+	for i, f := range s.CorePasses.fields() {
+		*f = counters.corePasses[i].Load()
+	}
 	return s
 }

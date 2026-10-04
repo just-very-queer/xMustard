@@ -750,6 +750,10 @@ type RememberRequest struct {
 	// derived from (PAR-PROV-04); both are checked before anything is written.
 	Evidence []string `json:"evidence,omitempty"`
 	RunID    string   `json:"run_id,omitempty"`
+	// JobID and Decision answer a consolidation job (op=job, WS-32a): the job the agent is
+	// answering and what it concluded about that job's candidates.
+	JobID    string `json:"job_id,omitempty"`
+	Decision string `json:"decision,omitempty"`
 	// SessionID is the session a handoff capsule (kind handoff) is stored under: an
 	// execution key, or the id of an MCP session (HandoffSessionKey).
 	SessionID string `json:"session_id,omitempty"`
@@ -820,10 +824,13 @@ func (req RememberRequest) proposal() ProposeContextRequest {
 
 // NormalizeRememberOp is the op Remember runs for raw: trimmed, lower case, propose
 // when blank. An unknown op is invalid input.
+// RememberOpJob answers a consolidation job rather than proposing memory directly (WS-32a).
+const RememberOpJob = "job"
+
 func NormalizeRememberOp(raw string) (string, error) {
 	op := fallbackString(strings.ToLower(strings.TrimSpace(raw)), "propose")
 	if _, ok := rememberOps[op]; !ok {
-		return "", fmt.Errorf("op %q is not propose, supersede, edit, retire, restore or tier: %w", raw, ErrInvalidInput)
+		return "", fmt.Errorf("op %q is not propose, supersede, edit, retire, restore, tier or job: %w", raw, ErrInvalidInput)
 	}
 	return op, nil
 }

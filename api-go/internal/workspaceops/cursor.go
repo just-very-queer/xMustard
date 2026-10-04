@@ -28,6 +28,8 @@ var (
 	searchCursors = cursorCodec{kind: "s2", fields: 1, maxLen: maxSearchCursorLen}
 	// recall cursors carry the offset and the stale-penalty block size.
 	recallCursors = cursorCodec{kind: "r2", fields: 2, maxLen: 128}
+	// impactCursors carry the tier offset an impact page continues from.
+	impactCursors = cursorCodec{kind: "i2", fields: 1, maxLen: maxSearchCursorLen}
 )
 
 // cursorKey is the process's cursor-signing key.

@@ -113,12 +113,18 @@ func explainFailure(w http.ResponseWriter, err error) {
 // edges; ?symbol= → blast radius by depth tier; ?path= → the files referencing one
 // file (WS-FIX-05); ?scope= → the symbols a scoped diff touches; otherwise the changes
 // since the index baseline. A parameter of another form (two targets among them), or
-// a value out of range, is a 400 before any core runs.
+// a value out of range, is a 400 before any core runs. A cursor= continues the tier page
+// the previous call handed back and becomes the core's offset (WS-59e); the paged forms
+// report has_more and next_cursor when a tier was cut.
 func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
 	params := map[string]string{}
 	for name := range q {
 		params[name] = q.Get(name)
+	}
+	if err := workspaceops.ResolveImpactCursor(ws, q, params); err != nil {
+		respondError(w, err)
+		return
 	}
 	form, rest, err := workspaceops.CheckImpactRequest(params)
 	if err != nil {
@@ -133,6 +139,7 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 		result, err = workspaceops.SymbolImpactCtx(r.Context(), dd, ws, q.Get("symbol"), rest)
 		if err == nil {
 			result = workspaceops.WithImpactMemories(r.Context(), dd, ws, callerOf(r).ID, q.Get("symbol"), nil, result)
+			result = workspaceops.WithImpactPaging(ws, q, result)
 		}
 	case workspaceops.ImpactFile:
 		result, err = workspaceops.FileImpactCtx(r.Context(), dd, ws, q.Get("path"), rest)
@@ -141,6 +148,9 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 		}
 	case workspaceops.ImpactChanges:
 		result, err = workspaceops.DetectChangesCtx(r.Context(), dd, ws, rest)
+		if err == nil {
+			result = workspaceops.WithImpactPaging(ws, q, result)
+		}
 	default:
 		result, err = workspaceops.WorkspaceChangesSinceIndexCtx(r.Context(), dd, ws)
 	}

@@ -72,6 +72,144 @@ fn commit(root: &Path, msg: &str) {
     git(root, &["commit", "-qm", msg]);
 }
 
+/// A temporary directory to hand the index as an operator-named `--index-dir`, created
+/// `0700` at creation time so its mode does not come from the umask of whoever runs the
+/// suite (WS-FIX-27). `TempDir::new` creates through `fs::create_dir`, which takes the umask's
+/// bits: under a `0002` login umask the directory lands at `0775` and WS-FIX-11's refusal
+/// answers a fixture that changed nothing. A umask narrows a creation-time mode and never
+/// widens it, so no umask can add the group- or other-**write** bit that `classify_dir`
+/// refuses (`mode & 0o022`); unlike a `chmod` after the fact, it also leaves no window in
+/// which the directory is wider than the guard will accept.
+///
+/// `0700` is stronger than the guard needs — `classify_dir` accepts group- and other-read
+/// and execute bits — and it is not the only mode the umask can produce: one clearing owner
+/// bits narrows it to the complement (`0o700 & ~0o177` is `0o600`), which the owner cannot
+/// traverse and which `classify_dir` does not notice, since it reads `mode & 0o022` and finds
+/// nothing. That is the operator's own setting and is left as it is; the claim is that the
+/// umask is no longer a source of a group- or other-write bit, not that the mode is `0o700`.
+fn index_dir() -> TempDir {
+    let mut b = tempfile::Builder::new();
+    b.permissions(perm(0o700)).tempdir().unwrap()
+}
+
+fn perm(mode: u32) -> fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    fs::Permissions::from_mode(mode)
+}
+
+/// Run `body` in a child process whose umask is `mask`, and return its stdout.
+///
+/// A process-wide `umask` is not safe to set in a test binary that runs tests in
+/// parallel threads, so the umask-dependent half of this row runs in a child. The child is
+/// this same test binary re-invoked with `XMUSTARD_UMASK_CHILD`, so it needs no second
+/// binary and no shell: the umask is set before the body runs, inside the child only.
+fn under_umask(mask: u32, body: &str) -> String {
+    let child = format!("umask_child_reports_the_mode_of_a_{body}");
+    let out = Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg(&child)
+        .arg("--nocapture")
+        .env("XMUSTARD_UMASK_CHILD", &child)
+        .env("XMUSTARD_UMASK_OCTAL", format!("{mask:o}"))
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "umask child {child} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+/// Set this process's umask to `XMUSTARD_UMASK_OCTAL`, or leave it alone when that variable
+/// is unset, which is how the parent run of this binary reaches this code: as a no-op.
+fn adopt_umask_from_env() {
+    if let Ok(octal) = std::env::var("XMUSTARD_UMASK_OCTAL") {
+        let mask = u32::from_str_radix(&octal, 8).unwrap();
+        // SAFETY: a single-threaded child of this test binary, before any other test thread
+        // exists, so the process-global umask has no concurrent reader.
+        unsafe {
+            libc::umask(mask);
+        }
+    }
+}
+
+fn mode_of_dir(d: &TempDir) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    fs::symlink_metadata(d.path()).unwrap().permissions().mode() & 0o777
+}
+
+/// Child of `under_umask`: the mode `index_dir` creates under the given umask.
+#[test]
+fn umask_child_reports_the_mode_of_a_index_dir() {
+    if std::env::var("XMUSTARD_UMASK_CHILD").as_deref()
+        != Ok("umask_child_reports_the_mode_of_a_index_dir")
+    {
+        return;
+    }
+    adopt_umask_from_env();
+    println!("UMASK_MODE={:04o}", mode_of_dir(&index_dir()));
+}
+
+/// Child of `under_umask`: the mode a plain `TempDir` creates under the same umask. This is
+/// the control: if it does not come out group-writable, the pair cannot tell an explicit
+/// mode from the umask and the parent assertion proves nothing.
+#[test]
+fn umask_child_reports_the_mode_of_a_plain_tempdir() {
+    if std::env::var("XMUSTARD_UMASK_CHILD").as_deref()
+        != Ok("umask_child_reports_the_mode_of_a_plain_tempdir")
+    {
+        return;
+    }
+    adopt_umask_from_env();
+    println!("UMASK_MODE={:04o}", mode_of_dir(&TempDir::new().unwrap()));
+}
+
+/// The mode `index_dir` creates at, under the umask that exposed the defect.
+///
+/// Both children run under the same `0o002`, the login umask that produced the failure this
+/// row exists for: a plain `TempDir` lands at `0775` there and only the explicit mode keeps
+/// `index_dir` at `0700`. Expected values are literals, never the result of calling the code
+/// under test. Running both under one umask is what makes the pair meaningful — under `0077` a
+/// plain `TempDir` is already `0700`, so `index_dir` could be a no-op without this noticing.
+#[test]
+fn an_index_fixture_dir_is_owner_only_whatever_the_process_umask() {
+    assert_eq!(
+        mode_of_dir_under(0o002, "index_dir"),
+        0o700,
+        "index_dir did not create 0700 under umask 0002, so a fixture's mode comes from \
+         whoever logged in and WS-FIX-11's refusal is umask-dependent"
+    );
+    assert_eq!(
+        mode_of_dir_under(0o002, "plain_tempdir"),
+        0o775,
+        "a plain TempDir must land at 0775 under umask 0002, otherwise this test cannot \
+         tell the explicit mode from the umask and proves nothing"
+    );
+    // A umask that clears owner bits narrows the request too: `0o700 & ~0o177` is `0o600`,
+    // and the owner can no longer traverse the directory, so a fixture using it would fail.
+    // `classify_dir` does not notice — it reads `mode & 0o022` and finds nothing — so this is
+    // NOT a result-independent case, and the test says so rather than implying otherwise.
+    assert_eq!(
+        mode_of_dir_under(0o177, "index_dir"),
+        0o600,
+        "umask 0177 must narrow index_dir to 0600, since mkdir applies the umask to the \
+         requested mode rather than replacing it"
+    );
+}
+
+/// The mode `body` creates under umask `mask`, by way of the same child helper.
+fn mode_of_dir_under(mask: u32, body: &str) -> u32 {
+    let out = under_umask(mask, body);
+    let line = out
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("UMASK_MODE="))
+        .unwrap_or_else(|| panic!("no UMASK_MODE line in child output: {out:?}"));
+    u32::from_str_radix(line.trim(), 8).unwrap()
+}
+
 /// Several languages, imports, calls, inheritance, a test file and an isolated file.
 fn fixture() -> TempDir {
     repo(&[
@@ -236,7 +374,7 @@ fn key(seg: &Segment, a: u32, b: u32, e: &Edge) -> EdgeKey {
 #[test]
 fn csr_equals_the_edges_table_and_reverse_edges_mirror_it() {
     let r = fixture();
-    let dir = TempDir::new().unwrap();
+    let dir = index_dir();
     let db = build(r.path(), dir.path());
     // add typed symbol-level edges (what the resolver will write) next to the lexical
     // ones, so both node kinds are exercised
@@ -505,7 +643,7 @@ fn assert_legacy_equal(root: &Path, db: &Path, max_names: usize) -> usize {
 #[test]
 fn bfs_trace_and_blast_radius_equal_the_legacy_graph_on_the_same_edges() {
     let r = fixture();
-    let dir = TempDir::new().unwrap();
+    let dir = index_dir();
     let db = build(r.path(), dir.path());
     let checked = assert_legacy_equal(r.path(), &db, 1000);
     assert!(checked > 10);
@@ -544,7 +682,7 @@ fn legacy_equality_holds_on_parity_fixtures() {
             eprintln!("{} missing; skipped", root.display());
             continue;
         }
-        let dir = TempDir::new().unwrap();
+        let dir = index_dir();
         let db = build(&root, dir.path());
         let n = assert_legacy_equal(&root, &db, 400);
         eprintln!("{name}: legacy-equal on {n} sampled symbols");
@@ -1196,6 +1334,55 @@ impl Serve {
     fn mem(&self) -> memprobe::Mem {
         memprobe::sample(self.child.id()).expect("a memory sample of the service")
     }
+
+    /// One reading of the service once it has settled: samples until two consecutive
+    /// readings agree to within `SETTLE_STABLE_MIB` and the window is at least
+    /// `settle_ms` long, and the reading is the **peak** of the samples after the
+    /// first one. Waiting for the readings to stop moving is what makes the name
+    /// true — a fixed delay does not establish that anything settled, and a bound
+    /// read before the service has finished releasing the round it just ran
+    /// compares against a service that is still working. Keeping the peak of the
+    /// settled samples means a genuine regression inside the window is still
+    /// caught; only the samples before it are discarded.
+    ///
+    /// The single instantaneous sample this replaced was the cause of WS-FLK-01:
+    /// `steady` and `after swap` name a settled service and neither delivered one,
+    /// so the two figures the bound checked depended on which instant the sample
+    /// landed on. `swap peak` was already a peak, taken while the swap ran.
+    fn mem_settled(&self, settle_ms: u64) -> memprobe::Mem {
+        let within = (SETTLE_STABLE_MIB * memprobe::MIB) as u64;
+        let started = std::time::Instant::now();
+        // The pre-settlement instant: read once, and not part of the figure. A
+        // round the service has just finished can still be holding its
+        // allocations, and seeding the peak with this sample is what kept that
+        // transient in the reading through rounds 1 and 2 of this row.
+        let mut previous = self.mem();
+        let mut peak = memprobe::Mem::default();
+        let mut settled_samples = 0usize;
+        loop {
+            std::thread::sleep(Duration::from_millis(5));
+            let Some(m) = memprobe::sample(self.child.id()) else {
+                // the child is gone or unreadable, so no bound can be read and
+                // waiting for it to come back would hang the suite
+                panic!("the service stopped answering memory samples");
+            };
+            // the first sample inside the loop is the second reading, so `peak` is
+            // never seeded with `previous` and the transient cannot return
+            if settled_samples == 0 {
+                peak = m;
+                settled_samples = 1;
+            } else {
+                peak.rss = peak.rss.max(m.rss);
+                peak.dirty = peak.dirty.max(m.dirty);
+            }
+            let settled = started.elapsed() >= Duration::from_millis(settle_ms)
+                && m.dirty.abs_diff(previous.dirty) <= within;
+            previous = m;
+            if settled {
+                return peak;
+            }
+        }
+    }
 }
 
 impl Drop for Serve {
@@ -1254,11 +1441,11 @@ struct Above {
 }
 
 struct Measured {
-    /// After the first query rounds.
+    /// After the first query rounds, once the service has settled (`SETTLE_MS`).
     steady: Above,
     /// The highest sampled while the swap happened under load.
     swap_peak: Above,
-    /// After the swap settled.
+    /// After the swap settled (`SETTLE_MS`).
     after_swap: Above,
     generations: BTreeSet<i64>,
 }
@@ -1291,13 +1478,30 @@ const OVERLAPPING: Lines = Lines {
     rss: 32.0,
 };
 
+/// The shortest settle window `steady` and `after swap` wait out, in milliseconds.
+/// The window is a floor, not the settling rule: `mem_settled` also waits for two
+/// consecutive readings to agree, so a slower cleanup extends the wait instead of
+/// being read mid-flight. Measured on the Linux build box at load 3.3-8.6 over 26
+/// runs, `steady` and `after swap` stop moving inside 500 ms, so this is the floor
+/// every one of those runs cleared rather than a fitted constant. The swap already
+/// waits 3 s for the new generation to land.
+const SETTLE_MS: u64 = 500;
+
+/// How close two consecutive dirty readings must be for the service to count as
+/// settled, in MiB. `/proc/<pid>/status` is reported in whole pages, so two readings
+/// of a service that has stopped allocating differ by at most a page or two plus
+/// whatever the kernel has accounted; a quarter of a MiB is well inside the noise a
+/// settling allocator makes and well under the 0.3-0.5 MiB spread this row measured
+/// on the instantaneous reading.
+const SETTLE_STABLE_MIB: f64 = 0.25;
+
 /// Measure the service on the synthetic store: base after the handshake, then after
 /// queries, then during and after a snapshot swap with queries in flight.
 fn measure(storage: &str, load: Load) -> Measured {
     let r = repo(&[("README.md", "synthetic\n")]);
     let root = r.path().to_str().unwrap().to_string();
     let head = git(r.path(), &["rev-parse", "HEAD"]);
-    let dir = TempDir::new().unwrap();
+    let dir = index_dir();
     let db = dir.path().join(index::DB_FILE);
     synthetic_store(&db, &head, 1);
     // the index worker writes the segment; the service only reads it
@@ -1316,7 +1520,7 @@ fn measure(storage: &str, load: Load) -> Measured {
             );
         }
     }
-    let steady = s.mem();
+    let steady = s.mem_settled(SETTLE_MS);
 
     // swap: a new generation lands while four clients keep querying
     let pid = s.child.id();
@@ -1362,12 +1566,22 @@ fn measure(storage: &str, load: Load) -> Measured {
     let (mut s, seen) = clients.join().unwrap();
     gens.extend(seen);
     let peak = sampler.join().unwrap();
+    // `peak` starts at `Mem::default()` and only moves when `sample` returns `Some`, so
+    // a sampler that observed nothing leaves both fields at 0 and `above`'s
+    // `saturating_sub` turns that into a 0.0 MiB delta that passes every bound below.
+    assert!(
+        peak.rss > 0 && peak.dirty > 0,
+        "{load:?}: the sampler observed no reading of the service (rss {}, dirty {}), so \
+         `swap peak` below would bound a figure that was never taken",
+        peak.rss,
+        peak.dirty
+    );
     for i in 0..4 {
         for v in client_rounds(&mut s, &root, load, i + 500) {
             gens.insert(v["freshness"]["snapshot_generation"].as_i64().unwrap());
         }
     }
-    let swapped = s.mem();
+    let swapped = s.mem_settled(SETTLE_MS);
     let stats = s.call("$/stats", &[]);
     let above = |m: memprobe::Mem| Above {
         rss: memprobe::mib(m.rss.saturating_sub(base.rss)),
