@@ -306,7 +306,10 @@ fn report(sig: i32, relayed: bool) {
         true => "forwarded",
         false => "not forwarded",
     };
-    write_best_effort(format!("xmustard run: {} {decision} to the child\n", name_of(sig)));
+    write_best_effort(format!(
+        "xmustard run: {} {decision} to the child\n",
+        name_of(sig)
+    ));
 }
 
 /// The channel the watcher enqueues reports on, plus the acknowledgement the drain waits for.
@@ -405,7 +408,6 @@ const REPORT_QUEUE: usize = 32;
 /// How long the wrapper waits for queued reports on its way out. Long enough for a write to a
 /// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
 const REPORT_DRAIN: Duration = Duration::from_millis(50);
-
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
 /// reaches it too. `false` on any error (the child is gone, or its group cannot be read):

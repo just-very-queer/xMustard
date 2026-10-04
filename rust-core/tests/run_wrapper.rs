@@ -1162,13 +1162,7 @@ fn fill_pipe(write_end: &std::fs::File) {
     // descriptor. SAFETY: `write_end` is live and the only file-status flags it carries are the
     // ones this function just set.
     assert_eq!(
-        unsafe {
-            libc::fcntl(
-                std::os::fd::AsRawFd::as_raw_fd(write_end),
-                libc::F_SETFL,
-                0,
-            )
-        },
+        unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(write_end), libc::F_SETFL, 0,) },
         0,
         "the fill could not restore the wrapper's descriptor to blocking"
     );
