@@ -12,17 +12,21 @@ var searchQueryArgs = []string{"q", "mode", "lang", "seed", "limit", "cursor", "
 	"timeout_ms"}
 
 var searchTool = &Tool{
-	Name:        "search",
+	Name: "search",
 	// The lean schema has zero byte headroom — the caps equal the measured sizes — so the
-	// two new modes and their two output members (89 bytes together) are paid for out of
-	// this description and its argument descriptions, never by raising a cap (§5.1 rule 9;
-	// WS-18, WS-21 and WS-35 trimmed the same way).
+	// two new modes and their two output members are paid for out of this description and
+	// its argument descriptions, never by raising a cap (§5.1 rule 9; WS-18, WS-21 and
+	// WS-35 trimmed the same way).
 	//
-	// What moved to `xmustard://docs/tools` is what the enum and the arg names already
-	// say: the per-mode gloss, and the two caveats a caller needs but a session prompt does
-	// not — that trigram tolerance is not meaning, and that `lang` does not filter
-	// `mode=symbol`. `Doc` is not rendered in tools/list, so it costs nothing there.
-	Description: "Code search: path:line, reasons. RRF (K=60) of BM25 over bodies, names, paths and docs; identifier match; trigram typo tolerance; reference degree; proximity to seed; pattern: ast-grep (`$A && $A()`); exact/regex: spans.",
+	// What was NOT taken is anything `TestToolDescriptionsStateImplementationLimits`
+	// pins: "function bodies", "doc sections" and "typo tolerance (not meaning)" are WS-18
+	// wording that names what the bm25 lane actually reads and what trigram tolerance is
+	// not, and that test is a contract rather than a snapshot. Those three phrases cost
+	// 47 bytes and stay. What went instead is the per-mode gloss ("text (body)",
+	// "exact/regex (spans)", "symbol: name path", "snippets"), which the `mode` enum's own
+	// values and `xmustard://docs/tools` already carry; `Doc` is not rendered in
+	// tools/list, so moving text there costs nothing there.
+	Description: "Code search: path:line, reasons. RRF (K=60) of BM25 over function bodies, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed; pattern: ast-grep (`$A && $A()`); exact/regex: spans.",
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},

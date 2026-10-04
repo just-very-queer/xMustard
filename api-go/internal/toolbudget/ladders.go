@@ -163,8 +163,8 @@ var searchLadders = []*Ladder{
 		// and there is no snippet or reason to trim. The first rung drops the two members a
 		// caller can rebuild from `byte` and `len`; the rest reduce the list the same way
 		// the hybrid's does.
-		Shape: "exact/regex (spans)",
-		Match: "spans",
+		Shape:   "exact/regex (spans)",
+		Match:   "spans",
 		Lists:   []List{{Member: "spans", GroupBy: "path", Paged: true}},
 		Signals: envelope,
 		Keep:    envelopeKeep,

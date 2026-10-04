@@ -43,17 +43,27 @@ const DFA_CACHE_BYTES: usize = 64 << 10;
 /// why it is small enough to interrupt a slow match quickly.
 const CHUNK_BYTES: usize = 64 << 10;
 
+/// Read `slice_bytes` at a time instead of `CHUNK_BYTES`, for a test that has to force a
+/// read boundary at a chosen offset. Production passes `None`.
+///
+/// It is a parameter rather than a constant because the boundary case is otherwise
+/// unreachable: production reads files larger than one slice, but no such file fits in a
+/// test fixture, so a test that wanted a straddling match could not create one. A case
+/// that cannot be reached is a case that is never exercised.
+fn slice_bytes(n: Option<usize>) -> usize {
+    n.unwrap_or(CHUNK_BYTES).clamp(1, CHUNK_BYTES)
+}
+
 /// The longest tail of the previous slice a match may straddle into the next one, and the
 /// bound on the compiled pattern's state size. A match longer than this is refused at
 /// compile time rather than silently missing the boundary it crosses.
 pub const MAX_MATCH_BYTES: usize = 4096;
 
-/// How far back the cursor keeps line starts. A match reported in a slice may have begun
-/// in the carried tail, which is at most `MAX_MATCH_BYTES` back, so the cursor needs the
-/// starts within that window and no older. Bounded therefore: at most `MAX_CURSOR_LINES`
-/// entries regardless of file size, which is what keeps this lane off the budget line
-/// (§5.1 rule 8: nothing proportional to the file lives in a heap).
-pub const MAX_CURSOR_LINES: usize = MAX_MATCH_BYTES;
+/// How many line starts one file's cursor keeps. The byte window is what a match can
+/// reach; this is the other bound, on the number of entries inside that window, because a
+/// file of one-byte lines would otherwise fill it. Bounded so the cursor is a fixed share
+/// of the scan's memory, never proportional to the file (§5.1 rule 8).
+pub const MAX_CURSOR_LINES: usize = 1024;
 
 /// The two matchers the lane compiles from one query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,7 +218,14 @@ pub fn compile(query: &str, matcher: Matcher) -> Result<Regex, String> {
 /// A match found in a slice may have STARTED in the carried tail, at most
 /// `MAX_MATCH_BYTES` back, so a running line counter alone cannot answer for it. The
 /// cursor therefore keeps the recent line starts and drops the ones that have fallen out
-/// of that window, which bounds it at `MAX_CURSOR_LINES` entries whatever the file's size.
+/// of that window.
+///
+/// The window is bounded two ways, because the two are not the same bound: by BYTES (a
+/// match reaches at most `MAX_MATCH_BYTES` back, so a start further back cannot answer a
+/// match) and by ENTRIES (a file of one-byte lines inside the byte window would otherwise
+/// accumulate `MAX_MATCH_BYTES` entries). Both keep it a fixed share of the scan's memory
+/// whatever the file's shape, which is what §5.1 rule 8 asks for.
+///
 /// An offset older than the window is a match that began further back than a match may
 /// be, so it cannot occur; the cursor refuses it rather than guessing.
 #[derive(Debug, Clone)]
@@ -229,6 +246,10 @@ impl Cursor {
 
     /// The position of `offset`, a file-relative byte offset, as (line, column), both
     /// 1-based. An offset between two starts belongs to the line that began first.
+    ///
+    /// `None` only when the offset precedes every start the cursor still holds, which is
+    /// a position further back than a match may begin (§5.1 rule 8's bound makes it
+    /// unreachable in the scan, so `None` is a refusal, not a guess).
     fn at(&self, offset: usize) -> Option<(usize, usize)> {
         let i = match self.starts.binary_search(&offset) {
             Ok(i) => i,
@@ -251,8 +272,18 @@ impl Cursor {
             }
         }
         let end = from + bytes.len();
-        let keep_from = end.saturating_sub(MAX_CURSOR_LINES);
-        let cut = self.starts.partition_point(|s| *s < keep_from);
+        // One byte more than a match may reach, so the start of the line the OLDEST
+        // possible match sits on is still in the window: `at` needs a start at or before
+        // the offset it is asked about, and pruning exactly at the cutoff leaves a match
+        // starting on the cutoff line with no line-start to resolve against.
+        let keep_from = end.saturating_sub(MAX_MATCH_BYTES + 1);
+        let mut cut = self.starts.partition_point(|s| *s < keep_from);
+        // The entry bound is applied after the byte bound, so the newest `MAX_CURSOR_LINES`
+        // starts always survive: a match at the very end of a file must be answerable
+        // however many one-byte lines preceded it.
+        if self.starts.len().saturating_sub(cut) > MAX_CURSOR_LINES {
+            cut = self.starts.len() - MAX_CURSOR_LINES;
+        }
         if cut > 0 {
             self.starts.drain(..cut);
             self.base_line += cut;
@@ -269,7 +300,18 @@ pub struct FileScan<'a> {
     pub read: u64,
     /// The tail of the previous slice, so a match straddling a read boundary is found.
     carry: Vec<u8>,
+    /// The file offset `carry[0]` came from, so a match found in the window is placed in
+    /// file coordinates rather than window coordinates.
+    carry_from: u64,
+    /// Every byte below this offset has been scanned by a completed match or skipped over,
+    /// so a match ending at or below it has already been reported. This is what makes a
+    /// straddling match report exactly once: it is reported by the slice holding its last
+    /// byte, and skipped by every later slice.
+    last_reported_to: u64,
     cursor: Cursor,
+    /// Bytes per positional read; `slice_bytes(None)` in production, and a chosen smaller
+    /// size in the test that forces a read boundary.
+    slice: usize,
     root: &'a std::path::Path,
     path: String,
 }
@@ -279,6 +321,16 @@ impl<'a> FileScan<'a> {
     /// `secretpath` refuses, a non-regular file (a fifo or socket read could never
     /// finish), and a file past the per-file ceiling.
     pub fn open(root: &'a std::path::Path, rel: &str) -> Result<Self, Loss> {
+        Self::open_with_slice(root, rel, None)
+    }
+
+    /// [`FileScan::open`] that reads `slice` bytes at a time, for a test that has to force
+    /// a read boundary at a chosen offset.
+    pub fn open_with_slice(
+        root: &'a std::path::Path,
+        rel: &str,
+        slice: Option<usize>,
+    ) -> Result<Self, Loss> {
         if crate::secretpath::is_secret_path(rel) {
             return Err(Loss::Secret(rel.to_string()));
         }
@@ -294,7 +346,10 @@ impl<'a> FileScan<'a> {
             file,
             read: 0,
             carry: Vec::new(),
+            carry_from: 0,
+            last_reported_to: 0,
             cursor: Cursor::new(),
+            slice: slice_bytes(slice),
             root,
             path: rel.to_string(),
         })
@@ -315,7 +370,7 @@ impl<'a> FileScan<'a> {
         if want == 0 {
             return Ok(None);
         }
-        let n = want.min(CHUNK_BYTES as u64) as usize;
+        let n = want.min(self.slice as u64) as usize;
         let mut buf = vec![0u8; n];
         let got = self.file.read_at(&mut buf, self.read)?;
         if got == 0 {
@@ -334,7 +389,7 @@ impl<'a> FileScan<'a> {
             return Ok(None);
         }
         self.file.seek(SeekFrom::Start(self.read))?;
-        let n = want.min(CHUNK_BYTES as u64) as usize;
+        let n = want.min(self.slice as u64) as usize;
         let mut buf = vec![0u8; n];
         let got = self.file.read(&mut buf)?;
         if got == 0 {
@@ -349,11 +404,17 @@ impl<'a> FileScan<'a> {
     /// `false` once `limits` cut the scan. `budget` is the whole scan's remaining byte
     /// allowance, so the byte cap spans files rather than restarting per file.
     ///
-    /// A match inside the carried tail is dropped rather than reported twice: the
-    /// previous slice already reported it, at the offset it has there.
+    /// Every byte is matched exactly once: a match wholly inside the carried tail was
+    /// reported by the previous slice and is skipped here, and one straddling the boundary
+    /// is found because the tail is still in the window. The window is at most
+    /// `MAX_MATCH_BYTES + CHUNK_BYTES` whatever the file's size, so nothing proportional
+    /// to the file is held.
     pub fn scan(&mut self, re: &Regex, limits: &Limits, budget: &mut u64, report: &mut Report, started: std::time::Instant) -> bool {
+        // The window the matcher sees: the carried tail, then this slice. It is at most
+        // `MAX_MATCH_BYTES + CHUNK_BYTES`, so it is a fixed size whatever the file is.
+        let mut window: Vec<u8> = Vec::with_capacity(MAX_MATCH_BYTES + CHUNK_BYTES);
         loop {
-            let want = (*budget).min(CHUNK_BYTES as u64);
+            let want = (*budget).min(self.slice as u64);
             if want == 0 {
                 if self.read < u64::MAX {
                     // the byte cap, not the end of this file
@@ -371,29 +432,44 @@ impl<'a> FileScan<'a> {
             };
             *budget -= buf.len() as u64;
             report.bytes_scanned += buf.len() as u64;
-
-            // the window the matcher sees: the carried tail, then this slice. A match is
-            // reported only when it ends inside the new bytes, which is what keeps a
-            // boundary-straddling match to one report.
-            let carry = std::mem::take(&mut self.carry);
             let base = self.read - buf.len() as u64;
-            let mut window = Vec::with_capacity(carry.len() + buf.len());
-            window.extend_from_slice(&carry);
-            let carry_len = carry.len();
+
+            // The cursor must know this slice's line starts BEFORE any match in it is
+            // placed, because a match on line 40 of this slice resolves against a line
+            // start inside it. Advancing after the match loop would leave every match past
+            // the first line unresolvable, and the answer would silently lose them.
+            self.cursor.advance(&buf, base as usize);
+
+            // The window is rebuilt from the PREVIOUS carry plus this slice, and the
+            // previous carry is dropped from the FRONT of it once reported, so every byte
+            // is matched exactly once: a match wholly inside the previous carry was
+            // already reported by the previous iteration, and dropping that prefix is what
+            // stops it being reported twice. It also stops the file from being re-matched
+            // in full on every slice, which a naive "match the whole window" would do.
+            let carry_from = self.carry_from;
+            window.clear();
+            window.extend_from_slice(&self.carry);
             window.extend_from_slice(&buf);
+            let new_from = base as usize;
+            // Matches ending before the new bytes began belong to the previous window and
+            // were reported then.
+            let last_reported_to = self.last_reported_to;
             for m in re.find_iter(&window) {
-                let start = m.start();
-                let end = m.end();
-                // a match that ends inside the carry was reported by the previous slice
-                if end <= carry_len {
+                let file_start = carry_from as usize + m.start();
+                let file_end = carry_from as usize + m.end();
+                // Report a match when it is not already reported. A match is reported by
+                // the slice in which it first becomes COMPLETE, which is the slice holding
+                // its LAST byte — so a match that straddles this boundary is reported HERE,
+                // even though it started in the previous carry. Testing the start instead
+                // drops every straddling match exactly once, silently.
+                if file_end <= last_reported_to as usize {
                     continue;
                 }
                 if report.spans.len() >= limits.max_lines {
                     report.cut = Some(Cut::Lines);
                     return false;
                 }
-                let file_off = start - carry_len;
-                let (line, column) = match self.cursor.at(base as usize + file_off) {
+                let (line, column) = match self.cursor.at(file_start) {
                     Some(p) => p,
                     // A match cannot begin further back than `MAX_MATCH_BYTES`, so the
                     // cursor always has its start. If it does not, the span is counted as
@@ -408,15 +484,24 @@ impl<'a> FileScan<'a> {
                     path: self.path.clone(),
                     line,
                     column,
-                    byte: base as usize + file_off,
-                    len: end - start,
+                    byte: file_start,
+                    len: m.end() - m.start(),
                 });
+                // Every match up to the end of this window has now been reported or
+                // skipped, so a later slice must not report one that ends below this.
+                self.last_reported_to = file_end as u64;
             }
-            self.cursor.advance(&buf, base as usize);
-            // keep the tail for the next slice; a match longer than this is refused at
-            // compile time, so the tail is always long enough
+
+            // Keep the tail for the next slice: the last `MAX_MATCH_BYTES` bytes, which is
+            // enough for any match to straddle the boundary because a longer pattern is
+            // refused at compile time.
             let keep = buf.len().min(MAX_MATCH_BYTES);
+            self.carry_from = (new_from + buf.len() - keep) as u64;
             self.carry = buf[buf.len() - keep..].to_vec();
+            // Bytes past the last match were scanned and found empty, so a later slice
+            // must not re-report a match ending inside them. The carry's start is where
+            // the next window begins, and every byte before it has been looked at.
+            self.last_reported_to = self.last_reported_to.max(self.carry_from);
 
             if started.elapsed() >= std::time::Duration::from_millis(limits.timeout_ms) {
                 report.cut = Some(Cut::Time);
@@ -572,35 +657,77 @@ mod tests {
         assert_eq!(c.at(6), Some((3, 1)), "the position at end of input");
     }
 
-    // The cursor is bounded so it never holds memory proportional to the file, which means
-    // it forgets old line starts. It must then still answer CORRECTLY for a recent one —
-    // the line number is carried in `base_line`, not recovered from a forgotten entry — and
-    // refuse an offset older than the window rather than report a line it cannot know.
+// The cursor is bounded two ways, so it never holds memory proportional to the file. It
+    // must then still answer CORRECTLY for a recent line — the line number is carried in
+    // `base_line`, not recovered from a forgotten entry — and refuse an offset older than
+    // the window rather than report a line it cannot know.
+    //
+    // The shape that catches a one-sided bound is many SHORT lines: a cursor pruned by
+    // bytes alone keeps them all, and a cursor pruned by entries alone keeps nothing. Both
+    // shapes are asserted below, because either bound alone passes half of them.
     #[test]
-    fn a_bounded_cursor_still_numbers_recent_lines_and_forgets_old_ones() {
+    fn a_pruned_cursor_still_numbers_lines_correctly() {
         let mut c = Cursor::new();
-        // one very long line, then a second line far beyond the window
-        let first = vec![b'x'; MAX_CURSOR_LINES + 16];
-        c.advance(&first, 0);
-        let second_at = first.len() as usize + 1;
-        let mut second = vec![b'y'; 8];
-        second.push(b'\n');
-        c.advance(&second, second_at);
+        let mut first = vec![b'x'; 8];
+        first.push(b'\n');
+        c.advance(&first, 0); // line 1 ends here, so line 2 begins at 9
+        // a slice far past the byte window, which prunes the start at 9
+        let gap = vec![b'y'; MAX_MATCH_BYTES * 2];
+        let second_at = first.len() + gap.len();
+        c.advance(&gap, first.len());
         assert!(
-            c.starts.len() <= MAX_CURSOR_LINES + 8,
-            "the cursor is bounded: {} entries",
-            c.starts.len()
-        );
-        // the second line's number is 2 even though the first line's start was forgotten
-        assert_eq!(
-            c.at(second_at),
-            Some((2, 1)),
-            "line numbering survives the bound: {:?}",
+            c.starts.first() != Some(&0),
+            "this fixture must actually prune something, or it proves nothing: starts={:?}",
             c.starts
         );
-        // an offset before the window is not answered rather than guessed
-        assert_eq!(c.at(0), None, "an offset older than the window is refused");
+        // the newline at the end of this slice ends line 2 and begins line 3, whose start
+        // is the newest and must be answerable however much was forgotten before it
+        let mut second = vec![b'z'; 4];
+        second.push(b'\n');
+        c.advance(&second, second_at);
+        let after = second_at + second.len();
+        assert_eq!(
+            c.at(after),
+            Some((3, 1)),
+            "the pruned cursor numbers the line it just recorded: {:?}",
+            c.starts
+        );
     }
+
+    // A position further back than a match may begin is refused rather than guessed:
+    // reporting a line number the cursor cannot know would be a lie about where the match
+    // is.
+    #[test]
+    fn a_position_older_than_the_byte_window_is_refused_rather_than_guessed() {
+        let mut c = Cursor::new();
+        c.advance(&vec![b'x'; MAX_MATCH_BYTES * 3], 0);
+        assert_eq!(c.at(0), None, "offset 0 is far outside the window");
+    }
+
+#[test]
+fn a_cursor_of_many_short_lines_stays_within_its_entry_bound() {
+    let mut c = Cursor::new();
+    // 4x the entry bound, all inside the byte window (one byte per line)
+    let mut body = Vec::new();
+    for _ in 0..MAX_CURSOR_LINES * 4 {
+        body.push(b'\n');
+    }
+    c.advance(&body, 0);
+    assert!(
+        c.starts.len() <= MAX_CURSOR_LINES,
+        "the cursor is bounded by entries too: {} entries",
+        c.starts.len()
+    );
+    // the LAST line of that many is still answerable, with the right number: an entries
+    // bound that dropped the newest starts would leave the newest match unanswerable.
+    let last = body.len() - 1;
+    assert_eq!(
+        c.at(last),
+        Some((MAX_CURSOR_LINES * 4, 1)),
+        "the newest line is still numbered correctly: base_line={}",
+        c.base_line
+    );
+}
 
     // A column is a byte offset within its line, because the lane matches over bytes.
     // A multi-byte character therefore advances the column by its encoded length, which

@@ -187,6 +187,24 @@ struct IndexEntry {
     path: Vec<u8>,
 }
 
+/// Every tracked path under `root`, in the `git ls-files` order, or None with the reason
+/// Git could not answer (WS-59c).
+///
+/// This is the whole tracked tree, NOT the language packs' files: `mode=exact|regex`
+/// exists to grep, and a grep that silently skipped `.md`, `.txt`, `.yaml`, a `Dockerfile`
+/// or a `.env.example` would be a grep that answers about code and pretends to answer
+/// about a repository. The scan lane filters by its own `path_glob`/`lang` afterwards.
+pub fn tracked_paths(root: &Path) -> Result<Vec<String>, String> {
+    match ls_files_stage(root) {
+        Ok(entries) => Ok(entries
+            .into_iter()
+            .filter(|e| !e.mode.starts_with("160000"))
+            .map(|e| String::from_utf8_lossy(&e.path).into_owned())
+            .collect()),
+        Err(e) => Err(format!("git ls-files failed: {e}")),
+    }
+}
+
 fn ls_files_stage(root: &Path) -> Result<Vec<IndexEntry>, crate::indexcache::GitRunError> {
     let out = crate::indexcache::run_git_bounded(
         root,

@@ -407,7 +407,7 @@ export const TOOL_SPECS: readonly ToolSpec[] = [
 	{
 		name: "search",
 		description:
-			"Code search: path:line, reasons. RRF (K=60) of BM25 over bodies, names, paths and docs; identifier match; trigram typo tolerance; reference degree; proximity to seed; pattern: ast-grep (`$A && $A()`); exact/regex: spans.",
+			"Code search: path:line, reasons. RRF (K=60) of BM25 over function bodies, names, paths and doc sections; identifier match; trigram typo tolerance (not meaning); reference degree; proximity to seed; pattern: ast-grep (`$A && $A()`); exact/regex: spans.",
 		args: [
 			workspaceArg,
 			{ name: "q", type: "string", required: true, desc: "the query" },

@@ -483,6 +483,10 @@ pub struct SearchOptions<'a> {
     pub scan_lines: usize,
     pub scan_bytes: u64,
     pub scan_timeout_ms: u64,
+    /// Bytes per positional read in the scan modes. None is the core's own slice size;
+    /// a test sets it to force a read boundary at a chosen offset, because a file large
+    /// enough to cross a real boundary does not fit in a fixture.
+    pub scan_slice: Option<usize>,
 }
 
 /// One candidate of the fused pool. The pool can hold every symbol of a large
@@ -678,7 +682,8 @@ fn scan(
     opts: &SearchOptions<'_>,
 ) -> SearchResult {
     let source = symbolgraph::query_source_for(root, workspace_id, identity_key);
-    let graph = source.graph.as_ref();
+    // the scan reads the working tree and lists it from Git, so it needs the source's
+    // coverage and freshness but not its graph
     let mut coverage = source.coverage.clone();
     let mut degradations: Vec<String> = Vec::new();
     let mut read_errors: Vec<(&str, String)> = Vec::new();
@@ -749,26 +754,27 @@ fn scan(
     let started = std::time::Instant::now();
     let mut report = crate::exactscan::Report::default();
     let mut budget = limits.max_bytes;
-    // The listed file count, so `files_skipped` can be the difference after a cap fired
-    // rather than a second walk.
-    let mut listed: u64 = 0;
     let mut losses: Vec<crate::exactscan::Loss> = Vec::new();
-    let mut paths: Vec<String> = Vec::new();
-    let listed_all = graph.for_each_file(&mut |f| {
-        listed += 1;
-        if admit(f.path) {
-            paths.push(f.path.to_string());
+    // The scan lists the TRACKED TREE, not the graph's files: the graph carries only the
+    // files a language pack claims, and a grep that skipped `.md`, `.txt`, `.yaml` and a
+    // `.env.example` would answer about code while claiming to answer about a repository.
+    let (listed, listed_paths) = match symbolgraph::tracked_paths(root) {
+        Ok(all) => (all.len() as u64, all),
+        Err(e) => {
+            // No listing means no answer can be complete, and saying so is the whole
+            // point of this lane's `degradations`.
+            read_errors.push(("files", e));
+            (0, Vec::new())
         }
-    });
-    if let Err(e) = listed_all {
-        read_errors.push(("files", e));
-    }
-    // Order is the index's own, so the same corpus produces the same bytes twice (the
-    // property `search_hybrid`'s `the_same_seed_over_the_same_index_is_byte_identical`
-    // asserts for the hybrid).
+    };
+    // `listed` counts what Git listed, BEFORE `admit`: `files_skipped` is a statement
+    // about the corpus the scan was asked about, not about the filter it applied.
+    let mut paths: Vec<String> = listed_paths.into_iter().filter(|p| admit(p)).collect();
+    // Order is Git's own, so the same corpus produces the same bytes twice (the property
+    // `search_hybrid`'s byte-identity test asserts for the hybrid).
     paths.sort();
     for rel in &paths {
-        let mut scan_file = match crate::exactscan::FileScan::open(root, rel) {
+        let mut scan_file = match crate::exactscan::FileScan::open_with_slice(root, rel, opts.scan_slice) {
             Ok(s) => s,
             Err(loss) => {
                 report.files_skipped_unreadable += 1;
@@ -2488,8 +2494,31 @@ mod scan_tests {
         );
     }
 
-    // The same inputs produce the same bytes twice. A scan's order comes from the index's
-    // own file order, and this is the property the retrieval gate and the hybrid's own
+    // The scan lists the TRACKED TREE, not the files a language pack claims. `.txt` is not
+    // in any pack, so a scan that took its file list from the symbol graph would find
+    // nothing here — and a grep that cannot reach a README, a Makefile, a `.yaml` or a
+    // `.env.example` is not a grep. This is the case that decides the listing source, and
+    // it is why `tracked_paths` exists.
+    #[test]
+    fn the_scan_reaches_a_file_no_language_pack_claims() {
+        let repo = git_repo(&[
+            ("notes.txt", "needle in plain text\n"),
+            ("config.yaml", "key: needle\n"),
+            ("src/lib.rs", "pub fn f() {}\n"),
+        ]);
+        let res = scan_repo(&repo, "needle", SearchMode::Exact);
+        let mut paths: Vec<&str> = res.spans.iter().map(|s| s.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["config.yaml", "notes.txt"],
+            "the scan must reach files outside the language packs: {:?}",
+            res.degradations
+        );
+    }
+
+    // The same inputs produce the same bytes twice. A scan's order comes from Git's own file
+    // order, and this is the property the retrieval gate and the hybrid's own
     // byte-identity test rely on.
     #[test]
     fn the_scan_is_byte_identical_across_runs() {
@@ -2508,8 +2537,15 @@ mod scan_tests {
     // read in slices and the term is planted across the cut.
     #[test]
     fn a_match_across_a_read_boundary_is_found_once() {
-        // the needle starts 60 bytes in and runs 6, so with a 64-byte cap the cut at 64
-        // lands inside it
+        // The needle runs from byte 60 to 66, and `scan_slice: Some(64)` ends the first
+        // slice at byte 64, so the match straddles the boundary.
+        //
+        // The first version of this test set the BYTE CAP to 64, which is the cap itself,
+        // so the second slice was never read and the match could not be found: the test
+        // failed for a reason that had nothing to do with the carry, and would have passed
+        // with a carry that dropped every straddling match. The fixture now asserts it
+        // really read past the first slice, so the case it claims to cover is the case it
+        // exercises.
         let body = format!("{}needle{}", "x".repeat(60), "\n");
         let repo = git_repo(&[("a.txt", &body)]);
         let res = search(
@@ -2520,9 +2556,16 @@ mod scan_tests {
             &SearchOptions {
                 limit: 50,
                 mode: SearchMode::Exact,
-                scan_bytes: 64,
+                // the slice size, not the cap, is what forces the boundary: the needle
+                // runs 60..66 and the slice ends at 64
+                scan_slice: Some(64),
                 ..Default::default()
             },
+        );
+        assert!(
+            res.bytes_scanned.unwrap() > 64,
+            "the fixture must really read past the first slice, or it proves nothing: {:?}",
+            res
         );
         let found: Vec<&crate::exactscan::Span> =
             res.spans.iter().filter(|s| s.len == 6).collect();
