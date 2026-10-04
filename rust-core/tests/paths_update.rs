@@ -375,3 +375,36 @@ fn a_directory_recreated_without_its_files_named_lists_the_tree() {
     assert_listed(&up, "directory", "recreated directory");
     assert_matches_full_build(r.path(), &[], &up, "recreated directory");
 }
+
+#[test]
+#[cfg(unix)]
+fn a_deleted_tracked_symlink_restored_as_a_file_lists_the_tree() {
+    let r = repo();
+    std::os::unix::fs::symlink("m0.ts", r.path().join("link.ts")).unwrap();
+    git(r.path(), &["add", "link.ts"]);
+    git(r.path(), &["commit", "-qm", "link"]);
+    index("build", r.path(), &[]);
+    fs::remove_file(r.path().join("link.ts")).unwrap();
+    let up = update_paths(r.path(), &[], &["link.ts"]);
+    assert_paths_only(&up, 1, "symlink deleted");
+    assert_matches_full_build(r.path(), &[], &up, "symlink deleted");
+    // the deletion kept the symlink mode, so a regular file in its place is not trusted
+    write(r.path(), "link.ts", &body(31));
+    let up = update_paths(r.path(), &[], &["link.ts"]);
+    assert_listed(&up, "symlink_mode", "symlink restored as a file");
+    assert_matches_full_build(r.path(), &[], &up, "symlink restored as a file");
+}
+
+#[test]
+fn a_renamed_directory_with_a_source_extension_lists_the_tree() {
+    let r = repo();
+    write(r.path(), "src.ts/a.ts", &body(22));
+    write(r.path(), "src.ts/b.ts", &body(23));
+    git(r.path(), &["add", "-A"]);
+    git(r.path(), &["commit", "-qm", "src.ts"]);
+    index("build", r.path(), &[]);
+    fs::rename(r.path().join("src.ts"), r.path().join("lib.ts")).unwrap();
+    let up = update_paths(r.path(), &[], &["src.ts", "lib.ts"]);
+    assert_listed(&up, "directory", "renamed src.ts");
+    assert_matches_full_build(r.path(), &[], &up, "renamed src.ts");
+}
