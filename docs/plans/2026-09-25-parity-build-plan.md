@@ -3205,6 +3205,57 @@ parked and not merged, so this row's `mod.rs` diff was originally cut against a 
 areas` takes `--seed` and `index flows` takes `--limit`, and neither takes the other's.
 §1.7 rule 4 governs a future re-merge and plan-file conflicts keep both sections.
 
+**Implementation record (branch parity/ws-38c, 2026-10-04).**
+
+- **Built.** `rust-core/src/index/flows.rs` (new): `index flows <root>` over the resolved
+  CALLS projection — entry-point scoring, a bounded DFS, dedup, labels, intra/cross
+  classification and truncation stats. `mod.rs`: the dispatcher, `--limit`, `--seed` handling
+  and `USAGE`. `reader.rs`: `resolved_files()`, `exported_by_symbol()`. `tests/flows.rs`: 32
+  tests, every one through the real binary against a disposable Git repository.
+- **Measured.** 32 flows tests pass, box, single run: `logs/ws-38c-run-20261004T042724Z.log`.
+  `BOXALL` on the reviewed head `73b5fda0`: `remote_exit=0`, `clippy_warnings=6` (equal to the
+  merge base), `rss_lines=ok`, 24 Go packages and 21 Rust binaries ok — counted from the saved
+  file, not the helper's stdout: `logs/ws-38c-check-20261004T042957Z.log`.
+- **Deviations, numbered.**
+  1. **Classification uses symbol-level areas, not the file-level communities the section
+     names** (WS-38c-r3-8). A resolved CALL needs an import to exist, so both of its ends
+     always sit in the same file-level component: every flow would classify `intra` and the
+     field would carry no information. `flows.rs` states this where the partition is chosen.
+     The section text is NOT edited to match — which partition the owner wants is theirs.
+  2. **A twelve-name chain answers 10 steps, not the 11 this section's Tests-required line
+     expects** (WS-38c-r3-6). The section's two halves disagree: deliverable 2 sets depth 10,
+     and with the seed counted as the origin rather than a step, a 12-chain reaches 10. The
+     code follows the stated bound.
+  3. **Two files outside the Files list.** `areas.rs` gains `Area::member_nodes`, the full
+     membership beside the rows `MAX_MEMBERS` caps — without it a symbol past 200 has no area
+     and the `u32::MAX` sentinel reads as a second community (round-1 blocker WS-38c-r1-1).
+     `csr.rs` makes `indexed_status_list` `pub(crate)` so the flags and the segment loader
+     cannot drift (round-1 blocker WS-38c-r1-2).
+- **Review.** Round 3 at `reviews/ws-38c/r3`, head `aa42a646`, 13 channel findings across
+  three channels deduplicated to 8; r3-1 fixed in `73b5fda0` with a RED/GREEN pair, six
+  recorded with their evidence. The first triage-check DISAGREE'd and was right on both counts
+  (`triage-check.md`); the corrections are `triage-check-2.md`.
+- **Merge recheck.** Three rule-4 re-merges (last `5764e5ce`, 51 files). Verified by script,
+  not by eye: the plan's heading set is the union of both parents' (118 + 120 → 121, nothing
+  lost from either, no duplicates, zero conflict markers), and the row's own two code files are
+  byte-identical across the last re-merge.
+- **Checks.** `cargo test --release --locked -p xmustard-core --test flows` (32 pass);
+  `xm-box.sh check <wt> all -count=1` (remote_exit=0). **Not run:** `BUD` — owed and recorded
+  as a follow-up, not claimed; `RET`, `PI`, `CAPS`, `SECDOC`, `GOLD` — this row changes no
+  index format, no memory store, no Pi source, no route or gate row, no projection and no
+  `tools/list` byte, so §3.0 names none of them.
+- **Follow-ups.** (1) The `BUD` report this row owes: two partial RSS measurements exist
+  (10,192 KiB at 40 seeds; 32,308 KiB at 98,304 symbols) but neither reaches the shape
+  WS-38c-r3-2 describes, so the retention question is unmeasured rather than answered.
+  Proposed owner: the WS-55 budget workstream. (2) `exported_by_symbol` reads the symbols
+  table through a connection opened after the segment snapshot, so a concurrent index build can
+  return flags from a newer generation (WS-38c-r3-3). Proposed owner: `reader.rs`.
+  (3) `total_paths` omits unselected callers' files, so editing one can leave a stored answer
+  looking current (WS-38c-r3-4). Proposed owner: this row's follow-up, or 38d when freshness
+  gains a caller-side input. (4) The seed does not count toward intra/cross (WS-38c-r3-5):
+  right in principle, but no fixture isolates it because such a seed either has no flow at all
+  or shares an edge with the caller. Proposed owner: whichever row adds the caller-side check.
+
 ### WS-38b — Functional areas: seeded deterministic communities at symbol granularity
 
 **Goal.** The areas half of the WS-38 row above, closing PAR-SYM-08. Communities over the **resolved symbol** projection (CALLS, EXTENDS, IMPLEMENTS), not the file projection WS-38a measured:
