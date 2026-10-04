@@ -403,6 +403,62 @@ func mustCursor(t *testing.T, page map[string]json.RawMessage) []byte {
 	return raw
 }
 
+// The budget's counts rung renames `occurrences` to `occurrences_by_path` and its total
+// rung drops the member entirely. Both leave the handler's signed cursor describing rows
+// the caller never received, so the reconciler must clear it in both shapes: it can no
+// longer say where the list continues, only that it stopped. The existing case above
+// carries an EMPTY `occurrences` beside `occurrences_by_path`, which no rung produces, so
+// it proved the counts path without reaching the guard that does the work.
+func TestReconcileOccurrencePagingClearsTheCursorWhenTheBudgetRenamedOrRemovedTheList(t *testing.T) {
+	const ws, symbol, op = "ws", "Store", "refs"
+	for _, tc := range []struct {
+		name string
+		page string
+	}{
+		{"renamed to occurrences_by_path", `{"total":9,"offset":4,"occurrences_by_path":{"a.go":2},"next_cursor":"9",` +
+			`"output_budget":{"degraded_stage":"counts","stages":["no_snippets","counts"]}}`},
+		{"removed altogether", `{"total":9,"offset":4,"next_cursor":"9",` +
+			`"output_budget":{"degraded_stage":"total","stages":["no_snippets","counts","total"]}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := ReconcileOccurrencePaging(ws, symbol, op, []byte(tc.page))
+			var page map[string]json.RawMessage
+			if err := json.Unmarshal(out, &page); err != nil {
+				t.Fatalf("the reconciled page is not an object: %v", err)
+			}
+			if c, ok := page["next_cursor"]; ok {
+				t.Fatalf("a page whose rows the budget %s kept a cursor %s for rows it never sent: %s",
+					tc.name, c, out)
+			}
+		})
+	}
+	// a tier page has neither member and keeps its own cursor: it is the tier reconciler's
+	// page, and clearing it here would strand the impact tiers
+	tier := `{"by_depth":[{"depth":1,"items":[]}],"next_cursor":"9"}`
+	if got := string(ReconcileOccurrencePaging(ws, symbol, op, []byte(tier))); got != tier {
+		t.Fatalf("a tier page was rewritten: %s", got)
+	}
+}
+
+// The reconciler signs the position the budget's cut reached, and that position is not
+// checked against maxOccurrenceOffset the way signOccurrencePage checks the core's own.
+// Near the ceiling a trimmed page can therefore be handed a cursor the next request's flag
+// parser refuses, so the client pages once and gets an error instead of the rows.
+func TestReconcileOccurrencePagingRefusesToSignACursorOutsideTheReadableWindow(t *testing.T) {
+	const ws, symbol, op = "ws", "Store", "refs"
+	// offset 4999 with two rows kept: the reconciled position is 5001, past the ceiling
+	page := `{"total":99999,"offset":4999,"occurrences":[{"path":"a.go"},{"path":"b.go"}],"next_cursor":"4999",` +
+		`"output_budget":{"degraded_stage":"trimmed","lists":{"occurrences":{"kept":2,"total":9}}}}`
+	out := ReconcileOccurrencePaging(ws, symbol, op, []byte(page))
+	var reconciled map[string]json.RawMessage
+	if err := json.Unmarshal(out, &reconciled); err != nil {
+		t.Fatalf("the reconciled page is not an object: %v", err)
+	}
+	if c, ok := reconciled["next_cursor"]; ok {
+		t.Fatalf("a page past the readable window was signed with %s, which the next request refuses: %s", c, out)
+	}
+}
+
 // The core emits a page's next_cursor only while its end is below maxOccurrenceOffset,
 // so an offset outside that window is a page this build cannot have produced. It is
 // refused rather than signed: signing it hands a client a position the next request's own

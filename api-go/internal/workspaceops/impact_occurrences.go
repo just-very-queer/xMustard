@@ -209,8 +209,13 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 		return out
 	}
 	// The member is the discriminator: an occurrence page is the only impact result
-	// that carries it, and a tier page that does not is left to the tier reconciler.
-	if _, ok := res["occurrences"]; !ok {
+	// that carries `occurrences`, the rung that renamed it, or the ladder's own report
+	// that it ran. The counts rung RENAMES the list and the total rung DROPS it, so a
+	// guard that only knew the original member returned before clearing the cursor on
+	// exactly the rungs that removed the rows the cursor described (WS-59d-r6-1).
+	_, hasList := res["occurrences"]
+	_, hasCounts := res["occurrences_by_path"]
+	if !hasList && !hasCounts && !occurrenceRungsRemovedTheList(res) {
 		return out
 	}
 	next, cut, more, trimmed := occurrencePageOffset(res)
@@ -227,17 +232,50 @@ func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byt
 		// offer, so the client would stop holding rows it never received and had no way
 		// back to them (WS-59d-r5-1). The position is where the budget's cut reached, so
 		// following it resumes exactly where the client's list ended.
-		cursor, err := json.Marshal(signOffset(occurrenceRanking(workspaceID, symbol, op), next))
-		if err != nil {
-			return out
+		//
+		// The position is offset plus the rows delivered, so a page near the ceiling can
+		// reach past maxOccurrenceOffset where the core's own cursor cannot. Signing it
+		// would hand the client a position its next request refuses, so the page is
+		// reconciled without one — the cursor is still cleared, because the rows it
+		// described are gone either way (WS-59d-r6-5).
+		if next >= 0 && next < maxOccurrenceOffset {
+			cursor, err := json.Marshal(signOffset(occurrenceRanking(workspaceID, symbol, op), next))
+			if err != nil {
+				return out
+			}
+			res["next_cursor"] = cursor
 		}
-		res["next_cursor"] = cursor
 	}
 	reconciled, err := json.Marshal(res)
 	if err != nil {
 		return out
 	}
 	return reconciled
+}
+
+// occurrenceRungsRemovedTheList names the rungs that reduce the occurrences list to
+// something other than rows. The total rung drops `occurrences` and leaves nothing but
+// its own stage report behind, so the report is the only trace that this answer was ever
+// an occurrence page. It reads the ladder's rung names rather than inventing a marker, so
+// a rung added to toolbudget is recognised here without a second edit.
+func occurrenceRungsRemovedTheList(res map[string]json.RawMessage) bool {
+	raw, ok := res["output_budget"]
+	if !ok {
+		return false
+	}
+	var report struct {
+		Stages []string `json:"stages"`
+	}
+	if json.Unmarshal(raw, &report) != nil {
+		return false
+	}
+	for _, s := range report.Stages {
+		switch s {
+		case "counts", "total":
+			return true
+		}
+	}
+	return false
 }
 
 // occurrencePageOffset returns where the next page continues after the budget's cut: the
@@ -270,8 +308,16 @@ func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut, more, 
 			} `json:"lists"`
 		} `json:"output_budget"`
 	}
-	if json.Unmarshal(raw, &page) != nil || page.Offset == nil || page.Occurrences == nil {
+	if json.Unmarshal(raw, &page) != nil || page.Offset == nil {
 		return 0, false, false, false
+	}
+	// The counts rung renamed the list and the total rung dropped it, so a page with
+	// neither member is a page whose rows are gone: there is no position to continue
+	// from and the cut is named. Returning early on the missing member instead would let
+	// the caller's own guard decide, and it decides by leaving the cursor in place
+	// (WS-59d-r6-1).
+	if page.Occurrences == nil {
+		return 0, true, page.NextCursor != nil, false
 	}
 	_, counted := res["occurrences_by_path"]
 	if page.Budget != nil && page.Budget.Stage == "trimmed" {
