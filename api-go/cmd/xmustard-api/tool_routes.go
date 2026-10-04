@@ -122,9 +122,17 @@ func impactSinceIndex(w http.ResponseWriter, r *http.Request) {
 	for name := range q {
 		params[name] = q.Get(name)
 	}
-	if err := workspaceops.ResolveImpactCursor(ws, q, params); err != nil {
-		respondError(w, err)
-		return
+	// impact's tier cursor is decoded here, before the form is known, because
+	// CheckImpactRequest must see one page position rather than two (WS-59e). An
+	// occurrence cursor (op=, WS-59d) is a different key over a different list and is
+	// signed and decoded by the occurrence read itself, so it is left for that call:
+	// decoding it here would refuse every valid occurrence cursor as one signed for
+	// another ranking.
+	if q.Get("op") == "" {
+		if err := workspaceops.ResolveImpactCursor(ws, q, params); err != nil {
+			respondError(w, err)
+			return
+		}
 	}
 	form, rest, err := workspaceops.CheckImpactRequest(params)
 	if err != nil {

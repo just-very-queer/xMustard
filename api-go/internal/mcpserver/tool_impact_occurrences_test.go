@@ -53,8 +53,13 @@ func TestTheOccurrenceOperationIsAdvancedAndDocumented(t *testing.T) {
 			t.Fatalf("the docs paragraph does not document %q", member)
 		}
 	}
-	// and none of them grew the lean output schema
-	for _, member := range []string{"occurrences", "next_cursor", "epistemic"} {
+	// and none of the occurrence-only members grew the lean output schema.
+	// has_more and next_cursor are not among them: WS-59e put both in the lean schema
+	// for the blast form's tier paging, so they are now members every paged form shares
+	// and this row does not take them back out — §5.1 rule 9 freezes lean caps downward,
+	// and removing a member the tip added would be a second, unmeasured edit to the same
+	// schema.
+	for _, member := range []string{"occurrences", "epistemic"} {
 		if impactTool.Output[member] != "" {
 			t.Fatalf("%q is listed in the lean output schema; the docs carry it", member)
 		}
