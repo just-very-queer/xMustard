@@ -4,6 +4,11 @@
 # copy arrived microseconds apart and the trap ran once (measured on the box: three
 # SIGINTs in a tight loop, one trap call). That is how the base code looked correct to a
 # shell-based test of WS-FIX-20b.
+#
+# Each delivery also acknowledges itself in `ack`, carrying the count it has seen. The
+# test waits for that acknowledgement rather than for a quiet log, so the observation
+# boundary is the child's own report that it handled the signal, not a timer that a
+# descheduled watcher can outlast (WS-FIX-20b r2).
 import os
 import signal
 import sys
@@ -17,6 +22,10 @@ def note(name):
     seen[0] += 1
     with open(d + "/log", "a") as f:
         f.write("%s %d\n" % (name, seen[0]))
+    with open(d + "/ack", "a") as f:
+        f.write("%s %d\n" % (name, seen[0]))
+        f.flush()
+        os.fsync(f.fileno())
 
 
 signal.signal(signal.SIGINT, lambda s, f: note("INT"))

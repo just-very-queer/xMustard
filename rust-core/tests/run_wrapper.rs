@@ -756,6 +756,12 @@ fn without_forwarding_the_wrapper_becomes_the_command() {
 /// ran **once** (measured on the box: three SIGINTs in a tight loop, one trap call). A
 /// shell-based version of this test passes on the broken code, which is how the first
 /// version of it did.
+///
+/// Linux only. The test asserts the wrapper does NOT relay, and on macOS `signal-hook`
+/// reports a populated sender for a terminal-generated signal, so the double delivery is
+/// there by design and the assertion would be false rather than revealing. `AGENTS.md` runs
+/// `cargo test` on macOS, so the gate is an attribute and not a skip inside the test.
+#[cfg(target_os = "linux")]
 #[test]
 fn one_terminal_keystroke_reaches_the_child_once() {
     // The keystrokes a terminal turns into SIGINT (INTR) and SIGQUIT (QUIT) for its
@@ -767,13 +773,77 @@ fn one_terminal_keystroke_reaches_the_child_once() {
         await_child(&dir.path().join("ready"), dir.path());
         let counted = keystroke_and_count(dir.path(), &mut master, byte);
         release(dir.path());
-        let _ = wait_within(&mut wrapper, 10);
+        // The wrapper must also END: it declines to relay, not to report. Asserting the exit
+        // is what keeps a hung wrapper from passing this test on the count alone.
+        let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
         assert_eq!(
             counted, 1,
             "{name}: the child recorded {counted} copies of the operator's keystroke, so the \
              wrapper relayed the terminal's own"
         );
+        assert_eq!(status.code(), Some(0), "{name}: wrapper status {status:?}");
     }
+}
+
+/// Writes `byte` to the pty master and returns how many deliveries the child acknowledged.
+///
+/// The boundary is the child's own `ack` file, not a quiet period: the child appends and
+/// `fsync`s one line per handled signal, so a line in `ack` means the child has already run
+/// its handler for that delivery. A timer cannot stand in for this — the wrapper's watcher is
+/// an ordinary thread and can be descheduled for longer than any fixed interval, which is
+/// what made the first two versions of this helper able to return a false 1 (r1 codex-spec 2,
+/// r1 OCR 1, r2 codex-spec 3, r2 OCR 1).
+///
+/// Acknowledging the *first* delivery is not enough on its own, because the duplicate this
+/// test exists to catch arrives second: returning there would race the very relay under
+/// test. So the wait has two stages. It first waits for a delivery to be acknowledged — the
+/// terminal's, which is synchronous with the keystroke. It then waits for the wrapper's own
+/// signal watcher to have finished with the signal, which is observable from outside: the
+/// wrapper's watcher forwards or declines, and either way it has then re-armed, so a second
+/// delivery the watcher chose to make would already be in the child's log. `SETTLE_POLLS`
+/// quiet polls AFTER that first acknowledgement is the wait for that decision, and it is the
+/// stage that a descheduled watcher has to survive — which is why it is a bound on the
+/// watcher, not on the keystroke.
+///
+/// The bound is a deadline; on expiry it returns the count the child last acknowledged, the
+/// honest reading at that point. The assertion is `== 1`, so a late duplicate still fails the
+/// test rather than passing it.
+const SETTLE_POLLS: usize = 50;
+const SETTLE_INTERVAL: Duration = Duration::from_millis(40);
+const ACK_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: &[u8]) -> usize {
+    master.write_all(byte).unwrap();
+    master.flush().unwrap();
+    let ack = || {
+        std::fs::read_to_string(dir.join("ack"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .count()
+    };
+    let deadline = std::time::Instant::now() + ACK_TIMEOUT;
+    // Stage 1: the terminal's own copy, which the line discipline delivers to the group.
+    while std::time::Instant::now() < deadline && ack() == 0 {
+        thread::sleep(SETTLE_INTERVAL);
+    }
+    // Stage 2: the wrapper's watcher has had its chance to relay a second one.
+    let mut stable = 0;
+    let mut last = ack();
+    while std::time::Instant::now() < deadline {
+        thread::sleep(SETTLE_INTERVAL);
+        let now = ack();
+        if now == last {
+            stable += 1;
+            if stable >= SETTLE_POLLS {
+                return last;
+            }
+        } else {
+            stable = 0;
+        }
+        last = now;
+    }
+    ack()
 }
 
 /// Writes `byte` to the pty master and returns how many lines the child's log holds after a
