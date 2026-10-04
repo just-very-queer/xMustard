@@ -843,6 +843,12 @@ describe("built-in tool projection through capture", () => {
 	test("the handle scan is per line and linear (r5)", () => {
 		assert.equal(carriesHandle(["[xmustard evidence] no\n[xmustard page] {\"h\":\"xm1.P\"}"]), true);
 		assert.equal(carriesHandle(["[xmustard evidence] no\nxm1.elsewhere"]), false, "a handle on another line is not the tag's");
+		// The `]` is what makes the tag a tag. This row's own first defect was a regex
+		// that could not match the footer it was written for; after round 5 rewrote the
+		// scan, the surviving form of that defect is a tag whose bracket is missing, and
+		// without this case M13 (the `]` dropped from the class) passes.
+		assert.equal(carriesHandle(["[xmustard evidence {\"h\":\"xm1.P\"}"]), false, "an unclosed tag is not the footer");
+		assert.equal(carriesHandle(["[xmustard evidence] {\"h\":\"xm1.P\"}"]), true);
 		const hostile = "[xmustard evidence] ".repeat(200_000);
 		const t0 = Date.now();
 		assert.equal(carriesHandle([hostile]), false);
