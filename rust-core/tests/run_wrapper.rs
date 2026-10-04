@@ -776,21 +776,42 @@ fn one_terminal_keystroke_reaches_the_child_once() {
     }
 }
 
-/// Writes `byte` to the pty master and returns how many lines the child's log holds once
-/// the count stops growing, so a second copy is read rather than raced past.
+/// Writes `byte` to the pty master and returns how many lines the child's log holds after a
+/// **settled** observation, not after the first plateau.
+///
+/// A plateau is not a settle: the wrapper's signal watcher is an ordinary thread, and under
+/// load it can be descheduled for longer than any short quiet interval, so stopping at the
+/// first unchanged count returns before a duplicate relay has been processed — which is the
+/// false green this function exists to avoid. The bound is instead an observation window with
+/// its own convergence rule: the count must hold steady across `SETTLE_QUIET` consecutive
+/// polls, and the window is long enough that a watcher cannot sit on a signal through all of
+/// it, while still ending on a live count so a busy child is not waited on forever. A count
+/// that grows during the window is returned as grown, never as the earlier value.
+const SETTLE_QUIET: usize = 25;
+const SETTLE_POLLS: usize = 300;
+const SETTLE_INTERVAL: Duration = Duration::from_millis(40);
+
 fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: &[u8]) -> usize {
     master.write_all(byte).unwrap();
     master.flush().unwrap();
-    let mut last = usize::MAX;
-    for _ in 0..900 {
-        let n = seen(dir).lines().filter(|l| !l.trim().is_empty()).count();
-        if n > 0 && n == last {
-            return n;
+    let count = || seen(dir).lines().filter(|l| !l.trim().is_empty()).count();
+    let mut stable = 0usize;
+    let mut last = count();
+    for _ in 0..SETTLE_POLLS {
+        thread::sleep(SETTLE_INTERVAL);
+        let now = count();
+        if now == last {
+            stable += 1;
+            if last > 0 && stable >= SETTLE_QUIET {
+                return last;
+            }
+        } else {
+            // It grew (or is still empty), so the previous reading was not the settled one.
+            stable = 0;
         }
-        last = n;
-        thread::sleep(Duration::from_millis(20));
+        last = now;
     }
-    seen(dir).lines().filter(|l| !l.trim().is_empty()).count()
+    count()
 }
 
 /// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
@@ -898,7 +919,9 @@ fn only_a_signal_with_a_sender_is_relayed() {
         "a terminal-generated signal has no sender and must not be relayed"
     );
     assert!(
-        !xmustard_core::run_wrapper::relay_origin(Some(0)),
-        "a sender of 0 means the field was not filled, which is the same as no sender"
+        xmustard_core::run_wrapper::relay_origin(Some(0)),
+        "a filled field naming pid 0 cannot be distinguished from a sender on a platform \
+         that ignores si_code, so it is relayed: a dropped timeout orphans the child, which \
+         is worse than a duplicated Ctrl-C"
     );
 }
