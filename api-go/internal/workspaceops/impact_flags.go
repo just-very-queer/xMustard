@@ -313,19 +313,14 @@ func ImpactFlags(form ImpactForm, params map[string]string) ([]string, error) {
 	return out, nil
 }
 
-// checkOccurrenceArgs refuses a cursor that pages a list the request has none, and a
-// cursor beside the tier paging it would silently shadow: op= pages occurrences with
-// the cursor, without op= the tiers page with offset (PAR-IMP-03, PAR-CTX-05). A
+// checkOccurrenceArgs refuses a cursor beside the tier paging it would shadow. Both the
+// tiers and the occurrences page with a cursor (WS-59e gave the tiers one, WS-59d the
+// occurrences), and each is signed with its own key over its own ranking, so a cursor and
+// an offset on one request name two different lists and one of them would be ignored. A
 // refused pair is never silently resolved (§5.1 rule 7).
 func checkOccurrenceArgs(form ImpactForm, params map[string]string) error {
-	if form != ImpactBlast || params["cursor"] == "" {
+	if form != ImpactBlast || params["cursor"] == "" || params["offset"] == "" {
 		return nil
 	}
-	if params["op"] == "" {
-		return fmt.Errorf("cursor pages a list; impact %s pages its tiers with offset: %w", form, ErrInvalidInput)
-	}
-	if params["offset"] != "" {
-		return fmt.Errorf("cursor and offset page different lists; pass one: %w", ErrInvalidInput)
-	}
-	return nil
+	return fmt.Errorf("cursor and offset page different lists; pass one: %w", ErrInvalidInput)
 }

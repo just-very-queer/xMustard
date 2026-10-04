@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"encoding/json"
+	"net/url"
 	"slices"
 	"strings"
 	"testing"
@@ -37,9 +38,14 @@ func TestImpactFlagsForwardsTheOccurrenceOperation(t *testing.T) {
 	if err := notBlank(" "); err == nil {
 		t.Fatal("a blank cursor was accepted")
 	}
-	// a cursor pages the occurrence list, so it only travels with op=
-	if _, err := ImpactFlags(ImpactBlast, map[string]string{"cursor": "x"}); !IsInvalidInput(err) {
-		t.Fatalf("cursor without op: want invalid input, got %v", err)
+	// A cursor alone pages whichever list the form walks: WS-59e gave the tiers one, so
+	// refusing a cursor that carries no op= would refuse the tiers' own second page. The
+	// pair is what cannot be honoured, because each cursor names a different list.
+	if _, err := ImpactFlags(ImpactBlast, map[string]string{"cursor": "x"}); err != nil {
+		t.Fatalf("a cursor alone pages the tiers (WS-59e): %v", err)
+	}
+	if _, err := ImpactFlags(ImpactBlast, map[string]string{"offset": "5", "cursor": "abc"}); !IsInvalidInput(err) {
+		t.Fatalf("an offset beside a cursor: want invalid input, got %v", err)
 	}
 	for _, form := range []ImpactForm{ImpactTrace, ImpactFile, ImpactChanges, ImpactSinceIndex} {
 		if _, err := ImpactFlags(form, map[string]string{"op": "refs"}); !IsInvalidInput(err) {
@@ -48,6 +54,30 @@ func TestImpactFlagsForwardsTheOccurrenceOperation(t *testing.T) {
 		if _, err := ImpactFlags(form, map[string]string{"cursor": "abc"}); !IsInvalidInput(err) {
 			t.Fatalf("%s took cursor: %v", form, err)
 		}
+	}
+}
+
+// op= selects between the tier walk and the occurrence read, so it is part of the tier
+// ranking key: a cursor signed for the tiers must not page an occurrence request, or one
+// occurrence list's cursor would continue the other. The occurrence cursor has its own
+// key and codec, so this binds only the tier side.
+func TestATierCursorIsBoundToTheOperationItWasSignedFor(t *testing.T) {
+	walk := url.Values{"symbol": {"Store"}, "limit": {"2"}}
+	c := ImpactCursor("ws", walk)(4)
+	if _, err := DecodeImpactCursor("ws", walk, c); err != nil {
+		t.Fatalf("the cursor does not decode for the walk it was signed for: %v", err)
+	}
+	// the same request with op= is a different list, so the walk's cursor is refused
+	occurrences := url.Values{"symbol": {"Store"}, "limit": {"2"}, "op": {"refs"}}
+	if _, err := DecodeImpactCursor("ws", occurrences, c); !IsInvalidInput(err) {
+		t.Fatalf("a walk cursor paged the occurrence read: %v", err)
+	}
+	// and one signed with op= does not page the walk, which is the reverse direction
+	if n, err := DecodeImpactCursor("ws", occurrences, ImpactCursor("ws", occurrences)(4)); err != nil || n != 4 {
+		t.Fatalf("an occurrence ranking does not sign its own cursor: %d %v", n, err)
+	}
+	if _, err := DecodeImpactCursor("ws", walk, ImpactCursor("ws", occurrences)(4)); !IsInvalidInput(err) {
+		t.Fatalf("an occurrence cursor paged the walk: %v", err)
 	}
 }
 
@@ -215,13 +245,16 @@ func TestReconcileOccurrencePagingFollowsWhatTheCallerReceivedAndNamesARemovedLi
 	// answer carries no cursor at all and names the cut
 	counts := `{"total":9,"offset":4,"occurrences":[],"occurrences_by_path":{"a.go":2},"next_cursor":"9"}`
 	out = ReconcileOccurrencePaging(ws, symbol, op, []byte(counts))
-	if err := json.Unmarshal(out, &page); err != nil {
+	// a fresh map, because Unmarshal merges into a map that already holds keys and the
+	// cursor from the case above would read as this page's own
+	var countsPage map[string]json.RawMessage
+	if err := json.Unmarshal(out, &countsPage); err != nil {
 		t.Fatal(err)
 	}
-	if c, ok := page["next_cursor"]; ok {
+	if c, ok := countsPage["next_cursor"]; ok {
 		t.Fatalf("a counts-only page kept a cursor %s: %s", c, out)
 	}
-	if string(page["truncated"]) != `"occurrences_removed"` {
+	if string(countsPage["truncated"]) != `"occurrences_removed"` {
 		t.Fatalf("a counts-only page does not name its cut: %s", out)
 	}
 
