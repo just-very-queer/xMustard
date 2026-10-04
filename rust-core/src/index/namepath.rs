@@ -15,6 +15,7 @@
 //! still hashes to its indexed blob, never on a secret path, and credential-shaped words
 //! are masked as snippets mask them.
 
+use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
@@ -361,9 +362,17 @@ pub fn children(
 #[derive(Default)]
 pub struct Texts {
     files: HashMap<i64, Result<String, &'static str>>,
+    /// The most files this cache has held at once, so a caller can assert the bound it
+    /// paid for instead of trusting it (WS-59d-r5-2).
+    peak: usize,
 }
 
 impl Texts {
+    /// The most files held at once since this cache was made.
+    pub fn peak_files(&self) -> usize {
+        self.peak
+    }
+
     /// The text of the file behind `s`, while it still hashes to its indexed blob.
     pub fn of(&mut self, root: &Path, s: &Symbol) -> Result<&str, &'static str> {
         self.file(root, s.row.file_id, &s.path, &s.row.content_hash)
@@ -377,11 +386,22 @@ impl Texts {
         path: &str,
         blob: &str,
     ) -> Result<&str, &'static str> {
-        self.files
-            .entry(id)
-            .or_insert_with(|| read_indexed(root, path, blob))
-            .as_deref()
-            .map_err(|e| *e)
+        // entry() rather than contains_key then insert: the second lookup would read the
+        // file twice on a miss, and the borrow of the vacant slot ends with the block, so
+        // the peak is measured once, after the insert (WS-59d-r5-2)
+        if let Entry::Vacant(slot) = self.files.entry(id) {
+            slot.insert(read_indexed(root, path, blob));
+        }
+        self.peak = self.peak.max(self.files.len());
+        self.files[&id].as_deref().map_err(|e| *e)
+    }
+
+    /// Forgets `id` once its last row has been read. A caller paging over many rows in
+    /// order can hold one file at a time instead of every file the page touched: a page
+    /// of `impact::MAX_LIMIT` rows, each in its own file, would otherwise retain
+    /// limit whole files for the life of the call (WS-59d-r5-2).
+    pub fn forget(&mut self, id: i64) {
+        self.files.remove(&id);
     }
 }
 

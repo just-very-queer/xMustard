@@ -159,7 +159,7 @@ func (s *groundingSession) buildSessions(ctx context.Context, dataDir, workspace
 			return err
 		}
 		main := mainSessions(sessions)
-		view, err := pendingRanking(ctx, r, workspaceID)
+		view, err := pendingRanking(ctx, r, workspaceID, caller, ScopeRequest{})
 		if err != nil {
 			return err
 		}
@@ -220,7 +220,7 @@ func HookSessionHandoff(ctx context.Context, dataDir, workspaceID, principal, ke
 		if err != nil {
 			return err
 		}
-		view, err := pendingRanking(ctx, r, workspaceID)
+		view, err := pendingRanking(ctx, r, workspaceID, principal, ScopeRequest{})
 		if err != nil {
 			return err
 		}
@@ -293,11 +293,54 @@ func (p handoffPick) handoff(ctx context.Context, r govstore.Reader, root, works
 	if h.Handles, err = recentHandles(ctx, r, workspaceID, from.ID, now); err != nil {
 		return nil, err
 	}
-	h.PendingProposals = awaitingVerifier(pending, from.Principal, snap.PendingProposals)
+	// The pending titles go into the session this handoff lands in, so they are filtered
+	// to ITS principal here rather than by whoever read the ranking above: a private,
+	// run- or session-scoped proposal of another principal is not handed over (WS-29b,
+	// round 3, r3-8). The session's own key is the run or session scope key it holds.
+	scoped := pendingForPrincipal(pending, from.Principal, ScopeRequest{RunID: from.ExecutionKey})
+	h.PendingProposals = awaitingVerifier(scoped, from.Principal, snap.PendingProposals)
+	// The snapshot was built (or stored) against the SESSION's principal, and the
+	// pending titles below were filtered to it too, but the handoff lands in the
+	// CALLER's session. When the two differ — a prior session of another principal,
+	// which priorRank deliberately offers — the goal, next step, decision titles,
+	// proposal titles and proposal bodies inside them are that principal's private
+	// content and must not cross (round 4, r4-1). What stays is the shape of the
+	// session: its ids, handles, files and failures, which are the caller's own facts
+	// and the reason a handoff exists.
+	if !samePrincipal(from.Principal, p.principal) {
+		h.Snapshot = snapshotAcrossPrincipals(snap)
+		h.PendingProposals = nil
+	}
 	if _, row, ok := sessionCapsule(ctx, r, workspaceID, key, false); ok {
 		h.Capsule, _ = capsuleRecord(ctx, r, root, workspaceID, row)
 	}
 	return h, nil
+}
+
+// snapshotAcrossPrincipals drops the agent-written text of a snapshot read for a
+// principal that is not its own. It copies rather than edits, so the stored snapshot
+// the next session of the real owner restores is unchanged.
+func snapshotAcrossPrincipals(s *SessionSnapshot) *SessionSnapshot {
+	if s == nil {
+		return nil
+	}
+	out := *s
+	out.Goal, out.NextStep = "", ""
+	out.Decisions, out.PendingProposals = nil, nil
+	return &out
+}
+
+// pendingForPrincipal keeps the pending entries a principal may see in its own handoff.
+// awaitingVerifier then narrows that to what still needs a distinct verifier, so the
+// scope filter runs on the list rather than on the ids that survive it.
+func pendingForPrincipal(pending []govstore.RankEntry, principal string, req ScopeRequest) []govstore.RankEntry {
+	out := pending[:0]
+	for _, e := range pending {
+		if ScopesVisible(e.Scope, e.ScopeKey, e.Author, principal, req) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 // SnapshotText is the handoff's snapshot as a SessionStart hook injects it: the

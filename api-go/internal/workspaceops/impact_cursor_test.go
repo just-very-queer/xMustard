@@ -290,6 +290,10 @@ func nextValue(check func(string) error, current string) string {
 	values := append([]string{}, ChangeScopes...)
 	values = append(values, "upstream", "downstream")
 	values = append(values, RelationTypes...)
+	// op= (WS-59d) is a closed set the blast form already declares, so its values are
+	// walked beside the others rather than hand-copied: a parameter with no value here is
+	// reported as unproven, which is how this row's op was first caught.
+	values = append(values, OccurrenceOps...)
 	values = append(values, "7", "1", "true", "false", "go", "/tmp/x", "0.5", "50", "2")
 	for _, v := range values {
 		if v != current && check(v) == nil {
