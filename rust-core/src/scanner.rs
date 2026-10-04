@@ -5,6 +5,8 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use walkdir::{DirEntry, WalkDir};
 
+use crate::symbolgraph::SourceReadFailure;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
 pub struct RustEvidenceRef {
     pub path: String,
@@ -78,26 +80,33 @@ pub fn scan_repo_signals(root_path: &Path) -> Result<SignalScan, std::io::Error>
         if !should_scan_file(&relative) {
             continue;
         }
-        reason = match (
-            files_read >= MAX_SIGNAL_FILES,
-            bytes_read >= MAX_SIGNAL_BYTES,
-        ) {
-            (true, _) => Some(format!(
+        if files_read >= MAX_SIGNAL_FILES {
+            reason = Some(format!(
                 "read {files_read} files, the scan's file bound ({MAX_SIGNAL_FILES}); later files by name were not scanned"
-            )),
-            (_, true) => Some(format!(
-                "read {bytes_read} bytes, the scan's byte bound ({MAX_SIGNAL_BYTES}); later files by name were not scanned"
-            )),
-            _ => None,
-        };
-        if reason.is_some() {
+            ));
             break;
         }
-        // shared bounded, no-follow, regular-file-checked reader: over-cap, symlinked,
-        // non-UTF-8 or vanished files are skipped rather than read raw.
-        let content = match crate::symbolgraph::read_repo_file_beneath(root_path, &relative) {
-            Ok(content) => content,
-            Err(_) => continue,
+        // shared bounded, no-follow, regular-file-checked reader, capped at what is
+        // left of the byte bound: a file is sized before it is read, so the scan never
+        // reads past MAX_SIGNAL_BYTES. Over-cap, symlinked, non-UTF-8 or vanished files
+        // are skipped rather than read raw.
+        let left = (MAX_SIGNAL_BYTES - bytes_read) as u64;
+        let read = crate::symbolgraph::read_source_beneath(
+            root_path,
+            Path::new(&relative),
+            crate::symbolgraph::MAX_REPO_FILE_BYTES.min(left),
+        );
+        let content = match read.map(String::from_utf8) {
+            Ok(Ok(content)) => content,
+            Err(SourceReadFailure::Oversized(n))
+                if n <= crate::symbolgraph::MAX_REPO_FILE_BYTES =>
+            {
+                reason = Some(format!(
+                    "read {bytes_read} bytes; the next file ({n} bytes) passes the scan's byte bound ({MAX_SIGNAL_BYTES}); later files by name were not scanned"
+                ));
+                break;
+            }
+            _ => continue,
         };
         files_read += 1;
         bytes_read += content.len();
@@ -286,6 +295,26 @@ mod tests {
             !signals.iter().any(|s| s.file_path == "big.py"),
             "an over-cap file was read without the shared bound"
         );
+    }
+
+    /// Nine 8,000,000-byte files: eight fit the 64 MiB byte bound, the ninth does not
+    /// and is never read.
+    #[test]
+    fn the_byte_bound_stops_before_a_file_that_does_not_fit() {
+        let dir = tempfile::TempDir::new().unwrap();
+        for i in 0..9 {
+            let mut body = format!("# TODO marker {i}\n").into_bytes();
+            body.resize(8_000_000, b' ');
+            fs::write(dir.path().join(format!("f{i}.py")), body).unwrap();
+        }
+        let scan = scan_repo_signals(dir.path()).unwrap();
+        assert_eq!((scan.files_read, scan.truncated), (8, true), "{scan:?}");
+        assert!(
+            scan.reason.as_deref().unwrap().contains("byte bound"),
+            "{:?}",
+            scan.reason
+        );
+        assert!(!scan.signals.iter().any(|s| s.file_path == "f8.py"));
     }
 
     #[test]
