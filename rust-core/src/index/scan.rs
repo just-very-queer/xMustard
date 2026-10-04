@@ -330,7 +330,7 @@ fn head(root: &Path) -> String {
 /// arrives. The output is never held whole. Git is killed once it has run for
 /// `git_timeout` not counting the time `on_record` takes (Git only waits on the pipe
 /// then), so slow record handling never fails the listing.
-fn stream_git_records(
+pub(crate) fn stream_git_records(
     root: &Path,
     args: &[&str],
     mut on_record: impl FnMut(&[u8]),
