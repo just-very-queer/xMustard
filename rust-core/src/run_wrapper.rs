@@ -34,7 +34,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -287,6 +287,11 @@ fn name_of(sig: i32) -> &'static str {
 /// the open file description, so the flag applied to the wrapper's own stderr and to the
 /// child's inherited one, and it stayed changed after the write (codex-review P1). A reporter
 /// thread needs neither, so the trap has nowhere to appear.
+/// States what the watcher decided about one signal and whether the child actually got it.
+///
+/// Three outcomes, not two, because a decision to relay is not the same as a delivery
+/// (codex-spec, round 5): the decision can be to relay, the delivery can still fail, and an
+/// operator reading "forwarded" for a child that kept running is told the opposite of the truth.
 fn report(sig: i32, relayed: bool) {
     let decision = match relayed {
         true => "forwarded",
@@ -316,8 +321,24 @@ struct Report {
 /// as the wrapper lives, which is the point — it is a thread nobody is waiting on.
 fn write_best_effort(line: String) {
     let (sender, _) = REPORTS.get_or_init(spawn_reporter);
-    let _ = sender.try_send(Report { line, ack: false });
+    if sender.try_send(Report { line, ack: false }).is_err() {
+        // Never silent: a line lost to a full queue means the operator is missing a decision,
+        // and the count is what makes that visible rather than merely possible (codex-spec,
+        // round 5). Counting is not blocking, so the watcher still cannot be held up.
+        let lost = DROPPED_REPORTS.fetch_add(1, Ordering::SeqCst) + 1;
+        // One line per burst, not one per drop, and this line is written with `eprintln!` on the
+        // caller's own stderr — a full queue means the reporter is behind, not that stderr is
+        // broken, so this write is the one thing that still reaches an operator.
+        if REPORTED_DROPS.swap(lost, Ordering::SeqCst) != lost {
+            eprintln!("xmustard run: {lost} decision report(s) dropped: the stderr reader is slow");
+        }
+    }
 }
+
+/// How many decision reports the queue has refused, and how many of those the operator has been
+/// told about.
+static DROPPED_REPORTS: AtomicU64 = AtomicU64::new(0);
+static REPORTED_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Starts the reporter thread and returns the two ends the watcher needs.
 fn spawn_reporter() -> (mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>) {
@@ -508,9 +529,29 @@ impl Forwarder {
                     // diagnostic, so a stderr whose reader has stopped may cost the diagnostic
                     // but never the signal: reporting first would let a full pipe swallow a
                     // client's timeout and orphan the child (WS-FIX-20c-r1-1).
-                    let _ = rustix::process::kill_process(child, sig);
+                    //
+                    // ESRCH is the normal race at exit and is not a delivery. Anything else
+                    // means the child was NOT signalled — EPERM after it changed credentials, or
+                    // an EINTR the watcher loop will not retry — and reporting that as forwarded
+                    // would tell an operator the opposite of what happened (codex-spec, round 5).
+                    let delivered = match rustix::process::kill_process(child, sig) {
+                        Ok(()) => true,
+                        // The child is gone, which is the ordinary end of a run rather than a
+                        // failure to relay.
+                        Err(rustix::io::Errno::SRCH) => false,
+                        Err(e) => {
+                            eprintln!(
+                                "xmustard run: could not signal the child ({} {}): {e}",
+                                name_of(raw),
+                                if shares_group { "grouped" } else { "single" },
+                            );
+                            false
+                        }
+                    };
+                    report(raw, relayed && delivered);
+                } else {
+                    report(raw, false);
                 }
-                report(raw, relayed);
             }
         });
         Some((handle, watcher))
