@@ -238,9 +238,6 @@ pub struct Snapshot {
     files: Files,
     root: PathBuf,
     clusters: OnceLock<Result<Communities, String>>,
-    /// The file community ranks alone, shared by `community_ranks()` with every reader that
-    /// only needs the partition and not the membership.
-    community_ranks: OnceLock<Result<Vec<u32>, String>>,
     /// The `exported` flag of every symbol, in dense symbol order (WS-38c).
     exported: OnceLock<Result<Vec<bool>, String>>,
     /// The import-cycle report (PAR-IMP-08), computed on first use.
@@ -269,7 +266,6 @@ impl Snapshot {
                 root: root.to_path_buf(),
                 seg,
                 clusters: OnceLock::new(),
-                community_ranks: OnceLock::new(),
                 exported: OnceLock::new(),
                 cycles: OnceLock::new(),
                 db: loc.db.clone(),
@@ -294,19 +290,6 @@ impl Snapshot {
         self.cycles
             .get_or_init(|| super::cycles::compute(self))
             .as_ref()
-            .map_err(Clone::clone)
-    }
-
-    /// The community rank of each file, from the file-level label propagation.
-    ///
-    /// A reader that only needs the partition reads the rank rather than the membership
-    /// list `communities()` builds, so the shared computation is the same and only the
-    /// projection differs. WS-38c classified flows against this partition and stopped:
-    /// see `flows.rs`'s `area_by_symbol`, which says why a resolved call cannot cross one.
-    pub fn community_ranks(&self) -> Result<&[u32], String> {
-        self.community_ranks
-            .get_or_init(|| Communities::compute(&self.seg).map(|c| c.rank_of))
-            .as_deref()
             .map_err(Clone::clone)
     }
 

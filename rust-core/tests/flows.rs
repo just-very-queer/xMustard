@@ -962,27 +962,27 @@ fn a_flow_explores_at_most_four_siblings_per_node() {
     );
 }
 
-/// No walk can reach [`MAX_STEPS_LISTED`], so that cap and its counter are dead today.
+/// The step-listing cap is reachable, and what stops a walk from growing is the SEED cap.
 ///
-/// The listing cap is the one bound a chain or a fan cannot reach. A walk's size is bounded
-/// by the two others together: a node is expanded once per distinct strictly-decreasing
-/// depth in `0..=max_depth`, and each expansion contributes at most `max_branching` new
-/// steps, so a whole walk holds at most `1 + max_branching * (max_depth + 1)` steps. At
-/// `MAX_BRANCHING` 4 and `MAX_DEPTH` 10 that is 45 — five short of 50, and the gap is
-/// structural rather than a property of this fixture.
+/// An earlier version of this file asserted the opposite — that no walk could reach
+/// `MAX_STEPS_LISTED`, on the arithmetic `1 + MAX_BRANCHING * (MAX_DEPTH + 1)` = 45. That
+/// bound does not hold: `expanded_at` permits a symbol to be expanded once per distinct
+/// SHORTER depth, so the number of expansions is not capped by `MAX_DEPTH` and a wide tree
+/// reaches far past 50. `a_flow_lists_at_most_fifty_steps_and_counts_the_rest` is the fixture
+/// that shows it, and on the box it walks 340 steps from its root, lists 50 and reports 290
+/// omitted (logs/ws-38c-run-20261004T022134Z.log). The two tests were not contradicting each
+/// other on the bound; they used different trees, and the assertion that looked structural
+/// was passing because of the other cap below.
 ///
-/// Mutation row M7 changed `label_of(&all_steps, &seeds)` back to `label_of(&steps, &seeds)`
-/// and survived every test, which is the correct outcome for a mutation that cannot change
-/// an answer. Rather than grow a fixture until a 46th step exists, this test measures the
-/// bound and states it, so the next reader sees why the row is equivalent and what would
-/// have to change for it not to be: `MAX_BRANCHING` above 4, or a walk that revisits a node
-/// at equal depth.
-///
-/// The fixture is the widest tree that still resolves — one file, one package, every node
-/// fanning to four children for four levels — so it exercises the re-expansion path rather
-/// than a chain, which would reach ten steps and prove nothing about the bound.
+/// What this fixture actually measures is the interaction with [`MAX_CANDIDATES`]: a 4-ary
+/// tree deep enough to be wide also has more symbols than the 200-seed cap admits, so the
+/// deep levels never become seeds and the widest walk a seed produces stops well short of 50.
+/// That is a real property of the answer, and it is the one worth pinning — a reader who
+/// wants to know why a large repository's flows look narrow should find it here rather than
+/// infer it. It is also what made mutation row M7 equivalent: with no walk over 50 steps
+/// here, swapping `label_of(&all_steps, …)` for `label_of(&steps, …)` cannot change a label.
 #[test]
-fn no_walk_reaches_the_step_listing_cap_at_the_depth_and_branching_caps() {
+fn the_widest_walk_a_seed_makes_stops_short_of_the_listing_cap_when_the_seed_cap_bites() {
     let mut src =
         String::from("package pkg\n\nfunc WideRoot() { Lvl1a(); Lvl1b(); Lvl1c(); Lvl1d() }\n");
     let mut level = vec![
@@ -1012,28 +1012,34 @@ fn no_walk_reaches_the_step_listing_cap_at_the_depth_and_branching_caps() {
     let v = flows(d.path(), &[]);
     let fs = read_flows(&v);
     assert!(!fs.is_empty(), "the fan must produce a flow: {v:#}");
-    // The walk really is re-expanding rather than stopping at the first route, so the bound
-    // below is a bound on the walk and not on a truncated fixture: more than one flow means
-    // more than one seed reached the tree, and the widest one is a real multi-level walk.
     let widest = fs.iter().map(|f| f.steps.len()).max().unwrap();
+    // The walk is a real multi-level one rather than a truncated fixture: more than one flow
+    // means more than one seed reached the tree, and the widest one is the root's.
     assert!(
         widest >= 8,
         "the fan reaches a walk of at least eight steps, so the re-expansion path ran: {fs:?}"
     );
-    // The structural bound, from the two caps that actually fire. Written as the arithmetic
-    // rather than a literal so a change to either cap is visible here instead of turning
-    // this into a test that passes for the wrong reason.
+    // The tree is wide enough that the seed cap, not the listing cap, is what bounds the
+    // answer here. Asserted rather than assumed: this is the condition under which the
+    // listing cap stays unobserved, and without it the assertion below proves nothing.
+    let dropped = truncation(&v)["dropped_candidates"];
+    assert!(
+        dropped > 0,
+        "this tree must exceed the 200-seed cap, or the walk is bounded by something else: {:?}",
+        truncation(&v)
+    );
     assert!(
         widest < 50,
-        "no walk reaches MAX_STEPS_LISTED at MAX_BRANCHING 4 and MAX_DEPTH 10 \
-         (bound 1 + 4 * 11 = 45); the widest here was {widest} in {fs:?}"
+        "with the seed cap biting, no seed's walk reaches MAX_STEPS_LISTED; the widest here \
+         was {widest} in {fs:?}"
     );
-    // And therefore the truncation counter beside the cap is zero, which is what makes
-    // mutation row M7 equivalent rather than merely unobserved.
+    // And therefore the truncation counter beside the cap is zero ON THIS FIXTURE, which is
+    // what makes mutation row M7 equivalent rather than merely unobserved. The cap itself is
+    // not dead: the other fixture in this file walks past it.
     assert_eq!(
         truncation(&v)["truncated_step_lists"],
         0,
-        "the listing cap never fires at these bounds: {:?}",
+        "no seed's step list is capped on this fixture: {:?}",
         truncation(&v)
     );
     for f in &fs {

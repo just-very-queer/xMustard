@@ -39,13 +39,14 @@ pub const MIN_STEPS: usize = 3;
 pub const MAX_FLOWS: usize = 200;
 /// Steps listed per flow.
 ///
-/// No walk can reach this cap at the other two bounds. A node is expanded once per
-/// distinct strictly-decreasing depth in `0..=MAX_DEPTH`, so it contributes at most
-/// `MAX_BRANCHING` new steps per depth and a whole walk at most
-/// `1 + MAX_BRANCHING * (MAX_DEPTH + 1)` = 45 steps. The cap is still applied, because it
-/// is the stated bound and raising `MAX_BRANCHING` must not silently change what a reader
-/// is promised, but at today's caps it never fires and the truncation counter beside it is
-/// always zero. Mutation row M7 measures this rather than assuming it.
+/// A listing bound, not a walk bound: the walk behind it can be much longer. `expanded_at`
+/// lets a symbol be expanded once per distinct SHORTER depth, so the number of expansions is
+/// not bounded by `MAX_DEPTH` and a wide tree reaches far past this cap — the root of a
+/// 4-ary fixture walks 340 steps and lists 50 here
+/// (`a_flow_lists_at_most_fifty_steps_and_counts_the_rest`). What the walk does NOT do is grow
+/// with the repository: `MAX_CANDIDATES` bounds the seeds and each seed's walk is bounded by
+/// the depth, branching and re-expansion rules, so the retained step list stays small. The
+/// steps past this cap are counted in `truncated_step_lists` rather than dropped in silence.
 pub const MAX_STEPS_LISTED: usize = 50;
 /// Steps that must share a name prefix before it is a flow's label.
 pub const LABEL_MIN_MEMBERS: usize = 2;
