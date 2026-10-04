@@ -404,7 +404,16 @@ func ProposeContext(dataDir, workspaceID string, req ProposeContextRequest) (*Co
 	if err != nil {
 		return nil, err
 	}
-	review := reviewInput{workspaceID: workspaceID, scope: scoped.Scope, scopeKey: scoped.Key,
+	// A run or session scope key is ASSERTED by the caller, and two principals can hold
+	// the same run id, so which principals may name one is an operator setting and its
+	// default trusts nobody (owner decision 2026-10-03). The check runs after the
+	// derivation so a workspace-scoped write with a provenance run id is untouched, and
+	// a refusal is audited so the operator sees an agent reaching for another run
+	// (round 3, r3-3).
+	if err := checkRunKeyTrust(dataDir, workspaceID, source, scoped); err != nil {
+		return nil, err
+	}
+	review := reviewInput{workspaceID: workspaceID, scope: scoped.Scope, scopeKey: scoped.Key, author: source,
 		content: req.Content, declared: declared, anchors: extracted,
 		claims: claims, intent: len(supersedes)+len(claims)+len(relations) > 0, quarantine: caller.Quarantine,
 		kind: req.Kind, topic: normalizeTopic(req.Topic), tags: cleanPaths(req.Tags), expires: strings.TrimSpace(req.Expires),
@@ -666,10 +675,19 @@ func pendingSupersedes(e govstore.Entry) []string {
 // applySupersession runs when e is promoted: every entry it names that is still active
 // becomes superseded by it, atomically with the promotion, and the pending intent is
 // cleared so a later restore of an old entry is not undone by the next vote.
+//
+// The entry e replaces must be one e's own scope and author admit. The supersedes list
+// is a payload field, so without this check a caller could name another principal's
+// private entry and the report would both retire it and name it back (WS-29b, round 3,
+// r3-6: a report that names a private entry is a disclosure of the same class as r3-1).
 func applySupersession(ctx context.Context, tx govstore.Tx, e govstore.Entry, actor govstore.Actor) error {
 	olds := pendingSupersedes(e)
 	if len(olds) == 0 {
 		return nil
+	}
+	req := ScopeRequest{RunID: e.ScopeKey, SessionID: e.ScopeKey}
+	if e.Scope == ScopeDir {
+		req.Dir = e.ScopeKey
 	}
 	var live []string
 	for _, id := range olds {
@@ -677,9 +695,13 @@ func applySupersession(ctx context.Context, tx govstore.Tx, e govstore.Entry, ac
 		if err != nil {
 			return err
 		}
-		if old.WorkspaceID == e.WorkspaceID && old.Lifecycle == govstore.LifecycleActive {
-			live = append(live, id)
+		if old.WorkspaceID != e.WorkspaceID || old.Lifecycle != govstore.LifecycleActive {
+			continue
 		}
+		if !ScopesVisible(old.Scope, old.ScopeKey, old.Source, e.Source, req) {
+			return fmt.Errorf("%w: supersedes %s is not a memory this principal may replace", ErrInvalidInput, id)
+		}
+		live = append(live, id)
 	}
 	if len(live) > 0 {
 		if err := tx.Supersede(ctx, govstore.SupersedeInput{NewID: e.ID, OldIDs: live,
@@ -731,6 +753,20 @@ type RememberRequest struct {
 	// SessionID is the session a handoff capsule (kind handoff) is stored under: an
 	// execution key, or the id of an MCP session (HandoffSessionKey).
 	SessionID string `json:"session_id,omitempty"`
+	// ScopeRunID and ScopeSessionID are the SCOPE keys, which are not the provenance
+	// keys above and are named separately so the decoder cannot shadow one with the
+	// other. Go's JSON decoder takes the shallower field, so a body carrying both
+	// `run_id` and `scope_run_id` fills provenance and scope independently; without
+	// these, an HTTP remember with visibility=run was REFUSED because the outer
+	// provenance run_id populated and the embedded scope key stayed empty
+	// (round 3, r3-2: round 1's fix copied the provenance key across and round 2
+	// proved that wrong, so the two need separate names rather than one field).
+	ScopeRunID     string `json:"scope_run_id,omitempty"`
+	ScopeSessionID string `json:"scope_session_id,omitempty"`
+	// ScopeDir is the directory a dir-scoped memory is derived from, repo-relative and
+	// confined to the workspace. `dir` is unambiguous over HTTP (no provenance field
+	// shadows it), and scope_dir names it explicitly for a caller that sends both.
+	ScopeDir string `json:"scope_dir,omitempty"`
 }
 
 var rememberOps = map[string]func(dataDir, workspaceID string, req RememberRequest, actor ContextActor) (*ContextEntry, error){
@@ -761,15 +797,24 @@ var rememberOps = map[string]func(dataDir, workspaceID string, req RememberReque
 }
 
 // proposal is the proposal a propose or supersede op makes: the request with its
-// one-line description. The outer RunID and SessionID are PROVENANCE: they name the
-// run or session a write came from and are recorded on the entry either way. They are
-// deliberately not carried across as the scope keys, because remember's run_id is
-// optional and an MCP client that cites its run would then get a memory it cannot
-// read back (the MCP recall tool has no run key; review round 2, P2). A caller that
-// wants run scope asks for it with visibility=run.
+// one-line description and its SCOPE keys. The outer RunID and SessionID are
+// PROVENANCE: they name the run or session a write came from and are recorded on the
+// entry either way, so they are not the scope keys. The scope keys arrive on their own
+// fields (scope_run_id, scope_session_id, scope_dir) and overwrite the proposal's own
+// narrowing keys only when they are set, so an in-process caller that fills the proposal
+// directly still derives the scope it asked for.
 func (req RememberRequest) proposal() ProposeContextRequest {
 	p := req.ProposeContextRequest
 	p.Description = derefStr(req.Description)
+	if req.ScopeRunID != "" {
+		p.RunID = req.ScopeRunID
+	}
+	if req.ScopeSessionID != "" {
+		p.SessionID = req.ScopeSessionID
+	}
+	if req.ScopeDir != "" {
+		p.Dir = req.ScopeDir
+	}
 	return p
 }
 
