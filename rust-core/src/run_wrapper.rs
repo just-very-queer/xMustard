@@ -182,29 +182,92 @@ const FORWARDED: &[i32] = &[
     signal_hook::consts::signal::SIGTERM,
 ];
 
+/// How one forwarded signal reaches the child. One row per entry in `FORWARDED`, so a signal
+/// is added by a row rather than by another branch in a decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Relayed whatever its origin and whatever the groups. The child cannot be shown to have
+    /// it already: the kernel delivers a terminal's hangup to the **session leader alone**, so
+    /// a child in that leader's group does not receive it from anywhere else (WS-FIX-20c,
+    /// which replaced WS-FIX-20b's group test here — a shared group is not evidence of a
+    /// delivery the kernel does not make). A duplicate costs the child a re-run of its
+    /// cleanup; a swallowed signal costs an orphan.
+    Always,
+    /// Relayed unless the child's own group has already delivered it. A terminal sends SIGINT
+    /// and SIGQUIT to **every** process in its foreground group, so the child has the
+    /// operator's keystroke and a relayed copy is the second one (WS-FIX-20-r4-1, WS-FIX-20b).
+    UnlessGroup,
+}
+
+/// The decision table. `SIGHUP` is the one signal a terminal does not deliver to a whole
+/// group, and it is the one whose relay cannot be skipped.
+const DELIVERIES: &[(i32, Delivery)] = &[
+    (signal_hook::consts::signal::SIGHUP, Delivery::Always),
+    (signal_hook::consts::signal::SIGINT, Delivery::UnlessGroup),
+    (signal_hook::consts::signal::SIGQUIT, Delivery::UnlessGroup),
+    (signal_hook::consts::signal::SIGTERM, Delivery::UnlessGroup),
+];
+
+/// How `sig` is delivered. A signal with no row is relayed: a signal this table has never
+/// been asked about is not a signal whose relay has been argued for.
+fn delivery_of(sig: i32) -> Delivery {
+    DELIVERIES
+        .iter()
+        .find(|(s, _)| *s == sig)
+        .map_or(Delivery::Always, |(_, d)| *d)
+}
+
 /// Whether a signal the wrapper caught should be relayed to the child.
 ///
-/// Two facts decide it. `sender` is the process the signal names (`None` when it names none),
-/// and `shares_group` is whether the child is in the wrapper's own process group, which is
-/// what makes a terminal's group-wide delivery reach the child as well.
+/// `sender` is the process the signal names (`None` when it names none), and `shares_group`
+/// is whether the child is in the wrapper's own process group, which is what makes a
+/// terminal's group-wide delivery reach the child as well.
 ///
 /// A signal a **process** sent is always relayed: `kill(2)` and `sigqueue(3)` fill the sender,
 /// and a client timeout or an operator's `kill <pid>` arrives this way with the wrapper as
-/// its only target (WS-41 deviation (2)).
+/// its only target (WS-41 deviation (2)). That holds for every signal, including the ones a
+/// group would have covered.
 ///
-/// A signal the **terminal or the kernel** generated is relayed only when the child is not in
-/// the wrapper's group. A terminal delivers SIGINT/SIGQUIT to every process in the foreground
-/// group, so the child already has the operator's keystroke and relaying gives it a second one
-/// (WS-FIX-20-r4-1). When the child has left the group that delivery would not reach it, and
-/// the same is true of a SIGHUP on pty disconnect, which the kernel sends to the session
-/// leader alone — relaying there is what stops the wrapper orphaning a live child.
+/// A signal the **terminal or the kernel** generated is relayed according to `DELIVERIES`:
+/// SIGINT and SIGQUIT are skipped only when the child shares the wrapper's group, because
+/// that is the one case where the terminal's own group-wide delivery has already reached it;
+/// SIGHUP is never skipped, because a terminal disconnect reaches the session leader alone
+/// and a skipped SIGHUP there orphans a live child (WS-FIX-20c).
 ///
-/// The skip is therefore never taken on the absence of a sender alone: an unfilled or
-/// zero-valued field is not evidence that the child already has the signal, and treating it as
-/// such is what would drop a timeout. A sender of 0 is a filled field naming pid 0, which no
-/// `kill(2)` can come from, and it is relayed for the same reason.
-pub fn relay_origin(sender: Option<i32>, shares_group: bool) -> bool {
-    sender.is_some() || !shares_group
+/// The skip is never taken on the absence of a sender alone: an unfilled or zero-valued field
+/// is not evidence that the child already has the signal, and treating it as such is what
+/// would drop a timeout. A sender of 0 is a filled field naming pid 0, which no `kill(2)` can
+/// come from, and it is relayed for the same reason.
+pub fn relay(sig: i32, sender: Option<i32>, shares_group: bool) -> bool {
+    match delivery_of(sig) {
+        Delivery::Always => true,
+        Delivery::UnlessGroup => sender.is_some() || !shares_group,
+    }
+}
+
+/// The signal's name as an operator sees it, for the watcher's report.
+fn name_of(sig: i32) -> &'static str {
+    match sig {
+        signal_hook::consts::signal::SIGHUP => "SIGHUP",
+        signal_hook::consts::signal::SIGINT => "SIGINT",
+        signal_hook::consts::signal::SIGQUIT => "SIGQUIT",
+        signal_hook::consts::signal::SIGTERM => "SIGTERM",
+        _ => "a signal",
+    }
+}
+
+/// Writes what the watcher decided about one signal the wrapper handled, on the wrapper's own
+/// stderr. The child cannot be told "I declined to relay that" and a quiet period says
+/// nothing, so the decision is stated rather than inferred: an operator reading a wrapper
+/// that did not stop its child can see why, and the pty regression waits for this line
+/// instead of for a period in which nothing happened (WS-FIX-20c). A signal that ended the
+/// wrapper keeps the wrapper's own disposition and needs no line.
+fn report(sig: i32, relayed: bool) {
+    eprintln!(
+        "xmustard run: {} {} to the child",
+        name_of(sig),
+        if relayed { "forwarded" } else { "not forwarded" }
+    );
 }
 
 /// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
@@ -228,7 +291,7 @@ fn same_process_group(child: rustix::process::Pid) -> bool {
 /// own. A terminal signal reaches the child through the process group, which is what
 /// WS-41's deviation (2) recorded; a signal to the wrapper's own pid does not, and that is
 /// the case this closes. A terminal signal that also arrives here is not relayed on, so the
-/// child sees one copy and not two (`relay_origin`).
+/// child sees one copy and not two, where the terminal delivers to a whole group (`relay`).
 ///
 /// The child's outcome is still what the wrapper reports: `wait` reaps the real status, so
 /// a child that survives the signal and exits 0 makes the wrapper exit 0, and one the
@@ -321,16 +384,14 @@ impl Forwarder {
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
                 }
-                // A signal the terminal or the kernel generated for a whole process group:
-                // the child may already have this one, and relaying it would be the second
-                // copy (WS-FIX-20b). "May have" is not enough to skip on, because a pty
-                // disconnect delivers SIGHUP to the session leader alone, and a child that
-                // has left the wrapper's group would not get a terminal's signal either.
-                // Skipping therefore requires the child to be in the wrapper's own group,
-                // which is what makes the terminal's group delivery reach it; anything else
-                // is relayed, so an orphan is not possible at the price of a duplicate Ctrl-C.
+                // Whether to relay is `DELIVERIES`' decision, not this loop's: a signal the
+                // terminal or the kernel generated is skipped only where a group delivery
+                // would already have reached the child, and SIGHUP is never skipped because
+                // a terminal disconnect reaches the session leader alone.
                 let shares_group = same_process_group(child);
-                if !relay_origin(origin.process.map(|p| p.pid), shares_group) {
+                let relayed = relay(raw, origin.process.map(|p| p.pid), shares_group);
+                report(raw, relayed);
+                if !relayed {
                     continue;
                 }
                 // ESRCH: the child is already gone, which is the normal race at exit.

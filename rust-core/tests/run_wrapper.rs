@@ -812,28 +812,29 @@ fn one_terminal_keystroke_reaches_the_child_once() {
 
 /// Writes `byte` to the pty master and returns how many deliveries the child acknowledged.
 ///
-/// The boundary is the child's own `ack` file, not a quiet period: the child appends and
+/// The wait has two stages and both are synchronised, neither on a timer.
+///
+/// Stage 1 is the terminal's own copy, which the line discipline delivers to the foreground
+/// group. The boundary is the child's `ack` file, not a quiet period: the child appends and
 /// `fsync`s one line per handled signal, so a line in `ack` means the child has already run
 /// its handler for that delivery. A timer cannot stand in for this — the wrapper's watcher is
 /// an ordinary thread and can be descheduled for longer than any fixed interval, which is
 /// what made the first two versions of this helper able to return a false 1 (r1 codex-spec 2,
 /// r1 OCR 1, r2 codex-spec 3, r2 OCR 1).
 ///
-/// Acknowledging the *first* delivery is not enough on its own, because the duplicate this
-/// test exists to catch arrives second: returning there would race the very relay under
-/// test. So the wait has two stages. It first waits for a delivery to be acknowledged — the
-/// terminal's, which is synchronous with the keystroke. It then waits for the wrapper's own
-/// signal watcher to have finished with the signal, which is observable from outside: the
-/// wrapper's watcher forwards or declines, and either way it has then re-armed, so a second
-/// delivery the watcher chose to make would already be in the child's log. `SETTLE_POLLS`
-/// quiet polls AFTER that first acknowledgement is the wait for that decision, and it is the
-/// stage that a descheduled watcher has to survive — which is why it is a bound on the
-/// watcher, not on the keystroke.
+/// Stage 2 is the wrapper's watcher finishing with the signal, and it is a wait on the
+/// watcher's own report of what it decided (`run_wrapper::report` writes one line on the
+/// wrapper's stderr, `dir/wrapper-err`). Acknowledging the terminal's delivery is not enough
+/// on its own, because the duplicate this test exists to catch arrives second: returning
+/// there would race the very relay under test. A count of unchanged polls after the
+/// acknowledgement was the previous answer and it is gone: the watcher forwards or declines,
+/// and either way it has then reported, so the wait is on that report and it means the same
+/// thing in both cases — which is what four rounds asked for (r1 codex-spec 2, r2 codex-spec 3,
+/// r3 codex-spec 1, r4 codex-spec 2).
 ///
 /// The bound is a deadline; on expiry it returns the count the child last acknowledged, the
 /// honest reading at that point. The assertion is `== 1`, so a late duplicate still fails the
 /// test rather than passing it.
-const SETTLE_POLLS: usize = 50;
 const SETTLE_INTERVAL: Duration = Duration::from_millis(40);
 const ACK_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -852,23 +853,32 @@ fn keystroke_and_count(dir: &std::path::Path, master: &mut std::fs::File, byte: 
     while std::time::Instant::now() < deadline && ack() == 0 {
         thread::sleep(SETTLE_INTERVAL);
     }
-    // Stage 2: the wrapper's watcher has had its chance to relay a second one.
-    let mut stable = 0;
-    let mut last = ack();
-    while std::time::Instant::now() < deadline {
-        thread::sleep(SETTLE_INTERVAL);
-        let now = ack();
-        if now == last {
-            stable += 1;
-            if stable >= SETTLE_POLLS {
-                return last;
-            }
-        } else {
-            stable = 0;
-        }
-        last = now;
-    }
+    // Stage 2: the watcher's report of what it decided about this signal. The report is the
+    // decision, so a delayed watcher extends the wait rather than letting it pass early.
+    await_report(dir, deadline);
     ack()
+}
+
+/// Blocks until the wrapper's watcher has reported the keystroke's signal. `dir/wrapper-err`
+/// is the wrapper's stderr, which `terminal_job` points at a file, so the report is a line
+/// in a file this test can read.
+fn await_report(dir: &std::path::Path, deadline: std::time::Instant) {
+    while std::time::Instant::now() < deadline {
+        if wrapper_reported(dir) {
+            return;
+        }
+        thread::sleep(SETTLE_INTERVAL);
+    }
+}
+
+/// Whether the wrapper has reported its decision about a signal: one `forwarded`/`not
+/// forwarded` line. Any signal counts, because a wrapper that reports one signal has reported
+/// the decision the watcher makes for every signal it handles.
+fn wrapper_reported(dir: &std::path::Path) -> bool {
+    std::fs::read_to_string(dir.join("wrapper-err"))
+        .unwrap_or_default()
+        .lines()
+        .any(|l| l.contains("forwarded") && l.starts_with("xmustard run:"))
 }
 
 /// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
@@ -968,37 +978,58 @@ fn a_signal_a_process_sent_still_reaches_the_child() {
 /// The rule that decides the tests above, as one decision with a refusal case on each side
 /// and no process or timing in it, so it is auditable without a terminal.
 ///
-/// The two axes are independent and both are exercised: a sender decides on its own, and a
-/// shared group decides on its own. The refusal — the one combination that does NOT relay —
-/// is terminal-origin plus a child in the wrapper's group, which is the only case where the
-/// child provably already has the signal.
+/// Three axes decide it: which signal, the `siginfo` sender, and whether the child is in the
+/// wrapper's own process group. All three are exercised, because all three are load-bearing:
+/// the sender alone decides the client's timeout, the group alone decides a terminal's
+/// keystroke, and the signal alone decides the hangup that reaches the session leader alone.
 #[test]
-fn only_a_signal_the_child_already_has_is_not_relayed() {
-    let relayed = xmustard_core::run_wrapper::relay_origin;
-    // A signal a process sent is relayed, group or no group: that is the client's timeout.
-    assert!(
-        relayed(Some(4321), true),
-        "a signal a process sent must be relayed"
-    );
-    assert!(
-        relayed(Some(4321), false),
-        "a signal a process sent must be relayed whatever the group"
-    );
+fn the_relay_rule_has_a_refusal_case_on_each_side() {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    let relayed = xmustard_core::run_wrapper::relay;
+    let shared = true;
+    let apart = false;
+    let sender = Some(4321);
+    let none = None;
+
+    // A signal a process sent is relayed whatever the signal and whatever the group: that is
+    // the client's timeout and an operator's `kill`, and WS-41 deviation (2) proper.
+    for sig in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
+        for group in [shared, apart] {
+            assert!(
+                relayed(sig, sender, group),
+                "signal {sig} sent by a process must be relayed (group shared: {group})"
+            );
+        }
+    }
+    // A terminal-generated SIGINT or SIGQUIT is skipped ONLY when the child is in the wrapper's
+    // group, so the terminal's own group-wide delivery is the one the child already has.
+    for sig in [SIGINT, SIGQUIT] {
+        assert!(
+            !relayed(sig, none, shared),
+            "a terminal-generated {sig} must not be relayed to a child already in the group"
+        );
+        assert!(
+            relayed(sig, none, apart),
+            "a child outside the wrapper's group never got the terminal's {sig}, so relaying \
+             is what keeps the wrapper from orphaning it"
+        );
+    }
+    // SIGHUP is the case the kernel delivers to the session leader ALONE, so a shared group
+    // says nothing about whether the child has it. Skipping it here is what left a live child
+    // unstopped behind a wrapper stuck in drain (WS-FIX-20c).
+    for group in [shared, apart] {
+        for from in [sender, none, Some(0)] {
+            assert!(
+                relayed(SIGHUP, from, group),
+                "a hangup reaches the session leader alone, so it must be relayed whatever \
+                 the sender ({from:?}) and whatever the group (shared: {group})"
+            );
+        }
+    }
     // A filled field naming pid 0 cannot come from `kill(2)`, so it is relayed rather than
     // treated as a sender-less terminal signal: dropping it would orphan the child.
     assert!(
-        relayed(Some(0), true),
+        relayed(SIGINT, Some(0), shared),
         "an unfilled sender is not evidence the child already has the signal"
-    );
-    // A terminal-generated signal is skipped ONLY when the child is in the wrapper's group,
-    // so the terminal's own group-wide delivery is the one the child already has.
-    assert!(
-        !relayed(None, true),
-        "a terminal-generated signal must not be relayed to a child already in the group"
-    );
-    assert!(
-        relayed(None, false),
-        "a child outside the wrapper's group never got the terminal's signal, so relaying is \
-         what keeps the wrapper from orphaning it"
     );
 }
