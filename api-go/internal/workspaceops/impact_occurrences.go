@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"strconv"
 
 	"xmustard/api-go/internal/rustcore"
@@ -23,7 +24,21 @@ func SymbolOccurrencesCtx(ctx context.Context, dataDir, workspaceID, symbol stri
 	if op == "" {
 		return nil, fmt.Errorf("op must be one of %v for an occurrence read: %w", OccurrenceOps, ErrInvalidInput)
 	}
-	flags, err := ImpactFlags(ImpactBlast, params)
+	// The cursor is this process's own signed position, decoded to an offset below. It
+	// must never become a --cursor flag: the core's occurrences query reads that flag as
+	// a decimal offset, so a signed cursor would be refused by the flag parser before the
+	// offset beside it was used, and every page past the first would fail.
+	core := maps.Clone(params)
+	delete(core, "cursor")
+	// The tier walk's own arguments describe a walk the occurrence read does not do, so
+	// with an operation that has no walk they are refused rather than forwarded and
+	// refused by the core as an unknown flag (PAR-IMP-03, and the spec's rule 6).
+	if op != "refs" {
+		if err := checkNoWalkArgs(core); err != nil {
+			return nil, err
+		}
+	}
+	flags, err := ImpactFlags(ImpactBlast, core)
 	if err != nil {
 		return nil, err
 	}
@@ -82,6 +97,25 @@ func DecodeOccurrenceCursor(workspaceID, symbol, op, cursor string) (int, error)
 	return nums[0], nil
 }
 
+// walkArgs are the arguments that describe impact's depth-tier walk, which the
+// definition and implementations operations replace. They are listed once here and
+// nowhere else, so adding a walk argument makes the check catch it.
+var walkArgs = []string{
+	"direction", "relation_types", "min_confidence", "include_tests",
+	"max_depth", "offset", "summary_only", "timeout_ms",
+}
+
+// checkNoWalkArgs refuses a tier-walk argument on an occurrence operation that has no
+// walk. A refused argument is never silently dropped (§5.1 rule 7).
+func checkNoWalkArgs(params map[string]string) error {
+	for _, name := range walkArgs {
+		if params[name] != "" {
+			return fmt.Errorf("%s does not apply to impact op= definition or implementations: %w", name, ErrInvalidInput)
+		}
+	}
+	return nil
+}
+
 // signOccurrencePage replaces the core's bare next_cursor offset with a signed one. The
 // core reports where the list continues; only this process holds the signing key, so a
 // client receives a cursor it cannot edit and the core never has to trust one.
@@ -125,4 +159,71 @@ func signOffset(ranking []byte, offset int) string {
 		return ""
 	}
 	return occurrenceCursors.encode(ranking, offset)
+}
+
+// ReconcileOccurrencePaging re-derives an occurrence page's cursor after the budget has
+// cut the list, the same contract ReconcileImpactPaging keeps for the tiers. The cursor
+// the handler signed describes the core's page, so a rung that removed rows would leave a
+// client following a position past rows it never received. The occurrence list is
+// detected by its own member rather than by the budget's stage names, because the rungs
+// it shares with the tiers are named "trimmed", "counts" and "total" and a stage-name
+// check would attribute one form's cut to another.
+//
+// When the budget removed the list outright there is no position to continue from, so
+// the answer carries truncated rather than a cursor: a next_cursor that cannot be
+// followed is worse than none, because a client follows it and gets the same page again.
+// A page the budget did not cut is returned unchanged.
+func ReconcileOccurrencePaging(workspaceID, symbol, op string, out []byte) []byte {
+	var res map[string]json.RawMessage
+	if json.Unmarshal(out, &res) != nil || res == nil {
+		return out
+	}
+	// The member is the discriminator: an occurrence page is the only impact result
+	// that carries it, and a tier page that does not is left to the tier reconciler.
+	if _, ok := res["occurrences"]; !ok {
+		return out
+	}
+	next, cut := occurrencePageOffset(res)
+	delete(res, "next_cursor")
+	if cut {
+		// the budget replaced the rows with counts, so the list cannot be continued
+		// from here and the cut is named instead of being papered over
+		res["truncated"] = json.RawMessage(strconv.Quote("occurrences_removed"))
+	} else {
+		cursor, err := json.Marshal(signOffset(occurrenceRanking(workspaceID, symbol, op), next))
+		if err != nil {
+			return out
+		}
+		res["next_cursor"] = cursor
+	}
+	reconciled, err := json.Marshal(res)
+	if err != nil {
+		return out
+	}
+	return reconciled
+}
+
+// occurrencePageOffset returns where the next page continues after the budget's cut: the
+// page's own offset plus the rows it actually delivered. cut is true when the budget
+// replaced the rows with their counts, which is the one case with no position to continue
+// from — an empty list is otherwise indistinguishable from a page that delivered nothing,
+// and signing a cursor onto an emptied list would tell a client to keep paging a list that
+// is gone.
+func occurrencePageOffset(res map[string]json.RawMessage) (next int, cut bool) {
+	var page struct {
+		Offset      *int               `json:"offset"`
+		Occurrences *[]json.RawMessage `json:"occurrences"`
+	}
+	if json.Unmarshal(mustJSON(res), &page) != nil || page.Offset == nil || page.Occurrences == nil {
+		return 0, false
+	}
+	_, counted := res["occurrences_by_path"]
+	return *page.Offset + len(*page.Occurrences), counted
+}
+
+// mustJSON re-marshals a decoded member so it can be read into a typed struct; the map
+// came from a decoded object, so this cannot fail.
+func mustJSON(res map[string]json.RawMessage) []byte {
+	b, _ := json.Marshal(res)
+	return b
 }

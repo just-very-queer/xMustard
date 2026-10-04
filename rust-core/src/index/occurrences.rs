@@ -182,13 +182,17 @@ fn reference_kind(kind: u8) -> &'static str {
 /// One row of the occurrence table, before its snippet is read.
 struct Row {
     path: String,
-    lang: String,
     line: u32,
     kind: u8,
     /// The containing symbol: (qualified name, kind, line), none at file scope.
     container: Option<(String, String, u32)>,
     file_id: i64,
     blob: String,
+    /// `resolved` when the reference's language has a scope resolver, else `lexical`.
+    /// The reference table keeps no per-row binding, so this is the strongest claim the
+    /// row's own evidence supports and nothing more (PAR-IMP-03's per-edge provenance).
+    provenance: &'static str,
+    confidence: f64,
 }
 
 /// The occurrence answer.
@@ -240,89 +244,90 @@ fn kinds_clause(kinds: &[u8]) -> String {
         .join(",")
 }
 
-/// Every occurrence row of the query, before paging: (path, line, col) order, so the
-/// same index answers the same page every time and the cursor means a position.
-fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<Vec<Row>> {
-    let mut out = Vec::new();
+/// The projection and predicate one occurrence operation reads, shared by every page so
+/// the pages of a list can never disagree about what the list is. Both operations
+/// project the same nine columns: path, lang, file id, content hash, line, kind
+/// (-1 on a declaration), the containing symbol's name, kind and start line.
+fn statement(q: &Query) -> String {
     match q.op.as_str() {
-        "definition" => {
-            let mut st = conn.prepare_cached(
-                "SELECT f.path, f.lang, f.id, f.content_hash, s.start_line, s.kind, s.qualified_name \
+        "definition" => "SELECT f.path, f.lang, f.id, f.content_hash, s.start_line, -1, \
+                 s.qualified_name, s.kind, s.start_line \
                  FROM symbols s JOIN names n ON n.id = s.name_id JOIN files f ON f.id = s.file_id \
-                 WHERE n.name = ?1 ORDER BY f.path, s.start_line, s.kind, s.qualified_name",
-            )?;
-            let rows = st.query_map([name], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, u32>(4)?,
-                    r.get::<_, String>(5)?,
-                    r.get::<_, String>(6)?,
-                ))
-            })?;
-            for row in rows {
-                let (path, lang, file_id, blob, line, kind, qualified) = row?;
-                out.push(Row {
-                    path,
-                    lang,
-                    line,
-                    kind: ref_kind::BIND,
-                    container: Some((qualified, kind, line)),
-                    file_id,
-                    blob,
-                });
-            }
-        }
+                 WHERE n.name = ?1"
+            .to_string(),
         op => {
             let kinds: &[u8] = if op == "implementations" {
                 &TYPE_KINDS
             } else {
                 &USE_KINDS
             };
-            let sql = format!(
-                "SELECT f.path, f.lang, f.id, f.content_hash, r.line, r.kind, r.symbol_id, \
+            format!(
+                "SELECT f.path, f.lang, f.id, f.content_hash, r.line, r.kind, \
                         s.qualified_name, s.kind, s.start_line \
                  FROM refs r JOIN names n ON n.id = r.name_id JOIN files f ON f.id = r.file_id \
                  LEFT JOIN symbols s ON s.id = r.symbol_id \
-                 WHERE n.name = ?1 AND r.kind IN ({}) \
-                 ORDER BY f.path, r.line, r.col, r.start_byte",
+                 WHERE n.name = ?1 AND r.kind IN ({})",
                 kinds_clause(kinds)
-            );
-            let mut st = conn.prepare_cached(&sql)?;
-            let rows = st.query_map([name], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, String>(3)?,
-                    r.get::<_, u32>(4)?,
-                    r.get::<_, u8>(5)?,
-                    r.get::<_, Option<i64>>(6)?,
-                    r.get::<_, Option<String>>(7)?,
-                    r.get::<_, Option<String>>(8)?,
-                    r.get::<_, Option<u32>>(9)?,
-                ))
-            })?;
-            for row in rows {
-                let (path, lang, file_id, blob, line, kind, symbol, qualified, skind, sline) = row?;
-                out.push(Row {
-                    path,
-                    lang,
-                    line,
-                    kind,
-                    container: match (symbol, qualified, skind, sline) {
-                        (Some(_), Some(q), Some(k), Some(l)) => Some((q, k, l)),
-                        _ => None,
-                    },
-                    file_id,
-                    blob,
-                });
-            }
+            )
         }
     }
-    Ok(out)
+}
+
+/// One occurrence page, read in (path, line, kind, name) order and bounded by SQL, so a
+/// name with a hundred thousand references costs one page of rows rather than all of them
+/// (§5.1 rule 8: nothing proportional to the repository in a heap). The LIMIT is one more
+/// than the page asks for, so the read learns whether more rows exist without counting
+/// them all, and `more` says whether it did.
+fn rows(conn: &Connection, q: &Query, name: &str) -> rusqlite::Result<(Vec<Row>, bool)> {
+    let sql = format!(
+        "{} ORDER BY 1, 5, 6, 7 LIMIT {} OFFSET {}",
+        statement(q),
+        q.limit + 1,
+        q.offset,
+    );
+    let mut st = conn.prepare_cached(&sql)?;
+    let mapped = st.query_map([name], |r| {
+        Ok((
+            r.get::<_, String>(0)?,
+            r.get::<_, String>(1)?,
+            r.get::<_, i64>(2)?,
+            r.get::<_, String>(3)?,
+            r.get::<_, u32>(4)?,
+            r.get::<_, i64>(5)?,
+            r.get::<_, Option<String>>(6)?,
+            r.get::<_, Option<String>>(7)?,
+            r.get::<_, Option<u32>>(8)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in mapped {
+        let (path, lang, file_id, blob, line, kind, qualified, skind, sline) = row?;
+        let container = qualified.map(|q| (q, skind.unwrap_or_default(), sline.unwrap_or(line)));
+        // The reference table records which symbol contains a reference, not that the
+        // reference binds to the queried symbol: `symbol_id` is the container, and a
+        // same-language name match carries it just as a bound one does. So the claim is
+        // the language's, and a caller reading it as proof that the reference resolves to
+        // the target would be reading more than the row knows. The epistemic envelope
+        // names the lexical rows for the same reason.
+        let resolved = resolves(&lang);
+        out.push(Row {
+            path,
+            line,
+            kind: if kind < 0 { ref_kind::BIND } else { kind as u8 },
+            container,
+            file_id,
+            blob,
+            provenance: if resolved { "resolved" } else { "lexical" },
+            confidence: if resolved {
+                RESOLVED_CONFIDENCE
+            } else {
+                LEXICAL_CONFIDENCE
+            },
+        });
+    }
+    let more = out.len() > q.limit;
+    out.truncate(q.limit);
+    Ok((out, more))
 }
 
 /// The index's own record of the name: the spans and whether any symbol declares it.
@@ -376,10 +381,12 @@ pub fn read(
     // The target may be a name, a `Container.name` name path or a UID; the reference
     // table is keyed by the bare name, so resolve the path or UID to one.
     let name = resolve_target(conn, &q.target)?;
-    let all = rows(conn, q, &name)?;
-    let total = all.len();
-    let truncated = total > MAX_OCCURRENCES;
-    let page = &all[q.offset.min(total)..(q.offset + q.limit).min(total)];
+    // The page is read in SQL at the cursor's offset, so a common name in a large
+    // repository costs one page rather than every row of it. `total` is what the page
+    // knows: rows below the cursor plus the page, and one more when more exist, so a
+    // caller is told the list is longer than it can say exactly rather than given a
+    // number that costs a full scan to compute.
+    let (page, more) = rows(conn, q, &name)?;
     let found = declares(conn, &name)?;
     let mut texts = Texts::default();
     let occurrences: Vec<Occurrence> = page
@@ -387,6 +394,8 @@ pub fn read(
         .map(|row| occurrence(&mut texts, root, row))
         .collect();
     let end = q.offset + occurrences.len();
+    let total = if more { end + 1 } else { end };
+    let truncated = more || q.offset + q.limit >= MAX_OCCURRENCES;
     let (bound, lexical) = occurrences.iter().fold((0, 0), |(r, l), o| {
         if o.provenance == "resolved" {
             (r + 1, l)
@@ -434,7 +443,10 @@ pub fn read(
         total,
         offset: q.offset,
         occurrences,
-        next_cursor: (end < total).then(|| end.to_string()),
+        // The cursor never advertises a position the flag parser would refuse: the
+        // offset bound is the same one, so a list that reaches it ends here rather than
+        // issuing a continuation that cannot be followed.
+        next_cursor: (more && end < MAX_OCCURRENCES).then(|| end.to_string()),
         truncated,
         epistemic,
     })
@@ -448,36 +460,43 @@ fn unresolved_references(conn: &Connection, name: &str) -> rusqlite::Result<i64>
     .query_row([name], |r| r.get(0))
 }
 
-/// The name an occurrence query is about. The reference table is keyed by the bare
-/// name, so a UID, a `Container.name` name path and a path each reduce to one. A
-/// target the index does not hold is its own name and an empty answer, not an error:
-/// a symbol outside the index is a fact about the index, not a malformed request.
+/// The name an occurrence query is about.
+///
+/// The reference table is keyed by the bare name and its rows carry no symbol id, so a
+/// uid, a `Container.name` path and a bare name all reduce to the name the reference rows
+/// are keyed by, and every namesake's use comes back. Narrowing a read to one of several
+/// same-named declarations would need a binding the table does not hold: a package or class
+/// qualifier is not a symbol in this index (measured 2026-10-04 on the box: no symbol is
+/// named `alpha` for package `alpha`), and a method's recorded qualifier is its receiver
+/// variable (`s.Put` records `s`, not `Store`), so neither can be checked against the
+/// container a name path names. The rows are therefore reported as the name match they
+/// are, each carrying its own provenance and the snippet the caller reads to judge it, and
+/// the envelope's lexical cause is what tells a caller the list is not a proof. A target
+/// the index does not hold reads as the name itself, which is an empty answer, not an
+/// error: a symbol outside the index is a fact about the index, not a malformed request.
 fn resolve_target(conn: &Connection, target: &str) -> rusqlite::Result<String> {
-    let by_uid = |t: &str| -> rusqlite::Result<Option<String>> {
-        conn.prepare_cached(
-            "SELECT n.name FROM symbols s JOIN names n ON n.id = s.name_id WHERE s.uid = ?1 LIMIT 1",
-        )?
-        .query_row([t], |r| r.get(0))
-        .optional()
-    };
-    if let Some(name) = by_uid(target)? {
+    if let Some(name) = name_of_symbol(conn, target)? {
         return Ok(name);
     }
-    // the name the target names: the trailing member of a name path, or the base name
-    // of a path. Both are the same lookup over one column, so they are one table.
-    let base = || match (target.rsplit_once('.'), target.rsplit_once('/')) {
-        (Some((_, tail)), _) => Some(tail),
-        (None, Some((_, base))) => Some(base),
-        (None, None) => None,
-    };
-    match base().filter(|b| *b != target) {
-        Some(b) => Ok(by_uid(b)?.unwrap_or_else(|| b.to_string())),
-        None => Ok(target.to_string()),
-    }
+    Ok(match target.rsplit_once('.') {
+        Some((_, member)) => member.to_string(),
+        None => match target.rsplit_once('/') {
+            Some((_, base)) => base.to_string(),
+            None => target.to_string(),
+        },
+    })
+}
+
+/// The name of the symbol a uid identifies, if the index holds it.
+fn name_of_symbol(conn: &Connection, uid: &str) -> rusqlite::Result<Option<String>> {
+    conn.prepare_cached(
+        "SELECT n.name FROM symbols s JOIN names n ON n.id = s.name_id WHERE s.uid = ?1 LIMIT 1",
+    )?
+    .query_row([uid], |r| r.get(0))
+    .optional()
 }
 
 fn occurrence(texts: &mut Texts, root: &Path, row: &Row) -> Occurrence {
-    let resolved = row.container.is_some() && resolves(&row.lang);
     let (name, kind) = match &row.container {
         Some((qualified, kind, _)) => (qualified.clone(), kind.clone()),
         None => (row.path.clone(), "File".to_string()),
@@ -506,12 +525,8 @@ fn occurrence(texts: &mut Texts, root: &Path, row: &Row) -> Occurrence {
         },
         snippet,
         snippet_unavailable,
-        provenance: if resolved { "resolved" } else { "lexical" },
-        confidence: if resolved {
-            RESOLVED_CONFIDENCE
-        } else {
-            LEXICAL_CONFIDENCE
-        },
+        provenance: row.provenance,
+        confidence: row.confidence,
     }
 }
 

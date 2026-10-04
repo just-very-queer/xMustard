@@ -585,3 +585,73 @@ fn each_row_names_the_kind_of_reference_that_produced_it() {
     assert_eq!(impls.len(), 1, "the fixture produced no implementation: {impls:#?}");
     assert_eq!(impls[0]["kind_of_reference"].as_str(), Some("implements"));
 }
+
+/// Two containers can declare a member of the same name, and the reference table is keyed
+/// by the bare name with no symbol id on its rows, so every target form reads both uses.
+/// Narrowing would need a binding the table does not hold: a package or class qualifier is
+/// not a symbol in this index, and a method's recorded qualifier is its receiver variable.
+/// So the answer reports the name match it is, each row carrying the snippet a caller judges
+/// it by, rather than silently dropping a use.
+#[test]
+fn a_name_a_name_path_and_a_uid_read_the_same_namesakes_because_the_table_keys_the_bare_name() {
+    let r = repo(&[
+        ("go.mod", GO_MOD),
+        (
+            "alpha/alpha.go",
+            "package alpha\n\n// Handle is alpha's own.\nfunc Handle() {}\n",
+        ),
+        (
+            "beta/beta.go",
+            "package beta\n\n// Handle is beta's own.\nfunc Handle() {}\n",
+        ),
+        (
+            "user/user.go",
+            "package user\n\n\
+             import (\n\t\"example.com/app/alpha\"\n\t\"example.com/app/beta\"\n)\n\n\
+             func run() {\n\talpha.Handle()\n\tbeta.Handle()\n}\n",
+        ),
+    ]);
+    build(r.path());
+
+    let by_name = occ(r.path(), "refs", "Handle", &[]);
+    let by_path = occ(r.path(), "refs", "alpha.Handle", &[]);
+    let uid = uid_of(r.path(), "Handle");
+    let by_uid = occ(r.path(), "refs", &uid, &[]);
+    for (label, v) in [("name path", &by_path), ("uid", &by_uid)] {
+        assert_eq!(
+            v["total"].as_u64(),
+            by_name["total"].as_u64(),
+            "a {label} read a different number of occurrences than the bare name"
+        );
+        assert_eq!(
+            v["resolved_name"].as_str(),
+            Some("Handle"),
+            "a {label} did not resolve to the name the reference table is keyed by"
+        );
+    }
+
+    // both uses come back, and each row's snippet names the receiver, so a caller tells
+    // the two apart without the answer guessing which declaration was meant
+    let got = rows(&by_name);
+    assert_eq!(got.len(), 2, "the fixture must give both call sites: {got:#?}");
+    // The snippet is a ±1 window, so two neighbouring rows can share a line. The
+    // reference's own line is the one the window is centred on, which is what
+    // distinguishes one use from the other.
+    let receivers: std::collections::BTreeSet<String> = got
+        .iter()
+        .filter_map(|o| {
+            let s = o["snippet"].as_str()?;
+            let want = o["line"].as_u64()?;
+            s.lines()
+                .find(|l| l.starts_with(&format!("{want}:")))
+                .and_then(|l| l.split_once('\t').map(|(_, rest)| rest.trim().to_string()))
+        })
+        .collect();
+    assert_eq!(
+        receivers,
+        ["alpha.Handle()".to_string(), "beta.Handle()".to_string()]
+            .into_iter()
+            .collect(),
+        "a use is missing from the name match: {got:#?}"
+    );
+}

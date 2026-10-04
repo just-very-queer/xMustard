@@ -3,6 +3,7 @@ package workspaceops
 import (
 	"encoding/json"
 	"slices"
+	"strings"
 	"testing"
 )
 
@@ -169,4 +170,73 @@ func TestOccurrenceCursorIsBoundToItsSymbolAndOperation(t *testing.T) {
 	if blank := sign(0); blank != "" {
 		t.Fatalf("offset zero was signed as %q", blank)
 	}
+}
+
+// A budget rung that removed occurrence rows leaves the handler's cursor describing the
+// core's page, so following it skips rows the caller never received. The reconciler
+// re-signs it at the first row the caller did not receive, and when the rung removed the
+// list outright there is nothing to continue from, so the cut is named instead.
+func TestReconcileOccurrencePagingFollowsWhatTheCallerReceivedAndNamesARemovedList(t *testing.T) {
+	const ws, symbol, op = "ws", "Store", "refs"
+	// the core signed page offset 4 of 9; the budget kept two of the five rows it held
+	signed, err := signOccurrencePage(
+		[]byte(`{"total":9,"offset":4,"occurrences":[{"path":"a.go"},{"path":"b.go"},{"path":"c.go"},{"path":"d.go"},{"path":"e.go"}],"next_cursor":"9"}`),
+		occurrenceRanking(ws, symbol, op))
+	if err != nil {
+		t.Fatalf("sign: %v", err)
+	}
+	trimmed := strings.Replace(string(signed), `"occurrences":[{"path":"a.go"},{"path":"b.go"},{"path":"c.go"},{"path":"d.go"},{"path":"e.go"}]`,
+		`"occurrences":[{"path":"a.go"},{"path":"b.go"}]`, 1)
+	if trimmed == string(signed) {
+		t.Fatal("the fixture did not trim the list, so it proves nothing")
+	}
+
+	out := ReconcileOccurrencePaging(ws, symbol, op, []byte(trimmed))
+	var page map[string]json.RawMessage
+	if err := json.Unmarshal(out, &page); err != nil {
+		t.Fatalf("the reconciled page is not an object: %v", err)
+	}
+	var cursor string
+	if err := json.Unmarshal(mustCursor(t, page), &cursor); err != nil {
+		t.Fatalf("next_cursor is not a string: %v", err)
+	}
+	got, err := DecodeOccurrenceCursor(ws, symbol, op, cursor)
+	if err != nil {
+		t.Fatalf("the reconciled cursor does not decode for this list: %v", err)
+	}
+	if got != 6 {
+		t.Fatalf("the cursor continues at %d, want the page offset 4 plus the 2 rows delivered: %s", got, out)
+	}
+	if _, ok := page["total"]; !ok {
+		t.Fatalf("reconciling dropped total: %s", out)
+	}
+
+	// the counts rung replaced the rows: there is no position to continue from, so the
+	// answer carries no cursor at all and names the cut
+	counts := `{"total":9,"offset":4,"occurrences":[],"occurrences_by_path":{"a.go":2},"next_cursor":"9"}`
+	out = ReconcileOccurrencePaging(ws, symbol, op, []byte(counts))
+	if err := json.Unmarshal(out, &page); err != nil {
+		t.Fatal(err)
+	}
+	if c, ok := page["next_cursor"]; ok {
+		t.Fatalf("a counts-only page kept a cursor %s: %s", c, out)
+	}
+	if string(page["truncated"]) != `"occurrences_removed"` {
+		t.Fatalf("a counts-only page does not name its cut: %s", out)
+	}
+
+	// a result that is not an occurrence page is left to the tier reconciler untouched
+	tier := `{"by_depth":[{"depth":1,"items":[]}],"next_cursor":"9"}`
+	if got := string(ReconcileOccurrencePaging(ws, symbol, op, []byte(tier))); got != tier {
+		t.Fatalf("a tier page was rewritten: %s", got)
+	}
+}
+
+func mustCursor(t *testing.T, page map[string]json.RawMessage) []byte {
+	t.Helper()
+	raw, ok := page["next_cursor"]
+	if !ok {
+		t.Fatal("the reconciled page carries no next_cursor")
+	}
+	return raw
 }
