@@ -998,6 +998,106 @@ fn a_signal_a_process_sent_still_reaches_the_child() {
     assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
 }
 
+/// Kills the wrapper and releases the child when a test fails, so a failed assertion never
+/// leaves a process behind on a box four other lanes share.
+struct Job {
+    wrapper: std::process::Child,
+    dir: std::path::PathBuf,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.dir.join("stop"), "");
+        let _ = self.wrapper.kill();
+        let _ = self.wrapper.wait();
+    }
+}
+
+/// Starts `xmustard-core run` over `WATCHDOG` with its stderr in `dir/wrapper-err`.
+///
+/// A file, not a pipe: every attempt to make the wrapper's stderr unwritable also makes the
+/// CHILD's stderr unwritable, because the wrapper hands its own stderr to the child, and a
+/// `dash` that cannot write to stderr from its first instruction never reaches the script —
+/// measured three ways on the box (a closed read end, a full blocking pipe, a full
+/// non-blocking pipe all left the wrapper alive with the child's dir empty). So a
+/// stderr-as-hazard harness cannot isolate the wrapper at all. The report is therefore
+/// observed by ORDER against the signal instead, on two files the test can read.
+fn report_job(dir: &std::path::Path) -> Job {
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(WATCHDOG)
+        .arg("sh")
+        .arg(dir.to_str().unwrap());
+    c.env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stderr(std::fs::File::create(dir.join("wrapper-err")).unwrap());
+    Job {
+        wrapper: c.spawn().expect("the wrapper could not start"),
+        dir: dir.to_path_buf(),
+    }
+}
+
+/// WS-FIX-20c-r1-1: by the time the wrapper reports what it decided, the child has the signal.
+///
+/// The report is a diagnostic, so it must not be able to cost the relay. Ordering is the
+/// whole contract, and it is observable without a stderr hazard: the watcher writes its
+/// report to `dir/wrapper-err` and the child records its own handling in `dir/log`, and this
+/// test waits for the REPORT and then reads the child's log **without waiting for it**. On
+/// the correct order the signal has already gone out, so the line is there the moment the
+/// report lands. On `report`-before-`kill_process` (the mutation that survived round 1) the
+/// report lands first and the child's log is still empty, which is the whole defect: the
+/// diagnostic can be read before the delivery it describes.
+///
+/// A file, not a pipe, for the wrapper's stderr: every attempt to make that stderr
+/// unwritable also makes the CHILD's stderr unwritable, because the wrapper hands its own
+/// stderr to the child, and a `dash` that cannot write to stderr from its first instruction
+/// never reaches the script. Measured three ways on the box — a closed read end, a full
+/// blocking pipe and a full non-blocking pipe each left the wrapper alive with the child's
+/// directory empty — so a stderr-as-hazard harness cannot isolate the wrapper at all, and
+/// the two versions that tried it are what hung the shared box (goal §1.7 rule 11).
+#[test]
+fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = report_job(dir.path());
+    await_file(&dir.path().join("ready"));
+    let sent = Command::new("kill")
+        .args(["-TERM", &job.wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -TERM on the wrapper");
+    // Both files are read in the SAME loop iteration, so the child's log is sampled in the
+    // instant the report is first seen and not one poll later: a separate wait for the log
+    // would let a report-first watcher fill it in between and the test would pass on the
+    // broken code. The loop exits the moment the report appears, which is the boundary this
+    // test is about.
+    let mut sampled: Option<String> = None;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if !decision(dir.path()).is_empty() {
+            sampled = Some(seen(dir.path()));
+            break;
+        }
+        thread::sleep(SETTLE_INTERVAL);
+    }
+    let decided = decision(dir.path());
+    assert!(
+        decided.contains("forwarded to the child"),
+        "the wrapper never reported forwarding: {decided:?}"
+    );
+    let log = sampled.unwrap_or_default();
+    assert!(
+        log.contains("TERM"),
+        "the wrapper reported forwarding before the child had the signal, so the diagnostic \
+         came first and the delivery could still be pending: {log:?}"
+    );
+    release(dir.path());
+    let ended = wait_within(&mut job.wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(ended.code(), Some(0), "wrapper status {ended:?}");
+}
+
 /// The rule that decides the tests above, as one decision with a refusal case on each side
 /// and no process or timing in it, so it is auditable without a terminal.
 ///
