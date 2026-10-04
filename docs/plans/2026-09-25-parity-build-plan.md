@@ -2150,6 +2150,16 @@ paths.
   whoever owns `tools_list_budget.json`), and the derivation's precedence question
   (r3-5) is in FU.
 
+**Mutation coverage (2026-10-04, owner unpark).** The 36 tests the r3/r4 audits inherited
+without a mutation row each have one now: 32 KILLED, 4 SURVIVED as equivalent mutants with
+a measured two-layer FAIL line (`reviews/ws-29b/r4/slop-audit.md` S5, runner
+`logs/ws-29b-rows-B.py`, run `logs/ws-29b-run-20261004T154924Z.log`). Measured on the box:
+CAPS PASS (no cap rise), BOXALL `remote_exit=0`, `clippy_warnings=6`, `rss_lines=ok`, 24 Go
+packages and 23 Rust binaries ok, 0 FAILED. One comment reworded for the gate's S2 rerun; no
+behaviour, assertion or bound changed. Gate `reviews/ws-29b/r4`:
+`gate=PASS changed=24 covered=24 channel_findings=8 triaged=9 reviewer=gpt-6-sol`, no fifth
+round opened.
+
 
 **PARKED (2026-10-04).** Round 4 is the fourth and last for a code task, and its gate is RED:
 `gate=FAIL changed=24 covered=24 channel_findings=8 triaged=9`, on 23 round-1 tests that have
