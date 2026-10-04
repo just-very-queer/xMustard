@@ -1047,7 +1047,8 @@ pub fn detect_drift(data_dir: &Path, root: &Path, workspace_id: &str) -> DriftRe
         return fail(report, e);
     }
     let head = Some(state.identity.head.clone()).filter(|h| !h.is_empty());
-    let dirty_paths = state.status.iter().filter(|e| e.xy[0] != b'!').count();
+    let dirty_paths =
+        state.status.iter().filter(|e| e.xy[0] != b'!').count() + state.identity.untracked_beyond;
     report.current_head = head.clone();
     report.current_remote = state.remote_url.clone();
     report.dirty = dirty_paths > 0;
@@ -1388,11 +1389,14 @@ fn symbol_pass(
 
 /// A change set over `listed` changed files: at most `bounds.listed_files` listed, the
 /// rest counted, and dirty symbols from the symbol pass. `baseline` is the compared
-/// baseline's signatures, or why there is none.
+/// baseline's signatures, or why there is none. `unlisted` changed paths have no entry
+/// (untracked ones past the identity's bound): they are counted, never listed or read,
+/// so the dirty-symbol total is unknown while any exist.
 fn change_set(
     root: &Path,
     mut set: ChangeSet,
     listed: Result<Vec<ChangedFile>, String>,
+    unlisted: usize,
     baseline: Result<&BTreeMap<String, String>, String>,
     bounds: ChangeBounds,
 ) -> ChangeSet {
@@ -1401,11 +1405,19 @@ fn change_set(
         Err(e) => return set.unlisted(&e),
     };
     let pass = symbol_pass(root, &changed, baseline.as_ref().ok().copied(), bounds);
-    let total = changed.len();
+    let total = changed.len() + unlisted;
     changed.truncate(bounds.listed_files);
+    let unread = (unlisted > 0).then(|| {
+        format!(
+            "{unlisted} untracked entries past the identity's bound ({}) are counted, \
+             not listed or read",
+            crate::indexcache::MAX_IDENTITY_UNTRACKED
+        )
+    });
     let cuts = [
         (total > changed.len())
             .then(|| format!("listed {} of {total} changed files", changed.len())),
+        unread.clone(),
         (pass.symbols > pass.listed.len()).then(|| {
             format!(
                 "listed {} of {} dirty symbols, contract breaks first",
@@ -1426,7 +1438,7 @@ fn change_set(
             symbols_total: pass.symbols,
         });
     }
-    match &pass.partial {
+    match join_reasons([pass.partial.clone(), unread]) {
         Some(why) => set
             .unknown
             .push(Unknown::new("dirty_symbols", format!("partial: {why}"))),
@@ -1470,7 +1482,7 @@ pub fn changed_since_baseline_bounded(
             });
             diff_hash_maps(&baseline.file_hashes, &current)
         });
-        return change_set(root, set, listed, Ok(&baseline.signatures), bounds);
+        return change_set(root, set, listed, 0, Ok(&baseline.signatures), bounds);
     }
     let missing = missing_baseline_reason(&read);
     let set = ChangeSet::new(workspace_id, "baseline", false);
@@ -1571,7 +1583,8 @@ pub fn working_tree_changes_bounded(
         .map(|b| &b.signatures)
         .ok_or_else(|| format!("{missing}: no signatures to compare against"));
     let set = ChangeSet::new(workspace_id, "working-tree", baseline.is_some());
-    change_set(root, set, listed, sigs, bounds)
+    let beyond = state.identity.untracked_beyond;
+    change_set(root, set, listed, beyond, sigs, bounds)
 }
 
 // ---------------------------------------------------------------------------

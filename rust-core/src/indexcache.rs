@@ -3,10 +3,13 @@
 //! `source_identity` is the one content identity for a working tree: canonical root +
 //! `HEAD` + every `git status --porcelain=v1 -z --untracked-files=all` entry (status,
 //! byte-exact path, rename origin) + the full SHA-256 of each dirty or untracked
-//! file's bytes, read through the bounded no-follow reader. Files that cannot be hashed
-//! in full (oversized, unreadable, not regular, over the identity byte budget) add a
-//! metadata token and an explicit limitation, so `identity_complete` is false: a
-//! bounded read never claims identity for bytes it did not read. A status entry that
+//! file's bytes, read through the bounded no-follow reader. The status and the hidden
+//! entry listings are streamed, never held whole (WS-RT3), and untracked entries past
+//! `MAX_IDENTITY_UNTRACKED` enter the key by path only, with a limitation. Files that
+//! cannot be hashed in full (oversized, unreadable, not regular, over the identity
+//! byte budget) add a metadata token and an explicit limitation, so
+//! `identity_complete` is false: a bounded read never claims identity for bytes it
+//! did not read. A status entry that
 //! is a nested repository (a directory with its own `.git`: an untracked `sub/`, a
 //! submodule, a gitlink without a module entry) is not read: its token is the nested
 //! HEAD, ref and Git index stat key, it is listed in `nested_repos`, and it leaves the
@@ -297,27 +300,51 @@ impl StatusEntry {
     }
 }
 
+/// Incremental `git status --porcelain=v1 -z` parser: records in, entries out. A rename
+/// or copy waits for the record after it, its origin.
+#[derive(Default)]
+pub(crate) struct PorcelainParser {
+    pending: Option<StatusEntry>,
+}
+
+impl PorcelainParser {
+    /// The entry `rec` completes, if any. Malformed records are skipped.
+    pub(crate) fn push(&mut self, rec: &[u8]) -> Option<StatusEntry> {
+        if let Some(mut e) = self.pending.take() {
+            e.orig_path = Some(rec.to_vec());
+            return Some(e);
+        }
+        if rec.len() < 4 || rec[2] != b' ' {
+            return None;
+        }
+        let xy = [rec[0], rec[1]];
+        let e = StatusEntry {
+            xy,
+            path: rec[3..].to_vec(),
+            orig_path: None,
+        };
+        if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
+            self.pending = Some(e);
+            return None;
+        }
+        Some(e)
+    }
+
+    /// A rename or copy the output ended before the origin of.
+    pub(crate) fn finish(self) -> Option<StatusEntry> {
+        self.pending
+    }
+}
+
 /// Parse `git status --porcelain=v1 -z` output: `XY SP path NUL`, followed by
 /// `orig NUL` for renames and copies. Malformed records are skipped.
 pub fn parse_porcelain_v1_z(out: &[u8]) -> Vec<StatusEntry> {
-    let mut records = out.split(|b| *b == 0);
-    let mut entries = Vec::new();
-    while let Some(rec) = records.next() {
-        if rec.len() < 4 || rec[2] != b' ' {
-            continue;
-        }
-        let xy = [rec[0], rec[1]];
-        let orig_path = if matches!(xy[0], b'R' | b'C') || matches!(xy[1], b'R' | b'C') {
-            records.next().map(<[u8]>::to_vec)
-        } else {
-            None
-        };
-        entries.push(StatusEntry {
-            xy,
-            path: rec[3..].to_vec(),
-            orig_path,
-        });
-    }
+    let mut parser = PorcelainParser::default();
+    let mut entries: Vec<StatusEntry> = out
+        .split(|b| *b == 0)
+        .filter_map(|rec| parser.push(rec))
+        .collect();
+    entries.extend(parser.finish());
     entries
 }
 
@@ -429,6 +456,10 @@ pub struct SourceIdentity {
     pub root: String,
     pub dirty_entries: usize,
     pub untracked_entries: usize,
+    /// Untracked entries past `MAX_IDENTITY_UNTRACKED`: counted in `untracked_entries`,
+    /// keyed by path, absent from the entries a `RepoState` carries.
+    #[serde(skip)]
+    pub untracked_beyond: usize,
     /// Assume-unchanged / skip-worktree index entries hashed directly because
     /// `git status` does not report their worktree edits.
     pub hidden_entries: usize,
@@ -453,8 +484,8 @@ pub struct SourceIdentity {
     /// ignored as a whole (top-level relative, trailing `/`). Git never descends into
     /// them, so nothing inside can change the key; the Go identity cache skips them
     /// when it fingerprints the working tree. None when not requested or not fully
-    /// reportable (a non-UTF-8 path, more than `MAX_IGNORED_DIRS`, or a status that
-    /// had to be re-run without the listing). Never part of the key.
+    /// reportable (a non-UTF-8 path, or more than `MAX_IGNORED_DIRS` or
+    /// `MAX_IGNORED_DIR_BYTES`). Never part of the key.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ignored_dirs: Option<Vec<String>>,
 }
@@ -819,6 +850,91 @@ pub(crate) fn ignored_dir_listing(entries: &[StatusEntry]) -> Option<Vec<String>
     Some(dirs)
 }
 
+/// Untracked status entries identified per call, in Git's order (PAR-RT-11). Each one
+/// past the bound enters the key by its path only and is counted in one
+/// `identity_untracked_budget` limitation.
+pub const MAX_IDENTITY_UNTRACKED: usize = 10_000;
+
+/// One streamed `git status` listing: the entries the identity keeps, the untracked
+/// ones past `MAX_IDENTITY_UNTRACKED` folded into a digest of their paths, and (for
+/// `repo-key`) the whole-directory ignored entries within the listing's bounds.
+struct StatusWalk {
+    parser: PorcelainParser,
+    entries: Vec<StatusEntry>,
+    untracked_kept: usize,
+    beyond: usize,
+    beyond_paths: Sha256,
+    list_ignored: bool,
+    ignored: Vec<StatusEntry>,
+    ignored_bytes: usize,
+    ignored_overflow: bool,
+}
+
+impl StatusWalk {
+    fn new(list_ignored: bool) -> Self {
+        StatusWalk {
+            parser: PorcelainParser::default(),
+            entries: Vec::new(),
+            untracked_kept: 0,
+            beyond: 0,
+            beyond_paths: Sha256::new(),
+            list_ignored,
+            ignored: Vec::new(),
+            ignored_bytes: 0,
+            ignored_overflow: false,
+        }
+    }
+
+    fn record(&mut self, rec: &[u8]) {
+        if let Some(e) = self.parser.push(rec) {
+            self.entry(e);
+        }
+    }
+
+    fn entry(&mut self, e: StatusEntry) {
+        match (e.xy == *b"!!", e.is_untracked()) {
+            // ignored entries are not working state: they never enter the key
+            (true, _) => self.ignored_dir(e),
+            (false, true) if self.untracked_kept >= MAX_IDENTITY_UNTRACKED => {
+                self.beyond += 1;
+                push_field(&mut self.beyond_paths, &e.path);
+            }
+            (false, true) => {
+                self.untracked_kept += 1;
+                self.entries.push(e);
+            }
+            (false, false) => self.entries.push(e),
+        }
+    }
+
+    /// Keep a whole-directory ignored entry for `ignored_dir_listing` while the listing
+    /// stays within its bounds; past them the listing is not reportable.
+    fn ignored_dir(&mut self, e: StatusEntry) {
+        if !self.list_ignored || self.ignored_overflow || e.path.last() != Some(&b'/') {
+            return;
+        }
+        self.ignored_bytes += e.path.len();
+        self.ignored_overflow =
+            self.ignored.len() >= MAX_IGNORED_DIRS || self.ignored_bytes > MAX_IGNORED_DIR_BYTES;
+        if !self.ignored_overflow {
+            self.ignored.push(e);
+        }
+    }
+
+    fn finish(mut self) -> Self {
+        if let Some(e) = std::mem::take(&mut self.parser).finish() {
+            self.entry(e);
+        }
+        self
+    }
+
+    fn ignored_dirs(&self) -> Option<Vec<String>> {
+        (!self.ignored_overflow)
+            .then(|| ignored_dir_listing(&self.ignored))
+            .flatten()
+    }
+}
+
 fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec<StatusEntry>) {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let root_str = canonical.to_string_lossy().into_owned();
@@ -832,6 +948,7 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         root: root_str.clone(),
         dirty_entries: 0,
         untracked_entries: 0,
+        untracked_beyond: 0,
         hidden_entries: 0,
         files_hashed: 0,
         bytes_hashed: 0,
@@ -873,43 +990,33 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         "--untracked-files=all",
         "--ignore-submodules=none",
     ];
-    let mut listed_ignored = list_ignored;
-    let mut status = if list_ignored {
+    let mut args = status_args.to_vec();
+    if list_ignored {
         // `matching` lists a directory that matches an ignore pattern without
         // descending into it, so the listing costs no extra traversal.
-        let mut args = status_args.to_vec();
         args.push("--ignored=matching");
-        run_git_bounded(root, &args, MAX_GIT_OUTPUT_BYTES, git_timeout())
-    } else {
-        run_git_bounded(root, &status_args, MAX_GIT_OUTPUT_BYTES, git_timeout())
-    };
-    if list_ignored && matches!(status, Err(GitRunError::Overflow(_))) {
-        // many individually ignored files: identify without the listing rather
-        // than lose the identity to the output cap
-        listed_ignored = false;
-        status = run_git_bounded(root, &status_args, MAX_GIT_OUTPUT_BYTES, git_timeout());
     }
-    let status = match status {
-        Ok(status) => status,
-        Err(e) => {
-            id.identity_complete = false;
-            id.limitations.push(IdentityLimitation {
-                path: None,
-                reason: "git_status_failed".into(),
-                detail: format!("{e}; dirty content is not identified"),
-            });
-            h.update(b"status-failed");
-            id.key = format!("{:x}", h.finalize());
-            id.layout = Some(layout);
-            return (id, Vec::new());
-        }
-    };
-    let mut entries = parse_porcelain_v1_z(&status);
-    if listed_ignored {
-        id.ignored_dirs = ignored_dir_listing(&entries);
+    // streamed record by record: no Git output is held whole, so no listing size fails
+    // the identity; only the kept entries stay
+    let mut walk = StatusWalk::new(list_ignored);
+    let streamed = crate::index::scan::stream_git_records(root, &args, |rec| walk.record(rec));
+    if let Err(e) = streamed {
+        id.identity_complete = false;
+        id.limitations.push(IdentityLimitation {
+            path: None,
+            reason: "git_status_failed".into(),
+            detail: format!("{e}; dirty content is not identified"),
+        });
+        h.update(b"status-failed");
+        id.key = format!("{:x}", h.finalize());
+        id.layout = Some(layout);
+        return (id, Vec::new());
     }
-    // ignored entries are not working state: they never enter the key
-    entries.retain(|e| e.xy != *b"!!");
+    let walk = walk.finish();
+    if list_ignored {
+        id.ignored_dirs = walk.ignored_dirs();
+    }
+    let (mut entries, beyond) = (walk.entries, (walk.beyond, walk.beyond_paths));
     // `git status` hides worktree edits to assume-unchanged / skip-worktree entries;
     // identify their bytes directly so no known working-state content is omitted.
     match hidden_index_entries(&layout.toplevel) {
@@ -1049,6 +1156,22 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         }
         id.dirty.insert(e.path.clone(), content);
     }
+    let (beyond, beyond_paths) = beyond;
+    if beyond > 0 {
+        h.update(b"untracked-beyond");
+        push_field(&mut h, &(beyond as u64).to_le_bytes());
+        push_field(&mut h, &beyond_paths.finalize());
+        id.untracked_entries += beyond;
+        id.untracked_beyond = beyond;
+        id.limitations.push(IdentityLimitation {
+            path: None,
+            reason: "identity_untracked_budget".into(),
+            detail: format!(
+                "{beyond} untracked entries past the first {MAX_IDENTITY_UNTRACKED} are keyed by \
+                 path only; their content is not identified"
+            ),
+        });
+    }
     id.identity_complete = id.limitations.is_empty();
     id.nested_repos.sort();
     id.key = format!("{:x}", h.finalize());
@@ -1065,32 +1188,24 @@ pub fn cheap_key(root: &Path) -> String {
 /// (`git ls-files -v` tag in lower case) and skip-worktree (`S`/`s`). Returned as
 /// status entries with `xy = ['!', tag]`, a marker no porcelain status uses, so the
 /// key distinguishes them. `toplevel` must be the worktree top (paths are relative).
-fn hidden_index_entries(toplevel: &Path) -> Result<Vec<StatusEntry>, GitRunError> {
-    let out = run_git_bounded(
-        toplevel,
-        &["ls-files", "-v", "-z"],
-        MAX_GIT_OUTPUT_BYTES,
-        git_timeout(),
-    )?;
+/// The listing is streamed and only the hidden entries are kept.
+fn hidden_index_entries(toplevel: &Path) -> Result<Vec<StatusEntry>, String> {
     let mut hidden: Vec<StatusEntry> = Vec::new();
-    for rec in out.split(|b| *b == 0) {
+    crate::index::scan::stream_git_records(toplevel, &["ls-files", "-v", "-z"], |rec| {
         if rec.len() < 3 || rec[1] != b' ' {
-            continue;
+            return;
         }
         let tag = rec[0];
-        if !(tag.is_ascii_lowercase() || tag == b'S') {
-            continue;
-        }
         // unmerged entries repeat a path; keep one.
-        if hidden.last().is_some_and(|e| e.path == rec[2..]) {
-            continue;
+        let repeated = hidden.last().is_some_and(|e| e.path == rec[2..]);
+        if (tag.is_ascii_lowercase() || tag == b'S') && !repeated {
+            hidden.push(StatusEntry {
+                xy: [b'!', tag],
+                path: rec[2..].to_vec(),
+                orig_path: None,
+            });
         }
-        hidden.push(StatusEntry {
-            xy: [b'!', tag],
-            path: rec[2..].to_vec(),
-            orig_path: None,
-        });
-    }
+    })?;
     Ok(hidden)
 }
 
