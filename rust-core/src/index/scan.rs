@@ -27,7 +27,7 @@
 //! Ignore matching itself is budgeted (`ignore::MATCH_BUDGET`); paths it cannot decide
 //! are the `ignore_budget` loss.
 
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -40,7 +40,7 @@ use crate::indexcache::{NestedRepo, git_timeout, run_git_bounded};
 use super::config::IndexConfig;
 use super::extract::Lang;
 use super::ignore::{DirMemo, Ignore, Verdict, XMUSTARD_IGNORE};
-use super::meta::{MAX_LOSS_ENTRIES, NestedRepos};
+use super::meta::{ListingState, MAX_EXCEPTIONS, MAX_LOSS_ENTRIES, NestedRepos};
 
 /// Candidates with a pre-read loss (symlink, oversized, envelope_bytes...) kept as rows;
 /// past this many they are only counted.
@@ -111,7 +111,7 @@ impl StatKey {
 
 /// Git index mode of a listed path.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Mode {
+pub(super) enum Mode {
     Regular,
     Symlink,
     Gitlink,
@@ -129,7 +129,7 @@ impl Mode {
 
 /// `lstat` of one listed path: its stat key and pre-read loss, or None when it is gone
 /// from the worktree. The key is empty for `symlink`, `not_regular` and `unreadable`.
-fn stat_file(
+pub(super) fn stat_file(
     root: &Path,
     path: &str,
     mode: Mode,
@@ -152,25 +152,17 @@ fn stat_file(
     Some((stat, loss))
 }
 
-/// Classify one listed path by `lstat`: None when it is gone from the worktree.
-fn stat_candidate(
-    root: &Path,
-    path: String,
-    lang: Lang,
-    mode: Mode,
-    max_file_size: u64,
-) -> Option<Candidate> {
-    let (stat, loss) = stat_file(root, &path, mode, max_file_size)?;
-    Some(Candidate {
-        path,
-        lang,
-        stat,
-        loss,
-    })
-}
-
 /// The pre-read loss of a doc on a secret path (`secretpath`): listed, never read.
 pub const SECRET_PATH: &str = "secret_path";
+
+/// Listing-state exception: a tracked, eligible source file missing from the worktree.
+pub const DELETED: &str = "deleted";
+/// Listing-state exception: a tracked doc or guidance file missing from the worktree.
+pub const DOC_DELETED: &str = "doc_deleted";
+/// Listing-state exceptions for a missing file the Git index records as a symlink: only
+/// the index knows that mode, so a paths update cannot judge what replaces it.
+pub const DELETED_SYMLINK: &str = "deleted_symlink";
+pub const DOC_DELETED_SYMLINK: &str = "doc_deleted_symlink";
 
 /// Tracked docs and guidance files the docs lane indexes at most (the smallest paths).
 pub const MAX_DOC_FILES: usize = 2000;
@@ -192,7 +184,7 @@ pub struct DocCandidate {
 }
 
 /// The docs-lane role of a path that no language pack claims.
-fn doc_role(path: &str) -> Option<&'static str> {
+pub(super) fn doc_role(path: &str) -> Option<&'static str> {
     match crate::symbolgraph::repo_role(path) {
         role @ ("doc" | "guide") => Some(role),
         _ => None,
@@ -232,9 +224,14 @@ pub struct Scan {
     /// Tracked gitlinks, and untracked nested repositories when untracked files are
     /// listed (WS-RT2): not files of this repository, so neither eligible nor a loss.
     pub nested_repos: NestedRepos,
+    /// What a later paths update needs from this listing (Git mode only, WS-RT6).
+    pub listing_state: Option<ListingState>,
+    /// Set when this scan covers only these paths (a paths update, WS-RT6): rows of
+    /// other paths stay as stored.
+    pub only: Option<BTreeSet<String>>,
 }
 
-fn now_ns() -> i64 {
+pub(super) fn now_ns() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
@@ -313,7 +310,7 @@ fn git_layout(root: &Path) -> Option<(PathBuf, String)> {
     Some((git_dir, lines.next().unwrap_or("").to_string()))
 }
 
-fn head(root: &Path) -> String {
+pub(super) fn head(root: &Path) -> String {
     run_git_bounded(
         root,
         &["rev-parse", "-q", "--verify", "HEAD"],
@@ -330,7 +327,7 @@ fn head(root: &Path) -> String {
 /// arrives. The output is never held whole. Git is killed once it has run for
 /// `git_timeout` not counting the time `on_record` takes (Git only waits on the pipe
 /// then), so slow record handling never fails the listing.
-fn stream_git_records(
+pub(crate) fn stream_git_records(
     root: &Path,
     args: &[&str],
     mut on_record: impl FnMut(&[u8]),
@@ -481,6 +478,8 @@ struct Collected {
     docs: Vec<DocCandidate>,
     docs_beyond: usize,
     nested_repos: NestedRepos,
+    exceptions: BTreeMap<String, String>,
+    exceptions_complete: bool,
 }
 
 /// Order doc candidates by path in their bounded heap (largest on top, evicted first).
@@ -523,6 +522,10 @@ struct Collector<'a> {
     nested_total: usize,
     /// The smallest nested repository paths (max-heap of at most MAX_LOSS_ENTRIES).
     nested: BinaryHeap<NestedRepo>,
+    /// Eligible paths left without a row whose state depends on the worktree (at most
+    /// MAX_EXCEPTIONS; `exceptions_complete` is false once one more was seen).
+    exceptions: BTreeMap<String, String>,
+    exceptions_complete: bool,
 }
 
 impl<'a> Collector<'a> {
@@ -539,6 +542,16 @@ impl<'a> Collector<'a> {
             docs_beyond: 0,
             nested_total: 0,
             nested: BinaryHeap::new(),
+            exceptions: BTreeMap::new(),
+            exceptions_complete: true,
+        }
+    }
+
+    fn note_exception(&mut self, path: String, state: &str) {
+        if self.exceptions.len() < MAX_EXCEPTIONS {
+            self.exceptions.insert(path, state.to_string());
+        } else {
+            self.exceptions_complete = false;
         }
     }
 
@@ -554,22 +567,20 @@ impl<'a> Collector<'a> {
         }
     }
 
-    /// A doc or guidance file for the docs lane; gone files are simply not indexed. A
-    /// secret path is listed with the `secret_path` loss, so its bytes are never read.
+    /// A doc or guidance file for the docs lane; a gone file is not indexed and is
+    /// recorded for the listing state.
     fn add_doc(&mut self, path: String, role: &'static str, mode: Mode) {
-        let cap = MAX_DOC_BYTES.min(self.cfg.max_file_size);
-        let Some((stat, loss)) = stat_file(self.root, &path, mode, cap) else {
-            return;
+        let doc = match doc_candidate(self.root, path, role, mode, self.cfg) {
+            Ok(doc) => doc,
+            Err(gone) => {
+                let state = match mode {
+                    Mode::Symlink => DOC_DELETED_SYMLINK,
+                    _ => DOC_DELETED,
+                };
+                return self.note_exception(gone, state);
+            }
         };
-        let loss = crate::secretpath::is_secret_path(&path)
-            .then_some(SECRET_PATH)
-            .or(loss);
-        self.docs.push(DocByPath(DocCandidate {
-            path,
-            role,
-            stat,
-            loss,
-        }));
+        self.docs.push(DocByPath(doc));
         if self.docs.len() > MAX_DOC_FILES {
             self.docs.pop();
             self.docs_beyond += 1;
@@ -577,9 +588,21 @@ impl<'a> Collector<'a> {
     }
 
     fn add(&mut self, path: String, lang: Lang, mode: Mode) {
-        match stat_candidate(self.root, path, lang, mode, self.cfg.max_file_size) {
-            None => self.worktree_deleted += 1,
-            Some(c) => self.push(c),
+        match stat_file(self.root, &path, mode, self.cfg.max_file_size) {
+            None => {
+                self.worktree_deleted += 1;
+                let state = match mode {
+                    Mode::Symlink => DELETED_SYMLINK,
+                    _ => DELETED,
+                };
+                self.note_exception(path, state);
+            }
+            Some((stat, loss)) => self.push(Candidate {
+                path,
+                lang,
+                stat,
+                loss,
+            }),
         }
     }
 
@@ -605,6 +628,11 @@ impl<'a> Collector<'a> {
 
     fn push_beyond(&mut self, path: String, reason: &str) {
         *self.beyond.entry(reason.to_string()).or_default() += 1;
+        // a readable file past the cut and an undecided path keep their reason whatever
+        // the worktree does; a pre-read loss does not
+        if !matches!(reason, "envelope_files" | "ignore_budget") {
+            self.note_exception(path.clone(), reason);
+        }
         if self.sample.len() < MAX_LOSS_ENTRIES {
             self.sample.push((path, reason.to_string()));
         } else if self.sample.peek().is_some_and(|(p, _)| path < *p) {
@@ -673,8 +701,43 @@ impl<'a> Collector<'a> {
                 total: self.nested_total,
                 repos: self.nested.into_sorted_vec(),
             },
+            exceptions: self.exceptions,
+            exceptions_complete: self.exceptions_complete,
         }
     }
+}
+
+/// A doc or guidance file as the docs lane lists it, or its path back when it is gone.
+/// A secret path is listed with the `secret_path` loss, so its bytes are never read.
+pub(super) fn doc_candidate(
+    root: &Path,
+    path: String,
+    role: &'static str,
+    mode: Mode,
+    cfg: &IndexConfig,
+) -> Result<DocCandidate, String> {
+    let cap = MAX_DOC_BYTES.min(cfg.max_file_size);
+    let Some((stat, loss)) = stat_file(root, &path, mode, cap) else {
+        return Err(path);
+    };
+    let loss = crate::secretpath::is_secret_path(&path)
+        .then_some(SECRET_PATH)
+        .or(loss);
+    Ok(DocCandidate {
+        path,
+        role,
+        stat,
+        loss,
+    })
+}
+
+/// Stat key of the Git index file (empty when there is none): a listing records it
+/// before it starts, so any later rewrite of the index (an add, a checkout, a commit)
+/// makes a paths update list the tree again.
+pub(super) fn git_index_key(git_dir: &Path) -> String {
+    std::fs::symlink_metadata(git_dir.join("index"))
+        .map(|m| StatKey::of(&m).encode())
+        .unwrap_or_default()
 }
 
 fn basename(path: &str) -> &str {
@@ -688,6 +751,7 @@ fn scan_git(
     cfg: &IndexConfig,
 ) -> Result<Scan, String> {
     let started_ns = now_ns();
+    let git_index = git_index_key(&git_dir);
     // The ignore files first (a small listing), so the main listing is filtered as it
     // streams. Untracked ignore files count only when untracked files are indexed.
     let mut ignore_files: Vec<String> = Vec::new();
@@ -808,6 +872,13 @@ fn scan_git(
         docs: c.docs,
         docs_beyond: c.docs_beyond,
         nested_repos: c.nested_repos,
+        listing_state: Some(ListingState {
+            git_index,
+            docs_beyond: c.docs_beyond,
+            exceptions: c.exceptions,
+            complete: c.exceptions_complete,
+        }),
+        only: None,
     })
 }
 
@@ -876,6 +947,8 @@ fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
         docs: c.docs,
         docs_beyond: c.docs_beyond,
         nested_repos: c.nested_repos,
+        listing_state: None,
+        only: None,
     }
 }
 
