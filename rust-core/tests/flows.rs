@@ -700,6 +700,68 @@ fn the_limit_flag_lowers_the_seed_cap_and_is_refused_when_it_is_not_a_number() {
 
 // --- bounded DFS ------------------------------------------------------------
 
+/// A symbol first listed down the LONG route is queued again by the SHORT one.
+///
+/// Before this row's fix one flag answered both "already a step" and "may be expanded", and
+/// the callee loop tested it before `expanded_at` could. So a symbol the walk reached first
+/// down a deep route held the step slot, and the shallower route beside it could never
+/// re-queue it at a depth where its own children were still inside the depth cap. The leaf
+/// under the hub was then absent from the answer even though three hops from the seed
+/// reaches it — and which route went first depends on the order the CSR holds callees in.
+///
+/// The fixture is the shape that shows it. `Start` declares the deep branch FIRST, so the
+/// LIFO stack pops it first and the hub is listed nine hops out, one hop short of its leaf.
+/// The short branch reaches the same hub two hops out, where the leaf is well inside the
+/// cap. Both routes are in the source, so the graph holds them either way: only the
+/// traversal decides whether the leaf is reported.
+#[test]
+fn a_symbol_first_reached_down_the_long_route_is_queued_again_by_the_short_one() {
+    let d = repo(&[
+        GO_MOD,
+        (
+            "pkg/hub.go",
+            gofuncs_ref(&[
+                // Deep is declared first so the stack pops it first: that is what puts the
+                // hub in the step list at depth nine, one hop short of its leaf.
+                go_func("Start", &["Deep", "Near"]),
+                go_func("Near", &["Hub"]),
+                go_func("Deep", &["E1"]),
+                go_func("E1", &["E2"]),
+                go_func("E2", &["E3"]),
+                go_func("E3", &["E4"]),
+                go_func("E4", &["E5"]),
+                go_func("E5", &["E6"]),
+                go_func("E6", &["E7"]),
+                go_func("E7", &["E8"]),
+                go_func("E8", &["Hub"]),
+                go_func("Hub", &["HubLeaf"]),
+                go_func("HubLeaf", &[]),
+            ]),
+        ),
+    ]);
+    build(d.path());
+    let v = flows(d.path(), &[]);
+    let fs = read_flows(&v);
+    let start = fs
+        .iter()
+        .find(|f| f.seeds.iter().any(|s| s == "Start"))
+        .unwrap_or_else(|| panic!("the flow seeded at Start in {fs:?}"));
+    let names: BTreeSet<&str> = start.steps.iter().map(|(n, _)| n.as_str()).collect();
+    // The hub is on both routes, so it is listed either way; the leaf is the step only the
+    // short route can reach, and it is the one the conflated flag used to drop.
+    assert!(
+        names.contains("HubLeaf"),
+        "HubLeaf is two hops from Start through Near, so it is inside the depth cap: {start:?}"
+    );
+    // The deep route is still walked. The fix re-queues a symbol at a shorter depth; it does
+    // not stop at the first route found, so a walk that reported only the short branch would
+    // satisfy the assertion above while losing the chain.
+    assert!(
+        names.contains("E4"),
+        "the deep branch is reached too: {start:?}"
+    );
+}
+
 #[test]
 fn a_flow_stops_at_depth_ten() {
     // 14 names in a chain. The depth cap bounds each walk, not the union of the walks,

@@ -721,20 +721,30 @@ struct Walk {
 /// in the call graph. The stack is explicit rather than recursive: the depth is bounded at
 /// ten, but this index does not want a call stack that grows with a repository.
 ///
-/// A symbol is marked EXPANDED, not queued, and a symbol reached again by a SHORTER route
-/// is expanded a second time. Marking it on the queue instead makes the reachability set
-/// depend on the order the CSR happens to hold: depth-first means the first route found
-/// wins, so a long chain into a subtree would block the short path beside it and the walk
-/// would report steps that are reachable within depth ten but absent from the answer. The
-/// second expansion is bounded by `max_depth` — a symbol can only be re-expanded on a
-/// strictly shorter route, and there are at most `max_depth` distinct route lengths — so
-/// this terminates on a cycle for the same reason the guard does.
+/// Two per-node flags, because "already in the answer" and "may be expanded" are different
+/// questions, and reading them as one makes the walk's answer depend on which route the
+/// stack happened to take first.
+///
+/// `expanded_at` is the second. A symbol reached again by a SHORTER route is expanded a
+/// second time, and there are at most `max_depth` distinct route lengths to expand at, which
+/// is what terminates the loop on a cycle.
+///
+/// `in_answer` is the first: it holds a symbol once in the step list. Sharing one flag for
+/// both, or skipping the queue for a symbol already listed, loses steps. The callee loop
+/// refuses to LIST a symbol twice but still QUEUES it, because the route that listed it may
+/// have been the deep one and this may be the short one. Refusing the queue instead makes
+/// the answer depend on which route the stack reached a symbol by: a symbol first listed
+/// near the depth cap can never be re-listed where its own children are still in reach, so
+/// those children go missing although the walk reaches them.
+/// `a_symbol_first_reached_down_the_long_route_is_queued_again_by_the_short_one` in
+/// `tests/flows.rs` is the fixture: a hub nine hops out on one route and two on another
+/// loses the leaf beneath it.
 fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) -> Walk {
     let mut expanded_at: Vec<u32> = vec![u32::MAX; graph.nodes.len()];
-    let mut visited_set = vec![false; graph.nodes.len()];
+    let mut in_answer = vec![false; graph.nodes.len()];
     let mut visited = Vec::with_capacity(limits.min_steps);
     let mut stack: Vec<(usize, u32)> = Vec::new();
-    visited_set[seed as usize] = true;
+    in_answer[seed as usize] = true;
     stack.push((seed as usize, 0));
     let mut deepest = 0u32;
 
@@ -759,9 +769,6 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
         let mut stopped_branching = 0u64;
         let mut stopped_depth = 0u64;
         for &callee in graph.callee_slice(node as u32) {
-            if visited_set[callee as usize] {
-                continue;
-            }
             // Both counters count every callee the bound stopped, not the node it stopped
             // at: the walk keeps scanning so a six-way fan under a cap of four reports the
             // two it did not take rather than one per node.
@@ -773,9 +780,20 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
                 stopped_depth += 1;
                 continue;
             }
-            visited_set[callee as usize] = true;
-            visited.push(callee as usize);
-            taken += 1;
+            // A symbol already in the step list is not a step again, but it is still QUEUED
+            // at this depth: the route that listed it may have been the long one, and this is
+            // the shorter one. Skipping the queue here is what made the walk's answer depend
+            // on which route the stack reached a symbol by — a symbol first listed near the
+            // depth cap could never be re-listed where its own children are still in reach,
+            // so those children went missing from the answer. It is not exploration, so it
+            // does not consume the branching budget; `expanded_at` still refuses the push
+            // unless this really is a shorter route, which bounds the stack growth.
+            let first_time = !in_answer[callee as usize];
+            if first_time {
+                in_answer[callee as usize] = true;
+                visited.push(callee as usize);
+                taken += 1;
+            }
             deepest = deepest.max(depth + 1);
             stack.push((callee as usize, depth + 1));
         }
