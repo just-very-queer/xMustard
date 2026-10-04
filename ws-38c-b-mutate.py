@@ -21,17 +21,16 @@ READER_RS = "rust-core/src/index/reader.rs"
 MOD_RS = "rust-core/src/index/mod.rs"
 
 # (row, file, exact old text, new text, test name)
+#
+# Each subject is the ONE line its test's assertion is about, chosen so the test's own
+# assertion — not some neighbour — is what fails. M2 is the generation comparison the
+# refusal turns on; M3 is the seed's area joining the community set; M4 is the retention cap's
+# own comparison, which the publication test reads through `caps.max_retained_steps`.
 SUBJECTS = [
-    (
-        "M1", MOD_RS,
-        "        .chain(result.candidate_paths.iter().cloned())\n",
-        "",
-        "an_unselected_callers_file_marks_the_answer_stale",
-    ),
     (
         "M2", READER_RS,
         "                    if read_generation != self.generation.to_string() {",
-        "                    if false {",
+        "                    if read_generation == read_generation {",
         "a_store_generation_that_moved_past_the_segment_is_refused_rather_than_mixed",
     ),
     (
@@ -44,10 +43,16 @@ SUBJECTS = [
         "M4", FLOWS_RS,
         "        if retained + walk.visited.len() as u64 > limits.max_retained_steps {",
         "        if retained + walk.visited.len() as u64 > u64::MAX {",
+        "a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted",
+    ),
+    (
+        "M5", FLOWS_RS,
+        "    let mut retained: u64 = 0;\n",
+        "    let mut retained: u64 = limits.max_retained_steps;\n",
         "the_retained_step_set_is_bounded_by_one_published_global_cap",
     ),
     (
-        "M5", READER_RS,
+        "M6", READER_RS,
         '                    conn.execute_batch("BEGIN DEFERRED").map_err(sql)?;\n',
         "",
         "a_store_generation_that_moved_past_the_segment_is_refused_rather_than_mixed",
@@ -73,6 +78,22 @@ def run_one(row, rel, old, new, test):
     with open(path, "w") as fh:
         fh.write(mutated)
     print(f"subject={row} applied={rel} bytes={len(original)}->{len(mutated)}")
+
+    # Force the rebuild. A survivor caused by a binary that never saw the change is worse
+    # than no row at all, and `cargo test`'s mtime check can miss an rsynced file.
+    os.utime(path, None)
+    built = subprocess.run(
+        ["cargo", "test", "--test", "flows", "--no-run"],
+        cwd=os.path.join(ROOT, "rust-core"),
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=280,
+    )
+    if built.returncode != 0:
+        print(f"subject={row} test={test} BUILD_FAILED")
+        for ln in built.stdout.decode(errors="replace").splitlines()[-15:]:
+            print("    " + ln)
+        with open(path, "w") as fh:
+            fh.write(original)
+        return None
 
     proc = subprocess.run(
         ["cargo", "test", "--test", "flows", "--", "--test-threads=1", test],

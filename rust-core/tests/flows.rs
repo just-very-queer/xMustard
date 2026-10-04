@@ -2005,20 +2005,34 @@ fn the_retained_step_set_is_bounded_by_one_published_global_cap() {
 
 /// The global cap fires, and says so, when the walks really do exceed it.
 ///
-/// The default cap is the product of two published caps, which a fixture cannot afford to
-/// build, so the cap is reached here through the `--limit` flag's existing arm is NOT
-/// available (it lowers the seed cap, not the retention cap). The path under test is
-/// therefore the arithmetic itself: with 60 one-step-delta suffixes over a 60-step trunk,
-/// every seed's walk is a suffix, so the sum across 60 walks is what the cap bounds. This
-/// test pins the SHAPE of the check rather than the default number, and the honest verdict
-/// is that the check is observable only when the product is exceeded — recorded as such in
-/// the row's mutation table rather than claimed as covered.
+/// **MEASURED: it cannot, with the current caps, so this test pins the counter's plumbing
+/// and the verdict is recorded rather than papered over.** A walk is cut at `MAX_DEPTH` (10)
+/// and there are at most `MAX_CANDIDATES` (200) seeds, so the retained sum cannot exceed
+/// 2,000 — under a fifth of the 10,000 `MAX_RETAINED_STEPS` is set to. Measured on the box at
+/// four shapes (`logs/ws-38c-b-run-20261004T154513Z.log`), including 230 seeds each reaching
+/// 50 distinct steps: peak RSS 12.72 / 14.09 / 15.52 / 16.15 MiB against the 32 MiB line, and
+/// `dropped_retained: 0` on every one, because what stops them is the seed cap.
+///
+/// Two fixture shapes were tried and failed before that, both recorded in the row's mutation
+/// table: suffixes DEDUP together (250 trunks reported `flows: 0`), and a 13,000-symbol single
+/// file sits past the Go extractor's budget (`call_edges: 0`), so the distinct sets have to
+/// come from branching rather than volume.
+///
+/// The mutation that would kill this test — replacing the cap comparison with `u64::MAX` —
+/// SURVIVES it (`logs/ws-38c-b-run-20261004T163307Z.log`, M4), because with the cap
+/// unreachable no run of this code can tell the comparison from its absence. `Limits` takes
+/// `max_retained_steps` so a unit test could drive it at a lowered value, but `flows_of` needs
+/// a real `csr::Segment` (it wraps serialized bytes), so the unit route would mean building a
+/// segment fixture for one assertion. The sibling test covers what IS observable — that the
+/// cap is published and equals the product of the two existing caps — and its mutation (M5,
+/// `retained` starting at the cap) IS killed.
 #[test]
 fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
     // Two independent trunks of 40 steps each, so there are two reachability sets rather
     // than 60 suffixes of one: dedup folds suffixes together, which is what keeps this
-    // fixture's retained sum small, and the assertion below is about the counter's PLUMBING
-    // — that it exists, reads zero when nothing was dropped, and is included in `truncated`.
+    // fixture's retained sum small. The assertions below are about the counter's PLUMBING —
+    // that it is published, reads zero when nothing was dropped, and is included in
+    // `truncated` — not about the cap firing, which the doc comment shows it cannot here.
     let mut src = String::from("package pkg\n\n");
     for trunk in ["P", "Q"] {
         src.push_str(&format!("func {trunk}0() {{ "));
