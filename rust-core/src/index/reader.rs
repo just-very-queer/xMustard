@@ -331,10 +331,11 @@ impl Snapshot {
                     // query share. `query_row` on `meta` is the first statement, so the
                     // snapshot is taken there; a concurrent build cannot move it afterwards.
                     conn.execute_batch("BEGIN DEFERRED")?;
-                    let read_generation: String = conn
-                        .query_row("SELECT value FROM meta WHERE key = 'generation'", [], |r| {
-                            r.get(0)
-                        })?;
+                    let read_generation: String = conn.query_row(
+                        "SELECT value FROM meta WHERE key = 'generation'",
+                        [],
+                        |r| r.get(0),
+                    )?;
                     if read_generation != self.generation.to_string() {
                         // Roll the read transaction back before refusing: leaving it open on a
                         // shared text connection would pin the store view for the next reader

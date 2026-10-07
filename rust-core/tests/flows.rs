@@ -2025,10 +2025,9 @@ fn a_duplicate_reachability_set_is_folded_rather_than_charged_to_the_cap() {
     build(d.path());
     let v = flows(d.path(), &[]);
     let fs = read_flows(&v);
-    let flow = fs
-        .iter()
-        .find(|f| f.seeds.len() >= 2)
-        .unwrap_or_else(|| panic!("the two heads share one set and name both seeds: {fs:?} in {v:#}"));
+    let flow = fs.iter().find(|f| f.seeds.len() >= 2).unwrap_or_else(|| {
+        panic!("the two heads share one set and name both seeds: {fs:?} in {v:#}")
+    });
     assert!(
         flow.seeds.iter().any(|s| s == "HeadA") && flow.seeds.iter().any(|s| s == "HeadB"),
         "one flow names both seeds, which is the fold: {flow:?}"
@@ -2162,11 +2161,7 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
     // exported = 4.0, against `CallerLow`'s single callee at 2.0.
     let mut mid = String::from("package pkg\n\n");
     for i in 0..260 {
-        mid.push_str(&format!(
-            "func M{i}() {{ M{}(); M{}() }}\n",
-            i + 1,
-            i + 2
-        ));
+        mid.push_str(&format!("func M{i}() {{ M{}(); M{}() }}\n", i + 1, i + 2));
     }
     mid.push_str("func M260() {}\nfunc M261() {}\n");
     let d = repo(&[
@@ -2243,7 +2238,9 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
         "Low1 is a reported seed, so the answer has a score this caller shaped: {before:#}"
     );
     assert!(
-        !read_seeds(&before).iter().any(|s| s.path == "caller/entry.go"),
+        !read_seeds(&before)
+            .iter()
+            .any(|s| s.path == "caller/entry.go"),
         "no seed lives in the caller's file, which is what makes the file envelope-only: {before:#}"
     );
     // The envelope has no `stale` boolean and `status` describes the indexed commit's
@@ -2352,7 +2349,10 @@ fn the_seeds_own_community_counts_toward_the_class() {
     let v = flows(d.path(), &[]);
     let seeds = read_seeds(&v);
     assert_eq!(
-        seeds.iter().find(|s| s.name == "GammaOne").map(|s| s.callees),
+        seeds
+            .iter()
+            .find(|s| s.name == "GammaOne")
+            .map(|s| s.callees),
         Some(2),
         "GammaOne's two calls into the beta package resolve: {v:#}"
     );
@@ -2368,9 +2368,7 @@ fn the_seeds_own_community_counts_toward_the_class() {
         "GammaOne's walk reaches the beta ring, so the flow is not empty: {flow:?}"
     );
     assert!(
-        flow.steps
-            .iter()
-            .all(|(_, p)| p == "beta/beta.go"),
+        flow.steps.iter().all(|(_, p)| p == "beta/beta.go"),
         "every step GammaOne reaches is a beta symbol, so the seed's own community is the \
          only second one: {flow:?}"
     );
