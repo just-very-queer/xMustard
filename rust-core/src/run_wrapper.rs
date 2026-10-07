@@ -387,22 +387,32 @@ impl Reporter {
     /// A spawned thread is detached, so a forwarded signal that promptly ends the child could end
     /// the wrapper before the writer ever ran, and the decision would go missing exactly when it
     /// matters most. The acknowledged line goes to the back of the queue, so its ack means every
-    /// line queued before it has been handed to the sink. Bounded, because the writer may itself
-    /// be parked on a sink nobody drains, and the wrapper's own outcome must not wait on that.
+    /// line queued before it has been handed to the sink. A full queue is waited on for room
+    /// rather than given up on, because the queue is fullest exactly when lines were dropped and
+    /// the count most needs stating. All of it is bounded by `limit`: the writer may be parked on
+    /// a sink nobody drains, and the wrapper's own outcome must not wait on that.
     fn drain(&self, limit: Duration) {
+        let deadline = std::time::Instant::now() + limit;
         let lost = self.dropped.swap(0, Ordering::SeqCst);
         let line = if lost == 0 {
             String::new()
         } else {
             format!("xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n")
         };
-        if self.lines.try_send(Report { line, ack: true }).is_err() {
-            // Still full: the count is kept for a later drain rather than forgotten.
-            self.dropped.fetch_add(lost, Ordering::SeqCst);
-            return;
+        let mut pending = Report { line, ack: true };
+        loop {
+            match self.lines.try_send(pending) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(report)) if std::time::Instant::now() < deadline => {
+                    pending = report;
+                    thread::sleep(DRAIN_POLL);
+                }
+                Err(_) => return,
+            }
         }
         if let Ok(acks) = self.acks.lock() {
-            let _ = acks.recv_timeout(limit);
+            let _ =
+                acks.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
         }
     }
 }
@@ -414,6 +424,9 @@ const REPORT_QUEUE: usize = 32;
 /// How long the wrapper waits for queued reports on its way out. Long enough for a write to a
 /// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
 const REPORT_DRAIN: Duration = Duration::from_millis(50);
+
+/// How often a drain looks for room in a full queue.
+const DRAIN_POLL: Duration = Duration::from_millis(1);
 
 /// Signals the child and says whether it got the signal.
 ///
