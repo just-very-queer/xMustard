@@ -71,45 +71,50 @@ impl Unknown {
     }
 }
 
-/// A bounded Git listing; a failure (not a repository, git missing, a timeout, output
-/// past the cap) is an error, never an empty listing.
-fn git_listing(root: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
-    crate::indexcache::run_git_bounded(
-        root,
-        args,
-        crate::indexcache::MAX_GIT_OUTPUT_BYTES,
-        crate::indexcache::git_timeout(),
-    )
-    .map_err(|e| format!("git {}: {e}", args[0]))
-}
-
+/// The tracked paths under `root`, from the index (`ls-files` order, an unmerged path
+/// once per stage) as `XMUSTARD_GIT_INDEX_READER` picks the source (WS-RT18). A
+/// failure (not a repository, an index the reader refuses, git missing) is an error,
+/// never an empty listing. Paths that are not UTF-8 are skipped.
 fn tracked_files(root: &Path) -> Result<Vec<String>, String> {
-    // NUL-delimited and untrimmed, so whitespace/newline names stay exact.
-    let out = git_listing(root, &["ls-files", "-z"])?;
-    Ok(out
-        .split(|b| *b == 0)
-        .filter(|p| !p.is_empty())
-        .filter_map(|p| String::from_utf8(p.to_vec()).ok())
-        .collect())
+    let mut paths = Vec::new();
+    let setting = crate::gitindex::Setting::from_env();
+    crate::gitindex::list_using(
+        root,
+        setting,
+        crate::gitindex::Listing::Tracked,
+        &mut |p, _| {
+            if let Ok(p) = std::str::from_utf8(p) {
+                paths.push(p.to_string());
+            }
+        },
+    )
+    .map_err(|e| format!("tracked listing: {e}"))?;
+    Ok(paths)
 }
 
-/// `git status --porcelain=v1 -z` parsed into (status_code, path), untrimmed; a rename
-/// reports its new path. Submodules are compared as `source_identity` compares them
-/// (`--ignore-submodules=none`), whatever `submodule.<name>.ignore` says.
-fn dirty_paths(root: &Path) -> Result<Vec<(String, String)>, String> {
-    let out = git_listing(
-        root,
-        &["status", "--porcelain=v1", "-z", "--ignore-submodules=none"],
-    )?;
-    Ok(crate::indexcache::parse_porcelain_v1_z(&out)
-        .into_iter()
+/// The uncommitted paths of the worktree as (status code, path), untrimmed: the source
+/// identity's listing (tracked changes, each untracked path, submodules compared with
+/// `--ignore-submodules=none`), so change tracking and the identity count the same
+/// paths (PAR-FRESH-01). The count adds the untracked paths keyed past the identity's
+/// bound.
+fn dirty_paths(root: &Path) -> Result<(Vec<(String, String)>, usize), String> {
+    let (state, _) = crate::indexcache::repo_state(root);
+    if let Some(e) = observation_error(&state) {
+        return Err(e);
+    }
+    let listed: Vec<(String, String)> = state
+        .status
+        .iter()
+        .filter(|e| e.xy[0] != b'!')
         .map(|e| {
             (
                 String::from_utf8_lossy(&e.xy).trim().to_string(),
                 String::from_utf8_lossy(&e.path).into_owned(),
             )
         })
-        .collect())
+        .collect();
+    let count = listed.len() + state.identity.untracked_beyond;
+    Ok((listed, count))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -179,9 +184,9 @@ fn fingerprint_of(
 /// the fingerprint of an empty repository.
 pub fn compute_fingerprint(root: &Path) -> Result<RepoFingerprint, String> {
     let map = file_hash_map(root)?;
-    let dirty = dirty_paths(root)?;
+    let (_, dirty) = dirty_paths(root)?;
     let head = git(root, &["rev-parse", "HEAD"]);
-    Ok(fingerprint_of(root, head, &map, dirty.len()))
+    Ok(fingerprint_of(root, head, &map, dirty))
 }
 
 /// A tracked path whose index or worktree content differs from HEAD, and HEAD's entry
@@ -201,68 +206,43 @@ impl HeadEntry {
 
 /// The tracked paths under `root` with uncommitted changes against commit `head`
 /// (`git diff <head> --raw`, a rename split into a deletion and an addition), relative
-/// to `root`. Without a commit every tracked path in `tracked` is uncommitted.
+/// to `root`, from the source `XMUSTARD_GIT_INDEX_READER` picks (WS-RT18). Without a
+/// commit every tracked path in `tracked` is uncommitted. A path that is not UTF-8 is
+/// skipped, as the tracked listing skips it.
 fn changed_from_head(
     root: &Path,
     head: Option<&str>,
     tracked: &BTreeMap<String, String>,
 ) -> Result<Vec<HeadEntry>, String> {
-    let Some(head) = head else {
-        return Ok(tracked
+    let all = || {
+        tracked
             .keys()
             .map(|path| HeadEntry {
                 path: path.clone(),
                 mode: "000000".into(),
                 oid: String::new(),
             })
-            .collect());
+            .collect()
     };
-    let out = git_listing(
-        root,
-        &[
-            "diff",
-            "--raw",
-            "-z",
-            "--no-renames",
-            "--relative",
-            "--no-abbrev",
-            "--no-ext-diff",
-            "--no-color",
-            "--ignore-submodules=none",
-            head,
-            "--",
-        ],
-    )?;
-    parse_raw_diff(&out)
-}
-
-/// Parse `git diff --raw -z --no-renames`: `:srcmode dstmode srcoid dstoid status NUL
-/// path NUL` per path. A path that is not UTF-8 is skipped, as the tracked listing
-/// skips it; a malformed record fails the parse.
-fn parse_raw_diff(out: &[u8]) -> Result<Vec<HeadEntry>, String> {
-    let malformed = || "git diff: malformed --raw record".to_string();
-    let mut fields = out.split(|b| *b == 0).filter(|f| !f.is_empty());
-    let mut entries = Vec::new();
-    while let Some(meta) = fields.next() {
-        let meta = std::str::from_utf8(meta).map_err(|_| malformed())?;
-        let path = fields.next().ok_or_else(malformed)?;
-        let parts: Vec<&str> = meta
-            .strip_prefix(':')
-            .ok_or_else(malformed)?
-            .split(' ')
-            .collect();
-        let [mode, _, oid, _, _] = parts[..] else {
-            return Err(malformed());
-        };
-        if let Ok(path) = String::from_utf8(path.to_vec()) {
-            entries.push(HeadEntry {
-                path,
-                mode: mode.to_string(),
-                oid: oid.to_string(),
-            });
-        }
+    if head.is_none() {
+        return Ok(all());
     }
-    Ok(entries)
+    let setting = crate::gitindex::Setting::from_env();
+    let changes = crate::gitindex::head_changes_using(root, setting)
+        .map_err(|e| format!("changes against HEAD: {e}"))?;
+    let Some(changes) = changes else {
+        return Ok(all());
+    };
+    Ok(changes
+        .into_iter()
+        .filter_map(|c| {
+            Some(HeadEntry {
+                path: String::from_utf8(c.path).ok()?,
+                mode: format!("{:06o}", c.mode),
+                oid: c.oid.map(|o| o.hex()).unwrap_or_default(),
+            })
+        })
+        .collect())
 }
 
 /// One `git cat-file` pass over `oids`: `--batch-check` reports each object's size,
@@ -888,13 +868,21 @@ impl DriftChecked {
 }
 
 /// Why the worktree could not be observed: Git is missing, the root is not a worktree,
-/// or `git status` failed.
+/// `git status` failed, or the index reader refused or failed (WS-RT18).
 fn observation_error(state: &crate::indexcache::RepoState) -> Option<String> {
     state
         .identity
         .limitations
         .iter()
-        .find(|l| matches!(l.reason.as_str(), "git_unavailable" | "git_status_failed"))
+        .find(|l| {
+            matches!(
+                l.reason.as_str(),
+                "git_unavailable"
+                    | "git_status_failed"
+                    | "git_index_unsupported"
+                    | "git_index_failed"
+            )
+        })
         .map(|l| {
             format!(
                 "git {}: {}",
@@ -1771,6 +1759,7 @@ mod tests {
             .unwrap();
         let paths: Vec<String> = dirty_paths(dir.path())
             .unwrap()
+            .0
             .into_iter()
             .map(|(_, p)| p)
             .collect();

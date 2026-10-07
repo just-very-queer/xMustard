@@ -35,6 +35,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
+use crate::gitindex::Listing;
 use crate::indexcache::{NestedRepo, git_timeout, run_git_bounded};
 
 use super::config::IndexConfig;
@@ -118,10 +119,11 @@ pub(super) enum Mode {
 }
 
 impl Mode {
-    fn parse(m: &[u8]) -> Mode {
+    /// The mode of an index entry (`0o120000`, `0o160000`, else a regular file).
+    fn of(m: u32) -> Mode {
         match m {
-            b"120000" => Mode::Symlink,
-            b"160000" => Mode::Gitlink,
+            0o120000 => Mode::Symlink,
+            0o160000 => Mode::Gitlink,
             _ => Mode::Regular,
         }
     }
@@ -753,29 +755,21 @@ fn scan_git(
     let started_ns = now_ns();
     let git_index = git_index_key(&git_dir);
     // The ignore files first (a small listing), so the main listing is filtered as it
-    // streams. Untracked ignore files count only when untracked files are indexed.
+    // streams. Untracked ignore files count only when untracked files are indexed. The
+    // listings come from the source `XMUSTARD_GIT_INDEX_READER` picks (WS-RT18).
+    let setting = crate::gitindex::Setting::from_env();
     let mut ignore_files: Vec<String> = Vec::new();
-    let mut ignore_listings: Vec<&[&str]> = vec![&[
-        "--glob-pathspecs",
-        "ls-files",
-        "-z",
-        "--",
-        "**/.xmustardignore",
-    ]];
-    if cfg.include_untracked {
-        ignore_listings.push(&[
-            "--glob-pathspecs",
-            "ls-files",
-            "-o",
-            "--exclude-standard",
-            "-z",
-            "--",
-            "**/.xmustardignore",
-        ]);
-    }
     let mut ignore_files_dropped = 0usize;
-    for args in ignore_listings {
-        stream_git_records(root, args, |rec| {
+    let mut ignore_listings = vec![false];
+    if cfg.include_untracked {
+        ignore_listings.push(true);
+    }
+    for untracked in ignore_listings {
+        let named = Listing::Named {
+            name: XMUSTARD_IGNORE,
+            untracked,
+        };
+        crate::gitindex::list_using(root, setting, named, &mut |rec, _| {
             if let Ok(p) = std::str::from_utf8(rec)
                 && basename(p) == XMUSTARD_IGNORE
             {
@@ -785,7 +779,8 @@ fn scan_git(
                     ignore_files_dropped += 1;
                 }
             }
-        })?;
+        })
+        .map_err(|e| e.to_string())?;
     }
     let mut ig = Ignore::with_defaults();
     ig.load_xmustard(root, &ignore_files);
@@ -833,27 +828,21 @@ fn scan_git(
         }
     };
     let mut last: Vec<u8> = Vec::new();
-    stream_git_records(root, &["ls-files", "-s", "-z"], |rec| {
-        // "<mode> <blob> <stage>\t<path>"
-        let Some(tab) = rec.iter().position(|b| *b == b'\t') else {
-            return;
-        };
-        let mode = Mode::parse(rec[..tab].split(|b| *b == b' ').next().unwrap_or(b""));
-        let raw = &rec[tab + 1..];
+    crate::gitindex::list_using(root, setting, Listing::Tracked, &mut |raw, mode| {
         // unmerged paths appear once per stage, consecutively
         if raw == last.as_slice() {
             return;
         }
         last.clear();
         last.extend_from_slice(raw);
-        on_entry(raw, mode, &mut col);
-    })?;
+        on_entry(raw, Mode::of(mode), &mut col);
+    })
+    .map_err(|e| e.to_string())?;
     if cfg.include_untracked {
-        stream_git_records(
-            root,
-            &["ls-files", "-o", "--exclude-standard", "-z"],
-            |raw| on_entry(raw, Mode::Regular, &mut col),
-        )?;
+        crate::gitindex::list_using(root, setting, Listing::Untracked, &mut |raw, _| {
+            on_entry(raw, Mode::Regular, &mut col)
+        })
+        .map_err(|e| e.to_string())?;
     }
     let c = col.finish();
     Ok(Scan {
