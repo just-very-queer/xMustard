@@ -26,6 +26,9 @@ use super::objects::{HeadItem, HeadWalk};
 use super::reader::{Entry, Hash, Index, Oid, Stat};
 use crate::indexcache::{StatusEntry, git_timeout, path_from_bytes, run_git_bounded};
 
+/// The most `git config --list` output the reader takes.
+const MAX_CONFIG_BYTES: usize = 1 << 20;
+
 /// Entries decided by one `update-index --refresh` child.
 pub const REFRESH_BATCH: usize = 4096;
 
@@ -72,19 +75,16 @@ impl Repo {
         };
         let hash = Hash::parse(format)
             .ok_or_else(|| Refusal::Unsupported(format!("object format {format}")))?;
-        // `--get-regexp` exits 1 when nothing matches: no settings
+        // the whole listing (it exits 0 with no settings), so a config Git cannot read,
+        // or one past the bound, is a refusal rather than an empty config that would
+        // skip `core.ignorecase` and `core.excludesFile`
         let config = run_git_bounded(
             root,
-            &[
-                "config",
-                "-z",
-                "--get-regexp",
-                r"^core\.(excludesfile|ignorecase)$",
-            ],
-            64 << 10,
+            &["config", "-z", "--list"],
+            MAX_CONFIG_BYTES,
             git_timeout(),
         )
-        .unwrap_or_default();
+        .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
         let mut ignore_case = false;
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
@@ -186,6 +186,7 @@ pub fn status(
     let ix = repo.index()?;
     let mut out = Outcome::default();
     let mut emit = |t: Tracked| {
+        crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
         each(StatusEntry {
             xy: t.xy,
             path: t.path,
@@ -735,20 +736,23 @@ pub struct HeadChange {
     pub oid: Option<Oid>,
 }
 
-/// Whether `path`'s worktree side differs from HEAD's `head`, from its status code, or
-/// None when only its content can tell: a worktree file Git calls modified (`git
-/// status` may say so from a size change alone, while `git diff HEAD` compares the
-/// converted content), and an unmerged path HEAD has.
-fn differs_from_head(t: &Tracked, exists: impl Fn() -> bool) -> Option<bool> {
+/// Whether `path`'s worktree side differs from HEAD's `head`, from its status code and
+/// the worktree's file type (`kind`, from `lstat`; None when the path is gone), or None
+/// when only its content can tell: a worktree file Git calls modified (`git status` may
+/// say so from a size change alone, while `git diff HEAD` compares the converted
+/// content), a type change that matches HEAD's type again, and an unmerged path HEAD
+/// has.
+fn differs_from_head(t: &Tracked, kind: impl Fn() -> Option<u32>) -> Option<bool> {
     let y = t.xy[1];
     match (t.head, is_unmerged(t.xy)) {
-        (None, true) => Some(exists()),
+        (None, true) => Some(kind().is_some()),
         (Some(_), true) => None,
         (None, false) => Some(y != b'D'),
         (Some((mode, _)), false) if mode == MODE_GITLINK => Some(true),
         (Some(_), false) if y == b'M' => None,
+        (Some((mode, _)), false) if y == b'T' && kind() == Some(mode & 0o170000) => None,
         // the index differs from HEAD (and the worktree from neither or as a whole),
-        // or the worktree path is gone or of another type
+        // or the worktree path is gone or of another type than HEAD's
         (Some(_), false) => Some(true),
     }
 }
@@ -764,8 +768,12 @@ pub(crate) fn head_changes(repo: &Repo) -> Result<Option<Vec<HeadChange>>, Refus
     let mut ask: Vec<(Vec<u8>, u32, Oid)> = Vec::new();
     let top = repo.toplevel.clone();
     let mut each = |t: Tracked| {
-        let exists = || fs::symlink_metadata(top.join(path_from_bytes(&t.path))).is_ok();
-        match (differs_from_head(&t, exists), t.head) {
+        let kind = || {
+            fs::symlink_metadata(top.join(path_from_bytes(&t.path)))
+                .ok()
+                .map(|m| m.mode() & 0o170000)
+        };
+        match (differs_from_head(&t, kind), t.head) {
             (Some(true), head) => {
                 let (mode, oid) = head.map_or((0, None), |(m, o)| (m, Some(o)));
                 changed.push(HeadChange {

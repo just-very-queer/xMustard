@@ -27,8 +27,12 @@ use super::status::Repo;
 use crate::index::ignore::{Glob, Line, parse_line};
 use crate::indexcache::{StatusEntry, git_timeout, path_from_bytes};
 
-/// Names held across the directories on the current path.
+/// Bytes held for the children of the directories on the current path: each name plus
+/// `CHILD_OVERHEAD`.
 pub const MAX_HELD_NAME_BYTES: usize = 8 << 20;
+/// What one child costs besides its name: the vector slot (a `Vec` header and its
+/// kind) and the allocator's rounding of the name.
+const CHILD_OVERHEAD: usize = std::mem::size_of::<Child>() + 16;
 /// Ignore rules held across the ignore files that apply to the current directory.
 pub const MAX_HELD_RULES: usize = 8192;
 /// The largest ignore file read; a larger one leaves the walk incomplete.
@@ -309,10 +313,10 @@ impl Walk<'_> {
             if kind == Kind::Dir {
                 key.push(b'/');
             }
-            held += key.len();
+            held += key.len() + CHILD_OVERHEAD;
             if self.held + held > MAX_HELD_NAME_BYTES {
                 return Err(format!(
-                    "directory names past {MAX_HELD_NAME_BYTES} bytes held"
+                    "directory listings past {MAX_HELD_NAME_BYTES} bytes held"
                 ));
             }
             children.push((key, kind));

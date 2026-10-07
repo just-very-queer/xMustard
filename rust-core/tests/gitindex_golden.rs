@@ -352,3 +352,89 @@ fn random_edits_keep_the_reader_equal_to_git() {
         }
     }
 }
+
+/// A split index whose link extension declares more delete-bitmap bits than its
+/// shared index has entries is refused before anything is allocated for them.
+#[test]
+fn a_split_bitmap_past_the_shared_index_is_refused() {
+    let fx = split_index();
+    rewrite_index(&fx.root, |b| {
+        let at = b
+            .windows(4)
+            .rposition(|w| w == b"link")
+            .expect("a link extension");
+        // signature, size, shared index id; then the delete bitmap's bit count
+        let bits = at + 8 + 20;
+        b[bits..bits + 4].copy_from_slice(&u32::MAX.to_be_bytes());
+    });
+    assert!(
+        matches!(refusal(&fx.root), Refusal::Failed(ref m) if m.contains("bitmaps")),
+        "{:?}",
+        refusal(&fx.root)
+    );
+}
+
+/// The Git fallback's cost estimate counts a split index's shared entries: a shared
+/// index of 100 entries beside an index of 3 is at least 100 entries for Git to load.
+#[test]
+fn the_fallback_estimate_counts_the_shared_index() {
+    let small = clean();
+    let big = clean();
+    for i in 0..97 {
+        write(&big.root, &format!("many/f{i:03}.txt"), b"m\n");
+    }
+    commit(&big.root, "many");
+    assert_eq!(git_tracked(&big.root).len(), 100);
+    let git_dir = small.root.join(".git");
+    fs::copy(
+        big.root.join(".git/index"),
+        git_dir.join(format!("sharedindex.{}", "0".repeat(40))),
+    )
+    .unwrap();
+    let counted = gitindex::loaded_entries(&git_dir).unwrap();
+    assert!(counted >= 100, "{counted} entries counted");
+}
+
+/// A config Git lists past the reader's bound is a refusal, not an empty config that
+/// would skip `core.ignorecase` and `core.excludesFile`.
+#[test]
+fn a_config_the_reader_cannot_take_is_a_refusal() {
+    let fx = clean();
+    let mut config = fs::read_to_string(fx.root.join(".git/config")).unwrap();
+    config.push_str("[xmpad]\n");
+    for i in 0..40_000 {
+        config.push_str(&format!("\tkey{i} = {}\n", "v".repeat(24)));
+    }
+    fs::write(fx.root.join(".git/config"), config).unwrap();
+    assert!(
+        matches!(Repo::open(&fx.root), Err(Refusal::Failed(ref m)) if m.contains("git config")),
+        "{:?}",
+        Repo::open(&fx.root).map(|_| ())
+    );
+}
+
+/// A directory whose listing is past the walk's bound (counted with each child's own
+/// cost, not only its name) leaves the untracked walk incomplete with its reason.
+#[test]
+fn a_directory_past_the_walk_bound_is_reported_incomplete() {
+    let fx = clean();
+    let dir = fx.root.join("wide");
+    fs::create_dir(&dir).unwrap();
+    // 160,000 names of 6-7 bytes: about 1 MiB of names, past 8 MiB with their slots
+    for i in 0..160_000 {
+        fs::File::create(dir.join(format!("f{i}"))).unwrap();
+    }
+    let repo = Repo::open(&fx.root).unwrap();
+    let opts = Options {
+        untracked: true,
+        list_ignored: false,
+    };
+    let out = status(&repo, opts, &mut |_| ControlFlow::Continue(())).unwrap();
+    assert!(
+        out.untracked_incomplete
+            .as_deref()
+            .is_some_and(|w| w.contains("past")),
+        "{:?}",
+        out.untracked_incomplete
+    );
+}

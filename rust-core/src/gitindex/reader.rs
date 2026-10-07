@@ -390,6 +390,8 @@ fn next_entry(
 /// A split index's link to its shared index.
 struct Link {
     shared: Oid,
+    /// The two serialized bitmaps, decoded once the shared index's size is known.
+    bitmaps: Vec<u8>,
     delete: Bits,
     replace: Bits,
 }
@@ -407,9 +409,13 @@ impl Bits {
         self.0.iter().map(|w| w.count_ones() as usize).sum()
     }
 
-    /// Decode Git's EWAH serialization from the front of `b`; the bytes it used.
-    fn decode(b: &[u8]) -> Option<(Bits, usize)> {
+    /// Decode Git's EWAH serialization from the front of `b`, which may declare at
+    /// most `max_bits` bits; the bytes it used.
+    fn decode(b: &[u8], max_bits: usize) -> Option<(Bits, usize)> {
         let bit_size = be32(b.get(..4)?, 0) as usize;
+        if bit_size > max_bits {
+            return None;
+        }
         let words = be32(b.get(4..8)?, 0) as usize;
         let body = b.get(8..8 + words.checked_mul(8)?)?;
         let word =
@@ -459,7 +465,7 @@ impl Index {
     /// The index of the Git dir `git_dir` (an absent index is an empty one).
     pub fn open(git_dir: &Path, hash: Hash) -> Result<Index, Refusal> {
         let mut ix = Index::open_file(&git_dir.join("index"), hash)?;
-        if let Some(link) = &ix.link {
+        if let Some(link) = &mut ix.link {
             let path = git_dir.join(format!("sharedindex.{}", link.shared.hex()));
             let shared = Index::open_file(&path, hash)?;
             if shared.file.is_none() || shared.link.is_some() {
@@ -468,6 +474,8 @@ impl Index {
                     path.display()
                 )));
             }
+            link.decode_bitmaps(shared.count)
+                .ok_or_else(|| Refusal::Failed("malformed split index bitmaps".into()))?;
             ix.shared = Some(Box::new(shared));
         }
         Ok(ix)
@@ -742,22 +750,29 @@ fn decode_tree(s: &mut Stream<'_>, size: usize, h: usize) -> Result<Vec<(Vec<u8>
 }
 
 fn decode_link(b: &[u8], h: usize) -> Option<Link> {
-    let shared = Oid::from_bytes(b.get(..h)?);
-    let rest = &b[h..];
-    if rest.is_empty() {
-        return Some(Link {
-            shared,
-            delete: Bits::default(),
-            replace: Bits::default(),
-        });
-    }
-    let (delete, used) = Bits::decode(rest)?;
-    let (replace, _) = Bits::decode(rest.get(used..)?)?;
     Some(Link {
-        shared,
-        delete,
-        replace,
+        shared: Oid::from_bytes(b.get(..h)?),
+        bitmaps: b.get(h..)?.to_vec(),
+        delete: Bits::default(),
+        replace: Bits::default(),
     })
+}
+
+impl Link {
+    /// Decode the delete and replace bitmaps of a shared index of `entries` entries; a
+    /// bitmap declaring more bits than that is malformed, so no allocation exceeds one
+    /// bit per shared entry.
+    fn decode_bitmaps(&mut self, entries: u32) -> Option<()> {
+        let rest = std::mem::take(&mut self.bitmaps);
+        if rest.is_empty() {
+            return Some(());
+        }
+        let (delete, used) = Bits::decode(&rest, entries as usize)?;
+        let (replace, _) = Bits::decode(rest.get(used..)?, entries as usize)?;
+        self.delete = delete;
+        self.replace = replace;
+        Some(())
+    }
 }
 
 /// One stream of entries from one index file; `e` holds the last entry (v4 names

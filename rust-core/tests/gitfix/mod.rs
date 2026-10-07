@@ -413,7 +413,7 @@ pub fn ignores() -> Fx {
     write(
         &r,
         ".gitignore",
-        b"*.log\n!keep.log\nbuild/\n/anchored.txt\ndocs/**/*.tmp\nlogs/\n",
+        b"*.log\n!keep.log\nbuild/\n/anchored.txt\ndocs/**/*.tmp\nlogs/\nsp\\ ace.txt\n\\#hash.txt\ntrail\\ \n",
     );
     write(&r, "sub/.gitignore", b"*.gen\n!special.gen\n");
     write(&r, "logs/keep.txt", b"k\n");
@@ -436,9 +436,34 @@ pub fn ignores() -> Fx {
         "logs/new.txt",
         "ok.txt",
         "sub/ok.txt",
+        "sp ace.txt",
+        "sp\\ ace.txt",
+        "#hash.txt",
+        "trail ",
+        "trail",
     ] {
         write(&r, f, b"u\n");
     }
+    fx(d, r)
+}
+
+/// A type change staged in the index (a file to a symlink) and then reverted in the
+/// worktree to HEAD's type and bytes, beside one left changed.
+pub fn type_change() -> Fx {
+    let (d, r) = repo();
+    write(&r, "back.txt", b"same\n");
+    write(&r, "kept.txt", b"kept\n");
+    write(&r, "target.txt", b"t\n");
+    commit(&r, "init");
+    for f in ["back.txt", "kept.txt"] {
+        fs::remove_file(r.join(f)).unwrap();
+        symlink(&r, "target.txt", f);
+        git(&r, &["add", f]);
+    }
+    fs::remove_file(r.join("back.txt")).unwrap();
+    write(&r, "back.txt", b"same\n");
+    fs::remove_file(r.join("kept.txt")).unwrap();
+    write(&r, "kept.txt", b"kept, edited\n");
     fx(d, r)
 }
 
@@ -465,6 +490,7 @@ pub const MATRIX: &[(&str, Build)] = &[
     ("unmerged", unmerged),
     ("nested", nested),
     ("ignores", ignores),
+    ("type_change", type_change),
 ];
 
 /// NUL-separated records.

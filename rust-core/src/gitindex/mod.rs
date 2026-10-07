@@ -92,11 +92,11 @@ pub fn predicted_git_bytes(entries: u64) -> u64 {
     (5_116 << 10) + 346 * entries
 }
 
-/// Entries in the header of the Git dir's index (0 when there is none), read from its
-/// first 12 bytes; None when the header cannot be read.
-pub fn header_entries(git_dir: &Path) -> Option<u64> {
+/// Entries in the header of the index file `path` (0 when there is none), read from
+/// its first 12 bytes; None when the header cannot be read.
+fn header_entries(path: &Path) -> Option<u64> {
     let mut head = [0u8; 12];
-    match File::open(git_dir.join("index")) {
+    match File::open(path) {
         Ok(mut f) => f.read_exact(&mut head).ok()?,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(0),
         Err(_) => return None,
@@ -105,11 +105,28 @@ pub fn header_entries(git_dir: &Path) -> Option<u64> {
         .then(|| u32::from_be_bytes([head[8], head[9], head[10], head[11]]) as u64)
 }
 
+/// At least as many entries as an index-loading Git child holds for the Git dir
+/// `git_dir`: its index's own entries plus the largest `sharedindex.*` file's (a split
+/// index loads one shared index; an unused one only makes the bound larger).
+pub fn loaded_entries(git_dir: &Path) -> Option<u64> {
+    let own = header_entries(&git_dir.join("index"))?;
+    let mut shared = 0u64;
+    for e in std::fs::read_dir(git_dir).ok()?.filter_map(Result::ok) {
+        if e.file_name()
+            .as_encoded_bytes()
+            .starts_with(b"sharedindex.")
+        {
+            shared = shared.max(header_entries(&e.path())?);
+        }
+    }
+    Some(own + shared)
+}
+
 /// Whether a reader refusal goes to Git: only under `auto`, and only while an
-/// index-loading Git child on this index is predicted within the Git line.
+/// index-loading Git child on this Git dir is predicted within the Git line.
 pub fn falls_back(setting: Setting, git_dir: &Path) -> bool {
     setting == Setting::Auto
-        && header_entries(git_dir).is_some_and(|n| predicted_git_bytes(n) <= GIT_LINE_BYTES)
+        && loaded_entries(git_dir).is_some_and(|n| predicted_git_bytes(n) <= GIT_LINE_BYTES)
 }
 
 /// A listing of the opened directory, as `git ls-files` run there gives it.
@@ -205,6 +222,7 @@ fn list_reader(
                 if let Some(rel) = e.path.strip_prefix(prefix)
                     && wanted(rel)
                 {
+                    crate::passcount::note(crate::passcount::Pass::FilesListed, 1);
                     each(rel, e.mode);
                 }
             }
