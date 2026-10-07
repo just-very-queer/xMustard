@@ -12,9 +12,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
+use xmustard_core::index::flows::MAX_RETAINED_STEPS;
+
+mod memprobe;
 use tempfile::TempDir;
 use xmustard_core::index;
 use xmustard_core::index::config::IndexConfig;
@@ -84,6 +89,40 @@ fn ok_json(args: &[&str]) -> Value {
 
 fn build(root: &Path) {
     ok_json(&["index", "build", root.to_str().unwrap()]);
+}
+
+fn flow_child_peak(mut command: Command) -> (u64, std::process::ExitStatus) {
+    let child = command.process_group(0).spawn().unwrap();
+    let pid = child.id() as libc::pid_t;
+    let started = Instant::now();
+    let mut status = 0;
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    loop {
+        let result = unsafe { libc::wait4(pid, &mut status, libc::WNOHANG, &mut usage) };
+        if result == pid {
+            std::mem::forget(child);
+            let unit = if cfg!(target_os = "macos") { 1 } else { 1024 };
+            return (
+                usage.ru_maxrss as u64 * unit,
+                ExitStatusExt::from_raw(status),
+            );
+        }
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            panic!("wait4 failed: {error}");
+        }
+        if started.elapsed() >= Duration::from_secs(300) {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+                libc::wait4(pid, &mut status, 0, &mut usage);
+            }
+            panic!("index flows exceeded the 300-second process limit");
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
 
 /// `index flows <root> [flags]`: the index family takes no workspace id.
@@ -1946,6 +1985,64 @@ fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
 }
 
 // --- WS-38c-b: the six decided findings --------------------------------------
+
+#[test]
+fn retained_branching_walks_stay_under_the_process_tree_line() {
+    let mut files = vec![GO_MOD];
+    let mut contents = Vec::new();
+    for root in 0..30 {
+        let prefix = format!("Ret{root:02}");
+        let mut level = vec![format!("{prefix}Root")];
+        let mut definitions = Vec::new();
+        let mut next_id = 0;
+        for _ in 0..5 {
+            let mut next = Vec::new();
+            for parent in level {
+                let mut children = Vec::new();
+                for _ in 0..4 {
+                    let child = format!("{prefix}N{next_id}");
+                    next_id += 1;
+                    children.push(child.clone());
+                    next.push(child);
+                }
+                definitions.push((parent, children));
+            }
+            level = next;
+        }
+        definitions.extend(level.into_iter().map(|leaf| (leaf, Vec::new())));
+        let mut src = String::from("package pkg\n\n");
+        for (name, children) in definitions {
+            let calls = children
+                .iter()
+                .map(|child| format!("{child}();"))
+                .collect::<String>();
+            src.push_str(&format!("func {name}() {{ {calls} }}\n"));
+        }
+        contents.push((format!("pkg/{prefix}.go"), src));
+    }
+    for (path, content) in &contents {
+        files.push((path.as_str(), content.as_str()));
+    }
+    let d = repo(&files);
+    build(d.path());
+    let output = tempfile::NamedTempFile::new().unwrap();
+    let mut command = Command::new(BIN);
+    command
+        .args(["index", "flows", d.path().to_str().unwrap()])
+        .stdout(Stdio::from(output.reopen().unwrap()))
+        .stderr(Stdio::null());
+    let (peak, status) = flow_child_peak(command);
+    assert!(status.success(), "index flows exited with {status}");
+    let answer: Value = serde_json::from_slice(&fs::read(output.path()).unwrap()).unwrap();
+    assert_eq!(answer["caps"]["max_retained_steps"], MAX_RETAINED_STEPS);
+    assert!(
+        answer["truncation"]["dropped_retained"].as_u64().unwrap_or(0) > 0,
+        "the branching fixture must exceed the retained-step cap: {answer:#}"
+    );
+    let mib = memprobe::mib(peak);
+    eprintln!("retained branching walks: wait4 ru_maxrss {mib:.1} MiB");
+    assert!(mib <= 95.4, "process-tree RSS {mib:.1} MiB exceeds 95.4 MiB");
+}
 
 /// The retained step set is bounded by ONE global cap, not by seeds x per-walk.
 ///

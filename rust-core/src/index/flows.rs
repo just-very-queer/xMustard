@@ -410,6 +410,10 @@ impl Graph {
     }
 }
 
+fn exceeds_retention_limit(retained: u64, steps: u64, limits: Limits) -> bool {
+    retained + steps > limits.max_retained_steps
+}
+
 /// The flows of an opened snapshot, read-only like `impact`.
 pub fn flows_for(snapshot: &super::reader::Snapshot, limits: Limits) -> Result<Flows, String> {
     let exported = snapshot.exported_by_symbol()?;
@@ -522,7 +526,7 @@ pub fn flows_of(
         // drop under a name that counts them. Continuing keeps the walk's steps out of
         // `keyed` — which is what bounds the retained set — and reports every step the cap
         // excluded.
-        if retained + walk.visited.len() as u64 > limits.max_retained_steps {
+        if exceeds_retention_limit(retained, walk.visited.len() as u64, limits) {
             truncation.dropped_retained += walk.visited.len() as u64;
             continue;
         }
@@ -1075,4 +1079,60 @@ fn shared_stem(steps: &[Step]) -> Option<String> {
     // A stem equal to a whole listed name is a name, not a shared prefix, so it does not
     // qualify; `min_steps` symbols named `Harvest` share nothing beyond that name.
     (stem.len() >= 2 && !steps.iter().all(|s| s.name == stem)).then(|| stem.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Graph, Limits, Node, exceeds_retention_limit, rank_seeds};
+
+    #[test]
+    fn retention_limit_rejects_steps_that_would_cross_the_global_cap() {
+        let limits = Limits {
+            max_retained_steps: 10_000,
+            ..Limits::default()
+        };
+        assert!(!exceeds_retention_limit(9_990, 10, limits));
+        assert!(exceeds_retention_limit(9_990, 11, limits));
+    }
+
+    #[test]
+    fn scored_candidates_contribute_their_own_path_before_the_seed_cut() {
+        let node = |name: &str, path: &str| Node {
+            graph_node: 0,
+            name: name.to_string(),
+            path: path.to_string(),
+            line: 1,
+            kind: "function".to_string(),
+            area: 0,
+            exported: false,
+        };
+        let graph = Graph {
+            nodes: vec![
+                node("Candidate", "candidate.go"),
+                node("Target", "target.go"),
+                node("Top", "top.go"),
+                node("LeafA", "leaf-a.go"),
+                node("LeafB", "leaf-b.go"),
+                node("LeafC", "leaf-c.go"),
+                node("LeafD", "leaf-d.go"),
+            ],
+            off: vec![0, 1, 1, 5, 5, 5, 5, 5],
+            dst: vec![1, 3, 4, 5, 6],
+            callers_off: vec![0, 0, 1, 1, 2, 3, 4, 5],
+            callers_dst: vec![0, 2, 2, 2, 2],
+            callees: vec![1, 0, 4, 0, 0, 0, 0],
+            callers: vec![0, 1, 0, 1, 1, 1, 1],
+        };
+
+        let limits = Limits {
+            max_candidates: 1,
+            ..Limits::default()
+        };
+
+        let (ranked, _, paths, truncation) = rank_seeds(&graph, limits);
+
+        assert_eq!(ranked, vec![2]);
+        assert_eq!(truncation.dropped_candidates, 1);
+        assert!(paths.iter().any(|path| path == "candidate.go"));
+    }
 }
