@@ -18,7 +18,7 @@ Configuration reaches the binaries four ways, none of them one operator-editable
    - clients and ops: `XMUSTARD_API_BASE`, `XMUSTARD_API_TOKEN`, `XMUSTARD_APPROVER_TOKEN`, `XMUSTARD_CODEX_BIN`, `XMUSTARD_LOG_FILE`, `XMUSTARD_LOG_MAX_BYTES`, `XMUSTARD_LOG_KEEP`, `XMUSTARD_WHY_FAILED_COMMANDS`.
 2. **`settings.json`** in the data directory, written through the admin API (`api-go/internal/workspaceops/runtime_settings.go`, `AppSettings`): `local_agent_type`, `codex_bin`, `codex_args`, `codex_model`, `opencode_bin`, `opencode_model`, `postgres_dsn`, `postgres_schema`, `require_multi_agent_verification`, `context_verification_threshold`, `principal_distinctness` (`token|owner`), `trusted_run_key_principals`.
 3. **Compiled tables**: the per-client delivery policy `clientPolicies` (`api-go/internal/evidence/shapes.go:71`), the heavy-slot table, the route-gate table, and the `tools_list_budget.json` caps (owner-edited).
-4. **Per-repository files** `.xmustard.yaml`/`.yml`/`.json` (`api-go/internal/workspaceops/project_truth.go:86`): path-specific instructions and filters. The `.json` form also carries an `index` section (`{"index": {...}}`) that the index loader reads with file-then-env-then-flags precedence (`rust-core/src/index/config.rs:263`), under a rule the loader enforces: **a repository file may narrow — a lower retention, fewer files — but cannot raise a bound or widen what is read or kept; a raise is refused and the compiled default kept** (the `a repo cannot raise bounds` assertion, `config.rs:282`; retention default `symbol`, `config.rs:96`).
+4. **Per-repository files** `.xmustard.yaml`/`.yml`/`.json` (`api-go/internal/workspaceops/project_truth.go:86`): path-specific instructions and filters. The `.json` form also carries an `index` section (`{"index": {...}}`) that the index loader reads with file-then-env-then-flags precedence (`rust-core/src/index/config.rs:263`), under a rule the loader enforces: **a repository file may narrow — a lower retention, fewer files — but cannot raise a bound or widen what is read or kept; a raise is ignored and the compiled default kept** (the loader clamps rather than errors; the `a repo cannot raise bounds` assertion, `config.rs:282`; retention default `symbol`, `config.rs:96`).
 
 Two behaviours the design must respect, both measured:
 
@@ -29,7 +29,7 @@ Two behaviours the design must respect, both measured:
 
 **The file.** One `xmustard.toml` per workspace root, a sibling of `.xmustardignore` and `.xmustard.yaml`. The path can be overridden with the `XMUSTARD_CONFIG` environment variable or an ops flag (exact flag surface is the code row's, with WS-48). A missing file is not an error: every key falls back to its default, so nothing changes for an operator who never writes one. A file that fails to parse, names an unknown key, holds an out-of-range value, or sets an operator-only key is refused (owner question OQ-1 for the parse-failure case; the refusal of operator-only keys is settled — see "Operator-only keys").
 
-**The one rule the whole surface follows:** a repository file narrows. It never widens, never raises a bound, and never sets an operator-only key. This is the rule the `.xmustard.json` index section already enforces (`config.rs:282`), extended to the whole surface.
+**The one rule the whole surface follows:** a repository file narrows. It never widens, never raises a bound, and never sets an operator-only key. This is the rule the `.xmustard.json` index section already enforces (`config.rs:282`), extended to the whole surface — and with the index loader's exact semantics: a raise is **ignored and the default kept** (the loader clamps; it does not error), which round-3 finding r3-2 pins so `config check` reports the same contract the cited code has.
 
 **Secrets and executables stay out.** The file never carries tokens, keys, deployment endpoints, or an executable path: `XMUSTARD_AUTH_TOKENS`, `XMUSTARD_API_TOKEN`, `XMUSTARD_APPROVER_TOKEN`, the TLS key paths, the Postgres DSN, the API host/port and `core_bin` stay environment- or flag-only. The file is expected to be committed to a repository, so it is contributor content; nothing that authenticates or executes may come from it (round-2 findings r2-2a and r2-2b).
 
@@ -37,7 +37,7 @@ Two behaviours the design must respect, both measured:
 
 | Key | Type and default | Environment override | Notes |
 |---|---|---|---|
-| `schema` | `lean` \| `full`, default `lean` (the tool profile) | `XMUSTARD_MCP_SCHEMA` | changes only what `tools/list` advertises (the Advanced arguments), inside the caps the `CAPS` gate measures |
+| `schema` | `lean` \| `full`, default `lean` (the tool profile) | `XMUSTARD_MCP_SCHEMA` | the stdio shim reads the override (`cmd/xmustard-mcp/main.go:82`); the HTTP `/mcp` endpoint reads the request's `schema` query parameter instead and, blank, serves lean without consulting the override (`cmd/xmustard-api/mcp_routes.go:69`). The code row proposes making the absent-parameter fallback read the configured value, so `config check` reports what every session uses (round-3 finding r3-3) |
 | `tools_disabled` | list of tool names, default `[]` | `XMUSTARD_DISABLED_TOOLS` | narrows only: a name the server does not know is refused |
 | `search_text_lanes` | `on` \| `off`, default `on` | `XMUSTARD_SEARCH_TEXT_LANES` | `off` is the kill switch; `on` is the default, so the file cannot widen |
 
@@ -53,7 +53,7 @@ One sub-table per client, starting with `claude` and `codex` (the clients `inter
 
 **What `fail=closed` can and cannot promise** (round-2 finding r2-1). The policy is enforced only where an xmustard component sits in the path:
 
-- **Static-client events** (Claude Code's `SessionStart` and `WorktreeRemove`; every Codex event): the client reads its own repository copy of the file, or its environment override, before it dials anything, so `closed` is enforceable offline. A client that can read no policy (no file, unparsable file) defaults to `open` and exits 0, which is today's behaviour. The daemon independently refuses a disabled client's events at the route, so `enabled=false` holds even for a client that never reads the file.
+- **Static-client events** (Claude Code's `SessionStart` and `WorktreeRemove`; every Codex event): the client reads its own repository copy of the file, or its environment override, before it dials anything, so `closed` is enforceable offline. A missing file is not an error: no policy means the defaults. An unparsable file is refused, not silently defaulted (round-3 finding r3-1): the client surfaces the error and exits non-zero instead of applying defaults, so corrupting the file cannot silently turn a configured `closed` policy into `open` — except for `WorktreeRemove`, whose failure must stay silent (`cmd/xmustard-hook/main.go:3`), which exits 0. The daemon independently refuses a disabled client's events at the route, so `enabled=false` holds even for a client that never reads the file.
 - **Claude Code's HTTP-hook events** (for example `PreToolUse`): these go from Claude Code straight to the daemon. When the daemon is unreachable, the event never reaches xmustard and there is no offline enforcement point; what Claude Code then does is Claude Code's own hook policy. The spec does not promise `closed` for these events, and the code row must not implement one silently.
 
 In v1 the policy is per client, not per event (owner question OQ-2). `WorktreeRemove` stays fail-open in v1 either way, because a failing hook there blocks the removal; a per-event carve-out is the owner's call.
@@ -62,8 +62,8 @@ In v1 the policy is per client, not per event (owner question OQ-2). `WorktreeRe
 
 | Key | Type and default | Environment override | Notes |
 |---|---|---|---|
-| `pending_quota` | int, default 500 | `XMUSTARD_MEMORY_PENDING_QUOTA` | the file may lower the value for its own workspace; a raise is refused and the default kept |
-| `active_envelope` | int, default 100000 | `XMUSTARD_MEMORY_ACTIVE_ENVELOPE` | the file may lower the value; a raise is refused and the default kept |
+| `pending_quota` | int, default 500 | `XMUSTARD_MEMORY_PENDING_QUOTA` | the file may lower the value for its own workspace; a raise is ignored and the default kept |
+| `active_envelope` | int, default 100000 | `XMUSTARD_MEMORY_ACTIVE_ENVELOPE` | the file may lower the value; a raise is ignored and the default kept |
 
 ### Operator-only keys
 
@@ -99,7 +99,7 @@ Proposed: environment variable over `xmustard.toml` over `settings.json` over th
 
 `xmustard-ops config check [--config <path>]` loads the environment, the file and `settings.json`, then:
 
-- refuses an unknown key, a bad value, an out-of-range number, a raise or widening from the file, and any operator-only key, naming the key, the value and the file;
+- refuses an unknown key, a bad value, an out-of-range number, and any operator-only key, naming the key, the value and the file; reports a clamped raise with its effective value and source;
 - prints the effective configuration as a table, one row per key with its value and source;
 - exits 0 when the configuration is valid, non-zero otherwise.
 
@@ -124,11 +124,11 @@ It changes nothing; it is a read-only validator and report. It runs against the 
 
 - `config check` refuses an unknown key and an out-of-range value, naming the key and the file.
 - One test per precedence boundary: environment over file, file over `settings.json`, `settings.json` over the compiled default, with the printed source asserted.
-- The file narrows: a lowered quota or timeout is accepted; a raised one is refused and the default kept, mirroring the index loader's rule (`config.rs:282`).
+- The file narrows: a lowered quota or timeout is accepted; a raised one is ignored and the default kept (the loader clamps, as the index loader does), with `config check` reporting the effective value and source.
 - Operator-only keys are refused from the file, one test per class: executable path (`core_bin`), posture (`profile`, `read_only`, `worker`), registration (`register.*`), daemon deployment (`hook.budget_ms`, `hook.socket`), reserved switches, memory trust and standing memory.
 - `trusted_run_key_principals` unset everywhere keeps WS-29b's refusal; an environment-set list behaves exactly like a `settings.json`-set list; the sources are never unioned.
-- A disabled hook client takes its refusal path; the fail-open default is pinned, with the `WorktreeRemove` must-stay-silent case asserted; `fail=closed` is tested only at the enforcement points the spec names (static client before dialing), and no offline closed path exists for HTTP-hook events.
-- The `schema` flip (`lean`/`full`) stays inside the code `TestToolsListStaysWithinByteCaps` exercises; the `CAPS` gate covers it.
+- A disabled hook client takes its refusal path; the fail-open default is pinned, with the `WorktreeRemove` must-stay-silent case asserted; an unparsable file is refused by the client rather than silently defaulted (WorktreeRemove excepted); `fail=closed` is tested only at the enforcement points the spec names (static client before dialing), and no offline closed path exists for HTTP-hook events.
+- The `schema` flip (`lean`/`full`) stays inside the code `TestToolsListStaysWithinByteCaps` exercises; the `CAPS` gate covers it; the absent query-parameter fallback on the HTTP `/mcp` endpoint reads the configured value, so `config check` and the sessions agree.
 - The reserved `semantic` and `lsp` overrides parse and change nothing.
 - Every new environment variable has a reader test and a documentation line.
 
