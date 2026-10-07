@@ -148,7 +148,11 @@ func promotedFilter(f *govstore.EntryFilter) { f.ServedOnly = true }
 
 // ListContextEntries returns entries filtered by status: "" / "all", "pending",
 // "promoted"/"active"/"verified", "rejected". An unknown filter selects nothing.
-func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, error) {
+// A non-empty reader applies the scope rule (WS-29b): an entry its scope does not
+// admit is left out, so this listing is not a way round a private memory. An empty
+// reader is the operator's own view (runtime settings and verifier telemetry count
+// what exists, not what one principal may read).
+func ListContextEntries(dataDir, workspaceID, filter string, reader ...string) ([]ContextEntry, error) {
 	if err := validateSafeID("workspace", workspaceID); err != nil {
 		return nil, err
 	}
@@ -156,6 +160,8 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 	if !ok {
 		return []ContextEntry{}, nil
 	}
+	who := firstOf(reader)
+	keys := ScopeRequest{}
 	f := govstore.EntryFilter{WorkspaceID: workspaceID}
 	apply(&f)
 	ctx := context.Background()
@@ -164,6 +170,15 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 		entries, err := listWorkspaceEntries(ctx, r, f)
 		if err != nil {
 			return err
+		}
+		if who != "" {
+			kept := entries[:0]
+			for _, e := range entries {
+				if ScopesVisible(e.Scope, e.ScopeKey, e.Source, who, keys) {
+					kept = append(kept, e)
+				}
+			}
+			entries = kept
 		}
 		if out, _, err = attachContent(ctx, r, entries); err != nil {
 			return err
@@ -178,9 +193,10 @@ func ListContextEntries(dataDir, workspaceID, filter string) ([]ContextEntry, er
 }
 
 // GetActiveContext returns only promoted (verified) entries — the read-only view
-// that actually enters an agent's working context.
-func GetActiveContext(dataDir, workspaceID string) (map[string]any, error) {
-	promoted, err := ListContextEntries(dataDir, workspaceID, "promoted")
+// that actually enters an agent's working context. A non-empty reader applies the
+// scope rule, as ListContextEntries does.
+func GetActiveContext(dataDir, workspaceID string, reader ...string) (map[string]any, error) {
+	promoted, err := ListContextEntries(dataDir, workspaceID, "promoted", reader...)
 	if err != nil {
 		return nil, err
 	}
@@ -270,8 +286,30 @@ type RecallRequest struct {
 	SessionID string
 	// Caller is the principal recalling, for awaiting_me and the seen-set key.
 	Caller string
+	// Dir and RunID narrow the READ to one directory or run (WS-29b): an entry
+	// confined to a key is served only inside it, and a recall naming no key is
+	// served none of the confined ones. SessionID above doubles as the session key.
+	Dir   string
+	RunID string
+	// scopeSessionKey is the SESSION SCOPE key after the run-key trust check, which is
+	// not the same value as SessionID: SessionID also drives seen-suppression and must
+	// survive an untrusted-key refusal, while this field is what ScopesVisible reads.
+	// scopeSessionChecked says the check ran, so an EMPTY key here means "no session key
+	// admitted", not "fall back to SessionID" — an unset field means the check never ran.
+	scopeSessionKey     string
+	scopeSessionChecked bool
 	// asOf is AsOf resolved against the repository, set while ranking.
 	asOf *asOfPoint
+}
+
+// sessionScopeKey is the session key the scope rule reads: the checked one when the
+// trust check ran, and SessionID otherwise. The two are separate because SessionID also
+// drives seen-suppression, which a refusal must not disturb.
+func (r RecallRequest) sessionScopeKey() string {
+	if r.scopeSessionChecked {
+		return strings.TrimSpace(r.scopeSessionKey)
+	}
+	return strings.TrimSpace(r.SessionID)
 }
 
 // Recall output budget bounds, in characters of the JSON result (Mem0's default).
@@ -418,6 +456,13 @@ func (r RecallRequest) filters(awaits func(govstore.RankEntry) bool, claimed map
 	add(r.ValidOnly, func(e govstore.RankEntry) bool { return e.InvalidatedAt == "" && e.State == govstore.RankServed })
 	add(r.Status == "awaiting_me", awaits)
 	add(r.Subject != "", func(e govstore.RankEntry) bool { return claimed[e.ID] })
+	// Always, and FIRST among the always-on predicates: a memory's scope decides who
+	// may read it, and a private memory must not be counted in the rank signals of a
+	// call it is not served in (WS-29b).
+	keys := scopeRequestOf(r)
+	add(true, func(e govstore.RankEntry) bool {
+		return ScopesVisible(e.Scope, e.ScopeKey, e.Author, r.Caller, keys)
+	})
 	return out
 }
 
@@ -457,6 +502,19 @@ func RecallWith(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	}
 	if err := req.validate(); err != nil {
 		return nil, err
+	}
+	// The reader's narrowing keys pass the same operator setting a write's do, here on
+	// the READ path: a key arrives in the request, so an unlisted principal naming an
+	// earlier run's id must not read that run's memory (WS-29b round 4, r4-2). An
+	// untrusted key narrows by nothing, so the answer is the workspace's and no confined
+	// entry is in it.
+	//
+	// RunID is written straight back. The SESSION key is not: SessionID also drives
+	// seen-suppression and has to survive a refusal, so the checked value lands in
+	// scopeSessionKey, which is the only key ScopesVisible and the ranking read.
+	if keys, dropped := dropUntrustedRunKey(dataDir, workspaceID, req.Caller, scopeRequestOf(req)); dropped {
+		req.RunID = keys.RunID
+		req.scopeSessionKey, req.scopeSessionChecked = keys.SessionID, true
 	}
 	var res map[string]any
 	var page recallPage
@@ -551,7 +609,8 @@ func rankRecall(ctx context.Context, dataDir, workspaceID string, req RecallRequ
 	var claimed map[string]bool
 	err = memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var err error
-		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller}); err != nil {
+		if ranking, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: states, Caller: req.Caller,
+			ScopeDir: req.Dir, ScopeRunID: req.RunID, ScopeSessionID: req.sessionScopeKey()}); err != nil {
 			return err
 		}
 		if len(qtokens) > 0 {

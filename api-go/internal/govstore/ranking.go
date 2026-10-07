@@ -59,6 +59,11 @@ type RankEntry struct {
 	Tier   string
 	Tags   []string
 	Author string
+	// Scope and ScopeKey are the entry's derived memory scope and the key that
+	// confines it (WS-29b). A reader is served a confined entry only inside that
+	// key, so the filter needs both without loading the entry.
+	Scope    string
+	ScopeKey string
 	// AuthorOwner is the owner recorded for the author at write time ("" for writes
 	// that recorded none).
 	AuthorOwner           string
@@ -93,7 +98,42 @@ type RankQuery struct {
 	WorkspaceID string
 	States      []string // default: served only
 	Caller      string
+	// ScopeKeys are the caller's own narrowing keys (WS-29b): a run-, session- or
+	// directory-scoped entry is served only inside its key. Empty means the caller
+	// named none, so no confined entry is served. The filter is in SQL rather than
+	// in each caller, so a surface that ranks cannot forget it.
+	ScopeDir, ScopeRunID, ScopeSessionID string
 }
+
+// scopeWhere is the SQL predicate that keeps a scoped entry out of a ranking the caller's
+// scope does not admit (WS-29b). It mirrors ScopesVisible: workspace (and an empty
+// scope, for rows written before scopes existed) is always admitted; private, run,
+// session and dir are the author's own and need the matching key; global is the
+// author's in whatever workspace this read reaches, which until WS-30e's
+// cross-workspace read means this workspace only; shared is never admitted, because
+// nothing derives or grants it yet.
+//
+// Every confined branch also carries the AUTHOR condition. A key alone is not authority:
+// run, session and dir keys are shared vocabulary, so two principals can legitimately
+// hold the same dir or the same run id, and admitting by key alone would serve one
+// principal's entry to the other. This predicate is therefore the whole rule, not a
+// pre-filter a caller is expected to strengthen (round 3, r3-4).
+//
+// The directory prefix is matched with GLOB, not LIKE: a dir key is a plain
+// repo-relative path, and % and _ are ordinary characters in one, while LIKE reads
+// both as wildcards. A memory confined to api_go would then be served for apiXgo,
+// which the Go rule (ScopesVisible) refuses, so the two halves of the same rule
+// disagreed (round 4, r4-3). GLOB's own metacharacters are * and ?, which a valid
+// dir key cannot contain, so it needs no escaping.
+const scopeWhere = `(
+	e.scope IN ('', 'workspace')
+	OR (e.scope = 'private' AND ?3 <> '' AND lower(e.scope_key) = ?3)
+	OR (e.scope = 'global' AND ?3 <> '' AND lower(e.scope_key) = ?3)
+	OR (e.scope = 'run' AND ?3 <> '' AND e.source_key = ?3 AND e.scope_key = ?5)
+	OR (e.scope = 'session' AND ?3 <> '' AND e.source_key = ?3 AND e.scope_key = ?6)
+	OR (e.scope = 'dir' AND ?3 <> '' AND e.source_key = ?3
+		AND (?7 <> '' AND (?7 = e.scope_key OR ?7 GLOB e.scope_key || '/*')))
+)`
 
 // RankingReader reads the ranking view of a workspace.
 type RankingReader interface {
@@ -128,17 +168,19 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 		}
 		whens[i] = "(" + when + ")"
 	}
-	// ?1 now, ?2 workspace, ?3 caller key, ?4 open-mode identity. SQLite counts the
-	// parameters up to the highest index a statement uses, so each query passes a
-	// prefix: where, the outcome and the anchor queries use ?1 and ?2 only.
-	where := `e.workspace_id = ?2 AND (` + strings.Join(whens, " OR ") + `)`
-	args := []any{r.nowText(), q.WorkspaceID, principalKey(q.Caller), OpenModeIdentity}
+	// ?1 now, ?2 workspace, ?3 caller key, ?4 open-mode identity, ?5 run, ?6 session,
+	// ?7 dir. SQLite counts the parameters up to the highest index a statement uses, so
+	// each query passes a prefix: where uses ?1..?7, the outcome and anchor queries use
+	// ?1 and ?2 only.
+	where := `e.workspace_id = ?2 AND (` + strings.Join(whens, " OR ") + `) AND ` + scopeWhere
+	args := []any{r.nowText(), q.WorkspaceID, principalKey(q.Caller), OpenModeIdentity,
+		q.ScopeRunID, q.ScopeSessionID, q.ScopeDir}
 	rows, err := r.query(ctx, `SELECT e.id, e.title, e.verification_mode, e.updated_at, e.content_digest,
 		`+rankStateExpr+`, e.status, e.kind, e.topic, e.tier, e.tags, e.source, e.source_owner, e.required_verifications,
 		coalesce(e.superseded_by, ''), e.source_key = ?3 AND ?3 <> '',
 		coalesce(e.valid_from, ''), e.valid_from_commit, coalesce(e.invalidated_at, ''), e.invalidated_commit,
-		e.needs_reverify, coalesce(e.stale_since, ''), coalesce(e.expires_at, '')
-		FROM entries e WHERE `+where+` ORDER BY e.pk`, args[:3]...)
+		e.needs_reverify, coalesce(e.stale_since, ''), coalesce(e.expires_at, ''), e.scope, coalesce(e.scope_key, '')
+		FROM entries e WHERE `+where+` ORDER BY e.pk`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -153,7 +195,8 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 		e = RankEntry{}
 		if err := rows.Scan(&e.ID, &e.Title, &e.VerificationMode, &e.UpdatedAt, &e.ContentDigest, &e.State,
 			&e.Status, &e.Kind, &e.Topic, &e.Tier, &tags, &e.Author, &e.AuthorOwner, &e.RequiredVerifications, &e.SupersededBy, &e.ByCaller,
-			&e.ValidFrom, &e.ValidFromCommit, &e.InvalidatedAt, &e.InvalidatedCommit, &e.NeedsReverify, &e.StaleSince, &e.ExpiresAt); err != nil {
+			&e.ValidFrom, &e.ValidFromCommit, &e.InvalidatedAt, &e.InvalidatedCommit, &e.NeedsReverify, &e.StaleSince, &e.ExpiresAt,
+			&e.Scope, &e.ScopeKey); err != nil {
 			return err
 		}
 		return decodeJSONColumn(tags, &e.Tags)
@@ -180,10 +223,14 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 		return nil, err
 	}
 	var helpful, misleading, harm int
+	// The outcome and anchor queries below filter on the same `where`, so they pass the
+	// full argument list: an outcome count or a declared path of an entry the caller's
+	// scope does not admit is itself a disclosure, and truncating the arguments to
+	// ?1..?2 would both skip that filter and leave SQLite missing a named parameter.
 	rows, err = r.query(ctx, `SELECT o.entry_id, coalesce(sum(o.outcome = 'helpful'), 0),
 		coalesce(sum(o.outcome = 'misleading'), 0), coalesce(sum(o.outcome = 'stale_harm'), 0)
 		FROM outcomes o JOIN entries e ON e.id = o.entry_id AND o.revision = e.revision
-		WHERE `+where+` GROUP BY o.entry_id`, args[:2]...)
+		WHERE `+where+` GROUP BY o.entry_id`, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -198,7 +245,7 @@ func (r *reader) Ranking(ctx context.Context, q RankQuery) ([]RankEntry, error) 
 	var declared, baselined bool
 	rows, err = r.query(ctx, `SELECT a.entry_id, a.value, a.declared, a.baseline_state <> 'none'
 		FROM anchors a JOIN entries e ON e.id = a.entry_id
-		WHERE `+where+` AND a.kind = 'path' ORDER BY a.entry_id, a.ordinal, a.pk`, args[:2]...)
+		WHERE `+where+` AND a.kind = 'path' ORDER BY a.entry_id, a.ordinal, a.pk`, args...)
 	if err != nil {
 		return nil, err
 	}

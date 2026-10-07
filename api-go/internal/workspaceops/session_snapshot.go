@@ -302,7 +302,7 @@ func buildSnapshot(ctx context.Context, r govstore.Reader, workspaceID, key stri
 		s.Goal = cmp.Or(cutBytes(firstOf(c.Goals), snapGoalMax), s.Goal)
 		s.NextStep = cutBytes(c.NextStep, snapGoalMax)
 	}
-	s.PendingProposals, s.Decisions, err = proposalState(ctx, r, workspaceID, proposed)
+	s.PendingProposals, s.Decisions, err = proposalState(ctx, r, workspaceID, sess.Principal, key, proposed)
 	if err != nil {
 		return nil, err
 	}
@@ -376,21 +376,28 @@ func activeFiles(evs []govstore.SessionEvent) []SnapshotFile {
 }
 
 // proposalState reads the memories a session proposed: those still pending, with the
-// peer votes they need, and the titles of its decisions.
-func proposalState(ctx context.Context, r govstore.Reader, workspaceID string, ids []string) ([]SnapshotProposal, []string, error) {
+// peer votes they need, and the titles of its decisions. principal is the session's own
+// principal and key its execution key: a proposal is listed when that session's scope
+// admits it, so a decision title of another principal cannot ride into this session's
+// snapshot (WS-29b, round 3, r3-8).
+func proposalState(ctx context.Context, r govstore.Reader, workspaceID, principal, key string, ids []string) ([]SnapshotProposal, []string, error) {
 	if len(ids) == 0 {
 		return nil, nil, nil
 	}
-	view, err := pendingRanking(ctx, r, workspaceID)
+	view, err := pendingRanking(ctx, r, workspaceID, principal, ScopeRequest{RunID: key})
 	if err != nil {
 		return nil, nil, err
 	}
 	pending := pendingByID(view)
+	req := ScopeRequest{RunID: key, SessionID: key}
 	var props []SnapshotProposal
 	var decisions []string
 	for i := len(ids) - 1; i >= 0; i-- { // newest first
 		e, err := r.GetEntry(ctx, ids[i])
 		if err != nil || e.WorkspaceID != workspaceID {
+			continue
+		}
+		if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, principal, req) {
 			continue
 		}
 		if p, ok := pending[e.ID]; ok {
@@ -403,9 +410,13 @@ func proposalState(ctx context.Context, r govstore.Reader, workspaceID string, i
 	return props, decisions, nil
 }
 
-// pendingRanking is the workspace's pending memory, oldest first.
-func pendingRanking(ctx context.Context, r govstore.Reader, workspaceID string) ([]govstore.RankEntry, error) {
-	return r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: []string{govstore.RankPending}})
+// pendingRanking is the pending view a snapshot and a handoff list. The reader's own
+// narrowing keys apply here as they do on recall (WS-29b): a scoped pending entry the
+// reader may not see is not listed, because a handoff carries its id and title into
+// another principal's session (round 3, r3-8).
+func pendingRanking(ctx context.Context, r govstore.Reader, workspaceID, caller string, req ScopeRequest) ([]govstore.RankEntry, error) {
+	return r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, States: []string{govstore.RankPending},
+		Caller: caller, ScopeDir: req.Dir, ScopeRunID: req.RunID, ScopeSessionID: req.SessionID})
 }
 
 // proposalOf is a pending memory with the peer votes it still needs.

@@ -203,11 +203,13 @@ func recallSessions(w http.ResponseWriter, r *http.Request) {
 }
 
 // recallAllActive is the complete promoted history: every entry, every drift hash.
+// The reader is the authenticated principal, so the scope rule applies here too
+// (WS-29b): an admin is the operator but not a way round a private memory.
 func recallAllActive(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, "admin") {
 		return
 	}
-	result, err := workspaceops.GetActiveContext(dataDir(), r.PathValue("workspace_id"))
+	result, err := workspaceops.GetActiveContext(dataDir(), r.PathValue("workspace_id"), callerOf(r).ID)
 	reply(w, result, err, respondError)
 }
 
@@ -216,11 +218,15 @@ func recallAllActive(w http.ResponseWriter, r *http.Request) {
 // history=true (revisions and events) need a reviewer: the verifier or human-approver
 // role (admin holds both; open mode is the operator).
 func recallEntry(w http.ResponseWriter, r *http.Request, id string) {
-	history := r.URL.Query().Get("history") == "true"
+	q := r.URL.Query()
+	history := q.Get("history") == "true"
 	if history && !requireReviewer(w, r) {
 		return
 	}
-	result, err := workspaceops.GetContextEntry(dataDir(), r.PathValue("workspace_id"), id, history, isReviewer(r))
+	// the reader's own keys follow the principal, so a run, session or directory
+	// scoped memory is fetchable by id from inside that key and by nobody else
+	result, err := workspaceops.GetContextEntry(dataDir(), r.PathValue("workspace_id"), id, history, isReviewer(r),
+		append([]string{callerOf(r).ID}, q.Get("dir"), q.Get("run_id"), q.Get("session_id"))...)
 	reply(w, result, err, respondError)
 }
 
@@ -244,7 +250,8 @@ func listContextEntries(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, "admin") {
 		return
 	}
-	result, err := workspaceops.ListContextEntries(dataDir(), r.PathValue("workspace_id"), r.URL.Query().Get("filter"))
+	result, err := workspaceops.ListContextEntries(dataDir(), r.PathValue("workspace_id"),
+		r.URL.Query().Get("filter"), callerOf(r).ID)
 	reply(w, result, err, respondError)
 }
 

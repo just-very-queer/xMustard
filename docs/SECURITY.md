@@ -172,6 +172,14 @@ peer invariant, so the API and the store agree on who is a peer.
   carries), so revoking a token does not detach its writes from its owner. An unreadable settings file or an
   unknown value takes `owner`. The check runs when a vote is cast; votes cast before
   the policy was switched on keep counting.
+- `trusted_run_key_principals` in settings lists the principals that may ASSERT a run or
+  session scope key (WS-29b). A run key is caller-supplied, so a later run that supplies
+  an earlier run's id would otherwise read that run's memory. The setting is unset by
+  default, which trusts nobody: an asserted run or session key from an unlisted
+  principal is refused (400) and the refusal is audited as `run_key_refused`. A
+  workspace-scoped write is never affected, so citing a run as provenance stays free.
+  The principals are compared case-insensitively, and the key is read on every
+  run-scoped write rather than cached.
 - Every memory write records its principal, owner and kind, the session and tool-call
   ids the transport sent (`X-Xmustard-Session-Id`, `X-Xmustard-Call-Id`: printable
   text, else 400; an id over 128 bytes is recorded as its prefix plus a digest, not

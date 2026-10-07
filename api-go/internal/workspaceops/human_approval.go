@@ -239,6 +239,10 @@ const (
 	skipOwn       = "own"
 	skipVoted     = "voted"
 	skipSameOwner = "same_owner"
+	// skipNotVisible is a scope refusal, not an approval rule: the entry exists and this
+	// approver could vote on it, but its scope names it as someone else's content
+	// (WS-29b round 4, r4-6).
+	skipNotVisible = "not_visible"
 )
 
 // queueCandidate is one pending revision of an entry; rv and votes are filled once it
@@ -260,7 +264,7 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 	limit, baselines = positiveOr(limit, 50), positiveOr(baselines, 10)
 	ctx := context.Background()
 	q := &ApprovalQueue{WorkspaceID: workspaceID, Approver: h.Principal.ID, Items: []ApprovalItem{},
-		Skipped: map[string]int{skipOwn: 0, skipVoted: 0, skipSameOwner: 0}, IndexBaselines: []IndexBaselineRecord{}}
+		Skipped: map[string]int{skipOwn: 0, skipVoted: 0, skipSameOwner: 0, skipNotVisible: 0}, IndexBaselines: []IndexBaselineRecord{}}
 	err := memoryView(ctx, dataDir, workspaceID, func(r govstore.Reader) error {
 		var eligible []queueCandidate
 		f := govstore.EntryFilter{WorkspaceID: workspaceID, Limit: storeListPage}
@@ -269,15 +273,21 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 			if err != nil {
 				return err
 			}
-			for _, e := range page {
-				for _, c := range pendingRevisions(e) {
-					ok, err := q.consider(ctx, r, dataDir, h, &c)
-					if err != nil {
-						return err
-					}
-					if ok {
-						eligible = append(eligible, c)
-					}
+			// One batched owner-distinct read over the page (WS-FIX-22b), instead of
+			// three queries per pending row, over the candidates the scope check admits.
+			candidates := q.visibleCandidates(page)
+			distinct, err := batchOwnerVoices(ctx, r, dataDir, candidates, h, "")
+			if err != nil {
+				return err
+			}
+			for i := range candidates {
+				c := candidates[i]
+				ok, err := q.consider(ctx, r, h, &c, distinct[i])
+				if err != nil {
+					return err
+				}
+				if ok {
+					eligible = append(eligible, c)
 				}
 			}
 			if len(page) < storeListPage {
@@ -306,6 +316,26 @@ func HumanApprovalQueue(dataDir, workspaceID string, h HumanApprover, limit, bas
 	return q, nil
 }
 
+// visibleCandidates are the page's pending candidates this approver may see, and it
+// counts the ones it may not. The scope check runs here, BEFORE the batched
+// owner-distinct read, so the batch never loads a revision, an edit event or a vote of
+// an entry the approver cannot see. WS-29b round 4 (r4-6) put the check ahead of every
+// per-row read for exactly that reason, and batching the guard for a whole page would
+// otherwise have moved those reads in front of it.
+func (q *ApprovalQueue) visibleCandidates(page []govstore.Entry) []queueCandidate {
+	candidates := make([]queueCandidate, 0, len(page))
+	for _, e := range page {
+		for _, c := range pendingRevisions(e) {
+			if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, q.Approver, ScopeRequest{}) {
+				q.Skipped[skipNotVisible]++
+				continue
+			}
+			candidates = append(candidates, c)
+		}
+	}
+	return candidates
+}
+
 // pendingRevisions are the revisions of e that await verdicts: its served revision
 // while it is an unpromoted proposal, and a pending edit.
 func pendingRevisions(e govstore.Entry) []queueCandidate {
@@ -320,9 +350,21 @@ func pendingRevisions(e govstore.Entry) []queueCandidate {
 }
 
 // consider reports whether h may vote on c, filling its revision and votes, or counts
-// why not.
-func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir string, h HumanApprover, c *queueCandidate) (bool, error) {
+// why not. distinct is the candidate's already-batched owner-distinct verdict
+// (WS-FIX-22b), so this reads nothing for it.
+func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, h HumanApprover,
+	c *queueCandidate, distinct error) (bool, error) {
 	e, me := c.entry, h.Principal.ID
+	// An approver is deliberately a principal OTHER than the author, so the scope rule
+	// is the only thing that keeps a private proposal's content out of its queue: an id
+	// in the listing is a disclosure, and so is the rendered body (round 4, r4-6). The
+	// page is filtered by this check before the batched owner-distinct read, so a
+	// candidate reaching here is already visible; the check stands again so a caller
+	// that skips the filter still reads nothing about an entry the approver may not see.
+	if !ScopesVisible(e.Scope, e.ScopeKey, e.Source, me, ScopeRequest{}) {
+		q.Skipped[skipNotVisible]++
+		return false, nil
+	}
 	rv, err := r.GetRevision(ctx, e.ID, c.revision)
 	if err != nil {
 		return false, err
@@ -337,14 +379,10 @@ func (q *ApprovalQueue) consider(ctx context.Context, r govstore.Reader, dataDir
 		skip = skipOwn
 	case votedBy(votes, me):
 		skip = skipVoted
-	default:
-		err := checkOwnerDistinct(ctx, r, dataDir, e, govstore.VoteInput{EntryID: e.ID, Revision: c.revision,
-			Verdict: govstore.VerdictApprove}, h.actor())
-		if errors.Is(err, ErrSameOwner) {
-			skip = skipSameOwner
-		} else if err != nil {
-			return false, err
-		}
+	case errors.Is(distinct, ErrSameOwner):
+		skip = skipSameOwner
+	case distinct != nil:
+		return false, distinct
 	}
 	if skip != "" {
 		q.Skipped[skip]++

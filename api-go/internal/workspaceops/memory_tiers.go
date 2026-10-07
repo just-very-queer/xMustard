@@ -339,11 +339,17 @@ func storeProjection(key projectionKey, c *cachedProjection) {
 }
 
 // servedForProjection pages through the served entries, newest update first, at most
-// maxProjectionScan; complete says every one was read.
+// maxProjectionScan; complete says every one was read. Only workspace-scoped entries
+// are read: the projection is a per-workspace document with no reader identity (it is
+// cached per workspace and pushed into every session), so a confined memory cannot be
+// put in it without disclosing it to every reader, and its author cannot be
+// distinguished there (WS-29b). A confined memory is served through recall, which
+// does know the reader.
 func servedForProjection(ctx context.Context, r govstore.Reader, workspaceID string) (entries []govstore.Entry, complete bool, err error) {
 	var after int64
 	for len(entries) < maxProjectionScan {
-		page, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true, AfterCursor: after, Limit: 1000})
+		page, err := r.ListEntries(ctx, govstore.EntryFilter{WorkspaceID: workspaceID, ServedOnly: true,
+			Scope: ScopeWorkspace, AfterCursor: after, Limit: 1000})
 		if err != nil {
 			return nil, false, err
 		}

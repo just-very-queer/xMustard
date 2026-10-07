@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"sort"
 
 	"xmustard/api-go/internal/govstore"
@@ -80,6 +81,10 @@ type groundMemoryOptions struct {
 	// result the index section already read, so the invalidation does not read it again.
 	ctx     context.Context
 	changes json.RawMessage
+	// The caller's own scope keys (WS-29b): a private, run, session or directory
+	// memory the caller may not read is not counted in ground's totals or at-risk
+	// details either. Empty means the caller named none, so none is served.
+	scopeDir, scopeRunID, scopeSessionID string
 }
 
 // noSince is the since value of a ground call that names no revision.
@@ -174,8 +179,13 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 		if scan.revision, err = r.MemoryRevision(ctx, workspaceID); err != nil {
 			return err
 		}
+		// The caller's own keys narrow this scan as they narrow recall (WS-29b): a
+		// private, run, session or directory memory the caller may not read is not
+		// counted here either, so ground's totals and at-risk details cannot disclose
+		// it. A caller naming no key sees no confined entry.
 		view, err = r.Ranking(ctx, govstore.RankQuery{WorkspaceID: workspaceID, Caller: caller,
-			States: []string{govstore.RankServed, govstore.RankPending}})
+			States:   []string{govstore.RankServed, govstore.RankPending},
+			ScopeDir: opts.scopeDir, ScopeRunID: opts.scopeRunID, ScopeSessionID: opts.scopeSessionID})
 		if err != nil {
 			return err
 		}
@@ -196,8 +206,18 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 			if events, err = readDeltaEvents(ctx, r, workspaceID, since); err != nil {
 				return err
 			}
+			// The ranking above filters what was SERVED, but the delta folds every
+			// workspace event after since, so a confined entry this caller cannot see
+			// was still named by id (and its replacement by id) in memory_delta
+			// (round 4, r4-4). The served set alone cannot decide this: an entry removed
+			// inside the window is not in it, which is exactly the case the delta
+			// exists to report, so each named entry's own scope is read and checked.
+			if events, err = restrictDeltaToVisible(ctx, r, events, caller, opts); err != nil {
+				return err
+			}
 		}
-		scan.atRisk, scan.atRiskTruncated, err = readAtRisk(ctx, r, workspaceID)
+		scan.atRisk, scan.atRiskTruncated, err = readAtRisk(ctx, r, workspaceID, caller,
+			ScopeRequest{Dir: opts.scopeDir, RunID: opts.scopeRunID, SessionID: opts.scopeSessionID})
 		return err
 	})
 	if err != nil {
@@ -240,6 +260,33 @@ func scanGroundMemory(dataDir, workspaceID, caller string, window int, since int
 		scan.delta = events.delta(since, scan.revision, served, staleNow)
 	}
 	return scan, nil
+}
+
+// restrictDeltaToVisible drops the delta's entries the caller's scope does not admit,
+// so ground's memory_delta names no entry another principal wrote privately. An entry
+// the store no longer holds is dropped too: it discloses nothing, and a name it no
+// longer resolves is not a disclosure either.
+func restrictDeltaToVisible(ctx context.Context, r govstore.Reader, events deltaEvents, caller string,
+	opts groundMemoryOptions) (deltaEvents, error) {
+	if len(events.byEntry) == 0 {
+		return events, nil
+	}
+	req := ScopeRequest{Dir: opts.scopeDir, RunID: opts.scopeRunID, SessionID: opts.scopeSessionID}
+	keep := make(map[string]*deltaChange, len(events.byEntry))
+	for id, c := range events.byEntry {
+		e, err := r.GetEntry(ctx, id)
+		if err != nil {
+			if errors.Is(err, govstore.ErrNotFound) {
+				continue
+			}
+			return events, err
+		}
+		if ScopesVisible(e.Scope, e.ScopeKey, e.Source, caller, req) {
+			keep[id] = c
+		}
+	}
+	events.byEntry = keep
+	return events, nil
 }
 
 // --- onboarding (PAR-GOV-15) ----------------------------------------------------------
