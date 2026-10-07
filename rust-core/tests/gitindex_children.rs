@@ -218,7 +218,7 @@ fn the_reader_starts_no_index_loading_git_child() {
         let loading: Vec<&(bool, String)> = calls
             .iter()
             .filter(|(private, sub)| {
-                !OBJECT_ONLY.contains(&sub.as_str()) && !(*private && sub == "update-index")
+                !(OBJECT_ONLY.contains(&sub.as_str()) || *private && sub == "update-index")
             })
             .collect();
         assert!(

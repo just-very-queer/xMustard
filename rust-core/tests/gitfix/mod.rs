@@ -442,8 +442,11 @@ pub fn ignores() -> Fx {
     fx(d, r)
 }
 
+/// A fixture builder.
+pub type Build = fn() -> Fx;
+
 /// The C8 fixture matrix, by name.
-pub const MATRIX: &[(&str, fn() -> Fx)] = &[
+pub const MATRIX: &[(&str, Build)] = &[
     ("clean", clean),
     ("dirty", dirty),
     ("filter", filter),

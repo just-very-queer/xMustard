@@ -242,7 +242,15 @@ fn op_delete(r: &Path, f: &str, _: &mut Rng) {
 
 fn op_chmod(r: &Path, f: &str, g: &mut Rng) {
     if fs::symlink_metadata(r.join(f)).is_ok_and(|m| m.is_file()) {
-        chmod(r, f, if g.next() % 2 == 0 { 0o755 } else { 0o644 });
+        chmod(
+            r,
+            f,
+            if g.next().is_multiple_of(2) {
+                0o755
+            } else {
+                0o644
+            },
+        );
     }
 }
 
