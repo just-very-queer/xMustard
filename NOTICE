@@ -63,3 +63,17 @@ option. It ships no NOTICE file and is a dependency of signal-hook, not a transl
 
   Used at signal-hook-registry 1.4.8, pulled in by signal-hook for the same
   forwarding. xMustard contributes no changes to it.
+
+Design references (ideas only; no code, text or tests are copied from them):
+
+  rust-core/src/gitindex/ (WS-RT18) reads Git's on-disk index and applies Git's
+  ignore and status rules as Git documents them. Git (https://git-scm.com) is
+  licensed under the GNU General Public License, version 2; its documentation was
+  read as a specification, and none of Git's or gitoxide's source was used:
+    Documentation/gitformat-index.txt (https://git-scm.com/docs/index-format):
+      index versions 2-4, extensions, the trailing checksum
+    Documentation/technical/split-index.txt: the link extension and its bitmaps
+    Documentation/technical/bitmap-format.txt: the EWAH bitmap serialization
+    Documentation/technical/racy-git.txt (https://git-scm.com/docs/racy-git):
+      the racy-timestamp rule
+    git-status(1) (porcelain format) and gitignore(5) (pattern rules and precedence)
