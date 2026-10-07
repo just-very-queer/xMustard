@@ -313,6 +313,9 @@ func TestSearchCursorIsBoundToLangAndMode(t *testing.T) {
 		{Query: "q", Lang: "go", Mode: SearchModeHybrid, PathGlob: "**/*.go"},
 		{Query: "q", Mode: SearchModeText, PathGlob: "**/*.go"},
 		{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.rs"},
+		{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go", ScanLines: 5},
+		{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go", ScanBytes: 64},
+		{Query: "q", Lang: "go", Mode: SearchModeText, PathGlob: "**/*.go", ScanTimeoutMS: 100},
 	} {
 		got, err := decodeSearchCursor(cursor, other.rankingKey("ws"))
 		if err == nil {
