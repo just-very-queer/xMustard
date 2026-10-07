@@ -49,20 +49,22 @@ Two behaviours the design must respect, both measured:
 | `hook.timeout_ms` | int, default 200 | `XMUSTARD_HOOK_TIMEOUT_MS` | environment |
 | `hook.budget_ms` | int 20-5000, default 180 | `XMUSTARD_HOOK_BUDGET_MS` | environment |
 | `hook.socket` | path, default compiled | `XMUSTARD_HOOK_SOCKET` | environment |
-| `semantic.enabled` | bool, default `false` | reserved (WS-37 lands it) | none yet |
-| `lsp.enabled` | bool, default `false` | reserved (WS-45 lands it) | none yet |
+| `semantic.enabled` | bool, default `false` | `XMUSTARD_ENGINE_SEMANTIC_ENABLED` (reserved; WS-37 lands the reader) | none yet |
+| `lsp.enabled` | bool, default `false` | `XMUSTARD_ENGINE_LSP_ENABLED` (reserved; WS-45 lands the reader) | none yet |
 
 The two reserved keys exist so the surface is named before their rows land: `semantic.enabled` is the WS-37 switch and ships off, and turning it on by default is G§5.12, an owner decision; `lsp.enabled` is the WS-45 pool switch. Until those rows merge, the keys parse, reject unknown sub-keys, and change no behaviour. The `worker` default stays as it is today; whether it flips to default-on is G§5.9, an owner decision.
 
 ### `[engine.hooks.<client>]`
 
-One sub-table per client, starting with `claude` and `codex` (the clients `internal/hooks` serves today); adding a client is one table entry.
+One sub-table per client, starting with `claude` and `codex` (the clients `internal/hooks` serves today); adding a client is one table entry. `<CLIENT>` in the overrides is the upper-case client name.
 
-| Key | Type and default | Notes |
-|---|---|---|
-| `enabled` | bool, default `true` | `false` refuses the client's hook events at the daemon and makes the client exit without posting |
-| `fail` | `open` \| `closed`, default `open` | what the client does when the daemon is unreachable or the budget runs out; `open` is today's behaviour (`cmd/xmustard-hook/main.go:11`), `closed` would deny the tool call the hook guards |
-| `timeout_ms` | int, default 200 | per-event client budget |
+| Key | Type and default | Environment override | Notes |
+|---|---|---|---|
+| `enabled` | bool, default `true` | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_ENABLED` | `false` refuses the client's hook events at the daemon and makes the client exit without posting |
+| `fail` | `open` \| `closed`, default `open` | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_FAIL` | what happens when the daemon is unreachable or the budget runs out; `open` is today's behaviour (`cmd/xmustard-hook/main.go:11`), `closed` denies the tool call the hook guards |
+| `timeout_ms` | int, default 200 | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_TIMEOUT_MS` | per-event client budget |
+
+The `fail` policy has to be knowable without the daemon, because the daemon is unreachable exactly when the policy matters (round-1 finding r1-2). The static hook client therefore reads its policy from its own repository copy of the file, or its environment override, before it dials anything; a client that can read no policy (no file, unparsable file) defaults to `open` and exits 0, which is today's behaviour. The daemon independently refuses a disabled client's events at the route, so `enabled=false` holds even for a client that never reads the file.
 
 In v1 the policy is per client, not per event (owner question OQ-2). `WorktreeRemove` stays fail-open in v1 either way, because a failing hook there blocks the removal; a per-event carve-out is the owner's call.
 
@@ -73,13 +75,13 @@ In v1 the policy is per client, not per event (owner question OQ-2). `WorktreeRe
 | `pending_quota` | int, default 500 | `XMUSTARD_MEMORY_PENDING_QUOTA` | environment |
 | `active_envelope` | int, default 100000 | `XMUSTARD_MEMORY_ACTIVE_ENVELOPE` | environment |
 | `standing_memory` | bool, default `true` | `XMUSTARD_MCP_STANDING_MEMORY` | environment |
-| `trusted_run_key_principals` | list of principals, default `[]` | (none; file or `settings.json`) | `settings.json` |
+| `trusted_run_key_principals` | list of principals, default `[]` | `XMUSTARD_MEMORY_TRUSTED_RUN_KEY_PRINCIPALS` (comma-separated) | environment or `settings.json`; never the repository file |
 
-`trusted_run_key_principals` is the same setting `settings.json` holds (WS-29b). The default stays empty: with no principals configured anywhere, run-key scope assertions are refused. The effective value is the value from the highest-precedence source that sets it, never the union of sources — a union would silently re-add a principal an operator removed.
+`trusted_run_key_principals` is the same setting `settings.json` holds (WS-29b), and it is deliberately not file-settable: the file is committed to the repository, so a trust list read from it would let whoever can commit to the repository grant run-key scope authority — a trust decision must stay in an operator-controlled source (round-1 finding r1-1; the owner decision of 2026-10-03 makes it a setup choice). The goal row's "trusted run-key agents" switch is this environment variable and the `settings.json` key, both reported by `config check`. The default stays empty: with no principals configured anywhere, run-key scope assertions are refused. The effective value is the value from the highest-precedence source that sets it, never the union of sources — a union would silently re-add a principal an operator removed.
 
 ### Precedence
 
-Proposed: environment variable over `xmustard.toml` over `settings.json` over the compiled default, one winner per key. `xmustard-ops config check` prints, for every key, its effective value and the source it came from (`default`, `file`, `env`, or `settings`). Whether `settings.json` — which the admin API writes at runtime — should outrank the repository file is owner question OQ-3; the proposed order puts the repository file above it so a committed config is the operator's statement of record.
+Proposed: environment variable over `xmustard.toml` over `settings.json` over the compiled default, one winner per key. One carve-out: a trust list never comes from the repository file (the escalation path round-1 finding r1-1 closes), so `trusted_run_key_principals` is sourced from the environment or `settings.json` only. `xmustard-ops config check` prints, for every key, its effective value and the source it came from (`default`, `file`, `env`, or `settings`). Whether `settings.json` — which the admin API writes at runtime — should outrank the repository file for the remaining keys is owner question OQ-3; the proposed order puts the repository file above it so a committed config is the operator's statement of record.
 
 ### `xmustard-ops config check`
 
@@ -101,15 +103,15 @@ It changes nothing; it is a read-only validator and report. It runs against the 
 ## Open questions for the owner
 
 - **OQ-1** Malformed configuration: refuse startup (proposed) or log and continue with defaults.
-- **OQ-2** Hook failure policy per client (proposed for v1) or per event; and whether any event besides none may be `closed`, given `WorktreeRemove` must stay silent.
-- **OQ-3** Precedence between `xmustard.toml` and `settings.json` (proposed: file above settings).
-- **OQ-4** File location: the workspace root (proposed), an additional install-level path, and which copy the static hook client reads (the repository it runs in, the daemon's, or both).
+- **OQ-2** Hook failure policy per client (proposed for v1) or per event; and whether any event may be `closed`, given `WorktreeRemove` must stay silent.
+- **OQ-3** Precedence between `xmustard.toml` and `settings.json` for the keys the file may carry (proposed: file above settings; trust lists are settled — never from the file).
+- **OQ-4** File location: the workspace root (proposed) or an additional install-level path. Settled by round 1: the static hook client reads its own repository copy, so `fail=closed` is enforceable without the daemon.
 
 ## Tests the code row runs
 
 - `config check` refuses an unknown key and an out-of-range value, naming the key and the file.
 - One test per precedence boundary: environment over file, file over `settings.json`, `settings.json` over the compiled default, with the printed source asserted.
-- `trusted_run_key_principals` unset everywhere keeps WS-29b's refusal; a file-set list behaves exactly like a `settings.json`-set list; the sources are never unioned.
+- `trusted_run_key_principals` unset everywhere keeps WS-29b's refusal; an environment-set list behaves exactly like a `settings.json`-set list; the sources are never unioned; the file loader refuses the key wherever it appears in `xmustard.toml`, naming the rule.
 - A disabled hook client takes its refusal path; the fail-open default is pinned, with the `WorktreeRemove` must-stay-silent case asserted.
 - The `schema` flip (`lean`/`full`) stays inside the code `TestToolsListStaysWithinByteCaps` exercises; the `CAPS` gate covers it.
 - The reserved `semantic` and `lsp` keys parse, reject unknown sub-keys, and change nothing.
