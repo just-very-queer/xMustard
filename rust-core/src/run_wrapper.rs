@@ -326,7 +326,8 @@ fn reporter() -> &'static Reporter {
 }
 
 /// Waits, up to `REPORT_DRAIN`, for the wrapper's reporter to write what is already queued.
-/// Nothing to wait for when no signal was ever reported.
+/// Nothing to wait for when no signal was ever handled: the watcher creates the reporter before
+/// it signals the child, so a child that died of a forwarded signal implies one exists.
 fn drain_reports() {
     if let Some(reporter) = REPORTER.get() {
         reporter.drain(REPORT_DRAIN);
@@ -337,13 +338,17 @@ fn drain_reports() {
 ///
 /// The queue is bounded, so a watcher cannot grow memory against a sink nobody drains, and a full
 /// queue drops the line rather than waiting: a lost diagnostic costs an operator one line, while a
-/// blocked watcher costs a child its next signal. Every dropped line is counted, and `drain`
-/// states the count, so a loss is visible rather than silent.
+/// blocked watcher costs a child its next signal. Every line that is not written, dropped by a full
+/// queue or refused by the sink, is counted, and `drain` states the count, so a loss is visible
+/// rather than silent.
 struct Reporter {
     lines: mpsc::SyncSender<Report>,
     /// Behind a `Mutex` only because a `static` must be `Sync` and `mpsc::Receiver` is not.
     acks: Mutex<mpsc::Receiver<()>>,
-    dropped: AtomicU64,
+    /// Lines a full queue dropped or the sink refused, not yet stated. Shared with the writer.
+    lost: Arc<AtomicU64>,
+    /// Signals the watcher has started acting on and not yet reported (`Deciding`).
+    deciding: AtomicU64,
 }
 
 /// One line for the reporter to write and, when `ack` is set, the signal that it has.
@@ -352,16 +357,37 @@ struct Report {
     ack: bool,
 }
 
+impl Report {
+    /// A line whose writing the writer acknowledges.
+    fn acked(line: String) -> Report {
+        Report { line, ack: true }
+    }
+}
+
+/// Held by the watcher from before it signals the child until its decision line is queued, so a
+/// drain on the exit path waits for a decision whose delivery may be what ended the child.
+struct Deciding<'a>(&'a Reporter);
+
+impl Drop for Deciding<'_> {
+    fn drop(&mut self) {
+        self.0.deciding.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 impl Reporter {
     /// Starts the writer thread over `sink`, with room for `depth` lines while it is behind.
     fn new(mut sink: impl Write + Send + 'static, depth: usize) -> Reporter {
         let (lines, queued) = mpsc::sync_channel::<Report>(depth);
         let (ack_tx, acks) = mpsc::channel();
+        let lost = Arc::new(AtomicU64::new(0));
+        let refused = Arc::clone(&lost);
         thread::spawn(move || {
             for report in queued {
-                // A failed write is not retried: a sink that refused this line will refuse the
-                // retry, and nothing the wrapper decides waits on it.
-                let _ = sink.write_all(report.line.as_bytes());
+                // A failed write is counted, not retried: a sink that refused this line will
+                // refuse the retry, and nothing the wrapper decides waits on it.
+                if sink.write_all(report.line.as_bytes()).is_err() {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                }
                 if report.ack {
                     let _ = ack_tx.send(());
                 }
@@ -370,50 +396,80 @@ impl Reporter {
         Reporter {
             lines,
             acks: Mutex::new(acks),
-            dropped: AtomicU64::new(0),
+            lost,
+            deciding: AtomicU64::new(0),
         }
     }
 
     /// Queues `line` without ever blocking the caller; a full queue drops it and counts it.
     fn send(&self, line: String) {
         if self.lines.try_send(Report { line, ack: false }).is_err() {
-            self.dropped.fetch_add(1, Ordering::SeqCst);
+            self.lost.fetch_add(1, Ordering::SeqCst);
         }
     }
 
-    /// Waits up to `limit` for the writer to reach everything queued so far, after stating how
-    /// many lines a full queue dropped.
+    /// Marks one signal as being acted on until the returned guard drops.
+    fn deciding(&self) -> Deciding<'_> {
+        self.deciding.fetch_add(1, Ordering::SeqCst);
+        Deciding(self)
+    }
+
+    /// Waits up to `limit` for every decision in progress to be queued and every queued line to
+    /// reach the sink, then states how many lines were lost.
     ///
     /// A spawned thread is detached, so a forwarded signal that promptly ends the child could end
-    /// the wrapper before the writer ever ran, and the decision would go missing exactly when it
-    /// matters most. The acknowledged line goes to the back of the queue, so its ack means every
-    /// line queued before it has been handed to the sink. A full queue is waited on for room
-    /// rather than given up on, because the queue is fullest exactly when lines were dropped and
-    /// the count most needs stating. All of it is bounded by `limit`: the writer may be parked on
-    /// a sink nobody drains, and the wrapper's own outcome must not wait on that.
+    /// the wrapper before the watcher queued its line or the writer ran, and the decision would
+    /// go missing exactly when it matters most. The loss is counted only after the writer has
+    /// caught up, so a write the sink refused is in the count, and the count is cleared only once
+    /// its notice is queued, so a drain that runs out of time leaves it for a later one. All of it
+    /// is bounded by `limit`: the writer may be parked on a sink nobody drains, and the wrapper's
+    /// own outcome must not wait on that.
     fn drain(&self, limit: Duration) {
         let deadline = std::time::Instant::now() + limit;
-        let lost = self.dropped.swap(0, Ordering::SeqCst);
-        let line = if lost == 0 {
-            String::new()
-        } else {
-            format!("xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n")
-        };
-        let mut pending = Report { line, ack: true };
+        while self.deciding.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+            thread::sleep(DRAIN_POLL);
+        }
+        if !self.flush(deadline) {
+            return;
+        }
+        let lost = self.lost.load(Ordering::SeqCst);
+        if lost == 0 {
+            return;
+        }
+        let notice = format!("xmustard run: {lost} decision report(s) not written to stderr\n");
+        if self.enqueue(Report::acked(notice), deadline) {
+            self.lost.fetch_sub(lost, Ordering::SeqCst);
+            self.await_ack(deadline);
+        }
+    }
+
+    /// Queues an acknowledged empty line and waits for its ack: once it arrives, every line queued
+    /// before it has been handed to the sink. `false` when the deadline passed first.
+    fn flush(&self, deadline: std::time::Instant) -> bool {
+        self.enqueue(Report::acked(String::new()), deadline) && self.await_ack(deadline)
+    }
+
+    /// Queues `report`, waiting for room until `deadline`: the queue is fullest exactly when lines
+    /// were lost, so giving up at the first full queue would lose the count with them.
+    fn enqueue(&self, mut report: Report, deadline: std::time::Instant) -> bool {
         loop {
-            match self.lines.try_send(pending) {
-                Ok(()) => break,
-                Err(mpsc::TrySendError::Full(report)) if std::time::Instant::now() < deadline => {
-                    pending = report;
+            match self.lines.try_send(report) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(r)) if std::time::Instant::now() < deadline => {
+                    report = r;
                     thread::sleep(DRAIN_POLL);
                 }
-                Err(_) => return,
+                Err(_) => return false,
             }
         }
-        if let Ok(acks) = self.acks.lock() {
-            let _ =
-                acks.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()));
-        }
+    }
+
+    fn await_ack(&self, deadline: std::time::Instant) -> bool {
+        let Ok(acks) = self.acks.lock() else {
+            return false;
+        };
+        acks.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
     }
 }
 
@@ -425,7 +481,7 @@ const REPORT_QUEUE: usize = 32;
 /// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
 const REPORT_DRAIN: Duration = Duration::from_millis(50);
 
-/// How often a drain looks for room in a full queue.
+/// How often a drain looks for room in a full queue or for a decision still in progress.
 const DRAIN_POLL: Duration = Duration::from_millis(1);
 
 /// Signals the child and says whether it got the signal.
@@ -595,6 +651,9 @@ impl Forwarder {
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
                 }
+                // Held until the line below is queued, so an exit-path drain that runs because
+                // this delivery ended the child waits for the line (codex-review, round 8).
+                let _deciding = reporter().deciding();
                 // Whether to relay is `DELIVERIES`' decision, not this loop's: a signal the
                 // terminal or the kernel generated is skipped only where a group delivery
                 // would already have reached the child, and a hangup or a timer is never
@@ -1045,7 +1104,7 @@ mod tests {
         assert_eq!(
             text,
             "first\nline 0\nline 1\n\
-             xmustard run: 3 decision report(s) dropped: the stderr reader is slow\n"
+             xmustard run: 3 decision report(s) not written to stderr\n"
         );
     }
 
@@ -1068,6 +1127,116 @@ mod tests {
         let waited = drained.recv_timeout(Duration::from_secs(10));
         drop(release);
         waited.expect("the drain waited on a stuck writer past its limit");
+    }
+
+    /// A drain on the exit path waits for a decision the watcher is still acting on: the signal it
+    /// just delivered may be what ended the child, and its line is not queued yet. The drain runs
+    /// on its own thread with a generous limit, so it cannot have timed out within the 200 ms
+    /// window; the test then queues the line, releases the decision, and expects exactly it.
+    #[test]
+    fn a_drain_waits_for_a_decision_still_being_acted_on() {
+        let (sink, _entered, release, out) = gated_sink();
+        drop(release);
+        let reporter = Arc::new(Reporter::new(sink, 2));
+        let deciding = reporter.deciding();
+        let (done, drained) = mpsc::channel();
+        let draining = Arc::clone(&reporter);
+        thread::spawn(move || {
+            draining.drain(Duration::from_secs(10));
+            let _ = done.send(());
+        });
+        assert_eq!(
+            drained.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the drain returned while a decision was still being acted on"
+        );
+        reporter.send("SIGTERM forwarded to the child\n".into());
+        drop(deciding);
+        drained
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drain never returned after the decision was queued");
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "SIGTERM forwarded to the child\n");
+    }
+
+    /// A sink that refuses every line starting with `refused` and keeps the rest.
+    struct RefusingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RefusingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.starts_with(b"refused") {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line the sink refuses is lost as surely as one a full queue dropped, so it is counted
+    /// and the drain states it.
+    #[test]
+    fn a_line_the_sink_refuses_is_counted_and_stated() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let reporter = Reporter::new(RefusingSink(Arc::clone(&out)), 4);
+        reporter.send("refused\n".into());
+        reporter.send("kept\n".into());
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text,
+            "kept\nxmustard run: 1 decision report(s) not written to stderr\n"
+        );
+    }
+
+    /// A drain that runs out of time before it can queue the loss notice keeps the count, so a
+    /// later drain still states it. The first drain runs on its own thread and is awaited with a
+    /// deadline, so a drain that waited on the stuck writer fails instead of hanging.
+    #[test]
+    fn a_drain_out_of_time_keeps_the_count_for_the_next_one() {
+        let (sink, entered, release, out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 1));
+        reporter.send("first\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the first line");
+        reporter.send("queued\n".into());
+        reporter.send("dropped\n".into());
+        let (done, drained) = mpsc::channel();
+        let draining = Arc::clone(&reporter);
+        thread::spawn(move || {
+            draining.drain(Duration::from_millis(100));
+            let _ = done.send(());
+        });
+        let waited = drained.recv_timeout(Duration::from_secs(10));
+        release.send(()).unwrap();
+        waited.expect("the drain waited on a stuck writer past its limit");
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text,
+            "first\nqueued\nxmustard run: 1 decision report(s) not written to stderr\n"
+        );
+    }
+
+    /// The wrapper's exit drains the reporter before it ends: with a decision held in progress,
+    /// `end_like` cannot return before the drain's limit has passed. A lower bound only, so load
+    /// can never make it fail; an exit that skipped the drain returns at once.
+    #[test]
+    fn ending_like_the_child_drains_the_reporter_first() {
+        let deciding = reporter().deciding();
+        let started = std::time::Instant::now();
+        let code = end_like(ChildExit::Code(5));
+        let waited = started.elapsed();
+        drop(deciding);
+        assert_eq!(code, 5);
+        assert!(
+            waited >= REPORT_DRAIN,
+            "end_like returned after {waited:?} with a decision in progress, so it did not drain"
+        );
     }
 
     #[test]
