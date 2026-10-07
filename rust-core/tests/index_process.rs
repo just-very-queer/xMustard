@@ -276,7 +276,9 @@ fn status_failing_git(dir: &Path) -> String {
 }
 
 /// Fable F3: when `git status` fails the identity is incomplete, the overall coverage
-/// must not read `complete=true`, and no cached (possibly stale) graph is served.
+/// must not read `complete=true`, and no cached (possibly stale) graph is served. Only
+/// the Git source runs `git status` (WS-RT18), so the shim runs under it;
+/// `a_refused_index_is_incomplete_and_never_serves_stale` is the reader's case.
 #[cfg(unix)]
 #[test]
 fn git_status_failure_is_incomplete_and_never_serves_stale() {
@@ -287,7 +289,10 @@ fn git_status_failure_is_incomplete_and_never_serves_stale() {
 
     let shim_dir = TempDir::new().unwrap();
     let path = status_failing_git(shim_dir.path());
-    let env = [("PATH", path.as_str())];
+    let env = [
+        ("PATH", path.as_str()),
+        ("XMUSTARD_GIT_INDEX_READER", "git"),
+    ];
     let key = json(&run(&["repo-key", r.path().to_str().unwrap()], &env));
     assert_eq!(key["identity_complete"], false);
     assert_eq!(key["limitations"][0]["reason"], "git_status_failed");
@@ -305,6 +310,44 @@ fn git_status_failure_is_incomplete_and_never_serves_stale() {
             .as_str()
             .unwrap()
             .contains("git_status_failed"),
+        "bypass reason not named: {}",
+        cov["work"]
+    );
+    assert_eq!(
+        out["hits"][0]["name"], "version_two_symbol",
+        "stale graph served"
+    );
+}
+
+/// WS-RT18: an index the reader refuses (here `core.ignorecase`, with the reader
+/// forced, so no Git fallback) is a named limitation; the identity and the overall
+/// coverage are incomplete, and no cached (possibly stale) graph is served.
+#[test]
+fn a_refused_index_is_incomplete_and_never_serves_stale() {
+    let r = repo(&[("a.rs", "pub fn version_one_symbol() {}\n")]);
+    let warm = search(r.path(), "ws", "version_one_symbol", &[]);
+    assert_eq!(warm["coverage"]["work"]["graph_cache"], "miss");
+    fs::write(r.path().join("a.rs"), "pub fn version_two_symbol() {}\n").unwrap();
+    git(r.path(), &["config", "core.ignorecase", "true"]);
+
+    let env = [("XMUSTARD_GIT_INDEX_READER", "reader")];
+    let key = json(&run(&["repo-key", r.path().to_str().unwrap()], &env));
+    assert_eq!(key["identity_complete"], false);
+    assert_eq!(key["limitations"][0]["reason"], "git_index_unsupported");
+
+    let out = search(r.path(), "ws", "version_two_symbol", &env);
+    let cov = &out["coverage"];
+    assert_eq!(cov["source_identity"]["identity_complete"], false);
+    assert_eq!(
+        cov["complete"], false,
+        "complete=true with a refused index: {cov}"
+    );
+    assert_eq!(cov["work"]["graph_cache"], "bypass");
+    assert!(
+        cov["work"]["graph_cache_detail"]
+            .as_str()
+            .unwrap()
+            .contains("git_index_unsupported"),
         "bypass reason not named: {}",
         cov["work"]
     );

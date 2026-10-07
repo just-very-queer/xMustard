@@ -88,7 +88,7 @@ fn tracked_files(root: &Path) -> Result<Vec<String>, String> {
             }
         },
     )
-    .map_err(|e| format!("tracked listing: {e}"))?;
+    .map_err(|e| e.to_string())?;
     Ok(paths)
 }
 
@@ -228,8 +228,7 @@ fn changed_from_head(
         return Ok(all());
     }
     let setting = crate::gitindex::Setting::from_env();
-    let changes = crate::gitindex::head_changes_using(root, setting)
-        .map_err(|e| format!("changes against HEAD: {e}"))?;
+    let changes = crate::gitindex::head_changes_using(root, setting).map_err(|e| e.to_string())?;
     let Some(changes) = changes else {
         return Ok(all());
     };

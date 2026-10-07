@@ -498,7 +498,7 @@ impl SourceIdentity {
     }
 
     /// Why this identity does not determine the graph's input, or None when it does:
-    /// Git mode, status and the hidden-entry listing succeeded, and every *tracked*
+    /// Git mode, status and the hidden-entry listing (or the index reader) succeeded, and every *tracked*
     /// dirty file has a known identity (hashed, deleted, symlink, or excluded from the
     /// graph by size with its size/ctime in the key). Untracked files never feed the
     /// graph, so an untracked-only limitation leaves the graph cacheable while
@@ -507,7 +507,11 @@ impl SourceIdentity {
         if let Some(l) = self.limitations.iter().find(|l| {
             matches!(
                 l.reason.as_str(),
-                "git_status_failed" | "git_unavailable" | "git_index_flags_failed"
+                "git_status_failed"
+                    | "git_unavailable"
+                    | "git_index_flags_failed"
+                    | "git_index_unsupported"
+                    | "git_index_failed"
             )
         }) {
             return Some(format!("identity limitation {}: {}", l.reason, l.detail));
