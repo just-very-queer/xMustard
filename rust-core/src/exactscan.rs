@@ -750,6 +750,32 @@ mod tests {
         assert_eq!(c.at(2), Some((1, 3)), "e-acute is two bytes");
     }
 
+    #[test]
+    fn opening_a_file_counts_one_stat_and_no_hashes() {
+        let td = tempfile::tempdir().unwrap();
+        std::fs::write(td.path().join("a.txt"), "needle\n").unwrap();
+        let call = crate::passcount::Call::begin();
+        let fs = FileScan::open(td.path(), "a.txt").unwrap();
+        let counts = call.counts();
+        drop(call);
+        drop(fs);
+        assert_eq!(
+            counts.get(crate::passcount::Pass::FilesStatted),
+            1,
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get(crate::passcount::Pass::FilesHashed),
+            0,
+            "{counts:?}"
+        );
+        assert_eq!(
+            counts.get(crate::passcount::Pass::BytesHashed),
+            0,
+            "{counts:?}"
+        );
+    }
+
     // The time cap is the scan's own wall clock, and this row's remaining uncovered
     // requirement (tests required (6)): a scan that would exceed it stops and names the
     // cut. `scan` takes its `started` as a parameter, so the test hands it one two seconds
