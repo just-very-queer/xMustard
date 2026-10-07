@@ -690,28 +690,29 @@ fn scan(
     // An over-ceiling cap is refused, not clamped: a caller told it may read 32 MiB and
     // given a 4 MiB bound would read a bounded answer as a complete one. `text_index`
     // and this are the only two places a search can fail before it answers.
-    let limits = match crate::exactscan::limits(opts.scan_lines, opts.scan_bytes, opts.scan_timeout_ms) {
-        Ok(l) => l,
-        Err(e) => {
-            return SearchResult {
-                workspace_id: workspace_id.to_string(),
-                query: query.to_string(),
-                total: 0,
-                offset: opts.offset,
-                omitted: 0,
-                hits: Vec::new(),
-                spans: Vec::new(),
-                bytes_scanned: Some(0),
-                truncated: true,
-                cut: None,
-                files_skipped: None,
-                degradations: vec![e],
-                coverage,
-                freshness: Some(source.freshness([])),
-                generated_at: now(),
-            };
-        }
-    };
+    let limits =
+        match crate::exactscan::limits(opts.scan_lines, opts.scan_bytes, opts.scan_timeout_ms) {
+            Ok(l) => l,
+            Err(e) => {
+                return SearchResult {
+                    workspace_id: workspace_id.to_string(),
+                    query: query.to_string(),
+                    total: 0,
+                    offset: opts.offset,
+                    omitted: 0,
+                    hits: Vec::new(),
+                    spans: Vec::new(),
+                    bytes_scanned: Some(0),
+                    truncated: true,
+                    cut: None,
+                    files_skipped: None,
+                    degradations: vec![e],
+                    coverage,
+                    freshness: Some(source.freshness([])),
+                    generated_at: now(),
+                };
+            }
+        };
     let matcher = match crate::exactscan::compile(query, opts.mode.matcher()) {
         Ok(re) => re,
         Err(e) => {
@@ -774,14 +775,15 @@ fn scan(
     // `search_hybrid`'s byte-identity test asserts for the hybrid).
     paths.sort();
     for rel in &paths {
-        let mut scan_file = match crate::exactscan::FileScan::open_with_slice(root, rel, opts.scan_slice) {
-            Ok(s) => s,
-            Err(loss) => {
-                report.files_skipped_unreadable += 1;
-                losses.push(loss);
-                continue;
-            }
-        };
+        let mut scan_file =
+            match crate::exactscan::FileScan::open_with_slice(root, rel, opts.scan_slice) {
+                Ok(s) => s,
+                Err(loss) => {
+                    report.files_skipped_unreadable += 1;
+                    losses.push(loss);
+                    continue;
+                }
+            };
         let more = scan_file.scan(&matcher, &limits, &mut budget, &mut report, started);
         report.files_scanned += 1;
         crate::passcount::note(crate::passcount::Pass::BytesHashed, scan_file.read);
@@ -2249,16 +2251,29 @@ mod scan_tests {
         let res = scan_repo(&repo, "zeppelinprobe", SearchMode::Exact);
         assert_eq!(res.hits.len(), 0, "the scan ranks nothing: {:?}", res.hits);
         assert_eq!(res.spans.len(), 2, "{:?}", res.spans);
-        assert!(res.spans.iter().all(|s| s.path == "svc/handler.go"), "{:?}", res.spans);
+        assert!(
+            res.spans.iter().all(|s| s.path == "svc/handler.go"),
+            "{:?}",
+            res.spans
+        );
         // line 4 and line 5, 1-based, in the file as written above
         assert_eq!(res.spans[0].line, 4, "{:?}", res.spans[0]);
         assert_eq!(res.spans[1].line, 5, "{:?}", res.spans[1]);
-        assert_eq!(res.spans[0].column, 2, "a tab then the call: {:?}", res.spans[0]);
+        assert_eq!(
+            res.spans[0].column, 2,
+            "a tab then the call: {:?}",
+            res.spans[0]
+        );
         assert_eq!(res.spans[0].len, "zeppelinprobe".len());
         // `byte` is the file offset, which is what a follow-up positional read takes. The
         // oracle is the literal: the file's own index_of the first occurrence.
         let body = "package svc\n\nfunc serve() {\n\tzeppelinprobe()\n\tzeppelinprobe()\n}\n";
-        assert_eq!(res.spans[0].byte, body.find("zeppelinprobe").unwrap(), "{:?}", res.spans[0]);
+        assert_eq!(
+            res.spans[0].byte,
+            body.find("zeppelinprobe").unwrap(),
+            "{:?}",
+            res.spans[0]
+        );
         assert!(!res.truncated, "nothing was cut: {:?}", res.degradations);
         assert_eq!(res.cut, None);
         // `bytes_scanned` reports what was read, so it covers the whole file that was
@@ -2278,7 +2293,11 @@ mod scan_tests {
         let repo = git_repo(&[("a.txt", "needle and needle again\n")]);
         let res = scan_repo(&repo, "needle", SearchMode::Exact);
         assert_eq!(res.spans.len(), 2, "{:?}", res.spans);
-        assert_eq!(res.spans[0].line, res.spans[1].line, "both on line 1: {:?}", res.spans);
+        assert_eq!(
+            res.spans[0].line, res.spans[1].line,
+            "both on line 1: {:?}",
+            res.spans
+        );
         assert_ne!(res.spans[0].byte, res.spans[1].byte);
         assert!(res.spans[0].byte < res.spans[1].byte, "ordered by offset");
     }
@@ -2290,10 +2309,20 @@ mod scan_tests {
     fn exact_mode_is_case_sensitive_and_matches_inside_a_line() {
         let repo = git_repo(&[("a.txt", "let Needle = 1;\nlet needle = 2;\n")]);
         let upper = scan_repo(&repo, "Needle", SearchMode::Exact);
-        assert_eq!(upper.spans.len(), 1, "only the capital N: {:?}", upper.spans);
+        assert_eq!(
+            upper.spans.len(),
+            1,
+            "only the capital N: {:?}",
+            upper.spans
+        );
         assert_eq!(upper.spans[0].line, 1);
         let lower = scan_repo(&repo, "needle", SearchMode::Exact);
-        assert_eq!(lower.spans.len(), 1, "only the lowercase n: {:?}", lower.spans);
+        assert_eq!(
+            lower.spans.len(),
+            1,
+            "only the lowercase n: {:?}",
+            lower.spans
+        );
         assert_eq!(lower.spans[0].line, 2);
     }
 
@@ -2322,7 +2351,9 @@ mod scan_tests {
         assert!(res.spans.is_empty(), "{:?}", res.spans);
         assert_eq!(res.bytes_scanned, Some(0), "nothing was read");
         assert!(
-            res.degradations.iter().any(|d| d.contains("regex pattern is not valid")),
+            res.degradations
+                .iter()
+                .any(|d| d.contains("regex pattern is not valid")),
             "{:?}",
             res.degradations
         );
@@ -2400,14 +2431,25 @@ mod scan_tests {
             "a secret path must never appear in a span: {:?}",
             res.spans
         );
-        assert!(res.truncated, "a file could not be read: {:?}", res.degradations);
         assert!(
-            res.degradations.iter().any(|d| d.contains(".env") && d.contains("secret path")),
+            res.truncated,
+            "a file could not be read: {:?}",
+            res.degradations
+        );
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains(".env") && d.contains("secret path")),
             "the loss names the path: {:?}",
             res.degradations
         );
         assert!(
-            res.coverage.loss_counts.get("exact_scan_secret_path").copied().unwrap_or(0) >= 1,
+            res.coverage
+                .loss_counts
+                .get("exact_scan_secret_path")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
             "the loss is counted under its own key: {:?}",
             res.coverage.loss_counts
         );
@@ -2418,7 +2460,10 @@ mod scan_tests {
     #[test]
     fn the_scan_composes_with_path_glob_and_lang_and_invents_nothing() {
         let repo = git_repo(&[
-            ("svc/handler.go", "package svc\n\nfunc serve() { zeppelinprobe() }\n"),
+            (
+                "svc/handler.go",
+                "package svc\n\nfunc serve() { zeppelinprobe() }\n",
+            ),
             ("src/lib.rs", "pub fn serve() { zeppelinprobe(); }\n"),
         ]);
         let all = scan_repo(&repo, "zeppelinprobe", SearchMode::Exact);
@@ -2436,7 +2481,11 @@ mod scan_tests {
             },
         );
         assert_eq!(globbed.spans.len(), 1, "{:?}", globbed.spans);
-        assert!(globbed.spans[0].path.ends_with(".go"), "{:?}", globbed.spans);
+        assert!(
+            globbed.spans[0].path.ends_with(".go"),
+            "{:?}",
+            globbed.spans
+        );
         let rust_only = search(
             repo.path(),
             "ws",
@@ -2450,7 +2499,11 @@ mod scan_tests {
             },
         );
         assert_eq!(rust_only.spans.len(), 1, "{:?}", rust_only.spans);
-        assert!(rust_only.spans[0].path.ends_with(".rs"), "{:?}", rust_only.spans);
+        assert!(
+            rust_only.spans[0].path.ends_with(".rs"),
+            "{:?}",
+            rust_only.spans
+        );
     }
 
     // An over-ceiling cap is refused by the library boundary, and the refusal reaches the
@@ -2567,10 +2620,13 @@ mod scan_tests {
             "the fixture must really read past the first slice, or it proves nothing: {:?}",
             res
         );
-        let found: Vec<&crate::exactscan::Span> =
-            res.spans.iter().filter(|s| s.len == 6).collect();
-        assert_eq!(found.len(), 1, "exactly once, not twice and not missed: {:?}", res.spans);
+        let found: Vec<&crate::exactscan::Span> = res.spans.iter().filter(|s| s.len == 6).collect();
+        assert_eq!(
+            found.len(),
+            1,
+            "exactly once, not twice and not missed: {:?}",
+            res.spans
+        );
         assert_eq!(found[0].byte, 60, "at the offset the file really has it");
     }
 }
-

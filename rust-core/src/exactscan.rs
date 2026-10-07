@@ -409,7 +409,14 @@ impl<'a> FileScan<'a> {
     /// is found because the tail is still in the window. The window is at most
     /// `MAX_MATCH_BYTES + CHUNK_BYTES` whatever the file's size, so nothing proportional
     /// to the file is held.
-    pub fn scan(&mut self, re: &Regex, limits: &Limits, budget: &mut u64, report: &mut Report, started: std::time::Instant) -> bool {
+    pub fn scan(
+        &mut self,
+        re: &Regex,
+        limits: &Limits,
+        budget: &mut u64,
+        report: &mut Report,
+        started: std::time::Instant,
+    ) -> bool {
         // The window the matcher sees: the carried tail, then this slice. It is at most
         // `MAX_MATCH_BYTES + CHUNK_BYTES`, so it is a fixed size whatever the file is.
         let mut window: Vec<u8> = Vec::with_capacity(MAX_MATCH_BYTES + CHUNK_BYTES);
@@ -604,7 +611,10 @@ mod tests {
     #[test]
     fn exact_escapes_the_query_and_regex_does_not() {
         let exact = compile("a.c", Matcher::Exact).unwrap();
-        assert!(!exact.is_match(b"abc"), "a.c is literal, so it does not match abc");
+        assert!(
+            !exact.is_match(b"abc"),
+            "a.c is literal, so it does not match abc"
+        );
         assert!(exact.is_match(b"a.c"), "a.c is literal, so it matches a.c");
         let re = compile("a.c", Matcher::Regex).unwrap();
         assert!(re.is_match(b"abc"), "a.c is a pattern, so it matches abc");
@@ -657,7 +667,7 @@ mod tests {
         assert_eq!(c.at(6), Some((3, 1)), "the position at end of input");
     }
 
-// The cursor is bounded two ways, so it never holds memory proportional to the file. It
+    // The cursor is bounded two ways, so it never holds memory proportional to the file. It
     // must then still answer CORRECTLY for a recent line — the line number is carried in
     // `base_line`, not recovered from a forgotten entry — and refuse an offset older than
     // the window rather than report a line it cannot know.
@@ -704,30 +714,30 @@ mod tests {
         assert_eq!(c.at(0), None, "offset 0 is far outside the window");
     }
 
-#[test]
-fn a_cursor_of_many_short_lines_stays_within_its_entry_bound() {
-    let mut c = Cursor::new();
-    // 4x the entry bound, all inside the byte window (one byte per line)
-    let mut body = Vec::new();
-    for _ in 0..MAX_CURSOR_LINES * 4 {
-        body.push(b'\n');
+    #[test]
+    fn a_cursor_of_many_short_lines_stays_within_its_entry_bound() {
+        let mut c = Cursor::new();
+        // 4x the entry bound, all inside the byte window (one byte per line)
+        let mut body = Vec::new();
+        for _ in 0..MAX_CURSOR_LINES * 4 {
+            body.push(b'\n');
+        }
+        c.advance(&body, 0);
+        assert!(
+            c.starts.len() <= MAX_CURSOR_LINES,
+            "the cursor is bounded by entries too: {} entries",
+            c.starts.len()
+        );
+        // the LAST line of that many is still answerable, with the right number: an entries
+        // bound that dropped the newest starts would leave the newest match unanswerable.
+        let last = body.len() - 1;
+        assert_eq!(
+            c.at(last),
+            Some((MAX_CURSOR_LINES * 4, 1)),
+            "the newest line is still numbered correctly: base_line={}",
+            c.base_line
+        );
     }
-    c.advance(&body, 0);
-    assert!(
-        c.starts.len() <= MAX_CURSOR_LINES,
-        "the cursor is bounded by entries too: {} entries",
-        c.starts.len()
-    );
-    // the LAST line of that many is still answerable, with the right number: an entries
-    // bound that dropped the newest starts would leave the newest match unanswerable.
-    let last = body.len() - 1;
-    assert_eq!(
-        c.at(last),
-        Some((MAX_CURSOR_LINES * 4, 1)),
-        "the newest line is still numbered correctly: base_line={}",
-        c.base_line
-    );
-}
 
     // A column is a byte offset within its line, because the lane matches over bytes.
     // A multi-byte character therefore advances the column by its encoded length, which

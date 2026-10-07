@@ -682,19 +682,19 @@ fn search(args: Args) -> CmdResult {
             Some(("--lang", l)) => lang = Some(l.to_string()),
             Some(("--mode", m)) => mode = Some(m.to_string()),
             Some(("--max-lines", n)) => {
-                max_lines = n
-                    .parse()
-                    .map_err(|_| CmdError::new(2, format!("search: bad --max-lines {n}\n{usage}")))?
+                max_lines = n.parse().map_err(|_| {
+                    CmdError::new(2, format!("search: bad --max-lines {n}\n{usage}"))
+                })?
             }
             Some(("--max-bytes", n)) => {
-                max_bytes = n
-                    .parse()
-                    .map_err(|_| CmdError::new(2, format!("search: bad --max-bytes {n}\n{usage}")))?
+                max_bytes = n.parse().map_err(|_| {
+                    CmdError::new(2, format!("search: bad --max-bytes {n}\n{usage}"))
+                })?
             }
             Some(("--timeout-ms", n)) => {
-                timeout_ms = n
-                    .parse()
-                    .map_err(|_| CmdError::new(2, format!("search: bad --timeout-ms {n}\n{usage}")))?
+                timeout_ms = n.parse().map_err(|_| {
+                    CmdError::new(2, format!("search: bad --timeout-ms {n}\n{usage}"))
+                })?
             }
             _ => {
                 return Err(CmdError::new(
