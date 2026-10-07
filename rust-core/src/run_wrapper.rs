@@ -274,36 +274,10 @@ fn name_of(sig: i32) -> &'static str {
     }
 }
 
-/// Writes what the watcher decided about one signal the wrapper handled, on the wrapper's own
-/// stderr, AFTER the decision has been acted on. The child cannot be told "I declined to relay
-/// that" and a quiet period says nothing, so the decision is stated rather than inferred: an
-/// operator reading a wrapper that did not stop its child can see why, and the pty regression
-/// waits for this line instead of for a period in which nothing happened (WS-FIX-20c). A signal
-/// that ended the wrapper keeps the wrapper's own disposition and needs no line.
+/// What the watcher decided about one signal, and whether the child actually got it.
 ///
-/// It runs after `kill_process` on purpose (WS-FIX-20c-r1-1): a write to a blocked stderr must
-/// not cost the relay, and once the signal has gone out a blocked write costs only the line.
-///
-/// The write must not BLOCK the watcher either, and that is a second requirement the reordering
-/// alone does not meet. There is exactly one watcher thread, so a `stderr` that blocks parks it
-/// for good and every LATER signal goes unforwarded — the child keeps running after a second
-/// client timeout, which is the outcome forwarding exists to prevent (codex-review P1). So the
-/// line is handed to a reporter thread that owns the write and may block on it, while the
-/// watcher only ever enqueues.
-///
-/// The reporter gets stderr **as it is**. An earlier attempt `dup`ed stderr and set
-/// `O_NONBLOCK` on the copy, which is wrong twice over and was found in round 3: `dup` shares
-/// the open file description, so the flag applied to the wrapper's own stderr and to the
-/// child's inherited one, and it stayed changed after the write (codex-review P1). A reporter
-/// thread needs neither, so the trap has nowhere to appear.
-/// States what the watcher decided about one signal, and whether the child actually got it.
-///
-/// Three outcomes, not two, because a decision to relay is not the same as a delivery
-/// (codex-spec, round 5): the decision can be to relay, the delivery can still fail, and an
-/// operator reading "forwarded" for a child that kept running is told the opposite of the truth.
-/// A **fourth** case exists because "not forwarded" cannot describe both a deliberate decline and
-/// a failed delivery - an operator deciding whether to re-signal needs those apart
-/// (codex-spec, round 7).
+/// Three outcomes, because a decision to relay is not a delivery and a deliberate decline is not
+/// a failed delivery: an operator deciding whether to re-signal the child needs all three apart.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Decision {
     /// The relay rule declined, by design: the child already has this signal.
@@ -324,142 +298,146 @@ impl Decision {
     }
 }
 
+/// States what the watcher decided about one signal the wrapper handled, AFTER the decision has
+/// been acted on. The child cannot be told "I declined to relay that" and a quiet period says
+/// nothing, so the decision is stated rather than inferred: an operator reading a wrapper that did
+/// not stop its child can see why, and the pty regression waits for this line instead of for a
+/// period in which nothing happened (WS-FIX-20c). A signal that ended the wrapper keeps the
+/// wrapper's own disposition and needs no line.
+///
+/// It runs after the delivery (WS-FIX-20c-r1-1), and it only enqueues: there is exactly one
+/// watcher thread, so a write that blocked on a stderr nobody reads would park it for good and
+/// every later signal would go unforwarded. The write is the `Reporter`'s.
 fn report(sig: i32, outcome: Decision) {
-    write_best_effort(format!(
+    reporter().send(format!(
         "xmustard run: {} {}\n",
         name_of(sig),
         outcome.phrase()
     ));
 }
 
-/// The channel the watcher enqueues reports on, plus the acknowledgement the drain waits for.
-///
-/// The receiver is behind a `Mutex` because `mpsc::Receiver` is not `Sync` and a `static` must
-/// be. The lock is only ever held for the length of one `recv_timeout`, on the exit path, and
-/// `write_best_effort` never touches it.
-static REPORTS: OnceLock<(mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>)> = OnceLock::new();
+/// The wrapper's reporter, writing to its own stderr as it is. No `dup` and no `O_NONBLOCK`: a
+/// `dup` shares the open file description, so a flag set on the copy would change the wrapper's
+/// stderr and the child's inherited one too. A thread that may block needs neither.
+static REPORTER: OnceLock<Reporter> = OnceLock::new();
 
-/// One line for the reporter to write, and — when `ack` is set — the signal that it did.
+fn reporter() -> &'static Reporter {
+    REPORTER.get_or_init(|| Reporter::new(io::stderr(), REPORT_QUEUE))
+}
+
+/// Waits, up to `REPORT_DRAIN`, for the wrapper's reporter to write what is already queued.
+/// Nothing to wait for when no signal was ever reported.
+fn drain_reports() {
+    if let Some(reporter) = REPORTER.get() {
+        reporter.drain(REPORT_DRAIN);
+    }
+}
+
+/// A thread that owns the diagnostic writes, so the signal watcher only ever enqueues.
+///
+/// The queue is bounded, so a watcher cannot grow memory against a sink nobody drains, and a full
+/// queue drops the line rather than waiting: a lost diagnostic costs an operator one line, while a
+/// blocked watcher costs a child its next signal. Every dropped line is counted, and `drain`
+/// states the count, so a loss is visible rather than silent.
+struct Reporter {
+    lines: mpsc::SyncSender<Report>,
+    /// Behind a `Mutex` only because a `static` must be `Sync` and `mpsc::Receiver` is not.
+    acks: Mutex<mpsc::Receiver<()>>,
+    dropped: AtomicU64,
+}
+
+/// One line for the reporter to write and, when `ack` is set, the signal that it has.
 struct Report {
     line: String,
     ack: bool,
 }
 
-/// Hands `line` to the reporter thread, never blocking the watcher.
-///
-/// `try_send` on a bounded channel is what keeps the watcher free: a full queue drops the line
-/// rather than waiting, and a dropped diagnostic costs an operator one line while a blocked
-/// watcher costs a child its next signal. The reporter may sit in a blocking write for as long
-/// as the wrapper lives, which is the point — it is a thread nobody is waiting on.
-fn write_best_effort(line: String) {
-    let (sender, _) = REPORTS.get_or_init(spawn_reporter);
-    if sender.try_send(Report { line, ack: false }).is_err() {
-        // Never silent: a line lost to a full queue means the operator is missing a decision,
-        // and the count is what makes that visible rather than merely possible (codex-spec,
-        // round 5).
-        //
-        // The notice goes to the same reporter, never to `eprintln!` from here. This function
-        // runs on the watcher thread, and a queue that is full means the reporter is behind — so
-        // writing the notice synchronously reintroduces the very defect the reporter exists to
-        // remove: if stderr itself is what is stuck, this `eprintln!` parks the watcher and every
-        // later signal goes unforwarded (OCR, round 5).
-        //
-        // If even the notice cannot be queued it is counted and nothing is written, which is the
-        // honest end of it: the count stays in `DROPPED_REPORTS` and `dropped_reports` reports it
-        // to a caller that is not the watcher.
-        //
-        // `REPORTED_DROPS` advances only when the notice was QUEUED. It used to `swap` first,
-        // which marked the loss as announced before anyone knew the line had been accepted, so a
-        // rejected notice was never retried and a single lost burst could go unannounced forever
-        // (codex-spec and OCR, round 7). Compare first, store on success.
-        let lost = DROPPED_REPORTS.fetch_add(1, Ordering::SeqCst) + 1;
-        if REPORTED_DROPS.load(Ordering::SeqCst) != lost {
-            let notice = format!(
-                "xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n"
-            );
-            if sender
-                .try_send(Report {
-                    line: notice,
-                    ack: false,
-                })
-                .is_ok()
-            {
-                REPORTED_DROPS.store(lost, Ordering::SeqCst);
+impl Reporter {
+    /// Starts the writer thread over `sink`, with room for `depth` lines while it is behind.
+    fn new(mut sink: impl Write + Send + 'static, depth: usize) -> Reporter {
+        let (lines, queued) = mpsc::sync_channel::<Report>(depth);
+        let (ack_tx, acks) = mpsc::channel();
+        thread::spawn(move || {
+            for report in queued {
+                // A failed write is not retried: a sink that refused this line will refuse the
+                // retry, and nothing the wrapper decides waits on it.
+                let _ = sink.write_all(report.line.as_bytes());
+                if report.ack {
+                    let _ = ack_tx.send(());
+                }
             }
+        });
+        Reporter {
+            lines,
+            acks: Mutex::new(acks),
+            dropped: AtomicU64::new(0),
+        }
+    }
+
+    /// Queues `line` without ever blocking the caller; a full queue drops it and counts it.
+    fn send(&self, line: String) {
+        if self.lines.try_send(Report { line, ack: false }).is_err() {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Waits up to `limit` for the writer to reach everything queued so far, after stating how
+    /// many lines a full queue dropped.
+    ///
+    /// A spawned thread is detached, so a forwarded signal that promptly ends the child could end
+    /// the wrapper before the writer ever ran, and the decision would go missing exactly when it
+    /// matters most. The acknowledged line goes to the back of the queue, so its ack means every
+    /// line queued before it has been handed to the sink. Bounded, because the writer may itself
+    /// be parked on a sink nobody drains, and the wrapper's own outcome must not wait on that.
+    fn drain(&self, limit: Duration) {
+        let lost = self.dropped.swap(0, Ordering::SeqCst);
+        let line = if lost == 0 {
+            String::new()
+        } else {
+            format!("xmustard run: {lost} decision report(s) dropped: the stderr reader is slow\n")
+        };
+        if self.lines.try_send(Report { line, ack: true }).is_err() {
+            // Still full: the count is kept for a later drain rather than forgotten.
+            self.dropped.fetch_add(lost, Ordering::SeqCst);
+            return;
+        }
+        if let Ok(acks) = self.acks.lock() {
+            let _ = acks.recv_timeout(limit);
         }
     }
 }
 
-/// How many decision reports the queue has refused, and how many of those the operator has been
-/// told about. A caller that is not the watcher can read the first to report a loss the queue
-/// could not carry.
-static DROPPED_REPORTS: AtomicU64 = AtomicU64::new(0);
-static REPORTED_DROPS: AtomicU64 = AtomicU64::new(0);
-
-/// How many decision reports have been dropped for want of queue space.
-pub fn dropped_reports() -> u64 {
-    DROPPED_REPORTS.load(Ordering::Relaxed)
-}
-
-/// Starts the reporter thread and returns the two ends the watcher needs.
-fn spawn_reporter() -> (mpsc::SyncSender<Report>, Mutex<mpsc::Receiver<()>>) {
-    let (tx, rx) = mpsc::sync_channel::<Report>(REPORT_QUEUE);
-    let (ack_tx, ack_rx) = mpsc::channel::<()>();
-    thread::spawn(move || {
-        for report in rx {
-            // An ack means the line reached stderr. A failed write must not claim it did, or
-            // `drain_reports` returns as though a diagnostic were handled when it was not
-            // (OCR, round 7).
-            let written = io::stderr().write_all(report.line.as_bytes()).is_ok();
-            if report.ack && written {
-                // Sent only after the write above returned Ok, so a received ack means the line
-                // has already been handed to stderr.
-                let _ = ack_tx.send(());
-            }
-        }
-    });
-    (tx, Mutex::new(ack_rx))
-}
-
-/// Waits for the reporter to write what is already queued, up to `REPORT_DRAIN`.
-///
-/// A spawned thread is detached, so a forwarded signal that promptly ends the child could end
-/// the wrapper before the reporter ever ran, and the decision this row promises to state would
-/// go missing exactly when it matters most (codex-spec, round 4). An empty line with `ack` set
-/// goes to the back of the queue, so receiving the ack means everything queued before it has
-/// been written.
-///
-/// Bounded, because the reporter may itself be parked in a write to a stderr nobody drains and
-/// the wrapper's own outcome must not wait on that: this narrows the gap to "stderr itself is
-/// stuck", which is what the report is for.
-fn drain_reports() {
-    let Some((sender, ack)) = REPORTS.get() else {
-        return;
-    };
-    if sender
-        .try_send(Report {
-            line: String::new(),
-            ack: true,
-        })
-        .is_err()
-    {
-        return;
-    }
-    // A poisoned lock would mean an earlier drain panicked, which this path cannot do; taking
-    // the inner value is cheaper than a second failure mode at the wrapper's exit.
-    if let Ok(received) = ack.lock() {
-        let _ = received.recv_timeout(REPORT_DRAIN);
-    }
-}
-
-/// How many reports may be waiting before the queue drops the newest. Bounded so a watcher
-/// cannot grow memory against a stderr nobody drains; deep enough that a burst of signals all
-/// get their line.
+/// How many reports may be waiting before the queue drops the newest. Deep enough that a burst of
+/// signals all get their line.
 const REPORT_QUEUE: usize = 32;
 
 /// How long the wrapper waits for queued reports on its way out. Long enough for a write to a
 /// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
 const REPORT_DRAIN: Duration = Duration::from_millis(50);
+
+/// Signals the child and says whether it got the signal.
+///
+/// Only the child, never its group: signalling the PROCESS GROUP would need the child to lead its
+/// own group (`CommandExt::process_group(0)`), which changes where an interactive child sits
+/// relative to the terminal. That is WS-21B's isolation policy, an owner decision (G§5.11).
+///
+/// ESRCH is the normal race at exit: the child is already gone and was not signalled. Any other
+/// error means the child will NOT be signalled (EPERM after it changed its credentials is the case
+/// that matters), and its reason goes through the reporter like every other line this thread
+/// writes, never `eprintln!`: a synchronous write to a full stderr would park the sole watcher.
+fn deliver(child: rustix::process::Pid, sig: rustix::process::Signal) -> Decision {
+    match kill_retrying_interrupt(child, sig) {
+        Ok(()) => Decision::Forwarded,
+        Err(rustix::io::Errno::SRCH) => Decision::Undeliverable,
+        Err(e) => {
+            reporter().send(format!(
+                "xmustard run: could not signal the child ({}): {e}\n",
+                name_of(sig.as_raw())
+            ));
+            Decision::Undeliverable
+        }
+    }
+}
 
 /// `kill(2)` to the child, retrying a signal that arrived before the syscall ran.
 ///
@@ -608,49 +586,16 @@ impl Forwarder {
                 // terminal or the kernel generated is skipped only where a group delivery
                 // would already have reached the child, and a hangup or a timer is never
                 // skipped because neither reaches the group.
-                let shares_group = same_process_group(child);
-                let relayed = relay(raw, origin.process.map(|p| p.pid), shares_group);
-                if relayed {
-                    // ESRCH: the child is already gone, which is the normal race at exit.
-                    // Signalling the PROCESS GROUP instead would need the child to lead its
-                    // own group (`CommandExt::process_group(0)`), which changes where an
-                    // interactive child sits relative to the terminal: that is WS-21B's
-                    // isolation policy, an owner decision (G§5.11), not this row's to take.
-                    //
-                    // BEFORE the report, always. The delivery is the contract and the line is a
-                    // diagnostic, so a stderr whose reader has stopped may cost the diagnostic
-                    // but never the signal: reporting first would let a full pipe swallow a
-                    // client's timeout and orphan the child (WS-FIX-20c-r1-1).
-                    //
-                    // ESRCH is the normal race at exit and is not a delivery. EINTR is the
-                    // syscall being interrupted before it ran — the child is untouched and the
-                    // signal has not been delivered — so it is retried rather than reported as
-                    // a failure, because reporting it as one would tell an operator the child
-                    // kept running when it simply has not been signalled yet (OCR, round 5).
-                    // Anything else means the child will NOT be signalled, EPERM after it
-                    // set its credentials being the case that matters, and reporting that as
-                    // forwarded would tell an operator the opposite (codex-spec, round 5).
-                    let outcome = match kill_retrying_interrupt(child, sig) {
-                        Ok(()) => Decision::Forwarded,
-                        Err(rustix::io::Errno::SRCH) => Decision::Undeliverable,
-                        Err(e) => {
-                            // Through the reporter, never `eprintln!` here: this is the sole
-                            // signal watcher and a synchronous write on a full stderr parks it,
-                            // so every LATER signal goes unforwarded. That is the defect the
-                            // reporter thread exists to prevent, reintroduced by the round-5
-                            // error path (codex-spec, round 7).
-                            write_best_effort(format!(
-                                "xmustard run: could not signal the child ({} {}): {e}\n",
-                                name_of(raw),
-                                if shares_group { "grouped" } else { "single" },
-                            ));
-                            Decision::Undeliverable
-                        }
-                    };
-                    report(raw, if relayed { outcome } else { Decision::Declined });
+                let sender = origin.process.map(|p| p.pid);
+                let outcome = if relay(raw, sender, same_process_group(child)) {
+                    deliver(child, sig)
                 } else {
-                    report(raw, Decision::Declined);
-                }
+                    Decision::Declined
+                };
+                // AFTER the delivery, always: the delivery is the contract and the line is a
+                // diagnostic, so a stderr whose reader has stopped may cost the line but never
+                // the signal (WS-FIX-20c-r1-1).
+                report(raw, outcome);
             }
         });
         Some((handle, watcher))
@@ -1015,6 +960,101 @@ mod tests {
         forwarder.stop();
         let status = status.expect("the held TERM never reached the child");
         assert_eq!(status.signal(), Some(signal_hook::consts::signal::SIGTERM));
+    }
+
+    /// A sink whose first write waits until `release` is sent or dropped, so a test can hold the
+    /// reporter's writer in one write while it fills the queue behind it. `entered` fires when
+    /// that first write starts; everything written lands in `out`.
+    struct GatedSink {
+        entered: Option<mpsc::Sender<()>>,
+        gate: mpsc::Receiver<()>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                let _ = self.gate.recv();
+            }
+            self.out.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The sink, the `entered` receiver, the `release` sender and the shared output.
+    fn gated_sink() -> (
+        GatedSink,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = GatedSink {
+            entered: Some(entered_tx),
+            gate,
+            out: Arc::clone(&out),
+        };
+        (sink, entered, release, out)
+    }
+
+    /// The watcher's side of the reporter never waits on the sink: with the writer held in a
+    /// write and the queue full, further lines are dropped at once, counted, and the count is
+    /// stated by the drain. The sends run on their own thread and are awaited with a deadline, so
+    /// a send that blocks fails the test instead of hanging it (goal §1.7 rule 11).
+    #[test]
+    fn a_full_report_queue_drops_lines_without_blocking_and_the_drain_counts_them() {
+        let (sink, entered, release, out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 2));
+        reporter.send("first\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the first line");
+        let (done, sent) = mpsc::channel();
+        let sender = Arc::clone(&reporter);
+        thread::spawn(move || {
+            for k in 0..5 {
+                sender.send(format!("line {k}\n"));
+            }
+            let _ = done.send(());
+        });
+        sent.recv_timeout(Duration::from_secs(10))
+            .expect("a send blocked behind a stuck writer");
+        release.send(()).unwrap();
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text,
+            "first\nline 0\nline 1\n\
+             xmustard run: 3 decision report(s) dropped: the stderr reader is slow\n"
+        );
+    }
+
+    /// The drain is bounded: a writer stuck on a sink nobody reads cannot hold the wrapper's exit.
+    /// Awaited with a deadline on another thread, so an unbounded drain fails instead of hanging.
+    #[test]
+    fn a_drain_returns_while_the_writer_is_stuck() {
+        let (sink, entered, release, _out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 2));
+        reporter.send("stuck\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the first line");
+        let (done, drained) = mpsc::channel();
+        let draining = Arc::clone(&reporter);
+        thread::spawn(move || {
+            draining.drain(Duration::from_millis(100));
+            let _ = done.send(());
+        });
+        let waited = drained.recv_timeout(Duration::from_secs(10));
+        drop(release);
+        waited.expect("the drain waited on a stuck writer past its limit");
     }
 
     #[test]
