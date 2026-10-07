@@ -749,4 +749,37 @@ mod tests {
         c.advance(body, 0);
         assert_eq!(c.at(2), Some((1, 3)), "e-acute is two bytes");
     }
+
+    // The time cap is the scan's own wall clock, and this row's remaining uncovered
+    // requirement (tests required (6)): a scan that would exceed it stops and names the
+    // cut. `scan` takes its `started` as a parameter, so the test hands it one two seconds
+    // in the past and drives read boundaries with a 1-byte slice; the cap fires on the
+    // first slice's check, which no machine races.
+    #[test]
+    fn the_time_cap_stops_a_scan_in_flight_and_names_its_cut() {
+        let td = tempfile::tempdir().unwrap();
+        let root = td.path();
+        // Two chunks long, so with a 1-byte slice the file has scans left to do when the
+        // cap fires; the scanner never sees its own end of file.
+        let body = vec![b'x'; CHUNK_BYTES * 2 + 1];
+        std::fs::write(root.join("a.txt"), &body).unwrap();
+        let mut fs = FileScan::open_with_slice(root, "a.txt", Some(1)).unwrap();
+        let started = std::time::Instant::now() - std::time::Duration::from_secs(2);
+        let limits = Limits {
+            max_lines: 200,
+            max_bytes: u64::MAX,
+            timeout_ms: 1,
+        };
+        let mut budget = limits.max_bytes;
+        let mut report = Report::default();
+        let re = compile("needle", Matcher::Exact).unwrap();
+        let more = fs.scan(&re, &limits, &mut budget, &mut report, started);
+        assert!(!more, "the time cap stops the scan before its corpus ends");
+        assert_eq!(report.cut, Some(Cut::Time), "{:?}", report);
+        assert_eq!(
+            report.bytes_scanned, 1,
+            "one slice, then the cap: {:?}",
+            report
+        );
+    }
 }
