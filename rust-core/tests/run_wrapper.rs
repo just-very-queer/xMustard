@@ -80,12 +80,12 @@ fn every_test_that_holds_a_descriptor_takes_the_terminal_lock() {
         "these tests hold a descriptor for an observation window but do not take the \
          terminal lock, so they run beside `ulimit -n 4`: {offenders:?}"
     );
-    // 1 pty test (which also holds a report job), the process-sent signal test, and the two
-    // report tests: 4 at this head, measured by this scan rather than assumed. A floor below the
+    // 2 pty tests (the keystroke and the hangup), the process-sent signal test, and the two
+    // report tests: 5 at this head, measured by this scan rather than assumed. A floor below the
     // true count would let a rename hide a contender, which is how `pty_session` - a name no test
     // calls - hid the pty tests while this check still counted itself (codex-spec, round 7).
     assert!(
-        checked >= 4,
+        checked >= 5,
         "only {checked} descriptor-holding tests were found"
     );
 }
@@ -886,6 +886,45 @@ fn one_terminal_keystroke_reaches_the_child_once() {
     }
 }
 
+/// A terminal disconnect hangs up the session leader ALONE, which is the wrapper here, so the
+/// child in the wrapper's group gets SIGHUP only if the wrapper relays it (goal §3.5i). The
+/// counter child has no SIGHUP handler and dies of one, so a relayed hangup ends the child and
+/// then the wrapper, the same way. A wrapper that declined the kernel's hangup would sit in
+/// `drain` behind a live child until that child's own 60 s deadline; the bounded wait below
+/// fails first, and `Job` stops the child and kills the wrapper on the way out.
+///
+/// The disconnect is real: `terminal_job` opens the master close-on-exec, so dropping the test's
+/// copy closes the last one and the kernel hangs the terminal up. The kernel's SIGHUP names no
+/// sender, so this is the case a sender test cannot reach. Linux only, like the keystroke test,
+/// because that is where the delivery was measured.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_hangup_reaches_the_child_and_ends_the_wrapper() {
+    let _g = serial_terminal();
+    let dir = tempfile::tempdir().unwrap();
+    let (wrapper, master) = terminal_job(dir.path());
+    let mut job = Job {
+        wrapper,
+        dir: dir.path().to_path_buf(),
+        _stderr_read: None,
+    };
+    await_child(&dir.path().join("ready"), dir.path());
+    drop(master);
+    let status = wait_within(&mut job.wrapper, 20).expect(
+        "the wrapper sat in drain after the terminal hung up, so the child never got SIGHUP",
+    );
+    assert_eq!(
+        decision(dir.path()),
+        "SIGHUP forwarded to the child",
+        "the wrapper's report of the hangup"
+    );
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGHUP),
+        "the wrapper must end the way the child did: {status:?}"
+    );
+}
+
 /// How many deliveries the pty child has acknowledged, from its `ack` file. One line per
 /// handled signal, `fsync`ed by the child, so a line means the child has run its handler.
 fn ack_count(dir: &std::path::Path) -> usize {
@@ -989,6 +1028,11 @@ fn terminal_job(dir: &std::path::Path) -> (std::process::Child, std::fs::File) {
             .unwrap();
     rustix::pty::grantpt(&master).unwrap();
     rustix::pty::unlockpt(&master).unwrap();
+    // Close-on-exec, so the test holds the only copy of the master: a wrapper or child that
+    // inherited one would keep the terminal alive after the test drops its own, and dropping it
+    // is how the hangup test disconnects the terminal. Set after the open because `posix_openpt`
+    // takes no `O_CLOEXEC` outside Linux.
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC).unwrap();
     let master = std::fs::File::from(master);
     let slave = {
         let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
