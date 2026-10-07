@@ -8,6 +8,7 @@ pub mod changetrack;
 pub mod diagnostics;
 pub mod dispatch;
 pub mod gitdiff;
+pub mod gitindex;
 pub mod goalruntime;
 pub mod hashcache;
 pub mod index;
