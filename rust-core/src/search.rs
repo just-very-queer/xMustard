@@ -786,7 +786,9 @@ fn scan(
             };
         let more = scan_file.scan(&matcher, &limits, &mut budget, &mut report, started);
         report.files_scanned += 1;
-        crate::passcount::note(crate::passcount::Pass::BytesHashed, scan_file.read);
+        // No pass counter is noted for the scan's own reads: `bytes_hashed` counts bytes
+        // fed through a digest, and the scan never makes one (its own `bytes_scanned`
+        // is the count it reports); the stats it does make are noted by the open.
         if !more {
             break;
         }
@@ -2583,6 +2585,47 @@ mod scan_tests {
         let one = scan_repo(&repo, "needle", SearchMode::Exact);
         let two = scan_repo(&repo, "needle", SearchMode::Exact);
         assert_eq!(one.spans, two.spans, "the same corpus, the same spans");
+    }
+
+    // The row's pass-counter evidence (WS-59c acceptance): within one `passcount::Call`,
+    // the scan stats the files it opens and hashes nothing. `bytes_hashed` counts bytes
+    // fed through a digest; a scan that read bytes and called them hashed would hand the
+    // budget story a number the scan never earns.
+    #[test]
+    fn its_pass_counters_show_it_stats_its_opens_and_hashes_nothing() {
+        let repo = git_repo(&[
+            ("a.go", "needle\n"),
+            ("b.go", "needle\n"),
+            ("c.txt", "needle\n"),
+        ]);
+        let call = crate::passcount::Call::begin();
+        let r = scan_repo(&repo, "needle", SearchMode::Exact);
+        let counts = call.counts();
+        drop(call);
+        assert_eq!(r.spans.len(), 3, "{:?}", r.spans);
+        assert_eq!(
+            counts.get(crate::passcount::Pass::FilesStatted),
+            3,
+            "one stat per opened file: {:?}",
+            counts
+        );
+        assert_eq!(
+            counts.get(crate::passcount::Pass::FilesHashed),
+            0,
+            "the scan hashes nothing: {:?}",
+            counts
+        );
+        assert_eq!(
+            counts.get(crate::passcount::Pass::BytesHashed),
+            0,
+            "the scan does not hold the hashing counters: {:?}",
+            counts
+        );
+        assert_eq!(
+            r.bytes_scanned,
+            Some(21),
+            "three 7-byte files, each read once"
+        );
     }
 
     // A match that straddles a read boundary is still found once, not twice and not
