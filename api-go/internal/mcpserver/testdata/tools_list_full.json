@@ -779,7 +779,7 @@
             "type": "boolean"
           },
           "limit": {
-            "description": "items per depth tier (default 50)",
+            "description": "items per depth tier (default 50), or per page with op=",
             "maximum": 500,
             "minimum": 1,
             "type": "integer"
@@ -807,6 +807,15 @@
             "maximum": 50000,
             "minimum": 0,
             "type": "integer"
+          },
+          "op": {
+            "description": "symbol-level occurrences instead of the depth tiers: refs (every use), definition (what declares it), implementations (types implementing it)",
+            "enum": [
+              "refs",
+              "definition",
+              "implementations"
+            ],
+            "type": "string"
           },
           "path": {
             "description": "a repo-relative file",

@@ -28,6 +28,10 @@ var (
 	searchCursors = cursorCodec{kind: "s2", fields: 1, maxLen: maxSearchCursorLen}
 	// recall cursors carry the offset and the stale-penalty block size.
 	recallCursors = cursorCodec{kind: "r2", fields: 2, maxLen: 128}
+	// occurrence cursors (WS-59d) carry the row offset the occurrence list continues
+	// from; they are bound to the symbol and the operation, so one symbol's cursor never
+	// continues another's.
+	occurrenceCursors = cursorCodec{kind: "o1", fields: 1, maxLen: maxSearchCursorLen}
 	// impactCursors carry the tier offset an impact page continues from.
 	impactCursors = cursorCodec{kind: "i2", fields: 1, maxLen: maxSearchCursorLen}
 )
