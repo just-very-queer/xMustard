@@ -11,8 +11,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::Path;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
@@ -2036,12 +2036,18 @@ fn retained_branching_walks_stay_under_the_process_tree_line() {
     let answer: Value = serde_json::from_slice(&fs::read(output.path()).unwrap()).unwrap();
     assert_eq!(answer["caps"]["max_retained_steps"], MAX_RETAINED_STEPS);
     assert!(
-        answer["truncation"]["dropped_retained"].as_u64().unwrap_or(0) > 0,
+        answer["truncation"]["dropped_retained"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
         "the branching fixture must exceed the retained-step cap: {answer:#}"
     );
     let mib = memprobe::mib(peak);
     eprintln!("retained branching walks: wait4 ru_maxrss {mib:.1} MiB");
-    assert!(mib <= 95.4, "process-tree RSS {mib:.1} MiB exceeds 95.4 MiB");
+    assert!(
+        mib <= 95.4,
+        "process-tree RSS {mib:.1} MiB exceeds 95.4 MiB"
+    );
 }
 
 /// The retained step set is bounded by ONE global cap, not by seeds x per-walk.

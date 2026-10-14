@@ -542,7 +542,10 @@ fn a_same_language_name_match_is_never_reported_as_a_resolved_or_exact_list() {
         "a list of name matches is not complete: {v:#}"
     );
     assert!(
-        v["epistemic"]["causes"]["name_match_occurrences"].as_u64().unwrap_or(0) > 0,
+        v["epistemic"]["causes"]["name_match_occurrences"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
         "the lower bound does not name its cause: {v:#}"
     );
 }
@@ -760,7 +763,11 @@ fn many_uses_in_one_file_page_without_repeating_or_skipping() {
     let src = format!(
         "package store\n\nfunc NewStore() {{}}\n\nfunc Uses() int {{\n\treturn {body}\n}}\n"
     );
-    let r = repo(&[("go.mod", GO_MOD), ("pkg/store/store.go", GO_STORE), ("pkg/store/uses.go", &src)]);
+    let r = repo(&[
+        ("go.mod", GO_MOD),
+        ("pkg/store/store.go", GO_STORE),
+        ("pkg/store/uses.go", &src),
+    ]);
     build(r.path());
 
     let all = rows(&occ(r.path(), "refs", "NewStore", &[format!("--limit=50")]));
@@ -807,7 +814,9 @@ fn a_page_of_rows_in_distinct_files_does_not_hold_every_file() {
     let mut bodies: Vec<String> = vec![GO_MOD.to_string()];
     for i in 0..24 {
         paths.push(format!("pkg/p{i}/f.go"));
-        bodies.push(format!("package p{i}\n\nfunc Use() {{\n\ts := NewStore()\n\t_ = s\n}}\n"));
+        bodies.push(format!(
+            "package p{i}\n\nfunc Use() {{\n\ts := NewStore()\n\t_ = s\n}}\n"
+        ));
     }
     let files: Vec<(&str, &str)> = paths
         .iter()
@@ -819,7 +828,10 @@ fn a_page_of_rows_in_distinct_files_does_not_hold_every_file() {
 
     let v = occ(r.path(), "refs", "NewStore", &[format!("--limit=24")]);
     let got = rows(&v);
-    assert!(got.len() >= 20, "the fixture spread its rows too thin: {v:#}");
+    assert!(
+        got.len() >= 20,
+        "the fixture spread its rows too thin: {v:#}"
+    );
     // every row kept its snippet, which is only possible if the file was read before it
     // was dropped: the drop is per file's last row, never before the row is converted
     for o in &got {
@@ -836,9 +848,9 @@ fn a_page_of_rows_in_distinct_files_does_not_hold_every_file() {
     );
     // the page spans many files, so holding every text would hold every one of them at
     // once: the peak must stay near one file, not near the page
-    let peak = v["peak_files_held"].as_u64().unwrap_or_else(|| {
-        panic!("the answer does not report its peak file count: {v:#}")
-    });
+    let peak = v["peak_files_held"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("the answer does not report its peak file count: {v:#}"));
     assert!(
         peak <= 2,
         "a page of {} files held {peak} of them at once",
@@ -910,7 +922,9 @@ fn a_middle_page_reports_a_lower_bound_total_and_is_not_truncated() {
     );
     // the last page still reports the whole list, because by then every row has been seen
     let last = occ(r.path(), "refs", "Store", &["--offset=1".to_string()]);
-    let total = last["total"].as_u64().expect("the last page reports no total");
+    let total = last["total"]
+        .as_u64()
+        .expect("the last page reports no total");
     assert_eq!(
         total as usize,
         rows(&last).len() + 1,
@@ -918,7 +932,9 @@ fn a_middle_page_reports_a_lower_bound_total_and_is_not_truncated() {
     );
     // and the envelope names the paged read on the page that has more rows after it
     assert_eq!(
-        first["epistemic"]["causes"].get("page_bound").and_then(|c| c.as_u64()),
+        first["epistemic"]["causes"]
+            .get("page_bound")
+            .and_then(|c| c.as_u64()),
         Some(1),
         "a page with rows after it does not say it is one page of a longer list: {first:#}"
     );
@@ -940,7 +956,10 @@ fn each_row_carries_the_containing_symbols_own_start_line() {
     build(r.path());
     let v = occ(r.path(), "refs", "Store", &[]);
     let hits = rows(&v);
-    assert!(!hits.is_empty(), "no rows to read a symbol_line from: {v:#}");
+    assert!(
+        !hits.is_empty(),
+        "no rows to read a symbol_line from: {v:#}"
+    );
     let mut saw_a_line_differing_from_the_reference = false;
     for h in &hits {
         if h["kind"].as_str() == Some("File") {

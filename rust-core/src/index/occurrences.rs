@@ -451,11 +451,13 @@ pub fn read(
     // cause of its own: without it a list holding only namesakes would report
     // completeness exact (adjudication-WS-59d-r4-3).
     let (resolved, lexical, name_match) =
-        occurrences.iter().fold((0, 0, 0), |(r, l, m), o| match o.provenance {
-            "name_match" => (r, l, m + 1),
-            "resolved" => (r + 1, l, m),
-            _ => (r, l + 1, m),
-        });
+        occurrences
+            .iter()
+            .fold((0, 0, 0), |(r, l, m), o| match o.provenance {
+                "name_match" => (r, l, m + 1),
+                "resolved" => (r + 1, l, m),
+                _ => (r, l + 1, m),
+            });
     let mut causes: BTreeMap<String, u64> = BTreeMap::new();
     if lexical > 0 {
         causes.insert("lexical_occurrences".to_string(), lexical as u64);
