@@ -1602,7 +1602,10 @@ fn build_graph(
     let status_known = !id.limitations.iter().any(|l| {
         matches!(
             l.reason.as_str(),
-            "git_status_failed" | "git_index_flags_failed"
+            "git_status_failed"
+                | "git_index_flags_failed"
+                | "git_index_unsupported"
+                | "git_index_failed"
         )
     });
     let parser = crate::indexcache::parser_version();

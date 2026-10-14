@@ -498,7 +498,7 @@ impl SourceIdentity {
     }
 
     /// Why this identity does not determine the graph's input, or None when it does:
-    /// Git mode, status and the hidden-entry listing succeeded, and every *tracked*
+    /// Git mode, status and the hidden-entry listing (or the index reader) succeeded, and every *tracked*
     /// dirty file has a known identity (hashed, deleted, symlink, or excluded from the
     /// graph by size with its size/ctime in the key). Untracked files never feed the
     /// graph, so an untracked-only limitation leaves the graph cacheable while
@@ -507,7 +507,11 @@ impl SourceIdentity {
         if let Some(l) = self.limitations.iter().find(|l| {
             matches!(
                 l.reason.as_str(),
-                "git_status_failed" | "git_unavailable" | "git_index_flags_failed"
+                "git_status_failed"
+                    | "git_unavailable"
+                    | "git_index_flags_failed"
+                    | "git_index_unsupported"
+                    | "git_index_failed"
             )
         }) {
             return Some(format!("identity limitation {}: {}", l.reason, l.detail));
@@ -935,6 +939,79 @@ impl StatusWalk {
     }
 }
 
+/// What the identity is computed from: the streamed status listing, the hidden
+/// (assume-unchanged / skip-worktree) entries, and why the untracked part is
+/// incomplete, if it is.
+struct IdentityListing {
+    walk: StatusWalk,
+    hidden: Result<Vec<StatusEntry>, String>,
+    untracked_incomplete: Option<String>,
+}
+
+/// The identity's listing from the source `XMUSTARD_GIT_INDEX_READER` picks (WS-RT18):
+/// the in-process reader (`gitindex::status`), or `git status` and `git ls-files -v`.
+/// Under `auto` a reader refusal goes to Git only while an index-loading Git child is
+/// predicted within the Git line; otherwise it is the error, as (reason, detail).
+fn identity_listing(
+    root: &Path,
+    layout: &GitLayout,
+    list_ignored: bool,
+) -> Result<IdentityListing, (&'static str, String)> {
+    use crate::gitindex::{Setting, status};
+    let via_reader = || -> Result<IdentityListing, crate::gitindex::Refusal> {
+        let repo = status::Repo::open(root)?;
+        let mut walk = StatusWalk::new(list_ignored);
+        let opts = status::Options {
+            untracked: true,
+            list_ignored,
+        };
+        let out = status::status(&repo, opts, &mut |e| {
+            walk.entry(e);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        Ok(IdentityListing {
+            walk: walk.finish(),
+            hidden: Ok(out.hidden),
+            untracked_incomplete: out.untracked_incomplete,
+        })
+    };
+    let via_git = || -> Result<IdentityListing, (&'static str, String)> {
+        // explicit flags override config that would hide working state
+        // (`status.showUntrackedFiles`, `submodule.<name>.ignore`,
+        // `diff.ignoreSubmodules`, `status.renames`); the reader reports the same view.
+        let mut args = vec![
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+        ];
+        if list_ignored {
+            // `matching` lists a directory that matches an ignore pattern without
+            // descending into it, so the listing costs no extra traversal.
+            args.push("--ignored=matching");
+        }
+        let mut walk = StatusWalk::new(list_ignored);
+        crate::index::scan::stream_git_records(root, &args, |rec| walk.record(rec))
+            .map_err(|e| ("git_status_failed", e))?;
+        Ok(IdentityListing {
+            walk: walk.finish(),
+            hidden: hidden_index_entries(&layout.toplevel),
+            untracked_incomplete: None,
+        })
+    };
+    let setting = Setting::from_env();
+    if setting == Setting::Git {
+        return via_git();
+    }
+    match via_reader() {
+        Ok(listed) => Ok(listed),
+        Err(_) if crate::gitindex::falls_back(setting, &layout.git_dir) => via_git(),
+        Err(r) => Err((r.reason(), r.to_string())),
+    }
+}
+
 fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec<StatusEntry>) {
     let canonical = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
     let root_str = canonical.to_string_lossy().into_owned();
@@ -981,45 +1058,31 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
         .unwrap_or_default();
     push_field(&mut h, id.head.as_bytes());
 
-    // explicit flags override config that would hide working state
-    // (`status.showUntrackedFiles`, `submodule.<name>.ignore`, `diff.ignoreSubmodules`).
-    let status_args = [
-        "status",
-        "--porcelain=v1",
-        "-z",
-        "--untracked-files=all",
-        "--ignore-submodules=none",
-    ];
-    let mut args = status_args.to_vec();
-    if list_ignored {
-        // `matching` lists a directory that matches an ignore pattern without
-        // descending into it, so the listing costs no extra traversal.
-        args.push("--ignored=matching");
-    }
-    // streamed record by record: no Git output is held whole, so no listing size fails
-    // the identity; only the kept entries stay
-    let mut walk = StatusWalk::new(list_ignored);
-    let streamed = crate::index::scan::stream_git_records(root, &args, |rec| walk.record(rec));
-    if let Err(e) = streamed {
-        id.identity_complete = false;
-        id.limitations.push(IdentityLimitation {
-            path: None,
-            reason: "git_status_failed".into(),
-            detail: format!("{e}; dirty content is not identified"),
-        });
-        h.update(b"status-failed");
-        id.key = format!("{:x}", h.finalize());
-        id.layout = Some(layout);
-        return (id, Vec::new());
-    }
-    let walk = walk.finish();
+    // streamed record by record: no listing is held whole, so no listing size fails the
+    // identity; only the kept entries stay
+    let listed = match identity_listing(root, &layout, list_ignored) {
+        Ok(listed) => listed,
+        Err((reason, detail)) => {
+            id.identity_complete = false;
+            id.limitations.push(IdentityLimitation {
+                path: None,
+                reason: reason.into(),
+                detail: format!("{detail}; dirty content is not identified"),
+            });
+            h.update(b"status-failed");
+            id.key = format!("{:x}", h.finalize());
+            id.layout = Some(layout);
+            return (id, Vec::new());
+        }
+    };
+    let walk = listed.walk;
     if list_ignored {
         id.ignored_dirs = walk.ignored_dirs();
     }
     let (mut entries, beyond) = (walk.entries, (walk.beyond, walk.beyond_paths));
     // `git status` hides worktree edits to assume-unchanged / skip-worktree entries;
     // identify their bytes directly so no known working-state content is omitted.
-    match hidden_index_entries(&layout.toplevel) {
+    match listed.hidden {
         Ok(hidden) => {
             let listed: std::collections::HashSet<Vec<u8>> =
                 entries.iter().map(|e| e.path.clone()).collect();
@@ -1030,6 +1093,13 @@ fn source_identity_with(root: &Path, list_ignored: bool) -> (SourceIdentity, Vec
             reason: "git_index_flags_failed".into(),
             detail: format!("{e}; assume-unchanged/skip-worktree entries may hide worktree edits"),
         }),
+    }
+    if let Some(why) = listed.untracked_incomplete {
+        id.limitations.push(IdentityLimitation {
+            path: None,
+            reason: "untracked_walk_incomplete".into(),
+            detail: format!("{why}; untracked paths past it are not identified"),
+        });
     }
     // tracked changes claim the byte budget before untracked files.
     entries.sort_by(|a, b| {

@@ -477,7 +477,7 @@ struct Rule {
 }
 
 /// One ignore-file line.
-enum Line<'a> {
+pub(crate) enum Line<'a> {
     /// Blank, a comment, or an empty pattern.
     NotARule,
     TooLong,
@@ -489,7 +489,7 @@ enum Line<'a> {
     },
 }
 
-fn parse_line(line: &str) -> Line<'_> {
+pub(crate) fn parse_line(line: &str) -> Line<'_> {
     if !is_rule_line(line) {
         return Line::NotARule;
     }
