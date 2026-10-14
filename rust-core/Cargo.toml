@@ -15,7 +15,10 @@ rustix = { version = "1", features = ["fs", "pipe", "process", "stdio"] }
 # signal handling under this crate's #![forbid(unsafe_code)]: the crate forbids sigaction
 # for the same reason. signal-hook's self-pipe handler needs no unsafe; its registry does
 # NOT restore the old disposition on drop, so run_wrapper::end_like restores SIG_DFL itself.
-signal-hook = "0.3"
+# extended-siginfo (WS-FIX-20b) is what makes the iterator report a signal's SENDER, so the
+# wrapper can tell a terminal-generated SIGINT from one a process sent and relay only the
+# latter; it compiles signal-hook's small C shim (`cc`), and needs no unsafe in this crate.
+signal-hook = { version = "0.3", features = ["extended-siginfo"] }
 tree-sitter = "0.25"
 tree-sitter-go = "0.25"
 tree-sitter-javascript = "0.25"
@@ -65,6 +68,12 @@ tempfile = "3.23"
 # tests/index_build.rs reads a child's peak RSS with wait4(2) (test code only; the
 # library keeps #![forbid(unsafe_code)]).
 libc = "0.2"
+# tests/run_wrapper.rs gives the wrapper a real pty and its child a controlling terminal,
+# so the double Ctrl-C of WS-FIX-20b is produced by a line discipline rather than by
+# kill(2) (the same rustix the library already depends on; the feature is only enabled here).
+# `termios` was removed in round 4: the tests call `rustix::pty` and `rustix::process` and
+# nothing calls `rustix::termios` (codex-spec, round 4).
+rustix = { version = "1", features = ["pty"] }
 
 [features]
 default = ["lang-all"]

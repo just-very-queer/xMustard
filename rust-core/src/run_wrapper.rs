@@ -32,7 +32,9 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
@@ -172,15 +174,381 @@ fn io_failed(what: &'static str) -> impl Fn(io::Error) -> CmdError {
     move |e| CmdError::failed(format!("run: {what}: {e}"))
 }
 
-/// The signals the wrapper forwards to its child, as the signal numbers `signal-hook`
-/// delivers. Only these: a signal the wrapper was not asked to forward keeps the
-/// disposition it had, so the wrapper neither swallows it nor dies from one.
-const FORWARDED: &[i32] = &[
-    signal_hook::consts::signal::SIGHUP,
-    signal_hook::consts::signal::SIGINT,
-    signal_hook::consts::signal::SIGQUIT,
-    signal_hook::consts::signal::SIGTERM,
+/// How one forwarded signal reaches the child. One row per forwarded signal, so a signal
+/// is added by a row rather than by another branch in a decision.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Delivery {
+    /// Relayed whatever its origin and whatever the groups. The child cannot be shown to have
+    /// it already: the kernel delivers a terminal's hangup to the **session leader alone**, so
+    /// a child in that leader's group does not receive it from anywhere else (WS-FIX-20c,
+    /// which replaced WS-FIX-20b's group test here — a shared group is not evidence of a
+    /// delivery the kernel does not make). A duplicate costs the child a re-run of its
+    /// cleanup; a swallowed signal costs an orphan.
+    Always,
+    /// Relayed unless the child's own group has already delivered it. A terminal sends SIGINT
+    /// and SIGQUIT to **every** process in its foreground group, so the child has the
+    /// operator's keystroke and a relayed copy is the second one (WS-FIX-20-r4-1, WS-FIX-20b).
+    UnlessGroup,
+}
+
+/// The decision table. One row per forwarded signal, and `FORWARDED` is derived from it, so a
+/// signal cannot be forwarded without a delivery decision to make about it.
+///
+/// `SIGHUP` and `SIGTERM` are `Always` because neither has a keystroke: a terminal delivers
+/// SIGINT and SIGQUIT to its foreground group and nothing else, so for those two a shared group
+/// means the child already has the operator's copy (WS-FIX-20-r4-1, WS-FIX-20b). A terminal
+/// disconnect hangs up the session leader alone (WS-FIX-20c) and a POSIX timer reaches the
+/// wrapper alone with no sender at all, so a group says nothing about either and skipping there
+/// is what leaves a live child unstopped behind a wrapper stuck in `drain`.
+const DELIVERIES: &[(i32, Delivery)] = &[
+    (signal_hook::consts::signal::SIGHUP, Delivery::Always),
+    (signal_hook::consts::signal::SIGTERM, Delivery::Always),
+    (signal_hook::consts::signal::SIGINT, Delivery::UnlessGroup),
+    (signal_hook::consts::signal::SIGQUIT, Delivery::UnlessGroup),
 ];
+
+/// The signals the wrapper forwards to its child, as the signal numbers `signal-hook`
+/// delivers, derived from `DELIVERIES` so the two cannot drift. Only these: a signal the
+/// wrapper was not asked to forward keeps the disposition it had, so the wrapper neither
+/// swallows it nor dies from one.
+fn forwarded() -> Vec<i32> {
+    DELIVERIES.iter().map(|(s, _)| *s).collect()
+}
+
+/// How `sig` is delivered. A signal with no row is relayed: this table is consulted only for a
+/// signal `forwarded` returned, which is derived from it, so the arm exists for a caller naming
+/// a signal directly rather than to paper over a missing row.
+fn delivery_of(sig: i32) -> Delivery {
+    DELIVERIES
+        .iter()
+        .find(|(s, _)| *s == sig)
+        .map_or(Delivery::Always, |(_, d)| *d)
+}
+
+/// Whether a signal the wrapper caught should be relayed to the child.
+///
+/// `sender` is the process the signal names (`None` when it names none), and `shares_group`
+/// is whether the child is in the wrapper's own process group, which is what makes a
+/// terminal's group-wide delivery reach the child as well.
+///
+/// A signal a **process** sent is always relayed: `kill(2)` and `sigqueue(3)` fill the sender,
+/// and a client timeout or an operator's `kill <pid>` arrives this way with the wrapper as
+/// its only target (WS-41 deviation (2)). That holds for every signal, including the ones a
+/// group would have covered.
+///
+/// A signal the **terminal or the kernel** generated is relayed according to `DELIVERIES`:
+/// SIGINT and SIGQUIT are skipped only when the child shares the wrapper's group, because
+/// those two are what a terminal sends to its whole foreground group and nothing else; SIGHUP
+/// and SIGTERM are never skipped, because a terminal disconnect hangs up the session leader
+/// alone and a POSIX timer reaches the wrapper alone, so neither reaches the group and a
+/// skipped one orphans a live child (WS-FIX-20c, WS-FIX-20c-r1-4).
+///
+/// **Known limit, owner-decided (WS-FIX-20c-r5-4).** "Skipped only when the child shares the
+/// group" is not the same as "skipped only when a terminal sent it". A signal with no sender
+/// and a shared group is skipped, and a POSIX timer delivers SIGINT to the wrapper alone with
+/// no sender, so a timer-sent SIGINT or SIGQUIT with a grouped child is **not** forwarded. The
+/// ruling that fixes this is goal §3.5i, which keeps the WS-FIX-20b rule and rules out the
+/// `si_code` table that would be needed to tell a keystroke from a timer; the three options and
+/// their costs are in followups.md for the owner. Not fixed here, and the comment no longer
+/// claims a timer is never skipped.
+///
+/// The skip is never taken on the absence of a sender alone: an unfilled or zero-valued field
+/// is not evidence that the child already has the signal, and treating it as such is what
+/// would drop a timeout. A sender of 0 is a filled field naming pid 0, which no `kill(2)` can
+/// come from, and it is relayed for the same reason.
+pub fn relay(sig: i32, sender: Option<i32>, shares_group: bool) -> bool {
+    match delivery_of(sig) {
+        Delivery::Always => true,
+        Delivery::UnlessGroup => sender.is_some() || !shares_group,
+    }
+}
+
+/// The signal's name as an operator sees it, for the watcher's report.
+fn name_of(sig: i32) -> &'static str {
+    match sig {
+        signal_hook::consts::signal::SIGHUP => "SIGHUP",
+        signal_hook::consts::signal::SIGINT => "SIGINT",
+        signal_hook::consts::signal::SIGQUIT => "SIGQUIT",
+        signal_hook::consts::signal::SIGTERM => "SIGTERM",
+        _ => "a signal",
+    }
+}
+
+/// What the watcher decided about one signal, and whether the child actually got it.
+///
+/// Three outcomes, because a decision to relay is not a delivery and a deliberate decline is not
+/// a failed delivery: an operator deciding whether to re-signal the child needs all three apart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Decision {
+    /// The relay rule declined, by design: the child already has this signal.
+    Declined,
+    /// The rule relayed it and the child received it.
+    Forwarded,
+    /// The rule relayed it and the delivery failed. The reason is a separate line.
+    Undeliverable,
+}
+
+impl Decision {
+    fn phrase(self) -> &'static str {
+        match self {
+            Decision::Declined => "not forwarded (the child already has this signal)",
+            Decision::Forwarded => "forwarded to the child",
+            Decision::Undeliverable => "NOT forwarded (delivery failed)",
+        }
+    }
+}
+
+/// States what the watcher decided about one signal the wrapper handled, AFTER the decision has
+/// been acted on. The child cannot be told "I declined to relay that" and a quiet period says
+/// nothing, so the decision is stated rather than inferred: an operator reading a wrapper that did
+/// not stop its child can see why, and the pty regression waits for this line instead of for a
+/// period in which nothing happened (WS-FIX-20c). A signal that ended the wrapper keeps the
+/// wrapper's own disposition and needs no line.
+///
+/// It runs after the delivery (WS-FIX-20c-r1-1), and it only enqueues: there is exactly one
+/// watcher thread, so a write that blocked on a stderr nobody reads would park it for good and
+/// every later signal would go unforwarded. The write is the `Reporter`'s.
+fn report(sig: i32, outcome: Decision) {
+    reporter().send(format!(
+        "xmustard run: {} {}\n",
+        name_of(sig),
+        outcome.phrase()
+    ));
+}
+
+/// The wrapper's reporter, writing to its own stderr as it is. No `dup` and no `O_NONBLOCK`: a
+/// `dup` shares the open file description, so a flag set on the copy would change the wrapper's
+/// stderr and the child's inherited one too. A thread that may block needs neither.
+static REPORTER: OnceLock<Reporter> = OnceLock::new();
+
+fn reporter() -> &'static Reporter {
+    REPORTER.get_or_init(|| Reporter::new(io::stderr(), REPORT_QUEUE))
+}
+
+/// Waits, up to `REPORT_DRAIN`, for the wrapper's reporter to write what is already queued.
+/// Nothing to wait for when no signal was ever handled: the watcher creates the reporter before
+/// it signals the child, so a child that died of a forwarded signal implies one exists.
+fn drain_reports() {
+    if let Some(reporter) = REPORTER.get() {
+        reporter.drain(REPORT_DRAIN);
+    }
+}
+
+/// A thread that owns the diagnostic writes, so the signal watcher only ever enqueues.
+///
+/// The queue is bounded, so a watcher cannot grow memory against a sink nobody drains, and a full
+/// queue drops the line rather than waiting: a lost diagnostic costs an operator one line, while a
+/// blocked watcher costs a child its next signal. Every line that is not written, dropped by a full
+/// queue or refused by the sink, is counted, and `drain` states the count, so a loss is visible
+/// rather than silent.
+struct Reporter {
+    lines: mpsc::SyncSender<Report>,
+    /// Behind a `Mutex` only because a `static` must be `Sync` and `mpsc::Receiver` is not.
+    acks: Mutex<mpsc::Receiver<()>>,
+    /// Lines a full queue dropped or the sink refused, not yet stated. Shared with the writer.
+    lost: Arc<AtomicU64>,
+    /// Signals the watcher has started acting on and not yet reported (`Deciding`).
+    deciding: AtomicU64,
+}
+
+/// One line for the reporter to write and, when `ack` is set, the signal that it has.
+struct Report {
+    line: String,
+    ack: bool,
+}
+
+impl Report {
+    /// A line whose writing the writer acknowledges.
+    fn acked(line: String) -> Report {
+        Report { line, ack: true }
+    }
+}
+
+/// Held by the watcher from before it signals the child until its decision line is queued, so a
+/// drain on the exit path waits for a decision whose delivery may be what ended the child.
+struct Deciding<'a>(&'a Reporter);
+
+impl Drop for Deciding<'_> {
+    fn drop(&mut self) {
+        self.0.deciding.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl Reporter {
+    /// Starts the writer thread over `sink`, with room for `depth` lines while it is behind.
+    fn new(mut sink: impl Write + Send + 'static, depth: usize) -> Reporter {
+        let (lines, queued) = mpsc::sync_channel::<Report>(depth);
+        let (ack_tx, acks) = mpsc::channel();
+        let lost = Arc::new(AtomicU64::new(0));
+        let refused = Arc::clone(&lost);
+        thread::spawn(move || {
+            for report in queued {
+                // A failed write is counted, not retried: a sink that refused this line will
+                // refuse the retry, and nothing the wrapper decides waits on it.
+                if sink.write_all(report.line.as_bytes()).is_err() {
+                    refused.fetch_add(1, Ordering::SeqCst);
+                }
+                if report.ack {
+                    let _ = ack_tx.send(());
+                }
+            }
+        });
+        Reporter {
+            lines,
+            acks: Mutex::new(acks),
+            lost,
+            deciding: AtomicU64::new(0),
+        }
+    }
+
+    /// Queues `line` without ever blocking the caller; a full queue drops it and counts it.
+    fn send(&self, line: String) {
+        if self.lines.try_send(Report { line, ack: false }).is_err() {
+            self.lost.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Marks one signal as being acted on until the returned guard drops.
+    fn deciding(&self) -> Deciding<'_> {
+        self.deciding.fetch_add(1, Ordering::SeqCst);
+        Deciding(self)
+    }
+
+    /// Waits up to `limit` for every decision in progress to be queued and every queued line to
+    /// reach the sink, then states how many lines were lost.
+    ///
+    /// A spawned thread is detached, so a forwarded signal that promptly ends the child could end
+    /// the wrapper before the watcher queued its line or the writer ran, and the decision would
+    /// go missing exactly when it matters most. The loss is counted only after the writer has
+    /// caught up, so a write the sink refused is in the count, and the count is cleared only once
+    /// its notice is queued, so a drain that runs out of time leaves it for a later one. All of it
+    /// is bounded by `limit`: the writer may be parked on a sink nobody drains, and the wrapper's
+    /// own outcome must not wait on that.
+    fn drain(&self, limit: Duration) {
+        let deadline = std::time::Instant::now() + limit;
+        while self.deciding.load(Ordering::SeqCst) > 0 && std::time::Instant::now() < deadline {
+            thread::sleep(DRAIN_POLL);
+        }
+        if !self.flush(deadline) {
+            return;
+        }
+        let lost = self.lost.load(Ordering::SeqCst);
+        if lost == 0 {
+            return;
+        }
+        let notice = format!("xmustard run: {lost} decision report(s) not written to stderr\n");
+        if self.enqueue(Report::acked(notice), deadline) {
+            self.lost.fetch_sub(lost, Ordering::SeqCst);
+            self.await_ack(deadline);
+        }
+    }
+
+    /// Queues an acknowledged empty line and waits for its ack: once it arrives, every line queued
+    /// before it has been handed to the sink. `false` when the deadline passed first.
+    fn flush(&self, deadline: std::time::Instant) -> bool {
+        self.enqueue(Report::acked(String::new()), deadline) && self.await_ack(deadline)
+    }
+
+    /// Queues `report`, waiting for room until `deadline`: the queue is fullest exactly when lines
+    /// were lost, so giving up at the first full queue would lose the count with them.
+    fn enqueue(&self, mut report: Report, deadline: std::time::Instant) -> bool {
+        loop {
+            match self.lines.try_send(report) {
+                Ok(()) => return true,
+                Err(mpsc::TrySendError::Full(r)) if std::time::Instant::now() < deadline => {
+                    report = r;
+                    thread::sleep(DRAIN_POLL);
+                }
+                Err(_) => return false,
+            }
+        }
+    }
+
+    fn await_ack(&self, deadline: std::time::Instant) -> bool {
+        let Ok(acks) = self.acks.lock() else {
+            return false;
+        };
+        acks.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .is_ok()
+    }
+}
+
+/// How many reports may be waiting before the queue drops the newest. Deep enough that a burst of
+/// signals all get their line.
+const REPORT_QUEUE: usize = 32;
+
+/// How long the wrapper waits for queued reports on its way out. Long enough for a write to a
+/// live stderr, short enough that a stuck stderr cannot hold the wrapper's exit.
+const REPORT_DRAIN: Duration = Duration::from_millis(50);
+
+/// How often a drain looks for room in a full queue or for a decision still in progress.
+const DRAIN_POLL: Duration = Duration::from_millis(1);
+
+/// Signals the child and says whether it got the signal.
+///
+/// Only the child, never its group: signalling the PROCESS GROUP would need the child to lead its
+/// own group (`CommandExt::process_group(0)`), which changes where an interactive child sits
+/// relative to the terminal. That is WS-21B's isolation policy, an owner decision (G§5.11).
+///
+/// ESRCH is the normal race at exit: the child is already gone and was not signalled. Any other
+/// error means the child will NOT be signalled (EPERM after it changed its credentials is the case
+/// that matters), and its reason goes through the reporter like every other line this thread
+/// writes, never `eprintln!`: a synchronous write to a full stderr would park the sole watcher.
+fn deliver(child: rustix::process::Pid, sig: rustix::process::Signal) -> Decision {
+    match kill_retrying_interrupt(child, sig) {
+        Ok(()) => Decision::Forwarded,
+        Err(rustix::io::Errno::SRCH) => Decision::Undeliverable,
+        Err(e) => {
+            reporter().send(format!(
+                "xmustard run: could not signal the child ({}): {e}\n",
+                name_of(sig.as_raw())
+            ));
+            Decision::Undeliverable
+        }
+    }
+}
+
+/// `kill(2)` to the child, retrying a signal that arrived before the syscall ran.
+///
+/// The watcher thread has every forwarded signal's handler installed while it makes this call, so
+/// `kill_process` can return `EINTR` with the child untouched. Treating that as a failed delivery
+/// would report a child as running that has merely not been signalled yet, which is the wrong
+/// diagnostic in the direction that matters (OCR, round 5).
+///
+/// Bounded, because an unbounded retry here is a spin on a signal that keeps arriving. A signal
+/// every millisecond for this long is not a client timeout.
+fn kill_retrying_interrupt(
+    child: rustix::process::Pid,
+    sig: rustix::process::Signal,
+) -> rustix::io::Result<()> {
+    let give_up = std::time::Instant::now() + KILL_RETRY_WINDOW;
+    loop {
+        match rustix::process::kill_process(child, sig) {
+            Err(rustix::io::Errno::INTR) if std::time::Instant::now() < give_up => {
+                thread::sleep(KILL_RETRY_INTERVAL);
+            }
+            other => return other,
+        }
+    }
+}
+
+/// How long `kill_retrying_interrupt` keeps retrying `EINTR`, and how long it waits between
+/// attempts.
+const KILL_RETRY_WINDOW: Duration = Duration::from_millis(200);
+const KILL_RETRY_INTERVAL: Duration = Duration::from_millis(5);
+
+/// Whether the child is in the wrapper's own process group, so a terminal's group-wide signal
+/// reaches it too. `false` on any error (the child is gone, or its group cannot be read):
+/// an unknown group is treated as "not shared", which relays rather than skips.
+fn same_process_group(child: rustix::process::Pid) -> bool {
+    match (
+        rustix::process::getpgid(Some(child)),
+        rustix::process::getpgid(None),
+    ) {
+        (Ok(child_group), Ok(own_group)) => child_group == own_group,
+        _ => false,
+    }
+}
 
 /// Forwards a termination signal to the child while the wrapper runs.
 ///
@@ -189,7 +557,8 @@ const FORWARDED: &[i32] = &[
 /// orphaned and keeps whatever it took (a lock, a temp file, a port) until it ends on its
 /// own. A terminal signal reaches the child through the process group, which is what
 /// WS-41's deviation (2) recorded; a signal to the wrapper's own pid does not, and that is
-/// the case this closes.
+/// the case this closes. A terminal signal that also arrives here is not relayed on, so the
+/// child sees one copy and not two, where the terminal delivers to a whole group (`relay`).
 ///
 /// The child's outcome is still what the wrapper reports: `wait` reaps the real status, so
 /// a child that survives the signal and exits 0 makes the wrapper exit 0, and one the
@@ -244,16 +613,19 @@ impl Forwarder {
         pid: mpsc::Receiver<u32>,
         reaped: Arc<AtomicBool>,
     ) -> Option<(signal_hook::iterator::Handle, thread::JoinHandle<()>)> {
-        let mut signals = signal_hook::iterator::Signals::new(FORWARDED)
-            .map_err(|e| io::Error::other(e.to_string()))
-            .inspect_err(|e| {
-                eprintln!("xmustard run: signals are not forwarded to the child: {e}");
-            })
-            .ok()?;
+        let mut signals = signal_hook::iterator::SignalsInfo::<
+            signal_hook::iterator::exfiltrator::WithOrigin,
+        >::new(forwarded())
+        .map_err(|e| io::Error::other(e.to_string()))
+        .inspect_err(|e| {
+            eprintln!("xmustard run: signals are not forwarded to the child: {e}");
+        })
+        .ok()?;
         let handle = signals.handle();
         let watcher = thread::spawn(move || {
             let mut child = None;
-            for raw in signals.forever() {
+            for origin in signals.forever() {
+                let raw = origin.signal;
                 if child.is_none() {
                     // Before `arm`: wait for the spawn. No pid ever coming means the spawn
                     // failed, and the signal ends the wrapper as it would have unforwarded.
@@ -279,12 +651,23 @@ impl Forwarder {
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
                 }
-                // ESRCH: the child is already gone, which is the normal race at exit.
-                // Signalling the PROCESS GROUP instead would need the child to lead its
-                // own group (`CommandExt::process_group(0)`), which changes where an
-                // interactive child sits relative to the terminal: that is WS-21B's
-                // isolation policy, an owner decision (G§5.11), not this row's to take.
-                let _ = rustix::process::kill_process(child, sig);
+                // Held until the line below is queued, so an exit-path drain that runs because
+                // this delivery ended the child waits for the line (codex-review, round 8).
+                let _deciding = reporter().deciding();
+                // Whether to relay is `DELIVERIES`' decision, not this loop's: a signal the
+                // terminal or the kernel generated is skipped only where a group delivery
+                // would already have reached the child, and a hangup or a timer is never
+                // skipped because neither reaches the group.
+                let sender = origin.process.map(|p| p.pid);
+                let outcome = if relay(raw, sender, same_process_group(child)) {
+                    deliver(child, sig)
+                } else {
+                    Decision::Declined
+                };
+                // AFTER the delivery, always: the delivery is the contract and the line is a
+                // diagnostic, so a stderr whose reader has stopped may cost the line but never
+                // the signal (WS-FIX-20c-r1-1).
+                report(raw, outcome);
             }
         });
         Some((handle, watcher))
@@ -416,6 +799,9 @@ fn exit_of(status: ExitStatus) -> ChildExit {
 /// not restore the previous disposition, so a signal sent here after `Forwarder::stop` would
 /// find this process's handler still in place and do nothing.
 pub fn end_like(exit: ChildExit) -> i32 {
+    // Before anything that ends the process, so a queued decision report is written before the
+    // wrapper's outcome is decided (codex-spec, round 4). Bounded inside.
+    drain_reports();
     match exit {
         ChildExit::Code(c) => c,
         ChildExit::Signal(n) => {
@@ -646,6 +1032,211 @@ mod tests {
         forwarder.stop();
         let status = status.expect("the held TERM never reached the child");
         assert_eq!(status.signal(), Some(signal_hook::consts::signal::SIGTERM));
+    }
+
+    /// A sink whose first write waits until `release` is sent or dropped, so a test can hold the
+    /// reporter's writer in one write while it fills the queue behind it. `entered` fires when
+    /// that first write starts; everything written lands in `out`.
+    struct GatedSink {
+        entered: Option<mpsc::Sender<()>>,
+        gate: mpsc::Receiver<()>,
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Write for GatedSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if let Some(entered) = self.entered.take() {
+                let _ = entered.send(());
+                let _ = self.gate.recv();
+            }
+            self.out.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The sink, the `entered` receiver, the `release` sender and the shared output.
+    fn gated_sink() -> (
+        GatedSink,
+        mpsc::Receiver<()>,
+        mpsc::Sender<()>,
+        Arc<Mutex<Vec<u8>>>,
+    ) {
+        let (entered_tx, entered) = mpsc::channel();
+        let (release, gate) = mpsc::channel();
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let sink = GatedSink {
+            entered: Some(entered_tx),
+            gate,
+            out: Arc::clone(&out),
+        };
+        (sink, entered, release, out)
+    }
+
+    /// The watcher's side of the reporter never waits on the sink: with the writer held in a
+    /// write and the queue full, further lines are dropped at once, counted, and the count is
+    /// stated by the drain. The sends run on their own thread and are awaited with a deadline, so
+    /// a send that blocks fails the test instead of hanging it (goal §1.7 rule 11).
+    #[test]
+    fn a_full_report_queue_drops_lines_without_blocking_and_the_drain_counts_them() {
+        let (sink, entered, release, out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 2));
+        reporter.send("first\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the first line");
+        let (done, sent) = mpsc::channel();
+        let sender = Arc::clone(&reporter);
+        thread::spawn(move || {
+            for k in 0..5 {
+                sender.send(format!("line {k}\n"));
+            }
+            let _ = done.send(());
+        });
+        sent.recv_timeout(Duration::from_secs(10))
+            .expect("a send blocked behind a stuck writer");
+        release.send(()).unwrap();
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text,
+            "first\nline 0\nline 1\n\
+             xmustard run: 3 decision report(s) not written to stderr\n"
+        );
+    }
+
+    /// The drain is bounded: a writer stuck on a sink nobody reads cannot hold the wrapper's exit.
+    /// Awaited with a deadline on another thread, so an unbounded drain fails instead of hanging.
+    #[test]
+    fn a_drain_returns_while_the_writer_is_stuck() {
+        let (sink, entered, release, _out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 2));
+        reporter.send("stuck\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the first line");
+        let (done, drained) = mpsc::channel();
+        let draining = Arc::clone(&reporter);
+        thread::spawn(move || {
+            draining.drain(Duration::from_millis(100));
+            let _ = done.send(());
+        });
+        let waited = drained.recv_timeout(Duration::from_secs(10));
+        drop(release);
+        waited.expect("the drain waited on a stuck writer past its limit");
+    }
+
+    /// A drain on the exit path waits for a decision the watcher is still acting on: the signal it
+    /// just delivered may be what ended the child, and its line is not queued yet. The drain runs
+    /// on its own thread with a generous limit, so it cannot have timed out within the 200 ms
+    /// window; the test then queues the line, releases the decision, and expects exactly it.
+    #[test]
+    fn a_drain_waits_for_a_decision_still_being_acted_on() {
+        let (sink, _entered, release, out) = gated_sink();
+        drop(release);
+        let reporter = Arc::new(Reporter::new(sink, 2));
+        let deciding = reporter.deciding();
+        let (done, drained) = mpsc::channel();
+        let draining = Arc::clone(&reporter);
+        thread::spawn(move || {
+            draining.drain(Duration::from_secs(10));
+            let _ = done.send(());
+        });
+        assert_eq!(
+            drained.recv_timeout(Duration::from_millis(200)),
+            Err(mpsc::RecvTimeoutError::Timeout),
+            "the drain returned while a decision was still being acted on"
+        );
+        reporter.send("SIGTERM forwarded to the child\n".into());
+        drop(deciding);
+        drained
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the drain never returned after the decision was queued");
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(text, "SIGTERM forwarded to the child\n");
+    }
+
+    /// A sink that refuses every line starting with `refused` and keeps the rest.
+    struct RefusingSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for RefusingSink {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if buf.starts_with(b"refused") {
+                return Err(io::ErrorKind::BrokenPipe.into());
+            }
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A line the sink refuses is lost as surely as one a full queue dropped, so it is counted
+    /// and the drain states it.
+    #[test]
+    fn a_line_the_sink_refuses_is_counted_and_stated() {
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let reporter = Reporter::new(RefusingSink(Arc::clone(&out)), 4);
+        reporter.send("refused\n".into());
+        reporter.send("kept\n".into());
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text,
+            "kept\nxmustard run: 1 decision report(s) not written to stderr\n"
+        );
+    }
+
+    /// A drain that runs out of time before it can queue the loss notice keeps the count, so a
+    /// later drain still states it. The first drain runs on its own thread and is awaited with a
+    /// deadline, so a drain that waited on the stuck writer fails instead of hanging.
+    #[test]
+    fn a_drain_out_of_time_keeps_the_count_for_the_next_one() {
+        let (sink, entered, release, out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 1));
+        reporter.send("first\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the first line");
+        reporter.send("queued\n".into());
+        reporter.send("dropped\n".into());
+        let (done, drained) = mpsc::channel();
+        let draining = Arc::clone(&reporter);
+        thread::spawn(move || {
+            draining.drain(Duration::from_millis(100));
+            let _ = done.send(());
+        });
+        let waited = drained.recv_timeout(Duration::from_secs(10));
+        release.send(()).unwrap();
+        waited.expect("the drain waited on a stuck writer past its limit");
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert_eq!(
+            text,
+            "first\nqueued\nxmustard run: 1 decision report(s) not written to stderr\n"
+        );
+    }
+
+    /// The wrapper's exit drains the reporter before it ends: with a decision held in progress,
+    /// `end_like` cannot return before the drain's limit has passed. A lower bound only, so load
+    /// can never make it fail; an exit that skipped the drain returns at once.
+    #[test]
+    fn ending_like_the_child_drains_the_reporter_first() {
+        let deciding = reporter().deciding();
+        let started = std::time::Instant::now();
+        let code = end_like(ChildExit::Code(5));
+        let waited = started.elapsed();
+        drop(deciding);
+        assert_eq!(code, 5);
+        assert!(
+            waited >= REPORT_DRAIN,
+            "end_like returned after {waited:?} with a decision in progress, so it did not drain"
+        );
     }
 
     #[test]

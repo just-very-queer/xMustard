@@ -5,13 +5,94 @@ mod memprobe;
 
 use std::io::{Read, Write};
 use std::net::TcpListener;
-use std::os::unix::process::ExitStatusExt;
+use std::os::fd::{FromRawFd, IntoRawFd};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Output, Stdio};
+use std::sync::Mutex;
+use std::sync::MutexGuard;
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
 const BIN: &str = env!("CARGO_BIN_EXE_xmustard-core");
+
+/// One descriptor-hungry test at a time.
+///
+/// `without_forwarding_the_wrapper_becomes_the_command` runs the wrapper under
+/// `ulimit -n 4`, so it passes only when the descriptors it needs are free: measured failing
+/// with status 127 and empty output, which is `sh` unable to exec, not the wrapper taking the
+/// forwarding path. Any test that holds an fd for the length of an observation window starves
+/// it — the pty tests hold a master, a slave and a piped stderr, and the two report tests hold
+/// a FILLED stderr pipe while the wrapper runs. Measured on the box: 2 failures in 10
+/// full-binary runs with those two unguarded, 0 in 10 once they take the lock, 20 of 20 serial,
+/// and 0 in 10 at the merge base. `every_test_that_holds_a_descriptor_takes_the_terminal_lock`
+/// enforces that coverage against this file's own source, so a new descriptor-hungry test
+/// cannot reintroduce it silently. Same shape as `tests/refresh.rs`'s `serial()`.
+///
+/// The lock covers only the descriptor-hungry tests; the rest of the binary is unaffected, and
+/// nothing here bounds or skips a test — it removes parallel-load contention, which is the
+/// first acceptable fix class in goal §3.3.
+static TERMINAL: Mutex<()> = Mutex::new(());
+
+/// Every test that holds an fd for the length of an observation window takes `TERMINAL`.
+///
+/// The lock existed for the `ulimit -n 4` test but covered only the pty tests, while the two
+/// report tests hold a FILLED stderr pipe for as long as the wrapper runs - which is the
+/// contention the lock was meant to remove. So the coverage is checked here against this file's
+/// own source rather than trusted: `report_job`, `report_file_job` and `terminal_job` are the
+/// constructors that fill or hold a descriptor, and a new descriptor-hungry test that forgets
+/// the lock fails here rather than as a flake on someone else's box.
+///
+/// This test skips itself, so the hog-name literals above and the `serial_terminal()` call here
+/// are not counted as coverage of themselves.
+#[test]
+fn every_test_that_holds_a_descriptor_takes_the_terminal_lock() {
+    const SELF: &str = "every_test_that_holds_a_descriptor_takes_the_terminal_lock";
+    let source = include_str!("run_wrapper.rs");
+    let hogs = ["report_job(", "report_file_job(", "terminal_job("];
+    let mut checked = 0;
+    let mut offenders = Vec::new();
+    // Split on `#[test]` and scan each SEGMENT: a test's body runs from its own marker to the
+    // next one, so the helpers between two tests belong to neither. The first version scanned
+    // forward from each marker to the next, which handed the helpers and the following test to
+    // whichever test preceded them (codex-spec, round 7).
+    let mut segments: Vec<&str> = source.split("#[test]").collect();
+    segments.remove(0);
+    for body in segments {
+        let name = body
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("fn "))
+            .and_then(|l| l.split('(').next())
+            .unwrap_or("");
+        if name == SELF {
+            continue;
+        }
+        if !hogs.iter().any(|h| body.contains(h)) {
+            continue;
+        }
+        checked += 1;
+        if !body.contains("serial_terminal()") {
+            offenders.push(name.to_string());
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "these tests hold a descriptor for an observation window but do not take the \
+         terminal lock, so they run beside `ulimit -n 4`: {offenders:?}"
+    );
+    // 2 pty tests (the keystroke and the hangup), the process-sent signal test, and the two
+    // report tests: 5 at this head, measured by this scan rather than assumed. A floor below the
+    // true count would let a rename hide a contender, which is how `pty_session` - a name no test
+    // calls - hid the pty tests while this check still counted itself (codex-spec, round 7).
+    assert!(
+        checked >= 5,
+        "only {checked} descriptor-holding tests were found"
+    );
+}
+
+fn serial_terminal() -> MutexGuard<'static, ()> {
+    TERMINAL.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// A run with no workspace configured: the API is never contacted.
 fn run(argv: &[&str]) -> Output {
@@ -97,6 +178,29 @@ fn await_file(path: &std::path::Path) {
         thread::sleep(Duration::from_millis(20));
     }
     panic!("{} never appeared", path.display());
+}
+
+/// `await_file` for a child that is an interpreter rather than a shell: starting one on a
+/// loaded box costs seconds, which the shell's 18 s budget does not always cover, and a
+/// timeout here would read as a broken wrapper rather than as a slow child.
+fn await_child(path: &std::path::Path, dir: &std::path::Path) {
+    for _ in 0..3000 {
+        if path.exists() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    panic!(
+        "{} never appeared; the wrapper said: {:?}; the dir holds {:?}",
+        path.display(),
+        std::fs::read_to_string(dir.join("wrapper-err")).unwrap_or_default(),
+        std::fs::read_dir(dir)
+            .map(|r| {
+                r.filter_map(|e| e.ok().map(|e| e.file_name()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    );
 }
 
 fn seen(dir: &std::path::Path) -> String {
@@ -689,6 +793,7 @@ fn a_child_that_exits_zero_on_term_makes_the_wrapper_exit_zero() {
 /// child's `$$` is the very pid the caller started, and its output is native.
 #[test]
 fn without_forwarding_the_wrapper_becomes_the_command() {
+    let _g = serial_terminal();
     let run = format!("ulimit -n 4 && exec '{BIN}' run -- sh -c 'echo \"pid=$$\"'");
     let mut wrapper = Command::new("sh")
         .args(["-c", &run])
@@ -710,5 +815,729 @@ fn without_forwarding_the_wrapper_becomes_the_command() {
         out.trim(),
         format!("pid={}", wrapper.id()),
         "not exec'd in place: {out:?}"
+    );
+}
+
+/// WS-FIX-20b: one Ctrl-C is one signal.
+///
+/// A terminal delivers SIGINT to every process in its foreground process group, so the child
+/// already receives the operator's keystroke. WS-FIX-20's watcher then relayed the wrapper's
+/// own copy on to the child, and the child ran its handler twice per keystroke
+/// (WS-FIX-20-r4-1). The wrapper must not relay a signal the terminal or the kernel
+/// generated for the whole group.
+///
+/// The terminal here is a real pty and the wrapper's group is its foreground group, which is
+/// what a shell does with a job: measured on the box, `fg == pgid == child's pgid`. Writing
+/// `\x03` to the master is then what the line discipline turns into SIGINT for that group,
+/// so the child gets the terminal's copy directly and the wrapper gets its own to relay. No
+/// `kill(2)` is involved, so a relayed copy is distinguishable from the terminal's.
+///
+/// The child is `python3`, not `sh`, and that is load-bearing rather than stylistic: `dash`
+/// coalesces back-to-back SIGINTs, so the two copies arrived microseconds apart and its trap
+/// ran **once** (measured on the box: three SIGINTs in a tight loop, one trap call). A
+/// shell-based version of this test passes on the broken code, which is how the first
+/// version of it did.
+///
+/// Linux only. The test asserts the wrapper does NOT relay, which holds when the terminal's
+/// own group delivery reached the child — the case `#[cfg]` below is the one measured
+/// (`AGENTS.md` runs `cargo test` on macOS, so the gate is an attribute rather than a skip).
+/// On macOS `Origin::extract` reports a terminal-generated signal as no sender as well (pid
+/// and uid both 0), so the same rule applies there; the test is gated because its discriminator
+/// was measured on Linux, not because the behaviour is known to differ.
+#[cfg(target_os = "linux")]
+#[test]
+fn one_terminal_keystroke_reaches_the_child_once() {
+    let _g = serial_terminal();
+    // The keystrokes a terminal turns into SIGINT (INTR) and SIGQUIT (QUIT) for its
+    // foreground group. Each keystroke gets its own wrapper, because a run is what leaves a
+    // child and its log behind and the first run's child is released before the next starts.
+    for (name, byte) in [("INT", b"\x03"), ("QUIT", b"\x1c")] {
+        let dir = tempfile::tempdir().unwrap();
+        let (mut wrapper, mut master) = terminal_job(dir.path());
+        await_child(&dir.path().join("ready"), dir.path());
+        let (_sampled, decided) = keystroke_and_count(dir.path(), &mut master, byte);
+        // The wrapper's own report of the decision it took, read after the wait above has
+        // seen it. For a terminal keystroke with the child in the wrapper's group that
+        // decision is to decline, so the line says so: it asserts the wrapper's reason for
+        // the count, and it fails when the report is missing or unreadable, which the count
+        // alone cannot do (measured: both report mutations survived the count on its own).
+        assert_eq!(
+            decided,
+            format!("SIG{name} not forwarded (the child already has this signal)"),
+            "{name}: the wrapper's report of its decision"
+        );
+        release(dir.path());
+        // The wrapper must also END: it declines to relay, not to report. Asserting the exit
+        // is what keeps a hung wrapper from passing this test on the count alone.
+        let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
+        // Re-read the count AFTER the wrapper has ended. `keystroke_and_count` sampled it when
+        // the report appeared, which proves the terminal's copy landed but says nothing about a
+        // duplicate the wrapper might still have been about to relay: the relay happens on the
+        // watcher thread and the report is written by the same thread after it, so a relay that
+        // raced the report would land after the sample and go uncounted (codex-spec 3). With
+        // the wrapper ended, every delivery it was ever going to make has been made.
+        let counted = ack_count(dir.path());
+        assert_eq!(
+            counted, 1,
+            "{name}: the child recorded {counted} copies of the operator's keystroke, so the \
+             wrapper relayed the terminal's own"
+        );
+        assert_eq!(status.code(), Some(0), "{name}: wrapper status {status:?}");
+    }
+}
+
+/// A terminal disconnect hangs up the session leader ALONE, which is the wrapper here, so the
+/// child in the wrapper's group gets SIGHUP only if the wrapper relays it (goal §3.5i). The
+/// counter child has no SIGHUP handler and dies of one, so a relayed hangup ends the child and
+/// then the wrapper, the same way. A wrapper that declined the kernel's hangup would sit in
+/// `drain` behind a live child until that child's own 60 s deadline; the bounded wait below
+/// fails first, and `Job` stops the child and kills the wrapper on the way out.
+///
+/// The disconnect is real: `terminal_job` opens the master close-on-exec, so dropping the test's
+/// copy closes the last one and the kernel hangs the terminal up. The kernel's SIGHUP names no
+/// sender, so this is the case a sender test cannot reach. Linux only, like the keystroke test,
+/// because that is where the delivery was measured.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_terminal_hangup_reaches_the_child_and_ends_the_wrapper() {
+    let _g = serial_terminal();
+    let dir = tempfile::tempdir().unwrap();
+    let (wrapper, master) = terminal_job(dir.path());
+    let mut job = Job {
+        wrapper,
+        dir: dir.path().to_path_buf(),
+        _stderr_read: None,
+    };
+    await_child(&dir.path().join("ready"), dir.path());
+    drop(master);
+    let status = wait_within(&mut job.wrapper, 20).expect(
+        "the wrapper sat in drain after the terminal hung up, so the child never got SIGHUP",
+    );
+    assert_eq!(
+        decision(dir.path()),
+        "SIGHUP forwarded to the child",
+        "the wrapper's report of the hangup"
+    );
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGHUP),
+        "the wrapper must end the way the child did: {status:?}"
+    );
+}
+
+/// How many deliveries the pty child has acknowledged, from its `ack` file. One line per
+/// handled signal, `fsync`ed by the child, so a line means the child has run its handler.
+fn ack_count(dir: &std::path::Path) -> usize {
+    std::fs::read_to_string(dir.join("ack"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .count()
+}
+
+/// Writes `byte` to the pty master and returns how many deliveries the child acknowledged,
+/// with what the wrapper reported it decided about that signal.
+///
+/// The wait has two stages and both are synchronised, neither on a timer.
+///
+/// Stage 1 is the terminal's own copy, which the line discipline delivers to the foreground
+/// group. The boundary is the child's `ack` file, not a quiet period: the child appends and
+/// `fsync`s one line per handled signal, so a line in `ack` means the child has already run
+/// its handler for that delivery. A timer cannot stand in for this — the wrapper's watcher is
+/// an ordinary thread and can be descheduled for longer than any fixed interval, which is
+/// what made the first two versions of this helper able to return a false 1 (r1 codex-spec 2,
+/// r1 OCR 1, r2 codex-spec 3, r2 OCR 1).
+///
+/// Stage 2 is the wrapper's watcher finishing with the signal, and it is a wait on the
+/// watcher's own report of what it decided (`run_wrapper::report` writes one line on the
+/// wrapper's stderr, `dir/wrapper-err`). Acknowledging the terminal's delivery is not enough
+/// on its own, because the duplicate this test exists to catch arrives second: returning
+/// there would race the very relay under test. A count of unchanged polls after the
+/// acknowledgement was the previous answer and it is gone: the watcher forwards or declines,
+/// and either way it has then reported, so the wait is on that report and it means the same
+/// thing in both cases — which is what four rounds asked for (r1 codex-spec 2, r2 codex-spec 3,
+/// r3 codex-spec 1, r4 codex-spec 2).
+///
+/// The bound is a deadline; on expiry it returns the count the child last acknowledged, the
+/// honest reading at that point. The assertion is `== 1`, so a late duplicate still fails the
+/// test rather than passing it.
+const SETTLE_INTERVAL: Duration = Duration::from_millis(40);
+const ACK_TIMEOUT: Duration = Duration::from_secs(20);
+
+fn keystroke_and_count(
+    dir: &std::path::Path,
+    master: &mut std::fs::File,
+    byte: &[u8],
+) -> (usize, String) {
+    master.write_all(byte).unwrap();
+    master.flush().unwrap();
+    let ack = || ack_count(dir);
+    let deadline = std::time::Instant::now() + ACK_TIMEOUT;
+    // Stage 1: the terminal's own copy, which the line discipline delivers to the group.
+    while std::time::Instant::now() < deadline && ack() == 0 {
+        thread::sleep(SETTLE_INTERVAL);
+    }
+    // Stage 2: the watcher's report of what it decided about this signal. The report is the
+    // decision, so a delayed watcher extends the wait rather than letting it pass early.
+    await_report(dir, deadline);
+    let decided = decision(dir);
+    (ack(), decided)
+}
+
+/// Blocks until the wrapper's watcher has reported the keystroke's signal. `dir/wrapper-err`
+/// is the wrapper's stderr, which `terminal_job` points at a file, so the report is a line
+/// in a file this test can read.
+fn await_report(dir: &std::path::Path, deadline: std::time::Instant) {
+    while std::time::Instant::now() < deadline && decision(dir).is_empty() {
+        thread::sleep(SETTLE_INTERVAL);
+    }
+}
+
+/// What the wrapper reported about the signals it handled, in order, as the operator reads
+/// them. Reading the lines rather than a boolean is what lets the caller assert the decision
+/// and not only its existence: a wait that recognised nothing and a wait that recognised a
+/// report both return, and only the lines tell them apart.
+fn decisions(dir: &std::path::Path) -> Vec<String> {
+    std::fs::read_to_string(dir.join("wrapper-err"))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.strip_prefix("xmustard run: "))
+        // A per-signal decision line, not a delivery error and not a drop notice. Keyed on the
+        // signal name rather than on a phrase: the three decision phrasings changed at round 7,
+        // and a filter pinned to one of them silently returns nothing when they do
+        // (codex-spec, round 7).
+        .filter(|l| l.starts_with("SIG") || l.starts_with("xmustard-core"))
+        .map(str::to_string)
+        .collect()
+}
+
+/// The one decision the wrapper reported, which is the one this keystroke caused. Empty when
+/// the report was never written or could not be read, which is the case the caller asserts.
+fn decision(dir: &std::path::Path) -> String {
+    decisions(dir).last().cloned().unwrap_or_default()
+}
+
+/// Starts `xmustard-core run` over `COUNTER_CHILD` in a new session whose controlling
+/// terminal is a fresh pty, and returns the wrapper and the pty master. The child inherits
+/// the wrapper's process group, so wrapper and child are the pty's one foreground group,
+/// exactly as a shell runs a job. The slave is closed here and not returned: a caller that
+/// held its number would be holding an fd that is no longer open and could be reused.
+fn terminal_job(dir: &std::path::Path) -> (std::process::Child, std::fs::File) {
+    let master =
+        rustix::pty::openpt(rustix::pty::OpenptFlags::RDWR | rustix::pty::OpenptFlags::NOCTTY)
+            .unwrap();
+    rustix::pty::grantpt(&master).unwrap();
+    rustix::pty::unlockpt(&master).unwrap();
+    // Close-on-exec, so the test holds the only copy of the master: a wrapper or child that
+    // inherited one would keep the terminal alive after the test drops its own, and dropping it
+    // is how the hangup test disconnects the terminal. Set after the open because `posix_openpt`
+    // takes no `O_CLOEXEC` outside Linux.
+    rustix::io::fcntl_setfd(&master, rustix::io::FdFlags::CLOEXEC).unwrap();
+    let master = std::fs::File::from(master);
+    let slave = {
+        let name = rustix::pty::ptsname(&master, Vec::new()).unwrap();
+        rustix::fs::open(name, rustix::fs::OFlags::RDWR, rustix::fs::Mode::empty())
+            .unwrap()
+            .into_raw_fd()
+    };
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .arg("python3")
+        .arg(COUNTER_CHILD)
+        .arg(dir.to_str().unwrap())
+        .env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stdin(owned(slave))
+        .stdout(owned(slave))
+        .stderr(std::fs::File::create(dir.join("wrapper-err")).unwrap());
+    // A controlling terminal is what makes the line discipline signal the group, and only a
+    // session leader may acquire one, so `setsid` runs between the fork and the exec. The
+    // wrapper then leads its own session and group, and the child it spawns inherits that
+    // group: the terminal job a shell would set up. Both calls are safe wrappers and nothing
+    // between them allocates, so the post-fork window is the one `spawn` already requires
+    // its caller to keep minimal.
+    unsafe {
+        c.pre_exec(|| {
+            rustix::process::setsid()?;
+            rustix::process::ioctl_tiocsctty(std::io::stdin())?;
+            Ok(())
+        });
+    }
+    let wrapper = c.spawn().unwrap_or_else(|e| {
+        panic!(
+            "the wrapper could not start in its own session: {e}; setsid on a process group \
+             leader answers EPERM, and the pty cannot signal a group it does not own"
+        );
+    });
+    // The parent's copy of the slave must close, or the master never sees EOF.
+    drop(unsafe { std::fs::File::from_raw_fd(slave) });
+    (wrapper, master)
+}
+
+/// `Stdio` for an inherited copy of `fd`. The dup is deliberate: three stdio slots need three
+/// descriptors and the pty has one.
+fn owned(fd: i32) -> Stdio {
+    let copy = unsafe { libc::dup(fd) };
+    assert!(copy >= 0, "the pty could not be duplicated");
+    unsafe { Stdio::from_raw_fd(copy) }
+}
+
+/// The child the pty tests run: it appends one line per signal it is handed, so two
+/// deliveries are two lines. A file rather than an inline script because `dash`'s trap
+/// coalesces the two copies into one call and cannot witness the defect. It is a path,
+/// because the wrapper runs an interpreter over it, and `CARGO_MANIFEST_DIR` is how a test
+/// names a file in its own crate without guessing the working directory.
+const COUNTER_CHILD: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/testdata/counter_child.py"
+);
+
+/// The other half of the contract, on the same harness: a signal a **process** sent is still
+/// relayed, which is WS-41 deviation (2) proper — a client timeout and `kill <pid>` reach
+/// the wrapper alone, and the pty test above proves a terminal one no longer is.
+#[test]
+fn a_signal_a_process_sent_still_reaches_the_child() {
+    let _g = serial_terminal();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut wrapper, _master) = terminal_job(dir.path());
+    await_child(&dir.path().join("ready"), dir.path());
+    Command::new("kill")
+        .args(["-TERM", &wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    let log = await_seen(dir.path(), "TERM");
+    assert!(
+        log.contains("TERM"),
+        "a sent TERM was not relayed to the child: {log:?}"
+    );
+    release(dir.path());
+    let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
+}
+
+/// Kills the wrapper and releases the child when a test fails, so a failed assertion never
+/// leaves a process behind on a box four other lanes share.
+struct Job {
+    wrapper: std::process::Child,
+    dir: std::path::PathBuf,
+    /// The read end of the wrapper's stderr pipe, held so it stays open for the whole test.
+    /// A dropped read end would give the wrapper's blocked report an EPIPE instead of a wait,
+    /// and EPIPE is not the hazard WS-FIX-20c-r1-1 is about.
+    _stderr_read: Option<std::fs::File>,
+}
+
+impl Drop for Job {
+    fn drop(&mut self) {
+        let _ = std::fs::write(self.dir.join("stop"), "");
+        let _ = self.wrapper.kill();
+        let _ = self.wrapper.wait();
+    }
+}
+
+/// The child of `report_job`, and the difference from `WATCHDOG` that makes the blocking
+/// harness work: it reopens its own stderr on `/dev/null` before anything else.
+///
+/// The wrapper hands its stderr to the child, so a stderr that blocks also blocks the child —
+/// which is why the three measured harnesses (a closed read end, a full blocking pipe, a full
+/// non-blocking pipe) each left the wrapper alive with the child's directory empty. Closing the
+/// child's stderr separates the two: the wrapper keeps a pipe that is full and undrained, and
+/// the child runs its script normally.
+const BLOCKING_STDERR_CHILD: &str = r#"exec 2>/dev/null
+WM_DIR="$1"
+note() { printf '%s\n' "$1" >> "$WM_DIR/log"; }
+trap 'note TERM' TERM
+trap 'note INT' INT
+trap 'note QUIT' QUIT
+trap 'note HUP' HUP
+trap 'note USR1' USR1
+printf '%s' "$$" > "$WM_DIR/pid"
+printf 'ready\n' > "$WM_DIR/ready"
+i=0
+while [ "$i" -lt 900 ]; do
+  i=$((i+1))
+  [ -f "$WM_DIR/stop" ] && exit 0
+  sleep 0.05
+done
+exit 9"#;
+
+/// Starts `xmustard-core run` over `BLOCKING_STDERR_CHILD` with its stderr on a pipe that is
+/// already at its buffer limit and that nobody ever drains, so the watcher's report write
+/// blocks for as long as the pipe stays full.
+///
+/// A blocking report, not a sampled one: a test that reads the child's log when it sees the
+/// report races the CHILD's own trap scheduling, which is the child's business and not the
+/// wrapper's (measured: green solo, 0 of 10 under box load). Blocking the report removes that
+/// race in the direction that matters. On the correct order the signal has already been
+/// delivered when the watcher reaches `report`, so the child has it while the watcher is
+/// stuck. On `report`-before-`kill_process` (the mutation that survived round 1) the watcher
+/// blocks BEFORE the delivery, so nothing ever reaches the child and its log stays empty.
+///
+/// The child must not inherit the blocked descriptor, or it would block on its first write and
+/// never reach its script: `BLOCKING_STDERR_CHILD` reopens its own stderr on `/dev/null` as its
+/// first statement, which is why this harness works where the three measured ones did not.
+fn report_job(dir: &std::path::Path) -> Job {
+    let (read_end, write_end) = pipe().expect("a pipe for the wrapper's stderr");
+    // Fill the pipe to its limit and keep the read end OPEN, so the wrapper's write blocks
+    // rather than seeing EPIPE: a diagnostic that fails fast would not exercise the ordering.
+    fill_pipe(&write_end);
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(BLOCKING_STDERR_CHILD)
+        .arg("sh")
+        .arg(dir.to_str().unwrap());
+    c.env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stderr(write_end);
+    let wrapper = c.spawn().expect("the wrapper could not start");
+    Job {
+        wrapper,
+        dir: dir.to_path_buf(),
+        // Held so the descriptor stays open for the whole test: closing it would turn the
+        // wrapper's blocked write into EPIPE and hand this test a pass on the wrong code.
+        _stderr_read: Some(read_end),
+    }
+}
+
+/// A pipe, on the two raw descriptors the wrapper needs. `libc::pipe` rather than
+/// `std::os::unix::net` because a pipe is what a blocking write needs and a socket pair is
+/// not what the wrapper writes to.
+fn pipe() -> Option<(std::fs::File, std::fs::File)> {
+    let mut fds = [0i32; 2];
+    // SAFETY: `fds` is two valid, writable ints; `pipe` writes exactly two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    Some(unsafe {
+        (
+            std::fs::File::from_raw_fd(fds[0]),
+            std::fs::File::from_raw_fd(fds[1]),
+        )
+    })
+}
+
+/// Writes into the pipe until it is full, then leaves the descriptor BLOCKING.
+///
+/// The fill must not block THIS process (the test would hang before spawning anything) and the
+/// wrapper's descriptor must stay BLOCKING (a non-blocking full pipe answers `EAGAIN`, which is
+/// a different hazard than the one r1-1 is about). One `dup` cannot give both: it shares the
+/// open file description, so `F_SETFL(O_NONBLOCK)` on the copy sets the flag for the wrapper too
+/// — three review channels found that independently (codex-review P2, codex-spec, OCR), and it
+/// would have made this test pass on the ordering it exists to condemn.
+///
+/// So the flag is set on a copy for the fill and then **cleared on the descriptor the wrapper
+/// inherits**. Dropping the copy is not enough, and that is measured rather than assumed: the
+/// flag lives on the shared open file description, which survives while any descriptor refers to
+/// it, so a closed filler leaves `write_end` non-blocking and the report `EAGAIN`s (the
+/// assertion below caught it, logs/ws-fix-20c-run-20261004T163930Z.log). `F_GETPIPE_SZ` is
+/// deliberately not used: it is Linux-only and the repository's checks run on macOS too
+/// (codex-review P1, round 3). The loop stops on `EAGAIN`, which is the kernel saying there is no
+/// room at all, and a one-byte probe afterwards proves it rather than assuming it (OCR, round 5).
+fn fill_pipe(write_end: &std::fs::File) {
+    {
+        // SAFETY: `dup` of a live descriptor; `fcntl(F_SETFL)` on this copy only.
+        let filler = unsafe {
+            let copy = libc::dup(std::os::fd::AsRawFd::as_raw_fd(write_end));
+            assert!(copy >= 0, "the fill descriptor could not be duplicated");
+            assert_eq!(
+                libc::fcntl(copy, libc::F_SETFL, libc::O_NONBLOCK),
+                0,
+                "the fill descriptor could not be made non-blocking"
+            );
+            std::fs::File::from_raw_fd(copy)
+        };
+        let chunk = vec![b'x'; 4096];
+        // Loop until `EAGAIN`, NOT until a short write. For a write larger than `PIPE_BUF` the
+        // kernel may take only the space that is free and return short while room remains, so a
+        // short write does not mean the pipe is full — and a partly-full pipe may still hold the
+        // decision line, which would let the wrapper's report through and the witness pass on the
+        // code it exists to condemn (OCR, round 5). Only `EAGAIN` says there is no room at all.
+        loop {
+            // SAFETY: a plain write of a live buffer to a valid descriptor.
+            let written = unsafe {
+                libc::write(
+                    std::os::fd::AsRawFd::as_raw_fd(&filler),
+                    chunk.as_ptr().cast(),
+                    chunk.len(),
+                )
+            };
+            if written < 0 {
+                // `last_os_error` rather than a compared constant: a non-blocking pipe with no
+                // room answers EAGAIN or EWOULDBLOCK depending on the platform, and this harness
+                // has to know which rather than assume it.
+                let e = std::io::Error::last_os_error();
+                assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock,
+                    "the fill failed for a reason other than a full pipe: {e}"
+                );
+                break;
+            }
+            assert!(
+                written > 0,
+                "a full pipe must refuse the write, not accept zero bytes"
+            );
+        }
+        // Proof, not an assumption: the filler is non-blocking and the pipe is still full, so a
+        // one-byte probe from this same descriptor must be refused. Without this the harness
+        // could be exercising a pipe with room in it and the test would not mean anything.
+        let probe = b".";
+        // SAFETY: a one-byte write from the same live non-blocking descriptor.
+        let refused = unsafe {
+            libc::write(
+                std::os::fd::AsRawFd::as_raw_fd(&filler),
+                probe.as_ptr().cast(),
+                1,
+            )
+        };
+        assert!(
+            refused < 0,
+            "the pipe still accepted a byte, so the wrapper's report would not block"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the pipe refused the probe for a reason other than being full"
+        );
+    }
+    // Clear the flag the fill set on the shared description, so the wrapper inherits a blocking
+    // descriptor. SAFETY: `write_end` is live and the only file-status flags it carries are the
+    // ones this function just set.
+    assert_eq!(
+        unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(write_end), libc::F_SETFL, 0,) },
+        0,
+        "the fill could not restore the wrapper's descriptor to blocking"
+    );
+    assert!(
+        !is_nonblocking(write_end),
+        "the fill left the wrapper's descriptor non-blocking"
+    );
+}
+
+/// Whether `fd` carries `O_NONBLOCK`, read back from the descriptor rather than assumed.
+fn is_nonblocking(fd: &std::fs::File) -> bool {
+    // SAFETY: `F_GETFL` takes no argument and returns the descriptor's flags.
+    let flags = unsafe { libc::fcntl(std::os::fd::AsRawFd::as_raw_fd(fd), libc::F_GETFL) };
+    flags & libc::O_NONBLOCK != 0
+}
+
+/// WS-FIX-20c-r1-1: the signal reaches the child even when the wrapper cannot report it.
+///
+/// The report is a diagnostic, so it must not be able to cost the relay. Two hazards, and
+/// `report_job` makes the second one real: the wrapper's stderr is a pipe already at its buffer
+/// limit that nobody ever drains, so **any** write the watcher makes there would wait.
+///
+/// 1. **A report that blocks must never sit between the decision and the delivery.** The
+///    delivery is `kill_process`; the report only describes it. So the delivery goes out first.
+/// 2. **A report must not block at all** (codex-review P1), because there is one watcher
+///    thread: a blocked write parks it and every LATER signal goes unforwarded. So `report`
+///    writes through its own non-blocking descriptor.
+///
+/// A third hazard the earlier version of this test had: it read the child's log at the instant
+/// it saw the report, which races the CHILD's trap scheduling rather than the wrapper's
+/// ordering — measured on the box, green solo and 0 of 10 under load. This one waits for the
+/// child's log, so the wrapper's ordering decides the outcome and the child only records it
+/// afterwards. Both hazards are witnessed: the child is signalled with the pipe full, and a
+/// SECOND signal still arrives afterwards, which a blocked watcher could not deliver.
+#[test]
+fn the_child_has_the_signal_before_the_wrapper_reports_it_did() {
+    let _g = serial_terminal();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = report_job(dir.path());
+    await_file(&dir.path().join("ready"));
+    let sent = Command::new("kill")
+        .args(["-TERM", &job.wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(sent.success(), "kill -TERM on the wrapper");
+    // The child's log is awaited, not sampled. Correct order delivers the signal before the
+    // watcher reports, so the line is already there or arrives immediately; report-first
+    // blocks in the watcher before the delivery, so nothing ever arrives.
+    let log = await_seen(dir.path(), "TERM");
+    assert!(
+        log.contains("TERM"),
+        "the wrapper's report cost the relay: the child was never signalled, so the diagnostic \
+         could report before the delivery it describes: {log:?}"
+    );
+    // The watcher is still running, so a second signal must still be relayed. With one watcher
+    // thread a report that blocked on this full pipe would park it forever and this line would
+    // never arrive: this is what codex-review P1 found, and the pipe being full is what makes
+    // it observable rather than theoretical.
+    let again = Command::new("kill")
+        .args(["-INT", &job.wrapper.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(again.success(), "kill -INT on the wrapper");
+    let log = await_seen(dir.path(), "INT");
+    assert!(
+        log.contains("INT"),
+        "the watcher was still blocked on the first report, so a later signal went unforwarded \
+         and the child kept running: {log:?}"
+    );
+    release(dir.path());
+    let ended = wait_within(&mut job.wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(ended.code(), Some(0), "wrapper status {ended:?}");
+    // No assertion on the report line here, and that is deliberate: this job's stderr is full
+    // and undrained, so a correct wrapper CANNOT get the line out, and asserting that it did
+    // would condemn the code for working. That this pipe is full is also why the harness is
+    // about the relay rather than about the report.
+    //
+    // Reporting has its own witness, and it needs a stderr that is merely SLOW rather than
+    // permanently full: `the_wrapper_states_what_it_decided_for_each_signal` gives the wrapper a
+    // file for stderr and reads the decision back. Between them the two claims are covered,
+    // which codex-spec (round 4) was right that neither test managed alone.
+}
+
+/// The other half of the report's contract, on its own harness: the wrapper SAYS what it decided
+/// about each signal it handled.
+///
+/// `the_child_has_the_signal_before_the_wrapper_reports_it_did` gives the wrapper a stderr that
+/// is permanently full, which is the right shape for proving the relay is not delayed by a
+/// diagnostic and the wrong shape for reading the diagnostic back — so it witnesses the relay
+/// and this witnesses the report. Neither test covers both, which is what codex-spec (round 4)
+/// found.
+///
+/// A file for stderr, so the reporter's write always completes and `drain_reports` has something
+/// to wait for. That is the part the reporter thread exists for and the part a detached thread
+/// got wrong: a forwarded signal that promptly ends the child could otherwise end the wrapper
+/// before the line was ever written.
+///
+/// The child's exit is delayed until after the wrapper's own outcome is decided, so the wrapper's
+/// exit races the reporter rather than following it. A child that ended instantly would let the
+/// reporter usually win by luck, and `drain_reports` would be untested — measured: with an
+/// instant child, removing the drain from the exit path leaves all 24 tests green
+/// (logs/ws-fix-20c-run-20261004T172918Z.log). `LATE_CHILD` makes the reporter lose by
+/// construction, so the drain is what decides whether the line lands.
+#[test]
+fn the_wrapper_states_what_it_decided_for_each_signal() {
+    let _g = serial_terminal();
+    let dir = tempfile::tempdir().unwrap();
+    let mut job = report_file_job(dir.path(), LATE_CHILD);
+    await_file(&dir.path().join("ready"));
+    let wrapper = job.wrapper.id().to_string();
+    for sig in ["-TERM", "-INT"] {
+        let sent = Command::new("kill").args([sig, &wrapper]).status().unwrap();
+        assert!(sent.success(), "kill {sig} on the wrapper");
+        let name = sig.trim_start_matches('-');
+        let log = await_seen(dir.path(), name);
+        assert!(log.contains(name), "the child never got {name}: {log:?}");
+    }
+    release(dir.path());
+    let ended = wait_within(&mut job.wrapper, 10).expect("the wrapper never ended");
+    assert_eq!(ended.code(), Some(0), "wrapper status {ended:?}");
+    // Read AFTER the wrapper ended, so `drain_reports` has had its chance and the line is there
+    // whether the reporter ran early or was flushed on the way out.
+    let stated = std::fs::read_to_string(dir.path().join("wrapper-err")).unwrap_or_default();
+    for name in ["TERM", "INT"] {
+        assert!(
+            stated.contains(&format!("SIG{name} forwarded to the child")),
+            "the wrapper handled SIG{name} without stating the decision: {stated:?}"
+        );
+    }
+}
+
+/// The child `the_wrapper_states_what_it_decided_for_each_signal` runs: `WATCHDOG`, but it
+/// stays alive until `stop` appears instead of only sleeping, so the wrapper's own exit cannot
+/// overtake it and the race the drain exists to win is decided by the drain rather than by luck.
+const LATE_CHILD: &str = r#"WM_DIR="$1"
+note() { printf '%s\n' "$1" >> "$WM_DIR/log"; }
+trap 'note TERM' TERM
+trap 'note INT' INT
+trap 'note QUIT' QUIT
+trap 'note HUP' HUP
+trap 'note USR1' USR1
+printf '%s' "$$" > "$WM_DIR/pid"
+printf 'ready\n' > "$WM_DIR/ready"
+i=0
+while [ "$i" -lt 900 ]; do
+  i=$((i+1))
+  [ -f "$WM_DIR/stop" ] && sleep 0.5 && exit 0
+  sleep 0.05
+done
+exit 9"#;
+
+/// `watchdog_with_file_stderr` over a named child script, so the two harnesses differ only in
+/// the child and not in how the wrapper is started.
+fn report_file_job(dir: &std::path::Path, child: &str) -> Job {
+    let mut c = Command::new(BIN);
+    c.arg("run")
+        .arg("--")
+        .arg("sh")
+        .arg("-c")
+        .arg(child)
+        .arg("sh")
+        .arg(dir.to_str().unwrap());
+    c.env_remove("XMUSTARD_WORKSPACE_ID")
+        .env_remove("XMUSTARD_API_TOKEN")
+        .stderr(std::fs::File::create(dir.join("wrapper-err")).unwrap());
+    Job {
+        wrapper: c.spawn().expect("the wrapper could not start"),
+        dir: dir.to_path_buf(),
+        _stderr_read: None,
+    }
+}
+
+/// The rule that decides the tests above, as one decision with a refusal case on each side
+/// and no process or timing in it, so it is auditable without a terminal.
+///
+/// Three axes decide it: which signal, the `siginfo` sender, and whether the child is in the
+/// wrapper's own process group. All three are exercised, because all three are load-bearing:
+/// the sender alone decides the client's timeout, the group alone decides a terminal's
+/// keystroke, and the signal alone decides the hangup that reaches the session leader alone.
+#[test]
+fn the_relay_rule_has_a_refusal_case_on_each_side() {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGQUIT, SIGTERM};
+    let relayed = xmustard_core::run_wrapper::relay;
+    let shared = true;
+    let apart = false;
+    let sender = Some(4321);
+    let none = None;
+
+    // A signal a process sent is relayed whatever the signal and whatever the group: that is
+    // the client's timeout and an operator's `kill`, and WS-41 deviation (2) proper.
+    for sig in [SIGHUP, SIGINT, SIGQUIT, SIGTERM] {
+        for group in [shared, apart] {
+            assert!(
+                relayed(sig, sender, group),
+                "signal {sig} sent by a process must be relayed (group shared: {group})"
+            );
+        }
+    }
+    // A terminal-generated SIGINT or SIGQUIT is skipped ONLY when the child is in the wrapper's
+    // group, so the terminal's own group-wide delivery is the one the child already has.
+    for sig in [SIGINT, SIGQUIT] {
+        assert!(
+            !relayed(sig, none, shared),
+            "a terminal-generated {sig} must not be relayed to a child already in the group"
+        );
+        assert!(
+            relayed(sig, none, apart),
+            "a child outside the wrapper's group never got the terminal's {sig}, so relaying \
+             is what keeps the wrapper from orphaning it"
+        );
+    }
+    // SIGHUP is the case the kernel delivers to the session leader ALONE, and SIGTERM the case a
+    // POSIX timer delivers to the wrapper alone with no sender at all: neither reaches the
+    // group, so a shared group says nothing about whether the child has it. Skipping either is
+    // what left a live child unstopped behind a wrapper stuck in drain (WS-FIX-20c).
+    for sig in [SIGHUP, SIGTERM] {
+        for group in [shared, apart] {
+            for from in [sender, none, Some(0)] {
+                assert!(
+                    relayed(sig, from, group),
+                    "{sig} reaches the wrapper alone, so it must be relayed whatever the sender \
+                     ({from:?}) and whatever the group (shared: {group})"
+                );
+            }
+        }
+    }
+    // A filled field naming pid 0 cannot come from `kill(2)`, so it is relayed rather than
+    // treated as a sender-less terminal signal: dropping it would orphan the child.
+    assert!(
+        relayed(SIGINT, Some(0), shared),
+        "an unfilled sender is not evidence the child already has the signal"
     );
 }
