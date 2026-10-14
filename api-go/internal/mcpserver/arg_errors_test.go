@@ -30,9 +30,12 @@ func TestArgumentErrorsAreToolResultsTheAgentCanRead(t *testing.T) {
 		{"impact", map[string]any{"workspace_id": "ws", "bogus": "x"}, "unknown",
 			[]string{`unknown argument "bogus" for tool impact.`, "Arguments of impact: workspace_id, symbol, path, from, to, max_depth (1-32)."}},
 		{"impact", map[string]any{"workspace_id": "ws", "symbol": 3}, "must be a string", []string{`"symbol"`, "must be a string"}},
-		{"search", map[string]any{"workspace_id": "ws", "q": "x", "mode": "regex"}, "must be one of: hybrid, text, pattern",
-			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|text|pattern|symbol), lang, seed, limit (1-50).",
-				"Also accepted (see " + DocsURI + "): cursor, path_glob, kinds, depth, include_body, include_info, substring, max_chars."}},
+		// `regex` became a real mode in WS-59c, so the invalid value here is one the
+		// advertised enum never held; the case still asserts that an enum refusal is a
+		// readable tool result naming every accepted value.
+		{"search", map[string]any{"workspace_id": "ws", "q": "x", "mode": "fuzzy"}, "must be one of: hybrid, text, exact, regex, pattern",
+			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|text|exact|regex|pattern|symbol), lang, seed, limit (1-50).",
+				"Also accepted (see " + DocsURI + "): cursor, path_glob, kinds, depth, include_body, include_info, substring, max_lines, max_bytes, timeout_ms, max_chars."}},
 		{"recall", map[string]any{"workspace_id": "ws", "limit": 0}, "must be between", []string{"must be between 1 and 50 (got 0)"}},
 		{"search", map[string]any{"workspace_id": "ws"}, "required", []string{`missing required argument "q" for search.`, "q (required)"}},
 		{"explain", map[string]any{"workspace_id": "ws", "name": "Add"}, "unknown",

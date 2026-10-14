@@ -37,8 +37,7 @@ func search(w http.ResponseWriter, r *http.Request) {
 	var err error
 	// `pattern` and `symbol` answer from their own surfaces, so they are dispatched
 	// first. The lexical modes share one request. A mode the tool does not advertise is
-	// bad input, not the hybrid by default, so `mode=exact|regex` (WS-59c) cannot answer
-	// silently until it lands.
+	// bad input, not the hybrid by default.
 	switch mode := q.Get("mode"); {
 	case mode == "symbol":
 		// name-path lookup over the code index (WS-36): q is a name path.
@@ -55,14 +54,16 @@ func search(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		result, err = json.Marshal(pat)
-	case mode != "" && mode != workspaceops.SearchModeHybrid && mode != workspaceops.SearchModeText:
+	case mode != "" && !workspaceops.IsSearchMode(mode):
 		respondError(w, fmt.Errorf("mode %q is not a search mode: %w", mode, workspaceops.ErrInvalidInput))
 		return
 	case q.Get("rerank") != "":
 		// The neural lane reranks a plain hybrid search and takes neither `mode` nor
 		// `lang`, so honouring one of them here would answer from a search that never
-		// applied it. Refuse rather than drop the filter silently.
-		if q.Get("mode") == workspaceops.SearchModeText || q.Get("lang") != "" {
+		// applied it. Refuse rather than drop the filter silently. `mode=hybrid` is the
+		// default the flag need not carry, so it composes as it always did; every named
+		// mode (text, exact, regex) and any `lang` are refused.
+		if (q.Get("mode") != "" && q.Get("mode") != workspaceops.SearchModeHybrid) || q.Get("lang") != "" {
 			respondError(w, fmt.Errorf("rerank cannot be combined with %w: rerank does not apply the mode or language filter",
 				workspaceops.ErrInvalidInput))
 			return
@@ -72,11 +73,13 @@ func search(w http.ResponseWriter, r *http.Request) {
 	default:
 		// the default search fuses the agent-feedback boost and records retrieval.
 		// ?seed=<symbol> activates the graph-proximity lane, ?lang= and ?path_glob=
-		// filter, ?mode=text answers from the body lane alone, and ?cursor= continues a
-		// page (next_cursor).
+		// filter, ?mode=text answers from the body lane alone, ?mode=exact|regex scans
+		// the working tree's bytes, and ?cursor= continues a page (next_cursor).
 		result, err = workspaceops.WorkspaceSearchPage(r.Context(), dd, ws, workspaceops.SearchRequest{
 			Query: query, Seed: q.Get("seed"), PathGlob: q.Get("path_glob"), Lang: q.Get("lang"),
 			Mode: q.Get("mode"), Cursor: q.Get("cursor"), Limit: limit,
+			ScanLines: queryInt(r, "max_lines", 0), ScanBytes: queryInt(r, "max_bytes", 0),
+			ScanTimeoutMS: queryInt(r, "timeout_ms", 0),
 		})
 	}
 	reply(w, result, err, respondError)

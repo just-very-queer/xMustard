@@ -158,6 +158,27 @@ var searchLadders = []*Ladder{
 		},
 		More: "next_cursor continues; a longer name path (Container/name) or path_glob narrows the match",
 	},
+	{
+		// `mode=exact|regex` (WS-59c): the scan ranks nothing, so its list is occurrences
+		// and there is no snippet or reason to trim. The first rung drops the two members a
+		// caller can rebuild from `byte` and `len`; the rest reduce the list the same way
+		// the hybrid's does.
+		Shape:   "exact/regex (spans)",
+		Match:   "spans",
+		Lists:   []List{{Member: "spans", GroupBy: "path", Paged: true}},
+		Signals: envelope,
+		Keep:    envelopeKeep,
+		Rungs: []Rung{
+			{Name: "no_positions", List: "spans", Drop: []string{"column", "len"},
+				Doc: "each span keeps path, line and byte; the column within its line and the match length go"},
+			signalCounts,
+			signalFlags,
+			{Name: "trimmed", Op: opFit, List: "spans", Doc: "fewer spans, in file order; next_cursor continues at the first span not returned"},
+			{Name: "counts", Op: opCount, List: "spans", Doc: "spans become spans_by_path"},
+			{Name: "total", Op: opTotal, List: "spans", Doc: "only total, omitted and bytes_scanned remain"},
+		},
+		More: "next_cursor continues; a narrower path_glob or a smaller max_bytes scans less",
+	},
 	fallback,
 }
 

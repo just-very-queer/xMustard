@@ -262,6 +262,13 @@ fn round6(x: f64) -> f64 {
     (x * 1e6).round() / 1e6
 }
 
+/// `serde`'s `skip_serializing_if` for a boolean that stays off unless it is on: `false`
+/// is the default state of a flag that only appears when something was cut, so an
+/// untruncated answer says nothing rather than saying `truncated: false`.
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
     Bm25,
@@ -376,6 +383,26 @@ pub struct SearchResult {
     /// Ranked hits after this page.
     pub omitted: usize,
     pub hits: Vec<SearchHit>,
+    /// Occurrences of the query as written, in `mode=exact|regex` (WS-59c). The scan
+    /// modes rank nothing, so they report every occurrence here and leave `hits` empty;
+    /// the hybrid and text modes report the reverse. One list per mode, not a hit shaped
+    /// half as a span.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::exactscan::Span>,
+    /// Bytes the scan read (WS-59c). Never more than the byte cap, and never more than
+    /// the files it lists, so an answer that stopped short says so by this number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_scanned: Option<u64>,
+    /// The scan did not reach the end of the corpus: a cap fired or a file could not be
+    /// read. Named in `cut` and `degradations`; a scan that finished leaves it false.
+    #[serde(skip_serializing_if = "is_false")]
+    pub truncated: bool,
+    /// Which cap stopped the scan, or the files it could not read (`WS-59c`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cut: Option<crate::exactscan::Cut>,
+    /// Files the scan listed but never opened, because a cap fired first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub files_skipped: Option<u64>,
     /// Lanes or fields this answer lacks, and why.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degradations: Vec<String>,
@@ -390,7 +417,8 @@ pub struct SearchResult {
     pub generated_at: String,
 }
 
-/// Which lanes one search runs (WS-59b: `search mode=hybrid|text`).
+/// Which lanes one search runs (WS-59b: `search mode=hybrid|text`, WS-59c:
+/// `mode=exact|regex`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SearchMode {
     /// The default fusion: bm25 over path/symbols/body, the docs lane, the name,
@@ -401,6 +429,40 @@ pub enum SearchMode {
     /// or the doc chunks. Every hit therefore carries a term in code the query asked
     /// for, which the hybrid's fusion can rank below a name or path match.
     Text,
+    /// The query as written, matched against the working tree's bytes (WS-59c,
+    /// PAR-RET-09). No ranking and no index: every occurrence becomes a span.
+    Exact,
+    /// The query as a regular expression, matched against the working tree's bytes over
+    /// the `regex` crate's linear-time automata (WS-59c, PAR-RET-09).
+    Regex,
+}
+
+impl SearchMode {
+    /// True for the two scan modes, which read the working tree and report spans rather
+    /// than ranking chunks. A closed set gets one predicate, not two comparisons at each
+    /// use.
+    pub fn is_scan(self) -> bool {
+        matches!(self, SearchMode::Exact | SearchMode::Regex)
+    }
+
+    /// The core's CLI spelling of this mode, or None for the default the flag need not
+    /// carry.
+    pub fn flag_value(self) -> Option<&'static str> {
+        match self {
+            SearchMode::Hybrid => None,
+            SearchMode::Text => Some("text"),
+            SearchMode::Exact => Some("exact"),
+            SearchMode::Regex => Some("regex"),
+        }
+    }
+
+    /// The matcher the scan modes compile their query with.
+    pub fn matcher(self) -> crate::exactscan::Matcher {
+        match self {
+            SearchMode::Exact => crate::exactscan::Matcher::Exact,
+            _ => crate::exactscan::Matcher::Regex,
+        }
+    }
 }
 
 /// Search arguments beyond the query.
@@ -416,6 +478,15 @@ pub struct SearchOptions<'a> {
     /// file; a name no file carries matches nothing.
     pub lang: Option<&'a str>,
     pub mode: SearchMode,
+    /// The scan modes' three caps (WS-59c). Zero takes each default; a value past its
+    /// ceiling is refused by `exactscan::limits`, never clamped.
+    pub scan_lines: usize,
+    pub scan_bytes: u64,
+    pub scan_timeout_ms: u64,
+    /// Bytes per positional read in the scan modes. None is the core's own slice size;
+    /// a test sets it to force a read boundary at a chosen offset, because a file large
+    /// enough to cross a real boundary does not fit in a fixture.
+    pub scan_slice: Option<usize>,
 }
 
 /// One candidate of the fused pool. The pool can hold every symbol of a large
@@ -592,7 +663,216 @@ pub fn hybrid_search_for(
     )
 }
 
-/// The full search: a page of the final order under `opts`.
+/// The `mode=exact|regex` scan (WS-59c, PAR-RET-09): the query matched against the
+/// working tree's bytes, under three reported caps.
+///
+/// The lane reads no index table and runs no ranking, so it needs neither `text_index`
+/// nor the fusion below: it lists the files the graph knows, applies the caller's
+/// `path_glob`/`lang` filters through the same `admit` the ranked lanes use (so one
+/// filter cannot mean two things in two modes), and scans each admitted file once,
+/// positionally, releasing it before the next open.
+///
+/// Returns the same `SearchResult` the ranked modes return, with `spans` filled and
+/// `hits` empty, so the Go side and the budget ladder see one result shape.
+fn scan(
+    root: &Path,
+    workspace_id: &str,
+    identity_key: Option<&str>,
+    query: &str,
+    opts: &SearchOptions<'_>,
+) -> SearchResult {
+    let source = symbolgraph::query_source_for(root, workspace_id, identity_key);
+    // the scan reads the working tree and lists it from Git, so it needs the source's
+    // coverage and freshness but not its graph
+    let mut coverage = source.coverage.clone();
+    let mut degradations: Vec<String> = Vec::new();
+    let mut read_errors: Vec<(&str, String)> = Vec::new();
+    // An over-ceiling cap is refused, not clamped: a caller told it may read 32 MiB and
+    // given a 4 MiB bound would read a bounded answer as a complete one. `text_index`
+    // and this are the only two places a search can fail before it answers.
+    let limits =
+        match crate::exactscan::limits(opts.scan_lines, opts.scan_bytes, opts.scan_timeout_ms) {
+            Ok(l) => l,
+            Err(e) => {
+                return SearchResult {
+                    workspace_id: workspace_id.to_string(),
+                    query: query.to_string(),
+                    total: 0,
+                    offset: opts.offset,
+                    omitted: 0,
+                    hits: Vec::new(),
+                    spans: Vec::new(),
+                    bytes_scanned: Some(0),
+                    truncated: true,
+                    cut: None,
+                    files_skipped: None,
+                    degradations: vec![e],
+                    coverage,
+                    freshness: Some(source.freshness([])),
+                    generated_at: now(),
+                };
+            }
+        };
+    let matcher = match crate::exactscan::compile(query, opts.mode.matcher()) {
+        Ok(re) => re,
+        Err(e) => {
+            return SearchResult {
+                workspace_id: workspace_id.to_string(),
+                query: query.to_string(),
+                total: 0,
+                offset: opts.offset,
+                omitted: 0,
+                hits: Vec::new(),
+                spans: Vec::new(),
+                bytes_scanned: Some(0),
+                truncated: false,
+                cut: None,
+                files_skipped: None,
+                degradations: vec![e],
+                coverage,
+                freshness: Some(source.freshness([])),
+                generated_at: now(),
+            };
+        }
+    };
+
+    // The same filters the ranked lanes apply, read once and shared, so `path_glob` and
+    // `lang` cannot mean one thing in the hybrid and another in the scan.
+    let glob = opts
+        .path_glob
+        .filter(|g| !g.is_empty())
+        .map(|g| Glob::compile(g.as_bytes()));
+    let lang = opts
+        .lang
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_ascii_lowercase());
+    let admits_lang = |p: &str| match &lang {
+        None => true,
+        Some(want) => crate::index::lang::Lang::for_path(p).is_some_and(|l| l.name() == want),
+    };
+    let admit = |p: &str| glob.as_ref().is_none_or(|g| g.matches(p.as_bytes())) && admits_lang(p);
+
+    let started = std::time::Instant::now();
+    let mut report = crate::exactscan::Report::default();
+    let mut budget = limits.max_bytes;
+    let mut losses: Vec<crate::exactscan::Loss> = Vec::new();
+    // The scan lists the TRACKED TREE, not the graph's files: the graph carries only the
+    // files a language pack claims, and a grep that skipped `.md`, `.txt`, `.yaml` and a
+    // `.env.example` would answer about code while claiming to answer about a repository.
+    let (listed, listed_paths) = match symbolgraph::tracked_paths(root) {
+        Ok(all) => (all.len() as u64, all),
+        Err(e) => {
+            // No listing means no answer can be complete, and saying so is the whole
+            // point of this lane's `degradations`.
+            read_errors.push(("files", e));
+            (0, Vec::new())
+        }
+    };
+    // `listed` counts what Git listed, BEFORE `admit`: `files_skipped` is a statement
+    // about the corpus the scan was asked about, not about the filter it applied.
+    let mut paths: Vec<String> = listed_paths.into_iter().filter(|p| admit(p)).collect();
+    // Order is Git's own, so the same corpus produces the same bytes twice (the property
+    // `search_hybrid`'s byte-identity test asserts for the hybrid).
+    paths.sort();
+    for rel in &paths {
+        let mut scan_file =
+            match crate::exactscan::FileScan::open_with_slice(root, rel, opts.scan_slice) {
+                Ok(s) => s,
+                Err(loss) => {
+                    report.files_skipped_unreadable += 1;
+                    losses.push(loss);
+                    continue;
+                }
+            };
+        let more = scan_file.scan(&matcher, &limits, &mut budget, &mut report, started);
+        report.files_scanned += 1;
+        // No pass counter is noted for the scan's own reads: `bytes_hashed` counts bytes
+        // fed through a digest, and the scan never makes one (its own `bytes_scanned`
+        // is the count it reports); the stats it does make are noted by the open.
+        if !more {
+            break;
+        }
+    }
+    if report.cut.is_some() {
+        // The corpus is not exhausted, so the files after this one were never opened.
+        report.files_skipped = listed.saturating_sub(report.files_scanned as u64);
+    }
+    for loss in &losses {
+        *coverage
+            .loss_counts
+            .entry(loss.count_key().to_string())
+            .or_default() += 1;
+        coverage.complete = false;
+        degradations.push(loss.message());
+    }
+    if let Some(cut) = report.cut {
+        degradations.push(match cut {
+            crate::exactscan::Cut::Lines => format!(
+                "the scan stopped at its line cap ({} lines); matches after it were not searched",
+                limits.max_lines
+            ),
+            crate::exactscan::Cut::Bytes => format!(
+                "the scan stopped at its byte cap ({} bytes); files after it were not searched",
+                limits.max_bytes
+            ),
+            crate::exactscan::Cut::Time => format!(
+                "the scan stopped at its time cap ({} ms); files after it were not searched",
+                limits.timeout_ms
+            ),
+        });
+    } else if report.files_skipped_unreadable > 0 {
+        degradations.push(format!(
+            "{} file(s) could not be read and were not searched",
+            report.files_skipped_unreadable
+        ));
+    }
+
+    if report.positions_lost > 0 {
+        degradations.push(format!(
+            "{} match(es) were found but their line could not be resolved",
+            report.positions_lost
+        ));
+    }
+    // A page of a scan's spans, by the same `offset`/`limit` the ranked modes use, so one
+    // cursor shape serves every mode.
+    let total = report.spans.len();
+    let page_end = opts.offset.saturating_add(opts.limit.max(1)).min(total);
+    let spans: Vec<crate::exactscan::Span> = report
+        .spans
+        .iter()
+        .skip(opts.offset)
+        .take(opts.limit.max(1))
+        .cloned()
+        .collect();
+    let omitted = total.saturating_sub(page_end);
+
+    for (what, e) in &read_errors {
+        coverage.note_read_error(what, e);
+    }
+    let freshness = source.freshness(spans.iter().map(|s| s.path.as_str()));
+    SearchResult {
+        workspace_id: workspace_id.to_string(),
+        query: query.to_string(),
+        total,
+        offset: opts.offset,
+        omitted,
+        hits: Vec::new(),
+        spans,
+        bytes_scanned: Some(report.bytes_scanned),
+        truncated: report.cut.is_some()
+            || report.files_skipped_unreadable > 0
+            || report.positions_lost > 0,
+        cut: report.cut,
+        files_skipped: (report.files_skipped > 0).then_some(report.files_skipped),
+        degradations,
+        coverage,
+        freshness: Some(freshness),
+        generated_at: now(),
+    }
+}
+
+/// The full search: a page of the final order under `opts`. The two scan modes
+/// (`exact`, `regex`) answer from `scan` above and never reach the fusion below.
 pub fn search(
     root: &Path,
     workspace_id: &str,
@@ -600,6 +880,12 @@ pub fn search(
     query: &str,
     opts: &SearchOptions<'_>,
 ) -> SearchResult {
+    // The scan modes read the working tree, not the index, so they dispatch before any
+    // text lane opens a store: an exact search must not report an index degradation it
+    // never depended on.
+    if opts.mode.is_scan() {
+        return scan(root, workspace_id, identity_key, query, opts);
+    }
     let source = symbolgraph::query_source_for(root, workspace_id, identity_key);
     let graph = source.graph.as_ref();
     let mut coverage = source.coverage.clone();
@@ -638,6 +924,13 @@ pub fn search(
         offset: opts.offset,
         omitted: 0,
         hits: Vec::new(),
+        // the ranked modes never scan, so the scan members stay absent rather than
+        // reporting a budget that was never applied (WS-59c).
+        spans: Vec::new(),
+        bytes_scanned: None,
+        truncated: false,
+        cut: None,
+        files_skipped: None,
         degradations,
         coverage,
         freshness: Some(source.freshness([])),
@@ -1047,6 +1340,12 @@ pub fn search(
         offset: opts.offset,
         omitted,
         hits,
+        // the ranked modes never scan, so the scan members stay absent (WS-59c).
+        spans: Vec::new(),
+        bytes_scanned: None,
+        truncated: false,
+        cut: None,
+        files_skipped: None,
         degradations,
         coverage,
         freshness: Some(freshness),
@@ -1890,5 +2189,463 @@ mod tests {
                 filtered.hits
             );
         }
+    }
+}
+
+/// The `mode=exact|regex` lane's own tests (WS-59c, PAR-RET-09). They sit in their own
+/// module because they assert the SCAN's contract, which is not the fusion's: spans, the
+/// three caps and the scan's degradation names. `git_repo` is the unindexed fixture the
+/// scan needs, and indexing is deliberately NOT done — a scan reads the working tree, so a
+/// test that indexed first would be testing the index.
+#[cfg(test)]
+mod scan_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn git_repo(files: &[(&str, &str)]) -> TempDir {
+        let dir = TempDir::new().unwrap();
+        for (rel, content) in files {
+            if let Some(parent) = Path::new(rel).parent() {
+                std::fs::create_dir_all(dir.path().join(parent)).unwrap();
+            }
+            std::fs::write(dir.path().join(rel), content).unwrap();
+        }
+        for args in [
+            vec!["init", "-q"],
+            vec!["config", "user.email", "t@t"],
+            vec!["config", "user.name", "t"],
+            vec!["add", "-A"],
+            vec!["commit", "-qm", "c"],
+        ] {
+            std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir.path())
+                .args(&args)
+                .output()
+                .unwrap();
+        }
+        dir
+    }
+
+    fn scan_repo(repo: &TempDir, query: &str, mode: SearchMode) -> SearchResult {
+        search(
+            repo.path(),
+            "ws",
+            None,
+            query,
+            &SearchOptions {
+                limit: 50,
+                mode,
+                ..Default::default()
+            },
+        )
+    }
+
+    // The lane's whole point: the query as written, found where it is, once per
+    // occurrence. The oracle is the file's own bytes, not the lane's output: the term is
+    // planted on two known lines of a known file and the span must name both.
+    #[test]
+    fn exact_mode_reports_a_span_per_occurrence_with_its_path_line_byte_and_column() {
+        let repo = git_repo(&[(
+            "svc/handler.go",
+            "package svc\n\nfunc serve() {\n\tzeppelinprobe()\n\tzeppelinprobe()\n}\n",
+        )]);
+        let res = scan_repo(&repo, "zeppelinprobe", SearchMode::Exact);
+        assert_eq!(res.hits.len(), 0, "the scan ranks nothing: {:?}", res.hits);
+        assert_eq!(res.spans.len(), 2, "{:?}", res.spans);
+        assert!(
+            res.spans.iter().all(|s| s.path == "svc/handler.go"),
+            "{:?}",
+            res.spans
+        );
+        // line 4 and line 5, 1-based, in the file as written above
+        assert_eq!(res.spans[0].line, 4, "{:?}", res.spans[0]);
+        assert_eq!(res.spans[1].line, 5, "{:?}", res.spans[1]);
+        assert_eq!(
+            res.spans[0].column, 2,
+            "a tab then the call: {:?}",
+            res.spans[0]
+        );
+        assert_eq!(res.spans[0].len, "zeppelinprobe".len());
+        // `byte` is the file offset, which is what a follow-up positional read takes. The
+        // oracle is the literal: the file's own index_of the first occurrence.
+        let body = "package svc\n\nfunc serve() {\n\tzeppelinprobe()\n\tzeppelinprobe()\n}\n";
+        assert_eq!(
+            res.spans[0].byte,
+            body.find("zeppelinprobe").unwrap(),
+            "{:?}",
+            res.spans[0]
+        );
+        assert!(!res.truncated, "nothing was cut: {:?}", res.degradations);
+        assert_eq!(res.cut, None);
+        // `bytes_scanned` reports what was read, so it covers the whole file that was
+        // scanned: the fixture's length, and no more.
+        let body_len = body.len() as u64;
+        assert_eq!(
+            res.bytes_scanned,
+            Some(body_len),
+            "the scan read the one file it listed"
+        );
+    }
+
+    // A term twice on ONE line is two spans, not one: the lane reports occurrences, so
+    // collapsing them would make a count of occurrences a count of lines.
+    #[test]
+    fn two_occurrences_on_one_line_are_two_spans() {
+        let repo = git_repo(&[("a.txt", "needle and needle again\n")]);
+        let res = scan_repo(&repo, "needle", SearchMode::Exact);
+        assert_eq!(res.spans.len(), 2, "{:?}", res.spans);
+        assert_eq!(
+            res.spans[0].line, res.spans[1].line,
+            "both on line 1: {:?}",
+            res.spans
+        );
+        assert_ne!(res.spans[0].byte, res.spans[1].byte);
+        assert!(res.spans[0].byte < res.spans[1].byte, "ordered by offset");
+    }
+
+    // "Exact" is case-sensitive and matches inside a line, not only at its start. Both
+    // halves matter: an index lane tokenizes and casefolds, so a case-sensitive literal
+    // match is exactly what the indexed lanes cannot do.
+    #[test]
+    fn exact_mode_is_case_sensitive_and_matches_inside_a_line() {
+        let repo = git_repo(&[("a.txt", "let Needle = 1;\nlet needle = 2;\n")]);
+        let upper = scan_repo(&repo, "Needle", SearchMode::Exact);
+        assert_eq!(
+            upper.spans.len(),
+            1,
+            "only the capital N: {:?}",
+            upper.spans
+        );
+        assert_eq!(upper.spans[0].line, 1);
+        let lower = scan_repo(&repo, "needle", SearchMode::Exact);
+        assert_eq!(
+            lower.spans.len(),
+            1,
+            "only the lowercase n: {:?}",
+            lower.spans
+        );
+        assert_eq!(lower.spans[0].line, 2);
+    }
+
+    // A regex the exact lane cannot express. The oracle is the planted value: the span's
+    // line must be the line carrying the digits, and its `len` the digit run's length.
+    #[test]
+    fn regex_mode_matches_what_the_exact_lane_cannot_express() {
+        let repo = git_repo(&[("a.txt", "version 4242 shipped\nversion 7 shipped\n")]);
+        let res = scan_repo(&repo, r"version \d+", SearchMode::Regex);
+        assert_eq!(res.spans.len(), 2, "{:?}", res.spans);
+        assert_eq!(res.spans[0].line, 1);
+        assert_eq!(res.spans[0].len, "version 4242".len());
+        // the exact lane takes the pattern literally, so it finds nothing: this is the
+        // pair that shows the two modes are different surfaces, not two spellings.
+        let exact = scan_repo(&repo, r"version \d+", SearchMode::Exact);
+        assert_eq!(exact.spans.len(), 0, "{:?}", exact.spans);
+    }
+
+    // A pattern the engine refuses is bad input, not a query matching nothing. The lane
+    // reports it and searches nothing, and the reported message carries the engine's own
+    // complaint so a caller can act on it.
+    #[test]
+    fn an_uncompilable_pattern_is_reported_and_searches_nothing() {
+        let repo = git_repo(&[("a.txt", "some text\n")]);
+        let res = scan_repo(&repo, "a(", SearchMode::Regex);
+        assert!(res.spans.is_empty(), "{:?}", res.spans);
+        assert_eq!(res.bytes_scanned, Some(0), "nothing was read");
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("regex pattern is not valid")),
+            "{:?}",
+            res.degradations
+        );
+        assert!(!res.truncated, "a refused query is not a truncated answer");
+    }
+
+    // The line cap is honoured and NAMED. The oracle is the fixture: with a cap of 1 and
+    // three occurrences, exactly one span is listed, `truncated` is true and `cut` says
+    // which cap did it, so a caller reads the bound rather than inferring it.
+    #[test]
+    fn the_line_cap_fires_and_names_itself() {
+        let repo = git_repo(&[("a.txt", "needle\nneedle\nneedle\n")]);
+        let res = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Exact,
+                scan_lines: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(res.spans.len(), 1, "{:?}", res.spans);
+        assert!(res.truncated, "a cap fired: {:?}", res.degradations);
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Lines));
+        assert_eq!(res.total, 1, "only what it listed is counted");
+        assert!(
+            res.degradations.iter().any(|d| d.contains("line cap")),
+            "the cap is named in prose too: {:?}",
+            res.degradations
+        );
+    }
+
+    // The byte cap is honoured and `bytes_scanned` reports what was read, never more than
+    // the cap. The fixture is one file past the cap, so the scan must stop inside it.
+    #[test]
+    fn the_byte_cap_fires_and_bytes_scanned_never_exceeds_it() {
+        let body = "needle ".repeat(400);
+        let repo = git_repo(&[("a.txt", &body)]);
+        let cap = 64u64;
+        let res = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Exact,
+                scan_bytes: cap,
+                ..Default::default()
+            },
+        );
+        assert!(res.truncated, "the cap fired: {:?}", res.degradations);
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        let scanned = res.bytes_scanned.unwrap();
+        assert!(scanned <= cap, "read {scanned} against a {cap}-byte cap");
+        assert!(scanned > 0, "it read something before the cap");
+    }
+
+    // A secret path is never read and never appears in the spans, and it is counted as an
+    // explicit loss rather than skipped silently. This is the guard's refusal path
+    // (§5.1 rule 7): the test asserts the bytes were not searched, not just that they were
+    // absent from the answer.
+    #[test]
+    fn a_secret_path_is_never_read_and_is_an_explicit_loss() {
+        let repo = git_repo(&[
+            ("ok.txt", "needle here\n"),
+            (".env", "NEEDLE=supersecretvalue\n"),
+        ]);
+        let res = scan_repo(&repo, "NEEDLE", SearchMode::Exact);
+        assert!(
+            res.spans.iter().all(|s| s.path != ".env"),
+            "a secret path must never appear in a span: {:?}",
+            res.spans
+        );
+        assert!(
+            res.truncated,
+            "a file could not be read: {:?}",
+            res.degradations
+        );
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains(".env") && d.contains("secret path")),
+            "the loss names the path: {:?}",
+            res.degradations
+        );
+        assert!(
+            res.coverage
+                .loss_counts
+                .get("exact_scan_secret_path")
+                .copied()
+                .unwrap_or(0)
+                >= 1,
+            "the loss is counted under its own key: {:?}",
+            res.coverage.loss_counts
+        );
+    }
+
+    // The filters mean the same thing in the scan as in the hybrid, and the scan invents
+    // nothing: its answer is a subset of the unfiltered one, intersected with the glob.
+    #[test]
+    fn the_scan_composes_with_path_glob_and_lang_and_invents_nothing() {
+        let repo = git_repo(&[
+            (
+                "svc/handler.go",
+                "package svc\n\nfunc serve() { zeppelinprobe() }\n",
+            ),
+            ("src/lib.rs", "pub fn serve() { zeppelinprobe(); }\n"),
+        ]);
+        let all = scan_repo(&repo, "zeppelinprobe", SearchMode::Exact);
+        assert_eq!(all.spans.len(), 2, "{:?}", all.spans);
+        let globbed = search(
+            repo.path(),
+            "ws",
+            None,
+            "zeppelinprobe",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Exact,
+                path_glob: Some("**/*.go"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(globbed.spans.len(), 1, "{:?}", globbed.spans);
+        assert!(
+            globbed.spans[0].path.ends_with(".go"),
+            "{:?}",
+            globbed.spans
+        );
+        let rust_only = search(
+            repo.path(),
+            "ws",
+            None,
+            "zeppelinprobe",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Exact,
+                lang: Some("rust"),
+                ..Default::default()
+            },
+        );
+        assert_eq!(rust_only.spans.len(), 1, "{:?}", rust_only.spans);
+        assert!(
+            rust_only.spans[0].path.ends_with(".rs"),
+            "{:?}",
+            rust_only.spans
+        );
+    }
+
+    // An over-ceiling cap is refused by the library boundary, and the refusal reaches the
+    // caller as a degradation rather than a clamped scan.
+    #[test]
+    fn an_over_ceiling_cap_is_refused_and_searches_nothing() {
+        let repo = git_repo(&[("a.txt", "needle\n")]);
+        let res = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Exact,
+                scan_bytes: crate::exactscan::DEFAULT_MAX_BYTES + 1,
+                ..Default::default()
+            },
+        );
+        assert!(res.spans.is_empty(), "{:?}", res.spans);
+        assert_eq!(res.bytes_scanned, Some(0), "nothing was read");
+        assert!(
+            res.degradations.iter().any(|d| d.contains("max_bytes")),
+            "{:?}",
+            res.degradations
+        );
+    }
+
+    // The scan reads the working tree, not the index: an unindexed repository answers, and
+    // it reports no index degradation because it never opened a store. This is the shape
+    // `search`'s own docs promise for the ranked lanes, inverted.
+    #[test]
+    fn the_scan_answers_from_an_unindexed_repository_without_an_index_degradation() {
+        let repo = git_repo(&[("a.txt", "needle\n")]);
+        let res = scan_repo(&repo, "needle", SearchMode::Exact);
+        assert_eq!(res.spans.len(), 1, "{:?}", res.spans);
+        assert!(
+            !res.degradations.iter().any(|d| d.contains("bm25")),
+            "a scan did not run a text lane, so it owes no bm25 degradation: {:?}",
+            res.degradations
+        );
+    }
+
+    // The scan lists the TRACKED TREE, not the files a language pack claims. `.txt` is not
+    // in any pack, so a scan that took its file list from the symbol graph would find
+    // nothing here — and a grep that cannot reach a README, a Makefile, a `.yaml` or a
+    // `.env.example` is not a grep. This is the case that decides the listing source, and
+    // it is why `tracked_paths` exists.
+    #[test]
+    fn the_scan_reaches_a_file_no_language_pack_claims() {
+        let repo = git_repo(&[
+            ("notes.txt", "needle in plain text\n"),
+            ("config.yaml", "key: needle\n"),
+            ("src/lib.rs", "pub fn f() {}\n"),
+        ]);
+        let res = scan_repo(&repo, "needle", SearchMode::Exact);
+        let mut paths: Vec<&str> = res.spans.iter().map(|s| s.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec!["config.yaml", "notes.txt"],
+            "the scan must reach files outside the language packs: {:?}",
+            res.degradations
+        );
+    }
+
+    // The same inputs produce the same bytes twice. A scan's order comes from Git's own file
+    // order, and this is the property the retrieval gate and the hybrid's own
+    // byte-identity test rely on.
+    #[test]
+    fn the_scan_is_byte_identical_across_runs() {
+        let repo = git_repo(&[
+            ("b.txt", "needle b\n"),
+            ("a.txt", "needle a\n"),
+            ("c.txt", "needle c\n"),
+        ]);
+        let one = scan_repo(&repo, "needle", SearchMode::Exact);
+        let two = scan_repo(&repo, "needle", SearchMode::Exact);
+        assert_eq!(one.spans, two.spans, "the same corpus, the same spans");
+    }
+
+    // The scan reads bytes without feeding them through a digest, so both hash counters
+    // remain zero. Its own bytes_scanned member is the read count for this lane.
+    #[test]
+    fn its_pass_counters_show_it_stats_its_opens_and_hashes_nothing() {
+        let repo = git_repo(&[
+            ("a.go", "needle\n"),
+            ("b.go", "needle\n"),
+            ("c.txt", "needle\n"),
+        ]);
+        let call = crate::passcount::Call::begin();
+        let r = scan_repo(&repo, "needle", SearchMode::Exact);
+        let counts = call.counts();
+        drop(call);
+        assert_eq!(r.spans.len(), 3, "{:?}", r.spans);
+        assert_eq!(
+            counts.get(crate::passcount::Pass::FilesHashed),
+            0,
+            "the scan hashes nothing: {:?}",
+            counts
+        );
+        assert_eq!(
+            counts.get(crate::passcount::Pass::BytesHashed),
+            0,
+            "the scan does not hold the hashing counters: {:?}",
+            counts
+        );
+        assert_eq!(
+            r.bytes_scanned,
+            Some(21),
+            "three 7-byte files, each read once"
+        );
+    }
+
+    // A match carried from the prior slice is not reported twice, and one that straddles
+    // the boundary is still found. `scan_slice: Some(64)` forces both cases into two reads.
+    #[test]
+    fn a_match_across_a_read_boundary_is_found_once() {
+        let body = format!("needle{}needle{}", "x".repeat(54), "\n");
+        let repo = git_repo(&[("a.txt", &body)]);
+        let res = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Exact,
+                // the slice size, not the cap, is what forces the boundary: the needle
+                // runs 60..66 and the slice ends at 64
+                scan_slice: Some(64),
+                ..Default::default()
+            },
+        );
+        assert!(
+            res.bytes_scanned.unwrap() > 64,
+            "the fixture must really read past the first slice, or it proves nothing: {:?}",
+            res
+        );
+        let found: Vec<usize> = res.spans.iter().map(|s| s.byte).collect();
+        assert_eq!(found, vec![0, 60], "each planted match is reported once");
     }
 }

@@ -660,7 +660,8 @@ fn identity_flag(args: Args) -> (Option<String>, Args) {
 
 fn search(args: Args) -> CmdResult {
     let usage = "xmustard-core search [--identity-key=K] [--offset=N] [--path-glob=GLOB] \
-                 [--lang=LANG] [--mode=hybrid|text] <root> <workspace_id> <query> [limit] [seed]";
+                 [--lang=LANG] [--mode=hybrid|text|exact|regex] [--max-lines=N] [--max-bytes=N] \
+                 [--timeout-ms=N] <root> <workspace_id> <query> [limit] [seed]";
     let (key, args) = identity_flag(args);
     // `--name=value` flags lead; the first other argument ends them, so a query or seed
     // symbol that looks like a flag is never read as one.
@@ -669,6 +670,7 @@ fn search(args: Args) -> CmdResult {
     let mut args = flags.split_off(lead).into_iter();
     let (mut offset, mut path_glob) = (0usize, None::<String>);
     let (mut lang, mut mode) = (None::<String>, None::<String>);
+    let (mut max_lines, mut max_bytes, mut timeout_ms) = (0usize, 0u64, 0u64);
     for flag in flags {
         match flag.split_once('=') {
             Some(("--offset", n)) => {
@@ -679,6 +681,21 @@ fn search(args: Args) -> CmdResult {
             Some(("--path-glob", g)) => path_glob = Some(g.to_string()),
             Some(("--lang", l)) => lang = Some(l.to_string()),
             Some(("--mode", m)) => mode = Some(m.to_string()),
+            Some(("--max-lines", n)) => {
+                max_lines = n.parse().map_err(|_| {
+                    CmdError::new(2, format!("search: bad --max-lines {n}\n{usage}"))
+                })?
+            }
+            Some(("--max-bytes", n)) => {
+                max_bytes = n.parse().map_err(|_| {
+                    CmdError::new(2, format!("search: bad --max-bytes {n}\n{usage}"))
+                })?
+            }
+            Some(("--timeout-ms", n)) => {
+                timeout_ms = n.parse().map_err(|_| {
+                    CmdError::new(2, format!("search: bad --timeout-ms {n}\n{usage}"))
+                })?
+            }
             _ => {
                 return Err(CmdError::new(
                     2,
@@ -690,6 +707,8 @@ fn search(args: Args) -> CmdResult {
     let mode = match mode.as_deref() {
         None | Some("hybrid") => SearchMode::Hybrid,
         Some("text") => SearchMode::Text,
+        Some("exact") => SearchMode::Exact,
+        Some("regex") => SearchMode::Regex,
         Some(other) => {
             return Err(CmdError::new(
                 2,
@@ -718,6 +737,15 @@ fn search(args: Args) -> CmdResult {
             path_glob: path_glob.as_deref(),
             lang: lang.as_deref(),
             mode,
+            scan_lines: max_lines,
+            scan_bytes: max_bytes,
+            scan_timeout_ms: timeout_ms,
+            // The read size is the core's own; only a test forces a smaller one. Spelled
+            // out rather than left to `..Default::default()` because this literal is the
+            // one place a new `SearchOptions` field can break the CLI: a field added to
+            // the struct and to the library tests left THIS binary uncompilable, and only
+            // a `--lib` test run had been green.
+            scan_slice: None,
         },
     ))
 }
