@@ -1,0 +1,59 @@
+{
+  "description": "xMustard hook client (WS-40c-b). Cursor has no http and no mcp_tool hook type, so every event spawns xmustard-cursor, which posts the event to the daemon and prints the answer. failClosed is false and the client exits non-zero and never 2 on a failure, so a stopped daemon, an unreadable event or a repository outside the token's workspaces costs an unreduced tool result and never the user's tool call. Only updated_mcp_tool_output is replaced, and only for MCP tools: a Cursor built-in (Shell, Read, Grep, Write, Task) is observed and left as Cursor produced it. preToolUse is registered for Shell alone, because updated_input is documented on the generic hook but is reported to be discarded outside Write and Task.",
+  "hooks": {
+    "sessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-cursor sessionStart",
+            "failClosed": false,
+            "loop_limit": 5,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "preToolUse": [
+      {
+        "matcher": "Shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-cursor preToolUse",
+            "failClosed": false,
+            "loop_limit": 5,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "postToolUse": [
+      {
+        "matcher": "MCP:.+",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-cursor postToolUse",
+            "failClosed": false,
+            "loop_limit": 5,
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "preCompact": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "xmustard-cursor preCompact",
+            "failClosed": false,
+            "loop_limit": 5,
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

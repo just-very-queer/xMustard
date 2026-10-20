@@ -77,9 +77,13 @@ var clientPolicies = map[string]ClientPolicy{
 	// additionalContextLimit defaults to 2,500 tokens and never raises the spill limit
 	"codex": {Client: "codex", Target: CodexHookTextBytes - codexFooterReserve, MaxChars: CodexHookTextBytes, MaxUnit: UnitBytes,
 		ContextTokens: 2500, Replacement: "PostToolUse decision=block reason", shaper: codexShaper{}},
-	// Cursor replaces MCP results only (updated_mcp_tool_output); built-ins are observe-only
-	"cursor": {Client: "cursor", Target: 16 << 10, MaxChars: 30000, Replacement: "postToolUse updated_mcp_tool_output (MCP tools only)",
-		shaper: cursorShaper{}},
+	// Cursor replaces MCP results only (updated_mcp_tool_output); built-ins are observe-only.
+	// ContextChars is Cursor's own additional_context cap, measured from the installed
+	// 3.22.7 bundle (limits.ts, Cbt=1e4): the injector throws rather than truncating, so an
+	// over-cap answer is dropped whole and the cap is a ceiling the shaper must respect.
+	"cursor": {Client: "cursor", Target: 16 << 10, MaxChars: 30000, ContextChars: 10000,
+		Replacement: "postToolUse updated_mcp_tool_output (MCP tools only)",
+		shaper:      cursorShaper{}},
 	// Pi truncates its own tool output at 50 KB / 2,000 lines
 	"pi": {Client: "pi", Target: 32 << 10, MaxChars: 50000, Replacement: "tool_result {content, details, isError}", shaper: piShaper{}},
 	// OpenCode: the plugin's tool execute.after hook replaces the model-visible text

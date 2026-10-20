@@ -587,8 +587,38 @@ func TestPolicyTableLowersTargets(t *testing.T) {
 		}
 	}
 	if PolicyFor("claude").ContextChars != 10000 || PolicyFor("codex").ContextTokens != 2500 || PolicyFor("letta").MaxChars != 30000 ||
+		PolicyFor("cursor").ContextChars != 10000 ||
 		PolicyFor("unknown").Client != "http" {
 		t.Fatalf("policy table drifted")
+	}
+}
+
+// A client that sets neither ContextChars nor ContextTokens leaves injected context
+// whole (WS-40c-a's finding, and the branch a policy value now selects). A policy
+// that stops setting both would leave an injection uncapped, so the branch is
+// pinned here rather than left to whichever client happens to omit both.
+func TestCapContextLeavesTextWholeWhenNeitherLimitIsSet(t *testing.T) {
+	uncapped := ClientPolicy{Client: "test", MaxChars: 30000}
+	long := strings.Repeat("x", 25000)
+	if got := uncapped.capContext(long); got != long {
+		t.Fatalf("a policy with no context limit must leave the text whole, got %d chars", len([]rune(got)))
+	}
+	if got := uncapped.capContext("short"); got != "short" {
+		t.Fatalf("a policy with no context limit must leave a short text alone, got %q", got)
+	}
+	capped := ClientPolicy{Client: "cursor", ContextChars: 10000, MaxChars: 30000}
+	if got := capped.capContext(long); len([]rune(got)) != 10000 {
+		t.Fatalf("ContextChars 10000 must cap at 10000 characters, got %d", len([]rune(got)))
+	}
+	// A token-limited client is bounded at three characters per token, and a
+	// byte-measured one cuts on a rune boundary.
+	tokens := ClientPolicy{Client: "codex", ContextTokens: 2500, MaxChars: 15360}
+	if got := tokens.capContext(long); len([]rune(got)) != 7500 {
+		t.Fatalf("ContextTokens 2500 must cap at 7500 characters, got %d", len([]rune(got)))
+	}
+	bytes := ClientPolicy{Client: "opencode", ContextChars: 100, MaxUnit: UnitBytes, MaxChars: 51200}
+	if got := bytes.capContext("é" + strings.Repeat("x", 200)); len(got) != 100 {
+		t.Fatalf("a byte-measured cap must cut at 100 bytes, got %d", len(got))
 	}
 }
 
