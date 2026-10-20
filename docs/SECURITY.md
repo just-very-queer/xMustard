@@ -1105,6 +1105,10 @@ whether `XMUSTARD_READ_ONLY=1` still serves the route.
 | `POST /api/hooks/codex/SubagentStart` | core | proposer | served |  | hook: the same context for a subagent, which has steering state of its own |
 | `POST /api/hooks/codex/SubagentStop` | core | proposer | served |  | hook: queued; answered at once |
 | `POST /api/hooks/codex/UserPromptSubmit` | core | proposer | served |  | hook: memories a prompt keyword triggers |
+| `POST /api/hooks/cursor/postToolUse` | core | proposer | served |  | hook: captures the caller's own tool output; updated_mcp_tool_output for an MCP tool |
+| `POST /api/hooks/cursor/preCompact` | core | proposer | served |  | hook: queued; answered at once; the ledger takes the compaction snapshot |
+| `POST /api/hooks/cursor/preToolUse` | core | proposer | served |  | hook: index hits and memories for a search pattern or a file |
+| `POST /api/hooks/cursor/sessionStart` | core | proposer | served |  | hook: ground's spawn-free part and core-tier memories as context |
 | `GET /api/workspaces` | core | reader | served |  | filtered by token scope and workspace allowlist |
 | `POST /api/workspaces/load` | core | proposer | refused |  | workspace registration; below admin only a git work tree top level under XMUSTARD_REGISTER_ROOTS; id checked against the allowlist and token scope |
 | `GET /api/workspaces/{workspace_id}/changes/since-index` | core | reader | served | impact |  |

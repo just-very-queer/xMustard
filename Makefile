@@ -14,7 +14,7 @@ BINDIR := $(PREFIX)/bin
 .PHONY: release release-sums
 
 build:
-	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay
+	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay --bin xmustard-cursor
 	cd api-go && go build -o bin/xmustard-api ./cmd/xmustard-api
 	cd api-go && go build -o bin/xmustard-mcp ./cmd/xmustard-mcp
 	cd api-go && go build -o bin/xmustard-ops ./cmd/xmustard-ops
@@ -24,6 +24,7 @@ install: build
 	install -d "$(BINDIR)"
 	install -m 0755 rust-core/target/release/xmustard-core "$(BINDIR)/xmustard-core"
 	install -m 0755 rust-core/target/release/xmustard-relay "$(BINDIR)/xmustard-relay"
+	install -m 0755 rust-core/target/release/xmustard-cursor "$(BINDIR)/xmustard-cursor"
 	install -m 0755 api-go/bin/xmustard-api "$(BINDIR)/xmustard-api"
 	install -m 0755 api-go/bin/xmustard-mcp "$(BINDIR)/xmustard-mcp"
 	install -m 0755 api-go/bin/xmustard-ops "$(BINDIR)/xmustard-ops"
@@ -49,7 +50,7 @@ VERSION := $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 SOURCE_DATE := $(shell TZ=UTC0 git log -1 --format=%cd --date=format-local:%Y%m%d%H%M.%S 2>/dev/null)
 RELEASE_NAME := xmustard-$(VERSION)-$(shell uname -s | tr '[:upper:]' '[:lower:]')-$(shell uname -m)
 RELEASE_DIR := $(abspath $(DIST))/$(RELEASE_NAME)
-RUST_BINS := xmustard-core xmustard-relay
+RUST_BINS := xmustard-core xmustard-relay xmustard-cursor
 GO_BINS := xmustard-api xmustard-mcp xmustard-ops xmustard-hook
 RELEASE_FILES := $(sort LICENSE $(RUST_BINS) $(GO_BINS))
 

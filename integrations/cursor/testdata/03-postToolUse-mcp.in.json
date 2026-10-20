@@ -1,0 +1,1 @@
+{"hook_event_name":"postToolUse","tool_name":"MCP:recall","tool_input":{"q":"auth","limit":5},"tool_output":"{\"content\":[{\"type\":\"text\",\"text\":\"line 1\\nline 2\\n\"}],\"isError\":false}","tool_use_id":"tu-2","duration_ms":42,"cwd":"/repo","conversation_id":"conv-abc","generation_id":"gen-1","cursor_version":"3.22.7","workspace_roots":["/repo"]}

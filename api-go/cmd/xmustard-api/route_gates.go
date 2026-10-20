@@ -139,6 +139,12 @@ var routeGateTable = map[string]routeGate{
 	"POST /api/hooks/codex/SubagentStop":     hookGate("queued; answered at once"),
 	"POST /api/hooks/codex/SessionEnd":       hookGate("queued; answered at once"),
 
+	// --- core: Cursor hook service (hooks_routes.go, WS-40c-b; posted by xmustard-cursor) ---
+	"POST /api/hooks/cursor/sessionStart": hookGate("ground's spawn-free part and core-tier memories as context"),
+	"POST /api/hooks/cursor/preToolUse":   hookGate("index hits and memories for a search pattern or a file"),
+	"POST /api/hooks/cursor/postToolUse":  hookGate("captures the caller's own tool output; updated_mcp_tool_output for an MCP tool"),
+	"POST /api/hooks/cursor/preCompact":   hookGate("queued; answered at once; the ledger takes the compaction snapshot"),
+
 	// --- platform: operator configuration ---
 	"GET /api/runtimes":                platformGate(roleReader, ""),
 	"GET /api/settings":                platformGate(roleReader, ""),

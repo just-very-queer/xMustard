@@ -5,6 +5,7 @@
 #![forbid(unsafe_code)]
 
 pub mod changetrack;
+pub mod cursorhook;
 pub mod diagnostics;
 pub mod dispatch;
 pub mod exactscan;

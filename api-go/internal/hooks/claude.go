@@ -42,7 +42,11 @@ const (
 // Event is one Claude Code hook event the service answers.
 type Event struct {
 	Name string
-	Mode Mode
+	// Handler names the shared handler that answers this event, for a client whose own
+	// event name is not the daemon's (Cursor's "postToolUse" is the "PostToolUse"
+	// handler). Empty means the handler is the event's own name.
+	Handler string
+	Mode    Mode
 	// Context says whether the event's output may carry additionalContext.
 	Context bool
 	// WatchPaths says whether the event's output may carry watchPaths. Claude Code
@@ -51,6 +55,15 @@ type Event struct {
 	WatchPaths bool
 	// Replaces says whether the event's output may carry updatedToolOutput.
 	Replaces bool
+}
+
+// Key returns the name of the handler that answers this event: the Handler when the
+// client names the event differently, else the event's own name.
+func (e Event) Key() string {
+	if e.Handler != "" {
+		return e.Handler
+	}
+	return e.Name
 }
 
 // Events is the table of Claude Code events with a route. WorktreeCreate is absent on
@@ -82,14 +95,17 @@ func EventByName(name string) (Event, bool) { return Claude.Event(name) }
 // here: PostToolUse capture stream-decodes the body itself (evidence.DecodeHookBody),
 // and a batch's responses are never needed.
 type Input struct {
-	SessionID string    `json:"session_id"`
-	Cwd       string    `json:"cwd"`
-	Event     string    `json:"hook_event_name"`
-	AgentID   string    `json:"agent_id"`
-	AgentType string    `json:"agent_type"`
-	ToolName  string    `json:"tool_name"`
-	ToolInput ToolInput `json:"tool_input"`
-	ToolUseID string    `json:"tool_use_id"`
+	SessionID string `json:"session_id"`
+	// ConversationID is Cursor's session id: Cursor names its session the way it
+	// names everything else, and the daemon's steering state is keyed on it.
+	ConversationID string    `json:"conversation_id"`
+	Cwd            string    `json:"cwd"`
+	Event          string    `json:"hook_event_name"`
+	AgentID        string    `json:"agent_id"`
+	AgentType      string    `json:"agent_type"`
+	ToolName       string    `json:"tool_name"`
+	ToolInput      ToolInput `json:"tool_input"`
+	ToolUseID      string    `json:"tool_use_id"`
 	// Prompt is UserPromptSubmit's submitted text.
 	Prompt string `json:"prompt"`
 	// Source is SessionStart's startup, resume, clear, compact or fork.
@@ -111,6 +127,16 @@ type Input struct {
 	TranscriptPath string `json:"transcript_path"`
 	// ToolCalls is PostToolBatch's batch.
 	ToolCalls []BatchCall `json:"tool_calls"`
+}
+
+// Session returns the session the event belongs to: the session id each client names
+// it by (Claude Code and Codex "session_id", Cursor "conversation_id"). A body that
+// names neither has no session, and the steering state it reaches is a throwaway one.
+func (i Input) Session() string {
+	if i.SessionID != "" {
+		return i.SessionID
+	}
+	return i.ConversationID
 }
 
 // ToolInput is the part of a tool's input the service reads. A Write's content or an

@@ -8,12 +8,13 @@
  },
  "process_roles": {
   "about": "Registered roots carry their own component. Descendants are matched by executable name (first matching rule wins; argv1 narrows a rule to a subcommand). Unknown descendants of owned processes count as owned (unclassified:<exe>). External rules and everything below them are never counted in the gate. owned_binaries are pulled in from agent trees: an xMustard binary an agent launched (hook client, shim, relay) counts toward the gate (§12.4 item on hook-client accounting).",
-  "owned_binaries": ["xmustard-api", "xmustard-mcp", "xmustard-core", "xmustard-ops", "xmustard-hook", "xmustard-relay", "xmustard-eval"],
+  "owned_binaries": ["xmustard-api", "xmustard-mcp", "xmustard-core", "xmustard-ops", "xmustard-hook", "xmustard-cursor", "xmustard-relay", "xmustard-eval"],
   "rules": [
    {"exe": ["xmustard-api"], "component": "go_daemon", "class": "owned"},
    {"exe": ["xmustard-mcp"], "component": "mcp_access", "class": "owned", "note": "stdio Go shim; transitional until WS-13 serves MCP over HTTP"},
    {"exe": ["xmustard-relay"], "component": "mcp_access", "class": "owned"},
    {"exe": ["xmustard-hook"], "component": "hook_client", "class": "owned"},
+   {"exe": ["xmustard-cursor"], "component": "hook_client", "class": "owned", "note": "the Cursor command hook client (WS-40c): Cursor spawns it per event, so it is the hook client the gate counts"},
    {"exe": ["xmustard-ops", "xmustard-eval"], "component": "ops_cli", "class": "owned"},
    {"exe": ["xmustard-core"], "argv1": ["serve"], "component": "rust_index_service", "class": "owned"},
    {"exe": ["xmustard-core"], "component": "rust_core_per_call", "class": "owned", "note": "per-call core children today; the heavy-slot worker after WS-02/WS-14"},

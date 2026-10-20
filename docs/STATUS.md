@@ -284,14 +284,39 @@ first-parent merge commit on `feat/parity-v2`.
   same confidence tiers, provenance and drop counters as the Go and TS/JS resolvers.
   Measurements in [WS-39](benchmarks/2026-09-30-ws39-resolvers.md).
 
+- **WS-38c-b** (`c9c5a498`): execution flows. `index flows` lists a repository's entry
+  points, scores them by callers over callees, and walks the retained reachability set
+  from each seed, with every bound published in the answer.
+- **WS-59c** (`8fb929c8`): `search mode=exact|regex`. The two modes read the working
+  tree's bytes through the existing pread primitive and match them against the query,
+  under three independent caps (reported lines, scanned bytes, elapsed time). The answer
+  says what it did not scan, so a partial answer never reads as a complete one.
+- **WS-RT18** (`582bb797`): the Git index reader. The source identity, change tracking
+  and the index scan read `.git/index` in-process and start no Git child that loads it;
+  their answers equal the Git path's. A repository whose `core.ignorecase` is true is
+  refused, which is what a case-insensitive volume (macOS) reports: **WS-RT18b** is the
+  follow-up, and the gitindex tests cannot pass on a Mac until it lands.
+- **WS-FIX-20c** (`fe1d74db`): the run wrapper's signal relay. SIGHUP is relayed
+  whatever its origin, and a terminal Ctrl-C reaches the child **once** (the wrapper
+  relays only a signal a process sent), so a child that traps SIGINT does not run its
+  handler twice per keystroke.
+- **WS-40c** (`990a40f7`): the Cursor adapter. The daemon answers Cursor's four events
+  in Cursor's schema (`/api/hooks/cursor/<event>`, one gate row each), and the Rust
+  command client `xmustard-cursor` posts to it, failing open: a stopped daemon, an
+  unreadable event or a repository outside the token's workspaces costs an unreduced
+  tool result and never the user's tool call.
+
 **On workstream branches, not yet merged**
 
-- None. Every workstream started through 2026-09-30 is merged; the next batch is the
-  parity plan's Phase A to Phase D hygiene and review-finding rows, tracked in the plan.
+- WS-RT16 (the behind-index overlay): the branch is WIP and does not compile — its
+  `OverlayGraph` is "still to write" — so it is not merged. Its plan section is in the
+  parity plan.
 
 **Planned**
 
 - WS-21B: hardening for `why_failed` command mode.
+- WS-RT18b: the Git index reader on a case-insensitive volume (`core.ignorecase=true`),
+  which is what keeps the gitindex tests red on macOS.
 - A large-result fixture for the Pi adapter e2e (WS-24 follow-up; WS-41 removed the
   `run --` dependency, the fixture itself is still missing).
 - Wave 3, including WS-50 (the parity evaluation suite and final parity-scale gate).

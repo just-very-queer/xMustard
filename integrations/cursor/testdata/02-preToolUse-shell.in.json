@@ -1,0 +1,1 @@
+{"hook_event_name":"preToolUse","tool_name":"Shell","tool_input":{"command":"rg -n TODO api-go","working_directory":"/repo"},"tool_use_id":"tu-1","cwd":"/repo","conversation_id":"conv-abc","generation_id":"gen-1","cursor_version":"3.22.7","workspace_roots":["/repo"]}
