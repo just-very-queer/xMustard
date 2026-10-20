@@ -174,17 +174,15 @@ impl Config {
         // it would end that header and start another (WS-40c-b r1-4). The token is
         // checked here, before it can reach the request; the pin is a workspace id,
         // whose own rule admits no such character.
-        if let Some(t) = &token {
-            if !valid_header_value(t) {
-                return Err(
-                    "XMUSTARD_API_TOKEN holds a character that cannot go in a header".into(),
-                );
-            }
+        if let Some(t) = &token
+            && !valid_header_value(t)
+        {
+            return Err("XMUSTARD_API_TOKEN holds a character that cannot go in a header".into());
         }
-        if let Some(w) = &workspace {
-            if !cursorhook::valid_workspace_id(w) {
-                return Err(format!("{w} is not a workspace id"));
-            }
+        if let Some(w) = &workspace
+            && !cursorhook::valid_workspace_id(w)
+        {
+            return Err(format!("{w} is not a workspace id"));
         }
         // plain http:// carries the bearer token in cleartext: loopback only, unless
         // the operator opts in (a TLS-terminating proxy on another host is their call)
