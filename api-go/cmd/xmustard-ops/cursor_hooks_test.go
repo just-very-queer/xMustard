@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"xmustard/api-go/internal/hooks"
+	"xmustard/api-go/internal/mcpserver"
 )
 
 // cursorHooksFile is the shape config prints, read back so the test asserts the
@@ -129,5 +130,94 @@ func TestTheShippedCursorHooksFileIsTheGeneratedOne(t *testing.T) {
 	if strings.Count(string(shipped), `"failClosed"`) != len(hooks.CursorEvents) {
 		t.Errorf("the shipped file states the failure policy %d times, want %d",
 			strings.Count(string(shipped), `"failClosed"`), len(hooks.CursorEvents))
+	}
+}
+
+// install writes the file where Cursor loads it, and keeps a backup of the one it
+// replaces.
+func TestCursorHooksInstallWritesTheFileAndKeepsABackup(t *testing.T) {
+	root := t.TempDir()
+	var out, errOut bytes.Buffer
+	e := opsEnv{stdout: &out, stderr: &errOut, getenv: func(string) string { return "" }}
+	if code := runCursorHooks(e, []string{"install", "--root", root}); code != 0 {
+		t.Fatalf("install: exit %d\n%s", code, errOut.String())
+	}
+	path := filepath.Join(root, ".cursor", "hooks.json")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A root pins the file to that root's workspace: the daemon binds the event to
+	// the repository the file names.
+	pin := mcpserver.WorkspaceIDForPath(filepath.Clean(root))
+	if !bytes.Equal(body, hooks.CursorHooksJSON(hooks.CursorClient, pin)) {
+		t.Fatalf("the installed file is not the generated one:\n%s", body)
+	}
+	// Installing again replaces xMustard's own file and keeps a backup of it.
+	if err := os.WriteFile(path, []byte("{\"hooks\":{}}\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if code := runCursorHooks(e, []string{"install", "--root", root}); code != 0 {
+		t.Fatalf("the second install: exit %d\n%s", code, errOut.String())
+	}
+	backup, err := os.ReadFile(path + ".bak")
+	if err != nil {
+		t.Fatalf("the install kept no backup: %v", err)
+	}
+	if !bytes.Equal(backup, []byte("{\"hooks\":{}}\n")) {
+		t.Errorf("the backup is %q, want the file that was there", backup)
+	}
+}
+
+// A file that holds hooks xMustard did not write is the user's, and the install
+// refuses it rather than taking those away.
+func TestCursorHooksInstallRefusesAForeignFile(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, ".cursor", "hooks.json")
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	foreign := []byte(`{"hooks":{"postToolUse":[{"hooks":[{"type":"command","command":"/usr/local/bin/other-tool"}]}]}}`)
+	if err := os.WriteFile(path, foreign, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var out, errOut bytes.Buffer
+	e := opsEnv{stdout: &out, stderr: &errOut, getenv: func(string) string { return "" }}
+	if code := runCursorHooks(e, []string{"install", "--root", root}); code == 0 {
+		t.Fatal("the install overwrote a file with hooks xMustard did not write")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, foreign) {
+		t.Errorf("the file was changed: %s", after)
+	}
+}
+
+// status reports what Cursor would load, and uninstall removes xMustard's file.
+func TestCursorHooksStatusAndUninstall(t *testing.T) {
+	root := t.TempDir()
+	var out, errOut bytes.Buffer
+	e := opsEnv{stdout: &out, stderr: &errOut, getenv: func(string) string { return "" }}
+	// Nothing installed yet.
+	if code := runCursorHooks(e, []string{"status", "--root", root}); code != exitNeedsUser {
+		t.Fatalf("status with nothing installed: exit %d", code)
+	}
+	if code := runCursorHooks(e, []string{"install", "--root", root}); code != 0 {
+		t.Fatalf("install: exit %d\n%s", code, errOut.String())
+	}
+	out.Reset()
+	if code := runCursorHooks(e, []string{"status", "--root", root}); code != 0 {
+		t.Fatalf("status after the install: exit %d\n%s", code, errOut.String())
+	}
+	if !strings.Contains(out.String(), "4 xMustard hooks") {
+		t.Errorf("status says %q", out.String())
+	}
+	if code := runCursorHooks(e, []string{"uninstall", "--root", root}); code != 0 {
+		t.Fatalf("uninstall: exit %d\n%s", code, errOut.String())
+	}
+	if _, err := os.Stat(filepath.Join(root, ".cursor", "hooks.json")); !os.IsNotExist(err) {
+		t.Errorf("the file is still there: %v", err)
 	}
 }

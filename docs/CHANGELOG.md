@@ -14,8 +14,10 @@ review are listed in [Status](STATUS.md#in-progress).
   four events — `sessionStart`, `preToolUse`, `postToolUse` and `preCompact` — in
   Cursor's own schema on `/api/hooks/cursor/<event>`, one gate row each. The command
   hook client `xmustard-cursor` (Rust, shipped in the release archive) posts the
-  event and prints the answer, and `xmustard-ops cursor-hooks config` writes the
-  `hooks.json` that installs it, with an optional workspace pin. The client **fails
+  event and prints the answer, and `xmustard-ops cursor-hooks config|install|status|uninstall`
+  writes, installs, reports and removes the `hooks.json` that Cursor loads, with an
+  optional workspace pin. The install swaps the file in atomically, keeps a backup of
+  the one it replaces, and refuses a file that holds hooks xMustard did not write. The client **fails
   open**: a stopped daemon, an unreadable event or a repository outside the token's
   workspaces costs an unreduced tool result and never the user's tool call. Only an
   MCP tool's result is replaced (`updated_mcp_tool_output`); a Cursor built-in tool is

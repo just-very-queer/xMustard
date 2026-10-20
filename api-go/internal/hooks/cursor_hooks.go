@@ -143,3 +143,66 @@ func ValidCursorClient(bin string) bool {
 	}
 	return path.IsAbs(bin) && path.Base(bin) == CursorClient && printable(bin)
 }
+
+// IsCursorClientCommand reports whether a command runs xMustard's Cursor client: the
+// client's own name, or an absolute path to it.
+func IsCursorClientCommand(cmd string) bool {
+	words, ok := shellWords(cmd)
+	if !ok || len(words) == 0 {
+		return false
+	}
+	return ValidCursorClient(words[0])
+}
+
+// CursorHooksHasEvent reports whether a Cursor hooks file registers an event.
+func CursorHooksHasEvent(body []byte, event string) bool {
+	var file struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if json.Unmarshal(body, &file) != nil {
+		return false
+	}
+	for _, g := range file.Hooks[event] {
+		for _, h := range g.Hooks {
+			if IsCursorClientCommand(h.Command) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// ClassifyCursorHooks reports how many of a Cursor hooks file's hooks are xMustard's
+// and how many are not.
+//
+// An install may replace a file that holds only xMustard's hooks (a backup is kept),
+// and **never** a file that holds another's: the user wrote those, and the install
+// would take them away.
+func ClassifyCursorHooks(body []byte) (ours, foreign int) {
+	var file struct {
+		Hooks map[string][]struct {
+			Hooks []struct {
+				Command string `json:"command"`
+			} `json:"hooks"`
+		} `json:"hooks"`
+	}
+	if json.Unmarshal(body, &file) != nil {
+		return 0, 0
+	}
+	for _, groups := range file.Hooks {
+		for _, g := range groups {
+			for _, h := range g.Hooks {
+				if IsCursorClientCommand(h.Command) {
+					ours++
+				} else {
+					foreign++
+				}
+			}
+		}
+	}
+	return ours, foreign
+}
