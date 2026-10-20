@@ -62,16 +62,15 @@ fn run(args: impl Iterator<Item = String>, stdin: &mut dyn Read, stdout: &mut dy
         warn(&msg);
         return FAIL_OPEN_EXIT;
     }
-    let pin = match cfg.workspace.clone().or_else(|| {
-        let env = cursorhook::read_env(cursorhook::process_env());
-        cursorhook::workspace_pin(&env, &event)
-    }) {
+    let env = cursorhook::read_env(cursorhook::process_env());
+    let pin = match cursorhook::workspace_pin(&env, &event, cfg.workspace.as_deref()) {
         Some(pin) => pin,
         // Fail-closed on binding, fail-open on the user's action: nothing is posted
         // and Cursor keeps its own output.
         None => {
             warn(
-                "no workspace root matches CURSOR_PROJECT_DIR and no workspace is pinned; sending nothing",
+                "the workspace roots do not agree with CURSOR_PROJECT_DIR, or no workspace id is \
+                 configured; sending nothing",
             );
             return 0;
         }
@@ -86,11 +85,11 @@ fn run(args: impl Iterator<Item = String>, stdin: &mut dyn Read, stdout: &mut dy
             return FAIL_OPEN_EXIT;
         }
     };
-    let cursorhook::Outcome::Answered(answer) = cursorhook::event_answer(
-        &cfg.event,
-        cursorhook::json_member(&reply, "context"),
-        cursorhook::json_member(&reply, "updated"),
-    ) else {
+    let context = cursorhook::json_member(&reply, "additional_context");
+    let replacement = cursorhook::replacement_for(&cfg.event, &reply);
+    let cursorhook::Outcome::Answered(answer) =
+        cursorhook::event_answer(&cfg.event, context.as_deref(), replacement.as_deref())
+    else {
         return 0;
     };
     let Some(rendered) = cursorhook::render(&answer) else {
@@ -171,6 +170,22 @@ impl Config {
         }
         let (host, port) = parse_base(&url)?;
         let token = nonblank(getenv("XMUSTARD_API_TOKEN"));
+        // A token and a pin both go into a header, and a value with a line break in
+        // it would end that header and start another (WS-40c-b r1-4). The token is
+        // checked here, before it can reach the request; the pin is a workspace id,
+        // whose own rule admits no such character.
+        if let Some(t) = &token {
+            if !valid_header_value(t) {
+                return Err(
+                    "XMUSTARD_API_TOKEN holds a character that cannot go in a header".into(),
+                );
+            }
+        }
+        if let Some(w) = &workspace {
+            if !cursorhook::valid_workspace_id(w) {
+                return Err(format!("{w} is not a workspace id"));
+            }
+        }
         // plain http:// carries the bearer token in cleartext: loopback only, unless
         // the operator opts in (a TLS-terminating proxy on another host is their call)
         if token.is_some() && !allow_remote && !is_loopback(&host) {
@@ -187,6 +202,12 @@ impl Config {
             workspace,
         })
     }
+}
+
+/// Whether a value can go into an HTTP header: no control character, which includes
+/// the line break that would end the header.
+fn valid_header_value(v: &str) -> bool {
+    !v.is_empty() && !v.bytes().any(|b| b < 0x20 || b == 0x7f)
 }
 
 /// `localhost`, 127.0.0.0/8 or ::1 (bracketed or not).
@@ -307,7 +328,13 @@ fn parse_reply(stream: &mut TcpStream) -> Result<Option<String>, String> {
         }
         raw.extend_from_slice(&chunk[..n]);
     }
-    let text = String::from_utf8_lossy(&raw);
+    // The reply is read as bytes and decoded strictly: a lossy decode would replace
+    // a byte that is not UTF-8 with U+FFFD, and the client would hand Cursor an
+    // answer that differs from the daemon's (WS-40c-b r1-9). A reply that is not
+    // valid UTF-8 is no answer.
+    let Ok(text) = String::from_utf8(raw) else {
+        return Err("the reply was not valid UTF-8".into());
+    };
     Ok(answer_of(&text))
 }
 

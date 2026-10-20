@@ -27,7 +27,7 @@ xmustard-ops workspace register --root "$PWD"
 | Event | Answer | What xMustard does |
 | --- | --- | --- |
 | `sessionStart` | `additional_context` | Ground's summary (failed runs, stale and pending memory) and the core-tier memories, bounded to Cursor's own 10,000-character cap. |
-| `preToolUse` (`Shell` only) | `updated_input` and `additional_context` | For a search command: the index hits and the memories for its pattern. The command may be rewritten. |
+| `preToolUse` (`Shell` only) | `additional_context` | For a search command: the index hits and the memories for its pattern. **The command is not rewritten:** xMustard never rewrites a tool's input, so the answer carries no `updated_input` and the command runs as Cursor's own matcher wrote it. |
 | `postToolUse` (MCP tools only) | `updated_mcp_tool_output` and `additional_context` | Captures the tool result (redacted, retained behind a handle) and replaces what the model sees with the projection plus the recovery line. |
 | `preCompact` | nothing | Observational. Cursor's output schema for this event takes `user_message` only, and it is not one of the five events whose responses carry `additional_context`, so xMustard sends nothing rather than an out-of-schema member. |
 

@@ -72,7 +72,9 @@ func TestCursorReplyWritesTheKeysCursorReads(t *testing.T) {
 		"isError": false,
 	})
 	m = out(t, ev("postToolUse"), Result{Context: "the context", Updated: payload})
-	if m["updated_mcp_tool_output"] != "the projection" {
+	// The replacement is the shaped result's own JSON text: Cursor's member takes a
+	// JSON-stringified result, so the model reads the reduced content blocks.
+	if m["updated_mcp_tool_output"] != string(payload) {
 		t.Errorf("postToolUse: updated_mcp_tool_output is %v", m["updated_mcp_tool_output"])
 	}
 	if m["additional_context"] != "the context" {
@@ -125,8 +127,8 @@ func TestCursorProjectionReadsOnlyTheShapeItKnows(t *testing.T) {
 	}
 	good := `{"content":[{"type":"text","text":"a"},{"type":"text","text":"b"}],"isError":false}`
 	text, ok := cursorProjection(json.RawMessage(good))
-	if !ok || text != "ab" {
-		t.Fatalf("the projection is %q (%v), want %q", text, ok, "ab")
+	if !ok || text != good {
+		t.Fatalf("the projection is %q (%v), want %q", text, ok, good)
 	}
 }
 

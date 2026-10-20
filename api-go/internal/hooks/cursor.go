@@ -2,7 +2,6 @@ package hooks
 
 import (
 	"encoding/json"
-	"strings"
 	"unicode/utf8"
 
 	"xmustard/api-go/internal/evidence"
@@ -79,9 +78,14 @@ func capCursorContext(s string) string {
 	return string([]rune(s)[:CursorContextChars])
 }
 
-// cursorProjection reads the text out of a shaped MCP result, the only shape the
-// cursor shaper builds ({"content":[{"type":"text","text":...}],"isError":...}). A
-// payload it cannot read says nothing, so the client keeps the tool's own output
+// cursorProjection reads the text of a shaped MCP result, the only shape the cursor
+// shaper builds ({"content":[{"type":"text","text":...}],"isError":...}), and returns
+// it as the JSON text Cursor's schema takes.
+//
+// Cursor's `updated_mcp_tool_output` is the replacement for an MCP tool's result,
+// and the result is a JSON-stringified payload: the replacement is that same shape,
+// so the model reads the reduced content blocks rather than a bare string. A payload
+// the daemon did not shape is not offered, so the client keeps the tool's own output
 // rather than being handed a projection xMustard did not write.
 func cursorProjection(payload json.RawMessage) (string, bool) {
 	if len(payload) == 0 {
@@ -96,17 +100,17 @@ func cursorProjection(payload json.RawMessage) (string, bool) {
 	if json.Unmarshal(payload, &p) != nil {
 		return "", false
 	}
-	var b strings.Builder
+	text := make([]string, 0, len(p.Content))
 	for _, c := range p.Content {
 		if c.Type != "" && c.Type != "text" {
 			continue
 		}
-		b.WriteString(c.Text)
+		text = append(text, c.Text)
 	}
-	if b.Len() == 0 {
+	if len(text) == 0 {
 		return "", false
 	}
-	return b.String(), true
+	return string(payload), true
 }
 
 // cursorToolClasses maps Cursor's built-in tools. Cursor renames Claude Code's tools

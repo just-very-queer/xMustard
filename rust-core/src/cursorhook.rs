@@ -112,6 +112,21 @@ fn cap(s: &str, limit: usize) -> String {
     s.chars().take(limit).collect()
 }
 
+/// The daemon's replacement for this event, read out of the daemon's own answer.
+///
+/// The daemon answers in Cursor's schema (WS-40c-c), so the replacement a Cursor
+/// event takes is the member that event's schema names: `updated_mcp_tool_output`
+/// for a postToolUse, `updated_input` for a preToolUse. An event that takes no
+/// replacement has none, whatever the reply carries (WS-40c-b r1-6: the client read
+/// a reply shape the daemon did not write, and every answer was empty).
+pub fn replacement_for(event: &str, reply: &str) -> Option<String> {
+    match event {
+        "postToolUse" => json_member(reply, "updated_mcp_tool_output"),
+        "preToolUse" => json_member(reply, "updated_input"),
+        _ => None,
+    }
+}
+
 /// The workspace the event belongs to, or why there is none.
 ///
 /// Cursor sends `workspace_roots` (one root normally, several for a multi-root
@@ -133,7 +148,13 @@ pub fn resolve_workspace(roots: &[String], project_dir: &str) -> Option<String> 
 }
 
 /// Whether two root paths name the same directory. Both are cleaned and compared
-/// as paths, so a trailing separator or a `.` component does not make a match fail.
+/// as paths, so a trailing separator or a repeated separator does not make a match
+/// fail.
+///
+/// A `.` root is the process's own directory and matches **only** a project dir that
+/// is `.` too (WS-40c-b r1-7: the old code let `.` match every path, so a `.` root
+/// bound whatever project Cursor happened to be in). Cursor sends an absolute
+/// `CURSOR_PROJECT_DIR`, so the fail-closed reading costs nothing in practice.
 fn same_path(a: &str, b: &str) -> bool {
     let clean = |p: &str| -> String {
         let mut out = String::with_capacity(p.len());
@@ -151,13 +172,7 @@ fn same_path(a: &str, b: &str) -> bool {
         }
         out
     };
-    let (a, b) = (clean(a), clean(b));
-    if a == b {
-        return true;
-    }
-    // A root of "." means the process's own directory, which is the project root
-    // for a project hook (Cursor runs those from the project root).
-    a == "." || b == "."
+    clean(a) == clean(b)
 }
 
 /// The exit code for an internal failure: non-zero and **not 2**.
@@ -211,6 +226,11 @@ pub fn json_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
+            // U+2028 and U+2029 are line terminators in JavaScript, so a reader that
+            // evaluates its input would break on them even though JSON allows them
+            // raw (WS-40c-b r1-8).
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
             c if (c as u32) < 0x20 => {
                 let _ = write!(out, "\\u{:04x}", c as u32);
             }
@@ -226,31 +246,142 @@ pub fn json_string(s: &str) -> String {
 /// The client is std-only for its startup budget, and it reads three fields from
 /// the daemon's reply and none from Cursor's payload (the daemon decodes that). A
 /// value that is not a plain string is absent, never a guess.
-pub fn json_member<'a>(body: &'a str, key: &str) -> Option<&'a str> {
-    let needle = format!("\"{key}\"");
-    let mut rest = body;
-    // Only the first occurrence counts, and a key that appears inside a value's
-    // text is not a member: the search restarts after each value.
-    loop {
-        let at = rest.find(&needle)?;
-        let after = &rest[at + needle.len()..];
-        let colon = after.find(':')?;
-        let value = after[colon + 1..].trim_start();
-        let value = value.strip_prefix('"')?;
-        let end = json_string_end(value)?;
-        if key_is_here(body, at) {
-            return Some(&value[..end]);
+///
+/// **Only a member of the top-level object counts** (WS-40c-b r1-5). The old search
+/// found the first occurrence of the key anywhere, and a key inside a nested object
+/// or an array shadowed the top-level one: `{"outer":{"context":"nested"},"context":"top"}`
+/// read the nested value. The scan below walks the object's own members, so a nested
+/// key is text, not a member.
+///
+/// **The value is decoded, not copied** (WS-40c-b r1-8). A member read raw and written
+/// into another JSON string is escaped twice: the reply's `{\"content\":[]}` would
+/// reach Cursor as `{\\\"content\\\":[]}`, which is not the text the daemon sent.
+pub fn json_member(body: &str, key: &str) -> Option<String> {
+    let value = top_level_member(body, key)?;
+    let value = value.strip_prefix('"')?;
+    let end = json_string_end(value)?;
+    json_unescape(&value[..end])
+}
+
+/// Decodes a JSON string's escapes into the characters they stand for.
+///
+/// An escape the reader does not know, or a `\u` escape that is not a character, is
+/// absent rather than a guess: the member is not one the client can read.
+fn json_unescape(value: &str) -> Option<String> {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
         }
-        rest = &after[colon + 1 + 1 + end..];
+        match chars.next()? {
+            '"' => out.push('"'),
+            '\\' => out.push('\\'),
+            '/' => out.push('/'),
+            'b' => out.push('\u{8}'),
+            'f' => out.push('\u{c}'),
+            'n' => out.push('\n'),
+            'r' => out.push('\r'),
+            't' => out.push('\t'),
+            'u' => {
+                let hex: String = (0..4).filter_map(|_| chars.next()).collect();
+                if hex.len() != 4 {
+                    return None;
+                }
+                let n = u32::from_str_radix(&hex, 16).ok()?;
+                out.push(char::from_u32(n)?);
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// The value text of a top-level member, and the offset just past it.
+///
+/// The value is returned as it stands in the body: a string with its quotes, an
+/// object or an array whole. A member that is not there is `None`.
+fn top_level_member<'a>(body: &'a str, key: &str) -> Option<&'a str> {
+    let bytes = body.as_bytes();
+    let mut i = 0usize;
+    // the object's own brace
+    while i < bytes.len() && bytes[i] != b'{' {
+        i += 1;
+    }
+    i += 1;
+    loop {
+        i = skip_space(bytes, i);
+        match bytes.get(i) {
+            Some(b'"') => {}
+            _ => return None, // a close, an end, or a value where a key belongs
+        }
+        let name_start = i + 1;
+        let name_end = name_start + json_string_end(&body[name_start..])?;
+        let name = &body[name_start..name_end];
+        i = skip_space(bytes, name_end + 1);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i = skip_space(bytes, i + 1);
+        let value_start = i;
+        let value_end = value_end(body, i)?;
+        if name == key {
+            return Some(&body[value_start..value_end]);
+        }
+        i = skip_space(bytes, value_end);
+        match bytes.get(i) {
+            Some(b',') => i += 1,
+            _ => return None,
+        }
     }
 }
 
-/// Whether the match at `at` is a member key rather than text inside a value.
-fn key_is_here(body: &str, at: usize) -> bool {
-    // The character before the opening quote decides: a key follows `{` or `,`
-    // (ignoring whitespace); text inside a string value is preceded by anything else.
-    let before = body[..at].trim_end();
-    matches!(before.chars().next_back(), Some('{') | Some(','))
+/// The offset just past the value that starts at `start`: a string, a nested
+/// object or array (scanned whole, strings inside them included), or a bare token
+/// up to the next comma.
+fn value_end(body: &str, start: usize) -> Option<usize> {
+    let bytes = body.as_bytes();
+    match bytes.get(start)? {
+        b'"' => Some(start + 1 + json_string_end(&body[start + 1..])? + 1),
+        b'{' | b'[' => {
+            let mut depth = 0usize;
+            let mut i = start;
+            while i < bytes.len() {
+                match bytes[i] {
+                    b'"' => {
+                        i += 1 + json_string_end(&body[i + 1..])? + 1;
+                        continue;
+                    }
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(i + 1);
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            None
+        }
+        _ => {
+            let mut i = start;
+            while i < bytes.len() && bytes[i] != b',' && bytes[i] != b'}' {
+                i += 1;
+            }
+            Some(i)
+        }
+    }
+}
+
+/// The offset of the first byte at or after `i` that is not JSON whitespace.
+fn skip_space(bytes: &[u8], mut i: usize) -> usize {
+    while i < bytes.len() && matches!(bytes[i], b' ' | b'\t' | b'\n' | b'\r') {
+        i += 1;
+    }
+    i
 }
 
 /// The index just past a JSON string value's closing quote, honouring escapes.
@@ -268,21 +399,16 @@ fn json_string_end(value: &str) -> Option<usize> {
 }
 
 /// Reads `workspace_roots` (an array of strings) out of Cursor's payload.
+///
+/// The member is the object's own (WS-40c-b r1-5): a `workspace_roots` key inside a
+/// nested object is text, not the member, and must not stand in for it.
 pub fn json_string_array(body: &str, key: &str) -> Vec<String> {
-    let needle = format!("\"{key}\"");
-    let Some(at) = body.find(&needle) else {
+    let Some(value) = top_level_member(body, key) else {
         return Vec::new();
     };
-    if !key_is_here(body, at) {
-        return Vec::new();
-    }
-    let Some(colon) = body[at + needle.len()..].find(':') else {
+    let Some(rest) = value.strip_prefix('[') else {
         return Vec::new();
     };
-    let Some(open) = body[at + needle.len() + colon + 1..].find('[') else {
-        return Vec::new();
-    };
-    let rest = &body[at + needle.len() + colon + 1 + open + 1..];
     let mut out = Vec::new();
     let mut depth = 0usize;
     let mut i = 0usize;
@@ -297,7 +423,12 @@ pub fn json_string_array(body: &str, key: &str) -> Vec<String> {
                 };
                 let raw = &rest[i + 1..i + 1 + end];
                 if depth == 0 {
-                    out.push(raw.to_string());
+                    // decoded, like every other member: a path read raw would carry
+                    // its escapes into the comparison
+                    match json_unescape(raw) {
+                        Some(v) => out.push(v),
+                        None => return out,
+                    }
                 }
                 i += end + 2;
             }
@@ -346,23 +477,55 @@ pub fn read_env(getenv: impl Fn(&str) -> Option<String>) -> Env {
     }
 }
 
-/// The workspace pin for a request: the resolved root when the environment agrees,
-/// else the operator's id. Cursor sends no MCP roots, so the daemon binds by `cwd`
-/// when neither is set.
-pub fn workspace_pin(env: &Env, payload: &str) -> Option<String> {
+/// The workspace pin for a request: the configured workspace id, when the roots
+/// agree with the project dir.
+///
+/// The pin is an **id**, never a path (WS-40c-b r1-2). The daemon's `X-Xmustard-Workspace`
+/// header is a workspace-id channel: it validates the id, looks the workspace up, and
+/// refuses one that is not in the caller's token scope. A path in that header is
+/// either refused as an unsafe id or names nothing, so the client sends an id.
+///
+/// The roots are the client's own check that the configured workspace is the one
+/// Cursor is running in (WS-40c-a): `CURSOR_PROJECT_DIR` must match a member of
+/// `workspace_roots`, and a disagreement sends nothing rather than binding the wrong
+/// repository (WS-40c-b r1-3: the old code fell back to the id here, which posted
+/// the event to a workspace the project dir disagreed with).
+pub fn workspace_pin(env: &Env, payload: &str, configured: Option<&str>) -> Option<String> {
+    let id = configured
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| env.workspace_id.trim());
+    if id.is_empty() || !valid_workspace_id(id) {
+        return None;
+    }
     let payload_roots = json_string_array(payload, "workspace_roots");
     let roots = if payload_roots.is_empty() {
         &env.workspace_roots
     } else {
         &payload_roots
     };
-    resolve_workspace(roots, &env.project_dir).or_else(|| {
-        if env.workspace_id.is_empty() {
-            None
-        } else {
-            Some(env.workspace_id.clone())
-        }
-    })
+    if !roots_agree(roots, &env.project_dir) {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+/// Whether a workspace id is one the daemon accepts: the same rule the daemon's
+/// transport applies (safe characters, at most 128 of them, and no `..`).
+pub fn valid_workspace_id(id: &str) -> bool {
+    if id.is_empty() || id.len() > 128 || id.contains("..") {
+        return false;
+    }
+    id.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// Whether the roots agree with the project dir: the project dir names one of them.
+///
+/// An empty list agrees with nothing (WS-40c-a refuses an empty list), and a project
+/// dir that names no root is a disagreement. Both send nothing.
+fn roots_agree(roots: &[String], project_dir: &str) -> bool {
+    resolve_workspace(roots, project_dir).is_some()
 }
 
 /// The usage line, printed by `-h` and by an argument error.
@@ -558,7 +721,7 @@ mod tests {
     fn a_key_inside_a_value_is_not_read_as_a_member() {
         let body = r#"{"content":"{\"additional_context\":\"decoy\"}","actual":"real"}"#;
         assert_eq!(json_member(body, "additional_context"), None);
-        assert_eq!(json_member(body, "actual"), Some("real"));
+        assert_eq!(json_member(body, "actual").as_deref(), Some("real"));
     }
 
     #[test]
@@ -597,15 +760,16 @@ mod tests {
     }
 
     #[test]
-    fn the_pin_prefers_the_resolved_root_over_the_operator_id() {
+    fn the_pin_is_the_workspace_id_when_the_roots_agree() {
         let env = Env {
             workspace_roots: vec!["/repo".into()],
             project_dir: "/repo".into(),
             workspace_id: "envid".into(),
         };
         assert_eq!(
-            workspace_pin(&env, r#"{"workspace_roots":["/repo"]}"#).as_deref(),
-            Some("/repo")
+            workspace_pin(&env, r#"{"workspace_roots":["/repo"]}"#, None).as_deref(),
+            Some("envid"),
+            "the pin is an id, and the roots agree with the project dir"
         );
     }
 
@@ -619,23 +783,37 @@ mod tests {
             workspace_id: "envid".into(),
         };
         assert_eq!(
-            workspace_pin(&env, r#"{"workspace_roots":["/repo"]}"#).as_deref(),
-            Some("/repo"),
+            workspace_pin(&env, r#"{"workspace_roots":["/repo"]}"#, None).as_deref(),
+            Some("envid"),
             "the event's own roots are fresher than an exported variable"
         );
     }
 
     #[test]
-    fn a_root_that_disagrees_with_the_project_dir_falls_back_to_the_operator_pin() {
+    fn a_root_that_disagrees_with_the_project_dir_sends_nothing() {
         let env = Env {
             workspace_roots: vec!["/a".into(), "/b".into()],
             project_dir: "/c".into(),
             workspace_id: "envid".into(),
         };
         assert_eq!(
-            workspace_pin(&env, r#"{"workspace_roots":["/a","/b"]}"#).as_deref(),
-            Some("envid"),
-            "no member matches the project dir, so the operator's pin is the only answer"
+            workspace_pin(&env, r#"{"workspace_roots":["/a","/b"]}"#, None),
+            None,
+            "no member matches the project dir, so nothing is sent (WS-40c-b r1-3): \
+             the operator's id would have bound the wrong repository"
+        );
+    }
+
+    #[test]
+    fn a_configured_id_wins_over_the_environment_one() {
+        let env = Env {
+            workspace_roots: vec!["/repo".into()],
+            project_dir: "/repo".into(),
+            workspace_id: "envid".into(),
+        };
+        assert_eq!(
+            workspace_pin(&env, r#"{"workspace_roots":["/repo"]}"#, Some("flagid")).as_deref(),
+            Some("flagid")
         );
     }
 
@@ -646,6 +824,6 @@ mod tests {
             project_dir: "/repo".into(),
             workspace_id: String::new(),
         };
-        assert_eq!(workspace_pin(&env, "{}"), None);
+        assert_eq!(workspace_pin(&env, "{}", None), None);
     }
 }
