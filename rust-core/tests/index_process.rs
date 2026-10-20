@@ -319,16 +319,27 @@ fn git_status_failure_is_incomplete_and_never_serves_stale() {
     );
 }
 
-/// WS-RT18: an index the reader refuses (here `core.ignorecase`, with the reader
+/// WS-RT18: an index the reader refuses (here a **sparse** index, with the reader
 /// forced, so no Git fallback) is a named limitation; the identity and the overall
 /// coverage are incomplete, and no cached (possibly stale) graph is served.
+///
+/// The refusal is a sparse index and not `core.ignorecase`: **WS-RT18b** made a
+/// repository that folds case readable (Git folds it too, so the reader answers the
+/// same), and a refusal that is gone cannot be what this row proves.
 #[test]
 fn a_refused_index_is_incomplete_and_never_serves_stale() {
     let r = repo(&[("a.rs", "pub fn version_one_symbol() {}\n")]);
     let warm = search(r.path(), "ws", "version_one_symbol", &[]);
     assert_eq!(warm["coverage"]["work"]["graph_cache"], "miss");
     fs::write(r.path().join("a.rs"), "pub fn version_two_symbol() {}\n").unwrap();
-    git(r.path(), &["config", "core.ignorecase", "true"]);
+    std::fs::create_dir_all(r.path().join("src")).unwrap();
+    std::fs::write(r.path().join("src/s.rs"), "pub fn in_the_cone() {}\n").unwrap();
+    git(r.path(), &["add", "src/s.rs"]);
+    git(
+        r.path(),
+        &["sparse-checkout", "init", "--cone", "--sparse-index"],
+    );
+    git(r.path(), &["sparse-checkout", "set", "src"]);
 
     let env = [("XMUSTARD_GIT_INDEX_READER", "reader")];
     let key = json(&run(&["repo-key", r.path().to_str().unwrap()], &env));

@@ -113,17 +113,23 @@ impl Repo {
     }
 
     /// Refuse what the reader does not follow (checked before any answer).
+    ///
+    /// **`core.ignorecase` is no longer a refusal** (WS-RT18b). Git folds case when it
+    /// compares paths on a case-insensitive volume, and the reader now folds it the
+    /// same way, so a repository whose index is sorted the way Git sorts it is read
+    /// here too. The index's order is checked when it is opened, because an index
+    /// written before the setting changed is sorted the other way and the reader's
+    /// cursor would stop early and miss entries.
     pub(crate) fn check(&self) -> Result<(), Refusal> {
-        match self.ignore_case {
-            true => Err(Refusal::Unsupported("core.ignorecase=true".into())),
-            false => Ok(()),
-        }
+        Ok(())
     }
 
     /// The index of this checkout, opened and verified.
     pub fn index(&self) -> Result<Index, Refusal> {
         self.check()?;
-        Index::open(&self.git_dir, self.hash)
+        let ix = Index::open(&self.git_dir, self.hash)?;
+        ix.verify_order(self.ignore_case)?;
+        Ok(ix)
     }
 
     /// HEAD's tree, None when HEAD is unborn.

@@ -83,13 +83,24 @@ fn refusals() -> &'static Mutex<HashMap<PathBuf, String>> {
 }
 
 fn record_refusal(root: &Path, why: &str) {
-    lock(refusals()).insert(root.to_path_buf(), why.to_string());
+    lock(refusals()).insert(refusal_key(root), why.to_string());
+}
+
+/// The key a root's refusal is filed under.
+///
+/// The same root reaches the reader spelled two ways: the caller may pass it
+/// relative and the reader may reach it canonical (a temporary directory is a
+/// symlink on macOS, so `/tmp/x` and `/private/tmp/x` are one root). Both sides
+/// of the slot file under the canonical form, or the operator never learns that
+/// the index was refused (WS-FIX-11).
+fn refusal_key(root: &Path) -> PathBuf {
+    fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf())
 }
 
 /// The refusal recorded for `root` by the read that just failed, if any. Taking it
 /// clears it, so a later successful read reports nothing.
 pub fn take_last_refusal(root: &Path) -> Option<String> {
-    lock(refusals()).remove(root)
+    lock(refusals()).remove(&refusal_key(root))
 }
 
 /// Stat of the store and its WAL: a commit or a swap changes it.

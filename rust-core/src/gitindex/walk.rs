@@ -15,6 +15,7 @@
 //! cannot finish within those bounds, the Git timeout or an unreadable directory
 //! returns the reason instead of a partial answer that reads as complete.
 
+use std::cmp::Ordering;
 use std::fs;
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -156,11 +157,17 @@ struct Frame {
 }
 
 /// What the walk compares worktree paths with: the index, one entry at a time.
+///
+/// The comparison folds case when the repository's `core.ignorecase` is set, the
+/// way Git's own index lookup does (WS-RT18b): on a case-insensitive volume the
+/// worktree's path may differ in case from the index's, and a byte-wise comparison
+/// would call the file deleted and untracked at once.
 struct Cursor<'a> {
     entries: Entries<'a>,
     cur: Option<Vec<u8>>,
     gitlinks: Vec<Vec<u8>>,
     started: bool,
+    ignore_case: bool,
 }
 
 impl Cursor<'_> {
@@ -172,7 +179,11 @@ impl Cursor<'_> {
                 self.load()?;
             }
             match &self.cur {
-                Some(p) if p.as_slice() < key => self.load()?,
+                Some(p)
+                    if crate::gitindex::cmp_paths(p, key, self.ignore_case) == Ordering::Less =>
+                {
+                    self.load()?
+                }
                 _ => return Ok(()),
             }
         }
@@ -196,12 +207,17 @@ impl Cursor<'_> {
 
     /// The index holds the file `path` (after `advance(path)`).
     fn holds_file(&self, path: &[u8]) -> bool {
-        self.cur.as_deref() == Some(path)
+        match &self.cur {
+            Some(p) => crate::gitindex::cmp_paths(p, path, self.ignore_case) == Ordering::Equal,
+            None => false,
+        }
     }
 
     /// The index holds paths under `dir` (`a/b/`, after `advance(dir)`).
     fn holds_under(&self, dir: &[u8]) -> bool {
-        self.cur.as_deref().is_some_and(|p| p.starts_with(dir))
+        self.cur
+            .as_deref()
+            .is_some_and(|p| crate::gitindex::path_starts_with(p, dir, self.ignore_case))
     }
 
     /// `dir` (`a/b/`) is a gitlink of the index (after `advance(dir)`).
@@ -386,6 +402,7 @@ pub(crate) fn untracked(
         cur: None,
         gitlinks: Vec::new(),
         started: false,
+        ignore_case: repo.ignore_case,
     };
     let base_files = [
         (repo.excludes_file.clone(), true),

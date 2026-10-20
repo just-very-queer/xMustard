@@ -634,6 +634,38 @@ impl Index {
             cur: Entry::default(),
         })
     }
+
+    /// The index's entries are in the order the repository compares paths in.
+    ///
+    /// Git sorts the index with the comparator it looks paths up with, which folds
+    /// case when `core.ignorecase` is set. An index written before that setting
+    /// changed is sorted the other way, and the reader's cursor would stop early
+    /// and miss entries, so the order is checked and the index is **refused** rather
+    /// than read wrong (WS-RT18b). A repository that compares byte-wise is already
+    /// in the order the reader uses, and nothing is checked.
+    ///
+    /// **The same path may appear more than once**: an unmerged path has one entry
+    /// per stage, and Git keeps them adjacent. Equal neighbours are that, not a
+    /// mis-ordering, so only a path that sorts *before* its neighbour refuses.
+    pub fn verify_order(&self, ignore_case: bool) -> Result<(), Refusal> {
+        if !ignore_case {
+            return Ok(());
+        }
+        let mut entries = self.entries()?;
+        let mut last: Option<Vec<u8>> = None;
+        while let Some(e) = entries.read_next()? {
+            if let Some(prev) = &last
+                && crate::gitindex::cmp_paths(&e.path, prev, ignore_case)
+                    == std::cmp::Ordering::Less
+            {
+                return Err(Refusal::Failed(
+                    "the index is not sorted the way this repository compares paths".into(),
+                ));
+            }
+            last = Some(e.path.clone());
+        }
+        Ok(())
+    }
 }
 
 fn skip(s: &mut Stream<'_>, mut n: usize) -> Result<(), Refusal> {

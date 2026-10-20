@@ -75,7 +75,12 @@ fn long_path_repo(skip_worktree: bool) -> TempDir {
     .unwrap();
     git(root, &["add", "a.go", "b.go"]);
     let blob = String::from_utf8(git_in(root, &["hash-object", "-w", "--stdin"], b"x\n")).unwrap();
-    let dirs: Vec<String> = ["a", "b", "c", "d"].iter().map(|c| c.repeat(240)).collect();
+    // 220 characters per component: long enough that the listing of LONG_ENTRIES
+    // paths is far past the old output cap, and short enough that the whole path
+    // fits macOS's PATH_MAX of 1024 (Linux allows 4096, and a path built to the
+    // Linux limit is refused with ENAMETOOLONG on a Mac, which is the platform's
+    // limit and not a reader's defect).
+    let dirs: Vec<String> = ["a", "b", "c", "d"].iter().map(|c| c.repeat(220)).collect();
     let paths: Vec<String> = (0..LONG_ENTRIES)
         .map(|i| format!("{}/f{i:06}.bin", dirs.join("/")))
         .collect();
