@@ -46,4 +46,4 @@ func (c Client) Event(name string) (Event, bool) {
 }
 
 // Clients are the hook clients the service routes.
-var Clients = []Client{Claude, Codex}
+var Clients = []Client{Claude, Codex, Cursor}

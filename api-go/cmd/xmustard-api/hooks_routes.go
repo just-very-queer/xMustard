@@ -160,6 +160,18 @@ type hookCall struct {
 	recallRefused bool
 }
 
+// class returns the posted tool's class for the client that posted it: a client whose
+// built-in tools have their own names decides it (WS-40c-b: Cursor's shell is "Shell",
+// not "Bash", and its MCP tools are namespaced).
+func (c *hookCall) class() hooks.ToolClass {
+	return hooks.ClassOfFor(c.client.Name, c.in.ToolName)
+}
+
+// captured reports whether this PostToolUse captures and reduces the tool's output.
+func (c *hookCall) captured() bool {
+	return hooks.CapturedFor(c.client.Name, c.in.ToolName)
+}
+
 // hookResult is what a handler produced. offered maps each memory a push considered to
 // the text whose presence in the answer marks it seen in this context (push). after
 // runs once the answer has been written (recording an outcome, say), so it never
@@ -254,13 +266,16 @@ func (s *hookServer) handle(client hooks.Client, ev hooks.Event) http.HandlerFun
 		if err == nil {
 			in, err = hooks.Decode(body)
 		}
-		if err != nil || in.Event != "" && in.Event != ev.Name {
+		// A client that names an event its own way (Cursor's "postToolUse") may post it
+		// under either name, so both are the event's own; a body that names a different
+		// event is refused and the client keeps its own output.
+		if err != nil || in.Event != "" && in.Event != ev.Name && in.Event != ev.Key() {
 			hookStats.failOpen.Add(1)
 			writeHookAnswer(w, nil)
 			return
 		}
 		caller, _ := principalScope(r)
-		call := &hookCall{r: r, client: client, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.SessionID, in.AgentID),
+		call := &hookCall{r: r, client: client, ev: ev, in: in, body: body, caller: caller, key: hooks.Key(caller, in.Session(), in.AgentID),
 			recallRefused: toolDisabledFor(postureFrom(r), callerOf(r), "recall")}
 		if ev.Mode == hooks.Enqueue {
 			s.enqueue(call)
@@ -311,7 +326,7 @@ func (s *hookServer) handle(client hooks.Client, ev hooks.Event) http.HandlerFun
 // when the budget ran out or there is nothing to say) and the memory ids it delivers.
 func (s *hookServer) answer(ctx context.Context, c *hookCall) (*hooks.Reply, []string, func(*http.Request)) {
 	c.bound = s.resolve(c)
-	res := hookHandlers[c.ev.Name](s, ctx, c)
+	res := hookHandlers[c.ev.Key()](s, ctx, c)
 	if ctx.Err() != nil {
 		return nil, nil, res.after
 	}
@@ -462,10 +477,10 @@ var hookHandoffs = map[string]struct {
 // capsule, each scanned for instruction patterns and framed as data (WS-56). A flagged
 // part is withheld with a note naming the ground call that returns it labeled.
 func (s *hookServer) sessionContext(ctx context.Context, c *hookCall) []string {
-	if !c.bound || c.in.SessionID == "" || c.in.AgentID != "" {
+	if !c.bound || c.in.Session() == "" || c.in.AgentID != "" {
 		return nil
 	}
-	key := workspaceops.ExecutionKey(c.client.Name, c.in.SessionID, "")
+	key := workspaceops.ExecutionKey(c.client.Name, c.in.Session(), "")
 	parts := []string{fmt.Sprintf("[xmustard session] this session is %s. Before it ends, remember(kind=\"handoff\", session_id=%q, "+
 		"content=<capsule JSON>, paths=...) leaves a handoff for the next session; ground session_id=%s restores its state.", key, key, key)}
 	mode, ok := hookHandoffs[c.in.Source]
@@ -596,7 +611,7 @@ func (s *hookServer) preToolUse(ctx context.Context, c *hookCall) hookResult {
 	if !c.bound {
 		return hookResult{}
 	}
-	switch hooks.ClassOf(c.in.ToolName) {
+	switch c.class() {
 	case hooks.ToolSearch, hooks.ToolShell:
 		return s.searchContext(ctx, c)
 	case hooks.ToolRead, hooks.ToolEdit:
@@ -633,7 +648,7 @@ func (s *hookServer) fileContext(ctx context.Context, c *hookCall) hookResult {
 		return hookResult{}
 	}
 	var wg sync.WaitGroup
-	if hooks.ClassOf(c.in.ToolName) == hooks.ToolEdit {
+	if c.class() == hooks.ToolEdit {
 		wg.Go(func() { s.baseline(ctx, c, rels) })
 	}
 	memory, offered := s.memoryContext(ctx, c, "", rels)
@@ -786,11 +801,11 @@ func (s *hookServer) postToolUse(ctx context.Context, c *hookCall) hookResult {
 	if !c.bound {
 		return hookResult{}
 	}
-	switch tool := c.in.ToolName; {
-	case hooks.ClassOf(tool) == hooks.ToolEdit:
+	switch {
+	case c.class() == hooks.ToolEdit:
 		s.recordCall(c, workspaceops.LedgerOK, nil)
 		return s.afterEdit(ctx, c)
-	case hooks.Captured(tool):
+	case c.captured():
 		return s.afterCapture(ctx, c)
 	}
 	s.recordCall(c, workspaceops.LedgerOK, nil)
@@ -823,11 +838,11 @@ func (s *hookServer) record(c *hookCall, ev workspaceops.LedgerEvent) {
 // read-only mode, where hooks change no shared state: no ledger row, and no boundary
 // work (snapshot, capsule, mined candidate).
 func ledgerBase(c *hookCall) *workspaceops.LedgerSession {
-	if !c.bound || c.in.SessionID == "" || postureFrom(c.r).readOnly() {
+	if !c.bound || c.in.Session() == "" || postureFrom(c.r).readOnly() {
 		return nil
 	}
 	return &workspaceops.LedgerSession{WorkspaceID: c.ws.WorkspaceID, Root: c.ws.Root, Client: c.client.Name,
-		Session: c.in.SessionID, Agent: c.in.AgentID, Principal: c.caller, Transcript: c.in.TranscriptPath}
+		Session: c.in.Session(), Agent: c.in.AgentID, Principal: c.caller, Transcript: c.in.TranscriptPath}
 }
 
 // recordCall records a tool call: its kind (ledgerFileKinds), its arguments' digest,
@@ -843,13 +858,13 @@ func (s *hookServer) recordCall(c *hookCall, status string, obs *evidence.Observ
 		}
 	}
 	ev.Kind = workspaceops.LedgerToolCall
-	if kind, ok := ledgerFileKinds[hooks.ClassOf(c.in.ToolName)]; ok && ev.Status == workspaceops.LedgerOK {
+	if kind, ok := ledgerFileKinds[c.class()]; ok && ev.Status == workspaceops.LedgerOK {
 		ev.Kind = kind
 	}
 	if kind, id, ok := hooks.OwnMemoryCall(c.in.ToolName, c.body); ok {
 		ev.Kind, ev.EntryID = kind, id
 	}
-	if hooks.ClassOf(c.in.ToolName) == hooks.ToolShell {
+	if c.class() == hooks.ToolShell {
 		ev.Text = c.in.ToolInput.Command
 	}
 	if ev.Status == workspaceops.LedgerError {
@@ -921,7 +936,7 @@ func (s *hookServer) afterCapture(ctx context.Context, c *hookCall) hookResult {
 		}
 		res.after = func(r *http.Request) { recordCaptureOutcome(r, s.store, c.ws.WorkspaceID, false, obs) }
 	}
-	if hooks.ClassOf(c.in.ToolName) == hooks.ToolShell {
+	if c.class() == hooks.ToolShell {
 		parts = append(parts, s.afterShell(ctx, c))
 	}
 	res.context = hooks.Compose(parts...)
@@ -1002,7 +1017,7 @@ func (s *hookServer) postToolFailure(ctx context.Context, c *hookCall) hookResul
 		return hookResult{}
 	}
 	var obs *evidence.ObservationResult
-	if hooks.Captured(c.in.ToolName) {
+	if c.captured() {
 		obs = s.capture(ctx, c)
 	}
 	s.recordCall(c, workspaceops.LedgerError, obs)
@@ -1099,7 +1114,7 @@ func watchPaths(ws workspaceops.ResolvedWorkspace, anchors []string) []string {
 // in-memory (the registry and the scope checks), so the answer is not delayed.
 func (s *hookServer) enqueue(c *hookCall) {
 	c.bound = s.resolve(c)
-	q := hookQueued{event: c.ev.Name, text: cmp.Or(c.in.Trigger, c.in.Reason), key: c.key, ledger: ledgerBase(c)}
+	q := hookQueued{event: c.ev.Key(), text: cmp.Or(c.in.Trigger, c.in.Reason), key: c.key, ledger: ledgerBase(c)}
 	select {
 	case s.queue <- q:
 		hookStats.enqueued.Add(1)
