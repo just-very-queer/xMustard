@@ -10,6 +10,16 @@ Merged into `feat/parity-v2` after v0.1.1 and not yet released. Branches still u
 review are listed in [Status](STATUS.md#in-progress).
 
 ### Added
+- The Cursor adapter (WS-40c, PAR-ADP-10, PAR-HAR-12). The daemon answers Cursor's
+  four events — `sessionStart`, `preToolUse`, `postToolUse` and `preCompact` — in
+  Cursor's own schema on `/api/hooks/cursor/<event>`, one gate row each. The command
+  hook client `xmustard-cursor` (Rust, shipped in the release archive) posts the
+  event and prints the answer, and `xmustard-ops cursor-hooks config` writes the
+  `hooks.json` that installs it, with an optional workspace pin. The client **fails
+  open**: a stopped daemon, an unreadable event or a repository outside the token's
+  workspaces costs an unreduced tool result and never the user's tool call. Only an
+  MCP tool's result is replaced (`updated_mcp_tool_output`); a Cursor built-in tool is
+  observed and left as Cursor produced it.
 - Memory scopes (WS-29b, PAR-SHARE-01). A memory's scope is derived from the writing
   principal and the request, never from a payload field or entry metadata: `private` is
   served to its author and nobody else whatever roles the reader holds, `dir` inside the
@@ -125,6 +135,14 @@ measurements, upgrade steps and known limits:
 [releases/v0.1.1.md](releases/v0.1.1.md). This is not a parity claim.
 
 ### Fixed
+- The Git index reader on a case-insensitive volume (WS-RT18b). A repository whose
+  `core.ignorecase` is true — every macOS checkout, and every Linux one on a
+  case-insensitive filesystem — is read now, with the same path comparison Git uses
+  there, instead of being refused. An index whose order does not match the
+  repository's comparison is refused by name rather than read wrong. The refusal
+  also reaches the operator on macOS now: it was filed under the canonical path on
+  one side of a slot and the given path on the other, and a temporary directory is a
+  symlink there.
 - Evidence capture works in release builds, and every capture is redacted (WS-FIX-03).
   v0.1.0 wired no redactor, so `POST .../evidence/capture` answered
   `503 redaction_unavailable` and Pi's built-in reduction, masking and compaction fell

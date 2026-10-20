@@ -52,8 +52,10 @@ func main() {
 		runMCPConfig(args[1:])
 	case "codex-hooks":
 		os.Exit(runCodexHooks(defaultOpsEnv(), args[1:]))
+	case "cursor-hooks":
+		os.Exit(runCursorHooks(defaultOpsEnv(), args[1:]))
 	default:
-		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config|codex-hooks> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config|codex-hooks|cursor-hooks> ...")
 	}
 }
 
