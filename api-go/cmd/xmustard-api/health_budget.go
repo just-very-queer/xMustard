@@ -8,6 +8,7 @@ import (
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/mcpserver"
 	"xmustard/api-go/internal/rustcore"
+	"xmustard/api-go/internal/shims"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -22,6 +23,7 @@ type healthBudget struct {
 	RequestBodyCapBytes int64                 `json:"request_body_cap_bytes"`
 	CaptureBodyCapBytes int64                 `json:"capture_body_cap_bytes"`
 	InFlightBodies      slotStatus            `json:"in_flight_bodies"`
+	Shims               shims.Summary         `json:"shims"`
 }
 
 type slotStatus struct {
@@ -103,12 +105,18 @@ func healthBudgetView(r *http.Request) (full bool, detail string) {
 }
 
 func healthBudgetBlock() healthBudget {
+	processes, err := shims.List()
+	shimSummary := shims.Count(nil)
+	if err == nil {
+		shimSummary = shims.Count(processes)
+	}
 	return healthBudget{
 		Snapshot:            budget.Status(),
 		CoreWorker:          rustcore.CoreWorkerHealth(),
 		RequestBodyCapBytes: ordinaryBodyCap,
 		CaptureBodyCapBytes: captureBodyCap,
 		InFlightBodies:      slotStatus{Cap: cap(bodyInFlight), InUse: len(bodyInFlight)},
+		Shims:               shimSummary,
 	}
 }
 

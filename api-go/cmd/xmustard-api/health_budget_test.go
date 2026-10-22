@@ -106,6 +106,12 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	num(t, h, "transient_pool", "max")
 	num(t, h, "children", "cap")
 	b := dig(t, h, "budget")
+	if _, ok := dig(t, b, "shims").(map[string]any); !ok {
+		t.Fatalf("budget shims must be an object: %v", b)
+	}
+	for _, key := range []string{"live", "orphaned", "runaway", "pids"} {
+		dig(t, b, "shims", key)
+	}
 	if num(t, b, "gate_bytes") != 1e8 || num(t, b, "soft_ceiling_bytes") <= 0 {
 		t.Fatalf("gate/soft ceiling: %v", b)
 	}

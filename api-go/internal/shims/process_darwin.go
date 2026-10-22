@@ -1,0 +1,82 @@
+//go:build darwin
+
+package shims
+
+import (
+	"os"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"golang.org/x/sys/unix"
+)
+
+const (
+	callListPIDs  = 1
+	callPIDInfo   = 2
+	callPIDRusage = 9
+	uidOnly       = 4
+	shortBSDInfo  = 13
+	rusageV0      = 0
+)
+
+type bsdShort struct {
+	PID, PPID, PGID, Status                        uint32
+	Comm                                           [16]byte
+	Flags, UID, GID, RUID, RGID, SVUID, SVGID, RFU uint32
+}
+type rusage struct {
+	UUID                                                                                       [16]byte
+	UserTime, SystemTime, PkgIdle, Interrupt, Pageins, Wired, Resident, Footprint, Start, Exit uint64
+}
+type procBSD struct {
+	Flags, Status, XStatus, PID, PPID, UID, GID, RUID, RGID, SVUID, SVGID, Reserved uint32
+	Comm                                                                            [16]byte
+	Name                                                                            [32]byte
+	NFiles, Pgid, Pjobc, Tdev, Tpgid                                                uint32
+	Nice                                                                            int32
+	StartSec, StartUsec                                                             uint64
+}
+
+func listPlatform() ([]Process, error) {
+	pids := make([]int32, 4096)
+	var n int
+	for {
+		count, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callListPIDs, uidOnly, uintptr(os.Getuid()), 0, uintptr(unsafe.Pointer(&pids[0])), uintptr(len(pids)*4))
+		if errno != 0 {
+			return nil, errno
+		}
+		n = min(int(count)/4, len(pids))
+		if n < len(pids) || len(pids) >= 1<<16 {
+			break
+		}
+		pids = make([]int32, len(pids)*2)
+	}
+	var out []Process
+	for _, raw := range pids[:n] {
+		if raw <= 0 {
+			continue
+		}
+		pid := int(raw)
+		var b bsdShort
+		got, _, e := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b))
+		if e != 0 || got != unsafe.Sizeof(b) || unix.ByteSliceToString(b.Comm[:]) != ProcessName {
+			continue
+		}
+		var r rusage
+		_, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDRusage, uintptr(pid), rusageV0, 0, uintptr(unsafe.Pointer(&r)), 0)
+		if e != 0 {
+			continue
+		}
+		var info procBSD
+		got, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), 3, 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+		if e != 0 || got != unsafe.Sizeof(info) {
+			continue
+		}
+		start := time.Unix(int64(info.StartSec), int64(info.StartUsec)*1000)
+		age := time.Since(start)
+		cpu := time.Duration(r.UserTime + r.SystemTime)
+		out = append(out, Process{PID: pid, PPID: int(b.PPID), Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: ProcessName})
+	}
+	return out, nil
+}
