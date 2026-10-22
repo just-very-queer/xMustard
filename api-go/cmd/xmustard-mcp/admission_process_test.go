@@ -29,6 +29,84 @@ func buildShim(t *testing.T) string {
 // Audit Go #5 (MCP calls): the stdio reader started one goroutine per request with no
 // admission limit. Beyond XMUSTARD_MCP_MAX_INFLIGHT outstanding calls, the shim must
 // answer at once with a protocol-correct JSON-RPC overload error.
+// TestShimParentHelper starts a shim then stays alive until its test process is killed.
+func TestShimParentHelper(t *testing.T) {
+	if os.Getenv("XMUSTARD_SHIM_PARENT_HELPER") != "1" {
+		return
+	}
+	cmd := exec.Command(os.Getenv("XMUSTARD_SHIM_PATH"))
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(cmd.Process.Pid)
+	time.Sleep(time.Hour)
+}
+
+// A shim must exit when its client dies even if another process keeps stdin open.
+func TestShimExitsWhenParentDiesWhileStdinHeld(t *testing.T) {
+	shim := buildShim(t)
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(helper, "-test.run=^TestShimParentHelper$")
+	cmd.Env = append(os.Environ(), "XMUSTARD_SHIM_PARENT_HELPER=1", "XMUSTARD_SHIM_PATH="+shim,
+		"XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 4)
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		scanner := bufio.NewScanner(stdout)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+	var child *os.Process
+	defer func() {
+		_ = stdin.Close()
+		if child != nil {
+			_ = child.Kill()
+		}
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	select {
+	case line := <-lines:
+		pid, err := strconv.Atoi(line)
+		if err != nil {
+			t.Fatalf("shim pid %q: %v", line, err)
+		}
+		child, err = os.FindProcess(pid)
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("helper did not start shim")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	select {
+	case <-scanDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("shim stayed alive after its parent died with stdin held open")
+	}
+	child = nil
+}
+
 // EOF must cancel an in-flight backend request rather than waiting for its HTTP timeout.
 func TestShimExitsPromptlyOnEOFWithInflightCall(t *testing.T) {
 	started := make(chan struct{})
