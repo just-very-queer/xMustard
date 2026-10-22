@@ -168,7 +168,7 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	} else {
 		tried = append(tried, "the server has no working directory")
 	}
-	msg := "no workspace resolved (" + strings.Join(tried, "; ") + "). Pass workspace_id"
+	msg := "no workspace resolved (" + strings.Join(tried, "; ") + "). Fix: run `xmustard-ops workspace load --root-path \"$PWD\" --data-dir <API data directory>`; pass workspace_id or set XMUSTARD_WORKSPACE_ID."
 	if list, _, err := s.listWorkspaces(ctx, false); err == nil && len(list) > 0 {
 		msg += "; registered: " + describe(list, 5)
 	}
