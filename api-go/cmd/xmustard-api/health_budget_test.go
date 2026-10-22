@@ -14,6 +14,7 @@ import (
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/evidence"
+	"xmustard/api-go/internal/shims"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -74,6 +75,16 @@ func holdHeavy(t *testing.T, owner string, declared int64) {
 		t.Fatalf("heavy slot: %v", err)
 	}
 	t.Cleanup(release)
+}
+
+func TestHealthReportsShimEnumerationError(t *testing.T) {
+	previous := listHealthShims
+	listHealthShims = func() ([]shims.Process, error) { return nil, errors.New("injected enumeration failure") }
+	t.Cleanup(func() { listHealthShims = previous })
+	got := healthBudgetBlock().Shims
+	if got.Available || got.Error != "injected enumeration failure" {
+		t.Fatalf("shim status = %+v", got)
+	}
 }
 
 // PAR-OPS-01: /api/health carries the budget block: reservations per component, the

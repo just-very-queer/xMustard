@@ -23,7 +23,13 @@ type healthBudget struct {
 	RequestBodyCapBytes int64                 `json:"request_body_cap_bytes"`
 	CaptureBodyCapBytes int64                 `json:"capture_body_cap_bytes"`
 	InFlightBodies      slotStatus            `json:"in_flight_bodies"`
-	Shims               shims.Summary         `json:"shims"`
+	Shims               shimHealth            `json:"shims"`
+}
+
+type shimHealth struct {
+	shims.Summary
+	Available bool   `json:"available"`
+	Error     string `json:"error,omitempty"`
 }
 
 type slotStatus struct {
@@ -104,11 +110,15 @@ func healthBudgetView(r *http.Request) (full bool, detail string) {
 	return true, ""
 }
 
+var listHealthShims = shims.List
+
 func healthBudgetBlock() healthBudget {
-	processes, err := shims.List()
-	shimSummary := shims.Count(nil)
+	processes, err := listHealthShims()
+	shimStatus := shimHealth{Available: err == nil}
 	if err == nil {
-		shimSummary = shims.Count(processes)
+		shimStatus.Summary = shims.Count(processes)
+	} else {
+		shimStatus.Error = err.Error()
 	}
 	return healthBudget{
 		Snapshot:            budget.Status(),
@@ -116,7 +126,7 @@ func healthBudgetBlock() healthBudget {
 		RequestBodyCapBytes: ordinaryBodyCap,
 		CaptureBodyCapBytes: captureBodyCap,
 		InFlightBodies:      slotStatus{Cap: cap(bodyInFlight), InUse: len(bodyInFlight)},
-		Shims:               shimSummary,
+		Shims:               shimStatus,
 	}
 }
 

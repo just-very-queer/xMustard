@@ -38,6 +38,32 @@ type procBSD struct {
 	StartSec, StartUsec                                                             uint64
 }
 
+func processIdentity(pid int) (Process, error) {
+	var b bsdShort
+	got, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b))
+	if errno != 0 || got != unsafe.Sizeof(b) {
+		if errno != 0 {
+			return Process{}, errno
+		}
+		return Process{}, ErrProcessChanged
+	}
+	var info procBSD
+	got, _, errno = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), 3, 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+	if errno != 0 || got != unsafe.Sizeof(info) {
+		if errno != 0 {
+			return Process{}, errno
+		}
+		return Process{}, ErrProcessChanged
+	}
+	return Process{PID: pid, UID: int(b.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Comm: unix.ByteSliceToString(b.Comm[:])}, nil
+}
+
+func signalProcess(expected Process) error {
+	return signalIfIdentity(expected, processIdentity, func(pid int) error {
+		return syscall.Kill(pid, syscall.SIGKILL)
+	})
+}
+
 func listPlatform() ([]Process, error) {
 	pids := make([]int32, 4096)
 	var n int
@@ -76,7 +102,7 @@ func listPlatform() ([]Process, error) {
 		start := time.Unix(int64(info.StartSec), int64(info.StartUsec)*1000)
 		age := time.Since(start)
 		cpu := time.Duration(r.UserTime + r.SystemTime)
-		out = append(out, Process{PID: pid, PPID: int(b.PPID), Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: ProcessName})
+		out = append(out, Process{PID: pid, PPID: int(b.PPID), UID: int(b.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: ProcessName})
 	}
 	return out, nil
 }

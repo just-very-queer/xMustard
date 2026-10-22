@@ -5,7 +5,6 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"syscall"
 
 	"xmustard/api-go/internal/shims"
 )
@@ -24,7 +23,7 @@ func runShims(args []string) {
 		fatal(err.Error())
 	}
 	if *reap {
-		err = shims.Reap(processes, func(pid int, signal os.Signal) error { return syscall.Kill(pid, signal.(syscall.Signal)) })
+		err = shims.ReapCurrent(processes)
 		if err != nil {
 			fatal(err.Error())
 		}

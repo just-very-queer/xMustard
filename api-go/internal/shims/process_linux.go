@@ -11,7 +11,54 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
+
+func processIdentity(pid int) (Process, error) {
+	path := filepath.Join("/proc", strconv.Itoa(pid))
+	info, err := os.Stat(path)
+	if err != nil {
+		return Process{}, err
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return Process{}, fmt.Errorf("process uid unavailable")
+	}
+	data, err := os.ReadFile(filepath.Join(path, "stat"))
+	if err != nil {
+		return Process{}, err
+	}
+	comm, rest, ok := parseProcStat(string(data))
+	fields := strings.Fields(rest)
+	if !ok || len(fields) < 20 {
+		return Process{}, fmt.Errorf("process stat unavailable")
+	}
+	start, err := strconv.ParseUint(fields[19], 10, 64)
+	if err != nil {
+		return Process{}, err
+	}
+	return Process{PID: pid, UID: int(st.Uid), StartTime: start, Comm: comm}, nil
+}
+
+func signalProcess(expected Process) error {
+	identity, err := processIdentity(expected.PID)
+	if err != nil || identity.PID != expected.PID || identity.UID != expected.UID || identity.StartTime != expected.StartTime || identity.Comm != ProcessName {
+		return ErrProcessChanged
+	}
+	fd, err := unix.PidfdOpen(expected.PID, 0)
+	if err == nil {
+		defer unix.Close(fd)
+		identity, err = processIdentity(expected.PID)
+		if err != nil || identity.PID != expected.PID || identity.UID != expected.UID || identity.StartTime != expected.StartTime || identity.Comm != ProcessName {
+			return ErrProcessChanged
+		}
+		return unix.PidfdSendSignal(fd, syscall.SIGKILL, nil, 0)
+	}
+	return signalIfIdentity(expected, processIdentity, func(pid int) error {
+		return syscall.Kill(pid, syscall.SIGKILL)
+	})
+}
 
 func listPlatform() ([]Process, error) {
 	entries, err := os.ReadDir("/proc")
@@ -66,7 +113,7 @@ func listPlatform() ([]Process, error) {
 				rss = resident * int64(os.Getpagesize())
 			}
 		}
-		out = append(out, Process{PID: pid, PPID: ppid, Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: rss, Comm: comm})
+		out = append(out, Process{PID: pid, PPID: ppid, UID: int(st.Uid), StartTime: start, Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: rss, Comm: comm})
 	}
 	return out, nil
 }

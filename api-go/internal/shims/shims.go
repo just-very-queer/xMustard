@@ -1,12 +1,14 @@
 package shims
 
 import (
-	"os"
+	"errors"
 	"sync"
 	"time"
 )
 
 const ProcessName = "xmustard-mcp"
+
+var ErrProcessChanged = errors.New("stdio shim process identity changed or is unverifiable")
 
 type Class string
 
@@ -19,6 +21,8 @@ const (
 type Process struct {
 	PID        int           `json:"pid"`
 	PPID       int           `json:"ppid"`
+	UID        int           `json:"uid"`
+	StartTime  uint64        `json:"-"`
 	Age        time.Duration `json:"-"`
 	AgeSeconds int64         `json:"age_seconds"`
 	CPUS       time.Duration `json:"-"`
@@ -49,17 +53,50 @@ func Classify(p Process) Class {
 	return Live
 }
 
-func Reap(processes []Process, kill func(int, os.Signal) error) error {
+func Reap(processes []Process, signal func(Process) error) error {
 	var first error
 	for _, p := range processes {
 		class := Classify(p)
 		if class == Runaway || class == Orphaned {
-			if err := kill(p.PID, os.Kill); err != nil && first == nil {
+			if err := signal(p); err != nil && first == nil {
 				first = err
 			}
 		}
 	}
 	return first
+}
+
+var sampleCollection sync.Mutex
+var enumerateProcesses = listPlatform
+
+func list() ([]Process, error) {
+	sampleCollection.Lock()
+	defer sampleCollection.Unlock()
+	ps, err := enumerateProcesses()
+	if err != nil {
+		return nil, err
+	}
+	updateSlopes(ps, time.Now())
+	for i := range ps {
+		ps[i].Class = Classify(ps[i])
+	}
+	return ps, nil
+}
+
+func List() ([]Process, error) {
+	return list()
+}
+
+func signalIfIdentity(expected Process, identify func(int) (Process, error), send func(int) error) error {
+	current, err := identify(expected.PID)
+	if err != nil || current.PID != expected.PID || current.UID != expected.UID || current.StartTime != expected.StartTime || current.Comm != ProcessName {
+		return ErrProcessChanged
+	}
+	return send(expected.PID)
+}
+
+func ReapCurrent(processes []Process) error {
+	return Reap(processes, signalProcess)
 }
 
 var slopes = struct {
@@ -83,27 +120,17 @@ func updateSlopes(ps []Process, now time.Time) {
 		}
 		seen[p.PID] = true
 		if old, ok := slopes.samples[p.PID]; ok && now.After(old.at) && p.CPUS >= old.cpu {
-			p.CPUSlope = float64(p.CPUS-old.cpu) / now.Sub(old.at).Seconds()
+			p.CPUSlope = (p.CPUS - old.cpu).Seconds() / now.Sub(old.at).Seconds()
 		}
-		slopes.samples[p.PID] = sample{now, p.CPUS}
+		if old, ok := slopes.samples[p.PID]; !ok || !now.Before(old.at) {
+			slopes.samples[p.PID] = sample{now, p.CPUS}
+		}
 	}
 	for pid := range slopes.samples {
 		if !seen[pid] {
 			delete(slopes.samples, pid)
 		}
 	}
-}
-
-func List() ([]Process, error) {
-	ps, err := listPlatform()
-	if err != nil {
-		return nil, err
-	}
-	updateSlopes(ps, time.Now())
-	for i := range ps {
-		ps[i].Class = Classify(ps[i])
-	}
-	return ps, nil
 }
 
 func ListForOperator() ([]Process, error) {
