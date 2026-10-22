@@ -1145,7 +1145,7 @@ func TestUnresolvableWorkspaceFailsClearly(t *testing.T) {
 				t.Fatalf("%s: want a tool error, got %v %v", tl.Name, rerr, res)
 			}
 			msg := text(res)
-			for _, want := range []string{"no workspace resolved", "XMUSTARD_WORKSPACE_ID is unset", "the client offers no roots", "Pass workspace_id", "alpha-1 (/nonexistent/alpha)"} {
+			for _, want := range []string{"no workspace resolved", "XMUSTARD_WORKSPACE_ID is unset", "the client offers no roots", "xmustard-ops workspace load --root-path", "--data-dir <API data directory>", "pass workspace_id or set XMUSTARD_WORKSPACE_ID", "alpha-1 (/nonexistent/alpha)"} {
 				if !strings.Contains(msg, want) {
 					t.Fatalf("%s: error %q lacks %q", tl.Name, msg, want)
 				}

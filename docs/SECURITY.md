@@ -425,7 +425,12 @@ registered workspace, but it does not register one: the roots the client declare
 may name a different repository. `XMUSTARD_REGISTER_CWD_WHEN_ROOTS_UNKNOWN=1`
 registers the working directory's own enclosing git repository in exactly that case,
 in the stdio shim (the `/mcp` endpoint has no working directory), and the table above
-still decides whether the caller's token may do it. The registration is the same
+still decides whether the caller's token may do it. The default remains off by owner
+choice (WS-FIX-15b); do not enable it as a workaround for missing client roots without
+reviewing that trust boundary. If tools cannot resolve a workspace, run
+`xmustard-ops workspace load --root-path "$PWD" --data-dir <API data directory>`
+against the same data directory as the API, then pass its `workspace_id` or set
+`XMUSTARD_WORKSPACE_ID` in the client environment. The registration is the same
 `POST /api/workspaces/load` as any other, so it is the same scan and the same
 accounting; turning it on means trusting the server's working directory.
 
