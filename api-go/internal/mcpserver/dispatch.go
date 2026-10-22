@@ -214,6 +214,9 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 	if isOverloadBody(resp.Status, resp.Body) {
 		return nil, OverloadError(budget.ErrOverloaded)
 	}
+	if isAuthFailure(resp.Status, resp.Body) {
+		return TextResult(authFailureMessage(resp.Status), true), nil
+	}
 	var res map[string]any
 	if d := s.srv.opts.Delivery; d != nil {
 		var rerr *RPCError
@@ -239,6 +242,30 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 		return ReplyRefused(err)
 	}
 	return res, nil
+}
+
+func isAuthFailure(status int, body string) bool {
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	if status != http.StatusForbidden {
+		return false
+	}
+	var refusal struct {
+		Reason      string `json:"reason"`
+		MissingRole string `json:"missing_role"`
+		Refusal     string `json:"refusal"`
+		Error       string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(body), &refusal); err != nil {
+		return false
+	}
+	return refusal.MissingRole != "" || refusal.Reason == "missing_role" || refusal.Reason == "presence_only_token" ||
+		refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace ")
+}
+
+func authFailureMessage(status int) string {
+	return fmt.Sprintf("xmustard authentication or authorization failed (HTTP %d); grounding is unavailable. For a missing or expired token, run `xmustard-api mint-token <id> agent`, update XMUSTARD_API_TOKEN for this client, and restart it. For HTTP 403, also check that the token has the required role.", status)
 }
 
 // finish adds what every result carries: the workspace echo and any normalizations

@@ -1331,6 +1331,30 @@ func TestStructuredShapes(t *testing.T) {
 	}
 }
 
+func TestToolAuthFailuresGiveActionableGroundingError(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		body   string
+	}{
+		{http.StatusUnauthorized, `{"error":"authentication required","detail":"private api refusal"}`},
+		{http.StatusForbidden, `{"error":"proposer role required","reason":"missing_role","missing_role":"proposer","detail":"private api refusal"}`},
+	} {
+		t.Run(fmt.Sprint(tc.status), func(t *testing.T) {
+			api := &fakeAPI{handle: func(Request) *APIResponse {
+				return &APIResponse{Status: tc.status, Body: tc.body}
+			}}
+			s := newSession(t, api, Options{}, nil, "2025-06-18")
+			res, rerr := call(t, s, "ground", map[string]any{"workspace_id": "ws"})
+			message := text(res)
+			if rerr != nil || res["isError"] != true || !strings.Contains(message, "grounding is unavailable") ||
+				!strings.Contains(message, "xmustard-api mint-token") || !strings.Contains(message, "XMUSTARD_API_TOKEN") ||
+				strings.Contains(message, "private api refusal") {
+				t.Fatalf("auth refusal should be a safe, actionable tool error, got %v %v", res, rerr)
+			}
+		})
+	}
+}
+
 // errBackend fails every request with err.
 type errBackend struct{ err error }
 
