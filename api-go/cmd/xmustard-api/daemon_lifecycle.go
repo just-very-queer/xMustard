@@ -2,12 +2,18 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
+	"time"
 
 	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/workspaceops"
@@ -60,19 +66,52 @@ func listen(cfg serverConfig, activated net.Listener) (net.Listener, error) {
 	if activated != nil {
 		return activated, nil
 	}
-	return net.Listen("tcp", cfg.addr())
+	ln, err := net.Listen("tcp", cfg.addr())
+	if err == nil || !errors.Is(err, syscall.EADDRINUSE) {
+		return ln, err
+	}
+	if existingAPI(cfg.addr()) {
+		return nil, errAlreadyRunning
+	}
+	return nil, err
+}
+
+var errAlreadyRunning = errors.New("already running")
+
+func existingAPI(addr string) bool {
+	client := http.Client{Timeout: 2 * time.Second}
+	resp, err := client.Get("http://" + addr + "/api/health")
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return false
+	}
+	var health struct {
+		Status  string `json:"status"`
+		Service string `json:"service"`
+	}
+	return json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&health) == nil && health.Status == "ok" && health.Service == "api-go"
+}
+
+// storeStartLine formats the startup check result; restore is reserved for diagnosed faults.
+func storeStartLine(h workspaceops.StoreHealth) string {
+	switch h.Status {
+	case workspaceops.StoreOK:
+		return fmt.Sprintf("store: governance store ok (schema v%d; migrated and quick_check passed in %d ms)", h.SchemaVersion, h.CheckMS)
+	case workspaceops.StoreNone:
+		return "store: no governance store yet; the first memory write creates it"
+	case workspaceops.StoreInterrupted:
+		return "store: governance store check interrupted; it reruns on next start"
+	case workspaceops.StoreCorrupt, workspaceops.StoreSchemaTooNew, workspaceops.StoreSchemaDrift:
+		return fmt.Sprintf("store: governance store %s: %s; memory calls fail until a backup is restored (xmustard-ops store restore)", strings.ToUpper(h.Status), h.Detail)
+	default:
+		return fmt.Sprintf("store: governance store %s: %s", strings.ToUpper(h.Status), h.Detail)
+	}
 }
 
 // checkStoreAtStart runs the governance store's startup check and logs the outcome.
 func checkStoreAtStart(ctx context.Context) {
-	h := workspaceops.CheckMemoryStore(ctx, dataDir())
-	switch h.Status {
-	case workspaceops.StoreOK:
-		log.Printf("store: governance store ok (schema v%d; migrated and quick_check passed in %d ms)", h.SchemaVersion, h.CheckMS)
-	case workspaceops.StoreNone:
-		log.Printf("store: no governance store yet; the first memory write creates it")
-	default:
-		log.Printf("store: governance store %s: %s; memory calls fail until a backup is restored (xmustard-ops store restore)",
-			strings.ToUpper(h.Status), h.Detail)
-	}
+	log.Print(storeStartLine(workspaceops.CheckMemoryStore(ctx, dataDir())))
 }

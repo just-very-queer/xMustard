@@ -10,6 +10,18 @@ import (
 	"xmustard/api-go/internal/govstore"
 )
 
+func TestCheckMemoryStoreCancelledIsInterrupted(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := Remember(dir, "ws", RememberRequest{ProposeContextRequest: ProposeContextRequest{Title: "t", Content: "valid store"}}, ContextActor{ID: "author"}); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if h := CheckMemoryStore(ctx, dir); h.Status != StoreInterrupted {
+		t.Fatalf("cancelled check = %+v, want %q", h, StoreInterrupted)
+	}
+}
+
 // The daemon's startup check: no store yet is "none"; a healthy store is migrated and
 // "ok" at this build's schema; a damaged one is "corrupt" and every later memory call
 // in the process is refused (fail closed) instead of served from a damaged file.

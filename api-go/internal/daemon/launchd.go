@@ -55,7 +55,8 @@ func (l Launchd) Files(s Spec) []File {
 		{"WorkingDirectory", s.DataDir},
 		{"RunAtLoad", true},
 		{"KeepAlive", []plistEntry{{"SuccessfulExit", false}}},
-		{"ThrottleInterval", 10},
+		{"ThrottleInterval", 60},
+		{"ProcessType", "Background"},
 		// the daemon drains for up to 25 s (in-flight requests, then runs) before it exits
 		{"ExitTimeOut", 30},
 		{"Umask", 0o077},

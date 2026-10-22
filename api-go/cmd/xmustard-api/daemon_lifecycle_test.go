@@ -5,9 +5,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +21,52 @@ import (
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/workspaceops"
 )
+
+func TestStoreStartLineAdvisesRestoreOnlyOnFault(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   bool
+	}{
+		{workspaceops.StoreInterrupted, false},
+		{workspaceops.StoreError, false},
+		{workspaceops.StoreCorrupt, true},
+		{workspaceops.StoreSchemaTooNew, true},
+		{workspaceops.StoreSchemaDrift, true},
+	} {
+		line := storeStartLine(workspaceops.StoreHealth{Status: tc.status, Detail: "check failed"})
+		if got := strings.Contains(line, "restore"); got != tc.want {
+			t.Errorf("%s: restore=%v; line %q", tc.status, got, line)
+		}
+	}
+	if line := storeStartLine(workspaceops.StoreHealth{Status: workspaceops.StoreInterrupted}); !strings.Contains(line, "reruns on next start") {
+		t.Errorf("interrupted line = %q", line)
+	}
+}
+
+func TestListenAlreadyRunningIsDistinctExit(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"api-go"}`))
+	}))
+	defer srv.Close()
+	host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	cfg := serverConfig{host: host, port: port}
+	if _, err := listen(cfg, nil); !errors.Is(err, errAlreadyRunning) {
+		t.Fatalf("listen error = %v, want already-running sentinel", err)
+	}
+}
+
+func TestListenForeignPortStillFails(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	host, port, _ := net.SplitHostPort(ln.Addr().String())
+	_, err = listen(serverConfig{host: host, port: port}, nil)
+	if err == nil || errors.Is(err, errAlreadyRunning) {
+		t.Fatalf("foreign listener error = %v", err)
+	}
+}
 
 // daemonEnv is the environment a fixture API runs with: the caller's, minus every
 // xMustard setting and socket-activation variable, plus env.

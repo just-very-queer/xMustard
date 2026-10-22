@@ -18,11 +18,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/mcpserver"
@@ -394,6 +396,20 @@ func (r *inflightRegistry) done(id string) {
 	r.mu.Unlock()
 }
 
+// cancelAll aborts every request still running when the stdio session ends.
+func (r *inflightRegistry) cancelAll() {
+	r.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(r.m))
+	for id, cancel := range r.m {
+		cancels = append(cancels, cancel)
+		delete(r.m, id)
+	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 // cancel aborts the in-flight request with this id (no-op if already finished/unknown).
 func (r *inflightRegistry) cancel(id string) {
 	r.mu.Lock()
@@ -591,6 +607,22 @@ func (s *stdioServer) refuseUndecoded(probe []byte, rerr *rpcError) {
 	}
 }
 
+func watchParent(stdin io.Closer, startPPID int, getPPID func() int, interval time.Duration, stop <-chan struct{}) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if getPPID() != startPPID {
+				_ = stdin.Close()
+				return
+			}
+		}
+	}
+}
+
 func main() {
 	if schemaErr != nil {
 		fmt.Fprintln(os.Stderr, "xmustard-mcp:", schemaErr)
@@ -612,7 +644,12 @@ func main() {
 	client.send = write
 	client.mu.Unlock()
 	s := &stdioServer{send: func(resp rpcResponse) { write(resp) }, inflight: newInflight(), slots: make(chan struct{}, maxInflight())}
-	defer s.workers.Wait()
+	parentDone := make(chan struct{})
+	defer close(parentDone)
+	startPPID := os.Getppid()
+	stopParentSignal := watchParentDeathSignal(startPPID, func() { _ = os.Stdin.Close() })
+	defer stopParentSignal()
+	go watchParent(os.Stdin, startPPID, os.Getppid, 5*time.Second, parentDone)
 
 	for {
 		// Every frame is admitted against the shim's transient pool before it is
@@ -624,5 +661,15 @@ func main() {
 		if f.err != nil { // io.EOF or a read error: stop
 			break
 		}
+	}
+	s.inflight.cancelAll()
+	workersDone := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-time.After(2 * time.Second):
 	}
 }

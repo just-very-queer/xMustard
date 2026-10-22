@@ -29,6 +29,42 @@ func buildShim(t *testing.T) string {
 // Audit Go #5 (MCP calls): the stdio reader started one goroutine per request with no
 // admission limit. Beyond XMUSTARD_MCP_MAX_INFLIGHT outstanding calls, the shim must
 // answer at once with a protocol-correct JSON-RPC overload error.
+// EOF must cancel an in-flight backend request rather than waiting for its HTTP timeout.
+func TestShimExitsPromptlyOnEOFWithInflightCall(t *testing.T) {
+	started := make(chan struct{})
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer api.Close()
+
+	cmd := exec.Command(buildShim(t))
+	cmd.Env = append(os.Environ(), "XMUSTARD_API_BASE="+api.URL, "XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	_, _ = fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	_, _ = fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"workspace_id":"ws","q":"probe query"}}}`)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recall did not reach blocked API")
+	}
+	_ = stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shim did not exit within 3s after EOF")
+	}
+}
+
 func TestShimRefusesCallsBeyondInflightLimit(t *testing.T) {
 	release := make(chan struct{})
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

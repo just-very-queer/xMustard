@@ -57,6 +57,10 @@ func main() {
 		log.Fatal(err)
 	}
 	ln, err := listen(cfg, activated)
+	if errors.Is(err, errAlreadyRunning) {
+		log.Printf("already running at %s; exiting", cfg.addr())
+		os.Exit(75)
+	}
 	if err != nil {
 		log.Fatal(err)
 	}

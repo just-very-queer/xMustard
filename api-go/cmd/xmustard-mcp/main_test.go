@@ -6,10 +6,56 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"xmustard/api-go/internal/mcpserver"
 )
+
+func TestInflightCancelAll(t *testing.T) {
+	registry := newInflight()
+	cancelled := make(chan struct{}, 2)
+	registry.add("one", func() { cancelled <- struct{}{} })
+	registry.add("two", func() { cancelled <- struct{}{} })
+	registry.cancelAll()
+	for range 2 {
+		select {
+		case <-cancelled:
+		case <-time.After(time.Second):
+			t.Fatal("cancelAll did not cancel every request")
+		}
+	}
+	registry.mu.Lock()
+	remaining := len(registry.m)
+	registry.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("in-flight requests remain: %d", remaining)
+	}
+}
+
+func TestWatchParentClosesStdinWhenParentChanges(t *testing.T) {
+	closed := make(chan struct{}, 1)
+	var ppid atomic.Int64
+	ppid.Store(10)
+	stop := make(chan struct{})
+	go watchParent(closeRecorder{closed}, 10, func() int { return int(ppid.Load()) }, time.Millisecond, stop)
+	ppid.Store(11)
+	select {
+	case <-closed:
+	case <-time.After(time.Second):
+		close(stop)
+		t.Fatal("parent watcher did not close stdin")
+	}
+	close(stop)
+}
+
+type closeRecorder struct{ closed chan struct{} }
+
+func (c closeRecorder) Close() error {
+	c.closed <- struct{}{}
+	return nil
+}
 
 // The shim answers initialize through the shared session: a client naming no version
 // keeps the legacy answer, a current client gets its version and the instructions.
