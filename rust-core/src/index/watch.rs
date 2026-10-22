@@ -231,6 +231,7 @@ fn git_class(rel: &str) -> Class {
     match rel.as_str() {
         "info/exclude" => Class::IgnoreFile,
         "index" => Class::Git { index: true },
+        "logs" | "info" | "refs" => Class::Git { index: false },
         r if GIT_STATE_FILES.contains(&r) || r.starts_with("refs/") => Class::Git { index: false },
         // a submodule's own Git dir: its commits move the HEAD this root's key covers
         r if r.starts_with("modules/") => Class::NestedGit,
@@ -786,8 +787,13 @@ impl Root {
                     inner.counters.git_events += 1;
                     inner.recheck_ignored |= index;
                     inner.queue.push(Change::Git, now);
+                    let new_dir = created_dir
+                        && std::fs::symlink_metadata(abs).is_ok_and(|meta| meta.is_dir());
                     drop(inner);
                     self.bump(true);
+                    if new_dir && !recursive_native() {
+                        self.cover_dir(&layout, abs, now);
+                    }
                 }
                 Class::IgnoreFile => {
                     inner.reload_ignored = true;
@@ -1271,6 +1277,34 @@ fn optional_worktree_dir(layout: &Layout, dir: &Path) -> bool {
             .any(|git_dir| dir.starts_with(git_dir))
 }
 
+fn optional_git_auxiliary_dir(layout: &Layout, dir: &Path) -> bool {
+    layout
+        .git_dirs
+        .iter()
+        .any(|git_dir| dir.starts_with(git_dir) && dir != git_dir)
+}
+
+fn optional_watch_dir(layout: &Layout, dir: &Path) -> bool {
+    optional_worktree_dir(layout, dir) || optional_git_auxiliary_dir(layout, dir)
+}
+
+fn register_required_git_dirs<I, F>(dirs: I, mut add: F) -> Result<(), NativeError>
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: FnMut(&Path) -> Result<(), WatchAddError>,
+{
+    for dir in dirs {
+        match add(&dir) {
+            Ok(()) => {}
+            Err(WatchAddError::Fatal(e)) => return Err(e),
+            Err(WatchAddError::Vanished | WatchAddError::Skipped) => {
+                return Err(NativeError::prefixed("cannot be watched", &dir));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn register_directories<I, F>(
     dirs: I,
     layout: &Layout,
@@ -1288,8 +1322,8 @@ where
             Ok(()) => {
                 watched.insert(dir);
             }
-            Err(WatchAddError::Vanished) if optional_worktree_dir(layout, &dir) => vanished += 1,
-            Err(WatchAddError::Skipped) if optional_worktree_dir(layout, &dir) => {}
+            Err(WatchAddError::Vanished) if optional_watch_dir(layout, &dir) => vanished += 1,
+            Err(WatchAddError::Skipped) if optional_watch_dir(layout, &dir) => {}
             Err(e) => {
                 return Err(match e {
                     WatchAddError::Fatal(e) => e,
@@ -1318,30 +1352,34 @@ fn start_native(
             reason: format!("the native watcher did not start: {e}"),
             path: String::new(),
         })?;
-    if recursive_native() {
-        add_watch(&mut w, &layout.root, RecursiveMode::Recursive).map_err(|e| match e {
-            WatchAddError::Fatal(e) => e,
-            WatchAddError::Vanished | WatchAddError::Skipped => {
-                NativeError::prefixed("cannot be watched", &layout.root)
-            }
+    let (watched, vanished) =
+        register_native_dirs(layout, max_dirs, recursive_native(), |dir, mode| {
+            add_watch(&mut w, dir, mode)
         })?;
-        for dir in layout
-            .git_dirs
-            .iter()
-            .filter(|d| !d.starts_with(&layout.root))
-        {
-            match add_watch(&mut w, dir, RecursiveMode::Recursive) {
-                Ok(()) => {}
-                Err(WatchAddError::Vanished) => {
-                    return Err(NativeError::prefixed("cannot be watched", dir));
-                }
-                Err(WatchAddError::Skipped) => {
-                    return Err(NativeError::prefixed("cannot be watched", dir));
-                }
-                Err(WatchAddError::Fatal(e)) => return Err(e),
-            }
-        }
-        return Ok((w, BTreeSet::new(), 0));
+    Ok((w, watched, vanished))
+}
+
+fn register_native_dirs<F>(
+    layout: &Layout,
+    max_dirs: usize,
+    recursive: bool,
+    mut add: F,
+) -> Result<(BTreeSet<PathBuf>, u64), NativeError>
+where
+    F: FnMut(&Path, RecursiveMode) -> Result<(), WatchAddError>,
+{
+    if recursive {
+        register_required_git_dirs(
+            std::iter::once(layout.root.clone()).chain(
+                layout
+                    .git_dirs
+                    .iter()
+                    .filter(|d| !d.starts_with(&layout.root))
+                    .cloned(),
+            ),
+            |dir| add(dir, RecursiveMode::Recursive),
+        )?;
+        return Ok((BTreeSet::new(), 0));
     }
     // HEAD, the Git index, packed-refs, config and the cookies in the Git dir itself;
     // logs/HEAD; info/exclude; every refs directory
@@ -1354,10 +1392,9 @@ fn start_native(
         .filter(|(_, is_dir)| *is_dir)
         .map(|(p, _)| p);
     let dirs = tree.chain(git_state_dirs);
-    let (watched, vanished) = register_directories(dirs, layout, max_dirs, |dir| {
-        add_watch(&mut w, dir, RecursiveMode::NonRecursive)
-    })?;
-    Ok((w, watched, vanished))
+    register_directories(dirs, layout, max_dirs, |dir| {
+        add(dir, RecursiveMode::NonRecursive)
+    })
 }
 
 fn walkdir_dirs(dir: PathBuf) -> impl Iterator<Item = PathBuf> {
@@ -1832,6 +1869,126 @@ mod tests {
         assert!(
             !watcher.vouches_git(),
             "failed registration cannot enable Git memo reuse"
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn fresh_repository_without_git_auxiliary_dirs_starts_watching() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root = temp.path().join("worktree");
+        let git_dir = root.join(".git");
+        std::fs::create_dir_all(&git_dir).expect("Git directory");
+        let layout = Layout {
+            root: root.clone(),
+            git_dirs: vec![git_dir.clone()],
+            ignored: Some(BTreeSet::new()),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let (watcher, watched, vanished) = start_native(&layout, tx, MAX_WATCH_DIRS)
+            .unwrap_or_else(|_| panic!("missing logs/info are optional"));
+
+        assert!(watched.contains(&git_dir));
+        assert!(vanished >= 2);
+        drop(watcher);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn linked_worktree_without_own_info_starts_watching() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root = temp.path().join("worktree");
+        let git_dir = temp.path().join("worktrees/one");
+        let common_dir = temp.path().join("common.git");
+        std::fs::create_dir_all(&root).expect("worktree root");
+        std::fs::create_dir_all(&git_dir).expect("worktree Git directory");
+        std::fs::create_dir_all(&common_dir).expect("common Git directory");
+        let layout = Layout {
+            root: root.clone(),
+            git_dirs: vec![git_dir.clone(), common_dir.clone()],
+            ignored: Some(BTreeSet::new()),
+        };
+        let (tx, _rx) = mpsc::channel();
+        let (watcher, watched, vanished) = start_native(&layout, tx, MAX_WATCH_DIRS)
+            .unwrap_or_else(|_| panic!("missing auxiliary dirs are optional"));
+
+        assert!(watched.contains(&git_dir));
+        assert!(watched.contains(&common_dir));
+        assert!(vanished >= 2);
+        drop(watcher);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn created_git_auxiliary_directory_is_covered_after_startup() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root_path = temp.path().join("worktree");
+        let git_dir = temp.path().join("repo.git");
+        std::fs::create_dir_all(&root_path).expect("worktree root");
+        std::fs::create_dir_all(&git_dir).expect("Git directory");
+        let layout = Layout {
+            root: root_path.clone(),
+            git_dirs: vec![git_dir.clone()],
+            ignored: Some(BTreeSet::new()),
+        };
+        let (tx, rx) = mpsc::channel();
+        let (native, watched, _) = start_native(&layout, tx, MAX_WATCH_DIRS)
+            .unwrap_or_else(|_| panic!("watch existing roots"));
+        let (root, _root_rx) = Root::new(root_path, None, MAX_WATCH_DIRS);
+        *lock(&root.layout) = Arc::new(layout);
+        {
+            let mut inner = lock(&root.inner);
+            inner.native = Some(native);
+            inner.watched = watched;
+        }
+        let logs = git_dir.join("logs");
+        std::fs::create_dir(&logs).expect("create auxiliary directory");
+        let mut event = Event::new(EventKind::Create(CreateKind::Folder));
+        event.paths.push(logs.clone());
+
+        root.on_event(Ok(event));
+
+        assert!(lock(&root.inner).watched.contains(&logs));
+        drop(rx);
+    }
+
+    #[test]
+    fn recursive_startup_fails_closed_for_a_vanished_required_git_root() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root = temp.path().join("worktree");
+        let git_dir = temp.path().join("linked-worktree-git");
+        std::fs::create_dir_all(&root).expect("worktree root");
+        let layout = Layout {
+            root: root.clone(),
+            git_dirs: vec![git_dir.clone()],
+            ignored: Some(BTreeSet::new()),
+        };
+        let result = register_native_dirs(&layout, MAX_WATCH_DIRS, true, |path, mode| {
+            assert_eq!(mode, RecursiveMode::Recursive);
+            if path == git_dir {
+                Err(WatchAddError::Vanished)
+            } else {
+                Ok(())
+            }
+        });
+        let (watcher, _rx) = Root::new(root, None, MAX_WATCH_DIRS);
+        *lock(&watcher.layout) = Arc::new(layout);
+        let now = Instant::now();
+        let mut inner = lock(&watcher.inner);
+        inner.establishing = false;
+        watcher.degrade(
+            &mut inner,
+            result.expect_err("required Git root failure must fail startup"),
+            now,
+        );
+        assert_eq!(inner.rewatch_at, Some(now + REWATCH_AFTER));
+        drop(inner);
+        watcher.publish();
+
+        assert_eq!(watcher.state(), WatcherState::Degraded);
+        assert!(
+            !watcher.vouches_git(),
+            "failed startup cannot vouch for Git"
         );
     }
 
