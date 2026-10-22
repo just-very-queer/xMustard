@@ -262,6 +262,8 @@ pub struct WatchCounters {
     /// inotify directory watches (0 with a recursive native stream); `status` fills it
     /// in from the watched set.
     pub dirs_watched: usize,
+    /// Directories that vanished while their inotify watch was being registered.
+    pub dirs_vanished: u64,
     pub cookies: u64,
     pub cookie_timeouts: u64,
     /// Repository state observations reused while nothing changed.
@@ -696,9 +698,10 @@ impl Root {
         let mut inner = lock(&self.inner);
         inner.establishing = false;
         match outcome {
-            Ok((watcher, watched)) => {
+            Ok((watcher, watched, vanished)) => {
                 inner.native = Some(watcher);
                 inner.watched = watched;
+                inner.counters.dirs_vanished += vanished;
                 inner.rewatch_at = None;
                 inner.rewatch_failures = 0;
                 inner.detail.clear();
@@ -820,22 +823,26 @@ impl Root {
     /// native stream.
     fn forget_gone_dirs(&self, paths: &[PathBuf]) {
         let mut inner = lock(&self.inner);
+        let mut gone = BTreeSet::new();
         for abs in paths {
-            let gone = inner.watched.contains(abs)
-                && !std::fs::symlink_metadata(abs).is_ok_and(|m| m.is_dir());
-            if !gone {
-                continue;
-            }
-            let below: Vec<PathBuf> = inner
-                .watched
-                .range(abs.clone()..)
-                .take_while(|p| p.starts_with(abs))
-                .cloned()
-                .collect();
-            for p in &below {
-                inner.watched.remove(p);
+            if inner.watched.contains(abs)
+                && !std::fs::symlink_metadata(abs).is_ok_and(|m| m.is_dir())
+            {
+                gone.insert(abs.clone());
             }
         }
+        // inotify watches survive a directory rename, but notify may report only the new
+        // pathname. Drop vanished keys too, or cover_dir will count the moved watches twice.
+        gone.extend(
+            inner
+                .watched
+                .iter()
+                .filter(|path| !std::fs::symlink_metadata(path).is_ok_and(|m| m.is_dir()))
+                .cloned(),
+        );
+        inner
+            .watched
+            .retain(|path| !gone.iter().any(|dir| path.starts_with(dir)));
     }
 
     /// Cover a directory the watcher did not see into: one that appeared (inotify) or
@@ -862,8 +869,9 @@ impl Root {
                 Ok(()) => {
                     inner.watched.insert(path);
                 }
-                Err(None) => {}
-                Err(Some(e)) => {
+                Err(WatchAddError::Vanished) => inner.counters.dirs_vanished += 1,
+                Err(WatchAddError::Skipped) => {}
+                Err(WatchAddError::Fatal(e)) => {
                     failure = Some(e);
                     break;
                 }
@@ -1207,27 +1215,80 @@ fn walk_tree<'a>(layout: &'a Layout, from: &Path) -> impl Iterator<Item = (PathB
         })
 }
 
-/// Add one watch; Ok(None) when the directory is gone or unreadable (it cannot be
-/// indexed either), Err(Some) when the watcher cannot go on.
+/// Add one watch. A vanished directory is counted and skipped; a permission failure is
+/// skipped as before, and other errors stop registration.
+enum WatchAddError {
+    Vanished,
+    Skipped,
+    Fatal(NativeError),
+}
+
 fn add_watch(
     w: &mut RecommendedWatcher,
     path: &Path,
     mode: RecursiveMode,
-) -> Result<(), Option<NativeError>> {
+) -> Result<(), WatchAddError> {
     match w.watch(path, mode) {
         Ok(()) => Ok(()),
-        Err(e) => match e.kind {
-            notify::ErrorKind::PathNotFound => Err(None),
-            notify::ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
-                Err(None)
-            }
-            notify::ErrorKind::MaxFilesWatch => Err(Some(NativeError::at_limit(
-                "the OS watch limit was reached (inotify max_user_watches, ENOSPC)",
-                path,
-            ))),
-            _ => Err(Some(NativeError::prefixed(&format!("watching: {e}"), path))),
-        },
+        Err(e) => Err(classify_watch_error(e, path)),
     }
+}
+
+fn classify_watch_error(e: notify::Error, path: &Path) -> WatchAddError {
+    match e.kind {
+        notify::ErrorKind::PathNotFound => WatchAddError::Vanished,
+        notify::ErrorKind::Io(ref io)
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            WatchAddError::Vanished
+        }
+        notify::ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::PermissionDenied => {
+            WatchAddError::Skipped
+        }
+        notify::ErrorKind::MaxFilesWatch => WatchAddError::Fatal(NativeError::at_limit(
+            "the OS watch limit was reached (inotify max_user_watches, ENOSPC)",
+            path,
+        )),
+        _ => WatchAddError::Fatal(NativeError::prefixed(&format!("watching: {e}"), path)),
+    }
+}
+
+fn register_directories<I, F>(
+    dirs: I,
+    root: &Path,
+    max_dirs: usize,
+    mut add: F,
+) -> Result<(BTreeSet<PathBuf>, u64), NativeError>
+where
+    I: IntoIterator<Item = PathBuf>,
+    F: FnMut(&Path) -> Result<(), WatchAddError>,
+{
+    let mut watched = BTreeSet::new();
+    let mut vanished = 0;
+    for dir in dirs {
+        match add(&dir) {
+            Ok(()) => {
+                watched.insert(dir);
+            }
+            Err(WatchAddError::Vanished) if dir != root => vanished += 1,
+            Err(WatchAddError::Skipped) if dir != root => {}
+            Err(e) => {
+                return Err(match e {
+                    WatchAddError::Fatal(e) => e,
+                    WatchAddError::Vanished | WatchAddError::Skipped => {
+                        NativeError::prefixed("cannot be watched", root)
+                    }
+                });
+            }
+        }
+        if watched.len() > max_dirs {
+            return Err(limit_error(max_dirs));
+        }
+    }
+    Ok((watched, vanished))
 }
 
 /// Start the native watcher for `layout`: one recursive stream where the platform has
@@ -1236,27 +1297,36 @@ fn start_native(
     layout: &Layout,
     tx: Sender<notify::Result<Event>>,
     max_dirs: usize,
-) -> Result<(RecommendedWatcher, BTreeSet<PathBuf>), NativeError> {
+) -> Result<(RecommendedWatcher, BTreeSet<PathBuf>, u64), NativeError> {
     let mut w =
         RecommendedWatcher::new(tx, notify::Config::default()).map_err(|e| NativeError::Other {
             reason: format!("the native watcher did not start: {e}"),
             path: String::new(),
         })?;
-    let fatal = |e: Option<NativeError>| {
-        e.unwrap_or_else(|| NativeError::prefixed("cannot be watched", &layout.root))
-    };
     if recursive_native() {
-        add_watch(&mut w, &layout.root, RecursiveMode::Recursive).map_err(fatal)?;
+        add_watch(&mut w, &layout.root, RecursiveMode::Recursive).map_err(|e| match e {
+            WatchAddError::Fatal(e) => e,
+            WatchAddError::Vanished | WatchAddError::Skipped => {
+                NativeError::prefixed("cannot be watched", &layout.root)
+            }
+        })?;
+        let mut vanished = 0;
         for dir in layout
             .git_dirs
             .iter()
             .filter(|d| !d.starts_with(&layout.root))
         {
-            add_watch(&mut w, dir, RecursiveMode::Recursive).map_err(fatal)?;
+            match add_watch(&mut w, dir, RecursiveMode::Recursive) {
+                Ok(()) => {}
+                Err(WatchAddError::Vanished) => vanished += 1,
+                Err(WatchAddError::Skipped) => {
+                    return Err(NativeError::prefixed("cannot be watched", dir));
+                }
+                Err(WatchAddError::Fatal(e)) => return Err(e),
+            }
         }
-        return Ok((w, BTreeSet::new()));
+        return Ok((w, BTreeSet::new(), vanished));
     }
-    let mut watched = BTreeSet::new();
     // HEAD, the Git index, packed-refs, config and the cookies in the Git dir itself;
     // logs/HEAD; info/exclude; every refs directory
     let git_state_dirs = layout.git_dirs.iter().flat_map(|g| {
@@ -1267,19 +1337,11 @@ fn start_native(
     let tree = walk_tree(layout, &layout.root)
         .filter(|(_, is_dir)| *is_dir)
         .map(|(p, _)| p);
-    for dir in tree.chain(git_state_dirs) {
-        match add_watch(&mut w, &dir, RecursiveMode::NonRecursive) {
-            Ok(()) => {
-                watched.insert(dir);
-            }
-            Err(None) if dir != layout.root => {}
-            Err(e) => return Err(fatal(e)),
-        }
-        if watched.len() > max_dirs {
-            return Err(limit_error(max_dirs));
-        }
-    }
-    Ok((w, watched))
+    let dirs = tree.chain(git_state_dirs);
+    let (watched, vanished) = register_directories(dirs, &layout.root, max_dirs, |dir| {
+        add_watch(&mut w, dir, RecursiveMode::NonRecursive)
+    })?;
+    Ok((w, watched, vanished))
 }
 
 fn walkdir_dirs(dir: PathBuf) -> impl Iterator<Item = PathBuf> {
@@ -1648,6 +1710,71 @@ mod tests {
             git_dirs: vec![PathBuf::from("/r/.git")],
             ignored: ignored.map(|d| d.iter().map(|s| s.to_string()).collect()),
         }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn vanished_directory_during_registration_does_not_degrade_watcher() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root = temp.path().to_path_buf();
+        let vanishing = root.join("vanishing");
+        std::fs::create_dir_all(vanishing.join("child")).expect("nested directory");
+        let layout = Layout {
+            root: root.clone(),
+            ignored: Some(BTreeSet::new()),
+            ..Layout::default()
+        };
+        let dirs: Vec<PathBuf> = walk_tree(&layout, &root)
+            .filter(|(_, is_dir)| *is_dir)
+            .map(|(path, _)| path)
+            .collect();
+        let (tx, _rx) = mpsc::channel();
+        let mut watcher = RecommendedWatcher::new(tx, notify::Config::default()).unwrap();
+        let mut removed = false;
+
+        let registration = register_directories(dirs, &root, MAX_WATCH_DIRS, |path| {
+            if path == vanishing && !removed {
+                std::fs::remove_dir_all(&vanishing).expect("remove after discovery");
+                removed = true;
+                return Err(classify_watch_error(
+                    notify::Error::io(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                    path,
+                ));
+            }
+            add_watch(&mut watcher, path, RecursiveMode::NonRecursive)
+        });
+        assert!(
+            registration.is_ok(),
+            "one vanished directory must not degrade the watcher"
+        );
+        let (watched, vanished) = registration.unwrap_or_else(|_| unreachable!());
+
+        assert!(removed);
+        assert_eq!(watched, BTreeSet::from([root]));
+        assert!(vanished > 0);
+    }
+
+    #[test]
+    fn rename_new_path_prunes_stale_watched_paths() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let old = dir.path().join("old");
+        let moved = dir.path().join("moved");
+        std::fs::create_dir(&moved).expect("the moved directory");
+        let (root, _rx) = Root::new(dir.path().to_path_buf(), None, MAX_WATCH_DIRS);
+        {
+            let mut inner = lock(&root.inner);
+            inner
+                .watched
+                .extend([dir.path().to_path_buf(), old.clone()]);
+        }
+
+        // A rename event carrying only the new path cannot identify `old` by event path.
+        root.forget_gone_dirs(&[moved]);
+
+        assert_eq!(
+            lock(&root.inner).watched,
+            BTreeSet::from([dir.path().to_path_buf()])
+        );
     }
 
     #[test]
