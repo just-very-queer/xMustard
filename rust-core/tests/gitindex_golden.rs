@@ -139,6 +139,8 @@ fn ignorecase_exclusion_patterns_match_ascii_case_insensitively() {
     write(&fx.root, "scratch.tmp", b"ignored\n");
     write(&fx.root, "_.range", b"not ignored by the A-z range\n");
     write(&fx.root, "_.neg", b"matches the negated class\n");
+    write(&fx.root, "a.neg", b"excluded lowercase letter\n");
+    write(&fx.root, "A.neg", b"excluded uppercase letter\n");
     write(&fx.root, "a.pos", b"ignored by the positive A-Z class\n");
     write(&fx.root, "A.POS", b"ignored by the positive A-Z class\n");
     assert_same_view(

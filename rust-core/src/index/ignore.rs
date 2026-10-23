@@ -125,6 +125,10 @@ fn set_bit(m: &mut [u64], i: usize) {
 /// Pattern elements and the byte sets of its classes. Runs of `*` merge, and `**/`
 /// repeated or before a trailing `**` adds nothing, so skip chains stay short.
 fn parse(p: &[u8]) -> (Vec<Tok>, Vec<ByteSet>) {
+    parse_with_case(p, false)
+}
+
+fn parse_with_case(p: &[u8], fold_classes: bool) -> (Vec<Tok>, Vec<ByteSet>) {
     let mut toks: Vec<Tok> = Vec::new();
     let mut classes: Vec<ByteSet> = Vec::new();
     let mut i = 0;
@@ -182,6 +186,14 @@ fn parse(p: &[u8]) -> (Vec<Tok>, Vec<ByteSet>) {
                     };
                     for c in a..=z {
                         set_bit(&mut set, c as usize);
+                    }
+                }
+                if fold_classes {
+                    for c in b'A'..=b'Z' {
+                        if set_has(&set, c) || set_has(&set, c.to_ascii_lowercase()) {
+                            set_bit(&mut set, c as usize);
+                            set_bit(&mut set, c.to_ascii_lowercase() as usize);
+                        }
                     }
                 }
                 if neg {
@@ -438,18 +450,10 @@ impl Glob {
 
     /// Compile with ASCII-insensitive matching without changing the pattern syntax.
     pub fn compile_ascii_case_insensitive(p: &[u8]) -> Glob {
-        let (mut toks, mut classes) = parse(p);
+        let (mut toks, classes) = parse_with_case(p, true);
         for tok in &mut toks {
             if let Tok::Lit(c) = tok {
                 *c = c.to_ascii_lowercase();
-            }
-        }
-        for set in &mut classes {
-            for c in b'A'..=b'Z' {
-                if set_has(set, c) || set_has(set, c.to_ascii_lowercase()) {
-                    set_bit(set, c as usize);
-                    set_bit(set, c.to_ascii_lowercase() as usize);
-                }
             }
         }
         Self::from_parts((toks, classes))

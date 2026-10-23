@@ -681,7 +681,7 @@ fn refresh_one(repo: &Repo, items: &[Probe<'_>]) -> Result<Vec<bool>, Refusal> {
             "-q",
             "--refresh",
         ])
-        .env("GIT_INDEX_FILE", &file.0)
+        .env("GIT_INDEX_FILE", &file.path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -691,7 +691,7 @@ fn refresh_one(repo: &Repo, items: &[Probe<'_>]) -> Result<Vec<bool>, Refusal> {
     if !status.success() {
         return Err(Refusal::Failed("git update-index --refresh failed".into()));
     }
-    let back = Index::open_file(&file.0, repo.hash)?;
+    let back = Index::open_file(&file.path, repo.hash)?;
     let mut entries = back.entries()?;
     let mut dirty = vec![true; items.len()];
     let mut at = 0usize;
@@ -735,34 +735,37 @@ fn wait_bounded(
 }
 
 /// A private index file, removed (with Git's lock file) when dropped.
-struct PrivateIndex(PathBuf);
+struct PrivateIndex {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
 
 impl PrivateIndex {
     fn create(bytes: &[u8]) -> Result<PrivateIndex, Refusal> {
         use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("xm-refresh-{}-{n}.index", std::process::id()));
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::Builder::new()
+            .prefix("xm-refresh-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .map_err(|e| Refusal::Failed(format!("private index directory: {e}")))?;
+        let path = dir.path().join("index");
         let mut f = fs::File::options()
             .write(true)
             .create_new(true)
             .mode(0o600)
             .open(&path)
             .map_err(|e| Refusal::Failed(format!("private index {}: {e}", path.display())))?;
-        let guard = PrivateIndex(path);
         f.write_all(bytes)
             .map_err(|e| Refusal::Failed(format!("private index: {e}")))?;
-        Ok(guard)
+        Ok(PrivateIndex { path, _dir: dir })
     }
 }
 
 impl Drop for PrivateIndex {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-        let mut lock = self.0.clone().into_os_string();
+        let _ = fs::remove_file(&self.path);
+        let mut lock = self.path.clone().into_os_string();
         lock.push(".lock");
         let _ = fs::remove_file(lock);
     }
@@ -874,8 +877,64 @@ mod tests {
     #[test]
     fn private_refresh_index_is_owner_only() {
         let file = PrivateIndex::create(b"private index").unwrap();
-        let mode = std::fs::metadata(&file.0).unwrap().permissions().mode() & 0o777;
+        let mode = std::fs::metadata(&file.path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(file.path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
         assert_eq!(mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn private_refresh_directory_protects_git_replacement_and_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(
+            git(&["config", "user.email", "test@example.com"])
+                .status
+                .success()
+        );
+        assert!(git(&["config", "user.name", "Test"]).status.success());
+        std::fs::write(repo.join("tracked"), b"content").unwrap();
+        assert!(git(&["add", "tracked"]).status.success());
+        assert!(git(&["commit", "-qm", "tracked"]).status.success());
+        let source_index = std::fs::read(repo.join(".git/index")).unwrap();
+        std::fs::write(repo.join("tracked"), b"content").unwrap();
+        let private = PrivateIndex::create(&source_index).unwrap();
+        let index_dir = private.path.parent().unwrap().to_owned();
+        let lock_path = private.path.with_file_name("index.lock");
+        let status = std::process::Command::new("sh")
+            .args(["-c", "umask 022; exec git update-index -q --refresh"])
+            .current_dir(repo)
+            .env("GIT_INDEX_FILE", &private.path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(&index_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for entry in std::fs::read_dir(&index_dir).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert!(private.path.exists());
+        assert!(!lock_path.exists());
+        drop(private);
+        assert!(!index_dir.exists());
     }
 
     #[test]
