@@ -432,6 +432,11 @@ impl Reporter {
         if !self.flush(deadline) {
             return;
         }
+        self.state_loss(deadline);
+    }
+
+    /// States the accumulated loss only after its notice is queued.
+    fn state_loss(&self, deadline: std::time::Instant) {
         let lost = self.lost.load(Ordering::SeqCst);
         if lost == 0 {
             return;
@@ -642,6 +647,9 @@ impl Forwarder {
                 else {
                     continue;
                 };
+                // Hold the reporter before any early return: the exit-path drain must wait even
+                // when reaping races a signal that was already received.
+                let _deciding = reporter().deciding();
                 if reaped.load(Ordering::SeqCst) || has_ended(child) {
                     // The child is reaped and there is nothing left to tell it, so the
                     // signal means what it would have meant without any forwarding at all:
@@ -651,9 +659,6 @@ impl Forwarder {
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
                 }
-                // Held until the line below is queued, so an exit-path drain that runs because
-                // this delivery ended the child waits for the line (codex-review, round 8).
-                let _deciding = reporter().deciding();
                 // Whether to relay is `DELIVERIES`' decision, not this loop's: a signal the
                 // terminal or the kernel generated is skipped only where a group delivery
                 // would already have reached the child, and a hangup or a timer is never
@@ -1190,6 +1195,26 @@ mod tests {
             text,
             "kept\nxmustard run: 1 decision report(s) not written to stderr\n"
         );
+    }
+
+    #[test]
+    fn a_loss_notice_that_cannot_be_queued_keeps_its_count() {
+        let (sink, entered, release, out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 1));
+        reporter.send("writer-held\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the held line");
+        reporter.send("queue-full\n".into());
+        reporter.send("lost\n".into());
+
+        reporter.state_loss(std::time::Instant::now() + Duration::from_millis(100));
+        assert_eq!(reporter.lost.load(Ordering::SeqCst), 1);
+
+        release.send(()).unwrap();
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert!(text.ends_with("xmustard run: 1 decision report(s) not written to stderr\n"));
     }
 
     /// A drain that runs out of time before it can queue the loss notice keeps the count, so a
