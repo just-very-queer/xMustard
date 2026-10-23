@@ -102,11 +102,39 @@ impl DecisionProvider for FixtureProvider {
             }
             result.insert(candidate.id.clone(), probability);
         }
-        Ok(Decision {
+        let decision = Decision {
             question_id: question.id.clone(),
             probabilities: result,
-        })
+        };
+        validate_decision(question, candidates, &decision)?;
+        Ok(decision)
     }
+}
+
+/// Refuses incomplete, mismatched, or out-of-range provider output before it can be used.
+pub fn validate_decision(
+    question: &Question,
+    candidates: &[Candidate],
+    decision: &Decision,
+) -> Result<(), ProviderError> {
+    if decision.question_id != question.id {
+        return Err(ProviderError::QuestionMismatch);
+    }
+    if decision.probabilities.len() != candidates.len()
+        || candidates
+            .iter()
+            .any(|candidate| !decision.probabilities.contains_key(&candidate.id))
+    {
+        return Err(ProviderError::CandidateMismatch);
+    }
+    if decision
+        .probabilities
+        .values()
+        .any(|probability| !probability.is_finite() || !(0.0..=1.0).contains(probability))
+    {
+        return Err(ProviderError::InvalidProbability);
+    }
+    Ok(())
 }
 
 fn validate_input(question: &Question, candidates: &[Candidate]) -> Result<(), ProviderError> {
@@ -185,6 +213,49 @@ mod tests {
         assert_eq!(decision.question_id, "q1");
         assert_eq!(decision.probabilities["a"], 0.75);
         assert_eq!(decision.probabilities["b"], 0.25);
+    }
+
+    #[test]
+    fn decision_validation_refuses_mismatched_or_incomplete_provider_output() {
+        let candidates = [candidate("a"), candidate("b")];
+        let valid = Decision {
+            question_id: "q1".into(),
+            probabilities: BTreeMap::from([("a".into(), 0.5), ("b".into(), 1.0)]),
+        };
+        assert_eq!(validate_decision(&question(), &candidates, &valid), Ok(()));
+        assert_eq!(
+            validate_decision(
+                &question(),
+                &candidates,
+                &Decision {
+                    question_id: "other".into(),
+                    ..valid.clone()
+                }
+            ),
+            Err(ProviderError::QuestionMismatch)
+        );
+        assert_eq!(
+            validate_decision(
+                &question(),
+                &candidates,
+                &Decision {
+                    probabilities: BTreeMap::from([("a".into(), 0.5), ("extra".into(), 0.5)]),
+                    ..valid.clone()
+                }
+            ),
+            Err(ProviderError::CandidateMismatch)
+        );
+        assert_eq!(
+            validate_decision(
+                &question(),
+                &candidates,
+                &Decision {
+                    probabilities: BTreeMap::from([("a".into(), f64::NAN), ("b".into(), 0.5)]),
+                    ..valid
+                }
+            ),
+            Err(ProviderError::InvalidProbability)
+        );
     }
 
     #[test]
