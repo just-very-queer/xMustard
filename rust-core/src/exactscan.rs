@@ -59,8 +59,8 @@ fn slice_bytes(n: Option<usize>) -> usize {
 /// it exceeds this window its reported length is capped and the result names that loss.
 pub const MAX_MATCH_BYTES: usize = 4096;
 
-/// Former cursor-entry ceiling, retained as the regression fixture's threshold. Runtime
-/// storage is bounded by one read slice plus the carried match window, not this count.
+/// Bound on the test cursor's retained line starts; production resolves positions while
+/// iterating matches and retains no per-line entries.
 pub const MAX_CURSOR_LINES: usize = 1024;
 
 /// The two matchers the lane compiles from one query.
@@ -212,9 +212,72 @@ pub fn compile(query: &str, matcher: Matcher) -> Result<Regex, String> {
         .map_err(|e| format!("{} pattern is not valid: {e}", matcher.name()))
 }
 
-/// The cursor retains line starts from the bounded scan buffer so each match position is
-/// a lookup, not a scan back through the file. The buffer is limited by the scan-wide byte
-/// budget, so this state is independent of repository size.
+/// Advance a 1-based line and byte-column position through a slice.
+fn advance_position(bytes: &[u8], line: &mut usize, column: &mut usize) {
+    for byte in bytes {
+        if *byte == b'\n' {
+            *line += 1;
+            *column = 1;
+        } else {
+            *column += 1;
+        }
+    }
+}
+
+/// Whether a pattern can treat an artificial buffer end as an assertion boundary.
+fn has_end_assertion(pattern: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    for ch in pattern.chars() {
+        if escaped {
+            if !in_class && matches!(ch, 'z' | 'b' | 'B') {
+                return true;
+            }
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '$' if !in_class => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether a pattern can vary a match's extent at the scan cutoff.
+fn may_extend_match(pattern: &str) -> bool {
+    let mut escaped = false;
+    let mut in_class = false;
+    for (index, ch) in pattern.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '[' => in_class = true,
+            ']' => in_class = false,
+            '*' | '+' if !in_class => return true,
+            '{' if !in_class => {
+                if pattern[index + 1..]
+                    .find('}')
+                    .map(|end| pattern[index + 1..index + 1 + end].contains(','))
+                    .unwrap_or(false)
+                {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+/// A bounded line-start cursor used to test line and column bookkeeping.
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct Cursor {
     /// Byte offset of each recent line start, ascending. Never empty.
@@ -223,6 +286,7 @@ struct Cursor {
     base_line: usize,
 }
 
+#[cfg(test)]
 impl Cursor {
     fn new() -> Self {
         Cursor {
@@ -234,9 +298,7 @@ impl Cursor {
     /// The position of `offset`, a file-relative byte offset, as (line, column), both
     /// 1-based. An offset between two starts belongs to the line that began first.
     ///
-    /// `None` only when the offset precedes every start the cursor still holds. A deferred
-    /// match may be older than this window; its saved position checkpoint resolves that case
-    /// without asking the cursor to guess.
+    /// `None` when the offset precedes the starts the bounded test cursor retains.
     fn at(&self, offset: usize) -> Option<(usize, usize)> {
         let i = match self.starts.binary_search(&offset) {
             Ok(i) => i,
@@ -250,6 +312,10 @@ impl Cursor {
         for (i, b) in bytes.iter().enumerate() {
             if *b == b'\n' {
                 self.starts.push(from + i + 1);
+                if self.starts.len() > MAX_CURSOR_LINES {
+                    self.starts.remove(0);
+                    self.base_line += 1;
+                }
             }
         }
     }
@@ -277,8 +343,6 @@ pub struct FileScan<'a> {
     file: std::fs::File,
     /// Bytes of this file already read.
     pub read: u64,
-    file_len: u64,
-    cursor: Cursor,
     /// Bytes per positional read; `slice_bytes(None)` in production, and a chosen smaller
     /// size in the test that forces a read boundary.
     slice: usize,
@@ -315,8 +379,6 @@ impl<'a> FileScan<'a> {
         Ok(FileScan {
             file,
             read: 0,
-            file_len: meta.len(),
-            cursor: Cursor::new(),
             slice: slice_bytes(slice),
             root,
             path: rel.to_string(),
@@ -392,7 +454,11 @@ impl<'a> FileScan<'a> {
         loop {
             let want = (*budget).min(self.slice as u64);
             if want == 0 {
-                eof = self.read >= self.file_len;
+                eof = self
+                    .file
+                    .metadata()
+                    .map(|meta| self.read >= meta.len())
+                    .unwrap_or(false);
                 break;
             }
             match self.slice(want) {
@@ -410,10 +476,6 @@ impl<'a> FileScan<'a> {
                     return true;
                 }
             }
-            if self.read >= self.file_len {
-                eof = true;
-                break;
-            }
             if started.elapsed() >= std::time::Duration::from_millis(limits.timeout_ms) {
                 report.cut = Some(Cut::Time);
                 break;
@@ -423,25 +485,28 @@ impl<'a> FileScan<'a> {
         // A regex occurrence ending at an artificial byte boundary may still grow; do
         // not publish that provisional extent. Fixed literals are complete immediately.
         let scan_len = body.len();
-        self.cursor.advance(&body, 0);
-        let mut fixed_literal = true;
-        let mut escaped = false;
-        for byte in re.as_str().bytes() {
-            if escaped {
-                escaped = false;
+        let end_sensitive = has_end_assertion(re.as_str());
+        let may_extend = may_extend_match(re.as_str());
+        let mut position_offset = 0;
+        let mut line = 1;
+        let mut column = 1;
+        let mut matches = re.find_iter(&body);
+        loop {
+            if started.elapsed() >= std::time::Duration::from_millis(limits.timeout_ms) {
+                report.cut = Some(Cut::Time);
+                break;
+            }
+            let Some(m) = matches.next() else {
+                break;
+            };
+            if !eof && may_extend {
                 continue;
             }
-            match byte {
-                b'\\' => escaped = true,
-                b'.' | b'?' | b'*' | b'+' | b'{' | b'}' | b'[' | b']' | b'(' | b')' | b'|' => {
-                    fixed_literal = false;
-                    break;
-                }
-                _ => {}
-            }
-        }
-        for m in re.find_iter(&body) {
-            if !eof && m.end() == scan_len && !fixed_literal {
+            if !eof
+                && end_sensitive
+                && (m.end() == scan_len
+                    || (m.end() + 1 == scan_len && body.get(m.end()) == Some(&b'\n')))
+            {
                 continue;
             }
             if m.start() == m.end() && m.start() == scan_len && !eof {
@@ -449,10 +514,11 @@ impl<'a> FileScan<'a> {
             }
             let start = m.start();
             let end = m.end();
-            let Some((line, column)) = self.cursor.at(start) else {
-                report.positions_lost += 1;
-                continue;
-            };
+            advance_position(&body[position_offset..start], &mut line, &mut column);
+            let match_line = line;
+            let match_column = column;
+            advance_position(&body[start..end], &mut line, &mut column);
+            position_offset = end;
             if report.spans.len() >= limits.max_lines {
                 report.cut = Some(Cut::Lines);
                 return false;
@@ -460,12 +526,12 @@ impl<'a> FileScan<'a> {
             let len = end.saturating_sub(start).min(MAX_MATCH_BYTES);
             report.spans.push(Span {
                 path: self.path.clone(),
-                line,
-                column,
+                line: match_line,
+                column: match_column,
                 byte: start,
                 len,
             });
-            if end - start > MAX_MATCH_BYTES || (!eof && end == scan_len) {
+            if end - start > MAX_MATCH_BYTES {
                 report.matches_cut += 1;
             }
         }
@@ -677,14 +743,14 @@ mod tests {
     }
 
     #[test]
-    fn a_cursor_keeps_more_than_the_old_entry_ceiling_without_losing_lines() {
+    fn a_cursor_bounds_line_starts_and_keeps_the_final_line_number() {
         let mut c = Cursor::new();
         // Four times the former entry limit, all within one small read window.
         let body = vec![b'\n'; MAX_CURSOR_LINES * 4];
         c.advance(&body, 0);
         assert!(
-            c.starts.len() > MAX_CURSOR_LINES,
-            "every line start in this bounded slice remains available"
+            c.starts.len() <= MAX_CURSOR_LINES,
+            "cursor line starts remain bounded"
         );
         // The final short line still has its exact number.
         let last = body.len() - 1;
@@ -907,7 +973,8 @@ mod tests {
 
     #[test]
     fn repeated_literal_occurrences_keep_whole_file_nonoverlap_alignment() {
-        let body = vec![b'a'; 70_000];
+        let mut body = vec![b'x'; 70_000];
+        body[65_000..65_000 + 511 * 2].fill(b'a');
         let report = scan_fixture(
             &body,
             &"a".repeat(511),
@@ -915,7 +982,7 @@ mod tests {
             None,
             DEFAULT_MAX_BYTES,
         );
-        let want = (0..70_000 - 511).step_by(511).collect::<Vec<_>>();
+        let want = [65_000, 65_511];
         assert_eq!(
             report.spans.iter().map(|s| s.byte).collect::<Vec<_>>(),
             want
@@ -993,6 +1060,90 @@ mod tests {
         assert_eq!(report.spans[0].byte, 0);
         assert_eq!(report.spans[0].len, MAX_MATCH_BYTES);
         assert_eq!(report.matches_cut, 1);
+    }
+
+    #[test]
+    fn regex_match_iteration_observes_the_scan_deadline() {
+        let body = vec![b'a'; 70_000];
+        let report = scan_fixture(
+            &body,
+            &"a".repeat(511),
+            Matcher::Exact,
+            None,
+            DEFAULT_MAX_BYTES,
+        );
+        assert_eq!(report.cut, Some(Cut::Time), "{report:?}");
+        assert!(
+            report.spans.len() < (0..70_000 - 511).step_by(511).count(),
+            "matching stopped at the deadline rather than exhausting all occurrences"
+        );
+    }
+
+    #[test]
+    fn artificial_cutoff_does_not_satisfy_end_assertions() {
+        for pattern in ["needle$", r"needle\z"] {
+            let report = scan_fixture(b"needlex", pattern, Matcher::Regex, Some(64), 6);
+            assert!(report.spans.is_empty(), "{pattern}: {report:?}");
+        }
+        let trailing_newline = scan_fixture(b"needle\nx", "needle$", Matcher::Regex, Some(64), 7);
+        assert!(trailing_newline.spans.is_empty(), "{trailing_newline:?}");
+        let literal_dollar = scan_fixture(b"$x", "[$]", Matcher::Regex, Some(64), 1);
+        assert_eq!(literal_dollar.spans.len(), 1, "{literal_dollar:?}");
+    }
+
+    #[test]
+    fn bounded_regex_match_is_kept_at_cutoff() {
+        let report = scan_fixture(b"ax", "[ab]", Matcher::Regex, Some(64), 1);
+        assert_eq!(report.spans.len(), 1, "{report:?}");
+        assert_eq!(report.spans[0].len, 1);
+        let bounded = scan_fixture(b"aax", "a{2}", Matcher::Regex, Some(64), 2);
+        assert_eq!(bounded.spans.len(), 1, "{bounded:?}");
+        assert_eq!(bounded.spans[0].len, 2);
+        assert_eq!(bounded.cut, Some(Cut::Bytes));
+        assert_eq!(report.cut, Some(Cut::Bytes));
+    }
+
+    #[test]
+    fn greedy_regex_extent_is_degraded_at_byte_cutoff() {
+        let report = scan_fixture(b"azxxz", "a.*z", Matcher::Regex, Some(64), 3);
+        assert!(report.spans.is_empty(), "{report:?}");
+        assert_eq!(report.matches_cut, 0);
+        assert_eq!(report.cut, Some(Cut::Bytes));
+        let variable = scan_fixture(b"aax", "a{1,2}", Matcher::Regex, Some(64), 1);
+        assert!(variable.spans.is_empty(), "{variable:?}");
+        assert_eq!(variable.cut, Some(Cut::Bytes));
+    }
+
+    #[test]
+    fn complete_literal_at_cutoff_is_not_length_capped() {
+        let report = scan_fixture(b"needlex", "needle", Matcher::Exact, Some(64), 6);
+        assert_eq!(report.spans[0].len, 6);
+        assert_eq!(report.matches_cut, 0);
+    }
+
+    #[test]
+    fn a_growing_file_is_read_past_its_open_length() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join("a.txt");
+        std::fs::write(&path, b"prefix").unwrap();
+        let mut fs = FileScan::open(td.path(), "a.txt").unwrap();
+        use std::io::Write;
+        std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(b"needle").unwrap();
+        let limits = Limits::default();
+        let mut budget = limits.max_bytes;
+        let mut report = Report::default();
+        let re = compile("needle", Matcher::Exact).unwrap();
+        assert!(fs.scan(&re, &limits, &mut budget, &mut report, std::time::Instant::now(), false));
+        assert_eq!(report.spans.len(), 1, "{report:?}");
+    }
+
+    #[test]
+    fn line_position_lookup_does_not_retain_line_entries() {
+        let body = vec![b'\n'; DEFAULT_MAX_BYTES as usize];
+        let mut line = 1;
+        let mut column = 1;
+        advance_position(&body, &mut line, &mut column);
+        assert_eq!((line, column), (body.len() + 1, 1));
     }
 
     // The time cap is the scan's own wall clock, and this row's remaining uncovered
