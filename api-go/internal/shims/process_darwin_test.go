@@ -116,3 +116,21 @@ func TestDarwinEnumerationRejectsPIDReuseDuringRusage(t *testing.T) {
 		t.Fatalf("reused PID sample accepted: err=%v identity=%+v", err, got)
 	}
 }
+
+// The enumeration tests inject the BSD reader, so this one checks the real proc_pidinfo decode:
+// both record flavors must report this test process's own parent, and the full one its start time.
+func TestDarwinProcessInfoDecodesTheLiveRecord(t *testing.T) {
+	for _, flavor := range []uint32{shortBSDInfo, 3} {
+		got, err := readProcessInfo(os.Getpid(), flavor)
+		if err != nil {
+			t.Fatalf("readProcessInfo(self, flavor %d): %v", flavor, err)
+		}
+		if got.PID != os.Getpid() || got.PPID != os.Getppid() || got.UID != os.Getuid() {
+			t.Fatalf("flavor %d decoded %+v, want PID %d, PPID %d, UID %d", flavor, got, os.Getpid(), os.Getppid(), os.Getuid())
+		}
+	}
+	self, err := processIdentity(os.Getpid())
+	if err != nil || self.StartTime == 0 || self.PPID != os.Getppid() {
+		t.Fatalf("processIdentity(self) = %+v, err %v; want this process's PPID and a start time", self, err)
+	}
+}
