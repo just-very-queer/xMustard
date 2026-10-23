@@ -27,6 +27,10 @@ first release.
 | Hooks never decide for the agent | The Claude Code hook service adds context, replaces a native output with its reduction (PostToolUse only) or says nothing; it never allows, denies or rewrites a tool call, and a slow or failed answer leaves Claude Code's own behavior. Authentication still fails closed. See [Client hooks](#client-hooks-ws-23). |
 | No credential in the service unit | `xmustard-ops setup` writes a loopback-only launchd agent or systemd unit that carries no token and refuses credential-named variables. See [Daemon service](#daemon-service-ws-58). |
 
+## Stdio shim reaper
+
+`xmustard-ops shims --reap` sends SIGKILL only to classified orphaned or runaway `xmustard-mcp` processes. Linux uses a pidfd opened before identity validation, binding delivery to that process; if a pidfd cannot be opened, the target is left untouched. Darwin has no identity-bound kill primitive: the operator re-reads UID, start time and command immediately before signaling, but a residual PID-reuse race remains between that check and `kill`.
+
 ## Authentication modes
 
 `XMUSTARD_AUTH` picks the mode. It is read at startup, and anything else stops the API.

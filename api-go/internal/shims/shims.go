@@ -24,8 +24,10 @@ type Process struct {
 	UID        int           `json:"uid"`
 	StartTime  uint64        `json:"-"`
 	Age        time.Duration `json:"-"`
+	AgeKnown   bool          `json:"-"`
 	AgeSeconds int64         `json:"age_seconds"`
 	CPUS       time.Duration `json:"-"`
+	CPUAt      time.Time     `json:"-"`
 	CPUSeconds float64       `json:"cpu_seconds"`
 	RSSBytes   int64         `json:"rss_bytes"`
 	Comm       string        `json:"comm"`
@@ -47,7 +49,7 @@ func Classify(p Process) Class {
 	if p.CPUS > 300*time.Second || p.CPUSlope >= .8 {
 		return Runaway
 	}
-	if p.PPID == 1 && p.Age > 10*time.Minute {
+	if p.PPID == 1 && p.AgeKnown && p.Age > 10*time.Minute {
 		return Orphaned
 	}
 	return Live
@@ -88,9 +90,11 @@ func List() ([]Process, error) {
 }
 
 func signalIfIdentity(expected Process, identify func(int) (Process, error), send func(int) error) error {
-	current, err := identify(expected.PID)
-	if err != nil || current.PID != expected.PID || current.UID != expected.UID || current.StartTime != expected.StartTime || current.Comm != ProcessName {
-		return ErrProcessChanged
+	for range 2 {
+		current, err := identify(expected.PID)
+		if err != nil || current.PID != expected.PID || current.UID != expected.UID || current.StartTime != expected.StartTime || current.Comm != ProcessName {
+			return ErrProcessChanged
+		}
 	}
 	return send(expected.PID)
 }
@@ -119,11 +123,14 @@ func updateSlopes(ps []Process, now time.Time) {
 			continue
 		}
 		seen[p.PID] = true
-		if old, ok := slopes.samples[p.PID]; ok && now.After(old.at) && p.CPUS >= old.cpu {
-			p.CPUSlope = (p.CPUS - old.cpu).Seconds() / now.Sub(old.at).Seconds()
+		if p.CPUAt.IsZero() {
+			p.CPUAt = now
 		}
-		if old, ok := slopes.samples[p.PID]; !ok || !now.Before(old.at) {
-			slopes.samples[p.PID] = sample{now, p.CPUS}
+		if old, ok := slopes.samples[p.PID]; ok && p.CPUAt.After(old.at) && p.CPUS >= old.cpu {
+			p.CPUSlope = (p.CPUS - old.cpu).Seconds() / p.CPUAt.Sub(old.at).Seconds()
+		}
+		if old, ok := slopes.samples[p.PID]; !ok || !p.CPUAt.Before(old.at) {
+			slopes.samples[p.PID] = sample{p.CPUAt, p.CPUS}
 		}
 	}
 	for pid := range slopes.samples {

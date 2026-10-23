@@ -32,6 +32,58 @@ func TestUpdateSlopesUsesSecondsAndRejectsStaleSamples(t *testing.T) {
 	}
 }
 
+func TestDarwinRechecksIdentityAtSignalBoundary(t *testing.T) {
+	expected := Process{PID: 99, UID: 10, StartTime: 100, Comm: ProcessName}
+	replacement := Process{PID: 99, UID: 10, StartTime: 200, Comm: ProcessName}
+	checks := 0
+	signaled := false
+	err := signalIfIdentity(expected, func(int) (Process, error) {
+		checks++
+		if checks == 1 {
+			return expected, nil
+		}
+		return replacement, nil
+	}, func(int) error {
+		signaled = true
+		return nil
+	})
+	if err != ErrProcessChanged || signaled || checks != 2 {
+		t.Fatalf("replacement at signal boundary: err=%v signaled=%v checks=%d", err, signaled, checks)
+	}
+}
+
+func TestUpdateSlopesUsesObservationTimes(t *testing.T) {
+	slopes.Lock()
+	slopes.samples = make(map[int]sample)
+	slopes.Unlock()
+	base := time.Unix(100, 0)
+	first := []Process{{PID: 70002, Comm: ProcessName, CPUS: 10 * time.Millisecond, CPUAt: base}}
+	updateSlopes(first, base.Add(10*time.Second))
+	second := []Process{{PID: 70002, Comm: ProcessName, CPUS: 110 * time.Millisecond, CPUAt: base.Add(2 * time.Second)}}
+	updateSlopes(second, base.Add(11*time.Second))
+	if second[0].CPUSlope < .049 || second[0].CPUSlope > .051 {
+		t.Fatalf("slope used collection completion timestamps: %v", second[0].CPUSlope)
+	}
+}
+
+func TestClassifyOrphanRequiresKnownAge(t *testing.T) {
+	p := Process{Comm: ProcessName, PPID: 1, Age: time.Hour}
+	if got := Classify(p); got != Live {
+		t.Fatalf("unknown age classified %q, want live", got)
+	}
+}
+
+func TestReapDoesNotSignalOrphanWithUnknownAge(t *testing.T) {
+	called := false
+	err := Reap([]Process{{PID: 32, Comm: ProcessName, PPID: 1, Age: time.Hour}}, func(Process) error {
+		called = true
+		return nil
+	})
+	if err != nil || called {
+		t.Fatalf("unknown-age orphan: err=%v signaled=%v", err, called)
+	}
+}
+
 func TestReapRefusesReusedPID(t *testing.T) {
 	original := Process{PID: 99, UID: 10, StartTime: 100, Comm: ProcessName, CPUS: 301 * time.Second}
 	replacement := Process{PID: 99, UID: 10, StartTime: 200, Comm: "unrelated"}
@@ -93,8 +145,8 @@ func TestClassifyShims(t *testing.T) {
 	}{
 		{"high cumulative CPU", Process{Comm: ProcessName, CPUS: 1200 * time.Second}, Runaway},
 		{"high CPU slope", Process{Comm: ProcessName, CPUSlope: .97}, Runaway},
-		{"old orphan", Process{Comm: ProcessName, PPID: 1, Age: 11 * time.Minute}, Orphaned},
-		{"new orphan", Process{Comm: ProcessName, PPID: 1, Age: 2 * time.Minute}, Live},
+		{"old orphan", Process{Comm: ProcessName, PPID: 1, Age: 11 * time.Minute, AgeKnown: true}, Orphaned},
+		{"new orphan", Process{Comm: ProcessName, PPID: 1, Age: 2 * time.Minute, AgeKnown: true}, Live},
 		{"ordinary live", Process{Comm: ProcessName, PPID: 4242, CPUS: 3 * time.Second}, Live},
 		{"other command", Process{Comm: "not-xmustard-mcp", PPID: 1, Age: time.Hour, CPUS: time.Hour}, ""},
 	}
@@ -110,8 +162,8 @@ func TestClassifyShims(t *testing.T) {
 func TestReapSelectsOnlyRunawayAndOrphaned(t *testing.T) {
 	processes := []Process{
 		{PID: 1, Comm: ProcessName, CPUS: 301 * time.Second},
-		{PID: 2, Comm: ProcessName, PPID: 1, Age: 11 * time.Minute},
-		{PID: 3, Comm: ProcessName, PPID: 1, Age: 2 * time.Minute},
+		{PID: 2, Comm: ProcessName, PPID: 1, Age: 11 * time.Minute, AgeKnown: true},
+		{PID: 3, Comm: ProcessName, PPID: 1, Age: 2 * time.Minute, AgeKnown: true},
 		{PID: 4, Comm: ProcessName, PPID: 4242, CPUS: 3 * time.Second},
 		{PID: 5, Comm: "other", CPUS: time.Hour},
 	}

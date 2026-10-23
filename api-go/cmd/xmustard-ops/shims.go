@@ -11,7 +11,7 @@ import (
 
 func runShims(args []string) {
 	fs := flag.NewFlagSet("xmustard-ops shims", flag.ExitOnError)
-	reap := fs.Bool("reap", false, "kill orphaned and runaway stdio shims")
+	reap := fs.Bool("reap", false, "SIGKILL orphaned/runaway stdio shims; Darwin rechecks identity but has a residual PID-reuse race")
 	if err := fs.Parse(args); err != nil {
 		fatal(err.Error())
 	}

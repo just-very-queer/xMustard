@@ -42,22 +42,22 @@ func processIdentity(pid int) (Process, error) {
 }
 
 func signalProcess(expected Process) error {
-	identity, err := processIdentity(expected.PID)
+	return signalWithPidfd(expected, unix.PidfdOpen, unix.Close, processIdentity, func(fd int) error {
+		return unix.PidfdSendSignal(fd, syscall.SIGKILL, nil, 0)
+	})
+}
+
+func signalWithPidfd(expected Process, open func(int, int) (int, error), closeFD func(int) error, identify func(int) (Process, error), send func(int) error) error {
+	fd, err := open(expected.PID, 0)
+	if err != nil {
+		return ErrProcessChanged
+	}
+	defer closeFD(fd)
+	identity, err := identify(expected.PID)
 	if err != nil || identity.PID != expected.PID || identity.UID != expected.UID || identity.StartTime != expected.StartTime || identity.Comm != ProcessName {
 		return ErrProcessChanged
 	}
-	fd, err := unix.PidfdOpen(expected.PID, 0)
-	if err == nil {
-		defer unix.Close(fd)
-		identity, err = processIdentity(expected.PID)
-		if err != nil || identity.PID != expected.PID || identity.UID != expected.UID || identity.StartTime != expected.StartTime || identity.Comm != ProcessName {
-			return ErrProcessChanged
-		}
-		return unix.PidfdSendSignal(fd, syscall.SIGKILL, nil, 0)
-	}
-	return signalIfIdentity(expected, processIdentity, func(pid int) error {
-		return syscall.Kill(pid, syscall.SIGKILL)
-	})
+	return send(fd)
 }
 
 func listPlatform() ([]Process, error) {
@@ -65,7 +65,10 @@ func listPlatform() ([]Process, error) {
 	if err != nil {
 		return nil, err
 	}
-	bootTime := linuxBootTime()
+	bootTime, err := linuxBootTime()
+	if err != nil {
+		return nil, err
+	}
 	var out []Process
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
@@ -85,6 +88,7 @@ func listPlatform() ([]Process, error) {
 			continue
 		}
 		line, readErr := bufio.NewReader(f).ReadString('\n')
+		cpuAt := time.Now()
 		f.Close()
 		if readErr != nil && len(line) == 0 {
 			continue
@@ -104,8 +108,9 @@ func listPlatform() ([]Process, error) {
 		if e1 != nil || e2 != nil || e3 != nil || e4 != nil {
 			continue
 		}
-		cpu := time.Duration((utime + stime) * uint64(time.Second) / 100)
-		age := time.Since(time.Unix(int64(bootTime), 0).Add(time.Duration(start) * time.Second / 100))
+		cpu := ticksDuration(utime + stime)
+		startAge := ticksDuration(start)
+		age := time.Since(time.Unix(bootTime, 0).Add(startAge))
 		var rss int64
 		if statm, err := os.ReadFile(filepath.Join("/proc", e.Name(), "statm")); err == nil {
 			var total, resident int64
@@ -113,25 +118,39 @@ func listPlatform() ([]Process, error) {
 				rss = resident * int64(os.Getpagesize())
 			}
 		}
-		out = append(out, Process{PID: pid, PPID: ppid, UID: int(st.Uid), StartTime: start, Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: rss, Comm: comm})
+		out = append(out, Process{PID: pid, PPID: ppid, UID: int(st.Uid), StartTime: start, Age: age, AgeKnown: true, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUAt: cpuAt, CPUSeconds: cpu.Seconds(), RSSBytes: rss, Comm: comm})
 	}
 	return out, nil
 }
 
-func linuxBootTime() int64 {
-	data, err := os.ReadFile("/proc/stat")
+func linuxBootTime() (int64, error) {
+	return readLinuxBootTime(os.ReadFile)
+}
+
+func readLinuxBootTime(readFile func(string) ([]byte, error)) (int64, error) {
+	data, err := readFile("/proc/stat")
 	if err != nil {
-		return time.Now().Unix()
+		return 0, fmt.Errorf("read Linux boot time: %w", err)
 	}
+	return parseLinuxBootTime(data)
+}
+
+func parseLinuxBootTime(data []byte) (int64, error) {
 	for _, line := range strings.Split(string(data), "\n") {
 		if strings.HasPrefix(line, "btime ") {
 			value, err := strconv.ParseInt(strings.TrimSpace(strings.TrimPrefix(line, "btime ")), 10, 64)
-			if err == nil {
-				return value
+			if err == nil && value > 0 {
+				return value, nil
 			}
+			return 0, fmt.Errorf("invalid Linux boot time %q", line)
 		}
 	}
-	return time.Now().Unix()
+	return 0, fmt.Errorf("Linux boot time missing from /proc/stat")
+}
+
+func ticksDuration(ticks uint64) time.Duration {
+	const ticksPerSecond = uint64(100)
+	return time.Duration(ticks/ticksPerSecond)*time.Second + time.Duration(ticks%ticksPerSecond)*(time.Second/time.Duration(ticksPerSecond))
 }
 
 func parseProcStat(line string) (string, string, bool) {

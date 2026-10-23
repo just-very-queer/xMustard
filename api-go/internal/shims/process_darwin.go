@@ -60,6 +60,7 @@ func processIdentity(pid int) (Process, error) {
 
 func signalProcess(expected Process) error {
 	return signalIfIdentity(expected, processIdentity, func(pid int) error {
+		// Darwin has no identity-bound kill; signalIfIdentity re-reads immediately before delivery.
 		return syscall.Kill(pid, syscall.SIGKILL)
 	})
 }
@@ -94,6 +95,7 @@ func listPlatform() ([]Process, error) {
 		if e != 0 {
 			continue
 		}
+		cpuAt := time.Now()
 		var info procBSD
 		got, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), 3, 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
 		if e != 0 || got != unsafe.Sizeof(info) {
@@ -102,7 +104,7 @@ func listPlatform() ([]Process, error) {
 		start := time.Unix(int64(info.StartSec), int64(info.StartUsec)*1000)
 		age := time.Since(start)
 		cpu := time.Duration(r.UserTime + r.SystemTime)
-		out = append(out, Process{PID: pid, PPID: int(b.PPID), UID: int(b.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Age: age, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: ProcessName})
+		out = append(out, Process{PID: pid, PPID: int(b.PPID), UID: int(b.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Age: age, AgeKnown: true, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUAt: cpuAt, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: ProcessName})
 	}
 	return out, nil
 }
