@@ -43,6 +43,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request waits for a refusing API to come back (a daemon restart).
 const RESTART_GRACE: Duration = Duration::from_secs(10);
 const THREAD_STACK: usize = 256 << 10;
+const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Mint an agent token with `xmustard-api mint-token <id> agent`, set XMUSTARD_API_TOKEN for this client, and restart it. If the token is valid, check its role.";
 
 fn main() {
     let cfg = match Config::from_args(env::args().skip(1), |k| env::var(k).ok()) {
@@ -370,14 +371,20 @@ fn deliver(r: &mut Response, out: &Output, id: Option<&str>) {
     if body.trim_start().starts_with('{') && body.contains("\"jsonrpc\"") {
         emit(out, &body);
     } else if let (Some(id), true) = (id, r.status >= 300) {
-        emit(
-            out,
-            &rpc_error(
-                id,
-                -32603,
-                &format!("xmustard MCP endpoint answered HTTP {}", r.status),
-            ),
-        );
+        let message = match r.status {
+            401 | 403 => AUTH_FAILURE_MESSAGE,
+            status => {
+                return emit(
+                    out,
+                    &rpc_error(
+                        id,
+                        -32603,
+                        &format!("xmustard MCP endpoint answered HTTP {status}"),
+                    ),
+                );
+            }
+        };
+        emit(out, &rpc_error(id, -32603, message));
     }
 }
 
@@ -745,6 +752,36 @@ mod tests {
         let mut body = String::new();
         r.body.read_to_string(&mut body).unwrap();
         assert_eq!((r.status, body.as_str()), (200, "hello, world"));
+    }
+
+    #[test]
+    fn auth_http_refusals_name_the_grounding_repair_command() {
+        for status in [401, 403] {
+            let mut response = Response {
+                status,
+                headers: vec![("content-type".into(), "application/json".into())],
+                body: Box::new(io::Cursor::new(
+                    br#"{"error":"authentication required"}"#.to_vec(),
+                )),
+            };
+            let sink = Sink::default();
+            let out: Output = Arc::new(Mutex::new(Box::new(sink.clone())));
+            deliver(&mut response, &out, Some("7"));
+            let answer = lines(&sink).join("\n");
+            assert!(
+                answer.contains("grounding is unavailable"),
+                "{status}: {answer}"
+            );
+            assert!(
+                answer.contains("xmustard-api mint-token"),
+                "{status}: {answer}"
+            );
+            assert!(answer.contains("XMUSTARD_API_TOKEN"), "{status}: {answer}");
+            assert!(
+                !answer.contains("authentication required"),
+                "{status}: {answer}"
+            );
+        }
     }
 
     #[test]

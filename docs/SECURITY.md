@@ -118,11 +118,13 @@ shim alike. If the API cannot answer within 2 seconds, it advertises all nine to
 and the API still enforces every gate. `ground` adds a `principal` block with the
 caller's id and roles.
 
-If a tool call receives an auth-related HTTP 401 or 403, the MCP result is an `isError` with a safe
-auth-recovery message; grounding is unavailable until the client has a valid token.
-Mint an agent token with `xmustard-api mint-token <id> agent`, update that client's
-`XMUSTARD_API_TOKEN` environment value, and restart it. The shared token store keeps
-only token hashes, so the raw value cannot be recovered from the store.
+An MCP tool call receiving an auth-related HTTP 401 or 403 becomes an `isError` result with a safe
+recovery message. At the transport boundary, `/mcp` answers an invalid or missing bearer token with
+an actionable HTTP 401; the stdio relay maps HTTP 401/403 responses to a JSON-RPC error with the
+same recovery guidance. In either case grounding is unavailable until the client can authenticate
+and is authorized. Mint an agent token with `xmustard-api mint-token <id> agent`, set that client's
+`XMUSTARD_API_TOKEN`, and restart it; if a valid token is refused, check its role. The shared token
+store keeps only token hashes, so the raw value cannot be recovered from the store.
 
 In open mode no credentials exist. Every caller is the single identity
 `anonymous`, passes every role gate, and memory it writes is labelled

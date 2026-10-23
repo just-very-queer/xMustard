@@ -542,6 +542,8 @@ func writeOverloaded(w http.ResponseWriter) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": budget.ErrOverloaded.Error(), "overloaded": true})
 }
 
+const mcpAuthFailureMessage = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Mint an agent token with `xmustard-api mint-token <id> agent`, set XMUSTARD_API_TOKEN for this client, and restart it. If the token is valid, check its role."
+
 func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/health" { // health stays public for liveness probes
@@ -565,7 +567,11 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 				Path:       r.URL.Path,
 				RemoteAddr: r.RemoteAddr,
 			})
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
+			message := "authentication required: provide Authorization: Bearer <token>"
+			if r.URL.Path == "/mcp" {
+				message = mcpAuthFailureMessage
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": message})
 			return
 		}
 		// A presence-only token is typed at the xmustard-ops prompt, never sent as a
@@ -575,8 +581,11 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 				Action: "denied", Actor: principal.ID, Detail: "presence-only token presented as a bearer token",
 				Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
 			})
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"reason": "presence_only_token",
-				"error": "this token is presence-only: it is accepted only when typed at the xmustard-ops prompt, never as a bearer token"})
+			message := "this token is presence-only: it is accepted only when typed at the xmustard-ops prompt, never as a bearer token"
+			if r.URL.Path == "/mcp" {
+				message = mcpAuthFailureMessage
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"reason": "presence_only_token", "error": message})
 			return
 		}
 		// A reader-only principal's writes are refused by the route gate, which

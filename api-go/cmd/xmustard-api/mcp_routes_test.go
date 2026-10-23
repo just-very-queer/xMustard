@@ -162,10 +162,18 @@ func TestMCPHTTPPrincipalPerConnection(t *testing.T) {
 	if code, _ := stolen.post(map[string]any{"jsonrpc": "2.0", "id": 3, "method": "tools/list"}); code != http.StatusNotFound {
 		t.Fatalf("session used by another principal: %d", code)
 	}
-	// no token: the endpoint is behind auth like every other route
-	anon := &mcpHTTPClient{t: t, url: srv.URL + "/mcp"}
-	if code, _ := anon.post(map[string]any{"jsonrpc": "2.0", "id": 0, "method": "initialize"}); code != http.StatusUnauthorized {
-		t.Fatalf("unauthenticated initialize: %d", code)
+	// Authentication failures at the transport boundary must explain that grounding
+	// is unavailable and name the operator repair command.
+	for name, token := range map[string]string{"missing": "", "stale": "invalid-token"} {
+		client := &mcpHTTPClient{t: t, url: srv.URL + "/mcp", token: token}
+		code, out := client.post(map[string]any{"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+		msg, _ := out["error"].(string)
+		if code != http.StatusUnauthorized || !strings.Contains(msg, "grounding is unavailable") || !strings.Contains(msg, "xmustard-api mint-token") || !strings.Contains(msg, "XMUSTARD_API_TOKEN") {
+			t.Errorf("%s token response: status=%d body=%v", name, code, out)
+		}
+		if token != "" && strings.Contains(fmt.Sprint(out), token) {
+			t.Errorf("%s token was disclosed in response: %v", name, out)
+		}
 	}
 }
 
