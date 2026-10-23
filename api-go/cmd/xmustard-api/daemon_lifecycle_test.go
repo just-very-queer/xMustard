@@ -95,12 +95,9 @@ func TestListenTLSAlreadyRunningIsIdentified(t *testing.T) {
 	}
 	other := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
 	defer other.Close()
-	wrongCert := filepath.Join(t.TempDir(), "other.pem")
-	if err := os.WriteFile(wrongCert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: other.Certificate().Raw}), 0600); err != nil {
-		t.Fatal(err)
-	}
-	cfg.tlsCert = wrongCert
-	if _, err := listen(cfg, nil); err == nil || errors.Is(err, errAlreadyRunning) {
+	otherHost, otherPort, _ := net.SplitHostPort(strings.TrimPrefix(other.URL, "https://"))
+	untrustedCfg := serverConfig{host: otherHost, port: otherPort, tlsCert: cert, tlsKey: "configured"}
+	if _, err := listen(untrustedCfg, nil); err == nil || errors.Is(err, errAlreadyRunning) {
 		t.Fatalf("untrusted TLS certificate was accepted as duplicate: %v", err)
 	}
 }

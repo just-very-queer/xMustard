@@ -94,7 +94,7 @@ func existingAPI(cfg serverConfig) bool {
 		if !roots.AppendCertsFromPEM(pem) {
 			return false
 		}
-		client.Transport = &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
+		client.Transport = &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: cfg.host, MinVersion: tls.VersionTLS12}}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
