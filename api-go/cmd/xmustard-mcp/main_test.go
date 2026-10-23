@@ -34,27 +34,33 @@ func TestInflightCancelAll(t *testing.T) {
 	}
 }
 
-func TestWatchParentClosesStdinWhenParentChanges(t *testing.T) {
-	closed := make(chan struct{}, 1)
-	var ppid atomic.Int64
-	ppid.Store(10)
+func TestWatchParentStaysIdleWhileParentLives(t *testing.T) {
+	called := make(chan struct{}, 1)
 	stop := make(chan struct{})
-	go watchParent(closeRecorder{closed}, 10, func() int { return int(ppid.Load()) }, time.Millisecond, stop)
-	ppid.Store(11)
+	go watchParent(10, func() int { return 10 }, 10*time.Millisecond, stop, func() { called <- struct{}{} })
 	select {
-	case <-closed:
-	case <-time.After(time.Second):
+	case <-called:
 		close(stop)
-		t.Fatal("parent watcher did not close stdin")
+		t.Fatal("parent watcher fired while the parent remained alive")
+	case <-time.After(50 * time.Millisecond):
 	}
 	close(stop)
 }
 
-type closeRecorder struct{ closed chan struct{} }
-
-func (c closeRecorder) Close() error {
-	c.closed <- struct{}{}
-	return nil
+func TestWatchParentCallsShutdownWhenParentChanges(t *testing.T) {
+	called := make(chan struct{}, 1)
+	var ppid atomic.Int64
+	ppid.Store(10)
+	stop := make(chan struct{})
+	go watchParent(10, func() int { return int(ppid.Load()) }, time.Millisecond, stop, func() { called <- struct{}{} })
+	ppid.Store(11)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		close(stop)
+		t.Fatal("parent watcher did not initiate shutdown")
+	}
+	close(stop)
 }
 
 // The shim answers initialize through the shared session: a client naming no version

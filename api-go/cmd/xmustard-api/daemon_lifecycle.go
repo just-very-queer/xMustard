@@ -2,10 +2,10 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"crypto/tls"
+	"crypto/x509"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -70,7 +70,7 @@ func listen(cfg serverConfig, activated net.Listener) (net.Listener, error) {
 	if err == nil || !errors.Is(err, syscall.EADDRINUSE) {
 		return ln, err
 	}
-	if existingAPI(cfg.addr()) {
+	if existingAPI(cfg) {
 		return nil, errAlreadyRunning
 	}
 	return nil, err
@@ -78,21 +78,28 @@ func listen(cfg serverConfig, activated net.Listener) (net.Listener, error) {
 
 var errAlreadyRunning = errors.New("already running")
 
-func existingAPI(addr string) bool {
-	client := http.Client{Timeout: 2 * time.Second}
-	resp, err := client.Get("http://" + addr + "/api/health")
-	if err != nil {
-		return false
+func existingAPI(cfg serverConfig) bool {
+	scheme := "http"
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
+	if cfg.hasTLS() {
+		scheme = "https"
+		pem, err := os.ReadFile(cfg.tlsCert)
+		if err != nil {
+			return false
+		}
+		roots, err := x509.SystemCertPool()
+		if err != nil || roots == nil {
+			roots = x509.NewCertPool()
+		}
+		if !roots.AppendCertsFromPEM(pem) {
+			return false
+		}
+		client.Transport = &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{RootCAs: roots, MinVersion: tls.VersionTLS12}}
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return false
-	}
-	var health struct {
-		Status  string `json:"status"`
-		Service string `json:"service"`
-	}
-	return json.NewDecoder(io.LimitReader(resp.Body, 4096)).Decode(&health) == nil && health.Status == "ok" && health.Service == "api-go"
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	h, err := daemon.ProbeWithClient(ctx, scheme+"://"+cfg.addr(), client)
+	return err == nil && h.Service == "api-go" && h.Status == "ok"
 }
 
 // storeStartLine formats the startup check result; restore is reserved for diagnosed faults.

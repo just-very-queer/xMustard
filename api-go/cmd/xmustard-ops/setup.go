@@ -288,6 +288,15 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 	},
 }
 
+func explainLaunchdDuplicate(ctx context.Context, status daemon.Status, base string, probe func(context.Context, string) (daemon.Health, error)) any {
+	if status.Manager == "launchd" && status.PID == 0 && probe != nil {
+		if _, err := probe(ctx, base); err == nil {
+			return map[string]any{"service": status, "notice": "launchd agent not running because another instance owns the port"}
+		}
+	}
+	return status
+}
+
 func requireInstalled(in daemon.Installer, s daemon.Spec) error {
 	present, err := in.Installed(s)
 	if err == nil && len(present) == 0 {
@@ -314,6 +323,11 @@ func runDaemon(e lifecycleEnv, args []string) int {
 	out, err := act(context.Background(), e.installer(p, f.wait), spec)
 	if err != nil {
 		return e.fail(err)
+	}
+	if args[0] == "status" {
+		if status, ok := out.(daemon.Status); ok {
+			out = explainLaunchdDuplicate(context.Background(), status, spec.BaseURL(), e.probe)
+		}
 	}
 	return e.emit(out)
 }

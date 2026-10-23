@@ -321,3 +321,18 @@ func TestSetupClientBindingFollowsMcpConfig(t *testing.T) {
 		t.Fatalf("no --root: %+v %v", r, err)
 	}
 }
+
+func TestLaunchdStatusExplainsHealthyDuplicate(t *testing.T) {
+	status := daemon.Status{Manager: "launchd", State: "not-loaded"}
+	probeOK := func(context.Context, string) (daemon.Health, error) {
+		return daemon.Health{Status: "ok", Service: "api-go"}, nil
+	}
+	out := explainLaunchdDuplicate(context.Background(), status, "http://127.0.0.1:8042", probeOK)
+	result, ok := out.(map[string]any)
+	if !ok || result["notice"] != "launchd agent not running because another instance owns the port" {
+		t.Fatalf("duplicate status = %#v", out)
+	}
+	if got := explainLaunchdDuplicate(context.Background(), daemon.Status{Manager: "systemd"}, "", probeOK); got.(daemon.Status).Manager != "systemd" {
+		t.Fatalf("systemd status changed: %#v", got)
+	}
+}

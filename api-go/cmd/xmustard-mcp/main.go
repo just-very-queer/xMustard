@@ -18,7 +18,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"strconv"
 	"strings"
@@ -472,7 +471,16 @@ type stdioServer struct {
 	send     func(rpcResponse)
 	inflight *inflightRegistry
 	slots    chan struct{}
+	workerMu sync.Mutex
+	closing  bool
 	workers  sync.WaitGroup
+}
+
+func (s *stdioServer) cancelWorkers() {
+	s.workerMu.Lock()
+	s.closing = true
+	s.inflight.cancelAll()
+	s.workerMu.Unlock()
 }
 
 // serve handles one frame read under admission; scope holds its reservation until the
@@ -585,10 +593,18 @@ func (s *stdioServer) startWorker(m rpcMessage, scope *budget.Scope) {
 			Message: fmt.Sprintf("xmustard overloaded: %d requests already in flight; retry shortly", cap(s.slots))}})
 		return
 	}
+	s.workerMu.Lock()
+	if s.closing {
+		s.workerMu.Unlock()
+		<-s.slots
+		scope.Close()
+		return
+	}
 	ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), m.ID))
 	idKey := string(m.ID)
 	s.inflight.add(idKey, cancel)
 	s.workers.Add(1)
+	s.workerMu.Unlock()
 	go func() {
 		defer s.workers.Done()
 		defer func() { <-s.slots }()
@@ -607,7 +623,9 @@ func (s *stdioServer) refuseUndecoded(probe []byte, rerr *rpcError) {
 	}
 }
 
-func watchParent(stdin io.Closer, startPPID int, getPPID func() int, interval time.Duration, stop <-chan struct{}) {
+// watchParent uses the caller's low-frequency interval to bound detection without
+// waking continuously while the client is alive.
+func watchParent(startPPID int, getPPID func() int, interval time.Duration, stop <-chan struct{}, onDeath func()) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -616,7 +634,7 @@ func watchParent(stdin io.Closer, startPPID int, getPPID func() int, interval ti
 			return
 		case <-ticker.C:
 			if getPPID() != startPPID {
-				_ = stdin.Close()
+				onDeath()
 				return
 			}
 		}
@@ -647,9 +665,25 @@ func main() {
 	parentDone := make(chan struct{})
 	defer close(parentDone)
 	startPPID := os.Getppid()
-	stopParentSignal := watchParentDeathSignal(startPPID, func() { _ = os.Stdin.Close() })
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			s.cancelWorkers()
+			workersDone := make(chan struct{})
+			go func() { s.workers.Wait(); close(workersDone) }()
+			select {
+			case <-workersDone:
+			case <-time.After(2 * time.Second):
+			}
+			os.Exit(0)
+		})
+	}
+	if startPPID <= 1 {
+		shutdown()
+	}
+	stopParentSignal := watchParentDeathSignal(startPPID, shutdown)
 	defer stopParentSignal()
-	go watchParent(os.Stdin, startPPID, os.Getppid, 5*time.Second, parentDone)
+	go watchParent(startPPID, os.Getppid, 5*time.Second, parentDone, shutdown)
 
 	for {
 		// Every frame is admitted against the shim's transient pool before it is
@@ -662,7 +696,7 @@ func main() {
 			break
 		}
 	}
-	s.inflight.cancelAll()
+	s.cancelWorkers()
 	workersDone := make(chan struct{})
 	go func() {
 		s.workers.Wait()
