@@ -383,6 +383,9 @@ func countAllJobs(t *testing.T, dir, ws string) int {
 // larger than one pass reads; a window equal to a pass would make this pair depend on where
 // the boundary happened to land.
 func TestClusterSpansAPageBoundary(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation makes the multi-page database fixture exceed the package test timeout")
+	}
 	dir := singleAgentDir(t)
 	ws := "wsJobs11"
 	// More entries than one pass reads, then the pair on one anchor, so the two members sit
