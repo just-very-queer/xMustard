@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -23,7 +24,44 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
+func parseRotateTokenArgs(args []string) (id, dataDir string, ok bool) {
+	if len(args) != 5 || args[1] != "rotate-token" || args[3] != "--data-dir" ||
+		args[4] != strings.TrimSpace(args[4]) || !filepath.IsAbs(args[4]) {
+		return "", "", false
+	}
+	return args[2], args[4], true
+}
+
 func main() {
+	// Recovery rotates the stored secret without changing the principal's claims.
+	if len(os.Args) > 1 && os.Args[1] == "rotate-token" {
+		id, dataDir, ok := parseRotateTokenArgs(os.Args)
+		if !ok {
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>")
+			os.Exit(2)
+		}
+		raw, err := workspaceops.RotateTokenPreservingClaims(dataDir, id)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(raw)
+		return
+	}
+	// Generate a secret for an environment-backed principal without touching the token store.
+	if len(os.Args) > 1 && os.Args[1] == "generate-token" {
+		if len(os.Args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api generate-token")
+			os.Exit(2)
+		}
+		raw, err := workspaceops.GenerateToken()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(raw)
+		return
+	}
 	// `xmustard-api mint-token <id> [role]` mints a bearer token (local file access,
 	// no server needed) — the bootstrap path for the first admin token.
 	if len(os.Args) > 1 && os.Args[1] == "mint-token" {
@@ -551,6 +589,9 @@ func writeOverloaded(w http.ResponseWriter) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": budget.ErrOverloaded.Error(), "overloaded": true})
 }
 
+const mcpAuthFailureMessage = "xMustard grounding is unavailable: this client could not authenticate. For a file-backed principal, rotate it with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. For an XMUSTARD_AUTH_TOKENS principal, run `xmustard-api generate-token` (it does not modify the token store), replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new secret, then restart the API. Removing the environment entry revokes that credential; an existing same-ID file record remains unchanged. Role and workspace-scope refusals require a suitably authorized principal; rotation cannot fix them."
+const mcpPresenceOnlyMessage = "xMustard grounding is unavailable: this token is presence-only and is accepted only when typed at the xmustard-ops prompt. Do not rotate or export it as XMUSTARD_API_TOKEN; use a separate agent-readable bearer principal."
+
 func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/api/health" { // health stays public for liveness probes
@@ -574,7 +615,11 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 				Path:       r.URL.Path,
 				RemoteAddr: r.RemoteAddr,
 			})
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "authentication required: provide Authorization: Bearer <token>"})
+			message := "authentication required: provide Authorization: Bearer <token>"
+			if r.URL.Path == "/mcp" {
+				message = mcpAuthFailureMessage
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": message})
 			return
 		}
 		// A presence-only token is typed at the xmustard-ops prompt, never sent as a
@@ -584,8 +629,11 @@ func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 				Action: "denied", Actor: principal.ID, Detail: "presence-only token presented as a bearer token",
 				Method: r.Method, Path: r.URL.Path, RemoteAddr: r.RemoteAddr,
 			})
-			writeJSON(w, http.StatusUnauthorized, map[string]any{"reason": "presence_only_token",
-				"error": "this token is presence-only: it is accepted only when typed at the xmustard-ops prompt, never as a bearer token"})
+			message := "this token is presence-only: it is accepted only when typed at the xmustard-ops prompt, never as a bearer token"
+			if r.URL.Path == "/mcp" {
+				message = mcpPresenceOnlyMessage
+			}
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"reason": "presence_only_token", "error": message})
 			return
 		}
 		// A reader-only principal's writes are refused by the route gate, which

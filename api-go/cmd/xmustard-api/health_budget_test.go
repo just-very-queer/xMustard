@@ -5,8 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -30,6 +32,36 @@ func getHealth(t *testing.T, base string) map[string]any {
 		t.Fatalf("health: status %d err %v", resp.StatusCode, err)
 	}
 	return h
+}
+
+func TestHealthReportsAuthStateWithoutDisclosingToken(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XMUSTARD_DATA_DIR", dir)
+	t.Setenv("XMUSTARD_AUTH", "auto")
+	token, err := workspaceops.MintToken(dir, "health-agent", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previous)
+	body := healthResponse(httptest.NewRequest(http.MethodGet, "/api/health", nil))
+	encoded, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), token) || strings.Contains(logs.String(), token) {
+		t.Fatal("health response or logs exposed the bearer token")
+	}
+	state, ok := body["auth"].(map[string]any)
+	if !ok || state["mode"] != "auto" || state["credentials_configured"] != true || state["required"] != true {
+		t.Fatalf("unexpected auth state: %v", body["auth"])
+	}
+	t.Setenv("XMUSTARD_AUTH", "off")
+	if got := healthAuthState(); got["required"] != false || got["credentials_configured"] != true {
+		t.Fatalf("off mode auth state should report configured credentials but not require auth: %v", got)
+	}
 }
 
 // dig walks nested JSON objects by key.

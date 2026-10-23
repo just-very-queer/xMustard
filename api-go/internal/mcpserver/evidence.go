@@ -122,6 +122,9 @@ func (e *Evidence) EnvelopeResult(ctx context.Context, body, ws string) (map[str
 	if err := json.Unmarshal([]byte(body), &env); err != nil {
 		return TextResult("xmustard: undecodable evidence envelope: "+err.Error(), true), nil
 	}
+	if isAuthFailure(env.Status, env.Projection) {
+		return TextResult(authFailureMessage(env.Status, env.Projection), true), nil
+	}
 	if env.Status == http.StatusServiceUnavailable && strings.Contains(env.Projection, `"overloaded":true`) {
 		return nil, OverloadError(budget.ErrOverloaded) // retryable: a protocol overload, not a tool error
 	}

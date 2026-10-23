@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // callTool handles tools/call. A malformed request or an unknown tool is a protocol
@@ -172,6 +173,10 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 		if errors.Is(err, budget.ErrOverloaded) {
 			return nil, OverloadError(err)
 		}
+		var authErr *authRefusalError
+		if errors.As(err, &authErr) {
+			return TextResult(authFailureMessage(authErr.status, authErr.body), true), nil
+		}
 		return TextResult("xmustard: "+err.Error(), true), nil
 	}
 	args["workspace_id"] = ws.ID
@@ -214,6 +219,9 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 	if isOverloadBody(resp.Status, resp.Body) {
 		return nil, OverloadError(budget.ErrOverloaded)
 	}
+	if isAuthFailure(resp.Status, resp.Body) {
+		return TextResult(authFailureMessage(resp.Status, resp.Body), true), nil
+	}
 	var res map[string]any
 	if d := s.srv.opts.Delivery; d != nil {
 		var rerr *RPCError
@@ -240,6 +248,63 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 	}
 	return res, nil
 }
+
+func isAuthFailure(status int, body string) bool {
+	if status == http.StatusUnauthorized {
+		return true
+	}
+	if status != http.StatusForbidden {
+		return false
+	}
+	refusal, ok := parseAuthRefusal(body)
+	return ok && (refusal.MissingRole != "" || refusal.Reason == "missing_role" || refusal.Reason == "presence_only_token" ||
+		refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace "))
+}
+
+type authRefusal struct {
+	Reason      string `json:"reason"`
+	MissingRole string `json:"missing_role"`
+	Refusal     string `json:"refusal"`
+	Error       string `json:"error"`
+}
+
+func parseAuthRefusal(body string) (authRefusal, bool) {
+	var refusal authRefusal
+	if err := json.Unmarshal([]byte(body), &refusal); err != nil {
+		return authRefusal{}, false
+	}
+	return refusal, true
+}
+
+func authFailureMessage(status int, body string) string {
+	refusal, _ := parseAuthRefusal(body)
+	if refusal.Reason == "presence_only_token" {
+		return "xMustard grounding is unavailable: this token is presence-only and is accepted only when typed at the xmustard-ops prompt. Do not rotate or export it as XMUSTARD_API_TOKEN; use a separate agent-readable bearer principal."
+	}
+	if status == http.StatusForbidden {
+		if refusal.MissingRole != "" {
+			if role, err := workspaceops.ParseRoleSpec(refusal.MissingRole); err == nil {
+				return fmt.Sprintf("xMustard grounding is unavailable: this token is missing the %q role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", role, tokenRotationCommand)
+			}
+		}
+		switch {
+		case refusal.Reason == "missing_role":
+			return fmt.Sprintf("xMustard grounding is unavailable: this token lacks a required role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", tokenRotationCommand)
+		case refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace "):
+			return fmt.Sprintf("xMustard grounding is unavailable: this token is not scoped to the requested workspace. Use a principal authorized for that workspace; do not replace it with an unrestricted token. If its secret is also expired, rotate it with %s; rotation preserves the current workspace scope.", tokenRotationCommand)
+		}
+	}
+	return fmt.Sprintf("xMustard grounding is unavailable: authentication failed (HTTP %d). For a missing or expired file-backed token, rotate its existing principal with %s, then update XMUSTARD_API_TOKEN for this client and restart it. For an XMUSTARD_AUTH_TOKENS principal, run `xmustard-api generate-token` (it does not modify the token store), replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new secret, then restart the API. Removing the environment entry revokes that credential; an existing same-ID file record remains unchanged. This preserves the principal's role, workspace scope, identity, and lifetime policy. For authorization refusals, use a principal with the required role and workspace scope; rotation cannot fix authorization.", status, tokenRotationCommand)
+}
+
+const tokenRotationCommand = "`xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`"
+
+type authRefusalError struct {
+	status int
+	body   string
+}
+
+func (e *authRefusalError) Error() string { return authFailureMessage(e.status, e.body) }
 
 // finish adds what every result carries: the workspace echo and any normalizations
 // in _meta; a one-line text echo the first time an implicitly resolved workspace is

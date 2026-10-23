@@ -171,19 +171,32 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	msg := "no workspace resolved (" + strings.Join(tried, "; ") + "). Fix: run `xmustard-ops workspace load --root-path \"$PWD\" --data-dir <API data directory>`; pass workspace_id or set XMUSTARD_WORKSPACE_ID."
 	if list, _, err := s.listWorkspaces(ctx, false); err == nil && len(list) > 0 {
 		msg += "; registered: " + describe(list, 5)
+	} else if err != nil {
+		var authErr *authRefusalError
+		if errors.As(err, &authErr) {
+			return Workspace{}, authErr
+		}
 	}
 	return Workspace{}, errors.New(msg)
 }
 
+// registrationRefusalError marks a 403 tied to one path signal; another signal may work.
+type registrationRefusalError struct{ *authRefusalError }
+
 // fatalError aborts resolution instead of falling through to the next signal
-// (admission refusal, cancellation).
+// (admission refusal, cancellation, authentication, or workspace listing).
 type fatalError struct{ error }
 
 func (e fatalError) Unwrap() error { return e.error }
 
 func isFatal(err error) bool {
+	var registrationRefusal *registrationRefusalError
+	if errors.As(err, &registrationRefusal) {
+		return false
+	}
 	var f fatalError
-	return errors.As(err, &f) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	var authErr *authRefusalError
+	return errors.As(err, &f) || errors.As(err, &authErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // byPathSignal maps a filesystem path (a root, the cwd, or an absolute path argument)
@@ -270,7 +283,22 @@ func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string
 		return ancestor(fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo))
 	}
 	if err := s.register(ctx, repo); err != nil {
-		return ancestor(err)
+		var authErr *authRefusalError
+		if !errors.As(err, &authErr) {
+			return ancestor(err)
+		}
+		if authErr.status != http.StatusForbidden {
+			// The API rejected the credential itself: a cached listing must not
+			// stand in for it, so this ends resolution.
+			return Workspace{}, err
+		}
+		// A 403 refuses only this registration: a registered ancestor that already
+		// contains the path stays the answer, and otherwise a later path signal may
+		// still select another workspace independently.
+		if ws, aerr := ancestor(err); aerr == nil {
+			return ws, nil
+		}
+		return Workspace{}, &registrationRefusalError{authErr}
 	}
 	list, _, err := s.listWorkspaces(ctx, true)
 	if err != nil {
@@ -297,6 +325,9 @@ func (s *Session) register(ctx context.Context, repo string) error {
 		return fatalOn(fmt.Errorf("registering git repository %s: %w", repo, budget.ErrOverloaded))
 	}
 	if resp.Status >= 400 {
+		if isAuthFailure(resp.Status, resp.Body) {
+			return &authRefusalError{status: resp.Status, body: resp.Body}
+		}
 		// the API's message names the rule that refused it (a non-admin token
 		// registers only under the operator's XMUSTARD_REGISTER_ROOTS)
 		return fmt.Errorf("git repository %s is not registered and the API refused to register it (%s: %s)", repo, statusText(resp.Status), clip(apiErrorText(resp.Body), 200))
@@ -332,6 +363,9 @@ func (s *Session) listWorkspaces(ctx context.Context, refresh bool) (list []regi
 		return nil, false, fatalOn(fmt.Errorf("listing workspaces: %w", budget.ErrOverloaded))
 	}
 	if resp.Status != http.StatusOK {
+		if isAuthFailure(resp.Status, resp.Body) {
+			return nil, false, &authRefusalError{status: resp.Status, body: resp.Body}
+		}
 		return nil, false, fmt.Errorf("listing workspaces failed (%s: %s)", statusText(resp.Status), clip(resp.Body, 200))
 	}
 	if err := json.Unmarshal([]byte(resp.Body), &list); err != nil {

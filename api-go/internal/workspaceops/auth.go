@@ -367,6 +367,64 @@ func MintToken(dataDir, id, role string) (string, error) {
 	return MintTokenTTL(dataDir, id, role, 0)
 }
 
+// GenerateToken returns a random bearer secret without creating or modifying a principal.
+func GenerateToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "xmt_" + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
+// RotateTokenPreservingClaims replaces the secret for an existing principal without
+// changing its role, workspace scope, identity, or lifetime policy. Expiring tokens
+// receive the same lifetime from rotation time; malformed lifetime metadata fails closed.
+func RotateTokenPreservingClaims(dataDir, id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if err := validateSafeID("token", id); err != nil {
+		return "", fmt.Errorf("token id must be alphanumeric/._-: %w", err)
+	}
+	unlock, err := lockTokenStore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	recs, err := loadTokenRecords(dataDir)
+	if err != nil {
+		return "", err
+	}
+	for _, rec := range recs {
+		if rec.ID != id {
+			continue
+		}
+		ttl := 0
+		if rec.ExpiresAt != "" {
+			created, createdErr := time.Parse(time.RFC3339Nano, rec.CreatedAt)
+			expires, expiresErr := time.Parse(time.RFC3339Nano, rec.ExpiresAt)
+			if createdErr != nil || expiresErr != nil || !expires.After(created) {
+				return "", fmt.Errorf("token %q has invalid expiry metadata", id)
+			}
+			// Minted lifetimes are whole seconds. Round up old records whose
+			// timestamps straddle the two clock reads by a fraction of a second.
+			delta := expires.Sub(created)
+			ttl = int(delta / time.Second)
+			if delta%time.Second != 0 {
+				ttl++
+			}
+		}
+		role := rec.Role
+		if err := validateMintInputs(&id, &role, ttl); err != nil {
+			return "", fmt.Errorf("token %q cannot be safely rotated: %w", id, err)
+		}
+		identity, err := (TokenIdentity{Owner: rec.Owner, Kind: rec.Kind, PresenceOnly: rec.PresenceOnly}).normalize(id)
+		if err != nil {
+			return "", fmt.Errorf("token %q has invalid identity claims: %w", id, err)
+		}
+		return mintTokenLocked(dataDir, rec.ID, role, ttl, slices.Clone(rec.Workspaces), identity)
+	}
+	return "", fmt.Errorf("token %q does not exist", id)
+}
+
 // MintTokenTTL generates a token for (id, role), stores its hash, and returns the
 // raw token once. Re-minting for an existing id replaces its token. ttlSeconds > 0
 // sets an expiry (enforced in ResolveToken); 0 means the token never expires.
@@ -429,11 +487,10 @@ func MintIdentityToken(dataDir, id, role string, ttlSeconds int, workspaces []st
 
 // mintTokenLocked does the load-modify-write; the caller MUST hold lockTokenStore.
 func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []string, ident TokenIdentity) (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
+	raw, err := GenerateToken()
+	if err != nil {
 		return "", err
 	}
-	raw := "xmt_" + base64.RawURLEncoding.EncodeToString(buf)
 	recs, err := loadTokenRecords(dataDir)
 	if err != nil {
 		return "", err
@@ -444,17 +501,16 @@ func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []stri
 			next = append(next, r)
 		}
 	}
+	createdAt := time.Now().UTC()
 	expiresAt := ""
 	if ttlSeconds > 0 {
-		// nanosecond precision matches the After() comparison in tokenExpired, so a
-		// short TTL doesn't live up to ~1s past its requested expiry.
-		expiresAt = time.Now().UTC().Add(time.Duration(ttlSeconds) * time.Second).Format(time.RFC3339Nano)
+		expiresAt = createdAt.Add(time.Duration(ttlSeconds) * time.Second).Format(time.RFC3339Nano)
 	}
 	next = append(next, tokenRecord{
 		ID:          id,
 		Role:        role,
 		TokenSHA256: hashToken(raw),
-		CreatedAt:   nowUTC(),
+		CreatedAt:   createdAt.Format(time.RFC3339Nano),
 		ExpiresAt:   expiresAt,
 		Workspaces:  workspaces,
 		// Only an owner other than the id itself is written, so stored records stay

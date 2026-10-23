@@ -122,6 +122,19 @@ shim alike. If the API cannot answer within 2 seconds, it advertises all nine to
 and the API still enforces every gate. `ground` adds a `principal` block with the
 caller's id and roles.
 
+An MCP tool call receiving an auth-related HTTP 401 or 403 becomes an `isError` result with a safe
+recovery message. At the transport boundary, `/mcp` answers an invalid or missing bearer token with
+an actionable HTTP 401; the stdio relay maps HTTP 401/403 responses to a JSON-RPC error with the
+same recovery guidance. In either case grounding is unavailable until the client can authenticate
+and is authorized. For an expired or missing secret, rotate the existing principal with
+`xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, using the directory configured
+on the API process as an absolute path, not the client's working directory. Then update that client's
+`XMUSTARD_API_TOKEN` and restart it. Rotation preserves role, workspace scope, identity, and
+lifetime policy. For an authorization refusal, check role and workspace scope; do not replace a
+scoped principal with an unrestricted token. The shared token store keeps only token hashes, so the
+raw value cannot be recovered from the store. `/api/health` reports only the auth mode, whether credentials
+are configured, and whether auth is required; it never returns bearer values.
+
 In open mode no credentials exist. Every caller is the single identity
 `anonymous`, passes every role gate, and memory it writes is labelled
 `self_asserted_open_mode`, never peer-verified.

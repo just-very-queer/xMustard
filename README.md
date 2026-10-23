@@ -201,7 +201,13 @@ needs no extra process. A client that can only launch a command uses `xmustard-r
 stdio bridge. `xmustard-ops mcp-config --root "$PWD" [--transport http|relay] [--client NAME]
 [--mode readonly]` prints a ready `mcpServers` entry for either. The entry refers to
 `${XMUSTARD_API_TOKEN}` and never contains the token itself. The workspace id comes from the
-checkout's absolute path, so generate an entry per checkout. The examples below use `$WS` from
+checkout's absolute path, so generate an entry per checkout. If an MCP transport or tool call reports
+an authentication error, grounding is unavailable until the client can authenticate and is authorized. Rotate
+its existing principal with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, where the
+argument is the API process's configured data directory as an absolute path (not the client's working directory). Update that
+client's `XMUSTARD_API_TOKEN` and restart it. Rotation preserves role, workspace scope, identity, and
+lifetime policy. Never paste a token into a config file shared with other clients.
+The examples below use `$WS` from
 step 4 of the Quickstart.
 
 | Client | What v0.1.1 ships |
