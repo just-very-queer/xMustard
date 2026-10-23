@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,7 +57,14 @@ type lifecycleEnv struct {
 func defaultLifecycleEnv() lifecycleEnv {
 	exe, _ := os.Executable()
 	return lifecycleEnv{opsEnv: defaultOpsEnv(), goos: runtime.GOOS, uid: os.Getuid(), run: daemon.ExecRunner,
-		probe: daemon.Probe, exe: exe, lookPath: exec.LookPath, now: time.Now}
+		probe: probeDirect, exe: exe, lookPath: exec.LookPath, now: time.Now}
+}
+
+// probeDirect keeps a health result tied to the requested listener.
+func probeDirect(ctx context.Context, base string) (daemon.Health, error) {
+	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil},
+		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+	return daemon.ProbeWithClient(ctx, base, client)
 }
 
 // lifecycleCommands are the subcommands this file adds to xmustard-ops.
@@ -288,13 +296,15 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 	},
 }
 
-func explainLaunchdDuplicate(ctx context.Context, status daemon.Status, base string, probe func(context.Context, string) (daemon.Health, error)) any {
-	if status.Manager == "launchd" && status.PID == 0 && probe != nil {
+func explainLaunchdDuplicate(ctx context.Context, report daemon.StatusReport, base string, probe func(context.Context, string) (daemon.Health, error)) any {
+	if report.Service.Manager == "launchd" && report.Service.PID == 0 && probe != nil {
 		if _, err := probe(ctx, base); err == nil {
-			return map[string]any{"service": status, "notice": "launchd agent not running because another instance owns the port"}
+			return map[string]any{"service": report.Service, "health": report.Health, "health_error": report.HealthError,
+				"api": report.API, "units": report.Units,
+				"notice": "launchd agent not running because another instance owns the port"}
 		}
 	}
-	return status
+	return report
 }
 
 func requireInstalled(in daemon.Installer, s daemon.Spec) error {
@@ -325,8 +335,8 @@ func runDaemon(e lifecycleEnv, args []string) int {
 		return e.fail(err)
 	}
 	if args[0] == "status" {
-		if status, ok := out.(daemon.Status); ok {
-			out = explainLaunchdDuplicate(context.Background(), status, spec.BaseURL(), e.probe)
+		if report, ok := out.(daemon.StatusReport); ok {
+			out = explainLaunchdDuplicate(context.Background(), report, report.API, e.probe)
 		}
 	}
 	return e.emit(out)

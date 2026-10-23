@@ -164,17 +164,23 @@ func TestShimExitsWhenLauncherDiesBeforeWatcherStarts(t *testing.T) {
 	cmd.Env = append(os.Environ(), "XMUSTARD_SHIM_PARENT_HELPER=1", "XMUSTARD_SHIM_PATH="+shim,
 		"XMUSTARD_SHIM_PARENT_EXIT_IMMEDIATELY=1", "XMUSTARD_SHIM_START_DELAY=1",
 		"XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
-	stdin, err := cmd.StdinPipe()
+	stdinR, stdin, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
 	}
+	cmd.Stdin = stdinR
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
 		t.Fatal(err)
 	}
 	if err := cmd.Start(); err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
 		t.Fatal(err)
 	}
+	_ = stdinR.Close()
 	var pid int
 	if _, err := fmt.Fscan(stdout, &pid); err != nil {
 		_ = cmd.Process.Kill()

@@ -5,8 +5,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"encoding/pem"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -45,17 +43,6 @@ func TestStoreStartLineAdvisesRestoreOnlyOnFault(t *testing.T) {
 	}
 }
 
-func TestListenAlreadyRunningIsDistinctExit(t *testing.T) {
-	payload := `{"status":"ok","service":"api-go","runtime":"` + strings.Repeat("x", 5000) + `"}`
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { _, _ = w.Write([]byte(payload)) }))
-	defer srv.Close()
-	host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
-	cfg := serverConfig{host: host, port: port}
-	if _, err := listen(cfg, nil); !errors.Is(err, errAlreadyRunning) {
-		t.Fatalf("listen error = %v, want already-running sentinel", err)
-	}
-}
-
 func TestDuplicateAPIExecutableExitsSuccessfully(t *testing.T) {
 	dataDir := t.TempDir()
 	owner := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})
@@ -74,44 +61,36 @@ func TestDuplicateAPIExecutableExitsSuccessfully(t *testing.T) {
 	if err := p.wait(t, 10*time.Second); err != nil {
 		t.Fatalf("duplicate API exit = %v, want success: %s", err, p.out)
 	}
-	if !strings.Contains(p.out.String(), "already running at 127.0.0.1:"+fmt.Sprint(owner.port)+"; exiting") {
+	if !strings.Contains(p.out.String(), "another instance owns this data directory; exiting") {
 		t.Fatalf("duplicate API log: %s", p.out)
 	}
 }
 
-func TestListenTLSAlreadyRunningIsIdentified(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = fmt.Fprintf(w, `{"status":"ok","service":"api-go","runtime":"%s"}`, strings.Repeat("x", 5000))
-	}))
-	defer srv.Close()
-	cert := filepath.Join(t.TempDir(), "server.pem")
-	if err := os.WriteFile(cert, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: srv.Certificate().Raw}), 0600); err != nil {
-		t.Fatal(err)
+func TestDataDirLockStopsSecondAPIOnAnotherPort(t *testing.T) {
+	dataDir := t.TempDir()
+	startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})
+	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
+		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": fmt.Sprint(freePort(t)),
+	})
+	if err := p.wait(t, 10*time.Second); err != nil {
+		t.Fatalf("second API exit = %v, want success: %s", err, p.out)
 	}
-	host, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "https://"))
-	cfg := serverConfig{host: host, port: port, tlsCert: cert, tlsKey: "configured"}
-	if _, err := listen(cfg, nil); !errors.Is(err, errAlreadyRunning) {
-		t.Fatalf("TLS duplicate listener error = %v, want already-running sentinel", err)
-	}
-	other := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
-	defer other.Close()
-	otherHost, otherPort, _ := net.SplitHostPort(strings.TrimPrefix(other.URL, "https://"))
-	untrustedCfg := serverConfig{host: otherHost, port: otherPort, tlsCert: cert, tlsKey: "configured"}
-	if _, err := listen(untrustedCfg, nil); err == nil || errors.Is(err, errAlreadyRunning) {
-		t.Fatalf("untrusted TLS certificate was accepted as duplicate: %v", err)
+	if !strings.Contains(p.out.String(), "another instance owns this data directory; exiting") {
+		t.Fatalf("second API log: %s", p.out)
 	}
 }
 
-func TestListenForeignPortStillFails(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-	host, port, _ := net.SplitHostPort(ln.Addr().String())
-	_, err = listen(serverConfig{host: host, port: port}, nil)
-	if err == nil || errors.Is(err, errAlreadyRunning) {
-		t.Fatalf("foreign listener error = %v", err)
+func TestForeignPortHolderIsFatalDespiteOwnedDataDir(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"api-go"}`))
+	}))
+	defer srv.Close()
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
+		"XMUSTARD_DATA_DIR": t.TempDir(), "XMUSTARD_API_PORT": port,
+	})
+	if err := p.wait(t, 10*time.Second); err == nil {
+		t.Fatalf("API exited successfully while an unrelated listener answered xMustard health on port %s: %s", port, p.out)
 	}
 }
 

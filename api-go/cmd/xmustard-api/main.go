@@ -56,11 +56,16 @@ func main() {
 	if err := validateStartup(cfg); err != nil {
 		log.Fatal(err)
 	}
-	ln, err := listen(cfg, activated)
-	if errors.Is(err, errAlreadyRunning) {
-		log.Printf("already running at %s; exiting", cfg.addr())
+	unlockDataDir, err := lockAPIDataDir(cfg.dataDir)
+	if errors.Is(err, errAPIAlreadyRunning) {
+		log.Printf("another instance owns this data directory; exiting")
 		os.Exit(0)
 	}
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer unlockDataDir()
+	ln, err := listen(cfg, activated)
 	if err != nil {
 		log.Fatal(err)
 	}

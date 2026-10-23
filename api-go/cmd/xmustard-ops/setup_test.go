@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
@@ -322,17 +324,43 @@ func TestSetupClientBindingFollowsMcpConfig(t *testing.T) {
 	}
 }
 
-func TestLaunchdStatusExplainsHealthyDuplicate(t *testing.T) {
-	status := daemon.Status{Manager: "launchd", State: "not-loaded"}
-	probeOK := func(context.Context, string) (daemon.Health, error) {
+func TestProbeDirectDoesNotFollowRedirects(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"api-go"}`))
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.RedirectHandler(target.URL, http.StatusTemporaryRedirect))
+	defer redirect.Close()
+	if health, err := probeDirect(context.Background(), redirect.URL); err == nil {
+		t.Fatalf("redirect to healthy API was accepted: %+v", health)
+	}
+}
+
+func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
+	e, out, errOut, _, home := lifecycleTest(t, "darwin", nil)
+	platform := daemon.Launchd{UID: 501}
+	spec := platform.Defaults(e.getenv, home)
+	if err := os.MkdirAll(spec.UnitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range platform.Files(spec) {
+		if err := os.WriteFile(unit.Path, []byte(unit.Content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.run = func(context.Context, string, ...string) (string, error) {
+		return "state = waiting\n", errors.New("not running")
+	}
+	e.probe = func(context.Context, string) (daemon.Health, error) {
 		return daemon.Health{Status: "ok", Service: "api-go"}, nil
 	}
-	out := explainLaunchdDuplicate(context.Background(), status, "http://127.0.0.1:8042", probeOK)
-	result, ok := out.(map[string]any)
-	if !ok || result["notice"] != "launchd agent not running because another instance owns the port" {
-		t.Fatalf("duplicate status = %#v", out)
+	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
+		t.Fatalf("status exit = %d: %s", code, errOut)
 	}
-	if got := explainLaunchdDuplicate(context.Background(), daemon.Status{Manager: "systemd"}, "", probeOK); got.(daemon.Status).Manager != "systemd" {
-		t.Fatalf("systemd status changed: %#v", got)
+	if !strings.Contains(out.String(), "launchd agent not running because another instance owns the port") {
+		t.Fatalf("status output missing duplicate notice: %s", out)
+	}
+	if !strings.Contains(out.String(), `"health":{"status":"ok","service":"api-go"}`) {
+		t.Fatalf("status output omitted health report: %s", out)
 	}
 }

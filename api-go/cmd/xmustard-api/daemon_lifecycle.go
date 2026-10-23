@@ -2,18 +2,12 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"crypto/x509"
-	"errors"
 	"fmt"
 	"log"
 	"net"
-	"net/http"
 	"os"
 	"strconv"
 	"strings"
-	"syscall"
-	"time"
 
 	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/workspaceops"
@@ -61,45 +55,13 @@ func adoptActivatedSocket(cfg *serverConfig) (net.Listener, error) {
 	return ln, nil
 }
 
-// listen returns the activated socket, or binds cfg's address.
+// listen returns the activated socket, or binds cfg's address. The data-directory lock
+// is the sole duplicate-instance authority; a bind conflict here is a foreign listener.
 func listen(cfg serverConfig, activated net.Listener) (net.Listener, error) {
 	if activated != nil {
 		return activated, nil
 	}
-	ln, err := net.Listen("tcp", cfg.addr())
-	if err == nil || !errors.Is(err, syscall.EADDRINUSE) {
-		return ln, err
-	}
-	if existingAPI(cfg) {
-		return nil, errAlreadyRunning
-	}
-	return nil, err
-}
-
-var errAlreadyRunning = errors.New("already running")
-
-func existingAPI(cfg serverConfig) bool {
-	scheme := "http"
-	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil}}
-	if cfg.hasTLS() {
-		scheme = "https"
-		pem, err := os.ReadFile(cfg.tlsCert)
-		if err != nil {
-			return false
-		}
-		roots, err := x509.SystemCertPool()
-		if err != nil || roots == nil {
-			roots = x509.NewCertPool()
-		}
-		if !roots.AppendCertsFromPEM(pem) {
-			return false
-		}
-		client.Transport = &http.Transport{Proxy: nil, TLSClientConfig: &tls.Config{RootCAs: roots, ServerName: cfg.host, MinVersion: tls.VersionTLS12}}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	defer cancel()
-	h, err := daemon.ProbeWithClient(ctx, scheme+"://"+cfg.addr(), client)
-	return err == nil && h.Service == "api-go" && h.Status == "ok"
+	return net.Listen("tcp", cfg.addr())
 }
 
 // storeStartLine formats the startup check result; restore is reserved for diagnosed faults.
