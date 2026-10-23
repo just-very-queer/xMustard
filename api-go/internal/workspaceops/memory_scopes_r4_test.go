@@ -460,9 +460,12 @@ func proposeAtRisk(t *testing.T, dir, ws, author, title, content, scope string) 
 		}, actor); err != nil {
 			return err
 		}
-		_, err = tx.MarkStale(ctx, entry.ID,
+		n, err := tx.MarkStale(ctx, entry.ID,
 			[]govstore.AnchorRef{{Kind: govstore.AnchorPath, Value: "srv.go"}}, "c0ffee1",
 			govstore.Actor{Principal: "drift-bot"})
+		if err == nil && n == 0 {
+			err = errNoDriftMarked
+		}
 		return err
 	}); err != nil {
 		t.Fatalf("seed at-risk entry %s: %v", id, err)
