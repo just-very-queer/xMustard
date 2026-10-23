@@ -84,7 +84,7 @@ impl DecisionProvider for FixtureProvider {
         question: &Question,
         candidates: &[Candidate],
     ) -> Result<Decision, ProviderError> {
-        validate_input(question, candidates)?;
+        validate_request(question, candidates)?;
         let probabilities = self
             .fixtures
             .get(&question.id)
@@ -135,7 +135,11 @@ pub fn validate_decision(
     Ok(())
 }
 
-fn validate_input(question: &Question, candidates: &[Candidate]) -> Result<(), ProviderError> {
+/// Enforces the serialized request bounds before any provider implementation sees input.
+pub fn validate_request(
+    question: &Question,
+    candidates: &[Candidate],
+) -> Result<(), ProviderError> {
     if question.id.is_empty()
         || question.id.len().saturating_add(question.text.len()) > MAX_BATCH_BYTES
         || question.text.trim().is_empty()

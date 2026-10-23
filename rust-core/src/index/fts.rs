@@ -403,6 +403,53 @@ pub fn locate(
     .optional()
 }
 
+/// The first indexed code chunk for a file, used for bounded file-level discovery.
+pub fn file_preview(conn: &Connection, path: &str) -> rusqlite::Result<Option<ChunkLoc>> {
+    conn.prepare_cached(
+        "SELECT c.id, c.start_line, c.end_line, c.start_byte, c.end_byte, c.content_hash
+         FROM files f JOIN chunks c ON c.file_id = f.id
+         WHERE f.path = ?1 ORDER BY c.start_line, c.id LIMIT 1",
+    )?
+    .query_row([path], |row| {
+        Ok(ChunkLoc {
+            id: row.get(0)?,
+            doc: false,
+            path: path.to_string(),
+            start_line: row.get(1)?,
+            end_line: row.get(2)?,
+            start_byte: row.get(3)?,
+            end_byte: row.get(4)?,
+            content_hash: row.get(5)?,
+        })
+    })
+    .optional()
+}
+
+/// Every indexed declaration in a file, in stable source order, with its indexed chunk.
+pub fn declarations(
+    conn: &Connection,
+    path: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<(Decl, Option<ChunkLoc>)>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT n.name, s.name_line FROM files f
+         JOIN symbols s ON s.file_id = f.id
+         JOIN names n ON n.id = s.name_id
+         WHERE f.path = ?1 ORDER BY s.start_line, s.name_line, n.name LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![path, limit.min(i64::MAX as usize) as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+    })?;
+    let mut declarations = Vec::new();
+    for row in rows {
+        let (name, name_line) = row?;
+        if let Some(declaration) = locate(conn, path, &name, name_line)? {
+            declarations.push(declaration);
+        }
+    }
+    Ok(declarations)
+}
+
 /// Why a chunk's text is not available.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextMiss {
