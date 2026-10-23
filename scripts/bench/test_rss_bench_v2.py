@@ -515,9 +515,23 @@ class PssGate(unittest.TestCase):
             shutil.copy2(src, relay_src)
             relay = v2.private_copy(relay_src, out, "relay")
             self.assertNotEqual(dest, relay)
+            self.assertEqual((os.path.basename(dest), os.path.basename(relay)), ("xmustard-core", "xmustard-core"))
             self.assertTrue(os.path.isfile(dest) and os.path.isfile(relay))
             self.assertNotEqual(os.stat(dest).st_ino, os.stat(src).st_ino)
             self.assertEqual((v2.sha_file(dest), os.access(dest, os.X_OK)), (v2.sha_file(src), True))
+            self.assertEqual(REGISTRY.classify(os.path.basename(dest)), ("rust_core_per_call", "owned"))
+            self.assertEqual(REGISTRY.classify(os.path.basename(dest), "serve"), ("rust_index_service", "owned"))
+            self.assertTrue(REGISTRY.is_owned_binary(os.path.basename(dest)))
+            self.assertTrue(os.path.basename(dest).startswith("xmustard"))  # mirrors Go ownedProcessName
+            relay_path = os.path.join(d, "relay", "xmustard-relay")
+            with open(relay_path, "wb") as f:
+                f.write(b"\x7fELF relay")
+            os.chmod(relay_path, 0o755)
+            relay_copy = v2.private_copy(relay_path, out, "relay")
+            self.assertEqual(os.path.basename(relay_copy), "xmustard-relay")
+            self.assertEqual(REGISTRY.classify(os.path.basename(relay_copy)), ("mcp_access", "owned"))
+            self.assertTrue(REGISTRY.is_owned_binary(os.path.basename(relay_copy)))
+            self.assertTrue(os.path.basename(relay_copy).startswith("xmustard"))  # mirrors Go ownedProcessName
 
     def test_cmd_run_provenance_uses_the_core_copy(self):
         with tempfile.TemporaryDirectory() as d:
@@ -549,7 +563,7 @@ class PssGate(unittest.TestCase):
                     unittest.mock.patch.object(v2, "write_reports"), \
                     unittest.mock.patch.object(v2, "exit_code", return_value=0):
                 self.assertEqual(v2.cmd_run(args), 0)
-            self.assertEqual(os.path.basename(seen["core"]), "core-xmustard-core")
+            self.assertEqual(os.path.basename(seen["core"]), "xmustard-core")
             self.assertNotEqual(seen["core"], source_core)
 
     def test_provenance_hashes_private_core_copy(self):

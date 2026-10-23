@@ -2034,9 +2034,11 @@ def resolve_relay(source_root, relay_bin=None):
 def private_copy(path, out_dir, role=None):
     """A copy of a binary that only this run maps. PSS splits a file page among every
     process that maps it, so a core that another process runs from the same file would
-    make the tree read low."""
-    name = os.path.basename(path) if role is None else f"{role}-{os.path.basename(path)}"
-    dest = os.path.join(out_dir, name)
+    make the tree read low. Role directories keep copies distinct without changing the
+    executable name used by runtime ownership and component classification."""
+    dest_dir = os.path.join(out_dir, role) if role else out_dir
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(path))
     shutil.copy2(path, dest)
     return dest
 
