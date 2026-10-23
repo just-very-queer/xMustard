@@ -15,13 +15,6 @@ import (
 
 var processIdentity = apiProcessIdentity
 
-type apiOwner struct {
-	PID       int    `json:"pid"`
-	StartTime int64  `json:"start_time"`
-	DataDir   string `json:"data_dir"`
-	Port      int    `json:"port"`
-}
-
 func apiOwnerMatches(dataDir string, port int, healthDataDirID string) bool {
 	_, ok := matchingAPIOwner(dataDir, port, healthDataDirID)
 	return ok
