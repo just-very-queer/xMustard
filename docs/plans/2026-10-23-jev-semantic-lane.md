@@ -45,7 +45,7 @@ The first version must cap candidate files, declarations, question count, input 
 
 Deepen the existing `search` MCP tool; do not add a tenth tool. Proposed request additions:
 
-- `mode="intent"` runs deterministic candidate generation plus Jev; `mode="hybrid"` keeps current behavior and runs Jev only when an explicit `semantic=true`/configured opt-in is supplied. Existing requests retain their current behavior.
+- `mode="intent"` runs deterministic candidate generation plus Jev; `mode="hybrid"` keeps current behavior and runs Jev only when an explicit `semantic=true`/configured opt-in is supplied. Existing requests retain their current behavior. A per-call `semantic=true` only uses a lane the operator has already enabled and whose egress notice is acknowledged; it can never enable egress by itself, and no MCP argument can name a provider, endpoint, model, key or threshold.
 - A bounded `filters` expression is a JSON AST, not an ad-hoc string parser: `all`, `any`, and `not` compose leaves for `text` (existing indexed BM25), `name` (existing identifier lane), `path_glob`, `lang`, and one typed `intent_question`. Enforce maximum depth 8 and 64 total nodes; reject malformed/unknown operators. `all` is intersection, `any` is union and `not` excludes only the explicitly evaluated candidate universe. `not` never means “the whole repository was proven irrelevant.”
 - Local lexical/path/language predicates execute against the index and are applied before remote classification whenever that is logically equivalent; this reduces both egress and cost. A semantic leaf is an explicit yes/no criterion, e.g. “Does this declaration create, validate, or revoke a workspace registration token?” It is not a free-form request to generate an answer.
 
