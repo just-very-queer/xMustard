@@ -16,6 +16,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -360,7 +361,7 @@ func TestProbeDirectReusesConnectionsAcrossWait(t *testing.T) {
 	}
 }
 
-func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
+func TestRunDaemonStatusDoesNotUseLaterHealthProbeAsDuplicateEvidence(t *testing.T) {
 	e, out, errOut, _, home := lifecycleTest(t, "darwin", nil)
 	platform := daemon.Launchd{UID: 501}
 	spec := platform.Defaults(e.getenv, home)
@@ -375,7 +376,81 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	e.run = func(context.Context, string, ...string) (string, error) {
 		return "state = waiting\n", errors.New("not running")
 	}
+	probeCalls := 0
 	e.probe = func(context.Context, string) (daemon.Health, error) {
+		probeCalls++
+		if probeCalls == 1 {
+			return daemon.Health{}, errors.New("first probe failed")
+		}
+		return daemon.Health{Status: "ok", Service: "api-go"}, nil
+	}
+	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
+		t.Fatalf("status exit = %d: %s", code, errOut)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("health probe calls = %d, want one", probeCalls)
+	}
+	if v := decodeOut(t, out); v["notice"] != nil {
+		t.Fatalf("later healthy probe caused duplicate notice: %v", v["notice"])
+	}
+}
+
+func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		service daemon.Status
+		health  *daemon.Health
+	}{
+		{name: "absent job", service: daemon.Status{Manager: "launchd", State: "not-loaded"}},
+		{name: "stopped job", service: daemon.Status{Manager: "launchd", State: "waiting"}},
+		{name: "healthy API without lock", service: daemon.Status{Manager: "launchd", State: "waiting"}, health: &daemon.Health{Status: "ok", Service: "api-go"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			report := daemon.StatusReport{Service: tc.service, Health: tc.health}
+			got := explainLaunchdDuplicate(report, t.TempDir())
+			if _, wrapped := got.(struct {
+				daemon.StatusReport
+				Notice string `json:"notice"`
+			}); wrapped {
+				t.Fatalf("status without recorded health was rewritten: %#v", got)
+			}
+		})
+	}
+}
+
+func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
+	e, out, errOut, _, home := lifecycleTest(t, "darwin", nil)
+	platform := daemon.Launchd{UID: 501}
+	spec := platform.Defaults(e.getenv, home)
+	if err := os.MkdirAll(spec.UnitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range platform.Files(spec) {
+		if err := os.WriteFile(unit.Path, []byte(unit.Content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(spec.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(filepath.Join(spec.DataDir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = lockFile.Close()
+		t.Fatal(err)
+	}
+	defer func() {
+		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
+		_ = lockFile.Close()
+	}()
+	e.run = func(context.Context, string, ...string) (string, error) {
+		return "state = waiting\n", errors.New("not running")
+	}
+	probeCalls := 0
+	e.probe = func(context.Context, string) (daemon.Health, error) {
+		probeCalls++
 		return daemon.Health{Status: "ok", Service: "api-go"}, nil
 	}
 	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
@@ -385,6 +460,9 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	if v["platform"] != "launchd" || v["label"] != spec.Label || v["api"] != spec.BaseURL() ||
 		v["notice"] != "launchd agent not running because another instance owns the port" {
 		t.Fatalf("status report fields were not preserved: %v", v)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("health probe calls = %d, want one status probe", probeCalls)
 	}
 	if units := v["units"].([]any); len(units) != 1 || units[0] != platform.Files(spec)[0].Path {
 		t.Fatalf("status units were not preserved: %v", v["units"])

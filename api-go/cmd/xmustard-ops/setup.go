@@ -297,14 +297,14 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 	},
 }
 
-func explainLaunchdDuplicate(ctx context.Context, report daemon.StatusReport, base string, probe func(context.Context, string) (daemon.Health, error)) any {
-	if report.Service.Manager == "launchd" && report.Service.PID == 0 && probe != nil {
-		if _, err := probe(ctx, base); err == nil {
-			return struct {
-				daemon.StatusReport
-				Notice string `json:"notice"`
-			}{StatusReport: report, Notice: "launchd agent not running because another instance owns the port"}
-		}
+func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string) any {
+	if report.Service.Manager == "launchd" && report.Service.PID == 0 &&
+		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" &&
+		dataDirLockHeld(dataDir) {
+		return struct {
+			daemon.StatusReport
+			Notice string `json:"notice"`
+		}{StatusReport: report, Notice: "launchd agent not running because another instance owns the port"}
 	}
 	return report
 }
@@ -338,7 +338,7 @@ func runDaemon(e lifecycleEnv, args []string) int {
 	}
 	if args[0] == "status" {
 		if report, ok := out.(daemon.StatusReport); ok {
-			out = explainLaunchdDuplicate(context.Background(), report, report.API, e.probe)
+			out = explainLaunchdDuplicate(report, spec.DataDir)
 		}
 	}
 	return e.emit(out)
