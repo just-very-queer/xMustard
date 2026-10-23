@@ -3,6 +3,8 @@
 package shims
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"syscall"
 	"time"
@@ -38,34 +40,69 @@ type procBSD struct {
 	StartSec, StartUsec                                                             uint64
 }
 
-func readStableRusage(pid int, identify func(int) (Process, error), readUsage func(int) (rusage, error)) (Process, rusage, bool) {
-	var usage rusage
-	identity, stable := stableIdentitySample(pid, os.Getuid(), identify, func() error {
-		var err error
-		usage, err = readUsage(pid)
-		return err
-	})
-	return identity, usage, stable
+func stableRusageSample(pid int, identify func(int) (Process, error), readUsage func(int) (rusage, error)) (Process, rusage, error) {
+	before, err := identify(pid)
+	if err != nil {
+		return Process{}, rusage{}, identitySampleError(pid, err)
+	}
+	if before.UID != os.Getuid() || before.Comm != ProcessName {
+		return Process{}, rusage{}, ErrProcessChanged
+	}
+	usage, readErr := readUsage(pid)
+	if readErr != nil {
+		after, identifyErr := identify(pid)
+		if identifyErr != nil {
+			return Process{}, rusage{}, identitySampleError(pid, identifyErr)
+		}
+		if !sameIdentity(before, after) {
+			return Process{}, rusage{}, ErrProcessChanged
+		}
+		return Process{}, rusage{}, fmt.Errorf("sample stdio shim %d: %w", pid, readErr)
+	}
+	after, err := identify(pid)
+	if err != nil {
+		return Process{}, rusage{}, identitySampleError(pid, err)
+	}
+	if !sameIdentity(before, after) {
+		return Process{}, rusage{}, ErrProcessChanged
+	}
+	return after, usage, nil
 }
 
-func processIdentity(pid int) (Process, error) {
-	var b bsdShort
-	got, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b))
-	if errno != 0 || got != unsafe.Sizeof(b) {
+func identitySampleError(pid int, err error) error {
+	if errors.Is(err, ErrProcessChanged) || errors.Is(err, syscall.ESRCH) || errors.Is(err, syscall.ENOENT) {
+		return ErrProcessChanged
+	}
+	return fmt.Errorf("identify stdio shim %d: %w", pid, err)
+}
+
+func readProcessInfo(pid int, flavor uint32) (Process, error) {
+	if flavor == shortBSDInfo {
+		var info bsdShort
+		got, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), uintptr(flavor), 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
 		if errno != 0 {
 			return Process{}, errno
 		}
-		return Process{}, ErrProcessChanged
+		if got != unsafe.Sizeof(info) || int(info.PID) != pid {
+			return Process{}, ErrProcessChanged
+		}
+		return Process{PID: pid, PPID: int(info.PPID), UID: int(info.UID), Comm: unix.ByteSliceToString(info.Comm[:])}, nil
 	}
 	var info procBSD
-	got, _, errno = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), 3, 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
-	if errno != 0 || got != unsafe.Sizeof(info) {
-		if errno != 0 {
-			return Process{}, errno
-		}
+	got, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), uintptr(flavor), 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
+	if errno != 0 {
+		return Process{}, errno
+	}
+	if got != unsafe.Sizeof(info) || int(info.PID) != pid {
 		return Process{}, ErrProcessChanged
 	}
-	return Process{PID: pid, UID: int(b.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Comm: unix.ByteSliceToString(b.Comm[:])}, nil
+	return Process{PID: pid, PPID: int(info.PPID), UID: int(info.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Comm: unix.ByteSliceToString(info.Comm[:])}, nil
+}
+
+var readBSDProcessInfo = readProcessInfo
+
+func processIdentity(pid int) (Process, error) {
+	return readBSDProcessInfo(pid, 3)
 }
 
 func signalProcess(expected Process) error {
@@ -89,39 +126,47 @@ func listPlatform() ([]Process, error) {
 		}
 		pids = make([]int32, len(pids)*2)
 	}
+	return listDarwinProcesses(pids[:n], readRusage, time.Now)
+}
+
+func readRusage(pid int) (rusage, error) {
+	var usage rusage
+	_, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDRusage, uintptr(pid), rusageV0, 0, uintptr(unsafe.Pointer(&usage)), 0)
+	if errno != 0 {
+		return rusage{}, errno
+	}
+	return usage, nil
+}
+
+func listDarwinProcesses(pids []int32, readUsage func(int) (rusage, error), now func() time.Time) ([]Process, error) {
 	var out []Process
-	for _, raw := range pids[:n] {
+	for _, raw := range pids {
 		if raw <= 0 {
 			continue
 		}
 		pid := int(raw)
-		var b bsdShort
-		got, _, e := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b))
-		if e != 0 || got != unsafe.Sizeof(b) || unix.ByteSliceToString(b.Comm[:]) != ProcessName {
+		short, err := readBSDProcessInfo(pid, shortBSDInfo)
+		if err != nil || short.Comm != ProcessName {
 			continue
 		}
-		var cpuAt time.Time
-		after, r, stable := readStableRusage(pid, processIdentity, func(pid int) (rusage, error) {
-			var usage rusage
-			_, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDRusage, uintptr(pid), rusageV0, 0, uintptr(unsafe.Pointer(&usage)), 0)
-			if errno != 0 {
-				return rusage{}, errno
+		cpuAt := time.Time{}
+		after, usage, sampleErr := stableRusageSample(pid, processIdentity, func(pid int) (rusage, error) {
+			r, err := readUsage(pid)
+			if err == nil {
+				cpuAt = now()
 			}
-			cpuAt = time.Now()
-			return usage, nil
+			return r, err
 		})
-		if !stable {
+		if errors.Is(sampleErr, ErrProcessChanged) {
 			continue
 		}
-		var finalBSD bsdShort
-		got, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&finalBSD)), unsafe.Sizeof(finalBSD))
-		if e != 0 || got != unsafe.Sizeof(finalBSD) || int(finalBSD.UID) != after.UID || unix.ByteSliceToString(finalBSD.Comm[:]) != after.Comm {
-			continue
+		if sampleErr != nil {
+			return nil, sampleErr
 		}
 		start := time.Unix(int64(after.StartTime/1_000_000), int64(after.StartTime%1_000_000)*1000)
-		age := time.Since(start)
-		cpu := time.Duration(r.UserTime + r.SystemTime)
-		out = append(out, Process{PID: pid, PPID: int(finalBSD.PPID), UID: after.UID, StartTime: after.StartTime, Age: age, AgeKnown: true, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUAt: cpuAt, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: after.Comm})
+		age := now().Sub(start)
+		cpu := time.Duration(usage.UserTime + usage.SystemTime)
+		out = append(out, Process{PID: pid, PPID: after.PPID, UID: after.UID, StartTime: after.StartTime, Age: age, AgeKnown: true, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUAt: cpuAt, CPUSeconds: cpu.Seconds(), RSSBytes: int64(usage.Resident), Comm: after.Comm})
 	}
 	return out, nil
 }

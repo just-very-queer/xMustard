@@ -2,30 +2,50 @@ package shims
 
 import (
 	"errors"
-	"os"
 	"reflect"
 	"testing"
 	"time"
 )
 
-func TestIdentitySampleRejectsPIDReuseDuringCPURead(t *testing.T) {
-	original := Process{PID: 42, UID: os.Getuid(), StartTime: 100, Comm: ProcessName}
-	replacement := Process{PID: 42, UID: os.Getuid(), StartTime: 200, Comm: ProcessName}
-	identities := 0
-	var sequence []string
-	got, stable := stableIdentitySample(original.PID, original.UID, func(int) (Process, error) {
-		sequence = append(sequence, "identity")
-		identities++
-		if identities == 1 {
-			return original, nil
+func TestUpdateSlopesResetsBaselineWhenProcessIdentityChangesOrCPUDecreases(t *testing.T) {
+	slopes.Lock()
+	slopes.samples = make(map[int]sample)
+	slopes.Unlock()
+	base := time.Unix(300, 0)
+	first := []Process{{PID: 70005, UID: 501, StartTime: 10, Comm: ProcessName, CPUAt: base}}
+	updateSlopes(first, base)
+	replacement := []Process{{PID: 70005, UID: 501, StartTime: 20, Comm: ProcessName, CPUS: 900 * time.Millisecond, CPUAt: base.Add(time.Second)}}
+	updateSlopes(replacement, base.Add(time.Second))
+	if replacement[0].CPUSlope != 0 || Classify(replacement[0]) != Live {
+		t.Fatalf("replacement inherited old identity slope: %+v", replacement[0])
+	}
+	next := []Process{{PID: 70005, UID: 501, StartTime: 20, Comm: ProcessName, CPUS: 1800 * time.Millisecond, CPUAt: base.Add(2 * time.Second)}}
+	updateSlopes(next, base.Add(2*time.Second))
+	if next[0].CPUSlope < .8 || Classify(next[0]) != Runaway {
+		t.Fatalf("replacement's own runaway slope not detected: %+v", next[0])
+	}
+	reset := []Process{{PID: 70005, UID: 501, StartTime: 20, Comm: ProcessName, CPUS: time.Second, CPUAt: base.Add(3 * time.Second)}}
+	updateSlopes(reset, base.Add(3*time.Second))
+	if reset[0].CPUSlope != 0 || Classify(reset[0]) != Live {
+		t.Fatalf("decreasing counter retained stale slope: %+v", reset[0])
+	}
+}
+
+func TestUpdateSlopesRetainsLastValidSlopeAcrossShortIntervals(t *testing.T) {
+	slopes.Lock()
+	slopes.samples = make(map[int]sample)
+	slopes.Unlock()
+	base := time.Unix(400, 0)
+	first := []Process{{PID: 70006, UID: 501, StartTime: 30, Comm: ProcessName, CPUAt: base}}
+	updateSlopes(first, base)
+	measured := []Process{{PID: 70006, UID: 501, StartTime: 30, Comm: ProcessName, CPUS: 900 * time.Millisecond, CPUAt: base.Add(time.Second)}}
+	updateSlopes(measured, base.Add(time.Second))
+	for i := 1; i <= 3; i++ {
+		short := []Process{{PID: 70006, UID: 501, StartTime: 30, Comm: ProcessName, CPUS: 900 * time.Millisecond, CPUAt: base.Add(time.Second + time.Duration(i)*100*time.Millisecond)}}
+		updateSlopes(short, base.Add(time.Second+time.Duration(i)*100*time.Millisecond))
+		if short[0].CPUSlope < .8 || Classify(short[0]) != Runaway {
+			t.Fatalf("short poll %d discarded valid runaway slope: %+v", i, short[0])
 		}
-		return replacement, nil
-	}, func() error {
-		sequence = append(sequence, "cpu")
-		return nil
-	})
-	if stable || got.PID != 0 || !reflect.DeepEqual(sequence, []string{"identity", "cpu", "identity"}) {
-		t.Fatalf("reused PID CPU sample: stable=%v identity=%+v sequence=%v", stable, got, sequence)
 	}
 }
 
