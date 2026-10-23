@@ -543,6 +543,13 @@ Source: `docs/research/PARITY_REQUIREMENTS_2026-09-25.md` (requirements, process
 
 **Correction.** Critic: per-component budget ledger file, CI fails on overrun; scenarios for queries-during-reindex, snapshot swap under load, 4 agents in 4 worktrees; fixtures are Apache/MIT repos (cline, pi-mono) not GitNexus (PolyForm NC).
 
+**Decision G5.10 (owner, 2026-10-23).** The gate verdict moved from summed ps-RSS to summed PSS of the xMustard-owned tree. The line is unchanged: 100,000,000 bytes (95.4 MiB). Summed ps-RSS counts a page that N processes share N times. On a `ubuntu-latest` runner (Ubuntu 26, THP always), one v1-workload run read 105.1 MiB summed ps-RSS and 79.1 MiB summed PSS.
+- *Sampling.* `rss_bench_v2.py` reads each owned process's PSS from `/proc/<pid>/smaps_rollup` in every 100 ms sample, the same reads as before. An owned process that exited between `ps` and its probe counts its ps-RSS, an upper bound. A live one whose PSS cannot be read makes the run INVALID. The core and relay run from copies private to the run, so no outside process shares their file pages.
+- *Platforms.* macOS has no PSS, so it keeps gating summed ps-RSS, and the report says which metric gated.
+- *Report.* Summed ps-RSS stays in the report, labelled, beside the gate.
+- *Ledger.* The tree check, the design and workstream lines, the tolerances and the reference measurement stay on the ps-RSS basis they were set on. `--workstream` refuses a baseline that was gated on another metric.
+- *Wording above.* From this date, the Goal's "ps-RSS as the gate" and the Acceptance's "≤95.4 MiB ps-RSS" mean summed PSS.
+
 ### WS-11 — Outcome evaluation executor (xmustard-eval)
 
 **Goal.** Build the paired-arm outcome harness that the parity claims require. It reads a task corpus schema and runs arms (baseline, baseline_nomcp, xmustard_mcp, xmustard_mcp_hooks placeholder, xmustard_memory) in a fresh detached worktree per run. Hidden oracles are run by the harness only. Drivers are claude -p stream-json, codex exec --json and pi --mode rpc. Tokens and cost come from each client's final events. It records diff churn and RSS samples via WS-10, and reuses the memory_harness.go statistics (McNemar, bootstrap).
