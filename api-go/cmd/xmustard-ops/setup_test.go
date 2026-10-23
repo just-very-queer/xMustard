@@ -628,11 +628,17 @@ func TestOwnerRecordInspectionDoesNotContendWithAdmission(t *testing.T) {
 		<-releaseInspection
 		return owner.StartTime, "xmustard-api", pid == owner.PID
 	}
-	defer func() { processIdentity = previousIdentity }()
-	defer unblockInspection()
-
 	statusDone := make(chan bool, 1)
-	go func() { statusDone <- apiOwnerMatches(dir, 8042, dataDirID(dir)) }()
+	statusExited := make(chan struct{})
+	go func() {
+		defer close(statusExited)
+		statusDone <- apiOwnerMatches(dir, 8042, dataDirID(dir))
+	}()
+	defer func() {
+		unblockInspection()
+		<-statusExited
+		processIdentity = previousIdentity
+	}()
 	select {
 	case <-inspectionEntered:
 	case <-time.After(time.Second):
