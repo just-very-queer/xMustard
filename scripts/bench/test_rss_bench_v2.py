@@ -10,6 +10,7 @@ XMUSTARD_FIXTURE_CACHE (or a temporary directory) and verifies them by hash.
 
 import collections
 import copy
+import errno
 import http.server
 import json
 import os
@@ -20,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 
@@ -273,8 +275,8 @@ class SamplerMetrics(unittest.TestCase):
         self.assertEqual(r["footprint"]["partial_samples"], 1)
         self.assertIsNone(r["footprint"]["tree_peak_mib"])
         self.assertFalse(r["split_at_gate_peak"]["complete"])
-        # the gate never counts a missing PSS as 0: the exited API counts its ps-RSS; the defunct child has none
-        self.assertEqual((r["gate"]["peak_mib"], r["gate"]["at_peak_by_source_mib"]), (2.0, {"exited": 2.0, "pss": 0.0}))
+        # the gate never counts a missing PSS as 0: the exited API and defunct child count their ps-RSS (zero for the child)
+        self.assertEqual((r["gate"]["peak_mib"], r["gate"]["at_peak_by_source_mib"]), (2.0, {"exited": 2.0}))
         self.assertEqual(s.validity(), [])
 
     def test_zero_samples_is_invalid(self):
@@ -406,7 +408,7 @@ class PssGate(unittest.TestCase):
         self.assertEqual(s.validity(), [])
         self.assertEqual(r["gate"]["peak_mib"], 52.0)
         self.assertEqual(r["gate"]["at_peak_by_source_mib"], {"exited": 40.0, "pss": 12.0})
-        self.assertEqual(r["gate"]["process_samples_by_source"], {"exited": 2, "pss": 4})
+        self.assertEqual(r["gate"]["process_samples_by_source"], {"exited": 3, "pss": 3})
         at_peak = {p["pid"]: p for p in r["processes_at_gate_peak"]}
         self.assertEqual((at_peak[101]["gate_source"], at_peak[101]["gate_bytes"]), ("exited", 30 * MIB))
 
@@ -467,6 +469,37 @@ class PssGate(unittest.TestCase):
             self.assertEqual({k: len(v) for k, v in reads.items() if v and k != "io"}, {}, "every scripted read was made")
         self.assertEqual(s.report()["gate"]["peak_bytes"], 15360 * 1024)
 
+    def test_linux_probe_read_only_treats_missing_process_as_gone(self):
+        with unittest.mock.patch("builtins.open", side_effect=PermissionError(errno.EACCES, "denied")):
+            with self.assertRaises(PermissionError):
+                v2.LinuxProbe._read("/proc/1/smaps_rollup")
+        for error in (FileNotFoundError(errno.ENOENT, "gone"), ProcessLookupError(errno.ESRCH, "gone")):
+            with unittest.mock.patch("builtins.open", side_effect=error):
+                self.assertIsNone(v2.LinuxProbe._read("/proc/1/status"))
+
+    def test_linux_probe_permission_error_is_unreadable_not_exited(self):
+        alive = "Name:\txmustard-api\nState:\tS (sleeping)\nVmRSS:\t20480 kB\n"
+
+        def read(path):
+            if path.endswith("/smaps_rollup"):
+                raise PermissionError(errno.EACCES, "denied")
+            if path.endswith("/status"):
+                return alive
+            return None
+        with unittest.mock.patch.object(v2.LinuxProbe, "_read", side_effect=read):
+            s = v2.SamplerV2([v2.Root("xmustard-api", 4242, "go_daemon", "owned")], REGISTRY, v2.LinuxProbe())
+            s.ingest(1.0, "x", ps((4242, 1, 20480, "xmustard-api")))
+        self.assertEqual(s.report()["gate"]["process_samples_by_source"], {"unreadable": 1})
+        self.assertTrue(any(p.startswith("PSS unreadable") for p in s.validity()), s.validity())
+
+    def test_zero_rss_owned_process_still_gets_a_pss_probe(self):
+        probe = FakeProbe(stats={100: {"resident_bytes": 1}})
+        s = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, probe)
+        s.ingest(1.0, "x", ps((100, 1, 0, "xmustard-api")))
+        self.assertEqual(probe.calls[100], 1)
+        self.assertEqual(s.report()["gate"]["process_samples_by_source"], {"unreadable": 1})
+        self.assertTrue(s.validity())
+
     def test_the_core_runs_from_a_copy_only_this_run_maps(self):
         # PSS divides a file page among every process that maps it: a core another process runs from the same
         # file would make the tree read low
@@ -477,9 +510,63 @@ class PssGate(unittest.TestCase):
             os.chmod(src, 0o755)
             os.makedirs(out)
             dest = v2.private_copy(src, out)
-            self.assertEqual(dest, os.path.join(out, "xmustard-core"))
+            relay_src = os.path.join(d, "relay", "xmustard-core")
+            os.makedirs(os.path.dirname(relay_src))
+            shutil.copy2(src, relay_src)
+            relay = v2.private_copy(relay_src, out, "relay")
+            self.assertNotEqual(dest, relay)
+            self.assertTrue(os.path.isfile(dest) and os.path.isfile(relay))
             self.assertNotEqual(os.stat(dest).st_ino, os.stat(src).st_ino)
             self.assertEqual((v2.sha_file(dest), os.access(dest, os.X_OK)), (v2.sha_file(src), True))
+
+    def test_cmd_run_provenance_uses_the_core_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            api, mcp, source_core = [os.path.join(d, name) for name in ("api", "mcp", "xmustard-core")]
+            for path in (api, mcp, source_core):
+                with open(path, "wb") as f:
+                    f.write(path.encode())
+            seen = {}
+
+            def build(_source_root, bin_dir, _core_bin):
+                os.makedirs(bin_dir)
+                return api, mcp, source_core
+
+            def provenance(_source_root, _api_bin, _mcp_bin, core, _scripts):
+                seen["core"] = core
+                return {"binaries_sha256": {}, "head": None}
+
+            args = types.SimpleNamespace(workstream=None, baseline=None, core_worker=False, ledger="ledger", source_root=d,
+                                         out=os.path.join(d, "out"), fixture_cache=d, core_bin=None, relay_bin=None,
+                                         keep=False, rounds=1, repeat=1, require_parity_claim=False)
+            with unittest.mock.patch.object(v2, "default_probe", return_value=FakeProbe()), \
+                    unittest.mock.patch.object(v2, "load_json", side_effect=[LEDGER, FIXTURES]), \
+                    unittest.mock.patch.object(v2, "select_scenarios", return_value=[]), \
+                    unittest.mock.patch.object(v2, "build_binaries_from", side_effect=build), \
+                    unittest.mock.patch.object(v2, "provenance_for", side_effect=provenance), \
+                    unittest.mock.patch.object(v2, "overall_verdict", return_value="PASS"), \
+                    unittest.mock.patch.object(v2, "parity_claim", return_value={"established": False}), \
+                    unittest.mock.patch.object(v2, "ledger_view", return_value={}), \
+                    unittest.mock.patch.object(v2, "write_reports"), \
+                    unittest.mock.patch.object(v2, "exit_code", return_value=0):
+                self.assertEqual(v2.cmd_run(args), 0)
+            self.assertEqual(os.path.basename(seen["core"]), "core-xmustard-core")
+            self.assertNotEqual(seen["core"], source_core)
+
+    def test_provenance_hashes_private_core_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            api, mcp, src = [os.path.join(d, name) for name in ("api", "mcp", "core")]
+            for path in (api, mcp, src):
+                with open(path, "wb") as f:
+                    f.write(path.encode())
+            os.makedirs(os.path.join(d, "bin"))
+            private = v2.private_copy(src, os.path.join(d, "bin"), "core")
+            with open(src, "wb") as f:
+                f.write(b"changed after copy")
+            result = unittest.mock.Mock(stdout="")
+            with unittest.mock.patch.object(v2, "run", return_value=result):
+                provenance = v2.provenance_for(d, api, mcp, private, [])
+            self.assertEqual(provenance["binaries_sha256"]["xmustard-core"], v2.sha_file(private))
+            self.assertNotEqual(provenance["binaries_sha256"]["xmustard-core"], v2.sha_file(src))
 
 
 class GateVerdict(unittest.TestCase):

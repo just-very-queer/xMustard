@@ -418,18 +418,34 @@ class LinuxProbe:
         try:
             with open(path, "rb") as f:
                 return f.read().decode(errors="replace")
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             return None
 
     def stats(self, pid):
-        status = self._read(f"/proc/{pid}/status")
+        try:
+            status = self._read(f"/proc/{pid}/status")
+        except OSError:
+            return {"resident_bytes": 1}  # ps observed it; inaccessible is not evidence it exited
         if status is None:
             return None
         # smaps_rollup binds the address space at open: an exec between open and read fails it once
-        rollup = self._read(f"/proc/{pid}/smaps_rollup") or self._read(f"/proc/{pid}/smaps_rollup")
+        try:
+            rollup = self._read(f"/proc/{pid}/smaps_rollup") or self._read(f"/proc/{pid}/smaps_rollup")
+        except OSError:
+            rollup = None
         if not rollup:  # its status again tells exited (gone, or a zombie without VmRSS) from alive and unreadable
-            status = self._read(f"/proc/{pid}/status")
-        return None if status is None else linux_stats(status, rollup, self._read(f"/proc/{pid}/io"))
+            try:
+                checked_status = self._read(f"/proc/{pid}/status")
+            except OSError:
+                checked_status = status
+            if checked_status is None:
+                return None
+            status = checked_status
+        try:
+            io = self._read(f"/proc/{pid}/io")
+        except OSError:
+            io = None
+        return linux_stats(status, rollup, io)
 
     def argv1(self, pid):
         raw = self._read(f"/proc/{pid}/cmdline")
@@ -477,7 +493,6 @@ GateInput = collections.namedtuple("GateInput", "pss rss resident")  # bytes; re
 GATE_SOURCES = {  # probe.gate_metric -> first-match rules: (source, bytes) that one owned process adds to the gate
     "pss": (
         (lambda g: g.pss is not None, lambda g: ("pss", g.pss)),
-        (lambda g: g.rss == 0, lambda g: ("pss", 0)),  # PSS <= RSS
         # gone, or a zombie, by its probe: it exited after ps listed it, and its ps-RSS is an upper bound on its PSS
         (lambda g: g.resident is None, lambda g: ("exited", g.rss)),
         (None, lambda g: ("unreadable", g.rss)),  # alive and its PSS unreadable: validity() makes the run INVALID
@@ -2016,11 +2031,12 @@ def resolve_relay(source_root, relay_bin=None):
     return out if p.returncode == 0 and os.path.isfile(out) else None
 
 
-def private_copy(path, out_dir):
+def private_copy(path, out_dir, role=None):
     """A copy of a binary that only this run maps. PSS splits a file page among every
     process that maps it, so a core that another process runs from the same file would
     make the tree read low."""
-    dest = os.path.join(out_dir, os.path.basename(path))
+    name = os.path.basename(path) if role is None else f"{role}-{os.path.basename(path)}"
+    dest = os.path.join(out_dir, name)
     shutil.copy2(path, dest)
     return dest
 
@@ -3086,12 +3102,12 @@ def cmd_run(args):
     bin_dir = os.path.join(work, "bin")
     api_bin, mcp_bin, core_src = build_binaries_from(source_root, bin_dir, args.core_bin)
     relay_src = resolve_relay(source_root, args.relay_bin) if any(SCENARIOS[n].get("transport") == "relay" for n in names) else None
-    core = private_copy(core_src, bin_dir)
-    relay_bin = private_copy(relay_src, bin_dir) if relay_src else None
+    core = private_copy(core_src, bin_dir, "core")
+    relay_bin = private_copy(relay_src, bin_dir, "relay") if relay_src else None
     ctx = {"ledger": ledger, "fixtures": fixtures, "registry": RoleRegistry(ledger["process_roles"]),
            "probe": mem_probe, "api_bin": api_bin, "mcp_bin": mcp_bin, "core": core, "relay_bin": relay_bin,
            "work": work, "cache": cache, "keep": args.keep, "rounds": args.rounds, "core_worker": args.core_worker}
-    ctx["provenance"] = provenance_for(source_root, api_bin, mcp_bin, core_src, SCRIPTS)
+    ctx["provenance"] = provenance_for(source_root, api_bin, mcp_bin, core, SCRIPTS)
     if relay_bin:
         ctx["provenance"]["binaries_sha256"]["xmustard-relay"] = sha_file(relay_bin)
     report = {"schema": 2, "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
