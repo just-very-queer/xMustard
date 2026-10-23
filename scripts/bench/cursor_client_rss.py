@@ -85,12 +85,13 @@ def linkage(path):
     return "dynamic" if PT_INTERP in kinds else "static"
 
 
-def run_traced(runner, binary, base, event, output_file):
+def run_traced(runner, binary, base, event, output_file, reservation=None):
     """One run under exitpeak; peak_kb is the larger of its two readings."""
     env = os.environ.copy()
     env["XMUSTARD_API_BASE"] = base
     env["CURSOR_PROJECT_DIR"] = "/tmp"
     env["XMUSTARD_WORKSPACE_ID"] = "rss-test"
+    env["TMPDIR"] = str(Path(output_file).parent)
     # The event goes in and stdin closes at once: the reading covers the whole run, so
     # nothing has to hold the client open for a sampler.
     try:
@@ -104,15 +105,21 @@ def run_traced(runner, binary, base, event, output_file):
         )
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"{base}: RSS runner exceeded its 15-second bound") from error
+    finally:
+        if reservation is not None:
+            reservation.close()
     if result.returncode != 0:
         raise RuntimeError(f"{base}: RSS runner failed: {result.stdout!r}")
+    leftovers = list(Path(output_file).parent.glob("xmustard-cursor-*.tmp"))
+    if leftovers:
+        raise RuntimeError(f"event spool names survived a completed run: {leftovers}")
     stats = json.loads(result.stdout)
     stats["peak_kb"] = max(stats["exit_hwm_kb"], stats["maxrss_kb"])
     return stats
 
 
-def measure(runner, binary, base, event, output_file, expected_exit, expected_output):
-    stats = run_traced(runner, binary, base, event, output_file)
+def measure(runner, binary, base, event, output_file, expected_exit, expected_output, reservation=None):
+    stats = run_traced(runner, binary, base, event, output_file, reservation)
     if stats["rc"] != expected_exit:
         raise RuntimeError(f"{base}: expected client exit {expected_exit}: {stats}")
     output = Path(output_file).read_bytes()
@@ -122,11 +129,61 @@ def measure(runner, binary, base, event, output_file, expected_exit, expected_ou
     return stats
 
 
+def verify_sigkill_cleanup(binary, directory):
+    import time
+
+    env = os.environ.copy()
+    env["TMPDIR"] = str(directory)
+    env["CURSOR_PROJECT_DIR"] = "/tmp"
+    env["XMUSTARD_WORKSPACE_ID"] = "rss-test"
+    env["XMUSTARD_API_BASE"] = "http://127.0.0.1:1"
+    process = subprocess.Popen(
+        [binary, "postToolUse"], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL, env=env,
+    )
+    try:
+        process.stdin.write(b'{"workspace_roots":["/tmp"],"tool_output":"')
+        process.stdin.flush()
+        deadline = time.monotonic() + 5
+        spool_open = False
+        while time.monotonic() < deadline:
+            fd_dir = Path(f"/proc/{process.pid}/fd")
+            if fd_dir.exists():
+                spool_open = False
+                for entry in fd_dir.iterdir():
+                    try:
+                        target = os.readlink(entry)
+                    except OSError:
+                        continue
+                    if "xmustard-cursor-" in target and "(deleted)" in target:
+                        spool_open = True
+                        break
+                if spool_open:
+                    break
+            if process.poll() is not None:
+                raise RuntimeError("client exited before entering the anonymous-spool read")
+            time.sleep(0.01)
+        if not spool_open:
+            raise RuntimeError("client did not expose its anonymous spool within 5 seconds")
+        process.kill()
+        process.wait(timeout=5)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5)
+        if process.stdin is not None:
+            process.stdin.close()
+    leftovers = list(Path(directory).glob("xmustard-cursor-*.tmp"))
+    if leftovers:
+        raise RuntimeError(f"event spool names survived SIGKILL: {leftovers}")
+    print(json.dumps({"scenario": "sigkill-mid-spool", "exit": process.returncode,
+                      "spool_names_remaining": len(leftovers)}), flush=True)
+
+
 def unavailable_base():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        port = sock.getsockname()[1]
-    return f"http://127.0.0.1:{port}"
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    return f"http://127.0.0.1:{sock.getsockname()[1]}", sock
 
 
 def main():
@@ -145,15 +202,15 @@ def main():
     server_thread = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1}, daemon=True)
     server_thread.start()
     responding = f"http://127.0.0.1:{server.server_port}"
-    unreachable = unavailable_base()
     results = []
     summaries = []
     try:
         with tempfile.TemporaryDirectory(prefix="cursor-rss-") as temp_dir:
             runner = build_runner(temp_dir)
             output_file = str(Path(temp_dir) / "stdout")
+            verify_sigkill_cleanup(binary, temp_dir)
             scenarios = (
-                ("large-unreachable", unreachable, LARGE_EVENT, FAIL_OPEN_EXIT, b""),
+                ("large-unreachable", None, LARGE_EVENT, FAIL_OPEN_EXIT, b""),
                 ("responding-small", responding, EVENT, 0, ANSWER),
                 ("responding-medium", responding, MEDIUM_EVENT, 0, ANSWER),
                 ("responding-large", responding, LARGE_EVENT, 0, ANSWER),
@@ -161,8 +218,12 @@ def main():
             for label, base, event, expected, answer in scenarios:
                 peaks = []
                 for trial in range(TRIALS):
-                    stats = measure(runner, binary, base, event, output_file, expected, answer)
-                    print(f"{label} trial={trial + 1}", json.dumps({"endpoint": base, **stats}), flush=True)
+                    held = None
+                    trial_base = base
+                    if trial_base is None:
+                        trial_base, held = unavailable_base()
+                    stats = measure(runner, binary, trial_base, event, output_file, expected, answer, held)
+                    print(f"{label} trial={trial + 1}", json.dumps({"endpoint": trial_base, **stats}), flush=True)
                     results.append(stats)
                     peaks.append(stats["peak_kb"])
                 summaries.append({"endpoint": label, "trials": len(peaks),

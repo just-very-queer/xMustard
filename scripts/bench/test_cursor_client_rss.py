@@ -67,10 +67,16 @@ class CursorClientRSSValidationTest(unittest.TestCase):
     def test_unreachable_endpoint_is_a_closed_port(self):
         import socket
 
-        base = module.unavailable_base()
+        base, reservation = module.unavailable_base()
         port = int(base.rsplit(":", 1)[1])
-        with socket.socket() as probe:
-            self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+        try:
+            with socket.socket() as probe:
+                self.assertNotEqual(probe.connect_ex(("127.0.0.1", port)), 0)
+            with socket.socket() as contender:
+                with self.assertRaises(OSError):
+                    contender.bind(("127.0.0.1", port))
+        finally:
+            reservation.close()
 
 
 @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("cc"), "needs Linux and a C compiler")

@@ -26,7 +26,7 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -256,46 +256,56 @@ fn parse_base(url: &str) -> Result<(String, u16), String> {
 
 /// Maximum bytes retained for workspace binding, independent of event size.
 const MAX_ROOTS_VALUE: usize = 64 << 10;
+const SPOOL_CREATE_ATTEMPTS: usize = 32;
 static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
-
-/// Removes the temporary spool when input validation or posting returns early.
-struct TempPath(PathBuf);
-
-impl Drop for TempPath {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
-}
 
 struct EventBody {
     file: File,
-    _temp_path: TempPath,
     len: usize,
 }
 
-fn event_file() -> Result<(File, PathBuf), String> {
-    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let path = std::env::temp_dir().join(format!(
-        "xmustard-cursor-{}-{sequence}.tmp",
-        std::process::id()
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).read(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+fn spool_path(directory: &Path, pid: u32, nanos: u128, sequence: u64) -> PathBuf {
+    directory.join(format!("xmustard-cursor-{pid}-{nanos}-{sequence}.tmp"))
+}
+
+fn event_file_in(directory: &Path, pid: u32, nanos: u128, sequence: u64) -> Result<File, String> {
+    for attempt in 0..SPOOL_CREATE_ATTEMPTS {
+        let path = spool_path(directory, pid, nanos, sequence.wrapping_add(attempt as u64));
+        let mut options = OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                if let Err(e) = fs::remove_file(&path) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("unlinking the event spool failed: {e}"));
+                }
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("creating the event spool failed: {e}")),
+        }
     }
-    options
-        .open(&path)
-        .map(|file| (file, path))
-        .map_err(|e| format!("creating the event spool failed: {e}"))
+    Err("creating the event spool failed: too many name collisions".into())
+}
+
+fn event_file() -> Result<File, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("getting the event spool timestamp failed: {e}"))?
+        .as_nanos();
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    event_file_in(&std::env::temp_dir(), std::process::id(), nanos, sequence)
 }
 
 /// Spools stdin in bounded chunks and refuses empty, invalid UTF-8 or oversized events.
 fn read_event(stdin: &mut dyn Read) -> Result<EventBody, String> {
-    let (mut file, path) = event_file()?;
-    let temp_path = TempPath(path);
+    let mut file = event_file()?;
     let mut len = 0usize;
     let mut chunk = [0u8; 8192];
     let mut carry = Vec::with_capacity(4);
@@ -333,11 +343,7 @@ fn read_event(stdin: &mut dyn Read) -> Result<EventBody, String> {
     }
     file.seek(SeekFrom::Start(0))
         .map_err(|e| format!("rewinding the event spool failed: {e}"))?;
-    Ok(EventBody {
-        file,
-        _temp_path: temp_path,
-        len,
-    })
+    Ok(EventBody { file, len })
 }
 
 fn read_json_byte(reader: &mut impl BufRead) -> Result<Option<u8>, String> {
@@ -764,8 +770,7 @@ mod tests {
             String::from("{\"nested\":{\"workspace_roots\":[\"/wrong\"]},\"tool_output\":\"");
         body.push_str(&"x".repeat(80 << 10));
         body.push_str(r#"","workspace_roots":["/repo"]}"#);
-        let (mut file, path) = event_file().expect("create temporary file");
-        let _temp_path = TempPath(path);
+        let mut file = event_file().expect("create anonymous spool");
         file.write_all(body.as_bytes()).expect("write event");
         let payload = read_roots_payload(&mut file).expect("extract roots");
         assert_eq!(
@@ -779,16 +784,14 @@ mod tests {
         let mut body = String::from("{\"workspace_roots\":[\"");
         body.push_str(&"x".repeat(MAX_ROOTS_VALUE));
         body.push_str(r#""]}"#);
-        let (mut file, path) = event_file().expect("create temporary file");
-        let _temp_path = TempPath(path);
+        let mut file = event_file().expect("create anonymous spool");
         file.write_all(body.as_bytes()).expect("write event");
         assert!(read_roots_payload(&mut file).is_err());
     }
 
     #[test]
     fn an_incomplete_workspace_roots_value_is_refused() {
-        let (mut file, path) = event_file().expect("create temporary file");
-        let _temp_path = TempPath(path);
+        let mut file = event_file().expect("create anonymous spool");
         file.write_all(br#"{"workspace_roots":["/repo""#)
             .expect("write event");
         assert!(read_roots_payload(&mut file).is_err());
@@ -801,6 +804,27 @@ mod tests {
             read_event(&mut input).is_err(),
             "Cursor sends JSON, never blanks"
         );
+    }
+
+    #[test]
+    fn a_spool_name_collision_retries_without_replacing_the_existing_file() {
+        let directory = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let pid = std::process::id();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let first = spool_path(&directory, pid, nanos, sequence);
+        fs::write(&first, b"keep me").expect("reserve first candidate");
+        let file = event_file_in(&directory, pid, nanos, sequence).expect("retry collision");
+        assert_eq!(fs::read(&first).expect("read collision file"), b"keep me");
+        assert!(file.metadata().expect("anonymous file metadata").is_file());
+        assert!(
+            !spool_path(&directory, pid, nanos, sequence + 1).exists(),
+            "the successful retry is unlinked immediately"
+        );
+        fs::remove_file(first).expect("remove collision fixture");
     }
 
     #[test]
