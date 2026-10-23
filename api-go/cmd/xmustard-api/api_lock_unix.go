@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"golang.org/x/sys/unix"
 )
@@ -22,7 +21,7 @@ type apiOwner struct {
 	Port      int    `json:"port"`
 }
 
-func lockAPIDataDir(dataDir string) (func(), error) {
+func lockAPIDataDir(dataDir string, port int) (func(), error) {
 	if err := os.MkdirAll(dataDir, 0o755); err != nil {
 		return nil, err
 	}
@@ -49,11 +48,10 @@ func lockAPIDataDir(dataDir string) (func(), error) {
 		_ = f.Close()
 		return nil, fmt.Errorf("read API process start time")
 	}
-	port, err := strconv.Atoi(envDefault("XMUSTARD_API_PORT", "8042"))
-	if err != nil {
+	if port <= 0 || port > 65535 {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		_ = f.Close()
-		return nil, fmt.Errorf("parse API port for owner record: %w", err)
+		return nil, fmt.Errorf("invalid API port for owner record: %d", port)
 	}
 	owner := apiOwner{PID: os.Getpid(), StartTime: start, DataDir: absDataDir, Port: port}
 	if err := writeAPIOwner(filepath.Join(dataDir, "api.owner"), owner); err != nil {

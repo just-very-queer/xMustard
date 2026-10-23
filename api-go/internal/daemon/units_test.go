@@ -127,6 +127,9 @@ func TestLaunchdPlistIsAKeepAliveAgentWithoutCredentials(t *testing.T) {
 	if ka := p["KeepAlive"].(map[string]any); ka["SuccessfulExit"] != false {
 		t.Errorf("KeepAlive = %v: restart after a failure only", ka)
 	}
+	if env["XMUSTARD_LAUNCHD_DUPLICATE_EXIT"] != "1" {
+		t.Errorf("launchd duplicate exit marker = %v, want 1", env["XMUSTARD_LAUNCHD_DUPLICATE_EXIT"])
+	}
 	for k, want := range map[string]string{
 		"XMUSTARD_DATA_DIR": s.DataDir, "XMUSTARD_API_HOST": "127.0.0.1", "XMUSTARD_API_PORT": "18042",
 		"XMUSTARD_LOG_FILE": s.LogFile, "XMUSTARD_CORE_BIN": s.CoreBin, "PATH": s.Path,
@@ -136,8 +139,8 @@ func TestLaunchdPlistIsAKeepAliveAgentWithoutCredentials(t *testing.T) {
 			t.Errorf("env %s = %v, want %q", k, env[k], want)
 		}
 	}
-	if len(env) != 8 {
-		t.Errorf("env has %d variables, want exactly the 8 set: %v", len(env), env)
+	if len(env) != 9 {
+		t.Errorf("env has %d variables, want exactly the 9 set: %v", len(env), env)
 	}
 	if lint, err := exec.LookPath("plutil"); err == nil {
 		path := filepath.Join(t.TempDir(), "agent.plist")

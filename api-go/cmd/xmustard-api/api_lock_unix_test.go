@@ -11,10 +11,29 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func TestLockAPIDataDirRecordsOwnerUntilUnlock(t *testing.T) {
-	t.Setenv("XMUSTARD_API_PORT", "9123")
+func TestLockAPIDataDirRecordsEffectiveListenerPort(t *testing.T) {
 	dir := t.TempDir()
-	unlock, err := lockAPIDataDir(dir)
+	unlock, err := lockAPIDataDir(dir, 49001)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	b, err := os.ReadFile(filepath.Join(dir, "api.owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner apiOwner
+	if err := json.Unmarshal(b, &owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner.Port != 49001 {
+		t.Fatalf("owner port = %d, want effective listener port 49001", owner.Port)
+	}
+}
+
+func TestLockAPIDataDirRecordsOwnerUntilUnlock(t *testing.T) {
+	dir := t.TempDir()
+	unlock, err := lockAPIDataDir(dir, 9123)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -48,7 +67,7 @@ func TestLockAPIDataDirRecordsOwnerUntilUnlock(t *testing.T) {
 	if !ok || owner.PID != os.Getpid() || owner.StartTime != start || owner.DataDir != absDir || owner.Port != 9123 {
 		t.Fatalf("owner record = %+v; process start = %d, want current API identity", owner, start)
 	}
-	otherUnlock, err := lockAPIDataDir(dir)
+	otherUnlock, err := lockAPIDataDir(dir, 9123)
 	if err != errAPIAlreadyRunning {
 		if err == nil {
 			otherUnlock()

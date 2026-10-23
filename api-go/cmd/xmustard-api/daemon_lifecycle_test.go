@@ -18,6 +18,7 @@ import (
 	"testing"
 	"time"
 
+	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -43,7 +44,7 @@ func TestStoreStartLineAdvisesRestoreOnlyOnFault(t *testing.T) {
 	}
 }
 
-func TestDuplicateAPIExecutableExitsSuccessfully(t *testing.T) {
+func TestDuplicateAPIExecutableReturnsDistinctExitStatus(t *testing.T) {
 	dataDir := t.TempDir()
 	owner := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})
 	resp, err := testClient.Get(owner.base + "/api/health")
@@ -57,9 +58,12 @@ func TestDuplicateAPIExecutableExitsSuccessfully(t *testing.T) {
 	}
 	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
 		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": fmt.Sprint(owner.port),
+		"XMUSTARD_LAUNCHD_DUPLICATE_EXIT": "1",
 	})
-	if err := p.wait(t, 10*time.Second); err != nil {
-		t.Fatalf("duplicate API exit = %v, want success: %s", err, p.out)
+	if err := p.wait(t, 10*time.Second); err == nil {
+		t.Fatal("duplicate API exited successfully; want its distinct exit status")
+	} else if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != daemon.DuplicateExitCode {
+		t.Fatalf("duplicate API exit = %v, want status %d: %s", err, daemon.DuplicateExitCode, p.out)
 	}
 	if !strings.Contains(p.out.String(), "another instance owns this data directory; exiting") {
 		t.Fatalf("duplicate API log: %s", p.out)
@@ -169,10 +173,12 @@ func TestSocketActivationServesThePassedSocket(t *testing.T) {
 		t.Fatal(err)
 	}
 	unused := freePort(t)
+	dataDir := t.TempDir()
 	p := startActivated(t, ln, map[string]string{
-		"XMUSTARD_DATA_DIR": t.TempDir(), "XMUSTARD_API_PORT": fmt.Sprint(unused),
+		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": fmt.Sprint(unused),
 	})
 	addr := ln.Addr().String()
+	activatedPort := ln.Addr().(*net.TCPAddr).Port
 	_ = ln.Close() // the parent lets go; the API holds the only copy of the socket
 	deadline := time.Now().Add(15 * time.Second)
 	for {
@@ -189,6 +195,17 @@ func TestSocketActivationServesThePassedSocket(t *testing.T) {
 	}
 	if _, err := probeHealth(fmt.Sprintf("http://127.0.0.1:%d", unused)); err == nil {
 		t.Fatal("the API also bound XMUSTARD_API_PORT")
+	}
+	ownerBytes, err := os.ReadFile(filepath.Join(dataDir, "api.owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner apiOwner
+	if err := json.Unmarshal(ownerBytes, &owner); err != nil {
+		t.Fatal(err)
+	}
+	if owner.Port != activatedPort {
+		t.Fatalf("owner port = %d, want activated listener port %d", owner.Port, activatedPort)
 	}
 	if !strings.Contains(p.out.String(), "socket activation passed "+addr) {
 		t.Fatalf("log does not name the activated socket:\n%s", p.out)

@@ -298,7 +298,9 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 }
 
 func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string, port int) any {
-	if report.Service.Manager == "launchd" && report.Service.PID == 0 &&
+	service := report.Service
+	if service.Manager == "launchd" && service.Loaded && service.PID == 0 &&
+		service.LastExitCode != nil && *service.LastExitCode == daemon.DuplicateExitCode &&
 		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" &&
 		apiOwnerMatches(dataDir, port, report.Health.DataDirID) {
 		return struct {

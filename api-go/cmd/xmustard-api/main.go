@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
@@ -56,10 +57,18 @@ func main() {
 	if err := validateStartup(cfg); err != nil {
 		log.Fatal(err)
 	}
-	unlockDataDir, err := lockAPIDataDir(cfg.dataDir)
+	listenerPort, err := strconv.Atoi(cfg.port)
+	if err != nil {
+		log.Fatalf("invalid API listener port %q: %v", cfg.port, err)
+	}
+	unlockDataDir, err := lockAPIDataDir(cfg.dataDir, listenerPort)
 	if errors.Is(err, errAPIAlreadyRunning) {
 		log.Printf("another instance owns this data directory; exiting")
-		os.Exit(0)
+		exitCode := 0
+		if os.Getenv("XMUSTARD_LAUNCHD_DUPLICATE_EXIT") == "1" {
+			exitCode = daemon.DuplicateExitCode
+		}
+		os.Exit(exitCode)
 	}
 	if err != nil {
 		log.Fatal(err)
