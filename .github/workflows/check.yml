@@ -35,15 +35,32 @@ jobs:
           grep -E 'MemTotal|MemAvailable|AnonHugePages|HugePages_Total' /proc/meminfo
           cat /proc/sys/vm/overcommit_memory
       - run: cd rust-core && cargo build --release
-      - name: "Gate A: default environment"
-        run: make bench-gate BENCH_OUT=bench-out/diag-a BENCH_ARGS="--repeat 2" || true
-      - name: "Gate B: MALLOC_ARENA_MAX=2"
-        run: MALLOC_ARENA_MAX=2 make bench-gate BENCH_OUT=bench-out/diag-b BENCH_ARGS="--repeat 2" || true
-      - name: "Gate C: THP madvise"
-        run: |
-          echo madvise | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
-          make bench-gate BENCH_OUT=bench-out/diag-c BENCH_ARGS="--repeat 2" || true
-      - name: "Gate D: THP never"
+      - name: "Gate D: THP never (baseline for this round)"
         run: |
           echo never | sudo tee /sys/kernel/mm/transparent_hugepage/enabled
           make bench-gate BENCH_OUT=bench-out/diag-d BENCH_ARGS="--repeat 2" || true
+      - name: "Gate E: THP never + glibc trim/mmap thresholds 128 KiB"
+        run: GLIBC_TUNABLES=glibc.malloc.trim_threshold=131072:glibc.malloc.mmap_threshold=131072 make bench-gate BENCH_OUT=bench-out/diag-e BENCH_ARGS="--repeat 2" || true
+      - name: "Gate F: THP never + tunables + MALLOC_ARENA_MAX=1"
+        run: MALLOC_ARENA_MAX=1 GLIBC_TUNABLES=glibc.malloc.trim_threshold=131072:glibc.malloc.mmap_threshold=131072 make bench-gate BENCH_OUT=bench-out/diag-f BENCH_ARGS="--repeat 2" || true
+      - name: Per-process peak breakdown
+        run: |
+          for r in bench-out/diag-*/; do echo "== $r"; find "$r" -name report.json | head -3 | while read f; do python3 - "$f" <<'PY'
+          import json, sys
+          d = json.load(open(sys.argv[1]))
+          def walk(o, path=""):
+              if isinstance(o, dict):
+                  for k, v in o.items():
+                      if any(t in k.lower() for t in ("peak", "rss", "process", "by_role", "breakdown")) and not isinstance(v, (dict, list)):
+                          print(f"{path}/{k} = {v}")
+                      walk(v, f"{path}/{k}")
+              elif isinstance(o, list):
+                  for i, v in enumerate(o[:40]):
+                      walk(v, f"{path}[{i}]")
+          walk(d)
+          PY
+          done; done 2>&1 | head -200
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: diag-rss-reports
+          path: bench-out/
