@@ -59,6 +59,7 @@ const (
 	SearchModeText   = "text"
 	SearchModeExact  = "exact"
 	SearchModeRegex  = "regex"
+	SearchModeIntent = "intent"
 )
 
 // searchModes is the closed set, as one table: §5.1 rule 10 (a closed set gets a table,
@@ -68,6 +69,7 @@ var searchModes = map[string]bool{
 	SearchModeText:   true,
 	SearchModeExact:  true,
 	SearchModeRegex:  true,
+	SearchModeIntent: true,
 }
 
 // IsSearchMode reports whether mode is one this search advertises. The empty string is

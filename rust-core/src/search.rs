@@ -435,6 +435,9 @@ pub enum SearchMode {
     /// The query as a regular expression, matched against the working tree's bytes over
     /// the `regex` crate's linear-time automata (WS-59c, PAR-RET-09).
     Regex,
+    /// Deterministic indexed search with the optional intent lane requested. This build
+    /// has no configured provider, so it preserves deterministic hits and reports why.
+    Intent,
 }
 
 impl SearchMode {
@@ -453,6 +456,7 @@ impl SearchMode {
             SearchMode::Text => Some("text"),
             SearchMode::Exact => Some("exact"),
             SearchMode::Regex => Some("regex"),
+            SearchMode::Intent => Some("intent"),
         }
     }
 
@@ -890,6 +894,11 @@ pub fn search(
     let graph = source.graph.as_ref();
     let mut coverage = source.coverage.clone();
     let mut degradations: Vec<String> = Vec::new();
+    if opts.mode == SearchMode::Intent {
+        // Intent is explicitly opt-in per call. Without a configured provider, return
+        // the ordinary indexed ranking and make the missing lane visible.
+        degradations.push("semantic_unavailable".to_string());
+    }
     // A graph read that fails leaves its lane empty and marks the result's coverage
     // incomplete (`graph_read_error`), so a partial answer never reads as complete.
     let mut read_errors: Vec<(&str, String)> = Vec::new();
@@ -1559,6 +1568,30 @@ mod tests {
         let cfg = crate::index::config::IndexConfig::load(dir.path()).unwrap();
         crate::index::build(dir.path(), &cfg).unwrap();
         dir
+    }
+
+    #[test]
+    fn intent_mode_without_provider_preserves_deterministic_hits_and_degrades() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn refresh_workspace_index() {}\n")]);
+        let regular = hybrid_search(repo.path(), "ws", "refresh workspace", 10, None);
+        let intent = search(
+            repo.path(),
+            "ws",
+            None,
+            "refresh workspace",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                ..Default::default()
+            },
+        );
+        assert_eq!(intent.hits, regular.hits);
+        assert!(
+            intent
+                .degradations
+                .iter()
+                .any(|d| d == "semantic_unavailable")
+        );
     }
 
     #[test]

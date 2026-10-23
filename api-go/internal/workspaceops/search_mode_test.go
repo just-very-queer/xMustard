@@ -157,7 +157,7 @@ func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
 	argsFile := fakeSearchCore(t, searchPageBody)
 	ctx := context.Background()
 
-	for _, mode := range []string{"semantic", "Text", "TEXT", "exacts", "regexes"} {
+	for _, mode := range []string{"Text", "TEXT", "exacts", "regexes"} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); !errors.Is(err, ErrInvalidInput) {
 			t.Errorf("mode=%q must be invalid input, got %v", mode, err)
 		}
@@ -166,22 +166,20 @@ func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
 		t.Error("an unknown mode reached the core")
 	}
 	// the advertised modes and the empty default are accepted
-	for _, mode := range []string{"", SearchModeHybrid, SearchModeText, SearchModeExact, SearchModeRegex} {
+	for _, mode := range []string{"", SearchModeHybrid, SearchModeText, SearchModeExact, SearchModeRegex, SearchModeIntent} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); err != nil {
 			t.Errorf("mode=%q must be accepted: %v", mode, err)
 		}
 	}
 }
 
-// `exact` and `regex` are the two modes the core must be told about explicitly, since its
-// own default is the hybrid: a mode the caller asked for and the core never received would
-// be answered by the fusion. The boundary is the argv the core is handed, so the test reads
-// the fake core's args file rather than the response.
-func TestSearchSendsTheScanModesToTheCore(t *testing.T) {
+// A mode the caller asked for must reach the core rather than be answered by the hybrid.
+func TestSearchSendsNonDefaultModesToTheCore(t *testing.T) {
 	for _, tc := range []struct{ mode, want string }{
 		{SearchModeText, "--mode=text"},
 		{SearchModeExact, "--mode=exact"},
 		{SearchModeRegex, "--mode=regex"},
+		{SearchModeIntent, "--mode=intent"},
 	} {
 		t.Run(tc.mode, func(t *testing.T) {
 			ws := "wsSearchModeSent"

@@ -660,7 +660,7 @@ fn identity_flag(args: Args) -> (Option<String>, Args) {
 
 fn search(args: Args) -> CmdResult {
     let usage = "xmustard-core search [--identity-key=K] [--offset=N] [--path-glob=GLOB] \
-                 [--lang=LANG] [--mode=hybrid|text|exact|regex] [--max-lines=N] [--max-bytes=N] \
+                 [--lang=LANG] [--mode=hybrid|text|exact|regex|intent] [--max-lines=N] [--max-bytes=N] \
                  [--timeout-ms=N] <root> <workspace_id> <query> [limit] [seed]";
     let (key, args) = identity_flag(args);
     // `--name=value` flags lead; the first other argument ends them, so a query or seed
@@ -709,6 +709,7 @@ fn search(args: Args) -> CmdResult {
         Some("text") => SearchMode::Text,
         Some("exact") => SearchMode::Exact,
         Some("regex") => SearchMode::Regex,
+        Some("intent") => SearchMode::Intent,
         Some(other) => {
             return Err(CmdError::new(
                 2,

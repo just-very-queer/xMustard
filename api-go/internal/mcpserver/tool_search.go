@@ -30,7 +30,7 @@ var searchTool = &Tool{
 	Args: []Arg{
 		workspaceArg,
 		{Name: "q", Type: typeString, Required: true, Desc: "the query"},
-		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "exact", "regex", "pattern", "symbol"}, Desc: "hybrid (default); see DocsURI"},
+		{Name: "mode", Type: typeString, Enum: []string{"hybrid", "text", "exact", "regex", "pattern", "symbol", "intent"}, Desc: "see DocsURI"},
 		{Name: "lang", Type: typeString, MaxLen: 256, Desc: "pattern: ast-grep hint; else a filter"},
 		{Name: "seed", Type: typeString, Desc: "proximity seed"},
 		{Name: "limit", Type: typeInteger, Min: 1, Max: maxSearchLimit, Desc: "max hits"},
@@ -107,7 +107,7 @@ const modesDoc = "### modes\n\n`hybrid` (default) fuses six lanes. `text` is the
 	"not its path or its declared names. `exact` and `regex` do not rank at all — they match " +
 	"`q` against the working tree's bytes and report one `spans` entry per occurrence " +
 	"(`path`, `line`, `column`, `byte`, `len`); two occurrences on one line are two spans. " +
-	"`pattern` is an ast-grep structural query and `symbol` is a name path.\n\n" +
+	"`pattern` is an ast-grep structural query and `symbol` is a name path. `intent` requests the opt-in intent lane; this fixture-only build reports `semantic_unavailable`.\n\n" +
 	"`lang` is ast-grep's own language under `mode=pattern` and a file-language filter under " +
 	"`hybrid`, `text`, `exact` and `regex`; it is not a filter under `mode=symbol`. Trigram " +
 	"tolerance in `hybrid` is typo tolerance, not meaning: it matches spellings, not intent."

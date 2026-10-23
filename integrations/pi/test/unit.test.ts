@@ -119,7 +119,7 @@ describe("tool specs mirror the MCP server", () => {
 			properties: {
 				workspace_id: { type: "string", description: "workspace id; auto-resolved if omitted" },
 				q: { type: "string", description: "the query" },
-				mode: { type: "string", description: "hybrid (default); see DocsURI", enum: ["hybrid", "text", "exact", "regex", "pattern", "symbol"] },
+				mode: { type: "string", description: "see DocsURI", enum: ["hybrid", "text", "exact", "regex", "pattern", "symbol", "intent"] },
 				lang: { type: "string", description: "pattern: ast-grep hint; else a filter", maxLength: 256 },
 				seed: { type: "string", description: "proximity seed" },
 				limit: { type: "integer", description: "max hits", minimum: 1, maximum: 50 },
