@@ -497,6 +497,52 @@ func TestRootsEntriesWithoutAURIAreAskedAgain(t *testing.T) {
 	}
 }
 
+// A reader cannot register the client's unregistered root, but the separately
+// authorized working-directory signal can still resolve an existing workspace.
+func TestRegistrationAuthRefusalFallsBackToRegisteredCwd(t *testing.T) {
+	clientRoot, cwd := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{
+		workspaces: []registeredWorkspace{{ID: "cwd-ws", Root: cwd}},
+		handle: func(r Request) *APIResponse {
+			if r.Method == "POST" && r.Path == "/api/workspaces/load" {
+				return &APIResponse{Status: http.StatusForbidden, Body: `{"reason":"missing_role","missing_role":"proposer"}`}
+			}
+			return nil
+		},
+	}
+	client := &rootsClient{roots: []string{clientRoot}}
+	s := newSession(t, api, Options{Cwd: cwd, AutoRegister: true}, client, "2026-06-18")
+	res, err := call(t, s, "ground", map[string]any{})
+	if err != nil || res["isError"] != false {
+		t.Fatalf("workspace resolution: err=%v result=%v", err, res)
+	}
+	if ws := wsOf(t, res); ws.ID != "cwd-ws" || ws.Source != SourceCWD {
+		t.Fatalf("resolved %+v, want registered cwd workspace", ws)
+	}
+}
+
+func TestRegistrationAuthenticationFailureRemainsTerminal(t *testing.T) {
+	clientRoot, cwd := tempRepo(t), tempRepo(t)
+	api := &fakeAPI{
+		workspaces: []registeredWorkspace{{ID: "cwd-ws", Root: cwd}},
+		handle: func(r Request) *APIResponse {
+			if r.Method == "POST" && r.Path == "/api/workspaces/load" {
+				return &APIResponse{Status: http.StatusUnauthorized, Body: `{"error":"authentication required"}`}
+			}
+			return nil
+		},
+	}
+	client := &rootsClient{roots: []string{clientRoot}}
+	s := newSession(t, api, Options{Cwd: cwd, AutoRegister: true}, client, "2026-06-18")
+	res, err := call(t, s, "ground", map[string]any{})
+	if err != nil || res["isError"] != true || !strings.Contains(text(res), "grounding is unavailable") {
+		t.Fatalf("authentication refusal fell through to cwd: err=%v result=%v", err, res)
+	}
+	if n := api.count("GET", "/api/workspaces"); n != 1 {
+		t.Fatalf("authentication refusal continued resolution (%d workspace listings)", n)
+	}
+}
+
 // clip never splits a UTF-8 sequence, so a cached error stays valid text.
 func TestClipKeepsValidUTF8(t *testing.T) {
 	for _, n := range []int{1, 2, 3, 4, 5} {

@@ -43,7 +43,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request waits for a refusing API to come back (a daemon restart).
 const RESTART_GRACE: Duration = Duration::from_secs(10);
 const THREAD_STACK: usize = 256 << 10;
-const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate. For a file-backed principal, rotate it with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. For an XMUSTARD_AUTH_TOKENS principal, an operator must run `xmustard-api mint-token <id> <role>`, replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new token, then restart the API. Rotating a same-ID file record does not replace or revoke the environment token.";
+const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate. For a file-backed principal, rotate it with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. For an XMUSTARD_AUTH_TOKENS principal, run `xmustard-api generate-token` (it does not modify the token store), replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new secret, then restart the API. Removing the environment entry revokes that credential; an existing same-ID file record remains unchanged.";
 const PRESENCE_ONLY_MESSAGE: &str = "xMustard grounding is unavailable: this token is presence-only and is accepted only when typed at the xmustard-ops prompt. Do not rotate or export it as XMUSTARD_API_TOKEN; use a separate agent-readable bearer principal.";
 const ROLE_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this principal lacks the required role. Use a suitably authorized principal; rotation preserves roles and cannot fix this refusal.";
 const SCOPE_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this principal is not scoped to the requested workspace. Use a principal authorized for that workspace; rotation preserves workspace scope and cannot fix this refusal.";
@@ -376,7 +376,7 @@ fn deliver(r: &mut Response, out: &Output, id: Option<&str>) {
         emit(out, &body);
     } else if let (Some(id), true) = (id, r.status >= 300) {
         let message = match r.status {
-            401 => AUTH_FAILURE_MESSAGE,
+            401 => auth_refusal_message(&body).unwrap_or(AUTH_FAILURE_MESSAGE),
             403 => auth_refusal_message(&body).unwrap_or(POLICY_FAILURE_MESSAGE),
             status => {
                 return emit(
@@ -804,7 +804,7 @@ mod tests {
                 ROLE_FAILURE_MESSAGE,
             ),
             (
-                403,
+                401,
                 r#"{"reason":"presence_only_token"}"#,
                 PRESENCE_ONLY_MESSAGE,
             ),

@@ -48,6 +48,20 @@ func main() {
 		fmt.Println(raw)
 		return
 	}
+	// Generate a secret for an environment-backed principal without touching the token store.
+	if len(os.Args) > 1 && os.Args[1] == "generate-token" {
+		if len(os.Args) != 2 {
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api generate-token")
+			os.Exit(2)
+		}
+		raw, err := workspaceops.GenerateToken()
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(raw)
+		return
+	}
 	// `xmustard-api mint-token <id> [role]` mints a bearer token (local file access,
 	// no server needed) — the bootstrap path for the first admin token.
 	if len(os.Args) > 1 && os.Args[1] == "mint-token" {
@@ -566,7 +580,7 @@ func writeOverloaded(w http.ResponseWriter) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": budget.ErrOverloaded.Error(), "overloaded": true})
 }
 
-const mcpAuthFailureMessage = "xMustard grounding is unavailable: this client could not authenticate. For a file-backed principal, rotate it with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. For an XMUSTARD_AUTH_TOKENS principal, an operator must run `xmustard-api mint-token <id> <role>`, replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new token, then restart the API. Rotating a same-ID file record does not replace or revoke the environment token. Role and workspace-scope refusals require a suitably authorized principal; rotation cannot fix them."
+const mcpAuthFailureMessage = "xMustard grounding is unavailable: this client could not authenticate. For a file-backed principal, rotate it with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. For an XMUSTARD_AUTH_TOKENS principal, run `xmustard-api generate-token` (it does not modify the token store), replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new secret, then restart the API. Removing the environment entry revokes that credential; an existing same-ID file record remains unchanged. Role and workspace-scope refusals require a suitably authorized principal; rotation cannot fix them."
 const mcpPresenceOnlyMessage = "xMustard grounding is unavailable: this token is presence-only and is accepted only when typed at the xmustard-ops prompt. Do not rotate or export it as XMUSTARD_API_TOKEN; use a separate agent-readable bearer principal."
 
 func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {

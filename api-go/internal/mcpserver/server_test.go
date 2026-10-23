@@ -1389,7 +1389,7 @@ func TestAuthFailureGuidancePreservesPrincipalTypesAndAuthorization(t *testing.T
 		t.Fatalf("scope refusal lacks specific guidance: %s", scope)
 	}
 	env := authFailureMessage(http.StatusUnauthorized, `{"error":"authentication required"}`)
-	if !strings.Contains(env, "XMUSTARD_AUTH_TOKENS") || !strings.Contains(env, "mint-token <id> <role>") || !strings.Contains(env, "id:role:token") || !strings.Contains(env, "restart the API") || !strings.Contains(env, "does not replace or revoke the environment token") {
+	if !strings.Contains(env, "XMUSTARD_AUTH_TOKENS") || !strings.Contains(env, "generate-token") || !strings.Contains(env, "does not modify the token store") || !strings.Contains(env, "id:role:token") || !strings.Contains(env, "restart the API") || !strings.Contains(env, "existing same-ID file record remains unchanged") {
 		t.Fatalf("env-backed credential recovery is underspecified: %s", env)
 	}
 }

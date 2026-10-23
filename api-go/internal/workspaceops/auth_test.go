@@ -2,6 +2,7 @@ package workspaceops
 
 import (
 	"os"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -9,6 +10,43 @@ import (
 	"time"
 )
 
+func TestGenerateTokenDoesNotCreateOrOverwritePrincipal(t *testing.T) {
+	t.Setenv("XMUSTARD_AUTH_TOKENS", "")
+	dir := t.TempDir()
+	fileToken, err := MintIdentityToken(dir, "same-id", "reader", 3600, []string{"workspace-a"}, TokenIdentity{Owner: "owner-a", Kind: PrincipalAgent})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := loadTokenRecords(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	envToken, err := GenerateToken()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if envToken == fileToken || !strings.HasPrefix(envToken, "xmt_") {
+		t.Fatalf("unexpected generated secret")
+	}
+	// Following the recovery guidance only updates XMUSTARD_AUTH_TOKENS. Removing
+	// that entry leaves no persisted credential for it, and leaves same-ID claims intact.
+	t.Setenv("XMUSTARD_AUTH_TOKENS", "same-id:reader:"+envToken)
+	if p := ResolveToken(dir, envToken); p == nil || p.ID != "same-id" {
+		t.Fatalf("generated environment secret did not authenticate before removal: %+v", p)
+	}
+	t.Setenv("XMUSTARD_AUTH_TOKENS", "")
+	if ResolveToken(dir, envToken) != nil {
+		t.Fatal("generated environment secret unexpectedly authenticates after removal")
+	}
+	after, err := loadTokenRecords(dir)
+	if err != nil || len(after) != 1 || len(before) != 1 || !reflect.DeepEqual(after[0], before[0]) {
+		t.Fatalf("secret generation changed same-ID record: before=%+v after=%+v err=%v", before, after, err)
+	}
+	p := ResolveToken(dir, fileToken)
+	if p == nil || p.Role != "reader" || p.Owner != "owner-a" || len(p.Workspaces) != 1 || p.Workspaces[0] != "workspace-a" {
+		t.Fatalf("same-ID file principal claims changed: %+v", p)
+	}
+}
 func TestMintResolveRevokeToken(t *testing.T) {
 	dir := t.TempDir()
 	if HasAuthConfigured(dir) {

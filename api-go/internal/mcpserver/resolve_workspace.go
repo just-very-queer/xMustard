@@ -180,13 +180,20 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	return Workspace{}, errors.New(msg)
 }
 
+// registrationRefusalError marks a 403 tied to one path signal; another signal may work.
+type registrationRefusalError struct{ *authRefusalError }
+
 // fatalError aborts resolution instead of falling through to the next signal
-// (admission refusal, cancellation).
+// (admission refusal, cancellation, authentication, or workspace listing).
 type fatalError struct{ error }
 
 func (e fatalError) Unwrap() error { return e.error }
 
 func isFatal(err error) bool {
+	var registrationRefusal *registrationRefusalError
+	if errors.As(err, &registrationRefusal) {
+		return false
+	}
 	var f fatalError
 	var authErr *authRefusalError
 	return errors.As(err, &f) || errors.As(err, &authErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
@@ -276,7 +283,13 @@ func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string
 		return ancestor(fmt.Errorf("git repository %s is not registered (auto-registration is off: XMUSTARD_MCP_AUTO_REGISTER=0)", repo))
 	}
 	if err := s.register(ctx, repo); err != nil {
-		return ancestor(err)
+		var authErr *authRefusalError
+		if !errors.As(err, &authErr) || authErr.status != http.StatusForbidden {
+			return ancestor(err)
+		}
+		// A registration refusal is specific to this signal: another registered
+		// workspace may still be independently selected by a later path signal.
+		return Workspace{}, &registrationRefusalError{authErr}
 	}
 	list, _, err := s.listWorkspaces(ctx, true)
 	if err != nil {

@@ -367,6 +367,15 @@ func MintToken(dataDir, id, role string) (string, error) {
 	return MintTokenTTL(dataDir, id, role, 0)
 }
 
+// GenerateToken returns a random bearer secret without creating or modifying a principal.
+func GenerateToken() (string, error) {
+	buf := make([]byte, 32)
+	if _, err := rand.Read(buf); err != nil {
+		return "", err
+	}
+	return "xmt_" + base64.RawURLEncoding.EncodeToString(buf), nil
+}
+
 // RotateTokenPreservingClaims replaces the secret for an existing principal without
 // changing its role, workspace scope, identity, or lifetime policy. Expiring tokens
 // receive the same lifetime from rotation time; malformed lifetime metadata fails closed.
@@ -478,11 +487,10 @@ func MintIdentityToken(dataDir, id, role string, ttlSeconds int, workspaces []st
 
 // mintTokenLocked does the load-modify-write; the caller MUST hold lockTokenStore.
 func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []string, ident TokenIdentity) (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
+	raw, err := GenerateToken()
+	if err != nil {
 		return "", err
 	}
-	raw := "xmt_" + base64.RawURLEncoding.EncodeToString(buf)
 	recs, err := loadTokenRecords(dataDir)
 	if err != nil {
 		return "", err
