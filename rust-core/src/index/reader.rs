@@ -342,56 +342,66 @@ impl Snapshot {
                     // query share. `query_row` on `meta` is the first statement, so the
                     // snapshot is taken there; a concurrent build cannot move it afterwards.
                     conn.execute_batch("BEGIN DEFERRED")?;
-                    let read_generation: String = conn.query_row(
-                        "SELECT value FROM meta WHERE key = 'generation'",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    if read_generation != self.generation.to_string() {
-                        // Roll the read transaction back before refusing: leaving it open on a
-                        // shared text connection would pin the store view for the next reader
-                        // of this snapshot, and the refusal is an answer, not a retry.
+                    let result = (|| {
+                        let read_generation: String = conn.query_row(
+                            "SELECT value FROM meta WHERE key = 'generation'",
+                            [],
+                            |r| r.get(0),
+                        )?;
+                        if read_generation != self.generation.to_string() {
+                            return Ok(Err(format!(
+                                "store generation {read_generation} does not match the snapshot's {}",
+                                self.generation
+                            )));
+                        }
+                        // The segment holds a SUBSET of the store's symbols — a file the
+                        // retention envelope skipped has no segment row — so a symbol's
+                        // position in a plain `SELECT ... ORDER BY id` is NOT its dense segment
+                        // index: the first gap shifts every later flag onto the wrong symbol,
+                        // which changes PAR-SYM-09's ×2 exported doubling and with it every
+                        // score. The segment's dense order is the store's symbols over the
+                        // segment's ADMITTED files, ordered by id (see `csr::load`, which fills
+                        // `seg_syms` with exactly that ORDER BY), so the flags are read with the
+                        // same restriction and the same ordering rather than consumed positionally.
+                        let statuses = super::csr::indexed_status_list();
+                        let mut out = vec![false; self.seg.counts().symbols as usize];
+                        // The same predicate and the same ordering the loader used for
+                        // `seg_files`/`seg_syms` (`csr::load_dense_tables`): the files whose
+                        // `parse_status` is indexed, and their symbols in id order. Reading the
+                        // flags through that restriction is what keeps a segment slot and a
+                        // store row in step.
+                        let mut st = conn.prepare(&format!(
+                            "SELECT s.exported FROM symbols s
+                             JOIN files f ON f.id = s.file_id
+                             WHERE f.parse_status IN ({statuses})
+                             ORDER BY s.id"
+                        ))?;
+                        let mut rows = st.query([])?;
+                        let mut i = 0usize;
+                        let mut surplus = false;
+                        while let Some(row) = rows.next()? {
+                            if let Some(slot) = out.get_mut(i) {
+                                *slot = row.get(0)?;
+                            } else {
+                                surplus = true;
+                            }
+                            i += 1;
+                        }
+                        drop(rows);
+                        drop(st);
+                        if surplus || i != out.len() {
+                            return Ok(Err(format!(
+                                "exported flags: store has {i} rows, segment {} symbols",
+                                out.len()
+                            )));
+                        }
+                        conn.execute_batch("COMMIT")?;
+                        Ok(Ok(out))
+                    })();
+                    if !matches!(&result, Ok(Ok(_))) {
                         let _ = conn.execute_batch("ROLLBACK");
-                        return Ok(Err(format!(
-                            "store generation {read_generation} does not match the snapshot's {}",
-                            self.generation
-                        )));
                     }
-                    // The segment holds a SUBSET of the store's symbols — a file the
-                    // retention envelope skipped has no segment row — so a symbol's
-                    // position in a plain `SELECT ... ORDER BY id` is NOT its dense segment
-                    // index: the first gap shifts every later flag onto the wrong symbol,
-                    // which changes PAR-SYM-09's ×2 exported doubling and with it every
-                    // score. The segment's dense order is the store's symbols over the
-                    // segment's ADMITTED files, ordered by id (see `csr::load`, which fills
-                    // `seg_syms` with exactly that ORDER BY), so the flags are read with the
-                    // same restriction and the same ordering rather than consumed positionally.
-                    let statuses = super::csr::indexed_status_list();
-                    let mut out = vec![false; self.seg.counts().symbols as usize];
-                    // The same predicate and the same ordering the loader used for
-                    // `seg_files`/`seg_syms` (`csr::load_dense_tables`): the files whose
-                    // `parse_status` is indexed, and their symbols in id order. Reading the
-                    // flags through that restriction is what keeps a segment slot and a
-                    // store row in step.
-                    let mut st = conn.prepare(&format!(
-                        "SELECT s.exported FROM symbols s
-                         JOIN files f ON f.id = s.file_id
-                         WHERE f.parse_status IN ({statuses})
-                         ORDER BY s.id"
-                    ))?;
-                    let mut rows = st.query([])?;
-                    let mut i = 0usize;
-                    while let Some(row) = rows.next()? {
-                        let Some(slot) = out.get_mut(i) else { break };
-                        *slot = row.get(0)?;
-                        i += 1;
-                    }
-                    // The prepared statement is dropped before the COMMIT: SQLite refuses to
-                    // commit while a statement is still stepping.
-                    drop(rows);
-                    drop(st);
-                    conn.execute_batch("COMMIT")?;
-                    Ok(Ok(out))
+                    result
                 })
                 .and_then(|inner| inner)
             })

@@ -1021,7 +1021,8 @@ fn a_flow_explores_at_most_four_siblings_per_node() {
 /// That is a real property of the answer, and it is the one worth pinning — a reader who
 /// wants to know why a large repository's flows look narrow should find it here rather than
 /// infer it. It is also what made mutation row M7 equivalent: with no walk over 50 steps
-/// here, swapping `label_of(&all_steps, …)` for `label_of(&steps, …)` cannot change a label.
+/// here, computing the name stem from every visited step or from the listed steps cannot
+/// change a label.
 #[test]
 fn the_widest_walk_a_seed_makes_stops_short_of_the_listing_cap_when_the_seed_cap_bites() {
     let mut src =
@@ -1987,6 +1988,58 @@ fn the_exported_flag_reaches_its_own_symbol_across_a_skipped_file() {
 // --- WS-38c-b: the six decided findings --------------------------------------
 
 #[test]
+fn a_single_walk_larger_than_the_retention_cap_keeps_its_seed_flow() {
+    let mut level = vec!["RunAll".to_string()];
+    let mut definitions = Vec::new();
+    let mut next_id = 0;
+    for _ in 0..7 {
+        let mut next = Vec::new();
+        for parent in level {
+            let children: Vec<String> = (0..4)
+                .map(|_| {
+                    let name = format!("Node{next_id}");
+                    next_id += 1;
+                    name
+                })
+                .collect();
+            next.extend(children.iter().cloned());
+            definitions.push((parent, children));
+        }
+        level = next;
+    }
+    definitions.extend(level.into_iter().map(|leaf| (leaf, Vec::new())));
+    let contents: Vec<(String, String)> = definitions
+        .chunks(1_000)
+        .enumerate()
+        .map(|(chunk, defs)| {
+            let mut src = String::from("package pkg\n\n");
+            for (name, children) in defs {
+                let calls = children
+                    .iter()
+                    .map(|child| format!("{child}();"))
+                    .collect::<String>();
+                src.push_str(&format!("func {name}() {{ {calls} }}\n"));
+            }
+            (format!("pkg/tree{chunk:02}.go"), src)
+        })
+        .collect();
+    let mut files = vec![GO_MOD];
+    for (path, content) in &contents {
+        files.push((path.as_str(), content.as_str()));
+    }
+    let d = repo(&files);
+    build(d.path());
+    let answer = flows(d.path(), &[]);
+    let run_flow = read_flows(&answer)
+        .into_iter()
+        .find(|flow| flow.seeds.iter().any(|seed| seed == "RunAll"));
+    assert!(
+        run_flow.is_some(),
+        "the 21,845-symbol walk still yields its highest-ranked seed flow: {answer:#}"
+    );
+}
+
+#[test]
 fn retained_branching_walks_stay_under_the_process_tree_line() {
     let mut files = vec![GO_MOD];
     let mut contents = Vec::new();
@@ -2035,15 +2088,18 @@ fn retained_branching_walks_stay_under_the_process_tree_line() {
     assert!(status.success(), "index flows exited with {status}");
     let answer: Value = serde_json::from_slice(&fs::read(output.path()).unwrap()).unwrap();
     assert_eq!(answer["caps"]["max_retained_steps"], MAX_RETAINED_STEPS);
-    assert!(
-        answer["truncation"]["dropped_retained"]
-            .as_u64()
-            .unwrap_or(0)
-            > 0,
-        "the branching fixture must exceed the retained-step cap: {answer:#}"
-    );
     let mib = memprobe::mib(peak);
     eprintln!("retained branching walks: wait4 ru_maxrss {mib:.1} MiB");
+    let retained_listed = answer["flows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|flow| flow["steps"].as_array().unwrap().len() as u64)
+        .sum::<u64>();
+    assert!(
+        retained_listed <= MAX_RETAINED_STEPS,
+        "the retained step rows fit the published global cap: {answer:#}"
+    );
     assert!(
         mib <= 95.4,
         "process-tree RSS {mib:.1} MiB exceeds 95.4 MiB"
@@ -2211,6 +2267,48 @@ fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
         v["truncated"].as_bool(),
         Some(t.values().any(|n| *n > 0)),
         "the flag is the OR of the counters beside it: {t:?}"
+    );
+}
+
+#[test]
+fn a_callee_file_cut_by_branching_marks_the_answer_stale() {
+    let files = [
+        GO_MOD,
+        (
+            "pkg/seed.go",
+            "package pkg\n\nfunc Seed() { A(); B(); C(); D(); E(); F() }\n",
+        ),
+        ("pkg/a.go", "package pkg\n\nfunc A() {}\n"),
+        ("pkg/b.go", "package pkg\n\nfunc B() {}\n"),
+        ("pkg/c.go", "package pkg\n\nfunc C() {}\n"),
+        ("pkg/d.go", "package pkg\n\nfunc D() {}\n"),
+        ("pkg/e.go", "package pkg\n\nfunc E() {}\n"),
+        ("pkg/f.go", "package pkg\n\nfunc F() {}\n"),
+    ];
+    let d = repo(&files);
+    build(d.path());
+    let before = flows(d.path(), &[]);
+    assert!(
+        read_seeds(&before).iter().any(|seed| seed.name == "Seed"),
+        "the six-callee entry point is scored: {before:#}"
+    );
+    let seed_flow = read_flows(&before)
+        .into_iter()
+        .find(|flow| flow.seeds.iter().any(|seed| seed == "Seed"))
+        .unwrap_or_else(|| panic!("{before:#}"));
+    assert!(
+        !seed_flow.steps.iter().any(|(_, path)| path == "pkg/f.go"),
+        "the branching cap cuts off F's file: {:?}",
+        seed_flow.steps
+    );
+    write(d.path(), "pkg/f.go", "package pkg\n\nfunc RenamedF() {}\n");
+    let after = flows(d.path(), &[]);
+    let dirty = after["freshness"]["dirty_paths_touching_result"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{after:#}"));
+    assert!(
+        dirty.iter().any(|path| path == "pkg/f.go"),
+        "the file of a callee excluded by the branching cap shapes Seed's score: {dirty:?}"
     );
 }
 
