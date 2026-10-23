@@ -182,9 +182,11 @@ The full posture is in [SECURITY](SECURITY.md).
 ## Footprint
 
 - **Release gate.** Budget gate v2 (`--suite ci`) passed on the v0.1.1 release tree on
-  a Linux x86_64 build box, with the release core and relay: process-tree peaks of
-  66.6 MiB for the frozen v1 workload over the stdio shim and 60.8 MiB for two agents
-  through `xmustard-relay`, against a 95.4 MiB line
+  a Linux x86_64 build box, with the release core and relay: summed ps-RSS process-tree
+  peaks of 66.6 MiB for the frozen v1 workload over the stdio shim and 60.8 MiB for two
+  agents through `xmustard-relay` (summed PSS 49.3 and 46.5 MiB), against a 95.4 MiB
+  line. ps-RSS was the gate metric then; since owner decision G5.10 (2026-10-23) the gate
+  is summed PSS, with summed ps-RSS reported beside it
   ([release notes](releases/v0.1.1.md#measured-on-the-release-tree-linux-x86_64-build-box)).
   v0.1.0's release commit measured 70.5 and 68.8 MiB.
 - **Not yet at parity scale.** The parity-scale suite (4 agents, 2 hot repositories,

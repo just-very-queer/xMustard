@@ -7,20 +7,41 @@ scratch repositories and data roots. None of them talks to a model provider.
 |---|---|---|
 | Retrieval | `make bench-retrieval` (`retrieval-gate.sh`) | 12/12 gold queries and 10/10 spans in the top 5, gold-path MRR@5 1.0, 6/6 body-term queries, cold, warm and after a one-file edit (thresholds in `gold/queries.json`, WS-18) |
 | Budget v1 (frozen at `6411f391`) | `rss.sh` | sampled tree peak ≤ 100,000,000 bytes on the 501-file workload |
-| Budget v2 | `make bench-gate` (CI suite), `make bench-parity` (parity-scale suite) | ps-RSS of the xMustard-owned tree ≤ 95.4 MiB on a valid, complete workload |
+| Budget v2 | `make bench-gate` (CI suite), `make bench-parity` (parity-scale suite) | summed PSS of the xMustard-owned tree ≤ 95.4 MiB on a valid, complete workload (summed ps-RSS where the platform has no PSS) |
 | Gate v2 unit tests | `make bench-test` | stdlib `unittest`, no binaries needed |
 | Streaming-runtime baseline (WS-RT1, box only) | `rt_fixtures.sh <dir> nested t100k t1m u200k`, then `rt_baseline.sh <dir> <out> <case>...` | not a gate: records wall time, peak RSS and the core's `pass_counters` per call, and the API's `core_passes` growth per API call |
 
 ## Budget gate v2 (`rss_bench_v2.py`)
 
-The gate metric is unchanged from v1: one `ps` snapshot every 100 ms, RSS summed over the
-xMustard-owned tree, limit 1e8 bytes (95.4 MiB). A run that lost a root, had a `ps`
-error, skipped a step or failed a workload check is **INVALID**, never PASS. So is a run
-whose sampler raised, whose sampler thread ended before the workload, or whose last
-sample is more than 5 s older than the end of the workload.
+The gate is summed PSS of the xMustard-owned tree, limit 1e8 bytes (95.4 MiB). Every
+100 ms one `ps` snapshot, v1's call, finds and attributes the processes, and
+`/proc/<pid>/smaps_rollup` gives each owned process's PSS.
+
+Until 2026-10-23 the gate was summed ps-RSS, v1's metric. That day the owner moved it to
+PSS (decision G5.10) and kept the line. ps-RSS counts a page that N processes share N
+times: on a `ubuntu-latest` runner (Ubuntu 26, THP always), one v1-workload run read
+105.1 MiB summed ps-RSS and 79.1 MiB summed PSS. Summed ps-RSS is still reported beside
+the gate, labelled.
+
+- An owned process that exited between `ps` and its probe counts its ps-RSS, an upper
+  bound on its PSS. The report counts these.
+- A live owned process whose PSS cannot be read makes the run **INVALID**.
+- macOS has no PSS, so the gate there stays summed ps-RSS, which is never below PSS. The
+  report's `gate_metric` and every label say which metric gated.
+- The run executes the core and the relay from copies in its own work directory. PSS
+  splits a file page among every process that maps it, so a core that another process
+  runs from the same file would make the tree read low.
+- PSS still counts private anonymous memory in full, so transparent huge pages still
+  inflate it.
+
+A run that lost a root, had a `ps` error, skipped a step or failed a workload check is
+**INVALID**, never PASS. So is a run whose sampler raised, whose sampler thread ended
+before the workload, or whose last sample is more than 5 s older than the end of the
+workload.
 
 Reported beside the gate, per process and per component:
 
+- summed ps-RSS of the owned tree, with its peak step, and RSS per component;
 - footprint: `phys_footprint` on macOS, PSS and USS on Linux;
 - anon versus file-backed resident memory at the tree peak (Linux `RssAnon/RssFile/RssShmem`,
   macOS `TASK_VM_INFO` internal/external); both sum to the RSS `ps` reports;
@@ -36,8 +57,8 @@ compilers, tests, shells, agent CLIs) and their descendants are reported on thei
 lines and never counted, except xMustard binaries: a hook client, shim, relay or core
 found below an agent or any external process counts toward the gate again, with its own
 descendants. Unknown children of owned processes count as owned. A child still running its
-parent's image (forked, not yet exec'd) counts as `fork_pre_exec`: ps-RSS counts its
-copy-on-write pages a second time, which footprint does not.
+parent's image (forked, not yet exec'd) counts as `fork_pre_exec`: summed ps-RSS counts its
+copy-on-write pages a second time, while PSS, and so the gate, counts them once.
 
 Scenarios (`--scenarios a,b` or `--suite ci|parity`):
 
@@ -64,7 +85,10 @@ Scenarios (`--scenarios a,b` or `--suite ci|parity`):
   core worker (`XMUSTARD_CORE_WORKER=1`). The resident index service and the watcher
   (WS-15) live in that worker, so `watcher-on` runs only with it, and the
   `rust_index_service` line has a process to measure only with it. The report records
-  `core_worker`, and `--workstream` refuses a `--baseline` measured the other way.
+  `core_worker`, and `--workstream` refuses a `--baseline` measured the other way. It
+  likewise refuses a `--baseline` gated on another metric. A report without
+  `gate_metric` is from before G5.10, so it gated ps-RSS. `ledger --head --baseline`
+  refuses the same mix.
 
 Feature markers are on only by `feature_on_rule` in `parity_fixtures.json`: a scalar that
 is not null, false, 0 or an off word, or an object with an `enabled`, `state` or `status`
@@ -113,7 +137,9 @@ line. The lines of workstreams already merged into the measured revision
 again. With `--workstream WS-NN` (on `run` with `--baseline`, or on `ledger` with
 `--head` and `--baseline`), each common scenario is checked:
 
-- tree: owned gate-peak delta ≤ line + 10 MiB; the owned+external peak delta must meet the
+- tree: owned summed ps-RSS peak delta ≤ line + 10 MiB. This check stays on ps-RSS, the
+  basis its lines and tolerance were set on; a report from before G5.10 has only its gate
+  peak, which was ps-RSS. The owned+external peak delta must meet the
   same allowance, and a negative delta counts only net of external growth (moving work
   into an external process is never a saving). A peak delta is the smaller of the median
   delta and the max delta over the valid repeats: these peaks are bimodal (on Linux the
@@ -154,7 +180,8 @@ repeats each) over the CI suite plus the workstream's designated scenarios
 (`rss_v2.sh ci-plan --branch REF`, which takes the workstream from a branch path segment
 starting `ws-NN`). What blocks the pull request (`gate_blocking` in the report):
 
-- a CI-suite scenario's own gate verdict: any repeat over 95.4 MiB, or an invalid run;
+- a CI-suite scenario's own gate verdict: any repeat whose summed PSS is over 95.4 MiB, or
+  an invalid run;
 - a designated scenario outside the CI suite only on a regression beyond noise: the base's
   median gate peak was within the gate, the head's is over it, and the peak delta (the
   smaller of the median and max deltas) is over `tolerance.tree_peak_mib` (10 MiB).
@@ -187,10 +214,13 @@ or `feat/parity-v2` as of 2026-09-25) could only be met by an admin bypass.
 
 `reference_measurement` was measured on Linux (a shared 6-core Ubuntu box, not a GitHub
 runner) by the budget-gate job's own commands: the base run of a pull request from
-`parity/ws-10` into `feat/parity-v2` at `c3603a2`, with RSS and PSS p50 per process. The
-tolerances were measured on a loaded M1 (darwin, where footprint is `phys_footprint`);
-the Linux observations are in `tolerance.basis`. Replace both with data from the first CI
-runs before relying on the design and cumulative bounds there.
+`parity/ws-10` into `feat/parity-v2` at `c3603a2`, with RSS and PSS p50 per process. Its
+`gate_peak_mib` (69.1) is a summed ps-RSS gate peak from before G5.10; `footprint_peak_mib`
+(54.9) is the summed PSS peak. The tolerances were measured on a loaded M1 (darwin, where
+footprint is `phys_footprint`); the Linux observations are in `tolerance.basis`. The
+10 MiB tree tolerance was set on ps-RSS peaks before G5.10 and is not recalibrated on PSS,
+yet the regression rule now applies it to PSS medians. Replace both with data from the
+first CI runs before relying on the design and cumulative bounds there.
 
 ### First CI run (owner or orchestrator)
 

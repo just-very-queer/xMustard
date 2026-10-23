@@ -58,9 +58,10 @@ Prebuilt binaries for macOS arm64 and Linux x86_64 are on the
   paths and docs with identifier and typo-tolerant matching. Hits come back as `path:line` with
   snippets and the reasons they ranked. 15 tree-sitter grammars cover Go, Rust, TypeScript, TSX,
   JavaScript, Python, Java, C, C++, C#, Ruby, PHP, Kotlin, Swift and Bash.
-- **Light enough to leave running.** Two agents on the relay peaked at 60.8 MiB for the whole
-  process tree on the v0.1.1 release tree (Linux x86_64), with the resident worker off. The
-  relay itself uses about 2 MiB per agent on macOS arm64 and up to 3 MiB on Linux.
+- **Light enough to leave running.** Two agents on the relay peaked at 60.8 MiB summed ps-RSS
+  (46.5 MiB PSS) for the whole process tree on the v0.1.1 release tree (Linux x86_64), with
+  the resident worker off. The relay itself uses about 2 MiB per agent on macOS arm64 and up
+  to 3 MiB on Linux.
 - **Failures explained and remembered.** `why_failed` reads a run, a pasted log or an evidence
   handle, points at the error lines, and records the failure so the next `ground` lists it.
 - **Hooks that shrink what the agent reads.** In Claude Code, the plugin replaces a large Bash,

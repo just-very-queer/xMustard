@@ -8,7 +8,9 @@ that v2 reproduces v1; XMUSTARD_FIXTURE_TEST=1 fetches the pinned parity fixture
 XMUSTARD_FIXTURE_CACHE (or a temporary directory) and verifies them by hash.
 """
 
+import collections
 import copy
+import errno
 import http.server
 import json
 import os
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import threading
 import time
+import types
 import unittest
 import unittest.mock
 
@@ -39,6 +42,7 @@ LEDGER = dict(REAL_LEDGER, reference_measurement=TEST_REFERENCE)
 FIXTURES = v2.load_json(v2.FIXTURES_PATH)
 REGISTRY = v2.RoleRegistry(LEDGER["process_roles"])
 HARNESS_PID = 900
+MIB = 2**20
 
 
 def ps(*rows):
@@ -47,13 +51,19 @@ def ps(*rows):
 
 
 class FakeProbe:
+    """footprint_bytes is PSS on the default pss basis. A pid without stats exited before its
+    probe; stats with resident_bytes and no footprint_bytes are a live process whose PSS
+    could not be read."""
     name = "fake"
     basis = {"footprint": "fake footprint", "split": "fake split", "process_peak": "fake peak", "io": "fake io"}
 
-    def __init__(self, stats=None, argv=None):
+    def __init__(self, stats=None, argv=None, gate_metric="pss"):
         self._stats, self._argv = stats or {}, argv or {}
+        self.gate_metric = gate_metric
+        self.calls = collections.Counter()
 
     def stats(self, pid):
+        self.calls[pid] += 1
         return self._stats.get(pid)
 
     def argv1(self, pid):
@@ -92,7 +102,7 @@ class ParseAndAttribution(unittest.TestCase):
         self.assertEqual(rows[105][:2], ("rust_core_per_call", "owned"))  # exited-but-unreaped macOS process
         self.assertEqual(rows[HARNESS_PID][1], "agent")
         tot = v2.snapshot_totals(procs, rows)
-        self.assertEqual(tot["gate_kib"], 20000 + 9000 + 15000 + 4000 + 3000 + 1000 + 22000)
+        self.assertEqual(tot["owned_kib"], 20000 + 9000 + 15000 + 4000 + 3000 + 1000 + 22000)
         self.assertEqual(tot["agents_kib"], {"bench-harness": 30000})
 
     def test_externals_are_separate_and_inherit_downward(self):
@@ -106,7 +116,7 @@ class ParseAndAttribution(unittest.TestCase):
         self.assertEqual(rows[113][:2], ("runner_command", "external"))  # below an external stays external
         self.assertEqual(rows[114][:2], ("lsp_server", "external"))  # Linux 15-byte comm truncation
         tot = v2.snapshot_totals(procs, rows)
-        self.assertEqual(tot["gate_kib"], 20000)
+        self.assertEqual(tot["owned_kib"], 20000)
         self.assertEqual(tot["tree_all_kib"], 20000 + 1000 + 50000 + 70000 + 3000 + 80000)
         self.assertEqual(tot["externals_kib"], {"runner_command": 54000, "lsp_server": 150000})
 
@@ -120,7 +130,7 @@ class ParseAndAttribution(unittest.TestCase):
         self.assertEqual(rows[302][:2], ("git_child", "owned"))
         for pid in (300, 303, 500):
             self.assertNotIn(pid, rows)
-        self.assertEqual(v2.snapshot_totals(procs, rows)["gate_kib"], 20000 + 2000 + 900)
+        self.assertEqual(v2.snapshot_totals(procs, rows)["owned_kib"], 20000 + 2000 + 900)
 
     def test_xmustard_binaries_below_an_external_count_again(self):
         # daemon -> agent CLI run by the runner -> shim and hook client; daemon -> sh -> core
@@ -136,7 +146,7 @@ class ParseAndAttribution(unittest.TestCase):
         self.assertEqual(rows[121][:2], ("rust_core_per_call", "owned"))
         self.assertEqual(rows[122][:2], ("runner_command", "external"))  # an external below it is external again
         tot = v2.snapshot_totals(procs, rows)
-        self.assertEqual(tot["gate_kib"], 20000 + 12000 + 9000 + 700 + 15000)
+        self.assertEqual(tot["owned_kib"], 20000 + 12000 + 9000 + 700 + 15000)
         self.assertEqual(tot["externals_kib"], {"runner_command": 50000 + 1000 + 4000})
 
     def test_forked_child_before_exec_is_named_and_counted(self):
@@ -144,7 +154,7 @@ class ParseAndAttribution(unittest.TestCase):
         _, rows = v2.attribute(procs, children, roots(shims=(), agent=None), REGISTRY)
         self.assertEqual(rows[101][:2], ("fork_pre_exec", "owned"))
         tot = v2.snapshot_totals(procs, rows)
-        self.assertEqual((tot["gate_kib"], tot["components_kib"]["go_daemon"]), (59000, 30000))
+        self.assertEqual((tot["owned_kib"], tot["components_kib"]["go_daemon"]), (59000, 30000))
 
     def test_missing_root_is_reported(self):
         procs, children = v2.parse_ps(ps((100, 1, 20000, "xmustard-api")))
@@ -153,7 +163,7 @@ class ParseAndAttribution(unittest.TestCase):
 
 
 class V1Equivalence(unittest.TestCase):
-    """v2's gate total is v1's total on the same snapshots (no externals present)."""
+    """v2's summed ps-RSS is v1's total on the same snapshots (no externals present)."""
 
     SNAPSHOTS = [
         ps((1, 0, 5, "launchd"), (100, 1, 20000, "xmustard-api"), (200, 1, 9000, "xmustard-mcp"), (201, 1, 9100, "xmustard-mcp")),
@@ -182,9 +192,11 @@ class V1Equivalence(unittest.TestCase):
             v1.subprocess.run = real_run
             v1.CURRENT_STEP[0] = "setup"
         o, n = old.report(), new.report()
-        self.assertEqual(o["peak_bytes"], n["gate"]["peak_bytes"])
+        self.assertEqual(o["peak_bytes"], n["rss"]["peak_bytes"])
         self.assertEqual(round(o["peak_bytes"] / 2**20, 1), n["tree_all_peak_mib"])
-        self.assertEqual(o["peak_step"], n["gate"]["peak_step"])
+        self.assertEqual(o["peak_step"], n["rss"]["peak_step"])
+        # no PSS was read (every process exited before its probe), so each counted its ps-RSS: here the gate is v1's number
+        self.assertEqual((n["gate"]["peak_bytes"], n["gate"]["peak_step"]), (o["peak_bytes"], o["peak_step"]))
         self.assertEqual(o["samples"], n["samples"])
         self.assertEqual(o["lost_root_count"], n["lost_root_count"])
         self.assertEqual(o["ps_error_count"], n["ps_error_count"])
@@ -233,8 +245,9 @@ class SamplerMetrics(unittest.TestCase):
         s.ingest(1.1, "work", ps((100, 1, 20480, "xmustard-api"), (101, 100, 12288, "xmustard-core"), (110, 100, 81920, "gopls")))
         s.ingest(1.2, "idle", ps((100, 1, 18432, "xmustard-api")))
         r = s.report()
-        self.assertEqual(r["gate"]["peak_mib"], 32.0)  # 20 + 12; the 80 MiB LSP server is external
+        self.assertEqual((r["gate"]["peak_mib"], r["gate"]["basis"]), (16.0, "pss"))  # PSS 12 + 4; the 80 MiB LSP server is external
         self.assertEqual(r["gate"]["peak_step"], "work")
+        self.assertEqual((r["rss"]["peak_mib"], r["rss"]["peak_step"], r["gate"]["rss_at_peak_mib"]), (32.0, "work", 32.0))  # 20 + 12
         self.assertEqual(r["tree_all_peak_mib"], 112.0)
         self.assertEqual(r["footprint"]["tree_peak_mib"], 16.0)
         self.assertEqual(r["split_at_gate_peak"]["anon_mib"], 24.0)
@@ -249,7 +262,9 @@ class SamplerMetrics(unittest.TestCase):
         self.assertEqual((d["footprint_p50_mib"], r["components"]["rust_core_per_call"]["footprint_p50_mib"]), (12.0, 0.0))
         c = r["components"]["rust_core_per_call"]
         self.assertEqual((c["peak_mib"], c["p50_mib"], c["at_gate_peak_mib"], c["processes_seen"]), (12.0, 0.0, 12.0, 1))
+        self.assertEqual(c["at_gate_peak_footprint_mib"], 4.0)
         self.assertEqual({p["pid"] for p in r["processes_at_gate_peak"]}, {100, 101, 110})
+        self.assertEqual({p["pid"]: p.get("gate_bytes") for p in r["processes_at_gate_peak"]}, {100: 12 * MIB, 101: 4 * MIB, 110: None})
         self.assertEqual(s.validity(), [])
 
     def test_missing_probe_data_marks_footprint_partial(self):
@@ -260,6 +275,9 @@ class SamplerMetrics(unittest.TestCase):
         self.assertEqual(r["footprint"]["partial_samples"], 1)
         self.assertIsNone(r["footprint"]["tree_peak_mib"])
         self.assertFalse(r["split_at_gate_peak"]["complete"])
+        # the gate never counts a missing PSS as 0: the exited API and defunct child count their ps-RSS (zero for the child)
+        self.assertEqual((r["gate"]["peak_mib"], r["gate"]["at_peak_by_source_mib"]), (2.0, {"exited": 2.0}))
+        self.assertEqual(s.validity(), [])
 
     def test_zero_samples_is_invalid(self):
         s = v2.SamplerV2(roots(), REGISTRY, FakeProbe())
@@ -332,6 +350,239 @@ class SamplerMetrics(unittest.TestCase):
             os.remove(f.name)
 
 
+class PssGate(unittest.TestCase):
+    """Owner decision G5.10 (2026-10-23): the verdict is summed PSS of the owned tree against
+    the same 100,000,000-byte line; summed ps-RSS is reported beside it."""
+
+    SHIMS = [(200, 1, 2048, "xmustard-mcp"), (201, 1, 2048, "xmustard-mcp")]
+
+    def sample(self, rows, stats, metric="pss"):
+        s = v2.SamplerV2(roots(shims=(200, 201), agent=None), REGISTRY, FakeProbe(stats=stats, gate_metric=metric))
+        s.ingest(1.0, "work", ps(*rows))
+        return s
+
+    def test_rss_over_the_line_with_pss_under_it_passes(self):
+        # the THP=always runner of 2026-10-23: summed ps-RSS 105.1 MiB, PSS 79.1 MiB
+        rows = [(100, 1, 30720, "xmustard-api"), (200, 1, 13312, "xmustard-mcp"), (201, 1, 13312, "xmustard-mcp"),
+                (101, 100, 24576, "xmustard-core"), (102, 100, 25702, "xmustard-core")]
+        pss = {100: 28.0, 200: 8.0, 201: 8.0, 101: 18.0, 102: 17.1}
+        s = self.sample(rows, {pid: {"footprint_bytes": int(m * MIB)} for pid, m in pss.items()})
+        r = s.report()
+        gate = v2.evaluate_gate(r, s.validity())
+        self.assertEqual((gate["verdict"], gate["peak_mib"]), ("PASS", 79.1))
+        self.assertEqual((r["rss"]["peak_mib"], r["gate"]["peak_mib"]), (105.1, 79.1))
+        self.assertGreater(r["rss"]["peak_bytes"], v2.GATE_BYTES)
+        self.assertEqual((gate["metric"], r["gate"]["basis"]), ("pss", "pss"))
+        self.assertTrue(r["gate"]["metric"].startswith("PSS"), r["gate"]["metric"])
+        self.assertTrue(r["rss"]["metric"].startswith("ps-RSS"), r["rss"]["metric"])
+
+    def test_a_pss_sum_over_the_line_fails(self):
+        rows = [(100, 1, 71680, "xmustard-api"), (200, 1, 51200, "xmustard-mcp"), (201, 1, 2048, "xmustard-mcp")]  # 120 MiB ps-RSS
+        for total, verdict in ((v2.GATE_BYTES, "PASS"), (v2.GATE_BYTES + 1, "FAIL")):
+            s = self.sample(rows, {100: {"footprint_bytes": 60_000_000}, 200: {"footprint_bytes": total - 61_000_000},
+                                   201: {"footprint_bytes": 1_000_000}})
+            r = s.report()
+            self.assertEqual(r["gate"]["peak_bytes"], total)
+            self.assertEqual(v2.evaluate_gate(r, s.validity())["verdict"], verdict)
+
+    def test_a_missing_pss_reading_is_invalid(self):
+        # alive (its status still maps memory) and its smaps_rollup gave no Pss: the gate cannot be read
+        rows = [(100, 1, 20480, "xmustard-api")] + self.SHIMS
+        s = self.sample(rows, {100: {"resident_bytes": 20 * MIB, "anon_bytes": 15 * MIB, "file_bytes": 5 * MIB},
+                               200: {"footprint_bytes": MIB}, 201: {"footprint_bytes": MIB}})
+        r = s.report()
+        gate = v2.evaluate_gate(r, s.validity())
+        self.assertEqual((gate["verdict"], gate["passed"]), ("INVALID", False))  # 22 MiB, far under the line: still not a PASS
+        self.assertTrue(any(p.startswith("PSS unreadable") for p in s.validity()), s.validity())
+        self.assertEqual(r["gate"]["process_samples_by_source"], {"pss": 2, "unreadable": 1})
+        self.assertEqual(r["gate"]["unreadable"][0]["pid"], 100)
+
+    def test_an_owned_process_that_exited_before_its_probe_counts_its_rss(self):
+        # ps listed the cores, then they exited (no /proc entry, or a zombie whose status maps nothing) before their
+        # probe: each counts its ps-RSS, an upper bound on its PSS; counting 0 would read low
+        rows = [(100, 1, 20480, "xmustard-api")] + self.SHIMS + [
+            (101, 100, 30720, "xmustard-core"), (102, 100, 10240, "xmustard-core"), (103, 100, 0, "git")]
+        s = self.sample(rows, {100: {"footprint_bytes": 10 * MIB}, 200: {"footprint_bytes": MIB}, 201: {"footprint_bytes": MIB},
+                               102: {"hwm_bytes": 12 * MIB}})  # 101 gone, 102 a zombie, 103 at RSS 0
+        r = s.report()
+        self.assertEqual(s.validity(), [])
+        self.assertEqual(r["gate"]["peak_mib"], 52.0)
+        self.assertEqual(r["gate"]["at_peak_by_source_mib"], {"exited": 40.0, "pss": 12.0})
+        self.assertEqual(r["gate"]["process_samples_by_source"], {"exited": 3, "pss": 3})
+        at_peak = {p["pid"]: p for p in r["processes_at_gate_peak"]}
+        self.assertEqual((at_peak[101]["gate_source"], at_peak[101]["gate_bytes"]), ("exited", 30 * MIB))
+
+    def test_the_gate_peak_is_the_pss_peak_sample(self):
+        probe = FakeProbe(stats={100: {"footprint_bytes": 20 * MIB, "anon_bytes": 10 * MIB, "file_bytes": 50 * MIB},
+                                 101: {"footprint_bytes": 10 * MIB, "anon_bytes": 5 * MIB, "file_bytes": 25 * MIB}})
+        s = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, probe)
+        s.ingest(1.0, "index", ps((100, 1, 61440, "xmustard-api"), (101, 100, 30720, "xmustard-core")))  # ps-RSS 90, PSS 30
+        probe._stats[100] = {"footprint_bytes": 45 * MIB, "anon_bytes": 40 * MIB, "file_bytes": 10 * MIB}
+        s.ingest(1.1, "query", ps((100, 1, 51200, "xmustard-api")))  # ps-RSS 50, PSS 45
+        r = s.report()
+        self.assertEqual((r["gate"]["peak_mib"], r["gate"]["peak_step"], r["gate"]["rss_at_peak_mib"]), (45.0, "query", 50.0))
+        self.assertEqual((r["rss"]["peak_mib"], r["rss"]["peak_step"]), (90.0, "index"))
+        # the detail is the gated sample's
+        self.assertEqual({p["pid"] for p in r["processes_at_gate_peak"]}, {100})
+        self.assertEqual((r["split_at_gate_peak"]["anon_mib"], r["split_at_gate_peak"]["file_mib"]), (40.0, 10.0))
+        d, c = r["components"]["go_daemon"], r["components"]["rust_core_per_call"]
+        self.assertEqual((d["at_gate_peak_mib"], d["at_gate_peak_footprint_mib"], c["at_gate_peak_mib"]), (50.0, 45.0, 0.0))
+        self.assertEqual((r["step_gate_peak_mib"], r["step_rss_peak_mib"]), ({"index": 30.0, "query": 45.0}, {"index": 90.0, "query": 50.0}))
+
+    def test_a_platform_without_pss_gates_rss(self):
+        # macOS has no PSS (phys_footprint is another metric): summed ps-RSS, never below PSS, stays its gate
+        self.assertEqual((v2.LinuxProbe.gate_metric, v2.DarwinProbe.gate_metric, v2.NullProbe.gate_metric), ("pss", "rss", "rss"))
+        rows = [(100, 1, 20480, "xmustard-api"), (200, 1, 13312, "xmustard-mcp"), (201, 1, 13312, "xmustard-mcp")]
+        s = self.sample(rows, {100: {"footprint_bytes": 12 * MIB, "resident_bytes": 20 * MIB}}, metric="rss")
+        r = s.report()
+        self.assertEqual((r["gate"]["basis"], r["gate"]["peak_mib"], r["rss"]["peak_mib"]), ("rss", 46.0, 46.0))
+        self.assertTrue(r["gate"]["metric"].startswith("ps-RSS"), r["gate"]["metric"])
+        self.assertEqual(s.validity(), [])
+        self.assertEqual(v2.evaluate_gate(r, [])["metric"], "rss")
+
+    def test_one_probe_read_per_process_per_sample(self):
+        # the gate adds arithmetic, not reads: each attributed process is probed once per 100 ms sample, as before
+        probe = FakeProbe(stats={100: {"footprint_bytes": MIB}})
+        s = v2.SamplerV2(roots(shims=(), agent=HARNESS_PID), REGISTRY, probe)
+        snap = ps((HARNESS_PID, 1, 30000, "python3"), (100, HARNESS_PID, 20480, "xmustard-api"), (101, 100, 4096, "xmustard-core"),
+                  (110, 100, 8192, "gopls"))
+        for i in range(3):
+            s.ingest(1.0 + i / 10, "x", snap)
+        self.assertEqual(dict(probe.calls), {HARNESS_PID: 3, 100: 3, 101: 3, 110: 3})
+
+    def test_linux_probe_tells_an_exited_process_from_an_unreadable_one(self):
+        # smaps_rollup gave nothing twice: the probe reads the status again. Gone, or a zombie without VmRSS: it
+        # exited after ps listed it (its ps-RSS counts). Still mapping memory: its PSS is unreadable, the run INVALID.
+        # Once only: an exec between open and read; the second read sees the new image.
+        alive = "Name:\txmustard-api\nState:\tS (sleeping)\nVmRSS:\t   20480 kB\nRssAnon:\t   15360 kB\nRssFile:\t    5120 kB\n"
+        zombie = "Name:\txmustard-api\nState:\tZ (zombie)\n"
+        rollup = "Rss:              20480 kB\nPss:              15360 kB\n"
+        for status, rollups, source in (([alive, None], [None, None], "exited"), ([alive, zombie], [None, None], "exited"),
+                                        ([alive, alive], [None, None], "unreadable"), ([alive], [None, rollup], "pss")):
+            reads = {"status": status, "smaps_rollup": rollups, "io": [None]}
+            fake = unittest.mock.Mock(side_effect=lambda path: reads[os.path.basename(path)].pop(0))
+            with unittest.mock.patch.object(v2.LinuxProbe, "_read", fake):
+                s = v2.SamplerV2([v2.Root("xmustard-api", 4242, "go_daemon", "owned")], REGISTRY, v2.LinuxProbe())
+                s.ingest(1.0, "x", ps((4242, 1, 20480, "xmustard-api")))
+            self.assertEqual(s.report()["gate"]["process_samples_by_source"], {source: 1}, (status, rollups))
+            self.assertEqual(s.validity() == [], source != "unreadable", s.validity())
+            self.assertEqual({k: len(v) for k, v in reads.items() if v and k != "io"}, {}, "every scripted read was made")
+        self.assertEqual(s.report()["gate"]["peak_bytes"], 15360 * 1024)
+
+    def test_linux_probe_read_only_treats_missing_process_as_gone(self):
+        with unittest.mock.patch("builtins.open", side_effect=PermissionError(errno.EACCES, "denied")):
+            with self.assertRaises(PermissionError):
+                v2.LinuxProbe._read("/proc/1/smaps_rollup")
+        for error in (FileNotFoundError(errno.ENOENT, "gone"), ProcessLookupError(errno.ESRCH, "gone")):
+            with unittest.mock.patch("builtins.open", side_effect=error):
+                self.assertIsNone(v2.LinuxProbe._read("/proc/1/status"))
+
+    def test_linux_probe_permission_error_is_unreadable_not_exited(self):
+        alive = "Name:\txmustard-api\nState:\tS (sleeping)\nVmRSS:\t20480 kB\n"
+
+        def read(path):
+            if path.endswith("/smaps_rollup"):
+                raise PermissionError(errno.EACCES, "denied")
+            if path.endswith("/status"):
+                return alive
+            return None
+        with unittest.mock.patch.object(v2.LinuxProbe, "_read", side_effect=read):
+            s = v2.SamplerV2([v2.Root("xmustard-api", 4242, "go_daemon", "owned")], REGISTRY, v2.LinuxProbe())
+            s.ingest(1.0, "x", ps((4242, 1, 20480, "xmustard-api")))
+        self.assertEqual(s.report()["gate"]["process_samples_by_source"], {"unreadable": 1})
+        self.assertTrue(any(p.startswith("PSS unreadable") for p in s.validity()), s.validity())
+
+    def test_zero_rss_owned_process_still_gets_a_pss_probe(self):
+        probe = FakeProbe(stats={100: {"resident_bytes": 1}})
+        s = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, probe)
+        s.ingest(1.0, "x", ps((100, 1, 0, "xmustard-api")))
+        self.assertEqual(probe.calls[100], 1)
+        self.assertEqual(s.report()["gate"]["process_samples_by_source"], {"unreadable": 1})
+        self.assertTrue(s.validity())
+
+    def test_the_core_runs_from_a_copy_only_this_run_maps(self):
+        # PSS divides a file page among every process that maps it: a core another process runs from the same
+        # file would make the tree read low
+        with tempfile.TemporaryDirectory() as d:
+            src, out = os.path.join(d, "xmustard-core"), os.path.join(d, "bin")
+            with open(src, "wb") as f:
+                f.write(b"\x7fELF core")
+            os.chmod(src, 0o755)
+            os.makedirs(out)
+            dest = v2.private_copy(src, out)
+            relay_src = os.path.join(d, "relay", "xmustard-core")
+            os.makedirs(os.path.dirname(relay_src))
+            shutil.copy2(src, relay_src)
+            relay = v2.private_copy(relay_src, out, "relay")
+            self.assertNotEqual(dest, relay)
+            self.assertEqual((os.path.basename(dest), os.path.basename(relay)), ("xmustard-core", "xmustard-core"))
+            self.assertTrue(os.path.isfile(dest) and os.path.isfile(relay))
+            self.assertNotEqual(os.stat(dest).st_ino, os.stat(src).st_ino)
+            self.assertEqual((v2.sha_file(dest), os.access(dest, os.X_OK)), (v2.sha_file(src), True))
+            self.assertEqual(REGISTRY.classify(os.path.basename(dest)), ("rust_core_per_call", "owned"))
+            self.assertEqual(REGISTRY.classify(os.path.basename(dest), "serve"), ("rust_index_service", "owned"))
+            self.assertTrue(REGISTRY.is_owned_binary(os.path.basename(dest)))
+            self.assertTrue(os.path.basename(dest).startswith("xmustard"))  # mirrors Go ownedProcessName
+            relay_path = os.path.join(d, "relay", "xmustard-relay")
+            with open(relay_path, "wb") as f:
+                f.write(b"\x7fELF relay")
+            os.chmod(relay_path, 0o755)
+            relay_copy = v2.private_copy(relay_path, out, "relay")
+            self.assertEqual(os.path.basename(relay_copy), "xmustard-relay")
+            self.assertEqual(REGISTRY.classify(os.path.basename(relay_copy)), ("mcp_access", "owned"))
+            self.assertTrue(REGISTRY.is_owned_binary(os.path.basename(relay_copy)))
+            self.assertTrue(os.path.basename(relay_copy).startswith("xmustard"))  # mirrors Go ownedProcessName
+
+    def test_cmd_run_provenance_uses_the_core_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            api, mcp, source_core = [os.path.join(d, name) for name in ("api", "mcp", "xmustard-core")]
+            for path in (api, mcp, source_core):
+                with open(path, "wb") as f:
+                    f.write(path.encode())
+            seen = {}
+
+            def build(_source_root, bin_dir, _core_bin):
+                os.makedirs(bin_dir)
+                return api, mcp, source_core
+
+            def provenance(_source_root, _api_bin, _mcp_bin, core, _scripts):
+                seen["core"] = core
+                return {"binaries_sha256": {}, "head": None}
+
+            args = types.SimpleNamespace(workstream=None, baseline=None, core_worker=False, ledger="ledger", source_root=d,
+                                         out=os.path.join(d, "out"), fixture_cache=d, core_bin=None, relay_bin=None,
+                                         keep=False, rounds=1, repeat=1, require_parity_claim=False)
+            with unittest.mock.patch.object(v2, "default_probe", return_value=FakeProbe()), \
+                    unittest.mock.patch.object(v2, "load_json", side_effect=[LEDGER, FIXTURES]), \
+                    unittest.mock.patch.object(v2, "select_scenarios", return_value=[]), \
+                    unittest.mock.patch.object(v2, "build_binaries_from", side_effect=build), \
+                    unittest.mock.patch.object(v2, "provenance_for", side_effect=provenance), \
+                    unittest.mock.patch.object(v2, "overall_verdict", return_value="PASS"), \
+                    unittest.mock.patch.object(v2, "parity_claim", return_value={"established": False}), \
+                    unittest.mock.patch.object(v2, "ledger_view", return_value={}), \
+                    unittest.mock.patch.object(v2, "write_reports"), \
+                    unittest.mock.patch.object(v2, "exit_code", return_value=0):
+                self.assertEqual(v2.cmd_run(args), 0)
+            self.assertEqual(os.path.basename(seen["core"]), "xmustard-core")
+            self.assertNotEqual(seen["core"], source_core)
+
+    def test_provenance_hashes_private_core_copy(self):
+        with tempfile.TemporaryDirectory() as d:
+            api, mcp, src = [os.path.join(d, name) for name in ("api", "mcp", "core")]
+            for path in (api, mcp, src):
+                with open(path, "wb") as f:
+                    f.write(path.encode())
+            os.makedirs(os.path.join(d, "bin"))
+            private = v2.private_copy(src, os.path.join(d, "bin"), "core")
+            with open(src, "wb") as f:
+                f.write(b"changed after copy")
+            result = unittest.mock.Mock(stdout="")
+            with unittest.mock.patch.object(v2, "run", return_value=result):
+                provenance = v2.provenance_for(d, api, mcp, private, [])
+            self.assertEqual(provenance["binaries_sha256"]["xmustard-core"], v2.sha_file(private))
+            self.assertNotEqual(provenance["binaries_sha256"]["xmustard-core"], v2.sha_file(src))
+
+
 class GateVerdict(unittest.TestCase):
     def rep(self, peak):
         return {"gate": {"peak_bytes": peak}}
@@ -343,6 +594,8 @@ class GateVerdict(unittest.TestCase):
         self.assertEqual(low["verdict"], "INVALID")
         self.assertFalse(low["passed"])
         self.assertEqual(v2.evaluate_gate(self.rep(1), [])["limit_mib"], 95.4)
+        # each scenario verdict names the metric that decided it
+        self.assertEqual(v2.evaluate_gate({"gate": {"peak_bytes": 1, "basis": "pss"}}, [])["metric"], "pss")
 
 
 class PlatformDecoders(unittest.TestCase):
@@ -650,6 +903,9 @@ class Ledger(unittest.TestCase):
         roles = {r["component"] for r in LEDGER["process_roles"]["rules"]}
         items = set(LEDGER["go_daemon_suballocation"]["items"])
         self.assertEqual(LEDGER["gate"]["limit_bytes"], v2.GATE_BYTES)
+        # the ledger names the metric the code gates (G5.10, 2026-10-23)
+        self.assertTrue(LEDGER["gate"]["metric"].startswith("PSS"), LEDGER["gate"]["metric"])
+        self.assertIn("G5.10", LEDGER["gate"]["note"])
         # WS-00..WS-63, plus the Open Code Review adoption's new workstreams as they land
         self.assertEqual(sorted(LEDGER["workstreams"]), [f"WS-{i:02d}" for i in range(64)] + ["WS-65", "WS-66"])
         for wid, w in LEDGER["workstreams"].items():
@@ -809,7 +1065,9 @@ class Ledger(unittest.TestCase):
                                                                                      "tree_all_peak_mib": 55.0, "externals": {"lsp_server": {"peak_mib": 5.0}}}},
             "b": {"status": "ran", "gate": {"valid": False, "peak_mib": 10.0}, "sampler": {"components": {}}},
             "c": {"status": "skipped"}}}
+        # "a" has no ps-RSS block: a report from before G5.10, whose gate peak was ps-RSS (tree_peak_key falls back to it)
         self.assertEqual(v2.ledger_view(rep), {"a": {"valid_runs": 1, "gate_peak_mib": 50.0, "gate_peak_max_mib": 50.0,
+                                                     "rss_peak_mib": None, "rss_peak_max_mib": None,
                                                      "tree_all_peak_mib": 55.0, "tree_all_peak_max_mib": 55.0,
                                                      "components_p50_mib": {"go_daemon": 20.0},
                                                      "components_footprint_p50_mib": {"go_daemon": None},
@@ -849,14 +1107,19 @@ class Ledger(unittest.TestCase):
         self.assertEqual(v2.ci_plan(LEDGER, FIXTURES, "parity/ws-14"), {"workstream": "WS-14", "scenarios": ci + ["agents-2"], "fixtures": True})
 
 
-def gate_run(peak, verdict=None, daemon=20.0, fp=None):
-    """One scenario run: the verdict follows the peak unless given (INVALID)."""
+def gate_run(peak, verdict=None, daemon=20.0, fp=None, rss=None):
+    """One scenario run: the verdict follows the gate peak unless given (INVALID). rss is the
+    summed ps-RSS peak reported beside the gate; without it the run reads like one from
+    before G5.10, whose gate peak was ps-RSS."""
     verdict = verdict or ("PASS" if peak * 2**20 <= v2.GATE_BYTES else "FAIL")
     reasons = ["a mandatory workload check failed"] if verdict == "INVALID" else []
     comps = {"go_daemon": {"p50_mib": daemon, "peak_mib": daemon + 5, "footprint_p50_mib": fp}}
+    sampler = {"components": comps, "tree_all_peak_mib": peak if rss is None else rss}
+    if rss is not None:
+        sampler["rss"] = {"peak_mib": rss}
     return {"status": "ran", "gate": {"peak_mib": peak, "peak_bytes": int(peak * 2**20), "verdict": verdict,
                                       "valid": verdict != "INVALID", "passed": verdict == "PASS", "invalid_reasons": reasons},
-            "sampler": {"components": comps, "tree_all_peak_mib": peak}}
+            "sampler": sampler}
 
 
 def gate_report(**scenarios):
@@ -964,6 +1227,19 @@ class PullRequestBlocking(unittest.TestCase):
         # a shift of the whole distribution fails
         grown = v2.ledger_view(gate_report(v1_workload=[80.0, 80.5, 87.0]))
         self.assertEqual(v2.ledger_check(LEDGER, "WS-10", grown, base)["verdict"], "FAIL")
+
+    def test_the_tree_check_stays_on_rss_and_the_gate_rule_moves_to_pss(self):
+        # G5.10 moved the 100,000,000-byte line to PSS. The tree check compares a delta with lines and a tolerance
+        # set on ps-RSS, not with that line, so it keeps comparing summed ps-RSS peaks
+        base = gate_report(v1_workload=[gate_run(70.0, rss=90.0), gate_run(71.0, rss=91.0), gate_run(72.0, rss=92.0)])
+        head = gate_report(v1_workload=[gate_run(70.0, rss=105.0), gate_run(71.0, rss=106.0), gate_run(72.0, rss=107.0)])
+        hv, bv = v2.ledger_view(head), v2.ledger_view(base)
+        self.assertEqual((hv["v1-workload"]["gate_peak_mib"], hv["v1-workload"]["rss_peak_mib"]), (71.0, 106.0))
+        chk = v2.ledger_check(LEDGER, "WS-10", hv, bv)
+        tree = chk["rows"][0]["tree"]
+        self.assertEqual((tree["peak"], tree["delta_mib"], chk["verdict"]), ("rss_peak_mib", 15.0, "FAIL"))
+        row = v2.gate_blocking(LEDGER, "WS-10", head, base)["rows"][0]
+        self.assertEqual((row["head_median_mib"], row["base_median_mib"], row["blocking"]), (71.0, 71.0, False))
 
     def test_a_scenario_the_base_could_not_run_is_judged_by_the_head(self):
         # WS-15 designating watcher-on, which its base cannot run (feature absent): the head's own verdict decides
@@ -1167,7 +1443,8 @@ class PullRequestBlocking(unittest.TestCase):
                                           "process": "go_daemon", "process_p50_delta_mib": 7.9, "process_allowed_mib": 2.0, "ok": False}]}}
         md = v2.render_markdown(old)
         for needle in ("Reconciliation (open)", "| go_daemon | 27 | 33 | 27.7 | 18.8 | 46.5 | – |", "**FAIL**",
-                       "| v1-workload | 0 | 6.1 (10.0) | – | – | 7.9 (2.0) | none | none |"):
+                       "| v1-workload | 0 | 6.1 (10.0) | – | – | 7.9 (2.0) | none | none |",
+                       "(gate: ps-RSS of the xMustard-owned tree <= 95.4 MiB, 100,000,000 bytes)"):  # no gate_metric: ps-RSS
             self.assertIn(needle, md)
 
 
@@ -1348,6 +1625,40 @@ class CoreWorker(unittest.TestCase):
             shutil.rmtree(d, ignore_errors=True)
 
 
+class BaselineMetric(unittest.TestCase):
+    """Medians gated on two metrics differ by the metric, not by the workstream: a ps-RSS base
+    against a PSS head reads as a 14-26 MiB saving on the recorded runs (G5.10)."""
+
+    def write(self, d, name, obj):
+        path = os.path.join(d, name)
+        with open(path, "w") as f:
+            json.dump(obj, f)
+        return path
+
+    def test_run_refuses_a_baseline_gated_on_another_metric(self):
+        with tempfile.TemporaryDirectory() as d:
+            # a report without gate_metric was written before G5.10: its gate was ps-RSS
+            for base_report in ({"schema": 2, "core_worker": False, "scenarios": {}},
+                                {"schema": 2, "core_worker": False, "gate_metric": "rss", "scenarios": {}}):
+                base = self.write(d, "base.json", base_report)
+                with unittest.mock.patch.object(v2, "default_probe", return_value=FakeProbe(gate_metric="pss")), \
+                        unittest.mock.patch.object(v2, "build_binaries_from", side_effect=AssertionError("measured: not refused")):
+                    with self.assertRaises(SystemExit) as e:
+                        v2.main(["run", "--scenarios", "v1-workload", "--workstream", "WS-10", "--baseline", base, "--out", d])
+                self.assertIn("gate_metric", str(e.exception))
+
+    def test_ledger_refuses_reports_gated_on_two_metrics(self):
+        head = gate_report(v1_workload=[74.0, 75.0, 76.0], agents_2=[80.0, 81.0, 82.0])
+        with tempfile.TemporaryDirectory() as d:
+            h = self.write(d, "head.json", dict(head, gate_metric="pss"))
+            b = self.write(d, "base.json", head)
+            with unittest.mock.patch("sys.stdout"):
+                with self.assertRaises(SystemExit) as e:
+                    v2.main(["ledger", "--workstream", "WS-14", "--head", h, "--baseline", b])
+                self.assertIn("gate_metric", str(e.exception))
+                self.assertEqual(v2.main(["ledger", "--workstream", "WS-14", "--head", h, "--baseline", h]), 0)
+
+
 class Repeats(unittest.TestCase):
     def run_(self, peak, verdict="PASS", daemon=20.0):
         reasons = ["v2 disagrees with the frozen v1 sampler by 9 MiB"] if verdict == "INVALID" else []
@@ -1394,7 +1705,7 @@ class Rendering(unittest.TestCase):
         s = v2.SamplerV2(roots(shims=(), agent=None), REGISTRY, FakeProbe(stats={100: {"footprint_bytes": 2**20}}))
         s.ingest(1.0, "work", ps((100, 1, 20480, "xmustard-api"), (110, 100, 81920, "gopls")))
         srep = s.report()
-        rep = {"generated_at": "t", "verdict": "PASS", "probe": "fake", "provenance": {"head": "abc", "env": {}},
+        rep = {"generated_at": "t", "verdict": "PASS", "probe": "fake", "provenance": {"head": "abc", "env": {}}, "gate_metric": "pss",
                "parity_claim": {"established": False, "missing": ["watcher-on: skipped (feature absent)"]},
                "scenarios": {"agents-1": {"status": "ran", "about": "x", "gate": v2.evaluate_gate(srep, []), "sampler": srep,
                                           "transport": "stdio-shim"},
@@ -1402,7 +1713,11 @@ class Rendering(unittest.TestCase):
                "ledger_reconcile": v2.ledger_reconcile(LEDGER), "unmeasured": v2.UNMEASURED}
         md = v2.render_markdown(rep)
         for needle in ("**Verdict: PASS**", "95.4 MiB", "not established", "watcher-on | skipped", "lsp_server: peak 80.0 MiB",
-                       "| go_daemon |", "Reconciliation (open)", "governance_caches (feature) | 3 | 10.5 **over**"):
+                       "| go_daemon |", "Reconciliation (open)", "governance_caches (feature) | 3 | 10.5 **over**",
+                       # the report says which metric gated, and shows summed ps-RSS beside it
+                       "(gate: PSS of the xMustard-owned tree <= 95.4 MiB, 100,000,000 bytes; summed ps-RSS is reported beside it)",
+                       "| Gate peak (PSS) MiB (MB) | ps-RSS peak MiB |", "| agents-1 | PASS | 1.0 (1.0) | 20.0 |",
+                       "Processes at the gate (PSS) peak"):
             self.assertIn(needle, md)
         view = {"agents-1": {"gate_peak_mib": 20.0, "tree_all_peak_mib": 100.0, "components_p50_mib": {"go_daemon": 30.0},
                              "components_footprint_p50_mib": {"go_daemon": 29.0}, "components_peak_mib": {"go_daemon": 40.0},

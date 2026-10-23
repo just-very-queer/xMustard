@@ -103,6 +103,17 @@ review are listed in [Status](STATUS.md#in-progress).
   printed the generic `mcpServers` entry.
 
 ### Changed
+- Budget gate v2 gates summed PSS of the xMustard-owned tree, owner decision G5.10
+  (2026-10-23). It used to gate summed ps-RSS, which counts a page that N processes
+  share N times. On a THP-always `ubuntu-latest` runner, one v1-workload run read
+  105.1 MiB summed ps-RSS and 79.1 MiB summed PSS. The line is unchanged at
+  100,000,000 bytes (95.4 MiB), and summed ps-RSS is reported beside the gate.
+  - PSS comes from `/proc/<pid>/smaps_rollup` for every owned process in every sample.
+  - An owned process that exited before its probe counts its ps-RSS.
+  - A live one whose PSS cannot be read makes the run INVALID.
+  - macOS, which has no PSS, keeps gating summed ps-RSS.
+  - The ledger's tree check stays on ps-RSS, and `--workstream` refuses a baseline that
+    was gated on another metric.
 - The `opencode` capture format is the plugin's flat body (`tool`, `sessionID`, `id`,
   `input`, `content`, scalar-only `metadata`, or `error`), replacing
   `{tool, sessionID, callID, args, output}`, which no client posted. Its shape payload is

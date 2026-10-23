@@ -3,14 +3,21 @@
 `rss_bench.py` (v1) is frozen at 6411f391. This module is its successor; it measures and
 reports, and it leaves v1 untouched.
 
-Gate. ps-RSS stays the gate for continuity with v1: one `ps -axo pid=,ppid=,rss=,comm=`
-snapshot every 100 ms, summed over the xMustard-owned process tree. The limit is
-100,000,000 bytes (95.4 MiB). A run counts only when the sampler took samples, every ps
-call succeeded, every registered root was present in every snapshot, and the whole
-workload completed with its mandatory checks. A low number from a broken run is INVALID,
-never PASS.
+Gate. Summed PSS of the xMustard-owned process tree (owner decision G5.10, 2026-10-23;
+summed ps-RSS was the gate before). Every 100 ms one `ps -axo pid=,ppid=,rss=,comm=`
+snapshot, v1's call, finds and attributes the processes, and /proc/<pid>/smaps_rollup
+gives each one's PSS. PSS splits a page shared by N processes N ways, so the pages the
+shims and per-call cores share count once; ps-RSS counts them N times, and its sum is
+reported beside the gate. An owned process that exited between ps and its probe counts
+its ps-RSS, an upper bound; a live one whose PSS cannot be read makes the run INVALID.
+Where there is no PSS (macOS, or no probe) the gate is summed ps-RSS, never below it.
+The limit is 100,000,000 bytes (95.4 MiB). A run counts only when the sampler took
+samples, every ps call succeeded, every registered root was present in every snapshot,
+and the whole workload completed with its mandatory checks. A low number from a broken
+run is INVALID, never PASS.
 
-Alongside the gate, per process and every sample:
+Beside the gate, per process and every sample:
+  * ps-RSS, summed over the owned tree (v1's metric) and per component;
   * footprint: phys_footprint on macOS (task_info TASK_VM_INFO), PSS and USS on Linux
     (/proc/<pid>/smaps_rollup);
   * anonymous versus file-backed resident memory, which sum to the RSS ps reports:
@@ -85,6 +92,23 @@ LEDGER_PATH = os.path.join(HERE, "budget_ledger.json")
 FIXTURES_PATH = os.path.join(HERE, "parity_fixtures.json")
 PS_CMD = ["ps", "-axo", "pid=,ppid=,rss=,comm="]  # identical to v1
 TOKEN_BASIS = "ceil(bytes/4) heuristic over result content bytes; no tokenizer is loaded"
+
+GateMetric = collections.namedtuple("GateMetric", "label about verdict_note")
+GATE_METRICS = {  # probe.gate_metric -> what the gate sums (G5.10, 2026-10-23: PSS where the platform has it)
+    "pss": GateMetric("PSS", "PSS (/proc/<pid>/smaps_rollup Pss) summed over the xMustard-owned tree in one snapshot every "
+                             "100 ms; an owned process that exited between ps and its probe counts its ps-RSS (an upper "
+                             "bound), and a live one whose PSS cannot be read makes the run INVALID; externals excluded",
+                      "; summed ps-RSS is reported beside it"),
+    "rss": GateMetric("ps-RSS", "ps-RSS summed over the xMustard-owned tree in one snapshot every 100 ms (no PSS on this "
+                                "platform; RSS is never below it); externals excluded", ""),
+}
+RSS_METRIC = ("ps-RSS summed over the xMustard-owned tree in the gate's snapshots (externals excluded): v1's metric, reported "
+              "beside the gate; it counts a page shared by N processes N times")
+GATE_SOURCE_NOTES = {  # how an owned process entered the gate (GATE_SOURCES) -> (report note, process-row mark)
+    "pss": ("PSS read", ""), "rss": ("ps-RSS", ""),
+    "exited": ("exited before the probe, ps-RSS counted", " (exited: ps-RSS)"),
+    "unreadable": ("alive with PSS unreadable (INVALID)", " (PSS unreadable)"),
+}
 
 
 def mib(n_bytes, nd=1):
@@ -225,20 +249,21 @@ def attribute(procs, children, roots, registry, argv1_of=lambda pid: None):
 
 
 def snapshot_totals(procs, rows):
-    """Synchronized sums for one snapshot: gate (owned), per owned component, per
-    external component, per agent line, and owned+external (the v1-equivalent tree)."""
-    gate = 0
+    """Synchronized ps-RSS sums for one snapshot: owned (reported beside the gate, and the
+    gate itself where there is no PSS), per owned component, per external component, per
+    agent line, and owned+external (the v1-equivalent tree)."""
+    owned = 0
     comp, ext, agents = collections.Counter(), collections.Counter(), collections.Counter()
     for pid, (c, k, label) in rows.items():
         rss = procs[pid].rss_kib
         if k == "owned":
-            gate += rss
+            owned += rss
             comp[c] += rss
         elif k == "external":
             ext[c] += rss
         else:
             agents[label] += rss
-    return {"gate_kib": gate, "tree_all_kib": gate + sum(ext.values()), "components_kib": dict(comp),
+    return {"owned_kib": owned, "tree_all_kib": owned + sum(ext.values()), "components_kib": dict(comp),
             "externals_kib": dict(ext), "agents_kib": dict(agents)}
 
 
@@ -315,6 +340,7 @@ def linux_stats(status_text, rollup_text, io_text):
 
 class DarwinProbe:
     name = "darwin"
+    gate_metric = "rss"  # no PSS; gating phys_footprint instead would be an owner decision of its own
     basis = {
         "footprint": "phys_footprint (task_info TASK_VM_INFO through task_name_for_pid)",
         "split": "TASK_VM_INFO internal (anonymous) and external (file-backed) resident bytes, every sample; they sum to the RSS ps reports",
@@ -378,6 +404,7 @@ def parse_procargs2(raw):
 
 class LinuxProbe:
     name = "linux"
+    gate_metric = "pss"
     basis = {
         "footprint": "PSS (/proc/<pid>/smaps_rollup Pss); USS = Private_Clean + Private_Dirty",
         "split": "RssAnon / RssFile / RssShmem (/proc/<pid>/status), every sample",
@@ -391,14 +418,34 @@ class LinuxProbe:
         try:
             with open(path, "rb") as f:
                 return f.read().decode(errors="replace")
-        except OSError:
+        except (FileNotFoundError, ProcessLookupError):
             return None
 
     def stats(self, pid):
-        status = self._read(f"/proc/{pid}/status")
+        try:
+            status = self._read(f"/proc/{pid}/status")
+        except OSError:
+            return {"resident_bytes": 1}  # ps observed it; inaccessible is not evidence it exited
         if status is None:
             return None
-        return linux_stats(status, self._read(f"/proc/{pid}/smaps_rollup"), self._read(f"/proc/{pid}/io"))
+        # smaps_rollup binds the address space at open: an exec between open and read fails it once
+        try:
+            rollup = self._read(f"/proc/{pid}/smaps_rollup") or self._read(f"/proc/{pid}/smaps_rollup")
+        except OSError:
+            rollup = None
+        if not rollup:  # its status again tells exited (gone, or a zombie without VmRSS) from alive and unreadable
+            try:
+                checked_status = self._read(f"/proc/{pid}/status")
+            except OSError:
+                checked_status = status
+            if checked_status is None:
+                return None
+            status = checked_status
+        try:
+            io = self._read(f"/proc/{pid}/io")
+        except OSError:
+            io = None
+        return linux_stats(status, rollup, io)
 
     def argv1(self, pid):
         raw = self._read(f"/proc/{pid}/cmdline")
@@ -408,6 +455,7 @@ class LinuxProbe:
 
 class NullProbe:
     name = "none"
+    gate_metric = "rss"
     basis = {"footprint": "unavailable on this platform", "split": "unavailable", "process_peak": "unavailable",
              "io": "unavailable"}
 
@@ -440,13 +488,27 @@ def _pct(values, q):
     return s[min(len(s) - 1, int(len(s) * q))]
 
 
+GateInput = collections.namedtuple("GateInput", "pss rss resident")  # bytes; resident None: no address space left
+
+GATE_SOURCES = {  # probe.gate_metric -> first-match rules: (source, bytes) that one owned process adds to the gate
+    "pss": (
+        (lambda g: g.pss is not None, lambda g: ("pss", g.pss)),
+        # gone, or a zombie, by its probe: it exited after ps listed it, and its ps-RSS is an upper bound on its PSS
+        (lambda g: g.resident is None, lambda g: ("exited", g.rss)),
+        (None, lambda g: ("unreadable", g.rss)),  # alive and its PSS unreadable: validity() makes the run INVALID
+    ),
+    "rss": ((None, lambda g: ("rss", g.rss)),),
+}
+
+
 class SamplerV2(threading.Thread):
     """Every 100 ms: one ps snapshot -> attribution -> per-process probes -> peaks.
 
     `ingest()` holds all per-sample logic so unit tests can feed synthetic snapshots and
     a fake probe; `run()` only adds the ps call and the pacing. Any exception inside a
-    sample is recorded and invalidates the run; so does a thread that ends before stop()
-    or a last sample older than STALE_S at stop().
+    sample is recorded and invalidates the run; so does a thread that ends before stop(),
+    a last sample older than STALE_S at stop(), or a live owned process whose PSS could
+    not be read (on the PSS basis).
     """
 
     STALE_S = 5.0
@@ -456,6 +518,7 @@ class SamplerV2(threading.Thread):
         self.roots = list(roots)
         self.registry = registry
         self.probe = probe or NullProbe()
+        self.metric = self.probe.gate_metric
         self.step_ref = step_ref if step_ref is not None else ["setup"]
         self.interval = interval
         self.storage_dir = storage_dir
@@ -464,9 +527,12 @@ class SamplerV2(threading.Thread):
         self.samples, self.errors, self.lost_roots, self.gaps, self.last_t = 0, [], [], [], None
         self.exceptions, self.exited_early, self.stopped_at = [], False, None
         self.sample_cost_ms = []
-        self.peak = {"gate_kib": 0}
+        self.peak = {"gate_bytes": 0}
+        self.rss_peak = {"kib": 0, "step": None, "t_s": None}  # summed ps-RSS, reported beside the gate
+        self.gate_sources = collections.Counter()  # owned process-samples by GATE_SOURCES source
+        self.unreadable = []  # the first live owned processes whose PSS could not be read
         self.tree_all_peak_kib = 0
-        self.step_peak_kib = {}
+        self.step_rss_peak_kib, self.step_gate_peak = {}, {}
         self.comp_peak_kib, self.comp_values = {}, collections.defaultdict(list)
         self.comp_fp_peak, self.comp_fp_values = {}, {}
         self.ext_peak_kib, self.ext_fp_peak, self.agent_peak_kib = {}, {}, {}
@@ -513,6 +579,8 @@ class SamplerV2(threading.Thread):
         self.last_t = t
         tot = snapshot_totals(procs, rows)
         stats, fp_total, fp_partial = {}, 0, False
+        counted = {}  # owned pid -> (source, bytes) it adds to the gate
+        rules = GATE_SOURCES[self.metric]
         comp_fp, ext_fp = collections.Counter(), collections.Counter()
         concurrent = collections.Counter()
         for pid, (c, k, label) in rows.items():
@@ -528,6 +596,7 @@ class SamplerV2(threading.Thread):
                 self.proc_last[key] = dict(st, component=c, klass=k)
             fp = (st or {}).get("footprint_bytes")
             if k == "owned":
+                counted[pid] = first_match(rules, GateInput(fp, procs[pid].rss_kib * 1024, (st or {}).get("resident_bytes")))
                 if fp is None:
                     fp_partial = True
                 else:
@@ -535,6 +604,11 @@ class SamplerV2(threading.Thread):
                     comp_fp[c] += fp
             elif k == "external" and fp is not None:
                 ext_fp[c] += fp
+        gate_bytes = sum(b for _, b in counted.values())
+        self.gate_sources.update(src for src, _ in counted.values())
+        for pid, (src, _) in counted.items():
+            if src == "unreadable" and len(self.unreadable) < 5:
+                self.unreadable.append({"t": round(t - self.t0, 2), "step": step, "pid": pid, "comm": procs[pid].comm})
         for c, n in concurrent.items():
             self.max_concurrent[c] = max(self.max_concurrent[c], n)
         for c, kib in tot["components_kib"].items():
@@ -560,19 +634,24 @@ class SamplerV2(threading.Thread):
         if fp_total > self.fp["peak_bytes"]:
             self.fp.update(peak_bytes=fp_total, step=step, t_s=round(t - self.t0, 2), partial=fp_partial)
         self.tree_all_peak_kib = max(self.tree_all_peak_kib, tot["tree_all_kib"])
-        self.step_peak_kib[step] = max(self.step_peak_kib.get(step, 0), tot["gate_kib"])
-        if tot["gate_kib"] > self.peak["gate_kib"]:
-            self._record_peak(t, step, procs, rows, stats, tot, fp_total, fp_partial)
-        self.series.append([round(t - self.t0, 2), step, tot["gate_kib"], fp_total // 1024, sum(tot["externals_kib"].values())])
+        self.step_rss_peak_kib[step] = max(self.step_rss_peak_kib.get(step, 0), tot["owned_kib"])
+        self.step_gate_peak[step] = max(self.step_gate_peak.get(step, 0), gate_bytes)
+        if tot["owned_kib"] > self.rss_peak["kib"]:
+            self.rss_peak = {"kib": tot["owned_kib"], "step": step, "t_s": round(t - self.t0, 2)}
+        if gate_bytes > self.peak["gate_bytes"]:
+            self._record_peak(t, step, procs, rows, stats, tot, counted, comp_fp, fp_total, fp_partial)
+        self.series.append([round(t - self.t0, 2), step, gate_bytes // 1024, tot["owned_kib"], fp_total // 1024,
+                            sum(tot["externals_kib"].values())])
         if self.storage_dir and self.samples % 10 == 0:
             s = dir_bytes(self.storage_dir)
             if s[0] > self.storage_peak[0]:
                 self.storage_peak, self.storage_step = s, step
 
-    def _record_peak(self, t, step, procs, rows, stats, tot, fp_total, fp_partial):
-        """Keep the per-process detail of a new gate peak: RSS, footprint and the resident
-        split (anon + file [+ shmem on Linux] = RSS), read in the same sample."""
-        rows_out, split, split_ok = [], collections.Counter(), True
+    def _record_peak(self, t, step, procs, rows, stats, tot, counted, comp_fp, fp_total, fp_partial):
+        """Keep the per-process detail of a new gate peak: what each owned process added to
+        the gate and how, RSS, footprint and the resident split (anon + file [+ shmem on
+        Linux] = RSS), read in the same sample."""
+        rows_out, split, split_ok, by_source = [], collections.Counter(), True, collections.Counter()
         for pid, (c, k, label) in rows.items():
             if k == "agent":
                 continue
@@ -584,6 +663,8 @@ class SamplerV2(threading.Thread):
                 if st.get(key) is not None:
                     row[key] = st[key]
             if k == "owned":
+                row["gate_source"], row["gate_bytes"] = counted[pid]
+                by_source[row["gate_source"]] += row["gate_bytes"]
                 if st.get("anon_bytes") is None or st.get("file_bytes") is None:
                     split_ok = False
                     split["unsplit_bytes"] += procs[pid].rss_kib * 1024  # exited or exiting: ps still shows RSS
@@ -592,10 +673,10 @@ class SamplerV2(threading.Thread):
                         split[key] += st.get(key) or 0
             rows_out.append(row)
         rows_out.sort(key=lambda r: -r["rss_kib"])
-        self.peak = {"gate_kib": tot["gate_kib"], "step": step, "t_s": round(t - self.t0, 2), "processes": rows_out,
-                     "components_kib": tot["components_kib"], "externals_kib": tot["externals_kib"],
-                     "footprint_bytes": fp_total, "footprint_partial": fp_partial,
-                     "split": dict(split, complete=split_ok)}
+        self.peak = {"gate_bytes": sum(by_source.values()), "rss_kib": tot["owned_kib"], "step": step, "t_s": round(t - self.t0, 2),
+                     "processes": rows_out, "components_kib": tot["components_kib"], "components_fp_bytes": dict(comp_fp),
+                     "externals_kib": tot["externals_kib"], "footprint_bytes": fp_total, "footprint_partial": fp_partial,
+                     "by_source_bytes": dict(by_source), "split": dict(split, complete=split_ok)}
 
     def read_ps(self):
         """(returncode, stdout text, stderr text) of one ps call. Decoded leniently: one
@@ -649,11 +730,15 @@ class SamplerV2(threading.Thread):
             problems.append("sampler thread ended before the workload did")
         if self.stopped_at and self.last_t and self.stopped_at - self.last_t > self.STALE_S:
             problems.append(f"no sample in the last {round(self.stopped_at - self.last_t, 1)} s before the workload ended")
+        if self.gate_sources["unreadable"]:
+            u = self.unreadable[0]
+            problems.append(f"PSS unreadable for {self.gate_sources['unreadable']} samples of live owned processes "
+                            f"(first: {u['comm']} pid {u['pid']} at {u['t']} s): the gate was not read")
         return problems
 
     def report(self):
         gaps = sorted(self.gaps)
-        peak_bytes = self.peak["gate_kib"] * 1024
+        peak_bytes, rss_bytes = self.peak["gate_bytes"], self.rss_peak["kib"] * 1024
         comps = {}
         for c in sorted(self.comp_peak_kib):  # owned components only
             vals = self.comp_values.get(c, [])
@@ -664,7 +749,8 @@ class SamplerV2(threading.Thread):
             io_w = [self.proc_last[k].get("io_written_bytes") for k in keys if k in self.proc_last]
             comps[c] = {
                 "peak_mib": mib(self.comp_peak_kib.get(c, 0) * 1024), "p50_mib": mib((_pct(vals, 0.5) or 0) * 1024),
-                "at_gate_peak_mib": mib(self.peak.get("components_kib", {}).get(c, 0) * 1024),
+                "at_gate_peak_mib": mib(self.peak.get("components_kib", {}).get(c, 0) * 1024),  # RSS
+                "at_gate_peak_footprint_mib": mib((self.peak.get("components_fp_bytes") or {}).get(c)),
                 "footprint_peak_mib": mib(self.comp_fp_peak.get(c)),
                 "footprint_p50_mib": mib(_pct(self.comp_fp_values.get(c, []), 0.5)),
                 "process_rss_peak_mib": mib(max(hwm) or None) if hwm else None,
@@ -677,9 +763,14 @@ class SamplerV2(threading.Thread):
                      for c, kib in sorted(self.ext_peak_kib.items())}
         split = self.peak.get("split") or {}
         return {
-            "gate": {"metric": "ps-RSS summed over the xMustard-owned tree in one snapshot (externals excluded)",
+            "gate": {"metric": GATE_METRICS[self.metric].about, "basis": self.metric,
                      "peak_bytes": peak_bytes, "peak_mib": mib(peak_bytes), "peak_mb": round(peak_bytes / 1e6, 1),
-                     "peak_step": self.peak.get("step"), "peak_t_s": self.peak.get("t_s")},
+                     "peak_step": self.peak.get("step"), "peak_t_s": self.peak.get("t_s"),
+                     "rss_at_peak_mib": mib(self.peak.get("rss_kib", 0) * 1024),
+                     "at_peak_by_source_mib": {k: mib(v) for k, v in sorted((self.peak.get("by_source_bytes") or {}).items())},
+                     "process_samples_by_source": dict(sorted(self.gate_sources.items())), "unreadable": self.unreadable},
+            "rss": {"metric": RSS_METRIC, "peak_bytes": rss_bytes, "peak_mib": mib(rss_bytes), "peak_mb": round(rss_bytes / 1e6, 1),
+                    "peak_step": self.rss_peak["step"], "peak_t_s": self.rss_peak["t_s"]},
             "tree_all_peak_mib": mib(self.tree_all_peak_kib * 1024),
             "footprint": {"basis": self.probe.basis["footprint"], "tree_peak_mib": mib(self.fp["peak_bytes"]) if self.fp["peak_bytes"] else None,
                           "tree_peak_step": self.fp["step"], "at_gate_peak_mib": mib(self.peak.get("footprint_bytes")),
@@ -696,7 +787,8 @@ class SamplerV2(threading.Thread):
             "processes_at_gate_peak": self.peak.get("processes", []),
             "per_exe_sampled_max_mib": {exe: mib(max(k for (_, e), k in self.pid_peak_kib.items() if e == exe) * 1024)
                                         for exe in sorted({e for _, e in self.pid_peak_kib})},
-            "step_peak_mib": {k: mib(v * 1024) for k, v in self.step_peak_kib.items()},
+            "step_gate_peak_mib": {k: mib(v) for k, v in self.step_gate_peak.items()},
+            "step_rss_peak_mib": {k: mib(v * 1024) for k, v in self.step_rss_peak_kib.items()},
             "samples": self.samples, "interval_ms_target": int(self.interval * 1000),
             "interval_ms_observed": {"median": round(gaps[len(gaps) // 2] * 1000, 1) if gaps else None,
                                      "max": round(gaps[-1] * 1000, 1) if gaps else None,
@@ -712,7 +804,7 @@ class SamplerV2(threading.Thread):
                                      "files": self.storage_peak[2], "step": self.storage_step},
             "spawn_note": "processes_seen counts distinct processes observed at 100 ms; short-lived children can be missed (lower bound)",
             "units": "*_mib = 2^20 bytes, *_mb = 10^6 bytes; ps rss is KiB on darwin and linux",
-            "series_t_step_gate_kib_fp_kib_ext_kib": self.series,
+            "series_t_step_gate_kib_rss_kib_fp_kib_ext_kib": self.series,
         }
 
 
@@ -732,12 +824,13 @@ def dir_bytes(path):
 
 
 def evaluate_gate(sampler_report, invalid_reasons, limit_bytes=GATE_BYTES):
-    """The gate verdict: PASS only for a valid run at or under the limit."""
+    """The gate verdict: PASS only for a valid run at or under the limit, on the metric the
+    sampler gated (gate.basis: pss, or rss where there is no PSS)."""
     peak = sampler_report["gate"]["peak_bytes"]
     valid = not invalid_reasons
     verdict = "INVALID" if not valid else ("PASS" if peak <= limit_bytes else "FAIL")
-    return {"limit_bytes": limit_bytes, "limit_mib": round(limit_bytes / MIB, 1), "peak_bytes": peak,
-            "peak_mib": mib(peak), "valid": valid, "invalid_reasons": list(invalid_reasons),
+    return {"limit_bytes": limit_bytes, "limit_mib": round(limit_bytes / MIB, 1), "metric": sampler_report["gate"].get("basis"),
+            "peak_bytes": peak, "peak_mib": mib(peak), "valid": valid, "invalid_reasons": list(invalid_reasons),
             "passed": verdict == "PASS", "verdict": verdict}
 
 
@@ -1384,7 +1477,8 @@ def run_digest(r):
     s = r.get("sampler") or {}
     comps = s.get("components") or {}
     g = r.get("gate") or {}
-    return {"gate_peak_mib": g.get("peak_mib"), "verdict": g.get("verdict"), "valid": bool(g.get("valid")),
+    return {"gate_peak_mib": g.get("peak_mib"), "rss_peak_mib": (s.get("rss") or {}).get("peak_mib"),
+            "verdict": g.get("verdict"), "valid": bool(g.get("valid")),
             "tree_all_peak_mib": s.get("tree_all_peak_mib"),
             "v1_difference_mib": (r.get("v1_crosscheck") or {}).get("difference_mib"),
             "components_p50_mib": {c: v["p50_mib"] for c, v in comps.items()},
@@ -1394,7 +1488,8 @@ def run_digest(r):
 
 
 def ledger_view(report):
-    """{scenario: medians over the valid runs} for ledger_check: gate peak, owned+external
+    """{scenario: medians over the valid runs} for ledger_check: gate peak, owned ps-RSS
+    peak (None in a report from before G5.10, whose gate peak was ps-RSS), owned+external
     tree peak, per-component RSS p50, footprint p50 and peak, and per-external peak. With
     repeats, every metric is the median of its own values over the valid repeats. A
     scenario counts as measured only when most of its repeats are valid: one broken
@@ -1420,6 +1515,8 @@ def ledger_view(report):
 
         out[sc] = {"valid_runs": len(runs), "gate_peak_mib": median([d.get("gate_peak_mib") for d in runs]),
                    "gate_peak_max_mib": max_of([d.get("gate_peak_mib") for d in runs]),
+                   "rss_peak_mib": median([d.get("rss_peak_mib") for d in runs]),
+                   "rss_peak_max_mib": max_of([d.get("rss_peak_mib") for d in runs]),
                    "tree_all_peak_mib": median([d.get("tree_all_peak_mib") for d in runs]),
                    "tree_all_peak_max_mib": max_of([d.get("tree_all_peak_mib") for d in runs]),
                    "components_p50_mib": per("components_p50_mib", 0.0),
@@ -1581,13 +1678,20 @@ LEDGER_VERDICTS = (  # first match decides (verdict, note) of ledger_check
 )
 
 
+def tree_peak_key(h, b):
+    """The owned-tree peak the tree check compares: summed ps-RSS, the basis its lines and
+    tolerance were set on (G5.10 moved only the 100,000,000-byte gate to PSS); the gate
+    peak when a view has none (a report from before G5.10, whose gate was ps-RSS)."""
+    return "rss_peak_mib" if h.get("rss_peak_mib") is not None and b.get("rss_peak_mib") is not None else "gate_peak_mib"
+
+
 def ledger_check(ledger, workstream, head, base, head_status=None, base_status=None, merged=None):
     """Check a workstream's measured delta (head minus base: ledger_view() of two reports
     measured on one machine) against its ledger line.
 
     Checks per common scenario, each failing the workstream:
-      * tree: owned gate-peak delta (peak_delta: the smaller of the median and the max
-        deltas) <= line + tolerance.tree_peak_mib;
+      * tree: owned ps-RSS peak delta (tree_peak_key; peak_delta: the smaller of the
+        median and the max deltas) <= line + tolerance.tree_peak_mib;
       * tree_all: owned+external peak delta <= the same allowance (moving work into an
         external process is never a saving, §7.6);
       * process: the workstream's process p50 delta (footprint when both reports have it,
@@ -1647,9 +1751,10 @@ def ledger_check(ledger, workstream, head, base, head_status=None, base_status=N
         fails = []
         row = {"scenario": sc, "designated": is_designated, "ci_suite": in_ci_suite(sc), "line_mib": line_here,
                "externals_new": sorted(set(hx) - set(bx)), "external_growth_mib": ext_growth}
-        d_tree, d_med, d_max = peak_delta(h, b, "gate_peak_mib")
+        tree_key = tree_peak_key(h, b)
+        d_tree, d_med, d_max = peak_delta(h, b, tree_key)
         allowed = round(line_here + t_tree, 2)
-        row["tree"] = {"delta_mib": d_tree, "median_delta_mib": d_med, "max_delta_mib": d_max,
+        row["tree"] = {"peak": tree_key, "delta_mib": d_tree, "median_delta_mib": d_med, "max_delta_mib": d_max,
                        "credited_mib": credited(d_tree), "allowed_mib": allowed}
         if credited(d_tree) > allowed:
             fails.append(f"tree peak delta {credited(d_tree)} MiB > {allowed} (median delta {d_med}, max delta {d_max})")
@@ -1778,7 +1883,8 @@ def gate_blocking(ledger, workstream, report, base_report):
       * coverage: a scenario the base ran and the head skipped, because its feature went
         away, blocks whether it is in the CI suite or not: the pull request removed a
         measurement. Skipped on both sides is reported.
-    Nothing having run blocks."""
+    Nothing having run blocks. The medians are of the gated metric (the report's
+    gate_metric), against the same line as each scenario's verdict."""
     w = ledger["workstreams"].get(workstream) or {}
     opt_in = set(w.get("scenarios") or []) if w.get("gate_blocking") else set()
     limit = ledger["gate"]["limit_bytes"] / MIB
@@ -1803,8 +1909,9 @@ def gate_blocking(ledger, workstream, report, base_report):
                      "head_median_mib": c.h_med, "base_median_mib": c.b_med, "verdict": c.verdict, "rule": rule,
                      "blocking": blocking, "why": why_})
     ran = [r for r in rows if r["rule"] != "coverage"]
-    return {"workstream": workstream, "limit_mib": round(limit, 1), "noise_allowance_mib": noise, "rows": rows,
-            "blocking": not ran or any(r["blocking"] for r in rows), "note": None if ran else "no scenario ran"}
+    return {"workstream": workstream, "metric": report.get("gate_metric", "rss"), "limit_mib": round(limit, 1),
+            "noise_allowance_mib": noise, "rows": rows, "blocking": not ran or any(r["blocking"] for r in rows),
+            "note": None if ran else "no scenario ran"}
 
 
 def exit_code(report, require_parity_claim=False):
@@ -1924,6 +2031,18 @@ def resolve_relay(source_root, relay_bin=None):
     return out if p.returncode == 0 and os.path.isfile(out) else None
 
 
+def private_copy(path, out_dir, role=None):
+    """A copy of a binary that only this run maps. PSS splits a file page among every
+    process that maps it, so a core that another process runs from the same file would
+    make the tree read low. Role directories keep copies distinct without changing the
+    executable name used by runtime ownership and component classification."""
+    dest_dir = os.path.join(out_dir, role) if role else out_dir
+    os.makedirs(dest_dir, exist_ok=True)
+    dest = os.path.join(dest_dir, os.path.basename(path))
+    shutil.copy2(path, dest)
+    return dest
+
+
 def provenance_for(source_root, api_bin, mcp_bin, core, scripts):
     def g(*a):
         return run(["git", *a], cwd=source_root, check=False).stdout.strip()
@@ -2032,6 +2151,8 @@ def run_v1_workload(ctx):
         for k, v in saved.items():
             setattr(v1, k, v)
         sys.argv = argv
+    print(f"   (v1's own [PASS]/[FAIL] lines above judge its ps-RSS sampler; gate v2 judges "
+          f"{GATE_METRICS[probe.gate_metric].label}: the run line below)", flush=True)
     if not os.path.exists(tmp_report) or "v2" not in holder:
         return {"status": "ran", "gate": evaluate_gate({"gate": {"peak_bytes": 0}}, ["v1 workload did not produce a report"]),
                 "exit_code": exit_code}
@@ -2050,6 +2171,7 @@ def run_v1_workload(ctx):
         d = round((srep["tree_all_peak_mib"] or 0) - v1_peak / MIB, 2)
         cross = {"v1_sampler_peak_mib": mib(v1_peak), "v1_sampler_peak_mb": round(v1_peak / 1e6, 1),
                  "v2_tree_all_peak_mib": srep["tree_all_peak_mib"], "v2_gate_peak_mib": srep["gate"]["peak_mib"],
+                 "v2_owned_rss_peak_mib": srep["rss"]["peak_mib"],
                  "difference_mib": d, "tolerance_mib": tol, "within_noise": abs(d) <= tol,
                  "v1_samples": (res.get("sampled_tree") or {}).get("samples"), "v2_samples": srep["samples"],
                  "v1_interval_ms_median": ((res.get("sampled_tree") or {}).get("interval_ms_observed") or {}).get("median"),
@@ -2649,10 +2771,11 @@ def render_markdown(report):
     L = []
     prov = report.get("provenance") or {}
     env = prov.get("env") or {}
+    gm = GATE_METRICS[report.get("gate_metric", "rss")]  # a report from before G5.10 gated ps-RSS
     L.append(f"# Budget gate v2 report ({report['generated_at']})")
     L.append("")
-    L.append(f"**Verdict: {report['verdict']}** (gate: ps-RSS of the xMustard-owned tree <= {GATE_MIB} MiB, "
-             f"{GATE_BYTES:,} bytes). Parity-scale claim: "
+    L.append(f"**Verdict: {report['verdict']}** (gate: {gm.label} of the xMustard-owned tree <= {GATE_MIB} MiB, "
+             f"{GATE_BYTES:,} bytes{gm.verdict_note}). Parity-scale claim: "
              + ("**established**." if report["parity_claim"]["established"] else "**not established**."))
     if not report["parity_claim"]["established"] and report["parity_claim"]["missing"]:
         L.append("")
@@ -2665,17 +2788,19 @@ def render_markdown(report):
     L.append("")
     L.append("## Scenarios")
     L.append("")
-    L.append("| Scenario | Status | Gate peak MiB (MB) | Footprint peak MiB | Anon / file at peak MiB | Externals peak MiB | Peak step | Transport |")
-    L.append("|---|---|---|---|---|---|---|---|")
+    L.append(f"| Scenario | Status | Gate peak ({gm.label}) MiB (MB) | ps-RSS peak MiB | Footprint peak MiB | "
+             "Anon / file at gate peak MiB | Externals peak MiB | Peak step | Transport |")
+    L.append("|---|---|---|---|---|---|---|---|---|")
     for name, r in report["scenarios"].items():
         if r.get("status") != "ran":
-            L.append(f"| {name} | {r.get('status')}: {r.get('reason')} | – | – | – | – | – | – |")
+            L.append(f"| {name} | {r.get('status')}: {r.get('reason')} | – | – | – | – | – | – | – |")
             continue
         g, s = r["gate"], r.get("sampler") or {}
         sp = s.get("split_at_gate_peak") or {}
         unsplit = f" (+{sp['unsplit_mib']} exited)" if sp.get("unsplit_mib") else ""
         ext = sum((v.get("peak_mib") or 0) for v in (s.get("externals") or {}).values())
         L.append(f"| {name} | {g['verdict']} | {fmt(g.get('peak_mib'))} ({fmt(round(g['peak_bytes'] / 1e6, 1) if g.get('peak_bytes') else None)}) | "
+                 f"{fmt((s.get('rss') or {}).get('peak_mib'))} | "
                  f"{fmt((s.get('footprint') or {}).get('tree_peak_mib'))} | {fmt(sp.get('anon_mib'))} / {fmt(sp.get('file_mib'))}{unsplit} | "
                  f"{fmt(round(ext, 1) if s.get('externals') else 0)} | {fmt((s.get('gate') or {}).get('peak_step'))} | {r.get('transport', '–')} |")
     for name, r in report["scenarios"].items():
@@ -2694,16 +2819,26 @@ def render_markdown(report):
             L.append(f"Repeats: {r['gate']['repeat_note']}.")
         if not s:
             continue
+        cost = s.get("sample_cost_ms") or {}
         L.append("")
-        L.append(f"Samples {s['samples']} (median interval {s['interval_ms_observed']['median']} ms, max {s['interval_ms_observed']['max']} ms). "
+        L.append(f"Samples {s['samples']} (median interval {s['interval_ms_observed']['median']} ms, max {s['interval_ms_observed']['max']} ms; "
+                 f"sample cost p50 {fmt(cost.get('p50'))} ms, max {fmt(cost.get('max'))} ms). "
                  f"Footprint basis: {s['footprint']['basis']}. Split basis: {s['split_at_gate_peak']['basis']}.")
+        gs = s.get("gate") or {}
+        at = gs.get("at_peak_by_source_mib") or {}
+        if gs.get("process_samples_by_source"):
+            L.append("")
+            L.append("Gate inputs (owned process-samples; MiB at the gate peak): "
+                     + "; ".join(f"{GATE_SOURCE_NOTES.get(k, (k, ''))[0]} {n} ({fmt(at.get(k))})"
+                                 for k, n in gs["process_samples_by_source"].items()) + ".")
         L.append("")
-        L.append("| Component | Peak MiB | p50 MiB | At gate peak MiB | Footprint peak MiB | Footprint p50 MiB | "
-                 "Largest process RSS peak MiB (unsampled) | Largest process footprint peak MiB (unsampled) | Processes seen | Max concurrent |")
-        L.append("|---|---|---|---|---|---|---|---|---|---|")
+        L.append("| Component | RSS peak MiB | RSS p50 MiB | RSS at gate peak MiB | Footprint at gate peak MiB | Footprint peak MiB | "
+                 "Footprint p50 MiB | Largest process RSS peak MiB (unsampled) | Largest process footprint peak MiB (unsampled) | "
+                 "Processes seen | Max concurrent |")
+        L.append("|---|---|---|---|---|---|---|---|---|---|---|")
         for c, v in s["components"].items():
-            L.append(f"| {c} | {fmt(v['peak_mib'])} | {fmt(v['p50_mib'])} | {fmt(v['at_gate_peak_mib'])} | {fmt(v['footprint_peak_mib'])} | "
-                     f"{fmt(v.get('footprint_p50_mib'))} | "
+            L.append(f"| {c} | {fmt(v['peak_mib'])} | {fmt(v['p50_mib'])} | {fmt(v['at_gate_peak_mib'])} | "
+                     f"{fmt(v.get('at_gate_peak_footprint_mib'))} | {fmt(v['footprint_peak_mib'])} | {fmt(v.get('footprint_p50_mib'))} | "
                      f"{fmt(v.get('process_rss_peak_mib'))} | {fmt(v.get('process_footprint_peak_mib'))} | {v['processes_seen']} | {v['max_concurrent']} |")
         L.append("")
         if s["externals"]:
@@ -2716,17 +2851,19 @@ def render_markdown(report):
         for lbl, v in (s.get("agents") or {}).items():
             L.append(f"- agent line `{lbl}` (the bench harness, external): peak {v['peak_mib']} MiB")
         L.append("")
-        L.append("Processes at the gate peak:")
+        L.append(f"Processes at the gate ({gm.label}) peak:")
         L.append("")
-        L.append("| PID | Command | Component | RSS MiB | Footprint MiB | Anon MiB | File MiB |")
-        L.append("|---|---|---|---|---|---|---|")
+        L.append("| PID | Command | Component | Counted in the gate MiB | RSS MiB | Footprint MiB | Anon MiB | File MiB |")
+        L.append("|---|---|---|---|---|---|---|---|")
         for p in s["processes_at_gate_peak"]:
-            L.append(f"| {p['pid']} | {p['comm']} | {p['component']} ({p['class']}) | {mib(p['rss_kib'] * 1024)} | "
+            L.append(f"| {p['pid']} | {p['comm']} | {p['component']} ({p['class']}) | "
+                     f"{fmt(mib(p.get('gate_bytes')))}{GATE_SOURCE_NOTES.get(p.get('gate_source'), ('', ''))[1]} | {mib(p['rss_kib'] * 1024)} | "
                      f"{fmt(mib(p.get('footprint_bytes')))} | {fmt(mib(p.get('anon_bytes')))} | {fmt(mib(p.get('file_bytes')))} |")
         cross = r.get("v1_crosscheck")
         if cross:
             L.append("")
-            L.append(f"v1 cross-check (same run): v1 sampler {cross['v1_sampler_peak_mib']} MiB ({cross['v1_sampler_peak_mb']} MB), "
+            L.append(f"v1 cross-check (same run, ps-RSS on both sides): v1 sampler {cross['v1_sampler_peak_mib']} MiB "
+                     f"({cross['v1_sampler_peak_mb']} MB), "
                      f"v2 owned+external {cross['v2_tree_all_peak_mib']} MiB, difference {cross['difference_mib']} MiB "
                      f"(tolerance {cross['tolerance_mib']}): {'within noise' if cross['within_noise'] else 'OUTSIDE noise'}. "
                      f"Median sample interval v1 {cross.get('v1_interval_ms_median')} ms, v2 {cross.get('v2_interval_ms_median')} ms.")
@@ -2777,7 +2914,8 @@ def render_markdown(report):
                  f"{gb.get('noise_allowance_mib', 'the tree tolerance')} MiB. A scenario the base ran and the head skipped "
                  "blocks.")
         L.append("")
-        L.append("| Scenario | Head verdict | Base verdict | Rule | Head median MiB | Base median MiB | Blocks | Why |")
+        L.append(f"| Scenario | Head verdict | Base verdict | Rule | Head median ({gm.label}) MiB | Base median ({gm.label}) MiB | "
+                 "Blocks | Why |")
         L.append("|---|---|---|---|---|---|---|---|")
         for row in gb.get("rows", []):
             L.append(f"| {row.get('scenario')} | {row.get('verdict')} | {row.get('base_verdict')} | {row.get('rule')} | "
@@ -2799,7 +2937,7 @@ def render_markdown(report):
                      + (f" (merge commits in {ms['range']}" + (f", plus declared {', '.join(ms['declared'])}" if ms.get("declared") else "")
                         + ")" if ms.get("derived") is not None else f" ({ms.get('note')})") + ".")
         L.append("")
-        L.append("| Scenario | Line MiB | Tree delta (allowed) | Owned+external delta | External growth | "
+        L.append("| Scenario | Line MiB | Tree ps-RSS delta (allowed) | Owned+external delta | External growth | "
                  "Process delta, basis (allowed) | Other components over | Design bounds over |")
         L.append("|---|---|---|---|---|---|---|---|")
         for row in lc.get("rows", []):
@@ -2845,7 +2983,8 @@ def render_markdown(report):
         L.append(f"Reconciliation ({rec.get('status', 'open')}): design steady {fmt(rec.get('design_steady_mib'))} MiB; peak "
                  f"{fmt(rec.get('design_peak_mib_7_2_method'))} MiB by the §7.2 method, "
                  f"{fmt(rec.get('design_peak_mib_with_query_overlap'))} MiB with query peaks overlapping the heavy slot; "
-                 f"gate {fmt(rec.get('gate_mib'))} MiB. Measured from {rec.get('measured_from', 'the ledger reference')}."
+                 f"gate {fmt(rec.get('gate_mib'))} MiB (the design lines are on the ps-RSS basis). "
+                 f"Measured from {rec.get('measured_from', 'the ledger reference')}."
                  + (f" Already in the measurement (their lines are not projected again): "
                     f"{', '.join(rec['workstreams_in_measurement'])}." if rec.get("workstreams_in_measurement") else "")
                  + (f" Projected over the design line: {', '.join(over)}." if over else ""))
@@ -2878,6 +3017,7 @@ UNMEASURED = [
     "allocations inside the Rust core and the MCP shim (only process totals are measured)",
     "byte copies per stage",
     "short peaks between 100 ms samples (the gate is a SAMPLED peak; the per-process lifetime maximum is reported beside it)",
+    "PSS at one instant: a sample reads each process's PSS after its ps snapshot, one process after another (milliseconds apart)",
     "exact tokens (a bytes/4 estimate is reported; no tokenizer is loaded)",
     "work inside short-lived children that exit between samples (processes_seen is a lower bound)",
 ]
@@ -2933,13 +3073,25 @@ def median_report(runs):
     return folded
 
 
+def refuse_mixed_metrics(base, metric):
+    """Refuse a baseline gated on another metric than the head: each head-minus-base median
+    would then be the metric change (ps-RSS read 14-26 MiB above PSS on the recorded runs),
+    not the workstream's. A report without gate_metric is from before G5.10: ps-RSS."""
+    if base.get("gate_metric", "rss") != metric:
+        raise SystemExit(f"--baseline has gate_metric {base.get('gate_metric', 'rss')} and the head gates {metric}: medians "
+                         "on two metrics are not a workstream delta; measure the base with this script")
+
+
 def cmd_run(args):
     if args.workstream and not args.baseline:
         raise SystemExit("--workstream needs --baseline <report.json> measured on the same machine")
+    mem_probe = default_probe()
     base = load_json(args.baseline) if args.baseline else None
-    if base is not None and bool(base.get("core_worker")) != args.core_worker:
-        raise SystemExit(f"--baseline was measured with core_worker={bool(base.get('core_worker'))} and this run has "
-                         f"core_worker={args.core_worker}: a worker process on one side only is not a workstream delta")
+    if base is not None:
+        if bool(base.get("core_worker")) != args.core_worker:
+            raise SystemExit(f"--baseline was measured with core_worker={bool(base.get('core_worker'))} and this run has "
+                             f"core_worker={args.core_worker}: a worker process on one side only is not a workstream delta")
+        refuse_mixed_metrics(base, mem_probe.gate_metric)
     ledger = load_json(args.ledger)
     fixtures = load_json(FIXTURES_PATH)
     source_root = os.path.abspath(args.source_root or REPO_ROOT)
@@ -2949,19 +3101,23 @@ def cmd_run(args):
     cache = os.path.abspath(args.fixture_cache or os.environ.get("XMUSTARD_FIXTURE_CACHE")
                             or os.path.join(tempfile.gettempdir(), "xmustard-parity-fixtures"))
     names = select_scenarios(args)
-    api_bin, mcp_bin, core = build_binaries_from(source_root, os.path.join(work, "bin"), args.core_bin)
-    relay_bin = resolve_relay(source_root, args.relay_bin) if any(SCENARIOS[n].get("transport") == "relay" for n in names) else None
+    bin_dir = os.path.join(work, "bin")
+    api_bin, mcp_bin, core_src = build_binaries_from(source_root, bin_dir, args.core_bin)
+    relay_src = resolve_relay(source_root, args.relay_bin) if any(SCENARIOS[n].get("transport") == "relay" for n in names) else None
+    core = private_copy(core_src, bin_dir, "core")
+    relay_bin = private_copy(relay_src, bin_dir, "relay") if relay_src else None
     ctx = {"ledger": ledger, "fixtures": fixtures, "registry": RoleRegistry(ledger["process_roles"]),
-           "probe": default_probe(), "api_bin": api_bin, "mcp_bin": mcp_bin, "core": core, "relay_bin": relay_bin,
+           "probe": mem_probe, "api_bin": api_bin, "mcp_bin": mcp_bin, "core": core, "relay_bin": relay_bin,
            "work": work, "cache": cache, "keep": args.keep, "rounds": args.rounds, "core_worker": args.core_worker}
     ctx["provenance"] = provenance_for(source_root, api_bin, mcp_bin, core, SCRIPTS)
     if relay_bin:
         ctx["provenance"]["binaries_sha256"]["xmustard-relay"] = sha_file(relay_bin)
     report = {"schema": 2, "generated_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-              "gate_limit_bytes": GATE_BYTES, "gate_limit_mib": GATE_MIB, "provenance": ctx["provenance"],
-              "core_worker": args.core_worker,
+              "gate_limit_bytes": GATE_BYTES, "gate_limit_mib": GATE_MIB, "gate_metric": mem_probe.gate_metric,
+              "provenance": ctx["provenance"], "core_worker": args.core_worker,
               "probe": ctx["probe"].name, "fixture_cache": cache, "scenarios": collections.OrderedDict(),
               "unmeasured": UNMEASURED}
+    label = GATE_METRICS[mem_probe.gate_metric].label
     try:
         present = {}
         if any(SCENARIOS[n]["kind"] == "agents" for n in names):
@@ -2984,8 +3140,10 @@ def cmd_run(args):
                 runs.append(r)
                 g = r.get("gate") or {}
                 cross = (r.get("v1_crosscheck") or {}).get("difference_mib")
-                print(f"   run {i + 1}: {r.get('status')} {g.get('verdict', '')} peak {g.get('peak_mib')} MiB"
-                      + (f" (v2 - v1 sampler: {cross} MiB)" if cross is not None else ""), flush=True)
+                rss = ((r.get("sampler") or {}).get("rss") or {}).get("peak_mib")
+                print(f"   run {i + 1}: {r.get('status')} {g.get('verdict', '')} {label} peak {g.get('peak_mib')} MiB, "
+                      f"ps-RSS {fmt(rss)} MiB" + (f" (v2 - v1 sampler, owned+external ps-RSS: {cross} MiB)" if cross is not None else ""),
+                      flush=True)
                 if r.get("status") != "ran":
                     break
             report["scenarios"][n] = median_report(runs)
@@ -3016,7 +3174,8 @@ def cmd_run(args):
     write_reports(report, out_dir)
     code = exit_code(report, args.require_parity_claim)
     gb = report.get("gate_blocking")
-    print(json.dumps({"verdict": report["verdict"], "exit": code, "parity_claim": report["parity_claim"]["established"],
+    print(json.dumps({"verdict": report["verdict"], "gate_metric": report["gate_metric"], "exit": code,
+                      "parity_claim": report["parity_claim"]["established"],
                       "ledger_check": (report.get("ledger_check") or {}).get("verdict"),
                       "blocking_scenarios": [r["scenario"] for r in gb["rows"] if r["blocking"]] if gb else None,
                       "scenarios": {n: (r.get("gate") or {}).get("verdict", r.get("status")) for n, r in report["scenarios"].items()},
@@ -3066,6 +3225,7 @@ def cmd_ledger(args):
         if not (args.head and args.baseline):
             raise SystemExit("ledger --workstream needs --head and --baseline report.json files")
         head, base = load_json(args.head), load_json(args.baseline)
+        refuse_mixed_metrics(base, head.get("gate_metric", "rss"))
         merged = merged_since(ledger, (base.get("provenance") or {}).get("head"))
         chk = ledger_check(ledger, args.workstream, ledger_view(head), ledger_view(base), scenario_status(head),
                            scenario_status(base), merged["workstreams"])
