@@ -129,8 +129,8 @@ fn adopt_umask_from_env() {
     if let Ok(octal) = std::env::var("XMUSTARD_UMASK_OCTAL") {
         let mask = u32::from_str_radix(&octal, 8).unwrap();
         // SAFETY: a single-threaded child of this test binary, before any other test thread
-        // exists, so the process-global umask has no concurrent reader. `mode_t` is u16 in
-        // the libc crate; a umask fits in 9 bits, so the narrowing is always exact.
+        // exists, so the process-global umask has no concurrent reader. `mode_t` is u16 on
+        // macOS and u32 on Linux; a umask fits in 9 bits, so the narrowing is always exact.
         let mode = mask as libc::mode_t;
         unsafe {
             libc::umask(mode);

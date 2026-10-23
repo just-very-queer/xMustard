@@ -239,11 +239,8 @@ mod tests {
         let mut roomy = String::with_capacity(4096);
         roomy.push_str("{\"a\":1}");
         let at = roomy.as_ptr();
-        assert_eq!(
-            attach(roomy, &c).as_ptr(),
-            at,
-            "the result is edited in place"
-        );
+        let attached = attach(roomy, &c);
+        assert_eq!(attached.as_ptr(), at, "the result is edited in place");
         let parsed: serde_json::Value =
             serde_json::from_str(&attach("{\"a\":[1]}".into(), &c)).unwrap();
         assert_eq!(parsed["pass_counters"]["rows_loaded"], 6);
