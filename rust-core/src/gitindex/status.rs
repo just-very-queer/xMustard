@@ -45,8 +45,10 @@ pub struct Repo {
     pub hash: Hash,
     /// `core.excludesFile`, or Git's default (`$XDG_CONFIG_HOME/git/ignore`).
     pub excludes_file: Option<PathBuf>,
-    /// `core.ignorecase`: the reader follows case-sensitive matching only.
+    /// `core.ignorecase`: Git's case-insensitive path matching setting.
     pub ignore_case: bool,
+    /// `core.symlinks`: false means symlinks are checked out as regular files.
+    pub symlinks: bool,
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String, Refusal> {
@@ -87,6 +89,7 @@ impl Repo {
         .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
         let mut ignore_case = false;
+        let mut symlinks = true;
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let rec = String::from_utf8_lossy(rec);
             let (key, value) = rec.split_once('\n').unwrap_or((&rec, ""));
@@ -96,6 +99,12 @@ impl Repo {
                     ignore_case = matches!(
                         value.to_ascii_lowercase().as_str(),
                         "true" | "yes" | "on" | "1" | ""
+                    )
+                }
+                "core.symlinks" => {
+                    symlinks = !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "false" | "no" | "off" | "0"
                     )
                 }
                 _ => {}
@@ -109,24 +118,12 @@ impl Repo {
             hash,
             excludes_file,
             ignore_case,
+            symlinks,
         })
-    }
-
-    /// Refuse what the reader does not follow (checked before any answer).
-    ///
-    /// **`core.ignorecase` is no longer a refusal** (WS-RT18b). Git folds case when it
-    /// compares paths on a case-insensitive volume, and the reader now folds it the
-    /// same way, so a repository whose index is sorted the way Git sorts it is read
-    /// here too. The index's order is checked when it is opened, because an index
-    /// written before the setting changed is sorted the other way and the reader's
-    /// cursor would stop early and miss entries.
-    pub(crate) fn check(&self) -> Result<(), Refusal> {
-        Ok(())
     }
 
     /// The index of this checkout, opened and verified.
     pub fn index(&self) -> Result<Index, Refusal> {
-        self.check()?;
         let ix = Index::open(&self.git_dir, self.hash)?;
         ix.verify_order(self.ignore_case)?;
         Ok(ix)
@@ -322,6 +319,9 @@ impl Run<'_> {
                 true => Ok(Side::Is(b'T')),
                 false => Ok(Side::Is(b'D')),
             },
+            (want, kind) if want == 0o120000 && kind == 0o100000 && !self.repo.symlinks => {
+                Ok(Side::Ask)
+            }
             (w, k) if w != k => Ok(Side::Is(b'T')),
             _ => {
                 let racy = self.index_mtime != 0 && self.index_mtime <= e.stat.mtime.0;
@@ -547,21 +547,42 @@ pub(crate) fn track(
 /// or changed or untracked content. A directory that is not a checked-out repository
 /// (an uninitialised submodule) does not.
 fn submodule_dirty(dir: &Path, oid: &Oid) -> Result<bool, Refusal> {
+    submodule_dirty_with_head(dir, oid, |dir| {
+        run_git_bounded(
+            dir,
+            &["rev-parse", "-q", "--verify", "HEAD"],
+            64 << 10,
+            git_timeout(),
+        )
+    })
+}
+
+fn submodule_dirty_with_head(
+    dir: &Path,
+    oid: &Oid,
+    head_probe: impl FnOnce(&Path) -> Result<Vec<u8>, crate::indexcache::GitRunError>,
+) -> Result<bool, Refusal> {
     if !super::walk::is_repository(dir) {
         return Ok(false);
     }
-    let head = run_git_bounded(
-        dir,
-        &["rev-parse", "-q", "--verify", "HEAD"],
-        64 << 10,
-        git_timeout(),
-    )
-    .ok()
-    .and_then(|b| Oid::parse_hex(&String::from_utf8_lossy(&b)));
-    let Some(head) = head else {
-        return Ok(false);
+    let head = match head_probe(dir) {
+        Ok(bytes) => Some(
+            Oid::parse_hex(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
+                Refusal::Failed(format!(
+                    "submodule {}: rev-parse returned an invalid HEAD",
+                    dir.display()
+                ))
+            })?,
+        ),
+        Err(crate::indexcache::GitRunError::Failed) => None,
+        Err(error) => {
+            return Err(Refusal::Failed(format!(
+                "submodule {}: rev-parse: {error}",
+                dir.display()
+            )));
+        }
     };
-    if head != *oid {
+    if head.is_some_and(|head| head != *oid) {
         return Ok(true);
     }
     let sub = Repo::open(dir)?;
@@ -570,12 +591,25 @@ fn submodule_dirty(dir: &Path, oid: &Oid) -> Result<bool, Refusal> {
         untracked: true,
         list_ignored: false,
     };
-    status(&sub, opts, &mut |_| {
+    let outcome = status(&sub, opts, &mut |_| {
         dirty = true;
         ControlFlow::Break(())
     })
     .map_err(|e| Refusal::Failed(format!("submodule {}: {e}", dir.display())))?;
+    if !dirty {
+        ensure_complete_submodule(dir, &outcome)?;
+    }
     Ok(dirty)
+}
+
+fn ensure_complete_submodule(dir: &Path, outcome: &Outcome) -> Result<(), Refusal> {
+    if let Some(reason) = &outcome.untracked_incomplete {
+        return Err(Refusal::Failed(format!(
+            "submodule {}: untracked walk incomplete: {reason}",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// One path whose worktree side Git decides: the index entry to compare it with.
@@ -647,7 +681,7 @@ fn refresh_one(repo: &Repo, items: &[Probe<'_>]) -> Result<Vec<bool>, Refusal> {
             "-q",
             "--refresh",
         ])
-        .env("GIT_INDEX_FILE", &file.0)
+        .env("GIT_INDEX_FILE", &file.path)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -657,7 +691,7 @@ fn refresh_one(repo: &Repo, items: &[Probe<'_>]) -> Result<Vec<bool>, Refusal> {
     if !status.success() {
         return Err(Refusal::Failed("git update-index --refresh failed".into()));
     }
-    let back = Index::open_file(&file.0, repo.hash)?;
+    let back = Index::open_file(&file.path, repo.hash)?;
     let mut entries = back.entries()?;
     let mut dirty = vec![true; items.len()];
     let mut at = 0usize;
@@ -701,32 +735,37 @@ fn wait_bounded(
 }
 
 /// A private index file, removed (with Git's lock file) when dropped.
-struct PrivateIndex(PathBuf);
+struct PrivateIndex {
+    path: PathBuf,
+    _dir: tempfile::TempDir,
+}
 
 impl PrivateIndex {
     fn create(bytes: &[u8]) -> Result<PrivateIndex, Refusal> {
         use std::io::Write;
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("xm-refresh-{}-{n}.index", std::process::id()));
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir = tempfile::Builder::new()
+            .prefix("xm-refresh-")
+            .permissions(fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .map_err(|e| Refusal::Failed(format!("private index directory: {e}")))?;
+        let path = dir.path().join("index");
         let mut f = fs::File::options()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
             .map_err(|e| Refusal::Failed(format!("private index {}: {e}", path.display())))?;
-        let guard = PrivateIndex(path);
         f.write_all(bytes)
             .map_err(|e| Refusal::Failed(format!("private index: {e}")))?;
-        Ok(guard)
+        Ok(PrivateIndex { path, _dir: dir })
     }
 }
 
 impl Drop for PrivateIndex {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-        let mut lock = self.0.clone().into_os_string();
+        let _ = fs::remove_file(&self.path);
+        let mut lock = self.path.clone().into_os_string();
         lock.push(".lock");
         let _ = fs::remove_file(lock);
     }
@@ -825,4 +864,104 @@ pub(crate) fn head_changes(repo: &Repo) -> Result<Option<Vec<HeadChange>>, Refus
         .collect();
     changed.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Some(changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        Outcome, PrivateIndex, Refusal, ensure_complete_submodule, submodule_dirty_with_head,
+    };
+    use crate::indexcache::GitRunError;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_refresh_index_is_owner_only() {
+        let file = PrivateIndex::create(b"private index").unwrap();
+        let mode = std::fs::metadata(&file.path).unwrap().permissions().mode() & 0o777;
+        let dir_mode = std::fs::metadata(file.path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(dir_mode, 0o700);
+    }
+
+    #[test]
+    fn private_refresh_directory_protects_git_replacement_and_lock_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(
+            git(&["config", "user.email", "test@example.com"])
+                .status
+                .success()
+        );
+        assert!(git(&["config", "user.name", "Test"]).status.success());
+        std::fs::write(repo.join("tracked"), b"content").unwrap();
+        assert!(git(&["add", "tracked"]).status.success());
+        assert!(git(&["commit", "-qm", "tracked"]).status.success());
+        let source_index = std::fs::read(repo.join(".git/index")).unwrap();
+        std::fs::write(repo.join("tracked"), b"content").unwrap();
+        let private = PrivateIndex::create(&source_index).unwrap();
+        let index_dir = private.path.parent().unwrap().to_owned();
+        let lock_path = private.path.with_file_name("index.lock");
+        let status = std::process::Command::new("sh")
+            .args(["-c", "umask 022; exec git update-index -q --refresh"])
+            .current_dir(repo)
+            .env("GIT_INDEX_FILE", &private.path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(&index_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for entry in std::fs::read_dir(&index_dir).unwrap() {
+            let entry = entry.unwrap();
+            assert_eq!(
+                entry.metadata().unwrap().permissions().mode() & 0o777,
+                0o644
+            );
+        }
+        assert!(private.path.exists());
+        assert!(!lock_path.exists());
+        drop(private);
+        assert!(!index_dir.exists());
+    }
+
+    #[test]
+    fn incomplete_nested_walk_refuses_a_clean_submodule() {
+        let outcome = Outcome {
+            hidden: Vec::new(),
+            untracked_incomplete: Some("walk exceeded its bound".into()),
+        };
+        let refusal =
+            ensure_complete_submodule(std::path::Path::new("child"), &outcome).unwrap_err();
+        assert!(matches!(refusal, Refusal::Failed(message)
+            if message.contains("child") && message.contains("walk exceeded its bound")));
+    }
+
+    #[test]
+    fn submodule_head_execution_error_is_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let oid = super::Oid::parse_hex(&"0".repeat(40)).unwrap();
+        let refusal = submodule_dirty_with_head(dir.path(), &oid, |_| {
+            Err(GitRunError::Spawn("shimmed spawn failure".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(refusal, Refusal::Failed(message)
+            if message.contains("submodule") && message.contains("rev-parse")));
+    }
 }

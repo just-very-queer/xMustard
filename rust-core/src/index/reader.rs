@@ -1341,6 +1341,21 @@ pub fn resident() -> Option<&'static Snapshots> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn refusal_recorded_for_a_root_is_taken_through_its_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        let alias = dir.path().join("alias");
+        fs::create_dir(&root).unwrap();
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+
+        record_refusal(&root, "index was refused");
+        assert_eq!(
+            take_last_refusal(&alias).as_deref(),
+            Some("index was refused")
+        );
+    }
+
     // Coverage comes from meta JSON with defaulted fields, so its counts need not agree:
     // more envelope losses than eligible files must not underflow.
     #[test]

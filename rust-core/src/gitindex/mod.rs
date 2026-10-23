@@ -31,41 +31,16 @@ use crate::indexcache::StatusEntry;
 pub use reader::Oid;
 pub use status::HeadChange;
 
-/// Compares two index paths the way the repository compares them.
-///
-/// Git sorts and looks the index up with `cache_name_compare`, which folds case when
-/// `core.ignorecase` is set: on a case-insensitive volume (macOS) the worktree's path
-/// may differ in case from the one the index holds, and a byte-wise comparison would
-/// call that file deleted and untracked at once. This is git's own comparator
-/// (`strcasecmp`, ASCII), so the reader and Git agree on which path is which
-/// (WS-RT18b).
-pub(crate) fn cmp_paths(a: &[u8], b: &[u8], ignore_case: bool) -> Ordering {
-    if !ignore_case {
-        return a.cmp(b);
-    }
-    a.iter()
-        .map(|c| c.to_ascii_lowercase())
-        .cmp(b.iter().map(|c| c.to_ascii_lowercase()))
-}
-
-/// Whether `path` starts with `prefix`, compared the way the repository compares
-/// paths (WS-RT18b).
-pub(crate) fn path_starts_with(path: &[u8], prefix: &[u8], ignore_case: bool) -> bool {
-    if !ignore_case {
-        return path.starts_with(prefix);
-    }
-    path.len() >= prefix.len()
-        && path[..prefix.len()]
-            .iter()
-            .zip(prefix)
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+/// Compares two index paths in Git's byte-sorted index order.
+pub(crate) fn cmp_paths(a: &[u8], b: &[u8]) -> Ordering {
+    a.cmp(b)
 }
 
 /// Why the reader gave no answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
     /// A layout the reader does not follow: a sparse index, an unknown required
-    /// extension, index version or object format, `core.ignorecase`.
+    /// extension, or an unsupported index version or object format.
     Unsupported(String),
     /// The index or the worktree could not be read: a checksum mismatch, a truncated
     /// file, an I/O error, a Git child that failed.

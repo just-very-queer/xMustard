@@ -16,6 +16,7 @@
 //! returns the reason instead of a partial answer that reads as complete.
 
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::Read;
 use std::ops::ControlFlow;
@@ -156,16 +157,19 @@ struct Frame {
     held: usize,
 }
 
-/// What the walk compares worktree paths with: the index, one entry at a time.
-///
-/// The comparison folds case when the repository's `core.ignorecase` is set, the
-/// way Git's own index lookup does (WS-RT18b): on a case-insensitive volume the
-/// worktree's path may differ in case from the index's, and a byte-wise comparison
-/// would call the file deleted and untracked at once.
+/// Folded index paths retained for case-insensitive membership checks, including the
+/// path buffer and an estimate of the ordered-set node overhead.
+const MAX_FOLDED_INDEX_BYTES: usize = 8 << 20;
+const FOLDED_PATH_OVERHEAD: usize = std::mem::size_of::<Vec<u8>>() + 32;
+
+/// What the walk compares worktree paths with: the index, one entry at a time. The
+/// cursor advances in byte order; case-insensitive membership uses the bounded set.
 struct Cursor<'a> {
     entries: Entries<'a>,
     cur: Option<Vec<u8>>,
     gitlinks: Vec<Vec<u8>>,
+    folded_paths: BTreeSet<Vec<u8>>,
+    folded_gitlinks: BTreeSet<Vec<u8>>,
     started: bool,
     ignore_case: bool,
 }
@@ -179,11 +183,7 @@ impl Cursor<'_> {
                 self.load()?;
             }
             match &self.cur {
-                Some(p)
-                    if crate::gitindex::cmp_paths(p, key, self.ignore_case) == Ordering::Less =>
-                {
-                    self.load()?
-                }
+                Some(p) if crate::gitindex::cmp_paths(p, key) == Ordering::Less => self.load()?,
                 _ => return Ok(()),
             }
         }
@@ -205,28 +205,80 @@ impl Cursor<'_> {
         Ok(())
     }
 
-    /// The index holds the file `path` (after `advance(path)`).
     fn holds_file(&self, path: &[u8]) -> bool {
         match &self.cur {
-            Some(p) => crate::gitindex::cmp_paths(p, path, self.ignore_case) == Ordering::Equal,
-            None => false,
+            Some(p) if !self.ignore_case => p == path,
+            Some(p) if p == path => true,
+            _ => self.ignore_case && self.folded_paths.contains(&fold_ascii(path)),
         }
     }
 
     /// The index holds paths under `dir` (`a/b/`, after `advance(dir)`).
     fn holds_under(&self, dir: &[u8]) -> bool {
-        self.cur
+        if self
+            .cur
             .as_deref()
-            .is_some_and(|p| crate::gitindex::path_starts_with(p, dir, self.ignore_case))
+            .is_some_and(|path| path.starts_with(dir))
+        {
+            return true;
+        }
+        if !self.ignore_case {
+            return false;
+        }
+        let folded = fold_ascii(dir);
+        self.folded_paths
+            .range(folded.clone()..)
+            .next()
+            .is_some_and(|path| path.starts_with(&folded))
     }
 
-    /// `dir` (`a/b/`) is a gitlink of the index (after `advance(dir)`).
+    /// `dir` (`a/b/`) is a gitlink of the index.
     fn is_gitlink(&self, dir: &[u8]) -> bool {
         let path = &dir[..dir.len() - 1];
-        self.gitlinks
-            .binary_search_by(|g| g.as_slice().cmp(path))
-            .is_ok()
+        if self.ignore_case {
+            self.folded_gitlinks.contains(&fold_ascii(path))
+        } else {
+            self.gitlinks
+                .binary_search_by(|gitlink| gitlink.as_slice().cmp(path))
+                .is_ok()
+        }
     }
+}
+
+fn fold_ascii(path: &[u8]) -> Vec<u8> {
+    path.iter().map(u8::to_ascii_lowercase).collect()
+}
+
+fn starts_with_ascii_folded(path: &[u8], prefix: &[u8]) -> bool {
+    path.len() >= prefix.len()
+        && path[..prefix.len()]
+            .iter()
+            .zip(prefix)
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
+fn remember_folded_path(
+    path: &[u8],
+    is_gitlink: bool,
+    bytes_held: &mut usize,
+    paths: &mut BTreeSet<Vec<u8>>,
+    gitlinks: &mut BTreeSet<Vec<u8>>,
+) -> Result<(), Refusal> {
+    let folded = fold_ascii(path);
+    let cost = folded.len()
+        + FOLDED_PATH_OVERHEAD
+        + usize::from(is_gitlink) * (folded.len() + FOLDED_PATH_OVERHEAD);
+    if bytes_held.saturating_add(cost) > MAX_FOLDED_INDEX_BYTES {
+        return Err(Refusal::Unsupported(format!(
+            "case-folded index paths exceed {MAX_FOLDED_INDEX_BYTES} bytes"
+        )));
+    }
+    *bytes_held += cost;
+    paths.insert(folded.clone());
+    if is_gitlink {
+        gitlinks.insert(folded);
+    }
+    Ok(())
 }
 
 struct Walk<'a> {
@@ -280,8 +332,16 @@ impl Walk<'_> {
                         return Err(format!("more than {MAX_HELD_RULES} ignore rules apply"));
                     }
                     self.rules.push(Rule {
-                        base: base.to_vec(),
-                        glob: Glob::compile(pattern.as_bytes()),
+                        base: if self.repo.ignore_case {
+                            fold_ascii(base)
+                        } else {
+                            base.to_vec()
+                        },
+                        glob: if self.repo.ignore_case {
+                            Glob::compile_ascii_case_insensitive(pattern.as_bytes())
+                        } else {
+                            Glob::compile(pattern.as_bytes())
+                        },
                         negate,
                         dir_only,
                         anchored,
@@ -294,11 +354,18 @@ impl Walk<'_> {
 
     /// Whether `path` (no trailing `/`) is ignored by the rules in force.
     fn excluded(&self, path: &[u8], is_dir: bool) -> bool {
+        let folded_path;
+        let path = if self.repo.ignore_case {
+            folded_path = fold_ascii(path);
+            folded_path.as_slice()
+        } else {
+            path
+        };
         self.rules
             .iter()
             .rev()
-            .find(|r| r.matches(path, is_dir))
-            .is_some_and(|r| !r.negate)
+            .find(|rule| rule.matches(path, is_dir))
+            .is_some_and(|rule| !rule.negate)
     }
 
     /// The sorted children of directory `path` (`""` or `dir/`), without `.git`, and
@@ -375,7 +442,11 @@ impl Walk<'_> {
     /// Whether directory `path` (`dir/`) is reported or entered at all: it is under
     /// the prefix, or leads to it.
     fn in_scope(&self, path: &[u8]) -> bool {
-        path.starts_with(self.prefix) || self.prefix.starts_with(path)
+        path.starts_with(self.prefix)
+            || self.prefix.starts_with(path)
+            || (self.repo.ignore_case
+                && (starts_with_ascii_folded(path, self.prefix)
+                    || starts_with_ascii_folded(self.prefix, path)))
     }
 }
 
@@ -397,10 +468,27 @@ pub(crate) fn untracked(
         held: 0,
         started: Instant::now(),
     };
+    let mut folded_paths = BTreeSet::new();
+    let mut folded_gitlinks = BTreeSet::new();
+    if repo.ignore_case {
+        let mut entries = ix.entries()?;
+        let mut bytes_held = 0usize;
+        while let Some(entry) = entries.read_next()? {
+            remember_folded_path(
+                &entry.path,
+                entry.mode == MODE_GITLINK,
+                &mut bytes_held,
+                &mut folded_paths,
+                &mut folded_gitlinks,
+            )?;
+        }
+    }
     let mut cursor = Cursor {
         entries: ix.entries()?,
         cur: None,
         gitlinks: Vec::new(),
+        folded_paths,
+        folded_gitlinks,
         started: false,
         ignore_case: repo.ignore_case,
     };
@@ -447,7 +535,8 @@ pub(crate) fn untracked(
             path,
             orig_path: None,
         };
-        let below_prefix = path.starts_with(prefix);
+        let below_prefix = path.starts_with(prefix)
+            || (repo.ignore_case && starts_with_ascii_folded(&path, prefix));
         let flow = match kind {
             Kind::File => {
                 if cursor.holds_file(&path)
@@ -503,4 +592,23 @@ pub(crate) fn untracked(
         }
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_FOLDED_INDEX_BYTES, remember_folded_path};
+    use crate::gitindex::Refusal;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn folded_index_membership_refuses_paths_over_its_bound() {
+        let path = vec![b'x'; MAX_FOLDED_INDEX_BYTES];
+        let mut bytes_held = 0;
+        let mut paths = BTreeSet::new();
+        let mut gitlinks = BTreeSet::new();
+        assert!(matches!(
+            remember_folded_path(&path, false, &mut bytes_held, &mut paths, &mut gitlinks),
+            Err(Refusal::Unsupported(message)) if message.contains("case-folded index paths")
+        ));
+    }
 }
