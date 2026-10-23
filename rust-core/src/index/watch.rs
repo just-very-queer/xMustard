@@ -666,8 +666,8 @@ impl Root {
     /// The thread body: establish the native watcher, then turn events into changes.
     fn run(self: Arc<Self>, rx: Receiver<notify::Result<Event>>) {
         self.establish(Instant::now());
+        let mut wait = self.next_wakeup(Instant::now());
         while !self.stop.load(Ordering::Acquire) {
-            let wait = self.next_wakeup(Instant::now());
             match rx.recv_timeout(wait) {
                 Ok(_) if self.stop.load(Ordering::Acquire) => break,
                 Ok(ev) => {
@@ -682,12 +682,16 @@ impl Root {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
-            #[cfg(test)]
-            self.wakeups.fetch_add(1, Ordering::Relaxed);
             if self.stop.load(Ordering::Acquire) {
                 break;
             }
             self.tick(Instant::now());
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            wait = self.next_wakeup(Instant::now());
+            #[cfg(test)]
+            self.wakeups.fetch_add(1, Ordering::Relaxed);
         }
         lock(&self.inner).native = None;
     }
@@ -1851,8 +1855,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (notices, notifier) = due_notices();
         let (root, rx) = Root::new(dir.path().to_path_buf(), Some(notifier), MAX_WATCH_DIRS);
-        let worker = root.clone();
-        let thread = std::thread::spawn(move || worker.run(rx));
+        let mut watcher = start_test_watcher(root.clone(), rx);
 
         std::thread::sleep(Duration::from_secs(2));
         let wakeups = root.wakeups.load(Ordering::Relaxed);
@@ -1860,19 +1863,43 @@ mod tests {
 
         let notices_before_retire = notices.load(Ordering::Relaxed);
         lock(&root.inner).due_notified = Some(Instant::now() - RENOTIFY_AFTER);
-        let started = Instant::now();
-        root.retire();
-        thread.join().expect("watch thread exits");
-        assert!(started.elapsed() < Duration::from_millis(500));
+        let elapsed = watcher.retire();
+        assert!(elapsed < Duration::from_millis(500));
         assert_eq!(lock(&root.inner).counters.events, 0);
         assert_eq!(notices.load(Ordering::Relaxed), notices_before_retire);
     }
 
-    fn start_test_watcher(
+    struct TestWatcher {
         root: Arc<Root>,
-        rx: Receiver<notify::Result<Event>>,
-    ) -> std::thread::JoinHandle<()> {
-        std::thread::spawn(move || root.run(rx))
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestWatcher {
+        fn retire(&mut self) -> Duration {
+            let started = Instant::now();
+            if let Some(thread) = self.thread.take() {
+                self.root.retire();
+                thread.join().expect("watch thread exits");
+            }
+            started.elapsed()
+        }
+    }
+
+    impl Drop for TestWatcher {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                self.root.retire();
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn start_test_watcher(root: Arc<Root>, rx: Receiver<notify::Result<Event>>) -> TestWatcher {
+        let worker = root.clone();
+        TestWatcher {
+            root,
+            thread: Some(std::thread::spawn(move || worker.run(rx))),
+        }
     }
 
     #[test]
@@ -1880,7 +1907,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (notices, notifier) = due_notices();
         let (root, rx) = Root::new(dir.path().to_path_buf(), Some(notifier), MAX_WATCH_DIRS);
-        let thread = start_test_watcher(root.clone(), rx);
+        let mut watcher = start_test_watcher(root.clone(), rx);
         let first = Instant::now() + MAX_WAIT + DEBOUNCE;
         while Instant::now() < first && notices.load(Ordering::Relaxed) == 0 {
             std::thread::sleep(Duration::from_millis(5));
@@ -1910,8 +1937,7 @@ mod tests {
             notices.load(Ordering::Relaxed) >= 2,
             "retry notification did not arrive promptly"
         );
-        root.retire();
-        thread.join().expect("watch thread exits");
+        watcher.retire();
     }
 
     #[test]
@@ -1919,7 +1945,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temp dir");
         let (notices, notifier) = due_notices();
         let (root, rx) = Root::new(dir.path().to_path_buf(), Some(notifier), MAX_WATCH_DIRS);
-        let thread = start_test_watcher(root.clone(), rx);
+        let mut watcher = start_test_watcher(root.clone(), rx);
         let deadline = Instant::now() + MAX_WAIT + DEBOUNCE;
         while Instant::now() < deadline && notices.load(Ordering::Relaxed) == 0 {
             std::thread::sleep(Duration::from_millis(5));
@@ -1960,8 +1986,7 @@ mod tests {
             notices.load(Ordering::Relaxed) >= 2,
             "pending batch notification missing"
         );
-        root.retire();
-        thread.join().expect("watch thread exits");
+        watcher.retire();
     }
 
     #[test]
