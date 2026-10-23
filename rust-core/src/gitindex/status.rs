@@ -547,15 +547,25 @@ pub(crate) fn track(
 /// or changed or untracked content. A directory that is not a checked-out repository
 /// (an uninitialised submodule) does not.
 fn submodule_dirty(dir: &Path, oid: &Oid) -> Result<bool, Refusal> {
+    submodule_dirty_with_head(dir, oid, |dir| {
+        run_git_bounded(
+            dir,
+            &["rev-parse", "-q", "--verify", "HEAD"],
+            64 << 10,
+            git_timeout(),
+        )
+    })
+}
+
+fn submodule_dirty_with_head(
+    dir: &Path,
+    oid: &Oid,
+    head_probe: impl FnOnce(&Path) -> Result<Vec<u8>, crate::indexcache::GitRunError>,
+) -> Result<bool, Refusal> {
     if !super::walk::is_repository(dir) {
         return Ok(false);
     }
-    let head = match run_git_bounded(
-        dir,
-        &["rev-parse", "-q", "--verify", "HEAD"],
-        64 << 10,
-        git_timeout(),
-    ) {
+    let head = match head_probe(dir) {
         Ok(bytes) => Some(
             Oid::parse_hex(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
                 Refusal::Failed(format!(
@@ -581,12 +591,25 @@ fn submodule_dirty(dir: &Path, oid: &Oid) -> Result<bool, Refusal> {
         untracked: true,
         list_ignored: false,
     };
-    status(&sub, opts, &mut |_| {
+    let outcome = status(&sub, opts, &mut |_| {
         dirty = true;
         ControlFlow::Break(())
     })
     .map_err(|e| Refusal::Failed(format!("submodule {}: {e}", dir.display())))?;
+    if !dirty {
+        ensure_complete_submodule(dir, &outcome)?;
+    }
     Ok(dirty)
+}
+
+fn ensure_complete_submodule(dir: &Path, outcome: &Outcome) -> Result<(), Refusal> {
+    if let Some(reason) = &outcome.untracked_incomplete {
+        return Err(Refusal::Failed(format!(
+            "submodule {}: untracked walk incomplete: {reason}",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// One path whose worktree side Git decides: the index entry to compare it with.
@@ -842,7 +865,10 @@ pub(crate) fn head_changes(repo: &Repo) -> Result<Option<Vec<HeadChange>>, Refus
 
 #[cfg(test)]
 mod tests {
-    use super::PrivateIndex;
+    use super::{
+        Outcome, PrivateIndex, Refusal, ensure_complete_submodule, submodule_dirty_with_head,
+    };
+    use crate::indexcache::GitRunError;
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
@@ -850,5 +876,33 @@ mod tests {
         let file = PrivateIndex::create(b"private index").unwrap();
         let mode = std::fs::metadata(&file.0).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn incomplete_nested_walk_refuses_a_clean_submodule() {
+        let outcome = Outcome {
+            hidden: Vec::new(),
+            untracked_incomplete: Some("walk exceeded its bound".into()),
+        };
+        let refusal =
+            ensure_complete_submodule(std::path::Path::new("child"), &outcome).unwrap_err();
+        assert!(matches!(refusal, Refusal::Failed(message)
+            if message.contains("child") && message.contains("walk exceeded its bound")));
+    }
+
+    #[test]
+    fn submodule_head_execution_error_is_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(git_dir.join("objects")).unwrap();
+        std::fs::create_dir_all(git_dir.join("refs")).unwrap();
+        std::fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
+        let oid = super::Oid::parse_hex(&"0".repeat(40)).unwrap();
+        let refusal = submodule_dirty_with_head(dir.path(), &oid, |_| {
+            Err(GitRunError::Spawn("shimmed spawn failure".into()))
+        })
+        .unwrap_err();
+        assert!(matches!(refusal, Refusal::Failed(message)
+            if message.contains("submodule") && message.contains("rev-parse")));
     }
 }

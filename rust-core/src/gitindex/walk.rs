@@ -338,13 +338,7 @@ impl Walk<'_> {
                             base.to_vec()
                         },
                         glob: if self.repo.ignore_case {
-                            Glob::compile(
-                                &pattern
-                                    .as_bytes()
-                                    .iter()
-                                    .map(u8::to_ascii_lowercase)
-                                    .collect::<Vec<_>>(),
-                            )
+                            Glob::compile_ascii_case_insensitive(pattern.as_bytes())
                         } else {
                             Glob::compile(pattern.as_bytes())
                         },

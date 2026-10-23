@@ -74,6 +74,37 @@ fn unborn_submodule_head_still_reports_its_untracked_worktree() {
 }
 
 #[test]
+fn submodule_with_incomplete_untracked_walk_refuses_parent_status() {
+    let fx = clean();
+    let child = fx.root.join("child");
+    init(&child, &[]);
+    commit(&child, "submodule base");
+    let oid = String::from_utf8(git(&child, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    git(
+        &fx.root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &oid,
+            "child",
+        ],
+    );
+    let wide = child.join("wide");
+    fs::create_dir(&wide).unwrap();
+    for i in 0..160_000 {
+        fs::File::create(wide.join(format!("f{i}"))).unwrap();
+    }
+    let err = refusal(&fx.root);
+    assert!(matches!(err, Refusal::Failed(message)
+        if message.contains("submodule") && message.contains("untracked walk incomplete")));
+}
+
+#[test]
 fn core_symlinks_false_compares_the_link_text_as_file_content() {
     let fx = clean();
     symlink(&fx.root, "target.txt", "link");
@@ -97,12 +128,23 @@ fn ignorecase_cursor_matches_a_lowercase_index_entry_to_an_uppercase_worktree_na
 #[test]
 fn ignorecase_exclusion_patterns_match_ascii_case_insensitively() {
     let fx = clean();
-    write(&fx.root, ".gitignore", b"CACHE/\n*.TMP\n");
+    write(
+        &fx.root,
+        ".gitignore",
+        b"CACHE/\n*.TMP\n[!A-z].range\n[!A-Z].neg\n[A-Z].pos\n",
+    );
     commit(&fx.root, "ignore rules");
     git(&fx.root, &["config", "core.ignorecase", "true"]);
     write(&fx.root, "cache/file", b"ignored\n");
     write(&fx.root, "scratch.tmp", b"ignored\n");
-    assert_same_view("core.ignorecase ignore rules", &fx.root);
+    write(&fx.root, "_.range", b"not ignored by the A-z range\n");
+    write(&fx.root, "_.neg", b"matches the negated class\n");
+    write(&fx.root, "a.pos", b"ignored by the positive A-Z class\n");
+    write(&fx.root, "A.POS", b"ignored by the positive A-Z class\n");
+    assert_same_view(
+        "core.ignorecase ignore rules and character ranges",
+        &fx.root,
+    );
 }
 
 #[test]

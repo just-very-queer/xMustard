@@ -433,7 +433,29 @@ const STACK_WORDS: usize = 17;
 
 impl Glob {
     pub fn compile(p: &[u8]) -> Glob {
-        let (toks, classes) = parse(p);
+        Self::from_parts(parse(p))
+    }
+
+    /// Compile with ASCII-insensitive matching without changing the pattern syntax.
+    pub fn compile_ascii_case_insensitive(p: &[u8]) -> Glob {
+        let (mut toks, mut classes) = parse(p);
+        for tok in &mut toks {
+            if let Tok::Lit(c) = tok {
+                *c = c.to_ascii_lowercase();
+            }
+        }
+        for set in &mut classes {
+            for c in b'A'..=b'Z' {
+                if set_has(set, c) || set_has(set, c.to_ascii_lowercase()) {
+                    set_bit(set, c as usize);
+                    set_bit(set, c.to_ascii_lowercase() as usize);
+                }
+            }
+        }
+        Self::from_parts((toks, classes))
+    }
+
+    fn from_parts((toks, classes): (Vec<Tok>, Vec<ByteSet>)) -> Glob {
         let literal: Option<Vec<u8>> = toks
             .iter()
             .map(|t| match t {
