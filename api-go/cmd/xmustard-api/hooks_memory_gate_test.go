@@ -20,7 +20,7 @@ func hookMemoryFixture(t *testing.T, p exposurePosture) *hookFixture {
 	f := newHookFixture(t)
 	p.Loopback = true
 	f.srv.Close()
-	f.srv = httptest.NewServer(buildHandler(serverConfig{host: "127.0.0.1", authMode: "auto", dataDir: f.dir, posture: p}, newAPIHandlerFor(p)))
+	f.srv = httptest.NewServer(buildHandler(serverConfig{host: "127.0.0.1", authMode: "auto", dataDir: f.dir, posture: p}, newAPIHandlerForWithHookDependencies(p, f.deps)))
 	t.Cleanup(f.srv.Close)
 	t.Cleanup(func() { waitRegistrationBaselines(t) })
 	return f
