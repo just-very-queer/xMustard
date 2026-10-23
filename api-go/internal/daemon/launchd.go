@@ -146,8 +146,12 @@ func (l Launchd) Status(ctx context.Context, run Runner, s Spec) Status {
 	if err != nil {
 		return st
 	}
+	st.Loaded = true
 	f := fields(out, " = ")
 	st.State = cmp.Or(f["state"], "loaded")
 	st.PID, _ = strconv.Atoi(f["pid"])
+	if code, err := strconv.Atoi(f["last exit code"]); err == nil {
+		st.LastExitCode = &code
+	}
 	return st
 }

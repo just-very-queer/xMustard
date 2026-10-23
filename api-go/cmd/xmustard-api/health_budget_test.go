@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"log"
@@ -145,6 +146,11 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	h := getHealth(t, f.srv.URL)
 	if dig(t, h, "status") != "ok" {
 		t.Fatalf("status: %v", h["status"])
+	}
+	if id, ok := h["data_dir_id"].(string); !ok || len(id) != 64 {
+		t.Fatalf("health must identify its data directory with a SHA-256 fingerprint: %v", h["data_dir_id"])
+	} else if _, err := hex.DecodeString(id); err != nil {
+		t.Fatalf("health data directory identity is not hex: %v", err)
 	}
 	num(t, h, "transient_pool", "max")
 	num(t, h, "children", "cap")

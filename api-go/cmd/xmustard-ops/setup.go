@@ -297,13 +297,16 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 	},
 }
 
-func explainLaunchdDuplicate(ctx context.Context, report daemon.StatusReport, base string, probe func(context.Context, string) (daemon.Health, error)) any {
-	if report.Service.Manager == "launchd" && report.Service.PID == 0 && probe != nil {
-		if _, err := probe(ctx, base); err == nil {
+func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string, port int) any {
+	service := report.Service
+	if service.Manager == "launchd" && service.Loaded && service.PID == 0 &&
+		service.LastExitCode != nil && *service.LastExitCode == 0 &&
+		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" {
+		if owner, ok := matchingAPIOwner(dataDir, port, report.Health.DataDirID); ok {
 			return struct {
 				daemon.StatusReport
 				Notice string `json:"notice"`
-			}{StatusReport: report, Notice: "launchd agent not running because another instance owns the port"}
+			}{StatusReport: report, Notice: fmt.Sprintf("launchd agent is not running; another xMustard API (pid %d, port %d) owns this data directory", owner.PID, owner.Port)}
 		}
 	}
 	return report
@@ -338,7 +341,7 @@ func runDaemon(e lifecycleEnv, args []string) int {
 	}
 	if args[0] == "status" {
 		if report, ok := out.(daemon.StatusReport); ok {
-			out = explainLaunchdDuplicate(context.Background(), report, report.API, e.probe)
+			out = explainLaunchdDuplicate(report, spec.DataDir, spec.Port)
 		}
 	}
 	return e.emit(out)

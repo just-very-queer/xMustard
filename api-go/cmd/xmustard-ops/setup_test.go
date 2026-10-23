@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"golang.org/x/sys/unix"
 	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -360,7 +362,7 @@ func TestProbeDirectReusesConnectionsAcrossWait(t *testing.T) {
 	}
 }
 
-func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
+func TestRunDaemonStatusDoesNotUseLaterHealthProbeAsDuplicateEvidence(t *testing.T) {
 	e, out, errOut, _, home := lifecycleTest(t, "darwin", nil)
 	platform := daemon.Launchd{UID: 501}
 	spec := platform.Defaults(e.getenv, home)
@@ -375,22 +377,375 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	e.run = func(context.Context, string, ...string) (string, error) {
 		return "state = waiting\n", errors.New("not running")
 	}
+	probeCalls := 0
 	e.probe = func(context.Context, string) (daemon.Health, error) {
+		probeCalls++
+		if probeCalls == 1 {
+			return daemon.Health{}, errors.New("first probe failed")
+		}
 		return daemon.Health{Status: "ok", Service: "api-go"}, nil
 	}
 	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
 		t.Fatalf("status exit = %d: %s", code, errOut)
 	}
+	if probeCalls != 1 {
+		t.Fatalf("health probe calls = %d, want one", probeCalls)
+	}
+	if v := decodeOut(t, out); v["notice"] != nil {
+		t.Fatalf("later healthy probe caused duplicate notice: %v", v["notice"])
+	}
+}
+
+func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
+	cleanExit, failedExit := 0, 1
+	for _, tc := range []struct {
+		name    string
+		service daemon.Status
+		want    bool
+	}{
+		{name: "absent job", service: daemon.Status{Manager: "launchd", State: "not-loaded"}},
+		{name: "stopped job with a stale clean exit", service: daemon.Status{Manager: "launchd", State: "not-loaded", LastExitCode: &cleanExit}},
+		{name: "loaded job whose last exit failed", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &failedExit}},
+		{name: "loaded job with no recorded exit", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true}},
+		{name: "loaded job stopped cleanly beside a live manual owner", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit}, want: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := apiOwner{PID: 123, StartTime: 456, DataDir: dir, Port: 8042}
+			ownerJSON, err := json.Marshal(owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "api.owner"), ownerJSON, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			previousIdentity := processIdentity
+			processIdentity = func(pid int) (int64, string, bool) {
+				return owner.StartTime, "xmustard-api", pid == owner.PID
+			}
+			t.Cleanup(func() { processIdentity = previousIdentity })
+			report := daemon.StatusReport{Service: tc.service, Health: &daemon.Health{
+				Status: "ok", Service: "api-go", DataDirID: dataDirID(dir),
+			}}
+			got := explainLaunchdDuplicate(report, dir, 8042)
+			_, wrapped := got.(struct {
+				daemon.StatusReport
+				Notice string `json:"notice"`
+			})
+			if wrapped != tc.want {
+				t.Fatalf("duplicate notice = %v, want %v: %#v", wrapped, tc.want, got)
+			}
+		})
+	}
+}
+
+func TestExplainLaunchdDuplicateRejectsStaleOwnerRecord(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		pid        int
+		ownerStart int64
+		procStart  int64
+	}{
+		{name: "dead pid", pid: 2_000_000_000, ownerStart: 456},
+		{name: "reused pid", pid: 123, ownerStart: 456, procStart: 457},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := apiOwner{PID: tc.pid, StartTime: tc.ownerStart, DataDir: dir, Port: 8042}
+			b, err := json.Marshal(owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "api.owner"), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if tc.pid != 2_000_000_000 {
+				previousIdentity := processIdentity
+				processIdentity = func(pid int) (int64, string, bool) {
+					return tc.procStart, "xmustard-api", pid == tc.pid
+				}
+				t.Cleanup(func() { processIdentity = previousIdentity })
+			}
+			cleanExit := 0
+			report := daemon.StatusReport{
+				Service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit},
+				Health:  &daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(dir)},
+			}
+			if _, wrapped := explainLaunchdDuplicate(report, dir, 8042).(struct {
+				daemon.StatusReport
+				Notice string `json:"notice"`
+			}); wrapped {
+				t.Fatal("stale owner record caused duplicate notice")
+			}
+		})
+	}
+}
+
+func TestExplainLaunchdDuplicateDoesNotInferFromUnrelatedLock(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.OpenFile(filepath.Join(dir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	cleanExit := 0
+	report := daemon.StatusReport{
+		Service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit},
+		Health:  &daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(dir)},
+	}
+	if _, wrapped := explainLaunchdDuplicate(report, dir, 8042).(struct {
+		daemon.StatusReport
+		Notice string `json:"notice"`
+	}); wrapped {
+		t.Fatal("an unrelated admission-lock holder caused the duplicate notice")
+	}
+}
+
+func TestOwnerRecordMatchesSymlinkAlias(t *testing.T) {
+	root := t.TempDir()
+	dataPath := filepath.Join(root, "data")
+	if err := os.Mkdir(dataPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := filepath.EvalSymlinks(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(dataPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	owner := apiOwner{PID: 123, StartTime: 456, DataDir: dir, Port: 8042}
+	b, err := json.Marshal(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api.owner"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousIdentity := processIdentity
+	processIdentity = func(pid int) (int64, string, bool) {
+		return owner.StartTime, "xmustard-api", pid == owner.PID
+	}
+	defer func() { processIdentity = previousIdentity }()
+	if !apiOwnerMatches(alias, 8042, dataDirID(dir)) {
+		t.Fatal("resolved and symlinked data-directory identities did not match")
+	}
+}
+
+func TestAPIProcessIdentityReadsCurrentProcess(t *testing.T) {
+	start, name, ok := apiProcessIdentity(os.Getpid())
+	if !ok || start <= 0 || name == "" {
+		t.Fatalf("current process identity = (%d, %q, %v)", start, name, ok)
+	}
+}
+
+func TestOwnerRecordRequiresLiveMatchingAPIProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pid       int
+		start     int64
+		process   string
+		dataDir   string
+		port      int
+		actual    bool
+		wantOwner bool
+	}{
+		{name: "valid", pid: 123, start: 456, process: "xmustard-api", wantOwner: true},
+		{name: "dead pid", pid: 2_000_000_000, start: 456, actual: true, wantOwner: false},
+		{name: "reused pid", pid: 123, start: 457, process: "xmustard-api", wantOwner: false},
+		{name: "unrelated process", pid: 123, start: 456, process: "maintenance", wantOwner: false},
+		{name: "different data dir", pid: 123, start: 456, process: "xmustard-api", dataDir: "/elsewhere", wantOwner: false},
+		{name: "different port", pid: 123, start: 456, process: "xmustard-api", port: 9000, wantOwner: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			wantDir, err := filepath.EvalSymlinks(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := apiOwner{PID: tc.pid, StartTime: 456, DataDir: wantDir, Port: 8042}
+			if tc.dataDir != "" {
+				owner.DataDir = tc.dataDir
+			}
+			if tc.port != 0 {
+				owner.Port = tc.port
+			}
+			b, err := json.Marshal(owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "api.owner"), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.actual {
+				previousIdentity := processIdentity
+				processIdentity = func(pid int) (int64, string, bool) {
+					return tc.start, tc.process, pid == owner.PID && tc.process != ""
+				}
+				t.Cleanup(func() { processIdentity = previousIdentity })
+			}
+			if got := apiOwnerMatches(dir, 8042, dataDirID(wantDir)); got != tc.wantOwner {
+				t.Fatalf("valid owner = %v, want %v", got, tc.wantOwner)
+			}
+		})
+	}
+}
+
+func TestOwnerRecordInspectionDoesNotContendWithAdmission(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := apiOwner{PID: 123, StartTime: 456, DataDir: dir, Port: 8042}
+	ownerJSON, err := json.Marshal(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api.owner"), ownerJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousIdentity := processIdentity
+	processIdentity = func(pid int) (int64, string, bool) {
+		return owner.StartTime, "xmustard-api", pid == owner.PID
+	}
+	defer func() { processIdentity = previousIdentity }()
+	lockPath := filepath.Join(dir, "api.lock")
+	admitted := make(chan struct{})
+	release := make(chan struct{})
+	admissionDone := make(chan error, 1)
+	go func() {
+		lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			admissionDone <- err
+			return
+		}
+		defer lock.Close()
+		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			admissionDone <- err
+			return
+		}
+		close(admitted)
+		<-release
+		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		admissionDone <- nil
+	}()
+	select {
+	case <-admitted:
+	case err := <-admissionDone:
+		t.Fatalf("API admission failed: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("API admission did not acquire its lock")
+	}
+	statusDone := make(chan bool, 1)
+	go func() { statusDone <- apiOwnerMatches(dir, 8042, dataDirID(dir)) }()
+	select {
+	case validOwner := <-statusDone:
+		if !validOwner {
+			t.Fatal("status failed to validate the live API owner during admission")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status inspection waited on API admission")
+	}
+	close(release)
+	if err := <-admissionDone; err != nil {
+		t.Fatalf("API admission cleanup: %v", err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("replacement API admission was blocked by status inspection: %v", err)
+	}
+	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	if err := assertStatusProbeDoesNotFlock(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertStatusProbeDoesNotFlock() error {
+	source, err := os.ReadFile("api_lock_unix.go")
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(source, []byte("Flock")) {
+		return errors.New("status probe must not call flock on the API admission lock")
+	}
+	return nil
+}
+
+func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
+	e, out, errOut, _, home := lifecycleTest(t, "darwin", nil)
+	platform := daemon.Launchd{UID: 501}
+	spec := platform.Defaults(e.getenv, home)
+	if err := os.MkdirAll(spec.UnitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range platform.Files(spec) {
+		if err := os.WriteFile(unit.Path, []byte(unit.Content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.MkdirAll(spec.DataDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	resolvedDataDir, err := filepath.EvalSymlinks(spec.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := apiOwner{PID: 123, StartTime: 456, DataDir: resolvedDataDir, Port: spec.Port}
+	ownerJSON, err := json.Marshal(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(resolvedDataDir, "api.owner"), ownerJSON, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousIdentity := processIdentity
+	processIdentity = func(pid int) (int64, string, bool) {
+		return owner.StartTime, "xmustard-api", pid == owner.PID
+	}
+	defer func() { processIdentity = previousIdentity }()
+	e.run = func(context.Context, string, ...string) (string, error) {
+		return "state = waiting\nlast exit code = 0\n", nil
+	}
+	probeCalls := 0
+	e.probe = func(context.Context, string) (daemon.Health, error) {
+		probeCalls++
+		return daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(resolvedDataDir)}, nil
+	}
+
+	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
+		t.Fatalf("status exit = %d: %s", code, errOut)
+	}
 	v := decodeOut(t, out)
 	if v["platform"] != "launchd" || v["label"] != spec.Label || v["api"] != spec.BaseURL() ||
-		v["notice"] != "launchd agent not running because another instance owns the port" {
+		v["notice"] != "launchd agent is not running; another xMustard API (pid 123, port 8042) owns this data directory" {
 		t.Fatalf("status report fields were not preserved: %v", v)
+	}
+	if probeCalls != 1 {
+		t.Fatalf("health probe calls = %d, want one status probe", probeCalls)
 	}
 	if units := v["units"].([]any); len(units) != 1 || units[0] != platform.Files(spec)[0].Path {
 		t.Fatalf("status units were not preserved: %v", v["units"])
 	}
 	service, ok := v["service"].(map[string]any)
-	if !ok || service["manager"] != "launchd" || service["state"] != "not-loaded" {
+	if !ok || service["manager"] != "launchd" || service["state"] != "waiting" || service["loaded"] != true || service["last_exit_code"] != float64(0) {
 		t.Fatalf("status service was not preserved: %v", v["service"])
 	}
 	health, ok := v["health"].(map[string]any)

@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"xmustard/api-go/internal/budget"
@@ -46,11 +49,22 @@ type publicBudget struct {
 	Detail           string `json:"detail"`
 }
 
-// healthResponse keeps liveness public. Its auth block exposes no credential values; the
-// full budget view exposes host-wide activity and is limited to unscoped operators.
+// dataDirID identifies the configured data directory without exposing its path.
+func dataDirID() string {
+	path, err := canonicalDataDir(dataDir())
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(path)))
+	return hex.EncodeToString(sum[:])
+}
+
+// healthResponse keeps liveness public. Its auth block exposes no credential values and
+// data_dir_id fingerprints the data directory without its path; the full budget view
+// exposes host-wide activity and is limited to unscoped operators.
 func healthResponse(r *http.Request) map[string]any {
 	full, detail := healthBudgetView(r)
-	body := map[string]any{"status": "ok", "service": "api-go", "auth": healthAuthState()}
+	body := map[string]any{"status": "ok", "service": "api-go", "auth": healthAuthState(), "data_dir_id": dataDirID()}
 	// the governance store's startup check (WS-58), once the daemon ran it
 	store := workspaceops.MemoryStoreHealth(dataDir())
 	if !full {

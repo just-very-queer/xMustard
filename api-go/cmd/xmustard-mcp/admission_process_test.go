@@ -39,8 +39,9 @@ func TestShimParentHelper(t *testing.T) {
 	stdout := os.NewFile(3, "shim-stdout")
 	shimPath := os.Getenv("XMUSTARD_SHIM_PATH")
 	var cmd *exec.Cmd
-	if os.Getenv("XMUSTARD_SHIM_START_DELAY") == "1" {
-		cmd = exec.Command("/bin/sh", "-c", `sleep 0.2; exec "$1"`, "sh", shimPath)
+	if os.Getenv("XMUSTARD_SHIM_START_GATE") == "1" {
+		cmd = exec.Command("/bin/sh", "-c", `IFS= read -r _ <&4; exec "$1"`, "sh", shimPath)
+		cmd.ExtraFiles = []*os.File{stdout, os.NewFile(4, "shim-start-gate")}
 	} else {
 		cmd = exec.Command(shimPath)
 	}
@@ -157,12 +158,18 @@ func TestShimExitsWhenLauncherDiesBeforeWatcherStarts(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	gateR, gateW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
 	defer childOutR.Close()
 	defer childOutW.Close()
+	defer gateR.Close()
+	defer gateW.Close()
 	cmd := exec.Command(helper, "-test.run=^TestShimParentHelper$")
-	cmd.ExtraFiles = []*os.File{childOutW}
+	cmd.ExtraFiles = []*os.File{childOutW, gateR}
 	cmd.Env = append(os.Environ(), "XMUSTARD_SHIM_PARENT_HELPER=1", "XMUSTARD_SHIM_PATH="+shim,
-		"XMUSTARD_SHIM_PARENT_EXIT_IMMEDIATELY=1", "XMUSTARD_SHIM_START_DELAY=1",
+		"XMUSTARD_SHIM_PARENT_EXIT_IMMEDIATELY=1", "XMUSTARD_SHIM_START_GATE=1",
 		"XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
 	stdinR, stdin, err := os.Pipe()
 	if err != nil {
@@ -195,6 +202,10 @@ func TestShimExitsWhenLauncherDiesBeforeWatcherStarts(t *testing.T) {
 	if err := cmd.Wait(); err != nil {
 		t.Fatalf("launcher exit: %v", err)
 	}
+	if _, err := fmt.Fprintln(gateW, "start"); err != nil {
+		t.Fatalf("release shim start gate: %v", err)
+	}
+	_ = gateW.Close()
 	if !waitForProcessExit(pid, 10*time.Second) {
 		t.Fatal("shim did not exit after starting already orphaned")
 	}

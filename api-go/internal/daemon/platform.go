@@ -36,10 +36,12 @@ type File struct {
 
 // Status is the service manager's view of the daemon.
 type Status struct {
-	Manager string `json:"manager"`
-	State   string `json:"state"`
-	PID     int    `json:"pid,omitempty"`
-	Socket  string `json:"socket,omitempty"`
+	Manager      string `json:"manager"`
+	State        string `json:"state"`
+	PID          int    `json:"pid,omitempty"`
+	Loaded       bool   `json:"loaded,omitempty"`
+	LastExitCode *int   `json:"last_exit_code,omitempty"`
+	Socket       string `json:"socket,omitempty"`
 }
 
 // Runner runs a service manager command and returns its combined output.
