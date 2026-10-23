@@ -2011,18 +2011,14 @@ mod tests {
             ignored: Some(BTreeSet::new()),
         };
 
-        let registration = register_native_dirs(
-            &layout,
-            MAX_WATCH_DIRS,
-            recursive_native(),
-            |path, _| {
+        let registration =
+            register_native_dirs(&layout, MAX_WATCH_DIRS, recursive_native(), |path, _| {
                 if path == linked {
                     Err(WatchAddError::Vanished)
                 } else {
                     Ok(())
                 }
-            },
-        );
+            });
         let (watcher, _root_rx) = Root::new(root, None, MAX_WATCH_DIRS);
         *lock(&watcher.layout) = Arc::new(layout);
         let now = Instant::now();
@@ -2038,7 +2034,10 @@ mod tests {
         watcher.publish();
 
         assert_eq!(watcher.state(), WatcherState::Degraded);
-        assert!(!watcher.vouches_git(), "failed startup cannot vouch for Git");
+        assert!(
+            !watcher.vouches_git(),
+            "failed startup cannot vouch for Git"
+        );
     }
 
     #[test]
