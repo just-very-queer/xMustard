@@ -224,7 +224,7 @@ func TestCodexPatchRenameKeepsTheBaseline(t *testing.T) {
 	const had = `{"line":4,"column":24,"kind":"missing","node":")","line_hash":"9f2c"}`
 	const added = `{"line":9,"column":2,"kind":"error","node":"}","line_hash":"77aa"}`
 	var patched atomic.Bool
-	hookSyntax = func(_ context.Context, _ workspaceops.ResolvedWorkspace, rels []string) (json.RawMessage, error) {
+	f.deps.setSyntax(func(_ context.Context, _ workspaceops.ResolvedWorkspace, rels []string) (json.RawMessage, error) {
 		files := make([]string, len(rels))
 		for i, rel := range rels {
 			switch {
@@ -237,7 +237,7 @@ func TestCodexPatchRenameKeepsTheBaseline(t *testing.T) {
 			}
 		}
 		return json.RawMessage(`{"files":[` + strings.Join(files, ",") + `]}`), nil
-	}
+	})
 	body := func(event string, extra map[string]any) string {
 		m := map[string]any{"session_id": "s-move", "turn_id": "t", "transcript_path": nil, "cwd": f.root, "hook_event_name": event,
 			"model": "m", "permission_mode": "default", "tool_name": "apply_patch", "tool_use_id": "call-move",

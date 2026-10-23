@@ -35,6 +35,10 @@ func newAPIHandler() http.Handler { return newAPIHandlerFor(postureFromEnv()) }
 // newAPIHandlerFor builds the gated route table with evidence delivery wired in. The
 // route gates run before delivery, so a refused call is never captured.
 func newAPIHandlerFor(p exposurePosture) http.Handler {
+	return newAPIHandlerForWithHookDependencies(p, nil)
+}
+
+func newAPIHandlerForWithHookDependencies(p exposurePosture, deps *hookDependencies) http.Handler {
 	mux := newGatedMux()
 	registerRoutes(mux)
 	limits := evidence.LimitsFromEnv()
@@ -49,7 +53,7 @@ func newAPIHandlerFor(p exposurePosture) http.Handler {
 	registerEvidenceRoutes(mux, store)
 	registerEvidenceCaptureRoutes(mux, store)
 	registerOutcomeRoutes(mux, store)
-	registerHookRoutes(mux, store)
+	registerHookRoutes(mux, store, deps)
 	return routeGateMiddleware(p, mux, evidenceDeliveryMiddleware(store, toolBudgetMiddleware(mux)))
 }
 

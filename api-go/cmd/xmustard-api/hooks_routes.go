@@ -105,13 +105,55 @@ func hookBudget() time.Duration {
 	return defaultHookBudget
 }
 
-// The resident-worker reads a hook makes, and the identity drop of a removed worktree;
-// tests replace them.
-var (
-	hookSearch     = workspaceops.HookSearch
-	hookSyntax     = workspaceops.HookSyntaxCheck
-	hookForgetRoot = workspaceops.ForgetRoot
-)
+type hookDependencies struct {
+	mu         sync.RWMutex
+	search     func(context.Context, workspaceops.ResolvedWorkspace, string, int) (json.RawMessage, error)
+	syntax     func(context.Context, workspaceops.ResolvedWorkspace, []string) (json.RawMessage, error)
+	forgetRoot func(string)
+}
+
+func defaultHookDependencies() *hookDependencies {
+	return &hookDependencies{search: workspaceops.HookSearch, syntax: workspaceops.HookSyntaxCheck, forgetRoot: workspaceops.ForgetRoot}
+}
+
+func (d *hookDependencies) setSearch(search func(context.Context, workspaceops.ResolvedWorkspace, string, int) (json.RawMessage, error)) {
+	d.mu.Lock()
+	d.search = search
+	d.mu.Unlock()
+}
+
+func (d *hookDependencies) setSyntax(syntax func(context.Context, workspaceops.ResolvedWorkspace, []string) (json.RawMessage, error)) {
+	d.mu.Lock()
+	d.syntax = syntax
+	d.mu.Unlock()
+}
+
+func (d *hookDependencies) setForgetRoot(forgetRoot func(string)) {
+	d.mu.Lock()
+	d.forgetRoot = forgetRoot
+	d.mu.Unlock()
+}
+
+func (d *hookDependencies) searchWith(ctx context.Context, ws workspaceops.ResolvedWorkspace, query string, limit int) (json.RawMessage, error) {
+	d.mu.RLock()
+	search := d.search
+	d.mu.RUnlock()
+	return search(ctx, ws, query, limit)
+}
+
+func (d *hookDependencies) syntaxWith(ctx context.Context, ws workspaceops.ResolvedWorkspace, rels []string) (json.RawMessage, error) {
+	d.mu.RLock()
+	syntax := d.syntax
+	d.mu.RUnlock()
+	return syntax(ctx, ws, rels)
+}
+
+func (d *hookDependencies) forget(path string) {
+	d.mu.RLock()
+	forget := d.forgetRoot
+	d.mu.RUnlock()
+	forget(path)
+}
 
 // hookStats counts hook answers since start (hookUsage, /api/health); drained counts
 // the queued events the consumer has handled.
@@ -136,6 +178,7 @@ type hookServer struct {
 	reg      *evidence.Registry
 	sessions *hooks.Sessions
 	queue    chan hookQueued
+	deps     *hookDependencies
 }
 
 // hookCall is one hook request being answered.
@@ -239,16 +282,19 @@ func endSubagent(s *hooks.Sessions, key hooks.SessionKey) {
 	s.End(key)
 }
 
-func newHookServer(store *evidence.Store) *hookServer {
+func newHookServer(store *evidence.Store, deps *hookDependencies) *hookServer {
+	if deps == nil {
+		deps = defaultHookDependencies()
+	}
 	s := &hookServer{store: store, reg: evidence.DefaultRegistry(), sessions: hooks.NewSessions(hooks.DefaultLimits, time.Now),
-		queue: make(chan hookQueued, hookQueueDepth)}
+		queue: make(chan hookQueued, hookQueueDepth), deps: deps}
 	go s.drain()
 	return s
 }
 
 // registerHookRoutes mounts one route per client event.
-func registerHookRoutes(mux routeRegistrar, store *evidence.Store) *hookServer {
-	s := newHookServer(store)
+func registerHookRoutes(mux routeRegistrar, store *evidence.Store, deps *hookDependencies) *hookServer {
+	s := newHookServer(store, deps)
 	for _, client := range hooks.Clients {
 		for _, ev := range client.Events {
 			mux.HandleFunc("POST /api/hooks/"+client.Name+"/"+ev.Name, s.handle(client, ev))
@@ -633,7 +679,7 @@ func (s *hookServer) searchContext(ctx context.Context, c *hookCall) hookResult 
 	}
 	var hits json.RawMessage
 	var wg sync.WaitGroup
-	wg.Go(func() { hits, _ = hookSearch(ctx, c.ws, q, hookSearchHits) })
+	wg.Go(func() { hits, _ = s.deps.searchWith(ctx, c.ws, q, hookSearchHits) })
 	memory, offered := s.memoryContext(ctx, c, q, nil)
 	wg.Wait()
 	return hookResult{context: hooks.Compose(memory, hooks.RenderHits(q, hits, hookSearchHits), nudge), offered: offered}
@@ -773,7 +819,7 @@ func (s *hookServer) push(ctx context.Context, c *hookCall, surface injection.Su
 // file is new. A file an apply_patch renames keeps its errors: the destination, which
 // does not exist yet, takes its source's baseline.
 func (s *hookServer) baseline(ctx context.Context, c *hookCall, rels []string) {
-	raw, err := hookSyntax(ctx, c.ws, rels)
+	raw, err := s.deps.syntaxWith(ctx, c.ws, rels)
 	files, perr := hooks.ParseSyntax(raw)
 	if err != nil || perr != nil {
 		return
@@ -905,7 +951,7 @@ func (s *hookServer) afterEdit(ctx context.Context, c *hookCall) hookResult {
 		errs, had := s.sessions.TakeBaseline(c.key, rel)
 		before[rel] = baseline{errs, had}
 	}
-	raw, err := hookSyntax(ctx, c.ws, rels)
+	raw, err := s.deps.syntaxWith(ctx, c.ws, rels)
 	files, perr := hooks.ParseSyntax(raw)
 	if err != nil || perr != nil {
 		return hookResult{}
@@ -1084,7 +1130,7 @@ func (s *hookServer) worktreeRemove(_ context.Context, c *hookCall) hookResult {
 		return hookResult{}
 	}
 	if p == filepath.Clean(c.ws.Root) || workspaceops.RelativeToRoot(c.ws, p) != "" {
-		hookForgetRoot(p)
+		s.deps.forget(p)
 	}
 	return hookResult{}
 }

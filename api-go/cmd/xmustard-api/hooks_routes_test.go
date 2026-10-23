@@ -35,6 +35,7 @@ type hookFixture struct {
 	srv           *httptest.Server
 	coreMarker    string // created if anything runs the core binary
 	searches      atomic.Int64
+	deps          *hookDependencies
 	memories      map[string]string // name -> memory id
 }
 
@@ -42,7 +43,7 @@ const hookRepoWS = "wsHooks"
 
 func newHookFixture(t testing.TB) *hookFixture {
 	t.Helper()
-	f := &hookFixture{ws: hookRepoWS, memories: map[string]string{}}
+	f := &hookFixture{ws: hookRepoWS, memories: map[string]string{}, deps: defaultHookDependencies()}
 	f.dir = t.TempDir()
 	// the ledger writer finishes before the data dir is removed (cleanups run last first)
 	t.Cleanup(func() { settleHooks(t, f.dir) })
@@ -91,9 +92,9 @@ func newHookFixture(t testing.TB) *hookFixture {
 		[]string{"src/billing.go"}, nil, true)
 	f.memory(t, "billing-peer", "billing currency", "Currency conversion happens before rounding.", []string{"src/billing.go"}, nil, false)
 	f.memory(t, "deploy", "deploy canary", "Deploys go through the canary stage for 30 minutes before full rollout.", nil, []string{"trigger-deploy"}, true)
-	f.srv = httptest.NewServer(bodyLimitMiddleware(authMiddleware(f.dir, "auto", newAPIHandler())))
+	f.srv = httptest.NewServer(bodyLimitMiddleware(authMiddleware(f.dir, "auto", newAPIHandlerForWithHookDependencies(postureFromEnv(), f.deps))))
 	t.Cleanup(f.srv.Close)
-	f.fakeWorker(t)
+	f.fakeWorker()
 	return f
 }
 
@@ -134,10 +135,8 @@ func (f *hookFixture) memory(t testing.TB, name, title, content string, paths, t
 }
 
 // fakeWorker stands in for the resident worker's search and syntax check.
-func (f *hookFixture) fakeWorker(t testing.TB) {
-	prevSearch, prevSyntax := hookSearch, hookSyntax
-	t.Cleanup(func() { hookSearch, hookSyntax = prevSearch, prevSyntax })
-	hookSearch = func(_ context.Context, ws workspaceops.ResolvedWorkspace, query string, limit int) (json.RawMessage, error) {
+func (f *hookFixture) fakeWorker() {
+	f.deps.setSearch(func(_ context.Context, ws workspaceops.ResolvedWorkspace, query string, limit int) (json.RawMessage, error) {
 		f.searches.Add(1)
 		first := strings.Fields(query)[0]
 		return json.RawMessage(fmt.Sprintf(`{"workspace_id":%q,"query":%q,"total":2,"hits":[`+
@@ -145,16 +144,16 @@ func (f *hookFixture) fakeWorker(t testing.TB) {
 			`{"kind":"chunk","name":"total","path":"src/ledger.go","line":1,"lanes_matched":["bm25"],"score":0.4}],`+
 			`"freshness":{"source":"resident_index","indexed_commit":"4b1f0c2d9e8a7f6b5a4c","head":"4b1f0c2d9e8a7f6b5a4c","status":"current","dirty_paths_touching_result":[]}}`,
 			ws.WorkspaceID, query, first)), nil
-	}
+	})
 	var checks sync.Map // path -> calls
-	hookSyntax = func(_ context.Context, ws workspaceops.ResolvedWorkspace, rels []string) (json.RawMessage, error) {
+	f.deps.setSyntax(func(_ context.Context, ws workspaceops.ResolvedWorkspace, rels []string) (json.RawMessage, error) {
 		n, _ := checks.LoadOrStore(rels[0], new(atomic.Int64))
 		errs := `[]`
 		if n.(*atomic.Int64).Add(1) > 1 { // after the edit: one missing brace
 			errs = `[{"line":4,"column":24,"end_line":4,"kind":"missing","node":")","line_hash":"9f2c"}]`
 		}
 		return json.RawMessage(fmt.Sprintf(`{"files":[{"path":%q,"language":"go","status":"checked","errors":%s,"truncated":false}]}`, rels[0], errs)), nil
-	}
+	})
 }
 
 func (f *hookFixture) post(t testing.TB, token, event, body string) (int, []byte) {
@@ -430,13 +429,13 @@ func TestHookTimeoutFailsOpenWithEmptyOutput(t *testing.T) {
 	t.Setenv("XMUSTARD_HOOK_BUDGET_MS", "60")
 	release := make(chan struct{})
 	defer close(release)
-	hookSearch = func(ctx context.Context, _ workspaceops.ResolvedWorkspace, _ string, _ int) (json.RawMessage, error) {
+	f.deps.setSearch(func(ctx context.Context, _ workspaceops.ResolvedWorkspace, _ string, _ int) (json.RawMessage, error) {
 		select { // a worker that ignores cancellation for a while
 		case <-release:
 		case <-time.After(400 * time.Millisecond):
 		}
 		return nil, ctx.Err()
-	}
+	})
 	grep := func(session string) string {
 		b, _ := json.Marshal(map[string]any{"session_id": session, "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Grep",
 			"tool_input": map[string]any{"pattern": "roundHalfEven"}})
@@ -452,9 +451,9 @@ func TestHookTimeoutFailsOpenWithEmptyOutput(t *testing.T) {
 		t.Fatal("the timeout was not counted")
 	}
 	t.Setenv("XMUSTARD_HOOK_BUDGET_MS", "3000")
-	hookSearch = func(context.Context, workspaceops.ResolvedWorkspace, string, int) (json.RawMessage, error) {
+	f.deps.setSearch(func(context.Context, workspaceops.ResolvedWorkspace, string, int) (json.RawMessage, error) {
 		return nil, workspaceops.ErrIndexNotResident
-	}
+	})
 	_, body = f.post(t, f.agent, "PreToolUse", grep("slow"))
 	if !strings.Contains(string(body), "returned no context because the daemon was busy") {
 		t.Fatalf("no busy note after a skipped hook: %s", body)
@@ -537,10 +536,10 @@ func TestHookPushBudgetsFramesAndMarksOnlyWhatIsDelivered(t *testing.T) {
 
 	// the budget runs out after admission (the pre-edit syntax baseline hangs)
 	t.Setenv("XMUSTARD_HOOK_BUDGET_MS", "800")
-	hookSyntax = func(ctx context.Context, _ workspaceops.ResolvedWorkspace, _ []string) (json.RawMessage, error) {
+	f.deps.setSyntax(func(ctx context.Context, _ workspaceops.ResolvedWorkspace, _ []string) (json.RawMessage, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
-	}
+	})
 	edit := hookEvent(map[string]any{"session_id": "late", "cwd": f.root, "hook_event_name": "PreToolUse", "tool_name": "Edit",
 		"tool_input": map[string]any{"file_path": filepath.Join(f.root, "src", "billing.go"), "old_string": "x", "new_string": "y"}})
 	if _, body := f.post(t, f.agent, "PreToolUse", edit); len(body) != 0 {
@@ -572,13 +571,11 @@ func TestHookWorktreeRemoveStaysInTheWorkspace(t *testing.T) {
 	f := newHookFixture(t)
 	var mu sync.Mutex
 	var forgot []string
-	prev := hookForgetRoot
-	t.Cleanup(func() { hookForgetRoot = prev })
-	hookForgetRoot = func(root string) {
+	f.deps.setForgetRoot(func(root string) {
 		mu.Lock()
 		defer mu.Unlock()
 		forgot = append(forgot, root)
-	}
+	})
 	under := filepath.Join(f.root, ".claude", "worktrees", "feature")
 	elsewhere := t.TempDir()
 	for _, c := range []struct {
