@@ -898,6 +898,11 @@ impl Root {
             (None, true) => self.degrade(inner, limit_error(max), now),
             (None, false) => {}
         }
+        drop(guard);
+        // A query may have memoized repository state after the event's initial bump
+        // but before this walk installed coverage. Invalidate that observation now.
+        let git = matches!(layout.classify(dir), Class::Git { .. });
+        self.bump(git);
     }
 
     /// The Git index changed, so a directory Git ignored as a whole may hold tracked
@@ -2157,6 +2162,66 @@ mod tests {
             l.classify(Path::new("/r/a/.github/ci.yml")),
             Class::Path("a/.github/ci.yml".into())
         );
+    }
+
+    #[test]
+    fn git_memo_created_during_subtree_coverage_is_invalidated_afterward() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let git_dir = dir.path().join(".git");
+        std::fs::create_dir_all(&git_dir).expect("Git directory");
+
+        let (root, rx) = Root::new(dir.path().to_path_buf(), None, MAX_WATCH_DIRS);
+        let layout = Layout {
+            root: dir.path().to_path_buf(),
+            git_dirs: vec![git_dir.clone()],
+            ignored: Some(BTreeSet::new()),
+        };
+        let (watcher, watched, _) = start_native(&layout, root.tx.clone(), MAX_WATCH_DIRS)
+            .unwrap_or_else(|_| panic!("native watcher"));
+        *lock(&root.layout) = Arc::new(layout.clone());
+        {
+            let mut inner = lock(&root.inner);
+            inner.native = Some(watcher);
+            inner.watched = watched;
+        }
+
+        let refs = git_dir.join("refs");
+        let heads = refs.join("heads");
+        std::fs::create_dir_all(&heads).expect("new refs subtree");
+        let ref_file = heads.join("main");
+        std::fs::write(&ref_file, "A\n").expect("initial ref value");
+        // This is the event's first bump. A concurrent query can memoize repository
+        // state after this point, before the new refs subtree has been covered.
+        root.bump(true);
+        let observed_epoch = root.change_epoch.load(Ordering::Acquire);
+        let observed_git_epoch = root.git_epoch.load(Ordering::Acquire);
+        let state = Arc::new(crate::indexcache::observe_repo_state(dir.path()));
+        lock(&root.inner).memo = Some((observed_epoch, state));
+        std::fs::write(&ref_file, "B\n").expect("change ref in coverage window");
+
+        root.cover_dir(&layout, &refs, Instant::now());
+
+        assert!(
+            root.change_epoch.load(Ordering::Acquire) > observed_epoch,
+            "coverage completion must invalidate any memo made during the window"
+        );
+        assert!(
+            root.git_epoch.load(Ordering::Acquire) > observed_git_epoch,
+            "coverage completion must invalidate Git identity observations"
+        );
+        assert_ne!(
+            lock(&root.inner).memo.as_ref().map(|(epoch, _)| *epoch),
+            Some(root.change_epoch.load(Ordering::Acquire)),
+            "the memo from before coverage completed must not be reusable"
+        );
+        if !recursive_native() {
+            let inner = lock(&root.inner);
+            assert!(
+                inner.watched.contains(&refs) && inner.watched.contains(&heads),
+                "inotify coverage must install watches on the new refs directories"
+            );
+        }
+        drop(rx);
     }
 
     // A commit inside a nested repository queues no refresh path, but it moves the
