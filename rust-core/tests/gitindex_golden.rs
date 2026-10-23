@@ -50,6 +50,86 @@ fn assert_same_view(what: &str, root: &Path) {
 }
 
 #[test]
+fn unborn_submodule_head_still_reports_its_untracked_worktree() {
+    let fx = clean();
+    let child = fx.root.join("child");
+    init(&child, &[]);
+    write(&child, "loose.txt", b"untracked\n");
+    let oid = String::from_utf8(git(&fx.root, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    git(
+        &fx.root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &oid,
+            "child",
+        ],
+    );
+    assert_same_view("unborn submodule with untracked content", &fx.root);
+}
+
+#[test]
+fn core_symlinks_false_compares_the_link_text_as_file_content() {
+    let fx = clean();
+    symlink(&fx.root, "target.txt", "link");
+    commit(&fx.root, "symlink");
+    git(&fx.root, &["config", "core.symlinks", "false"]);
+    fs::remove_file(fx.root.join("link")).unwrap();
+    write(&fx.root, "link", b"target.txt");
+    assert_same_view("core.symlinks=false", &fx.root);
+}
+
+#[test]
+fn ignorecase_cursor_matches_a_lowercase_index_entry_to_an_uppercase_worktree_name() {
+    let fx = clean();
+    write(&fx.root, "zeta.txt", b"tracked\n");
+    commit(&fx.root, "lowercase path");
+    git(&fx.root, &["config", "core.ignorecase", "true"]);
+    write(&fx.root, "ZETA.txt", b"tracked\n");
+    assert_same_view("core.ignorecase case alias", &fx.root);
+}
+
+#[test]
+fn ignorecase_exclusion_patterns_match_ascii_case_insensitively() {
+    let fx = clean();
+    write(&fx.root, ".gitignore", b"CACHE/\n*.TMP\n");
+    commit(&fx.root, "ignore rules");
+    git(&fx.root, &["config", "core.ignorecase", "true"]);
+    write(&fx.root, "cache/file", b"ignored\n");
+    write(&fx.root, "scratch.tmp", b"ignored\n");
+    assert_same_view("core.ignorecase ignore rules", &fx.root);
+}
+
+#[test]
+fn ignorecase_reader_matches_git_with_byte_sorted_mixed_case_paths() {
+    let fx = clean();
+    write(&fx.root, "README.md", b"readme\n");
+    write(&fx.root, "api/lib.rs", b"pub fn tracked() {}\n");
+    write(&fx.root, ".gitignore", b"CACHE/\n*.TMP\n");
+    commit(&fx.root, "mixed case");
+    git(&fx.root, &["config", "core.ignorecase", "true"]);
+    write(&fx.root, "readme.MD", b"readme\n");
+    write(&fx.root, "API/new.rs", b"new\n");
+    write(&fx.root, "cache/file", b"ignored\n");
+    write(&fx.root, "scratch.tmp", b"ignored\n");
+    assert_same_view("core.ignorecase mixed case", &fx.root);
+    assert_eq!(
+        reader_list(&fx.root, Listing::Tracked),
+        git_tracked(&fx.root)
+    );
+    let got: Vec<Vec<u8>> = reader_list(&fx.root, Listing::Untracked)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(got, git_untracked(&fx.root));
+}
+
+#[test]
 fn the_reader_equals_git_status_on_the_matrix() {
     for (name, build) in MATRIX {
         let fx = build();
@@ -99,6 +179,45 @@ fn the_listings_equal_ls_files_on_the_matrix() {
 }
 
 #[test]
+fn staged_submodule_bump_keeps_git_diff_head_semantics_after_worktree_revert() {
+    let fx = submodules();
+    let old = String::from_utf8(git(&fx.root, &["rev-parse", "HEAD:m_commit"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    git(&fx.root, &["add", "m_commit"]);
+    git(&fx.root.join("m_commit"), &["reset", "--hard", &old]);
+    let current = String::from_utf8(git(&fx.root.join("m_commit"), &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    let staged = String::from_utf8(git(&fx.root, &["rev-parse", ":m_commit"]))
+        .unwrap()
+        .trim()
+        .to_string();
+    assert_eq!(current, old, "submodule worktree is at HEAD's gitlink");
+    assert_ne!(staged, old, "the parent index still holds the staged bump");
+    let got = gitindex::head_changes_using(&fx.root, Setting::Reader)
+        .unwrap()
+        .unwrap();
+    let width = git(&fx.root, &["rev-parse", "HEAD"]).len() - 1;
+    let want = git_head_changes(&fx.root);
+    assert_eq!(
+        got.iter()
+            .map(|change| (
+                change.path.clone(),
+                change.mode,
+                change
+                    .oid
+                    .map_or_else(|| "0".repeat(width), |oid| oid.hex())
+            ))
+            .collect::<Vec<_>>(),
+        want,
+        "staged gitlink bump reverted in the worktree"
+    );
+}
+
+#[test]
 fn head_changes_equal_git_diff_head_on_the_matrix() {
     for (name, build) in MATRIX {
         let fx = build();
@@ -143,6 +262,35 @@ fn refusal(root: &Path) -> Refusal {
         list_ignored: false,
     };
     status(&repo, opts, &mut |_| ControlFlow::Continue(())).unwrap_err()
+}
+
+#[test]
+fn ignorecase_reader_refuses_an_index_that_is_not_byte_sorted() {
+    let fx = clean();
+    git(&fx.root, &["config", "core.ignorecase", "true"]);
+    rewrite_index(&fx.root, |bytes| {
+        let count = u32::from_be_bytes(bytes[8..12].try_into().unwrap());
+        assert!(count >= 2);
+        let mut ranges = Vec::new();
+        let mut at = 12;
+        for _ in 0..count {
+            let flags = u16::from_be_bytes([bytes[at + 60], bytes[at + 61]]);
+            let len = usize::from(flags & 0x0fff);
+            let end = at + ((63 + len + 7) & !7);
+            ranges.push(at..end);
+            at = end;
+        }
+        let first = ranges[0].clone();
+        let second = ranges[1].clone();
+        let a = bytes[first.clone()].to_vec();
+        let b = bytes[second.clone()].to_vec();
+        assert!(first.end <= second.start);
+        bytes.splice(second.clone(), a);
+        bytes.splice(first, b);
+    });
+    assert!(
+        matches!(refusal(&fx.root), Refusal::Failed(ref message) if message.contains("byte-sorted"))
+    );
 }
 
 #[test]

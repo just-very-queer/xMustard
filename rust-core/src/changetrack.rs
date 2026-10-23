@@ -880,6 +880,7 @@ fn observation_error(state: &crate::indexcache::RepoState) -> Option<String> {
                     | "git_status_failed"
                     | "git_index_unsupported"
                     | "git_index_failed"
+                    | "untracked_walk_incomplete"
             )
         })
         .map(|l| {
@@ -1731,6 +1732,21 @@ mod tests {
             .args(["commit", "-qm", "c"])
             .output()
             .unwrap();
+    }
+
+    #[test]
+    fn dirty_paths_refuses_an_incomplete_untracked_walk() {
+        let dir = TempDir::new().unwrap();
+        git_init(dir.path());
+        fs::write(dir.path().join("tracked.txt"), "tracked\n").unwrap();
+        git_commit(dir.path());
+        let wide = dir.path().join("wide");
+        fs::create_dir(&wide).unwrap();
+        for i in 0..160_000 {
+            fs::File::create(wide.join(format!("f{i}"))).unwrap();
+        }
+        let error = dirty_paths(dir.path()).unwrap_err();
+        assert!(error.contains("untracked walk incomplete"), "{error}");
     }
 
     // Fable F4: whitespace/newline names must hash the exact file Git lists (not a

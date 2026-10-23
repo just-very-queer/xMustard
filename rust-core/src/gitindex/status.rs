@@ -45,8 +45,10 @@ pub struct Repo {
     pub hash: Hash,
     /// `core.excludesFile`, or Git's default (`$XDG_CONFIG_HOME/git/ignore`).
     pub excludes_file: Option<PathBuf>,
-    /// `core.ignorecase`: the reader follows case-sensitive matching only.
+    /// `core.ignorecase`: Git's case-insensitive path matching setting.
     pub ignore_case: bool,
+    /// `core.symlinks`: false means symlinks are checked out as regular files.
+    pub symlinks: bool,
 }
 
 fn git_text(root: &Path, args: &[&str]) -> Result<String, Refusal> {
@@ -87,6 +89,7 @@ impl Repo {
         .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
         let mut ignore_case = false;
+        let mut symlinks = true;
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let rec = String::from_utf8_lossy(rec);
             let (key, value) = rec.split_once('\n').unwrap_or((&rec, ""));
@@ -96,6 +99,12 @@ impl Repo {
                     ignore_case = matches!(
                         value.to_ascii_lowercase().as_str(),
                         "true" | "yes" | "on" | "1" | ""
+                    )
+                }
+                "core.symlinks" => {
+                    symlinks = !matches!(
+                        value.to_ascii_lowercase().as_str(),
+                        "false" | "no" | "off" | "0"
                     )
                 }
                 _ => {}
@@ -109,24 +118,12 @@ impl Repo {
             hash,
             excludes_file,
             ignore_case,
+            symlinks,
         })
-    }
-
-    /// Refuse what the reader does not follow (checked before any answer).
-    ///
-    /// **`core.ignorecase` is no longer a refusal** (WS-RT18b). Git folds case when it
-    /// compares paths on a case-insensitive volume, and the reader now folds it the
-    /// same way, so a repository whose index is sorted the way Git sorts it is read
-    /// here too. The index's order is checked when it is opened, because an index
-    /// written before the setting changed is sorted the other way and the reader's
-    /// cursor would stop early and miss entries.
-    pub(crate) fn check(&self) -> Result<(), Refusal> {
-        Ok(())
     }
 
     /// The index of this checkout, opened and verified.
     pub fn index(&self) -> Result<Index, Refusal> {
-        self.check()?;
         let ix = Index::open(&self.git_dir, self.hash)?;
         ix.verify_order(self.ignore_case)?;
         Ok(ix)
@@ -322,6 +319,9 @@ impl Run<'_> {
                 true => Ok(Side::Is(b'T')),
                 false => Ok(Side::Is(b'D')),
             },
+            (want, kind) if want == 0o120000 && kind == 0o100000 && !self.repo.symlinks => {
+                Ok(Side::Ask)
+            }
             (w, k) if w != k => Ok(Side::Is(b'T')),
             _ => {
                 let racy = self.index_mtime != 0 && self.index_mtime <= e.stat.mtime.0;
@@ -550,18 +550,29 @@ fn submodule_dirty(dir: &Path, oid: &Oid) -> Result<bool, Refusal> {
     if !super::walk::is_repository(dir) {
         return Ok(false);
     }
-    let head = run_git_bounded(
+    let head = match run_git_bounded(
         dir,
         &["rev-parse", "-q", "--verify", "HEAD"],
         64 << 10,
         git_timeout(),
-    )
-    .ok()
-    .and_then(|b| Oid::parse_hex(&String::from_utf8_lossy(&b)));
-    let Some(head) = head else {
-        return Ok(false);
+    ) {
+        Ok(bytes) => Some(
+            Oid::parse_hex(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
+                Refusal::Failed(format!(
+                    "submodule {}: rev-parse returned an invalid HEAD",
+                    dir.display()
+                ))
+            })?,
+        ),
+        Err(crate::indexcache::GitRunError::Failed) => None,
+        Err(error) => {
+            return Err(Refusal::Failed(format!(
+                "submodule {}: rev-parse: {error}",
+                dir.display()
+            )));
+        }
     };
-    if head != *oid {
+    if head.is_some_and(|head| head != *oid) {
         return Ok(true);
     }
     let sub = Repo::open(dir)?;
@@ -711,9 +722,11 @@ impl PrivateIndex {
         let n = N.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("xm-refresh-{}-{n}.index", std::process::id()));
+        use std::os::unix::fs::OpenOptionsExt;
         let mut f = fs::File::options()
             .write(true)
             .create_new(true)
+            .mode(0o600)
             .open(&path)
             .map_err(|e| Refusal::Failed(format!("private index {}: {e}", path.display())))?;
         let guard = PrivateIndex(path);
@@ -825,4 +838,17 @@ pub(crate) fn head_changes(repo: &Repo) -> Result<Option<Vec<HeadChange>>, Refus
         .collect();
     changed.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(Some(changed))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PrivateIndex;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn private_refresh_index_is_owner_only() {
+        let file = PrivateIndex::create(b"private index").unwrap();
+        let mode = std::fs::metadata(&file.0).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
 }
