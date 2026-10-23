@@ -75,14 +75,43 @@ func search(w http.ResponseWriter, r *http.Request) {
 		// ?seed=<symbol> activates the graph-proximity lane, ?lang= and ?path_glob=
 		// filter, ?mode=text answers from the body lane alone, ?mode=exact|regex scans
 		// the working tree's bytes, and ?cursor= continues a page (next_cursor).
+		maxLines, capErr := scanCap(r, "max_lines")
+		if capErr != nil {
+			respondError(w, capErr)
+			return
+		}
+		maxBytes, capErr := scanCap(r, "max_bytes")
+		if capErr != nil {
+			respondError(w, capErr)
+			return
+		}
+		timeoutMS, capErr := scanCap(r, "timeout_ms")
+		if capErr != nil {
+			respondError(w, capErr)
+			return
+		}
 		result, err = workspaceops.WorkspaceSearchPage(r.Context(), dd, ws, workspaceops.SearchRequest{
 			Query: query, Seed: q.Get("seed"), PathGlob: q.Get("path_glob"), Lang: q.Get("lang"),
 			Mode: q.Get("mode"), Cursor: q.Get("cursor"), Limit: limit,
-			ScanLines: queryInt(r, "max_lines", 0), ScanBytes: queryInt(r, "max_bytes", 0),
-			ScanTimeoutMS: queryInt(r, "timeout_ms", 0),
+			ScanLines: maxLines, ScanBytes: maxBytes, ScanTimeoutMS: timeoutMS,
 		})
 	}
 	reply(w, result, err, respondError)
+}
+
+func scanCap(r *http.Request, name string) (int, error) {
+	values, present := r.URL.Query()[name]
+	if !present {
+		return 0, nil
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("%s must be one non-negative integer: %w", name, workspaceops.ErrInvalidInput)
+	}
+	value, err := strconv.Atoi(values[0])
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be one non-negative integer: %w", name, workspaceops.ErrInvalidInput)
+	}
+	return value, nil
 }
 
 // explainPath explains one file (its explanation, outline and cluster) or a directory

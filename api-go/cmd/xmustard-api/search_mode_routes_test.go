@@ -171,6 +171,27 @@ func TestSearchRefusesAnUnknownMode(t *testing.T) {
 	}
 }
 
+func TestSearchRejectsInvalidScanCaps(t *testing.T) {
+	dir := t.TempDir()
+	seedCoreWorkspace(t, dir, "ws")
+	core := writeScript(t, "echo '{}'\n")
+	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core})
+
+	for _, tc := range []struct{ key, value string }{
+		{"max_lines", "nope"}, {"max_bytes", "1MB"}, {"timeout_ms", "-1"},
+	} {
+		q := url.Values{"mode": {"exact"}, "q": {"x"}, tc.key: {tc.value}}
+		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s=%q: status %d, want 400", tc.key, tc.value, resp.StatusCode)
+		}
+	}
+}
+
 // The two scan modes reach the route and are answered, not refused (WS-59c): a mode the
 // tool advertises must not be a 400, and the answer carries the scan's own shape.
 func TestSearchRoutesTheScanModes(t *testing.T) {
