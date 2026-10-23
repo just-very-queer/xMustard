@@ -13,11 +13,14 @@ import (
 
 func TestLockAPIDataDirRecordsEffectiveListenerPort(t *testing.T) {
 	dir := t.TempDir()
-	unlock, err := lockAPIDataDir(dir, 49001)
+	publish, unlock, err := lockAPIDataDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer unlock()
+	if err := publish(49001); err != nil {
+		t.Fatal(err)
+	}
 	b, err := os.ReadFile(filepath.Join(dir, "api.owner"))
 	if err != nil {
 		t.Fatal(err)
@@ -31,10 +34,48 @@ func TestLockAPIDataDirRecordsEffectiveListenerPort(t *testing.T) {
 	}
 }
 
+func TestLockAPIDataDirCanonicalizesSymlinkAlias(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "data")
+	if err := os.Mkdir(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(dir, alias); err != nil {
+		t.Fatal(err)
+	}
+	publish, unlock, err := lockAPIDataDir(alias)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	if err := publish(8042); err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "api.owner"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var owner apiOwner
+	if err := json.Unmarshal(b, &owner); err != nil {
+		t.Fatal(err)
+	}
+	resolvedDir, err := canonicalDataDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if owner.DataDir != resolvedDir {
+		t.Fatalf("owner data dir = %q, want resolved directory %q", owner.DataDir, resolvedDir)
+	}
+}
+
 func TestLockAPIDataDirRecordsOwnerUntilUnlock(t *testing.T) {
 	dir := t.TempDir()
-	unlock, err := lockAPIDataDir(dir, 9123)
+	publish, unlock, err := lockAPIDataDir(dir)
 	if err != nil {
+		t.Fatal(err)
+	}
+	if err := publish(9123); err != nil {
 		t.Fatal(err)
 	}
 	unlocked := false
@@ -59,7 +100,7 @@ func TestLockAPIDataDirRecordsOwnerUntilUnlock(t *testing.T) {
 	if err := json.Unmarshal(b, &owner); err != nil {
 		t.Fatal(err)
 	}
-	absDir, err := filepath.Abs(dir)
+	absDir, err := canonicalDataDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -67,9 +108,10 @@ func TestLockAPIDataDirRecordsOwnerUntilUnlock(t *testing.T) {
 	if !ok || owner.PID != os.Getpid() || owner.StartTime != start || owner.DataDir != absDir || owner.Port != 9123 {
 		t.Fatalf("owner record = %+v; process start = %d, want current API identity", owner, start)
 	}
-	otherUnlock, err := lockAPIDataDir(dir, 9123)
+	otherPublish, otherUnlock, err := lockAPIDataDir(dir)
 	if err != errAPIAlreadyRunning {
 		if err == nil {
+			_ = otherPublish(9123)
 			otherUnlock()
 		}
 		t.Fatalf("second API admission error = %v, want duplicate", err)

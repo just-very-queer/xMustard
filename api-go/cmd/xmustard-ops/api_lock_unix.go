@@ -23,26 +23,38 @@ type apiOwner struct {
 }
 
 func apiOwnerMatches(dataDir string, port int, healthDataDirID string) bool {
+	_, ok := matchingAPIOwner(dataDir, port, healthDataDirID)
+	return ok
+}
+
+func matchingAPIOwner(dataDir string, port int, healthDataDirID string) (apiOwner, bool) {
 	wantDir, err := filepath.Abs(dataDir)
+	if err != nil {
+		return apiOwner{}, false
+	}
+	wantDir, err = filepath.EvalSymlinks(wantDir)
 	if err != nil || healthDataDirID == "" || healthDataDirID != dataDirID(wantDir) {
-		return false
+		return apiOwner{}, false
 	}
 	path := filepath.Join(wantDir, "api.owner")
 	info, err := os.Stat(path)
 	if err != nil || info.Mode().Perm() != 0o600 {
-		return false
+		return apiOwner{}, false
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return false
+		return apiOwner{}, false
 	}
 	var owner apiOwner
 	if json.Unmarshal(b, &owner) != nil || owner.PID <= 0 || owner.StartTime <= 0 ||
 		filepath.Clean(owner.DataDir) != wantDir || owner.Port != port {
-		return false
+		return apiOwner{}, false
 	}
 	start, name, ok := processIdentity(owner.PID)
-	return ok && start == owner.StartTime && name == "xmustard-api"
+	if !ok || start != owner.StartTime || name != "xmustard-api" {
+		return apiOwner{}, false
+	}
+	return owner, true
 }
 
 func dataDirID(dataDir string) string {

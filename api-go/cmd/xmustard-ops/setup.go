@@ -300,15 +300,14 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string, port int) any {
 	service := report.Service
 	if service.Manager == "launchd" && service.Loaded && service.PID == 0 &&
-		// A duplicate exits 0 (so launchd does not relaunch it): a loaded job that last
-		// exited cleanly while a live owner holds this data directory is that case.
 		service.LastExitCode != nil && *service.LastExitCode == 0 &&
-		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" &&
-		apiOwnerMatches(dataDir, port, report.Health.DataDirID) {
-		return struct {
-			daemon.StatusReport
-			Notice string `json:"notice"`
-		}{StatusReport: report, Notice: "launchd agent not running because another instance owns the port"}
+		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" {
+		if owner, ok := matchingAPIOwner(dataDir, port, report.Health.DataDirID); ok {
+			return struct {
+				daemon.StatusReport
+				Notice string `json:"notice"`
+			}{StatusReport: report, Notice: fmt.Sprintf("launchd agent is not running; another xMustard API (pid %d, port %d) owns this data directory", owner.PID, owner.Port)}
+		}
 	}
 	return report
 }

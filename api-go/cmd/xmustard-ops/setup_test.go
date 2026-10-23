@@ -407,10 +407,13 @@ func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
 		{name: "stopped job with a stale clean exit", service: daemon.Status{Manager: "launchd", State: "not-loaded", LastExitCode: &cleanExit}},
 		{name: "loaded job whose last exit failed", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &failedExit}},
 		{name: "loaded job with no recorded exit", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true}},
-		{name: "loaded job that exited cleanly beside a live owner", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit}, want: true},
+		{name: "loaded job stopped cleanly beside a live manual owner", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit}, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir, _ := filepath.Abs(t.TempDir())
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
 			owner := apiOwner{PID: 123, StartTime: 456, DataDir: dir, Port: 8042}
 			ownerJSON, err := json.Marshal(owner)
 			if err != nil {
@@ -450,7 +453,10 @@ func TestExplainLaunchdDuplicateRejectsStaleOwnerRecord(t *testing.T) {
 		{name: "reused pid", pid: 123, ownerStart: 456, procStart: 457},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			dir, _ := filepath.Abs(t.TempDir())
+			dir, err := filepath.EvalSymlinks(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
 			owner := apiOwner{PID: tc.pid, StartTime: tc.ownerStart, DataDir: dir, Port: 8042}
 			b, err := json.Marshal(owner)
 			if err != nil {
@@ -482,7 +488,10 @@ func TestExplainLaunchdDuplicateRejectsStaleOwnerRecord(t *testing.T) {
 }
 
 func TestExplainLaunchdDuplicateDoesNotInferFromUnrelatedLock(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	lock, err := os.OpenFile(filepath.Join(dir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
@@ -502,6 +511,38 @@ func TestExplainLaunchdDuplicateDoesNotInferFromUnrelatedLock(t *testing.T) {
 		Notice string `json:"notice"`
 	}); wrapped {
 		t.Fatal("an unrelated admission-lock holder caused the duplicate notice")
+	}
+}
+
+func TestOwnerRecordMatchesSymlinkAlias(t *testing.T) {
+	root := t.TempDir()
+	dataPath := filepath.Join(root, "data")
+	if err := os.Mkdir(dataPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	dir, err := filepath.EvalSymlinks(dataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(dataPath, alias); err != nil {
+		t.Fatal(err)
+	}
+	owner := apiOwner{PID: 123, StartTime: 456, DataDir: dir, Port: 8042}
+	b, err := json.Marshal(owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "api.owner"), b, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	previousIdentity := processIdentity
+	processIdentity = func(pid int) (int64, string, bool) {
+		return owner.StartTime, "xmustard-api", pid == owner.PID
+	}
+	defer func() { processIdentity = previousIdentity }()
+	if !apiOwnerMatches(alias, 8042, dataDirID(dir)) {
+		t.Fatal("resolved and symlinked data-directory identities did not match")
 	}
 }
 
@@ -532,7 +573,7 @@ func TestOwnerRecordRequiresLiveMatchingAPIProcess(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
-			wantDir, err := filepath.Abs(dir)
+			wantDir, err := filepath.EvalSymlinks(dir)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -565,7 +606,10 @@ func TestOwnerRecordRequiresLiveMatchingAPIProcess(t *testing.T) {
 }
 
 func TestOwnerRecordInspectionDoesNotContendWithAdmission(t *testing.T) {
-	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
 	owner := apiOwner{PID: 123, StartTime: 456, DataDir: dir, Port: 8042}
 	ownerJSON, err := json.Marshal(owner)
 	if err != nil {
@@ -660,12 +704,16 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	if err := os.MkdirAll(spec.DataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	owner := apiOwner{PID: 123, StartTime: 456, DataDir: spec.DataDir, Port: spec.Port}
+	resolvedDataDir, err := filepath.EvalSymlinks(spec.DataDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owner := apiOwner{PID: 123, StartTime: 456, DataDir: resolvedDataDir, Port: spec.Port}
 	ownerJSON, err := json.Marshal(owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(spec.DataDir, "api.owner"), ownerJSON, 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(resolvedDataDir, "api.owner"), ownerJSON, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	previousIdentity := processIdentity
@@ -679,7 +727,7 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	probeCalls := 0
 	e.probe = func(context.Context, string) (daemon.Health, error) {
 		probeCalls++
-		return daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(spec.DataDir)}, nil
+		return daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(resolvedDataDir)}, nil
 	}
 
 	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
@@ -687,7 +735,7 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	}
 	v := decodeOut(t, out)
 	if v["platform"] != "launchd" || v["label"] != spec.Label || v["api"] != spec.BaseURL() ||
-		v["notice"] != "launchd agent not running because another instance owns the port" {
+		v["notice"] != "launchd agent is not running; another xMustard API (pid 123, port 8042) owns this data directory" {
 		t.Fatalf("status report fields were not preserved: %v", v)
 	}
 	if probeCalls != 1 {

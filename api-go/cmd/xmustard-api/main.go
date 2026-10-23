@@ -56,11 +56,7 @@ func main() {
 	if err := validateStartup(cfg); err != nil {
 		log.Fatal(err)
 	}
-	listenerPort, err := strconv.Atoi(cfg.port)
-	if err != nil {
-		log.Fatalf("invalid API listener port %q: %v", cfg.port, err)
-	}
-	unlockDataDir, err := lockAPIDataDir(cfg.dataDir, listenerPort)
+	publishOwner, unlockDataDir, err := lockAPIDataDir(cfg.dataDir)
 	if errors.Is(err, errAPIAlreadyRunning) {
 		// Exit cleanly: launchd's KeepAlive {SuccessfulExit: false} and systemd's
 		// Restart=on-failure relaunch only a failed exit, so a duplicate never loops.
@@ -73,6 +69,11 @@ func main() {
 	defer unlockDataDir()
 	ln, err := listen(cfg, activated)
 	if err != nil {
+		log.Fatal(err)
+	}
+	listenerPort := ln.Addr().(*net.TCPAddr).Port
+	if err := publishOwner(listenerPort); err != nil {
+		_ = ln.Close()
 		log.Fatal(err)
 	}
 	applyRuntimeHygiene()

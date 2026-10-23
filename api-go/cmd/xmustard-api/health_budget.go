@@ -51,7 +51,7 @@ type publicBudget struct {
 
 // dataDirID identifies the configured data directory without exposing its path.
 func dataDirID() string {
-	path, err := filepath.Abs(dataDir())
+	path, err := canonicalDataDir(dataDir())
 	if err != nil {
 		return ""
 	}

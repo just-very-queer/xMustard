@@ -68,6 +68,37 @@ func TestDuplicateAPIExecutableExitsCleanly(t *testing.T) {
 	}
 }
 
+func TestAPIExecutableRecordsEphemeralListenerPort(t *testing.T) {
+	dataDir := t.TempDir()
+	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
+		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": "0",
+	})
+	deadline := time.Now().Add(15 * time.Second)
+	var port int
+	for time.Now().Before(deadline) {
+		b, err := os.ReadFile(filepath.Join(dataDir, "api.owner"))
+		if err == nil {
+			var owner apiOwner
+			if json.Unmarshal(b, &owner) == nil && owner.Port > 0 {
+				port = owner.Port
+				break
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if port == 0 {
+		t.Fatalf("owner record did not contain assigned listener port: %s", p.out)
+	}
+	resp, err := testClient.Get(fmt.Sprintf("http://127.0.0.1:%d/api/health", port))
+	if err != nil {
+		t.Fatalf("health on ephemeral listener: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("health status = %d, want 200", resp.StatusCode)
+	}
+}
+
 func TestDataDirLockStopsSecondAPIOnAnotherPort(t *testing.T) {
 	dataDir := t.TempDir()
 	startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})

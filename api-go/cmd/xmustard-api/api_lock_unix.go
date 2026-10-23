@@ -21,49 +21,54 @@ type apiOwner struct {
 	Port      int    `json:"port"`
 }
 
-func lockAPIDataDir(dataDir string, port int) (func(), error) {
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
-		return nil, err
-	}
-	f, err := os.OpenFile(filepath.Join(dataDir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+func canonicalDataDir(dataDir string) (string, error) {
+	absDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
-		return nil, err
+		return "", err
+	}
+	return filepath.EvalSymlinks(absDataDir)
+}
+
+func lockAPIDataDir(dataDir string) (func(int) error, func(), error) {
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return nil, nil, err
+	}
+	resolvedDataDir, err := canonicalDataDir(dataDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	f, err := os.OpenFile(filepath.Join(resolvedDataDir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, nil, err
 	}
 	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		_ = f.Close()
 		if errors.Is(err, unix.EWOULDBLOCK) {
-			return nil, errAPIAlreadyRunning
+			return nil, nil, errAPIAlreadyRunning
 		}
-		return nil, err
-	}
-	absDataDir, err := filepath.Abs(dataDir)
-	if err != nil {
-		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-		_ = f.Close()
-		return nil, err
+		return nil, nil, err
 	}
 	start, ok := procStartTime(os.Getpid())
 	if !ok {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		_ = f.Close()
-		return nil, fmt.Errorf("read API process start time")
+		return nil, nil, fmt.Errorf("read API process start time")
 	}
-	if port <= 0 || port > 65535 {
+	ownerPath := filepath.Join(resolvedDataDir, "api.owner")
+	var owner apiOwner
+	publish := func(port int) error {
+		if port <= 0 || port > 65535 {
+			return fmt.Errorf("invalid API listener port for owner record: %d", port)
+		}
+		owner = apiOwner{PID: os.Getpid(), StartTime: start, DataDir: resolvedDataDir, Port: port}
+		return writeAPIOwner(ownerPath, owner)
+	}
+	unlock := func() {
+		removeAPIOwner(ownerPath, owner)
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		_ = f.Close()
-		return nil, fmt.Errorf("invalid API port for owner record: %d", port)
 	}
-	owner := apiOwner{PID: os.Getpid(), StartTime: start, DataDir: absDataDir, Port: port}
-	if err := writeAPIOwner(filepath.Join(dataDir, "api.owner"), owner); err != nil {
-		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-		_ = f.Close()
-		return nil, err
-	}
-	return func() {
-		removeAPIOwner(filepath.Join(dataDir, "api.owner"), owner)
-		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
-		_ = f.Close()
-	}, nil
+	return publish, unlock, nil
 }
 
 func writeAPIOwner(path string, owner apiOwner) error {
@@ -96,6 +101,9 @@ func writeAPIOwner(path string, owner apiOwner) error {
 }
 
 func removeAPIOwner(path string, owner apiOwner) {
+	if owner.PID == 0 {
+		return
+	}
 	var current apiOwner
 	b, err := os.ReadFile(path)
 	if err == nil && json.Unmarshal(b, &current) == nil && current == owner {
