@@ -196,6 +196,13 @@ impl RefreshQueue {
         Some(self.retry_at.map_or(due, |r| due.max(r)))
     }
 
+    /// When an in-flight batch expires, if any.
+    pub fn expire_at(&self) -> Option<Instant> {
+        self.in_flight
+            .as_ref()
+            .map(|(_, since)| *since + IN_FLIGHT_LIMIT)
+    }
+
     pub fn is_due(&self, now: Instant) -> bool {
         self.due_at().is_some_and(|at| at <= now)
     }

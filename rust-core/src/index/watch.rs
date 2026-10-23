@@ -82,8 +82,6 @@ pub const REWATCH_AFTER: Duration = Duration::from_secs(60);
 pub const REWATCH_MAX: Duration = Duration::from_secs(30 * 60);
 /// A due batch nobody took is announced again after this long.
 pub const RENOTIFY_AFTER: Duration = Duration::from_secs(10);
-/// Longest sleep of a root's thread (its stop latency).
-const TICK: Duration = Duration::from_millis(250);
 /// Cookie file name prefix, in the Git dir.
 const COOKIE_PREFIX: &str = "xm-watch-cookie-";
 /// Ignore files anywhere in the tree.
@@ -653,10 +651,13 @@ impl Root {
         }
     }
 
-    /// Stop watching (the thread ends within a tick) and tell the orchestrator the
-    /// root is no longer watched, so its next read registers it again.
+    /// Stop watching and tell the orchestrator the root is no longer watched, so its
+    /// next read registers it again. Wake the thread without waiting for a deadline.
     fn retire(&self) {
         self.stop.store(true, Ordering::Release);
+        let wake = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(self.root.clone());
+        let _ = self.tx.send(Ok(wake));
         self.notify("$/watch.state", absent_status(&self.root));
     }
 
@@ -666,14 +667,21 @@ impl Root {
         while !self.stop.load(Ordering::Acquire) {
             let wait = self.next_wakeup(Instant::now());
             match rx.recv_timeout(wait) {
+                Ok(_) if self.stop.load(Ordering::Acquire) => break,
                 Ok(ev) => {
                     self.on_event(ev);
-                    while let Ok(ev) = rx.try_recv() {
-                        self.on_event(ev);
+                    while !self.stop.load(Ordering::Acquire) {
+                        match rx.try_recv() {
+                            Ok(ev) => self.on_event(ev),
+                            Err(_) => break,
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
+            }
+            if self.stop.load(Ordering::Acquire) {
+                break;
             }
             self.tick(Instant::now());
         }
@@ -682,15 +690,26 @@ impl Root {
 
     fn next_wakeup(&self, now: Instant) -> Duration {
         let inner = lock(&self.inner);
+        let queue_due = inner.queue.due_at().map(|due| {
+            if due <= now {
+                inner
+                    .due_notified
+                    .map_or(due, |notified| notified + RENOTIFY_AFTER)
+            } else {
+                due
+            }
+        });
         [
-            inner.queue.due_at(),
+            queue_due,
+            inner.queue.expire_at(),
             inner.rewatch_at,
             Some(inner.verify_at),
         ]
         .into_iter()
         .flatten()
         .map(|at| at.saturating_duration_since(now))
-        .fold(TICK, Duration::min)
+        .min()
+        .unwrap_or(VERIFY_EVERY)
     }
 
     /// Learn the layout and the ignored directories, then start the native watcher.
@@ -1761,6 +1780,7 @@ pub fn run(args: Args) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::refresh_queue::{DEBOUNCE, MAX_WAIT};
 
     fn layout(ignored: Option<&[&str]>) -> Layout {
         Layout {
@@ -1768,6 +1788,64 @@ mod tests {
             git_dirs: vec![PathBuf::from("/r/.git")],
             ignored: ignored.map(|d| d.iter().map(|s| s.to_string()).collect()),
         }
+    }
+
+    #[test]
+    fn due_refresh_waits_until_renotify_instead_of_spinning() {
+        let (root, _rx) = Root::new(PathBuf::from("/r"), None, MAX_WATCH_DIRS);
+        let now = Instant::now();
+        let mut inner = lock(&root.inner);
+        inner
+            .queue
+            .push(Change::Full(FullReason::Startup), now - MAX_WAIT - DEBOUNCE);
+        inner.due_notified = Some(now);
+        let expected = RENOTIFY_AFTER.min(inner.verify_at.saturating_duration_since(now));
+        drop(inner);
+
+        assert_eq!(root.next_wakeup(now), expected);
+    }
+
+    #[test]
+    fn in_flight_refresh_wakes_at_its_expiry_deadline() {
+        let (root, _rx) = Root::new(PathBuf::from("/r"), None, MAX_WATCH_DIRS);
+        let now = Instant::now();
+        let mut inner = lock(&root.inner);
+        assert!(inner.queue.take(now, true).is_some());
+        drop(inner);
+
+        assert_eq!(root.next_wakeup(now), super::super::refresh_queue::IN_FLIGHT_LIMIT);
+    }
+
+    #[test]
+    fn idle_watcher_sleeps_until_a_deadline_and_retire_wakes_promptly() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (root, rx) = Root::new(dir.path().to_path_buf(), None, MAX_WATCH_DIRS);
+        let worker = root.clone();
+        let thread = std::thread::spawn(move || worker.run(rx));
+
+        std::thread::sleep(Duration::from_secs(2));
+
+        let started = Instant::now();
+        root.retire();
+        thread.join().expect("watch thread exits");
+        assert!(started.elapsed() < Duration::from_millis(500));
+        assert_eq!(lock(&root.inner).counters.events, 0);
+    }
+
+    #[test]
+    fn idle_watcher_waits_for_its_next_real_deadline() {
+        let (root, _rx) = Root::new(PathBuf::from("/r"), None, MAX_WATCH_DIRS);
+        let now = Instant::now();
+        let mut inner = lock(&root.inner);
+        inner.queue = RefreshQueue::new();
+        inner.due_notified = None;
+        inner.rewatch_at = None;
+        inner.verify_at = now + VERIFY_EVERY;
+        drop(inner);
+
+        let wait = root.next_wakeup(now);
+        assert!(wait > Duration::from_millis(250));
+        assert!(wait <= VERIFY_EVERY);
     }
 
     #[test]
