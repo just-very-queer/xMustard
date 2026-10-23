@@ -111,21 +111,6 @@ func List() ([]Process, error) {
 	return list()
 }
 
-func stableIdentitySample(pid, uid int, identify func(int) (Process, error), read func() error) (Process, bool) {
-	before, err := identify(pid)
-	if err != nil || before.UID != uid || before.Comm != ProcessName {
-		return Process{}, false
-	}
-	if err := read(); err != nil {
-		return Process{}, false
-	}
-	after, err := identify(pid)
-	if err != nil || !sameIdentity(before, after) {
-		return Process{}, false
-	}
-	return after, true
-}
-
 func sameIdentity(before, after Process) bool {
 	return before.PID == after.PID && before.UID == after.UID && before.StartTime == after.StartTime && before.Comm == after.Comm
 }

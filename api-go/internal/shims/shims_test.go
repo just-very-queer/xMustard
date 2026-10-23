@@ -2,7 +2,6 @@ package shims
 
 import (
 	"errors"
-	"os"
 	"reflect"
 	"testing"
 	"time"
@@ -47,27 +46,6 @@ func TestUpdateSlopesRetainsLastValidSlopeAcrossShortIntervals(t *testing.T) {
 		if short[0].CPUSlope < .8 || Classify(short[0]) != Runaway {
 			t.Fatalf("short poll %d discarded valid runaway slope: %+v", i, short[0])
 		}
-	}
-}
-
-func TestIdentitySampleRejectsPIDReuseDuringCPURead(t *testing.T) {
-	original := Process{PID: 42, UID: os.Getuid(), StartTime: 100, Comm: ProcessName}
-	replacement := Process{PID: 42, UID: os.Getuid(), StartTime: 200, Comm: ProcessName}
-	identities := 0
-	var sequence []string
-	got, stable := stableIdentitySample(original.PID, original.UID, func(int) (Process, error) {
-		sequence = append(sequence, "identity")
-		identities++
-		if identities == 1 {
-			return original, nil
-		}
-		return replacement, nil
-	}, func() error {
-		sequence = append(sequence, "cpu")
-		return nil
-	})
-	if stable || got.PID != 0 || !reflect.DeepEqual(sequence, []string{"identity", "cpu", "identity"}) {
-		t.Fatalf("reused PID CPU sample: stable=%v identity=%+v sequence=%v", stable, got, sequence)
 	}
 }
 
