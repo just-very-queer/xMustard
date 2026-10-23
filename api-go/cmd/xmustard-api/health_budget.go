@@ -1,8 +1,11 @@
 package main
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"log"
 	"net/http"
+	"path/filepath"
 	"strings"
 
 	"xmustard/api-go/internal/budget"
@@ -46,6 +49,16 @@ type publicBudget struct {
 	Detail           string `json:"detail"`
 }
 
+// dataDirID identifies the configured data directory without exposing its path.
+func dataDirID() string {
+	path, err := filepath.Abs(dataDir())
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(filepath.Clean(path)))
+	return hex.EncodeToString(sum[:])
+}
+
 // healthResponse is the /api/health body. Health stays public for liveness probes. The
 // full view (the budget block, the live pool and child counters, and mcp_usage) shows host-wide
 // activity: captures, hashed bytes, spawns, the owned tree and live external processes,
@@ -57,7 +70,7 @@ type publicBudget struct {
 // workspace-scoped token of any role) sees the static limits, and nothing is sampled.
 func healthResponse(r *http.Request) map[string]any {
 	full, detail := healthBudgetView(r)
-	body := map[string]any{"status": "ok", "service": "api-go"}
+	body := map[string]any{"status": "ok", "service": "api-go", "data_dir_id": dataDirID()}
 	// the governance store's startup check (WS-58), once the daemon ran it
 	store := workspaceops.MemoryStoreHealth(dataDir())
 	if !full {

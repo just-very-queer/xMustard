@@ -297,10 +297,10 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 	},
 }
 
-func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string) any {
+func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string, port int) any {
 	if report.Service.Manager == "launchd" && report.Service.PID == 0 &&
 		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" &&
-		dataDirLockHeld(dataDir) {
+		apiOwnerMatches(dataDir, port, report.Health.DataDirID) {
 		return struct {
 			daemon.StatusReport
 			Notice string `json:"notice"`
@@ -338,7 +338,7 @@ func runDaemon(e lifecycleEnv, args []string) int {
 	}
 	if args[0] == "status" {
 		if report, ok := out.(daemon.StatusReport); ok {
-			out = explainLaunchdDuplicate(report, spec.DataDir)
+			out = explainLaunchdDuplicate(report, spec.DataDir, spec.Port)
 		}
 	}
 	return e.emit(out)

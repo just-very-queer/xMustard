@@ -11,8 +11,9 @@ import (
 
 // Health is the part of /api/health the lifecycle reads.
 type Health struct {
-	Status  string `json:"status"`
-	Service string `json:"service"`
+	Status    string `json:"status"`
+	Service   string `json:"service"`
+	DataDirID string `json:"data_dir_id,omitempty"`
 	// Store is the governance store's state after the daemon's startup check
 	// (migration and quick_check), passed through as the daemon reports it.
 	Store json.RawMessage `json:"store,omitempty"`

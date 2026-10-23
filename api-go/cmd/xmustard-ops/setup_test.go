@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"net"
 	"net/http"
@@ -407,7 +408,7 @@ func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			report := daemon.StatusReport{Service: tc.service, Health: tc.health}
-			got := explainLaunchdDuplicate(report, t.TempDir())
+			got := explainLaunchdDuplicate(report, t.TempDir(), 8042)
 			if _, wrapped := got.(struct {
 				daemon.StatusReport
 				Notice string `json:"notice"`
@@ -416,6 +417,156 @@ func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestExplainLaunchdDuplicateDoesNotInferFromUnrelatedLock(t *testing.T) {
+	dir := t.TempDir()
+	lock, err := os.OpenFile(filepath.Join(dir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	report := daemon.StatusReport{
+		Service: daemon.Status{Manager: "launchd", State: "waiting"},
+		Health:  &daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(dir)},
+	}
+	if _, wrapped := explainLaunchdDuplicate(report, dir, 8042).(struct {
+		daemon.StatusReport
+		Notice string `json:"notice"`
+	}); wrapped {
+		t.Fatal("an unrelated admission-lock holder caused the duplicate notice")
+	}
+}
+
+func TestAPIProcessIdentityReadsCurrentProcess(t *testing.T) {
+	start, name, ok := apiProcessIdentity(os.Getpid())
+	if !ok || start <= 0 || name == "" {
+		t.Fatalf("current process identity = (%d, %q, %v)", start, name, ok)
+	}
+}
+
+func TestOwnerRecordRequiresLiveMatchingAPIProcess(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		pid       int
+		start     int64
+		process   string
+		dataDir   string
+		port      int
+		actual    bool
+		wantOwner bool
+	}{
+		{name: "valid", pid: 123, start: 456, process: "xmustard-api", wantOwner: true},
+		{name: "dead pid", pid: 2_000_000_000, start: 456, actual: true, wantOwner: false},
+		{name: "reused pid", pid: 123, start: 457, process: "xmustard-api", wantOwner: false},
+		{name: "unrelated process", pid: 123, start: 456, process: "maintenance", wantOwner: false},
+		{name: "different data dir", pid: 123, start: 456, process: "xmustard-api", dataDir: "/elsewhere", wantOwner: false},
+		{name: "different port", pid: 123, start: 456, process: "xmustard-api", port: 9000, wantOwner: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			wantDir, err := filepath.Abs(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			owner := apiOwner{PID: tc.pid, StartTime: 456, DataDir: wantDir, Port: 8042}
+			if tc.dataDir != "" {
+				owner.DataDir = tc.dataDir
+			}
+			if tc.port != 0 {
+				owner.Port = tc.port
+			}
+			b, err := json.Marshal(owner)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "api.owner"), b, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if !tc.actual {
+				previousIdentity := processIdentity
+				processIdentity = func(pid int) (int64, string, bool) {
+					return tc.start, tc.process, pid == owner.PID && tc.process != ""
+				}
+				t.Cleanup(func() { processIdentity = previousIdentity })
+			}
+			if got := apiOwnerMatches(dir, 8042, dataDirID(wantDir)); got != tc.wantOwner {
+				t.Fatalf("valid owner = %v, want %v", got, tc.wantOwner)
+			}
+		})
+	}
+}
+
+func TestOwnerRecordInspectionDoesNotContendWithAdmission(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "api.lock")
+	admitted := make(chan struct{})
+	release := make(chan struct{})
+	admissionDone := make(chan error, 1)
+	go func() {
+		lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
+		if err != nil {
+			admissionDone <- err
+			return
+		}
+		defer lock.Close()
+		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+			admissionDone <- err
+			return
+		}
+		close(admitted)
+		<-release
+		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		admissionDone <- nil
+	}()
+	select {
+	case <-admitted:
+	case err := <-admissionDone:
+		t.Fatalf("API admission failed: %v", err)
+	case <-time.After(time.Second):
+		t.Fatal("API admission did not acquire its lock")
+	}
+	statusDone := make(chan bool, 1)
+	go func() { statusDone <- apiOwnerMatches(dir, 8042, dir) }()
+	select {
+	case owner := <-statusDone:
+		if owner {
+			t.Fatal("status inferred ownership without a validated owner record")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status inspection waited on API admission")
+	}
+	close(release)
+	if err := <-admissionDone; err != nil {
+		t.Fatalf("API admission cleanup: %v", err)
+	}
+	lock, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatalf("replacement API admission was blocked by status inspection: %v", err)
+	}
+	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+	if err := assertStatusProbeDoesNotFlock(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func assertStatusProbeDoesNotFlock() error {
+	source, err := os.ReadFile("api_lock_unix.go")
+	if err != nil {
+		return err
+	}
+	if bytes.Contains(source, []byte("Flock")) {
+		return errors.New("status probe must not call flock on the API admission lock")
+	}
+	return nil
 }
 
 func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
@@ -433,26 +584,28 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	if err := os.MkdirAll(spec.DataDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	lockFile, err := os.OpenFile(filepath.Join(spec.DataDir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
+	owner := apiOwner{PID: 123, StartTime: 456, DataDir: spec.DataDir, Port: spec.Port}
+	ownerJSON, err := json.Marshal(owner)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := unix.Flock(int(lockFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = lockFile.Close()
+	if err := os.WriteFile(filepath.Join(spec.DataDir, "api.owner"), ownerJSON, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	defer func() {
-		_ = unix.Flock(int(lockFile.Fd()), unix.LOCK_UN)
-		_ = lockFile.Close()
-	}()
+	previousIdentity := processIdentity
+	processIdentity = func(pid int) (int64, string, bool) {
+		return owner.StartTime, "xmustard-api", pid == owner.PID
+	}
+	defer func() { processIdentity = previousIdentity }()
 	e.run = func(context.Context, string, ...string) (string, error) {
 		return "state = waiting\n", errors.New("not running")
 	}
 	probeCalls := 0
 	e.probe = func(context.Context, string) (daemon.Health, error) {
 		probeCalls++
-		return daemon.Health{Status: "ok", Service: "api-go"}, nil
+		return daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(spec.DataDir)}, nil
 	}
+
 	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
 		t.Fatalf("status exit = %d: %s", code, errOut)
 	}

@@ -2,4 +2,4 @@
 
 package main
 
-func dataDirLockHeld(string) bool { return false }
+func apiOwnerMatches(string, int, string) bool { return false }
