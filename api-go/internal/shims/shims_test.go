@@ -1,10 +1,62 @@
 package shims
 
 import (
+	"errors"
+	"os"
 	"reflect"
 	"testing"
 	"time"
 )
+
+func TestIdentitySampleRejectsPIDReuseDuringCPURead(t *testing.T) {
+	original := Process{PID: 42, UID: os.Getuid(), StartTime: 100, Comm: ProcessName}
+	replacement := Process{PID: 42, UID: os.Getuid(), StartTime: 200, Comm: ProcessName}
+	identities := 0
+	var sequence []string
+	got, stable := stableIdentitySample(original.PID, original.UID, func(int) (Process, error) {
+		sequence = append(sequence, "identity")
+		identities++
+		if identities == 1 {
+			return original, nil
+		}
+		return replacement, nil
+	}, func() error {
+		sequence = append(sequence, "cpu")
+		return nil
+	})
+	if stable || got.PID != 0 || !reflect.DeepEqual(sequence, []string{"identity", "cpu", "identity"}) {
+		t.Fatalf("reused PID CPU sample: stable=%v identity=%+v sequence=%v", stable, got, sequence)
+	}
+}
+
+func TestUpdateSlopesKeepsBaselineAcrossShortQuantizedIntervals(t *testing.T) {
+	slopes.Lock()
+	slopes.samples = make(map[int]sample)
+	slopes.Unlock()
+	base := time.Unix(200, 0)
+	first := []Process{{PID: 70003, Comm: ProcessName, CPUAt: base}}
+	updateSlopes(first, base.Add(10*time.Second))
+	for i := 1; i <= 5; i++ {
+		short := []Process{{PID: 70003, Comm: ProcessName, CPUS: 10 * time.Millisecond, CPUAt: base.Add(time.Duration(i) * 10 * time.Millisecond)}}
+		updateSlopes(short, base.Add(20*time.Second))
+		if short[0].CPUSlope != 0 || Classify(short[0]) != Live {
+			t.Fatalf("short quantized sample %d classified as %s at slope %v", i, Classify(short[0]), short[0].CPUSlope)
+		}
+	}
+	idle := []Process{{PID: 70003, Comm: ProcessName, CPUS: 10 * time.Millisecond, CPUAt: base.Add(time.Second)}}
+	updateSlopes(idle, base.Add(30*time.Second))
+	if idle[0].CPUSlope >= .8 || Classify(idle[0]) != Live {
+		t.Fatalf("quantized idle sample = %+v", idle[0])
+	}
+
+	baseline := []Process{{PID: 70004, Comm: ProcessName, CPUAt: base}}
+	updateSlopes(baseline, base.Add(40*time.Second))
+	runaway := []Process{{PID: 70004, Comm: ProcessName, CPUS: 900 * time.Millisecond, CPUAt: base.Add(time.Second)}}
+	updateSlopes(runaway, base.Add(50*time.Second))
+	if runaway[0].CPUSlope < .8 || Classify(runaway[0]) != Runaway {
+		t.Fatalf("sustained runaway sample = %+v", runaway[0])
+	}
+}
 
 func TestUpdateSlopesUsesSecondsAndRejectsStaleSamples(t *testing.T) {
 	slopes.Lock()
@@ -159,6 +211,22 @@ func TestClassifyShims(t *testing.T) {
 	}
 }
 
+func TestReapEachPreservesPerPIDOutcomes(t *testing.T) {
+	processes := []Process{
+		{PID: 10, Comm: ProcessName, CPUS: 301 * time.Second},
+		{PID: 11, Comm: ProcessName, CPUS: 302 * time.Second},
+	}
+	outcomes := ReapEach(processes, func(p Process) error {
+		if p.PID == 10 {
+			return errors.New("process exited before signal")
+		}
+		return nil
+	})
+	if len(outcomes) != 2 || outcomes[0].PID != 10 || outcomes[0].Result != "failed" || outcomes[1].PID != 11 || outcomes[1].Result != "signaled" {
+		t.Fatalf("reap outcomes = %+v", outcomes)
+	}
+}
+
 func TestReapSelectsOnlyRunawayAndOrphaned(t *testing.T) {
 	processes := []Process{
 		{PID: 1, Comm: ProcessName, CPUS: 301 * time.Second},
@@ -168,14 +236,14 @@ func TestReapSelectsOnlyRunawayAndOrphaned(t *testing.T) {
 		{PID: 5, Comm: "other", CPUS: time.Hour},
 	}
 	var got []int
-	err := Reap(processes, func(p Process) error {
+	outcomes := ReapEach(processes, func(p Process) error {
 		got = append(got, p.PID)
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
 	if want := []int{1, 2}; !reflect.DeepEqual(got, want) {
 		t.Fatalf("killed pids %v, want %v", got, want)
+	}
+	if len(outcomes) != len(got) {
+		t.Fatalf("reap outcomes = %+v, want one for each selected PID", outcomes)
 	}
 }

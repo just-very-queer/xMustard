@@ -55,17 +55,39 @@ func Classify(p Process) Class {
 	return Live
 }
 
+type ReapOutcome struct {
+	PID    int    `json:"pid"`
+	Class  Class  `json:"class"`
+	Result string `json:"result"`
+	Error  string `json:"error,omitempty"`
+	err    error
+}
+
 func Reap(processes []Process, signal func(Process) error) error {
-	var first error
-	for _, p := range processes {
-		class := Classify(p)
-		if class == Runaway || class == Orphaned {
-			if err := signal(p); err != nil && first == nil {
-				first = err
-			}
+	for _, outcome := range ReapEach(processes, signal) {
+		if outcome.err != nil {
+			return outcome.err
 		}
 	}
-	return first
+	return nil
+}
+
+func ReapEach(processes []Process, signal func(Process) error) []ReapOutcome {
+	outcomes := make([]ReapOutcome, 0)
+	for _, p := range processes {
+		class := Classify(p)
+		if class != Runaway && class != Orphaned {
+			continue
+		}
+		outcome := ReapOutcome{PID: p.PID, Class: class, Result: "signaled"}
+		if err := signal(p); err != nil {
+			outcome.Result = "failed"
+			outcome.Error = err.Error()
+			outcome.err = err
+		}
+		outcomes = append(outcomes, outcome)
+	}
+	return outcomes
 }
 
 var sampleCollection sync.Mutex
@@ -89,6 +111,25 @@ func List() ([]Process, error) {
 	return list()
 }
 
+func stableIdentitySample(pid, uid int, identify func(int) (Process, error), read func() error) (Process, bool) {
+	before, err := identify(pid)
+	if err != nil || before.UID != uid || before.Comm != ProcessName {
+		return Process{}, false
+	}
+	if err := read(); err != nil {
+		return Process{}, false
+	}
+	after, err := identify(pid)
+	if err != nil || !sameIdentity(before, after) {
+		return Process{}, false
+	}
+	return after, true
+}
+
+func sameIdentity(before, after Process) bool {
+	return before.PID == after.PID && before.UID == after.UID && before.StartTime == after.StartTime && before.Comm == after.Comm
+}
+
 func signalIfIdentity(expected Process, identify func(int) (Process, error), send func(int) error) error {
 	for range 2 {
 		current, err := identify(expected.PID)
@@ -99,8 +140,8 @@ func signalIfIdentity(expected Process, identify func(int) (Process, error), sen
 	return send(expected.PID)
 }
 
-func ReapCurrent(processes []Process) error {
-	return Reap(processes, signalProcess)
+func ReapCurrent(processes []Process) []ReapOutcome {
+	return ReapEach(processes, signalProcess)
 }
 
 var slopes = struct {
@@ -112,6 +153,8 @@ type sample struct {
 	at  time.Time
 	cpu time.Duration
 }
+
+const minimumSlopeInterval = time.Second
 
 func updateSlopes(ps []Process, now time.Time) {
 	slopes.Lock()
@@ -126,10 +169,10 @@ func updateSlopes(ps []Process, now time.Time) {
 		if p.CPUAt.IsZero() {
 			p.CPUAt = now
 		}
-		if old, ok := slopes.samples[p.PID]; ok && p.CPUAt.After(old.at) && p.CPUS >= old.cpu {
+		if old, ok := slopes.samples[p.PID]; ok && p.CPUAt.Sub(old.at) >= minimumSlopeInterval && p.CPUS >= old.cpu {
 			p.CPUSlope = (p.CPUS - old.cpu).Seconds() / p.CPUAt.Sub(old.at).Seconds()
-		}
-		if old, ok := slopes.samples[p.PID]; !ok || !p.CPUAt.Before(old.at) {
+			slopes.samples[p.PID] = sample{p.CPUAt, p.CPUS}
+		} else if _, ok := slopes.samples[p.PID]; !ok {
 			slopes.samples[p.PID] = sample{p.CPUAt, p.CPUS}
 		}
 	}

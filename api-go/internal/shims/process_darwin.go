@@ -38,6 +38,16 @@ type procBSD struct {
 	StartSec, StartUsec                                                             uint64
 }
 
+func readStableRusage(pid int, identify func(int) (Process, error), readUsage func(int) (rusage, error)) (Process, rusage, bool) {
+	var usage rusage
+	identity, stable := stableIdentitySample(pid, os.Getuid(), identify, func() error {
+		var err error
+		usage, err = readUsage(pid)
+		return err
+	})
+	return identity, usage, stable
+}
+
 func processIdentity(pid int) (Process, error) {
 	var b bsdShort
 	got, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&b)), unsafe.Sizeof(b))
@@ -90,21 +100,28 @@ func listPlatform() ([]Process, error) {
 		if e != 0 || got != unsafe.Sizeof(b) || unix.ByteSliceToString(b.Comm[:]) != ProcessName {
 			continue
 		}
-		var r rusage
-		_, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDRusage, uintptr(pid), rusageV0, 0, uintptr(unsafe.Pointer(&r)), 0)
-		if e != 0 {
+		var cpuAt time.Time
+		after, r, stable := readStableRusage(pid, processIdentity, func(pid int) (rusage, error) {
+			var usage rusage
+			_, _, errno := syscall.Syscall6(unix.SYS_PROC_INFO, callPIDRusage, uintptr(pid), rusageV0, 0, uintptr(unsafe.Pointer(&usage)), 0)
+			if errno != 0 {
+				return rusage{}, errno
+			}
+			cpuAt = time.Now()
+			return usage, nil
+		})
+		if !stable {
 			continue
 		}
-		cpuAt := time.Now()
-		var info procBSD
-		got, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), 3, 0, uintptr(unsafe.Pointer(&info)), unsafe.Sizeof(info))
-		if e != 0 || got != unsafe.Sizeof(info) {
+		var finalBSD bsdShort
+		got, _, e = syscall.Syscall6(unix.SYS_PROC_INFO, callPIDInfo, uintptr(pid), shortBSDInfo, 0, uintptr(unsafe.Pointer(&finalBSD)), unsafe.Sizeof(finalBSD))
+		if e != 0 || got != unsafe.Sizeof(finalBSD) || int(finalBSD.UID) != after.UID || unix.ByteSliceToString(finalBSD.Comm[:]) != after.Comm {
 			continue
 		}
-		start := time.Unix(int64(info.StartSec), int64(info.StartUsec)*1000)
+		start := time.Unix(int64(after.StartTime/1_000_000), int64(after.StartTime%1_000_000)*1000)
 		age := time.Since(start)
 		cpu := time.Duration(r.UserTime + r.SystemTime)
-		out = append(out, Process{PID: pid, PPID: int(b.PPID), UID: int(b.UID), StartTime: info.StartSec*1_000_000 + info.StartUsec, Age: age, AgeKnown: true, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUAt: cpuAt, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: ProcessName})
+		out = append(out, Process{PID: pid, PPID: int(finalBSD.PPID), UID: after.UID, StartTime: after.StartTime, Age: age, AgeKnown: true, AgeSeconds: int64(age.Seconds()), CPUS: cpu, CPUAt: cpuAt, CPUSeconds: cpu.Seconds(), RSSBytes: int64(r.Resident), Comm: after.Comm})
 	}
 	return out, nil
 }

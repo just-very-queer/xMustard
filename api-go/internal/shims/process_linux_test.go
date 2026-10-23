@@ -13,6 +13,35 @@ import (
 	"time"
 )
 
+func TestPidfdIdentityChangesAndReadErrorsNeverSignal(t *testing.T) {
+	expected := Process{PID: 123, UID: 10, StartTime: 456, Comm: ProcessName}
+	cases := []struct {
+		name string
+		got  Process
+		err  error
+	}{
+		{"uid", Process{PID: 123, UID: 11, StartTime: 456, Comm: ProcessName}, nil},
+		{"start time", Process{PID: 123, UID: 10, StartTime: 457, Comm: ProcessName}, nil},
+		{"command", Process{PID: 123, UID: 10, StartTime: 456, Comm: "replacement"}, nil},
+		{"identity read error", Process{}, os.ErrPermission},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			signaled, closed := false, false
+			err := signalWithPidfd(expected, func(int, int) (int, error) { return 8, nil }, func(fd int) error {
+				closed = fd == 8
+				return nil
+			}, func(int) (Process, error) { return tc.got, tc.err }, func(int) error {
+				signaled = true
+				return nil
+			})
+			if err != ErrProcessChanged || signaled || !closed {
+				t.Fatalf("changed identity: err=%v signaled=%v descriptor closed=%v", err, signaled, closed)
+			}
+		})
+	}
+}
+
 func TestPidfdFailureAndReplacementNeverSignal(t *testing.T) {
 	expected := Process{PID: 123, UID: 10, StartTime: 456, Comm: ProcessName}
 	signaled := false
