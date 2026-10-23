@@ -1375,12 +1375,37 @@ func TestToolAuthFailuresGiveActionableGroundingError(t *testing.T) {
 	}
 }
 
+func TestAuthFailureGuidancePreservesPrincipalTypesAndAuthorization(t *testing.T) {
+	presence := authFailureMessage(http.StatusUnauthorized, `{"reason":"presence_only_token"}`)
+	if (!strings.Contains(presence, "terminal") && !strings.Contains(presence, "typed at the xmustard-ops prompt")) || strings.Contains(presence, "rotate-token") || strings.Contains(presence, "then update XMUSTARD_API_TOKEN") {
+		t.Fatalf("presence-only guidance is unsafe: %s", presence)
+	}
+	missingRole := authFailureMessage(http.StatusForbidden, `{"reason":"missing_role","missing_role":"verifier"}`)
+	if !strings.Contains(missingRole, "verifier") || !strings.Contains(missingRole, "rotation does not change the role") {
+		t.Fatalf("role refusal lacks specific guidance: %s", missingRole)
+	}
+	scope := authFailureMessage(http.StatusForbidden, `{"refusal":"token_scope"}`)
+	if !strings.Contains(scope, "workspace") || !strings.Contains(scope, "rotation preserves the current workspace scope") {
+		t.Fatalf("scope refusal lacks specific guidance: %s", scope)
+	}
+	env := authFailureMessage(http.StatusUnauthorized, `{"error":"authentication required"}`)
+	if !strings.Contains(env, "XMUSTARD_AUTH_TOKENS") || !strings.Contains(env, "mint-token <id> <role>") || !strings.Contains(env, "id:role:token") || !strings.Contains(env, "restart the API") || !strings.Contains(env, "does not replace or revoke the environment token") {
+		t.Fatalf("env-backed credential recovery is underspecified: %s", env)
+	}
+}
+
 func TestEvidenceEnvelopeAuthRefusalIsNormalized(t *testing.T) {
+	body := `{"tool":"recall","status":403,"is_error":true,"projection":"{\"error\":\"token not scoped to workspace ws-b\"}"}`
+	probeDelivery := NewEvidence(&fakeAPI{}, nil)
+	limited := budget.WithScope(context.Background(), budget.NewScope(budget.NewByteBudget(1)))
+	if result, rerr := probeDelivery.EnvelopeResult(limited, body, "ws-b"); rerr != nil || result["isError"] != true || !strings.Contains(text(result), "larger than this shim's transient budget") {
+		t.Fatalf("admission should refuse before classification: %v %v", result, rerr)
+	}
 	api := &fakeAPI{handle: func(Request) *APIResponse {
 		return &APIResponse{
 			Status: http.StatusOK,
 			Header: http.Header{DeliveryHeader: []string{DeliveryVersion}},
-			Body:   `{"tool":"recall","status":403,"is_error":true,"projection":"{\"error\":\"token not scoped to workspace ws-b\"}"}`,
+			Body:   body,
 		}
 	}}
 	delivery := NewEvidence(api, nil)
@@ -1390,6 +1415,14 @@ func TestEvidenceEnvelopeAuthRefusalIsNormalized(t *testing.T) {
 	if rerr != nil || res["isError"] != true || !strings.Contains(message, "not scoped to the requested workspace") ||
 		strings.Contains(message, "token not scoped to workspace ws-b") {
 		t.Fatalf("embedded evidence auth refusal should be normalized safely: %v %v", res, rerr)
+	}
+	tool, ok := ToolByName("recall")
+	if !ok {
+		t.Fatal("recall tool missing")
+	}
+	ctx := budget.WithScope(context.Background(), budget.NewScope(budget.NewByteBudget(64)))
+	if result, rerr := s.RunTool(ctx, tool, map[string]string{"workspace_id": "ws-b", "entry_id": "entry-a", "history": "true"}, nil); rerr != nil || result["isError"] != true || !strings.Contains(text(result), "larger than this shim's transient budget") {
+		t.Fatalf("evidence body was classified before reply admission: %v %v", result, rerr)
 	}
 }
 
@@ -1403,6 +1436,18 @@ func TestWorkspaceResolutionAuthFailureIsActionableWithoutWorkspaceID(t *testing
 	message := text(res)
 	if rerr != nil || res["isError"] != true || !strings.Contains(message, "rotate-token") || !strings.Contains(message, "grounding is unavailable") {
 		t.Fatalf("workspace discovery auth refusal should be actionable: %v %v", res, rerr)
+	}
+}
+
+func TestWorkspaceListingFallbackAuthFailureWithoutWorkspaceSignals(t *testing.T) {
+	api := &fakeAPI{handle: func(Request) *APIResponse {
+		return &APIResponse{Status: http.StatusUnauthorized, Body: `{"error":"authentication required"}`}
+	}}
+	s := newSession(t, api, Options{}, nil, "2025-06-18")
+	res, rerr := call(t, s, "ground", map[string]any{})
+	message := text(res)
+	if rerr != nil || res["isError"] != true || !strings.Contains(message, "grounding is unavailable") || !strings.Contains(message, "rotate-token") || strings.Contains(message, "Pass workspace_id") {
+		t.Fatalf("workspace-list fallback swallowed auth refusal: %v %v", res, rerr)
 	}
 }
 

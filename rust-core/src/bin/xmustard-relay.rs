@@ -43,7 +43,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request waits for a refusing API to come back (a daemon restart).
 const RESTART_GRACE: Duration = Duration::from_secs(10);
 const THREAD_STACK: usize = 256 << 10;
-const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Rotate the existing principal with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. Rotation preserves its role, workspace scope, identity, and lifetime policy.";
+const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate. For a file-backed principal, rotate it with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. For an XMUSTARD_AUTH_TOKENS principal, an operator must run `xmustard-api mint-token <id> <role>`, replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new token, then restart the API. Rotating a same-ID file record does not replace or revoke the environment token.";
+const PRESENCE_ONLY_MESSAGE: &str = "xMustard grounding is unavailable: this token is presence-only and is accepted only when typed at the xmustard-ops prompt. Do not rotate or export it as XMUSTARD_API_TOKEN; use a separate agent-readable bearer principal.";
+const ROLE_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this principal lacks the required role. Use a suitably authorized principal; rotation preserves roles and cannot fix this refusal.";
+const SCOPE_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this principal is not scoped to the requested workspace. Use a principal authorized for that workspace; rotation preserves workspace scope and cannot fix this refusal.";
 const POLICY_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: the API refused this request because of its deployment policy. Check the API's allowed-host and route configuration; token rotation will not fix this refusal.";
 
 fn main() {
@@ -374,8 +377,7 @@ fn deliver(r: &mut Response, out: &Output, id: Option<&str>) {
     } else if let (Some(id), true) = (id, r.status >= 300) {
         let message = match r.status {
             401 => AUTH_FAILURE_MESSAGE,
-            403 if is_auth_refusal(&body) => AUTH_FAILURE_MESSAGE,
-            403 => POLICY_FAILURE_MESSAGE,
+            403 => auth_refusal_message(&body).unwrap_or(POLICY_FAILURE_MESSAGE),
             status => {
                 return emit(
                     out,
@@ -391,14 +393,26 @@ fn deliver(r: &mut Response, out: &Output, id: Option<&str>) {
     }
 }
 
-fn is_auth_refusal(body: &str) -> bool {
-    [
-        r#""reason":"missing_role""#,
-        r#""reason":"presence_only_token""#,
-        r#""refusal":"token_scope""#,
-    ]
-    .iter()
-    .any(|marker| body.contains(marker))
+fn json_string_value(raw: &str) -> Option<String> {
+    raw.strip_prefix('"')?.strip_suffix('"').map(str::to_string)
+}
+
+fn auth_refusal_message(body: &str) -> Option<&'static str> {
+    let head = scan_top_level(body);
+    if head.reason.as_deref() == Some("presence_only_token") {
+        Some(PRESENCE_ONLY_MESSAGE)
+    } else if head.reason.as_deref() == Some("missing_role") || head.missing_role.is_some() {
+        Some(ROLE_FAILURE_MESSAGE)
+    } else if head.refusal.as_deref() == Some("token_scope")
+        || head
+            .error
+            .as_deref()
+            .is_some_and(|e| e.starts_with("token not scoped to workspace "))
+    {
+        Some(SCOPE_FAILURE_MESSAGE)
+    } else {
+        None
+    }
 }
 
 fn rpc_error(id: &str, code: i32, message: &str) -> String {
@@ -457,6 +471,10 @@ struct Head {
     method: Option<String>,
     /// The raw JSON of the id (a string keeps its quotes).
     id: Option<String>,
+    reason: Option<String>,
+    refusal: Option<String>,
+    missing_role: Option<String>,
+    error: Option<String>,
 }
 
 /// Reads the top-level "method" and "id" of a JSON object without a JSON library:
@@ -492,6 +510,10 @@ fn scan_top_level(s: &str) -> Head {
                     .map(str::to_string)
             }
             "id" if raw != "null" => head.id = Some(raw.to_string()),
+            "reason" => head.reason = json_string_value(raw),
+            "refusal" => head.refusal = json_string_value(raw),
+            "missing_role" => head.missing_role = json_string_value(raw),
+            "error" => head.error = json_string_value(raw),
             _ => {}
         }
         i = skip_ws(b, val_end);
@@ -738,7 +760,8 @@ mod tests {
             h,
             Head {
                 method: Some("tools/call".into()),
-                id: Some("\"c-1\"".into())
+                id: Some("\"c-1\"".into()),
+                ..Head::default()
             }
         );
         let n = scan_top_level(
@@ -768,17 +791,30 @@ mod tests {
     }
 
     #[test]
-    fn auth_http_refusals_name_the_grounding_repair_command() {
-        for status in [401, 403] {
-            let body = if status == 401 {
-                br#"{"error":"authentication required"}"#.to_vec()
-            } else {
-                br#"{"reason":"missing_role","missing_role":"proposer"}"#.to_vec()
-            };
+    fn auth_http_refusals_name_specific_safe_repairs() {
+        let cases = [
+            (
+                401,
+                r#"{"error":"authentication required"}"#,
+                AUTH_FAILURE_MESSAGE,
+            ),
+            (
+                403,
+                r#"{ "reason": "missing_role", "missing_role": "proposer" }"#,
+                ROLE_FAILURE_MESSAGE,
+            ),
+            (
+                403,
+                r#"{"reason":"presence_only_token"}"#,
+                PRESENCE_ONLY_MESSAGE,
+            ),
+            (403, r#"{"refusal":"token_scope"}"#, SCOPE_FAILURE_MESSAGE),
+        ];
+        for (status, body, expected) in cases {
             let mut response = Response {
                 status,
                 headers: vec![("content-type".into(), "application/json".into())],
-                body: Box::new(io::Cursor::new(body)),
+                body: Box::new(io::Cursor::new(body.as_bytes().to_vec())),
             };
             let sink = Sink::default();
             let out: Output = Arc::new(Mutex::new(Box::new(sink.clone())));
@@ -788,16 +824,32 @@ mod tests {
                 answer.contains("grounding is unavailable"),
                 "{status}: {answer}"
             );
-            assert!(
-                answer.contains("xmustard-api rotate-token"),
-                "{status}: {answer}"
-            );
-            assert!(answer.contains("XMUSTARD_API_TOKEN"), "{status}: {answer}");
+            assert!(answer.contains(expected), "{status}: {answer}");
             assert!(
                 !answer.contains("authentication required"),
                 "{status}: {answer}"
             );
         }
+    }
+
+    #[test]
+    fn auth_refusal_inspects_top_level_fields_not_nested_substrings() {
+        assert_eq!(
+            auth_refusal_message(r#"{ "reason" : "missing_role" }"#),
+            Some(ROLE_FAILURE_MESSAGE)
+        );
+        assert_eq!(
+            auth_refusal_message(
+                r#"{"nested":{"reason":"missing_role"},"error":"host_not_allowed"}"#
+            ),
+            None
+        );
+        assert_eq!(
+            auth_refusal_message(
+                r#"{"reason":"host_not_allowed","nested":{"refusal":"token_scope"}}"#
+            ),
+            None
+        );
     }
 
     #[test]

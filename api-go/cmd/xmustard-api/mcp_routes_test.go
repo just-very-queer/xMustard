@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -117,9 +118,88 @@ func resultText(res map[string]any) string {
 	return s
 }
 
-// Four agents on four concurrent MCP sessions: every memory is attributed to the
-// principal of the connection that proposed it, and a session answers only the
-// principal that opened it.
+func TestMCPHTTPPresenceOnlyTokenKeepsTerminalOnlyGuidance(t *testing.T) {
+	srv, dir, _ := mcpServer(t, exposurePosture{}, map[string]string{"admin": "admin"})
+	token, err := workspaceops.MintIdentityToken(dir, "human", workspaceops.RoleHumanApprover, 0, nil, workspaceops.TokenIdentity{Kind: workspaceops.PrincipalHuman, PresenceOnly: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c := &mcpHTTPClient{t: t, url: srv.URL + "/mcp", token: token}
+	status, out := c.post(map[string]any{"jsonrpc": "2.0", "id": 0, "method": "initialize"})
+	message := fmt.Sprint(out)
+	if status != http.StatusUnauthorized || !strings.Contains(message, "presence-only") || !strings.Contains(message, "typed at the xmustard-ops prompt") || strings.Contains(message, "rotate-token") || strings.Contains(message, "then update XMUSTARD_API_TOKEN") || strings.Contains(message, token) {
+		t.Fatalf("presence-only transport refusal gave unsafe guidance: %d %v", status, out)
+	}
+}
+
+func TestRotateTokenDataDirRejectsWhitespaceFromClientWorkingDirectory(t *testing.T) {
+	serverDir := t.TempDir()
+	clientDir := t.TempDir()
+	original, err := workspaceops.MintToken(serverDir, "scoped", "reader")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cwd, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(clientDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(cwd)
+	validArgs := []string{"xmustard-api", "rotate-token", "scoped", "--data-dir", serverDir}
+	id, dataDir, ok := parseRotateTokenArgs(validArgs)
+	if !ok || id != "scoped" || dataDir != serverDir {
+		t.Fatalf("CLI boundary changed the server data directory: id=%q dataDir=%q ok=%v", id, dataDir, ok)
+	}
+	rotated, err := workspaceops.RotateTokenPreservingClaims(dataDir, id)
+	if err != nil || workspaceops.ResolveToken(serverDir, rotated) == nil || workspaceops.ResolveToken(serverDir, original) != nil {
+		t.Fatalf("CLI data directory did not select the server token store: err=%v", err)
+	}
+	for _, path := range []string{" " + serverDir, serverDir + " "} {
+		args := append([]string(nil), validArgs...)
+		args[4] = path
+		if _, _, ok := parseRotateTokenArgs(args); ok {
+			t.Fatalf("CLI boundary accepted data dir with surrounding whitespace: %q", path)
+		}
+	}
+}
+
+// HTTP MCP carries the caller's reader token through a real evidence-delivered
+// recall(history=true) refusal without exposing the API's private denial body.
+func TestMCPHTTPRecallHistoryAuthRefusalIsNormalized(t *testing.T) {
+	srv, dir, tokens := mcpServer(t, exposurePosture{}, map[string]string{"rita": "reader"})
+	base := srv.URL + "/api/workspaces/ws/context"
+	// Seed a promoted entry through the regular HTTP routes so recall returns the
+	// real evidence envelope rather than a handcrafted backend response.
+	created, err := workspaceops.MintToken(dir, "seed", "agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	status, seeded := sendJSON(t, http.MethodPost, base, created, `{"content":"release process"}`)
+	if status != http.StatusOK {
+		t.Fatalf("create memory: %d %v", status, seeded)
+	}
+	id := seeded["id"].(string)
+	for _, who := range []string{"approver-a", "approver-b"} {
+		tok, err := workspaceops.MintToken(dir, who, "agent")
+		if err != nil {
+			t.Fatal(err)
+		}
+		status, out := sendJSON(t, http.MethodPost, base+"/"+id+"/verify?approve=true", tok, "")
+		if status != http.StatusOK {
+			t.Fatalf("verify as %s: %d %v", who, status, out)
+		}
+	}
+	c := &mcpHTTPClient{t: t, url: srv.URL + "/mcp?workspace=ws", token: tokens["rita"]}
+	c.initialize()
+	res := c.call(2, "recall", map[string]any{"entry_id": id, "history": true})
+	message := resultText(res)
+	if res["isError"] != true || !strings.Contains(message, "grounding is unavailable") || !strings.Contains(message, "missing the") || !strings.Contains(message, "verifier") || !strings.Contains(message, "rotation does not change the role") || strings.Contains(message, "missing_role") || strings.Contains(message, tokens["rita"]) {
+		t.Fatalf("reader history refusal was not safely normalized: %v", res)
+	}
+}
+
 func TestMCPHTTPPrincipalPerConnection(t *testing.T) {
 	agents := map[string]string{"alice": "agent", "bob": "agent", "carol": "agent", "dave": "agent"}
 	srv, dir, tokens := mcpServer(t, exposurePosture{}, agents)

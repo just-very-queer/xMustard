@@ -222,15 +222,6 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 	if isAuthFailure(resp.Status, resp.Body) {
 		return TextResult(authFailureMessage(resp.Status, resp.Body), true), nil
 	}
-	if resp.Status == http.StatusOK && resp.Header.Get(DeliveryHeader) == DeliveryVersion {
-		var envelope struct {
-			Status     int    `json:"status"`
-			Projection string `json:"projection"`
-		}
-		if json.Unmarshal([]byte(resp.Body), &envelope) == nil && isAuthFailure(envelope.Status, envelope.Projection) {
-			return TextResult(authFailureMessage(envelope.Status, envelope.Projection), true), nil
-		}
-	}
 	var res map[string]any
 	if d := s.srv.opts.Delivery; d != nil {
 		var rerr *RPCError
@@ -286,22 +277,24 @@ func parseAuthRefusal(body string) (authRefusal, bool) {
 }
 
 func authFailureMessage(status int, body string) string {
+	refusal, _ := parseAuthRefusal(body)
+	if refusal.Reason == "presence_only_token" {
+		return "xMustard grounding is unavailable: this token is presence-only and is accepted only when typed at the xmustard-ops prompt. Do not rotate or export it as XMUSTARD_API_TOKEN; use a separate agent-readable bearer principal."
+	}
 	if status == http.StatusForbidden {
-		if refusal, ok := parseAuthRefusal(body); ok {
-			if refusal.MissingRole != "" {
-				if role, err := workspaceops.ParseRoleSpec(refusal.MissingRole); err == nil {
-					return fmt.Sprintf("xMustard grounding is unavailable: this token is missing the %q role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", role, tokenRotationCommand)
-				}
-			}
-			switch {
-			case refusal.Reason == "missing_role":
-				return fmt.Sprintf("xMustard grounding is unavailable: this token lacks a required role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", tokenRotationCommand)
-			case refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace "):
-				return fmt.Sprintf("xMustard grounding is unavailable: this token is not scoped to the requested workspace. Use a principal authorized for that workspace; do not replace it with an unrestricted token. If its secret is also expired, rotate it with %s; rotation preserves the current workspace scope.", tokenRotationCommand)
+		if refusal.MissingRole != "" {
+			if role, err := workspaceops.ParseRoleSpec(refusal.MissingRole); err == nil {
+				return fmt.Sprintf("xMustard grounding is unavailable: this token is missing the %q role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", role, tokenRotationCommand)
 			}
 		}
+		switch {
+		case refusal.Reason == "missing_role":
+			return fmt.Sprintf("xMustard grounding is unavailable: this token lacks a required role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", tokenRotationCommand)
+		case refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace "):
+			return fmt.Sprintf("xMustard grounding is unavailable: this token is not scoped to the requested workspace. Use a principal authorized for that workspace; do not replace it with an unrestricted token. If its secret is also expired, rotate it with %s; rotation preserves the current workspace scope.", tokenRotationCommand)
+		}
 	}
-	return fmt.Sprintf("xMustard grounding is unavailable: authentication failed (HTTP %d). For a missing or expired token, rotate its existing principal with %s, then update XMUSTARD_API_TOKEN for this client and restart it. This preserves the principal's role, workspace scope, identity, and lifetime policy. For authorization refusals, check the token's role and workspace scope.", status, tokenRotationCommand)
+	return fmt.Sprintf("xMustard grounding is unavailable: authentication failed (HTTP %d). For a missing or expired file-backed token, rotate its existing principal with %s, then update XMUSTARD_API_TOKEN for this client and restart it. For an XMUSTARD_AUTH_TOKENS principal, an operator must run `xmustard-api mint-token <id> <role>`, replace that principal's `id:role:token` entry in the environment value supplied to the API service with the new token, then restart the API. Rotating a same-ID file record does not replace or revoke the environment token. This preserves the principal's role, workspace scope, identity, and lifetime policy. For authorization refusals, use a principal with the required role and workspace scope; rotation cannot fix authorization.", status, tokenRotationCommand)
 }
 
 const tokenRotationCommand = "`xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`"

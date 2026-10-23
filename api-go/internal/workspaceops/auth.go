@@ -395,11 +395,13 @@ func RotateTokenPreservingClaims(dataDir, id string) (string, error) {
 			if createdErr != nil || expiresErr != nil || !expires.After(created) {
 				return "", fmt.Errorf("token %q has invalid expiry metadata", id)
 			}
-			seconds := int(expires.Sub(created).Seconds())
-			if seconds < 1 {
-				seconds = 1
+			// Minted lifetimes are whole seconds. Round up old records whose
+			// timestamps straddle the two clock reads by a fraction of a second.
+			delta := expires.Sub(created)
+			ttl = int(delta / time.Second)
+			if delta%time.Second != 0 {
+				ttl++
 			}
-			ttl = seconds
 		}
 		role := rec.Role
 		if err := validateMintInputs(&id, &role, ttl); err != nil {
@@ -491,17 +493,16 @@ func mintTokenLocked(dataDir, id, role string, ttlSeconds int, workspaces []stri
 			next = append(next, r)
 		}
 	}
+	createdAt := time.Now().UTC()
 	expiresAt := ""
 	if ttlSeconds > 0 {
-		// nanosecond precision matches the After() comparison in tokenExpired, so a
-		// short TTL doesn't live up to ~1s past its requested expiry.
-		expiresAt = time.Now().UTC().Add(time.Duration(ttlSeconds) * time.Second).Format(time.RFC3339Nano)
+		expiresAt = createdAt.Add(time.Duration(ttlSeconds) * time.Second).Format(time.RFC3339Nano)
 	}
 	next = append(next, tokenRecord{
 		ID:          id,
 		Role:        role,
 		TokenSHA256: hashToken(raw),
-		CreatedAt:   nowUTC(),
+		CreatedAt:   createdAt.Format(time.RFC3339Nano),
 		ExpiresAt:   expiresAt,
 		Workspaces:  workspaces,
 		// Only an owner other than the id itself is written, so stored records stay

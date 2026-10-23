@@ -171,6 +171,11 @@ func (s *Session) resolveWorkspace(ctx context.Context, t *Tool, args map[string
 	msg := "no workspace resolved (" + strings.Join(tried, "; ") + "). Pass workspace_id"
 	if list, _, err := s.listWorkspaces(ctx, false); err == nil && len(list) > 0 {
 		msg += "; registered: " + describe(list, 5)
+	} else if err != nil {
+		var authErr *authRefusalError
+		if errors.As(err, &authErr) {
+			return Workspace{}, authErr
+		}
 	}
 	return Workspace{}, errors.New(msg)
 }

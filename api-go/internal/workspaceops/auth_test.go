@@ -98,6 +98,27 @@ func TestLegacyTokenFixtureSurvivesStoreUpdate(t *testing.T) {
 	}
 }
 
+func TestRepeatedRotationPreservesConfiguredShortTTL(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := MintTokenTTL(dir, "short", "reader", 2); err != nil {
+		t.Fatal(err)
+	}
+	for rotation := 1; rotation <= 3; rotation++ {
+		if _, err := RotateTokenPreservingClaims(dir, "short"); err != nil {
+			t.Fatalf("rotation %d: %v", rotation, err)
+		}
+		recs, err := loadTokenRecords(dir)
+		if err != nil || len(recs) != 1 {
+			t.Fatalf("rotation %d records=%+v err=%v", rotation, recs, err)
+		}
+		created, cErr := time.Parse(time.RFC3339Nano, recs[0].CreatedAt)
+		expires, eErr := time.Parse(time.RFC3339Nano, recs[0].ExpiresAt)
+		if cErr != nil || eErr != nil || expires.Sub(created) != 2*time.Second {
+			t.Fatalf("rotation %d eroded lifetime: record=%+v", rotation, recs[0])
+		}
+	}
+}
+
 func TestRotateTokenPreservesPrincipalClaims(t *testing.T) {
 	serverDir := t.TempDir()
 	clientDir := t.TempDir()
