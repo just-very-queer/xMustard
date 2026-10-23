@@ -14,6 +14,7 @@ import (
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/evidence"
+	"xmustard/api-go/internal/shims"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -76,6 +77,16 @@ func holdHeavy(t *testing.T, owner string, declared int64) {
 	t.Cleanup(release)
 }
 
+func TestHealthReportsShimEnumerationError(t *testing.T) {
+	previous := listHealthShims
+	listHealthShims = func() ([]shims.Process, error) { return nil, errors.New("injected enumeration failure") }
+	t.Cleanup(func() { listHealthShims = previous })
+	got := healthBudgetBlock().Shims
+	if got.Available || got.Error != "injected enumeration failure" {
+		t.Fatalf("shim status = %+v", got)
+	}
+}
+
 // PAR-OPS-01: /api/health carries the budget block: reservations per component, the
 // heavy slot's owner and queue, the watchdog, runtime GC/heap stats and the counters.
 // The existing transient_pool and children fields stay for current readers.
@@ -106,6 +117,12 @@ func TestHealthReportsBudgetBlock(t *testing.T) {
 	num(t, h, "transient_pool", "max")
 	num(t, h, "children", "cap")
 	b := dig(t, h, "budget")
+	if _, ok := dig(t, b, "shims").(map[string]any); !ok {
+		t.Fatalf("budget shims must be an object: %v", b)
+	}
+	for _, key := range []string{"live", "orphaned", "runaway", "pids"} {
+		dig(t, b, "shims", key)
+	}
 	if num(t, b, "gate_bytes") != 1e8 || num(t, b, "soft_ceiling_bytes") <= 0 {
 		t.Fatalf("gate/soft ceiling: %v", b)
 	}

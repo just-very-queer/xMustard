@@ -377,6 +377,15 @@ xmustard-ops uninstall                    # keeps the data dir and the logs
 On Linux, `loginctl enable-linger` keeps the daemon running without a login session. Through
 the relay, calls wait up to 10 s for a restarting daemon.
 
+Keep the xMustard binaries and data directory on the boot data volume (for example,
+`~/.local/xmustard/`), not on removable or separately mounted `/Volumes/*` storage. A volume
+failure can strand a stdio shim in a CPU fault loop that cannot handle SIGTERM. Inspect
+this user's shims with `xmustard-ops shims`; `xmustard-ops shims --reap` sends SIGKILL only
+to shims classified as runaway (over 300 CPU seconds or a measured CPU slope of at least
+0.8 seconds/second) or orphaned (PPID 1 and older than 10 minutes). An example five-minute
+user LaunchAgent is in
+[`examples/launchagents/com.xmustard.shim-reaper.plist`](examples/launchagents/com.xmustard.shim-reaper.plist); replace its binary path before installing it.
+
 ## One agent, two, or a team
 
 Every recalled memory carries one of three trust labels:
