@@ -61,10 +61,11 @@ func defaultLifecycleEnv() lifecycleEnv {
 }
 
 // probeDirect keeps a health result tied to the requested listener.
+var directProbeClient = &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
 func probeDirect(ctx context.Context, base string) (daemon.Health, error) {
-	client := &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil},
-		CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
-	return daemon.ProbeWithClient(ctx, base, client)
+	return daemon.ProbeWithClient(ctx, base, directProbeClient)
 }
 
 // lifecycleCommands are the subcommands this file adds to xmustard-ops.
@@ -299,9 +300,10 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 func explainLaunchdDuplicate(ctx context.Context, report daemon.StatusReport, base string, probe func(context.Context, string) (daemon.Health, error)) any {
 	if report.Service.Manager == "launchd" && report.Service.PID == 0 && probe != nil {
 		if _, err := probe(ctx, base); err == nil {
-			return map[string]any{"service": report.Service, "health": report.Health, "health_error": report.HealthError,
-				"api": report.API, "units": report.Units,
-				"notice": "launchd agent not running because another instance owns the port"}
+			return struct {
+				daemon.StatusReport
+				Notice string `json:"notice"`
+			}{StatusReport: report, Notice: "launchd agent not running because another instance owns the port"}
 		}
 	}
 	return report
