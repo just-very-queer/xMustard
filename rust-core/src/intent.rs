@@ -50,7 +50,7 @@ pub enum ProviderError {
 }
 
 /// A provider classifies one bounded batch against one typed yes/no question.
-pub trait DecisionProvider {
+pub trait DecisionProvider: std::fmt::Debug {
     fn decide(
         &self,
         question: &Question,
@@ -59,6 +59,7 @@ pub trait DecisionProvider {
 }
 
 /// Reads recorded decisions from JSON shaped as `{question-id: {candidate-id: probability}}`.
+#[derive(Debug)]
 pub struct FixtureProvider {
     fixtures: BTreeMap<String, BTreeMap<String, f64>>,
 }
@@ -88,9 +89,6 @@ impl DecisionProvider for FixtureProvider {
             .fixtures
             .get(&question.id)
             .ok_or(ProviderError::QuestionMismatch)?;
-        if probabilities.len() != candidates.len() {
-            return Err(ProviderError::CandidateMismatch);
-        }
         let mut result = BTreeMap::new();
         for candidate in candidates {
             let probability = probabilities
@@ -213,6 +211,13 @@ mod tests {
         assert_eq!(decision.question_id, "q1");
         assert_eq!(decision.probabilities["a"], 0.75);
         assert_eq!(decision.probabilities["b"], 0.25);
+    }
+
+    #[test]
+    fn fixture_can_answer_a_bounded_stage_from_a_larger_recording() {
+        let provider = FixtureProvider::from_json(r#"{"q1":{"a":0.75,"b":0.25}}"#).unwrap();
+        let decision = provider.decide(&question(), &[candidate("a")]).unwrap();
+        assert_eq!(decision.probabilities, BTreeMap::from([("a".into(), 0.75)]));
     }
 
     #[test]

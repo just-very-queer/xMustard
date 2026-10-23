@@ -747,6 +747,8 @@ fn search(args: Args) -> CmdResult {
             // the struct and to the library tests left THIS binary uncompilable, and only
             // a `--lib` test run had been green.
             scan_slice: None,
+            intent_provider: None,
+            intent_question: None,
         },
     ))
 }

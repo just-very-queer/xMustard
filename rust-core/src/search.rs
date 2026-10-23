@@ -1,4 +1,4 @@
-//! Hybrid repo search (knowledge layer, WS-18). Up to six lanes are fused with
+//! Hybrid repo search (knowledge layer, WS-18). Up to seven lanes are fused with
 //! Reciprocal Rank Fusion, then the top candidates are reranked by features that each
 //! hit reports as reasons:
 //!
@@ -77,6 +77,8 @@ const FUZZY_GATE: f32 = 0.30;
 const PROXIMITY_DEPTH: usize = 3;
 /// Query tokens the name lane matches (a bit set per name holds them).
 const MAX_NAME_TOKENS: usize = 128;
+/// Minimum fixture/provider probability admitted to the semantic ranking lane.
+const MIN_INTENT_PROBABILITY: f64 = 0.5;
 /// Dimensions of the trigram sketch.
 const SKETCH_DIM: usize = 256;
 
@@ -277,16 +279,18 @@ enum Lane {
     Structural,
     Proximity,
     Docs,
+    Semantic,
 }
 
 impl Lane {
-    const ALL: [Lane; 6] = [
+    const ALL: [Lane; 7] = [
         Lane::Bm25,
         Lane::Name,
         Lane::Fuzzy,
         Lane::Structural,
         Lane::Proximity,
         Lane::Docs,
+        Lane::Semantic,
     ];
 
     /// `mode=text` fuses the body lane alone. The other lanes read declared names,
@@ -303,6 +307,7 @@ impl Lane {
             Lane::Structural => "structural",
             Lane::Proximity => "proximity",
             Lane::Docs => "docs",
+            Lane::Semantic => "semantic",
         }
     }
 
@@ -310,7 +315,7 @@ impl Lane {
     fn weight(self) -> f64 {
         match self {
             Lane::Bm25 | Lane::Name | Lane::Docs => 1.0,
-            Lane::Fuzzy | Lane::Proximity => 0.5,
+            Lane::Fuzzy | Lane::Proximity | Lane::Semantic => 0.5,
             Lane::Structural => 0.25,
         }
     }
@@ -491,6 +496,10 @@ pub struct SearchOptions<'a> {
     /// a test sets it to force a read boundary at a chosen offset, because a file large
     /// enough to cross a real boundary does not fit in a fixture.
     pub scan_slice: Option<usize>,
+    /// Fixture or operator-selected typed provider for an explicit intent call.
+    pub intent_provider: Option<&'a dyn crate::intent::DecisionProvider>,
+    /// The one bounded yes/no question for the intent call.
+    pub intent_question: Option<&'a crate::intent::Question>,
 }
 
 /// One candidate of the fused pool. The pool can hold every symbol of a large
@@ -514,6 +523,7 @@ struct Cand {
     /// Row of the docs lane (its rank).
     doc: Option<u32>,
     hotspot: bool,
+    semantic: Option<f64>,
 }
 
 impl Cand {
@@ -528,6 +538,7 @@ impl Cand {
             Lane::Fuzzy => (self.fuzzy >= FUZZY_GATE).then_some(f64::from(self.fuzzy)),
             Lane::Structural => positive(self.structural as f64),
             Lane::Proximity => positive(self.proximity),
+            Lane::Semantic => self.semantic,
         }
     }
 
@@ -540,6 +551,7 @@ impl Cand {
             Lane::Fuzzy => f64::from(self.fuzzy),
             Lane::Structural => self.structural as f64,
             Lane::Proximity => self.proximity,
+            Lane::Semantic => self.semantic.unwrap_or(0.0),
         }
     }
 
@@ -564,6 +576,14 @@ struct Ctx {
     miss: Option<TextMiss>,
     features: Features,
     snippet: Vec<Snippet>,
+}
+
+fn bounded_excerpt(text: &str) -> String {
+    let mut end = text.len().min(crate::intent::MAX_EXCERPT_BYTES);
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    text[..end].to_string()
 }
 
 /// Read a candidate's declaration, chunk and text, and compute its rerank features.
@@ -894,11 +914,6 @@ pub fn search(
     let graph = source.graph.as_ref();
     let mut coverage = source.coverage.clone();
     let mut degradations: Vec<String> = Vec::new();
-    if opts.mode == SearchMode::Intent {
-        // Intent is explicitly opt-in per call. Without a configured provider, return
-        // the ordinary indexed ranking and make the missing lane visible.
-        degradations.push("semantic_unavailable".to_string());
-    }
     // A graph read that fails leaves its lane empty and marks the result's coverage
     // incomplete (`graph_read_error`), so a partial answer never reads as complete.
     let mut read_errors: Vec<(&str, String)> = Vec::new();
@@ -1112,6 +1127,7 @@ pub fn search(
                 code,
                 doc: None,
                 hotspot: hotspots.contains(sym.path),
+                semantic: None,
             });
         }),
     );
@@ -1160,6 +1176,7 @@ pub fn search(
                 code: None,
                 doc: None,
                 hotspot: hotspots.contains(f.path),
+                semantic: None,
             });
         }),
     );
@@ -1191,6 +1208,7 @@ pub fn search(
             code: Some(i),
             doc: None,
             hotspot: hotspots.contains(&h.loc.path),
+            semantic: None,
         });
     }
     for (i, h) in text.docs.iter().enumerate() {
@@ -1207,6 +1225,7 @@ pub fn search(
             code: None,
             doc: Some(i as u32),
             hotspot: false,
+            semantic: None,
         });
     }
     drop(shared_paths);
@@ -1251,6 +1270,219 @@ pub fn search(
             if let Some(&p) = prox.get(&*c.path) {
                 c.proximity = p;
             }
+        }
+    }
+
+    if opts.mode == SearchMode::Intent {
+        match (opts.intent_provider, opts.intent_question, index) {
+            (Some(provider), Some(question), Some(opened)) => {
+                let decision = opened.snapshot.with_text(|conn| {
+                    // Classify bounded file previews before opening declaration excerpts.
+                    let mut file_candidates = Vec::new();
+                    let mut file_targets: HashMap<String, Vec<usize>> = HashMap::new();
+                    let mut file_paths = HashMap::new();
+                    let mut files = HashSet::new();
+                    let mut stale_excerpt = false;
+                    for cand in &cands {
+                        if cand.kind == Kind::Doc || !files.insert(cand.path.to_string()) {
+                            continue;
+                        }
+                        if file_candidates.len() >= crate::intent::MAX_CANDIDATE_FILES {
+                            break;
+                        }
+                        let Some(hit) = text.code.iter().find(|hit| hit.loc.path == *cand.path)
+                        else {
+                            continue;
+                        };
+                        match fts::chunk_text(conn, root, &hit.loc) {
+                            Ok(excerpt) => {
+                                let id = format!("file:{}", cand.path);
+                                file_candidates.push(crate::intent::Candidate {
+                                    id: id.clone(),
+                                    kind: crate::intent::CandidateKind::File,
+                                    excerpt: bounded_excerpt(&excerpt),
+                                });
+                                file_paths.insert(id.clone(), cand.path.to_string());
+                                file_targets.entry(id).or_default().extend(
+                                    cands
+                                        .iter()
+                                        .enumerate()
+                                        .filter(|(_, candidate)| {
+                                            candidate.path == cand.path
+                                                && candidate.kind == Kind::File
+                                        })
+                                        .map(|(index, _)| index),
+                                );
+                            }
+                            Err(fts::TextMiss::Changed) => stale_excerpt = true,
+                            Err(_) => {}
+                        }
+                    }
+                    let file_decision = if file_candidates.is_empty() {
+                        Err(crate::intent::ProviderError::CandidateMismatch)
+                    } else {
+                        provider
+                            .decide(question, &file_candidates)
+                            .and_then(|decision| {
+                                crate::intent::validate_decision(
+                                    question,
+                                    &file_candidates,
+                                    &decision,
+                                )
+                                .map(|_| decision)
+                            })
+                    };
+                    let file_decision = match file_decision {
+                        Ok(decision) => decision,
+                        Err(error) => {
+                            return Ok::<_, rusqlite::Error>((
+                                Err(error),
+                                file_targets,
+                                stale_excerpt,
+                            ));
+                        }
+                    };
+                    let positive_paths: HashSet<String> = file_decision
+                        .probabilities
+                        .iter()
+                        .filter(|(_, probability)| **probability >= MIN_INTENT_PROBABILITY)
+                        .filter_map(|(id, _)| file_paths.get(id).cloned())
+                        .collect();
+                    let mut probabilities = file_decision.probabilities;
+                    for (id, path) in &file_paths {
+                        if !positive_paths.contains(path) {
+                            continue;
+                        }
+                        let targets = file_targets.entry(id.clone()).or_default();
+                        if !targets.is_empty() {
+                            continue;
+                        }
+                        let Some(indexed_path) = cands
+                            .iter()
+                            .find(|candidate| candidate.path.as_ref() == path)
+                            .map(|candidate| candidate.path.clone())
+                        else {
+                            continue;
+                        };
+                        let index = cands.len();
+                        cands.push(Cand {
+                            kind: Kind::File,
+                            name: indexed_path.to_string().into(),
+                            path: indexed_path,
+                            line: None,
+                            name_score: 0.0,
+                            matched: 0,
+                            fuzzy: 0.0,
+                            structural: 0,
+                            proximity: 0.0,
+                            code: None,
+                            doc: None,
+                            hotspot: false,
+                            semantic: None,
+                        });
+                        targets.push(index);
+                    }
+                    let mut declaration_candidates = Vec::new();
+                    let mut declaration_targets: HashMap<String, Vec<usize>> = HashMap::new();
+                    let mut seen_declarations = HashSet::new();
+                    for (i, cand) in cands.iter().enumerate() {
+                        if cand.kind != Kind::Symbol
+                            || !positive_paths.contains(&*cand.path)
+                            || declaration_candidates.len() >= crate::intent::MAX_DECLARATIONS
+                        {
+                            continue;
+                        }
+                        let Some(line) = cand.line else { continue };
+                        let Some((decl, Some(loc))) =
+                            fts::locate(conn, &cand.path, &cand.name, line)
+                                .ok()
+                                .flatten()
+                        else {
+                            continue;
+                        };
+                        if !seen_declarations.insert(decl.uid.clone()) {
+                            continue;
+                        }
+                        let excerpt = match fts::chunk_text(conn, root, &loc) {
+                            Ok(excerpt) => excerpt,
+                            Err(fts::TextMiss::Changed) => {
+                                stale_excerpt = true;
+                                continue;
+                            }
+                            Err(_) => continue,
+                        };
+                        let id = format!("decl:{}:{}:{}", cand.path, decl.name_line, decl.name);
+                        declaration_candidates.push(crate::intent::Candidate {
+                            id: id.clone(),
+                            kind: crate::intent::CandidateKind::Declaration,
+                            excerpt: bounded_excerpt(&excerpt),
+                        });
+                        declaration_targets.entry(id).or_default().push(i);
+                    }
+                    if !declaration_candidates.is_empty() {
+                        let decision = provider.decide(question, &declaration_candidates).and_then(
+                            |decision| {
+                                crate::intent::validate_decision(
+                                    question,
+                                    &declaration_candidates,
+                                    &decision,
+                                )
+                                .map(|_| decision)
+                            },
+                        );
+                        match decision {
+                            Ok(decision) => probabilities.extend(decision.probabilities),
+                            Err(error) => {
+                                return Ok::<_, rusqlite::Error>((
+                                    Err(error),
+                                    file_targets,
+                                    stale_excerpt,
+                                ));
+                            }
+                        }
+                    }
+                    file_targets.extend(declaration_targets);
+                    Ok::<_, rusqlite::Error>((
+                        Ok(crate::intent::Decision {
+                            question_id: question.id.clone(),
+                            probabilities,
+                        }),
+                        file_targets,
+                        stale_excerpt,
+                    ))
+                });
+                match decision {
+                    Ok((Ok(decision), targets, stale_excerpt)) => {
+                        if stale_excerpt {
+                            degradations.push("semantic_stale".to_string());
+                        }
+                        for (id, probability) in decision.probabilities {
+                            if probability >= MIN_INTENT_PROBABILITY {
+                                if let Some(indices) = targets.get(&id) {
+                                    for &i in indices {
+                                        cands[i].semantic = Some(probability);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Ok((
+                        Err(
+                            crate::intent::ProviderError::InvalidQuestion
+                            | crate::intent::ProviderError::InvalidCandidates,
+                        ),
+                        _,
+                        _,
+                    )) => {
+                        degradations.push("semantic_budget".to_string());
+                    }
+                    Ok((Err(_), _, true)) => degradations.push("semantic_stale".to_string()),
+                    Ok((Err(_), _, false)) => degradations.push("semantic_unavailable".to_string()),
+                    Err(_) => degradations.push("semantic_stale".to_string()),
+                }
+            }
+            (Some(_), Some(_), None) => degradations.push("semantic_stale".to_string()),
+            _ => degradations.push("semantic_unavailable".to_string()),
         }
     }
 
@@ -1469,6 +1701,10 @@ impl Render<'_> {
                 }),
                 // the fuzzy lane ranks most candidates; it is a reason only when it alone
                 // brought the hit in
+                Lane::Semantic => Some(format!(
+                    "intent_probability: {:.2}",
+                    c.semantic.unwrap_or(0.0)
+                )),
                 Lane::Fuzzy => (c.name_score <= 0.0 && c.code.is_none() && c.doc.is_none())
                     .then(|| format!("{}: name similarity {:.2}", lane.name(), c.fuzzy)),
                 Lane::Structural => Some(format!(
@@ -1568,6 +1804,233 @@ mod tests {
         let cfg = crate::index::config::IndexConfig::load(dir.path()).unwrap();
         crate::index::build(dir.path(), &cfg).unwrap();
         dir
+    }
+
+    #[test]
+    fn intent_provider_adds_probability_ranked_semantic_lane() {
+        let repo = indexed_repo(&[(
+            "src/lib.rs",
+            "/// Refreshes repository metadata after edits.\npub fn reconcile() {}\n",
+        )]);
+        let provider = crate::intent::FixtureProvider::from_json(
+            r#"{"q-behavior":{"file:src/lib.rs":0.9,"decl:src/lib.rs:2:reconcile":0.9}}"#,
+        )
+        .unwrap();
+        let question = crate::intent::Question {
+            id: "q-behavior".into(),
+            text: "Does this update repository state after edits?".into(),
+        };
+        let intent = search(
+            repo.path(),
+            "ws",
+            None,
+            "update repository state after edits",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        let hit = intent
+            .hits
+            .iter()
+            .find(|hit| hit.path == "src/lib.rs")
+            .unwrap();
+        assert!(hit.lanes_matched.contains(&"semantic"));
+        assert_eq!(hit.scores["semantic"], 0.9);
+        assert!(
+            hit.reasons
+                .iter()
+                .any(|reason| reason.contains("intent_probability"))
+        );
+        assert!(
+            !intent
+                .degradations
+                .iter()
+                .any(|d| d == "semantic_unavailable")
+        );
+    }
+
+    #[test]
+    fn positive_file_preview_can_rank_a_file_hit_without_positive_symbols() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn rebuild_registry() {}\n")]);
+        let provider = crate::intent::FixtureProvider::from_json(
+            r#"{"q-behavior":{"file:src/lib.rs":0.9,"decl:src/lib.rs:1:rebuild_registry":0.1}}"#,
+        )
+        .unwrap();
+        let question = crate::intent::Question {
+            id: "q-behavior".into(),
+            text: "Does this rebuild the registry?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "rebuild registry",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        let hit = result.hits.iter().find(|hit| hit.kind == "file").unwrap();
+        assert!(hit.lanes_matched.contains(&"semantic"));
+        assert_eq!(hit.scores["semantic"], 0.9);
+    }
+
+    #[test]
+    fn equal_intent_probabilities_sort_files_stably() {
+        let repo = indexed_repo(&[
+            (
+                "src/b.rs",
+                "/// Refreshes repository metadata after edits.\npub fn reconcile_b() {}\n",
+            ),
+            (
+                "src/a.rs",
+                "/// Refreshes repository metadata after edits.\npub fn reconcile_a() {}\n",
+            ),
+        ]);
+        let provider = crate::intent::FixtureProvider::from_json(
+            r#"{"q-behavior":{"file:src/a.rs":0.8,"file:src/b.rs":0.8,"decl:src/a.rs:2:reconcile_a":0.8,"decl:src/b.rs:2:reconcile_b":0.8}}"#,
+        )
+        .unwrap();
+        let question = crate::intent::Question {
+            id: "q-behavior".into(),
+            text: "Does this update repository state after edits?".into(),
+        };
+        let run = || {
+            search(
+                repo.path(),
+                "ws",
+                None,
+                "update repository state after edits",
+                &SearchOptions {
+                    limit: 10,
+                    mode: SearchMode::Intent,
+                    intent_provider: Some(&provider),
+                    intent_question: Some(&question),
+                    ..Default::default()
+                },
+            )
+        };
+        let first = run();
+        let second = run();
+        let file_paths: Vec<&str> = first
+            .hits
+            .iter()
+            .filter(|hit| hit.kind == "file" && hit.lanes_matched.contains(&"semantic"))
+            .map(|hit| hit.path.as_str())
+            .collect();
+        assert_eq!(file_paths, ["src/a.rs", "src/b.rs"]);
+        assert_eq!(first.hits, second.hits);
+    }
+
+    #[test]
+    fn over_budget_question_keeps_deterministic_hits() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn rebuild_registry() {}\n")]);
+        let provider =
+            crate::intent::FixtureProvider::from_json(r#"{"q-behavior":{"file:src/lib.rs":0.9}}"#)
+                .unwrap();
+        let question = crate::intent::Question {
+            id: "q-behavior".into(),
+            text: "x".repeat(crate::intent::MAX_BATCH_BYTES + 1),
+        };
+        let regular = hybrid_search(repo.path(), "ws", "rebuild registry", 10, None);
+        let intent = search(
+            repo.path(),
+            "ws",
+            None,
+            "rebuild registry",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        assert_eq!(intent.hits, regular.hits);
+        assert!(intent.degradations.iter().any(|d| d == "semantic_budget"));
+    }
+
+    #[test]
+    fn intent_skips_declarations_when_the_file_preview_is_negative() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn rebuild_registry() {}\n")]);
+        let provider = crate::intent::FixtureProvider::from_json(
+            r#"{"q-behavior":{"file:src/lib.rs":0.25,"decl:src/lib.rs:1:rebuild_registry":0.9}}"#,
+        )
+        .unwrap();
+        let question = crate::intent::Question {
+            id: "q-behavior".into(),
+            text: "Does this rebuild the registry?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "rebuild registry",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| !hit.lanes_matched.contains(&"semantic"))
+        );
+        assert!(
+            !result
+                .degradations
+                .iter()
+                .any(|d| d == "semantic_unavailable")
+        );
+    }
+
+    #[test]
+    fn intent_refuses_candidates_after_source_hash_changes() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn rebuild_registry() {}\n")]);
+        std::fs::write(
+            repo.path().join("src/lib.rs"),
+            "pub fn erase_registry() {}\n",
+        )
+        .unwrap();
+        let provider = crate::intent::FixtureProvider::from_json(
+            r#"{"q-behavior":{"file:src/lib.rs":0.9,"decl:src/lib.rs:1:rebuild_registry":0.9}}"#,
+        )
+        .unwrap();
+        let question = crate::intent::Question {
+            id: "q-behavior".into(),
+            text: "Does this rebuild the registry?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "rebuild registry",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        assert!(result.degradations.iter().any(|d| d == "semantic_stale"));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| !hit.lanes_matched.contains(&"semantic"))
+        );
     }
 
     #[test]
