@@ -82,8 +82,6 @@ pub const REWATCH_AFTER: Duration = Duration::from_secs(60);
 pub const REWATCH_MAX: Duration = Duration::from_secs(30 * 60);
 /// A due batch nobody took is announced again after this long.
 pub const RENOTIFY_AFTER: Duration = Duration::from_secs(10);
-/// Longest sleep of a root's thread (its stop latency).
-const TICK: Duration = Duration::from_millis(250);
 /// Cookie file name prefix, in the Git dir.
 const COOKIE_PREFIX: &str = "xm-watch-cookie-";
 /// Ignore files anywhere in the tree.
@@ -313,6 +311,8 @@ pub struct Root {
     /// Bumped by Git state changes (and rescans, which may have hidden one).
     git_epoch: AtomicU64,
     stop: AtomicBool,
+    #[cfg(test)]
+    wakeups: AtomicU64,
     inner: Mutex<Inner>,
     cookie_seen: Condvar,
     used: Mutex<Instant>,
@@ -607,6 +607,8 @@ impl Root {
             change_epoch: AtomicU64::new(1),
             git_epoch: AtomicU64::new(1),
             stop: AtomicBool::new(false),
+            #[cfg(test)]
+            wakeups: AtomicU64::new(0),
             inner: Mutex::new(Inner {
                 queue,
                 native: None,
@@ -653,44 +655,69 @@ impl Root {
         }
     }
 
-    /// Stop watching (the thread ends within a tick) and tell the orchestrator the
-    /// root is no longer watched, so its next read registers it again.
+    /// Stop watching and tell the orchestrator the root is no longer watched, so its
+    /// next read registers it again. Wake the thread without waiting for a deadline.
     fn retire(&self) {
         self.stop.store(true, Ordering::Release);
+        self.wake();
         self.notify("$/watch.state", absent_status(&self.root));
     }
 
     /// The thread body: establish the native watcher, then turn events into changes.
     fn run(self: Arc<Self>, rx: Receiver<notify::Result<Event>>) {
         self.establish(Instant::now());
+        let mut wait = self.next_wakeup(Instant::now());
         while !self.stop.load(Ordering::Acquire) {
-            let wait = self.next_wakeup(Instant::now());
             match rx.recv_timeout(wait) {
+                Ok(_) if self.stop.load(Ordering::Acquire) => break,
                 Ok(ev) => {
                     self.on_event(ev);
-                    while let Ok(ev) = rx.try_recv() {
-                        self.on_event(ev);
+                    while !self.stop.load(Ordering::Acquire) {
+                        match rx.try_recv() {
+                            Ok(ev) => self.on_event(ev),
+                            Err(_) => break,
+                        }
                     }
                 }
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => break,
             }
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
             self.tick(Instant::now());
+            if self.stop.load(Ordering::Acquire) {
+                break;
+            }
+            wait = self.next_wakeup(Instant::now());
+            #[cfg(test)]
+            self.wakeups.fetch_add(1, Ordering::Relaxed);
         }
         lock(&self.inner).native = None;
     }
 
     fn next_wakeup(&self, now: Instant) -> Duration {
         let inner = lock(&self.inner);
+        let queue_due = inner.queue.due_at().map(|due| {
+            if due <= now {
+                inner
+                    .due_notified
+                    .map_or(due, |notified| notified + RENOTIFY_AFTER)
+            } else {
+                due
+            }
+        });
         [
-            inner.queue.due_at(),
+            queue_due,
+            inner.queue.expire_at(),
             inner.rewatch_at,
             Some(inner.verify_at),
         ]
         .into_iter()
         .flatten()
         .map(|at| at.saturating_duration_since(now))
-        .fold(TICK, Duration::min)
+        .min()
+        .unwrap_or(VERIFY_EVERY)
     }
 
     /// Learn the layout and the ignored directories, then start the native watcher.
@@ -1094,6 +1121,9 @@ impl Root {
             inner.due_notified = None;
         }
         drop(inner);
+        if batch.is_some() {
+            self.wake();
+        }
         self.publish();
         TakenBatch {
             batch,
@@ -1110,8 +1140,17 @@ impl Root {
             inner.last_refresh = report.map(|r| summarize_refresh(&r));
         }
         drop(inner);
+        if known {
+            self.wake();
+        }
         self.publish();
         known
+    }
+
+    fn wake(&self) {
+        let wake = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(self.root.clone());
+        let _ = self.tx.send(Ok(wake));
     }
 
     pub fn status(&self) -> Value {
@@ -1766,6 +1805,7 @@ pub fn run(args: Args) -> CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::refresh_queue::{DEBOUNCE, MAX_WAIT};
 
     fn layout(ignored: Option<&[&str]>) -> Layout {
         Layout {
@@ -1773,6 +1813,201 @@ mod tests {
             git_dirs: vec![PathBuf::from("/r/.git")],
             ignored: ignored.map(|d| d.iter().map(|s| s.to_string()).collect()),
         }
+    }
+
+    fn due_notices() -> (Arc<AtomicU64>, Notifier) {
+        let notices = Arc::new(AtomicU64::new(0));
+        let seen = notices.clone();
+        let notifier: Notifier = Arc::new(move |method: &str, _| {
+            if method == "$/refresh.due" {
+                seen.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+        (notices, notifier)
+    }
+
+    #[test]
+    fn due_refresh_waits_until_renotify_instead_of_spinning() {
+        let (root, _rx) = Root::new(PathBuf::from("/r"), None, MAX_WATCH_DIRS);
+        let now = Instant::now();
+        let mut inner = lock(&root.inner);
+        inner
+            .queue
+            .push(Change::Full(FullReason::Startup), now - MAX_WAIT - DEBOUNCE);
+        inner.due_notified = Some(now);
+        let expected = RENOTIFY_AFTER.min(inner.verify_at.saturating_duration_since(now));
+        drop(inner);
+
+        assert_eq!(root.next_wakeup(now), expected);
+    }
+
+    #[test]
+    fn in_flight_refresh_wakes_at_its_expiry_deadline() {
+        let (root, _rx) = Root::new(PathBuf::from("/r"), None, MAX_WATCH_DIRS);
+        let now = Instant::now();
+        let mut inner = lock(&root.inner);
+        assert!(inner.queue.take(now, true).is_some());
+        drop(inner);
+
+        assert_eq!(
+            root.next_wakeup(now),
+            super::super::refresh_queue::IN_FLIGHT_LIMIT
+        );
+    }
+
+    #[test]
+    fn idle_watcher_sleeps_until_a_deadline_and_retire_wakes_promptly() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (notices, notifier) = due_notices();
+        let (root, rx) = Root::new(dir.path().to_path_buf(), Some(notifier), MAX_WATCH_DIRS);
+        let mut watcher = start_test_watcher(root.clone(), rx);
+
+        std::thread::sleep(Duration::from_secs(2));
+        let wakeups = root.wakeups.load(Ordering::Relaxed);
+        assert!(wakeups <= 2, "idle watcher woke {wakeups} times");
+
+        let notices_before_retire = notices.load(Ordering::Relaxed);
+        lock(&root.inner).due_notified = Some(Instant::now() - RENOTIFY_AFTER);
+        let elapsed = watcher.retire();
+        assert!(elapsed < Duration::from_millis(500));
+        assert_eq!(lock(&root.inner).counters.events, 0);
+        assert_eq!(notices.load(Ordering::Relaxed), notices_before_retire);
+    }
+
+    struct TestWatcher {
+        root: Arc<Root>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestWatcher {
+        fn retire(&mut self) -> Duration {
+            let started = Instant::now();
+            if let Some(thread) = self.thread.take() {
+                self.root.retire();
+                thread.join().expect("watch thread exits");
+            }
+            started.elapsed()
+        }
+    }
+
+    impl Drop for TestWatcher {
+        fn drop(&mut self) {
+            if let Some(thread) = self.thread.take() {
+                self.root.retire();
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn start_test_watcher(root: Arc<Root>, rx: Receiver<notify::Result<Event>>) -> TestWatcher {
+        let worker = root.clone();
+        TestWatcher {
+            root,
+            thread: Some(std::thread::spawn(move || worker.run(rx))),
+        }
+    }
+
+    #[test]
+    fn failed_batch_retry_deadline_wakes_the_watcher() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (notices, notifier) = due_notices();
+        let (root, rx) = Root::new(dir.path().to_path_buf(), Some(notifier), MAX_WATCH_DIRS);
+        let mut watcher = start_test_watcher(root.clone(), rx);
+        let first = Instant::now() + MAX_WAIT + DEBOUNCE;
+        while Instant::now() < first && notices.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            notices.load(Ordering::Relaxed) > 0,
+            "initial due notification missing"
+        );
+        let waits_before_take = root.wakeups.load(Ordering::Relaxed);
+        let batch = root.take(true).batch.expect("startup batch");
+        let wake_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wake_deadline
+            && root.wakeups.load(Ordering::Relaxed) <= waits_before_take
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(root.wakeups.load(Ordering::Relaxed) > waits_before_take);
+        let done_at = Instant::now();
+        assert!(root.done(batch.id, false, None));
+        let retry_delay = super::super::refresh_queue::backoff(1);
+        while Instant::now() < done_at + retry_delay + Duration::from_millis(200)
+            && notices.load(Ordering::Relaxed) < 2
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            notices.load(Ordering::Relaxed) >= 2,
+            "retry notification did not arrive promptly"
+        );
+        watcher.retire();
+    }
+
+    #[test]
+    fn successful_batch_with_pending_work_wakes_next_deadline() {
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let (notices, notifier) = due_notices();
+        let (root, rx) = Root::new(dir.path().to_path_buf(), Some(notifier), MAX_WATCH_DIRS);
+        let mut watcher = start_test_watcher(root.clone(), rx);
+        let deadline = Instant::now() + MAX_WAIT + DEBOUNCE;
+        while Instant::now() < deadline && notices.load(Ordering::Relaxed) == 0 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            notices.load(Ordering::Relaxed) > 0,
+            "initial due notification missing"
+        );
+        let waits_before_take = root.wakeups.load(Ordering::Relaxed);
+        let batch = root.take(true).batch.expect("startup batch");
+        let wake_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < wake_deadline
+            && root.wakeups.load(Ordering::Relaxed) <= waits_before_take
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(root.wakeups.load(Ordering::Relaxed) > waits_before_take);
+        let waits_before_event = root.wakeups.load(Ordering::Relaxed);
+        let mut pending = Event::new(EventKind::Modify(ModifyKind::Any));
+        pending.paths.push(root.root.join("pending.go"));
+        root.tx.send(Ok(pending)).expect("queue pending change");
+        let event_deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < event_deadline
+            && (lock(&root.inner).counters.paths == 0
+                || root.wakeups.load(Ordering::Relaxed) <= waits_before_event)
+        {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(lock(&root.inner).counters.paths, 1);
+        assert!(root.wakeups.load(Ordering::Relaxed) > waits_before_event);
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(root.done(batch.id, true, None));
+        let due_deadline = Instant::now() + DEBOUNCE + Duration::from_millis(200);
+        while Instant::now() < due_deadline && notices.load(Ordering::Relaxed) < 2 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            notices.load(Ordering::Relaxed) >= 2,
+            "pending batch notification missing"
+        );
+        watcher.retire();
+    }
+
+    #[test]
+    fn idle_watcher_waits_for_its_next_real_deadline() {
+        let (root, _rx) = Root::new(PathBuf::from("/r"), None, MAX_WATCH_DIRS);
+        let now = Instant::now();
+        let mut inner = lock(&root.inner);
+        inner.queue = RefreshQueue::new();
+        inner.due_notified = None;
+        inner.rewatch_at = None;
+        inner.verify_at = now + VERIFY_EVERY;
+        drop(inner);
+
+        let wait = root.next_wakeup(now);
+        assert!(wait > Duration::from_millis(250));
+        assert!(wait <= VERIFY_EVERY);
     }
 
     #[test]
