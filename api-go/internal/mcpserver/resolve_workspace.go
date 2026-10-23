@@ -284,11 +284,20 @@ func (s *Session) byPathSignal(ctx context.Context, p, source, noRegister string
 	}
 	if err := s.register(ctx, repo); err != nil {
 		var authErr *authRefusalError
-		if !errors.As(err, &authErr) || authErr.status != http.StatusForbidden {
+		if !errors.As(err, &authErr) {
 			return ancestor(err)
 		}
-		// A registration refusal is specific to this signal: another registered
-		// workspace may still be independently selected by a later path signal.
+		if authErr.status != http.StatusForbidden {
+			// The API rejected the credential itself: a cached listing must not
+			// stand in for it, so this ends resolution.
+			return Workspace{}, err
+		}
+		// A 403 refuses only this registration: a registered ancestor that already
+		// contains the path stays the answer, and otherwise a later path signal may
+		// still select another workspace independently.
+		if ws, aerr := ancestor(err); aerr == nil {
+			return ws, nil
+		}
 		return Workspace{}, &registrationRefusalError{authErr}
 	}
 	list, _, err := s.listWorkspaces(ctx, true)

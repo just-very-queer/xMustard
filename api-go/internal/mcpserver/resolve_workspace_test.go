@@ -891,3 +891,60 @@ func TestTheOptInRefusesNothingElse(t *testing.T) {
 		}
 	})
 }
+
+// A 403 on registering the cwd's own nested repository is specific to that
+// registration: the registered ancestor that already contains the cwd stays the answer.
+func TestRegistrationRefusalKeepsTheRegisteredAncestor(t *testing.T) {
+	outer, inner := nestedRepo(t)
+	api := &fakeAPI{
+		workspaces: []registeredWorkspace{{ID: "outer-ws", Root: outer}},
+		handle: func(r Request) *APIResponse {
+			if r.Method == "POST" && r.Path == "/api/workspaces/load" {
+				return &APIResponse{Status: http.StatusForbidden, Body: `{"reason":"missing_role","missing_role":"proposer"}`}
+			}
+			return nil
+		},
+	}
+	s := newSession(t, api, Options{Cwd: inner, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, err := call(t, s, "ground", map[string]any{})
+	if err != nil || res["isError"] != false {
+		t.Fatalf("a refused registration lost the registered ancestor: err=%v result=%v", err, res)
+	}
+	if ws := wsOf(t, res); ws.ID != "outer-ws" || ws.Source != SourceCWD || ws.Registered {
+		t.Fatalf("resolved %+v, want the registered ancestor outer-ws", ws)
+	}
+}
+
+// A 401 while registering is terminal even when a registered ancestor contains the
+// cwd: a cached listing must not stand in for a credential the API just rejected.
+func TestRegistrationAuthenticationFailureSkipsTheAncestor(t *testing.T) {
+	outer, inner := nestedRepo(t)
+	api := &fakeAPI{
+		workspaces: []registeredWorkspace{{ID: "outer-ws", Root: outer}},
+		handle: func(r Request) *APIResponse {
+			if r.Method == "POST" && r.Path == "/api/workspaces/load" {
+				return &APIResponse{Status: http.StatusUnauthorized, Body: `{"error":"authentication required"}`}
+			}
+			return nil
+		},
+	}
+	s := newSession(t, api, Options{Cwd: inner, AutoRegister: true, RegisterCwdWhenRootsUnknown: true}, rootsUnknownClient(errors.New("client error -32603: busy")), "2025-06-18")
+	res, err := call(t, s, "ground", map[string]any{})
+	if err != nil || res["isError"] != true || !strings.Contains(text(res), "grounding is unavailable") {
+		t.Fatalf("authentication refusal fell back to the ancestor: err=%v result=%v", err, res)
+	}
+}
+
+// nestedRepo is a git repository with another, unregistered one inside it.
+func nestedRepo(t *testing.T) (outer, inner string) {
+	t.Helper()
+	outer = tempRepo(t)
+	inner = filepath.Join(outer, "vendor", "inner")
+	if err := os.MkdirAll(inner, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if out, err := exec.Command("git", "-C", inner, "init", "--quiet").CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v %s", err, out)
+	}
+	return outer, inner
+}
