@@ -200,10 +200,11 @@ fn the_same_seed_over_the_same_index_is_byte_identical_across_runs() {
     );
     assert!(second.status.success());
     // pass_counters is the call's own accounting (the first run loads rows the second
-    // finds resident on disk), so the answer is compared without it.
+    // finds resident on disk), and freshness.identity_age_ms is time-derived. Exclude only
+    // those fields; every other output byte remains part of the determinism assertion.
     assert_eq!(
-        without_pass_counters(&first.stdout),
-        without_pass_counters(&second.stdout),
+        without_volatile_fields(&first.stdout),
+        without_volatile_fields(&second.stdout),
         "the same seed over the same index gave two different answers"
     );
     let v: Value = serde_json::from_slice(&first.stdout).unwrap();
@@ -895,12 +896,39 @@ fn a_non_numeric_seed_is_refused() {
     );
 }
 
-/// `out` up to the trailing `"pass_counters"` field the CLI appends, byte for byte.
-fn without_pass_counters(out: &[u8]) -> &[u8] {
+/// The answer with only call accounting and the time-derived freshness age removed.
+/// Every other byte, including freshness content and formatting, remains comparable.
+fn without_volatile_fields(out: &[u8]) -> Vec<u8> {
+    let mut stable = out.to_vec();
+    let age = b"\"identity_age_ms\":";
+    let start = stable
+        .windows(age.len())
+        .position(|w| w == age)
+        .expect("freshness includes identity_age_ms");
+    let value_start = start + age.len();
+    let value_end = stable[value_start..]
+        .iter()
+        .position(|b| !b.is_ascii_digit())
+        .map(|offset| value_start + offset)
+        .expect("identity_age_ms has a JSON integer value");
+    assert!(value_end > value_start, "identity_age_ms is not an integer");
+    let field_start = if start > 0 && stable[start - 1] == b',' {
+        start - 1
+    } else {
+        start
+    };
+    let field_end = if stable.get(value_end) == Some(&b',') {
+        value_end + 1
+    } else {
+        value_end
+    };
+    stable.drain(field_start..field_end);
+
     let key = b",\"pass_counters\":";
-    let at = out
+    let at = stable
         .windows(key.len())
         .rposition(|w| w == key)
         .expect("a JSON object result ends with pass_counters");
-    &out[..at]
+    stable.truncate(at);
+    stable
 }
