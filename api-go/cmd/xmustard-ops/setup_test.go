@@ -618,61 +618,52 @@ func TestOwnerRecordInspectionDoesNotContendWithAdmission(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "api.owner"), ownerJSON, 0o600); err != nil {
 		t.Fatal(err)
 	}
+	inspectionEntered := make(chan struct{})
+	releaseInspection := make(chan struct{})
+	var releaseOnce sync.Once
+	unblockInspection := func() { releaseOnce.Do(func() { close(releaseInspection) }) }
 	previousIdentity := processIdentity
 	processIdentity = func(pid int) (int64, string, bool) {
+		close(inspectionEntered)
+		<-releaseInspection
 		return owner.StartTime, "xmustard-api", pid == owner.PID
 	}
-	defer func() { processIdentity = previousIdentity }()
-	lockPath := filepath.Join(dir, "api.lock")
-	admitted := make(chan struct{})
-	release := make(chan struct{})
-	admissionDone := make(chan error, 1)
+	statusDone := make(chan bool, 1)
+	statusExited := make(chan struct{})
 	go func() {
-		lock, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o600)
-		if err != nil {
-			admissionDone <- err
-			return
-		}
-		defer lock.Close()
-		if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-			admissionDone <- err
-			return
-		}
-		close(admitted)
-		<-release
-		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-		admissionDone <- nil
+		defer close(statusExited)
+		statusDone <- apiOwnerMatches(dir, 8042, dataDirID(dir))
+	}()
+	defer func() {
+		unblockInspection()
+		<-statusExited
+		processIdentity = previousIdentity
 	}()
 	select {
-	case <-admitted:
-	case err := <-admissionDone:
-		t.Fatalf("API admission failed: %v", err)
+	case <-inspectionEntered:
 	case <-time.After(time.Second):
-		t.Fatal("API admission did not acquire its lock")
+		t.Fatal("status inspection did not reach process identity validation")
 	}
-	statusDone := make(chan bool, 1)
-	go func() { statusDone <- apiOwnerMatches(dir, 8042, dataDirID(dir)) }()
-	select {
-	case validOwner := <-statusDone:
-		if !validOwner {
-			t.Fatal("status failed to validate the live API owner during admission")
-		}
-	case <-time.After(time.Second):
-		t.Fatal("status inspection waited on API admission")
-	}
-	close(release)
-	if err := <-admissionDone; err != nil {
-		t.Fatalf("API admission cleanup: %v", err)
-	}
-	lock, err := os.OpenFile(lockPath, os.O_RDWR, 0o600)
+
+	lock, err := os.OpenFile(filepath.Join(dir, "api.lock"), os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer lock.Close()
 	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		t.Fatalf("replacement API admission was blocked by status inspection: %v", err)
+		t.Fatalf("replacement API admission was blocked during status inspection: %v", err)
 	}
 	_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+
+	unblockInspection()
+	select {
+	case validOwner := <-statusDone:
+		if !validOwner {
+			t.Fatal("status failed to validate the live API owner")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("status inspection did not finish after release")
+	}
 	if err := assertStatusProbeDoesNotFlock(); err != nil {
 		t.Fatal(err)
 	}
