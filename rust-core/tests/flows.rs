@@ -91,6 +91,45 @@ fn build(root: &Path) {
     ok_json(&["index", "build", root.to_str().unwrap()]);
 }
 
+fn opened_snapshot(
+    contents: &str,
+) -> (
+    TempDir,
+    std::path::PathBuf,
+    std::sync::Arc<xmustard_core::index::reader::Snapshot>,
+) {
+    let d = repo(&[GO_MOD, ("pkg/flags.go", contents)]);
+    build(d.path());
+    let db = index::stats(d.path(), &IndexConfig::default(), false).unwrap()["index_path"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let opened = index::reader::open_at(
+        d.path(),
+        Path::new(&db),
+        index::csr::GraphStorage::from_env(),
+    )
+    .unwrap();
+    (d, db.into(), opened.snapshot)
+}
+
+fn assert_exported_flag_refusal_rolls_back(
+    db: &Path,
+    snapshot: &xmustard_core::index::reader::Snapshot,
+    mutate: impl FnOnce(&rusqlite::Connection),
+    expected: &str,
+) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    mutate(&conn);
+    drop(conn);
+    let error = snapshot.exported_by_symbol().unwrap_err();
+    assert!(error.contains(expected), "unexpected refusal: {error}");
+    assert!(
+        snapshot.with_text(|conn| Ok(conn.is_autocommit())).unwrap(),
+        "a refused exported-flag read must leave the shared text connection out of a transaction"
+    );
+}
+
 fn flow_child_peak(mut command: Command) -> (u64, std::process::ExitStatus) {
     let child = command.process_group(0).spawn().unwrap();
     let pid = child.id() as libc::pid_t;
@@ -2583,13 +2622,73 @@ fn the_seeds_own_community_counts_toward_the_class() {
     );
 }
 
+#[test]
+fn exported_flag_row_mismatches_refuse_and_roll_back() {
+    let source = "package pkg\n\nfunc Root() { LeafA(); LeafB(); LeafC() }\n\
+                  func LeafA() {}\nfunc LeafB() {}\nfunc LeafC() {}\n";
+
+    let (_d, db, snapshot) = opened_snapshot(source);
+    assert_exported_flag_refusal_rolls_back(
+        &db,
+        &snapshot,
+        |conn| {
+            let file_id: i64 = conn
+                .query_row(
+                    "SELECT id FROM files WHERE parse_status = 'tree_sitter' LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            conn.execute("INSERT INTO names(name) VALUES ('SurplusFlag')", [])
+                .unwrap();
+            let name_id = conn.last_insert_rowid();
+            conn.execute(
+                "INSERT INTO symbols (file_id, ord, uid, name_id, qualified_name, kind,
+                    start_byte, end_byte, start_line, end_line, name_line, name_col,
+                    exported, depth, local)
+                 VALUES (?1, 999, 'surplus-flag-test', ?2, 'SurplusFlag', 'function',
+                    0, 0, 1, 1, 1, 1, 0, 0, 0)",
+                rusqlite::params![file_id, name_id],
+            )
+            .unwrap();
+        },
+        "store has 5 rows",
+    );
+
+    let (_d, db, snapshot) = opened_snapshot(source);
+    assert_exported_flag_refusal_rolls_back(
+        &db,
+        &snapshot,
+        |conn| {
+            conn.execute(
+                "DELETE FROM symbols WHERE id = (SELECT MIN(id) FROM symbols)",
+                [],
+            )
+            .unwrap();
+        },
+        "store has 3 rows",
+    );
+
+    let (_d, db, snapshot) = opened_snapshot(source);
+    assert_exported_flag_refusal_rolls_back(
+        &db,
+        &snapshot,
+        |conn| {
+            conn.execute(
+                "UPDATE symbols SET exported = 'not-a-boolean' WHERE id = (SELECT MIN(id) FROM symbols)",
+                [],
+            )
+            .unwrap();
+        },
+        "index store:",
+    );
+}
+
 /// The exported flags cannot come from a newer generation than the segment (WS-38c-b r4-3).
 ///
-/// The segment in a snapshot is loaded when the snapshot is taken; the flags live in the
-/// `symbols` table and were read through a connection opened LAZILY, on first use. A build
-/// committing between the two replaces those rows, so the answer's ×2 exported doubling —
-/// and with it every score — is computed from a generation the segment does not describe.
-/// Ordering by id cannot repair a row that was changed or deleted.
+/// The segment in a snapshot is loaded when it is opened, but flags live in the `symbols`
+/// table and are read lazily on first use. A build committing between those reads could
+/// otherwise pair a newer flag set with an older segment, changing the answer's scores.
 ///
 /// The fixture reproduces the mixed generation deterministically rather than racing a thread:
 /// the store's `generation` is advanced by a direct write, which is what a build does when it

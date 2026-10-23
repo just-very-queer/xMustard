@@ -233,9 +233,6 @@ pub struct Flow {
     pub seeds: Vec<Seed>,
     /// The symbols the walk visited, seed first, capped at [`MAX_STEPS_LISTED`].
     pub steps: Vec<Step>,
-    /// Every file reached by the complete walk, including steps not listed.
-    #[serde(skip)]
-    pub all_paths: BTreeSet<String>,
     /// The steps the walk visited beyond the listed ones.
     pub steps_omitted: u64,
     /// The graph distance from a seed to the furthest visited step.
@@ -283,18 +280,8 @@ pub struct Flows {
     pub command: &'static str,
     pub entry_points: Vec<Seed>,
     pub flows: Vec<Flow>,
-    /// Every path that contributed to this answer: each entry point's file, and every step
-    /// of every flow built — including the steps past the listing cap and the flows
-    /// dropped by the MAX_FLOWS cut. Not serialized: the dispatch computes freshness from
-    /// it rather than from the listed rows, which would leave the answer claiming `current`
-    /// while its scores came from a file the walk never listed. `areas()` does the same
-    /// with `total_paths` for the same reason.
-    #[serde(skip)]
-    pub total_paths: Vec<String>,
-    /// Every file that contributed a resolved CALL to a SCORED candidate, whether or not the
-    /// candidate became a seed, its walk reached the caller, or the flow survived
-    /// [`MAX_FLOWS`]. Not serialized: the dispatch reads it beside `total_paths`, for the
-    /// same reason.
+    /// The deduplicated freshness envelope: every scored candidate, its callers and callees.
+    /// Not serialized; dispatch uses it instead of reconstructing coverage from listed rows.
     ///
     /// WS-38c-b decision r4-4. A caller edge raises a symbol's `callers` count, which is the
     /// denominator of its score, so an unselected caller's file shaped every score the answer
@@ -413,6 +400,44 @@ fn exceeds_retention_limit(retained: u64, steps: u64, limits: Limits) -> bool {
     retained + steps > limits.max_retained_steps
 }
 
+fn listed_steps(visited: &[usize], max_steps_listed: usize) -> Vec<usize> {
+    visited[..visited.len().min(max_steps_listed)].to_vec()
+}
+
+#[derive(Default)]
+struct RetainedWalks {
+    steps: u64,
+    keyed: Vec<(Vec<usize>, Walk)>,
+    index: BTreeMap<[u8; 32], usize>,
+}
+
+impl RetainedWalks {
+    fn admit(
+        &mut self,
+        key: [u8; 32],
+        rank: usize,
+        mut walk: Walk,
+        limits: Limits,
+        truncation: &mut Truncation,
+    ) {
+        if let Some(&at) = self.index.get(&key) {
+            self.keyed[at].0.push(rank);
+            self.keyed[at].1.origins.extend(walk.origins);
+            return;
+        }
+
+        let retained_steps = walk.visited.len().min(limits.max_steps_listed) as u64;
+        if exceeds_retention_limit(self.steps, retained_steps, limits) {
+            truncation.dropped_retained += walk.visited.len() as u64;
+            return;
+        }
+        self.steps += retained_steps;
+        walk.visited = listed_steps(&walk.visited, limits.max_steps_listed);
+        self.index.insert(key, self.keyed.len());
+        self.keyed.push((vec![rank], walk));
+    }
+}
+
 /// The flows of an opened snapshot, read-only like `impact`.
 pub fn flows_for(snapshot: &super::reader::Snapshot, limits: Limits) -> Result<Flows, String> {
     let exported = snapshot.exported_by_symbol()?;
@@ -480,14 +505,12 @@ pub fn flows_of(
     // One flow per distinct reachability set, keyed by a fixed-size digest of its sorted
     // node indices so the retained dedup index does not grow with walk length.
     //
-    // The retention budget is GLOBAL (WS-38c-b decision r4-2). Every walk first produces
-    // bounded summaries for its complete class, label and freshness envelope. The resident
-    // step vector is then truncated to `MAX_STEPS_LISTED`, and only those retained rows count
-    // against `MAX_RETAINED_STEPS`; a walk that would exceed the remaining budget is dropped
-    // and counted rather than silently shortening another flow's answer.
-    let mut keyed: Vec<(Vec<usize>, Walk)> = Vec::new();
-    let mut index: std::collections::BTreeMap<[u8; 32], usize> = Default::default();
-    let mut retained: u64 = 0;
+    // The retention budget is GLOBAL (WS-38c-b decision r4-2). Each walk's class and label
+    // summaries use the complete set, but its retained step vector is replaced by a new
+    // allocation no larger than `MAX_STEPS_LISTED`; only those rows count against
+    // `MAX_RETAINED_STEPS`. A walk that would exceed the remaining budget is dropped and
+    // counted rather than silently shortening another flow's answer.
+    let mut retained = RetainedWalks::default();
     for (rank, &seed) in ranked.iter().enumerate() {
         let mut walk = walk(&graph, seed, &limits, &mut truncation);
         walk.full_len = walk.visited.len();
@@ -496,11 +519,6 @@ pub fn flows_of(
             .iter()
             .map(|&i| graph.nodes[i].area)
             .filter(|&area| area != UNCLASSIFIED)
-            .collect();
-        walk.paths = walk
-            .visited
-            .iter()
-            .map(|&i| graph.nodes[i].path.clone())
             .collect();
         let label_steps: Vec<Step> = walk
             .visited
@@ -520,8 +538,8 @@ pub fn flows_of(
             truncation.dropped_under_min_steps += 1;
             continue;
         }
-        // The reachability set, computed before either the dedup lookup or the cap, because both
-        // are about the SET rather than the walk.
+        // The reachability set, computed before deduplication and retention, because both
+        // decisions are about the SET rather than the walk.
         let key: [u8; 32] = {
             let mut set: Vec<u32> = walk.visited.iter().map(|&v| v as u32).collect();
             set.sort_unstable();
@@ -531,37 +549,10 @@ pub fn flows_of(
             }
             digest.finalize().into()
         };
-        // A set that is ALREADY retained adds no resident step data: its steps are the steps
-        // the existing `Walk` holds, and folding it only records one more origin. So this is
-        // checked BEFORE the cap, and charged nothing. The order WS-38c-b first wrote charged
-        // the cap per WALK, which let a run of duplicate sets be dropped wholesale once the
-        // cap filled — changing which seeds a flow names and, through the seed's community,
-        // its intra/cross class, for a cap meant to bound memory alone.
-        if let Some(&at) = index.get(&key) {
-            keyed[at].0.push(rank);
-            // The folded seed is an origin too: the set is shared, so the flow's
-            // communities must count every seed that reaches it.
-            keyed[at].1.origins.push(seed as usize);
-            continue;
-        }
-        // The cap is checked before a NEW set is retained, because retaining it is exactly
-        // what the cap bounds. The walk is SKIPPED and counted, not `break`-ed out of: a
-        // break would leave `dropped_retained` holding only the first walk that tripped the
-        // cap while every later seed was dropped uncounted, so the counter would read as one
-        // drop under a name that counts them. Continuing keeps the walk's steps out of
-        // `keyed` — which is what bounds the retained set — and reports every step the cap
-        // excluded.
-        let retained_steps = walk.visited.len().min(limits.max_steps_listed) as u64;
-        if exceeds_retention_limit(retained, retained_steps, limits) {
-            truncation.dropped_retained += retained_steps;
-            continue;
-        }
-        retained += retained_steps;
-        walk.visited.truncate(limits.max_steps_listed);
-        index.insert(key, keyed.len());
-        keyed.push((vec![rank], walk));
+        retained.admit(key, rank, walk, limits, &mut truncation);
     }
-    let mut flows: Vec<Flow> = keyed
+    let mut flows: Vec<Flow> = retained
+        .keyed
         .into_iter()
         .map(|(ranks, walk)| {
             let flow_seeds: Vec<Seed> = ranks.iter().map(|&r| seeds[r].clone()).collect();
@@ -572,14 +563,9 @@ pub fn flows_of(
     // run did not list, and a flow the run did not list at all still had steps it did not
     // list. Summing after the cut would understate exactly the run that did the most work.
     truncation.truncated_step_lists = flows.iter().map(|f| f.steps_omitted).sum();
-    // The freshness set is built from the same pre-cut answer: every entry point's file and
-    // every flow's every step, so a file that only contributed to a dropped flow or to a
-    // step past the listing cap still marks the answer stale when it changes.
-    let total_paths: Vec<String> = seeds
-        .iter()
-        .map(|s| s.path.clone())
-        .chain(flows.iter().flat_map(|f| f.all_paths.iter().cloned()))
-        .collect();
+    // Every visited node is a scored candidate's callee: the start of every walk is a
+    // candidate, and any deeper step is reached by following a candidate's callee edge. The
+    // deduplicated candidate envelope therefore already covers all flow steps, listed or not.
     flows.sort_by(|a, b| {
         b.seeds[0]
             .score
@@ -596,7 +582,6 @@ pub fn flows_of(
         command: "flows",
         entry_points: seeds,
         flows,
-        total_paths,
         candidate_paths: candidates,
         symbols_considered: graph.nodes.len() as u64,
         unclassified_symbols: graph
@@ -797,9 +782,8 @@ fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Vec<String>, Tru
         let score = ratio * if node.exported { 2.0 } else { 1.0 } * rule.multiplier;
         scored.push((score, i as u32));
     }
-    // Every file that shaped a score: each SCORED CANDIDATE's own file, and the file of every
-    // caller of one. Deduplicated through the adjacency the graph already holds rather than a
-    // second pass over the store.
+    // Every file that shaped a score or a walk: each SCORED CANDIDATE's own file, the file
+    // of every caller (the score denominator), and every callee (the walk edge endpoints).
     //
     // The candidate's OWN file is not redundant with the seed set. `seeded` is `scored` after
     // the `MAX_CANDIDATES` cut, so a candidate that loses that cut contributes its `callees`
@@ -809,19 +793,17 @@ fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Vec<String>, Tru
     // its callee count shapes the ranking, the caller's because the caller count is the
     // denominator of the score it shapes (WS-38c-b decision r4-4).
     let candidate_paths: Vec<String> = {
-        let mut set: std::collections::BTreeSet<usize> = Default::default();
+        let mut paths: BTreeSet<String> = Default::default();
         for (_, i) in &scored {
-            set.insert(*i as usize);
+            paths.insert(graph.nodes[*i as usize].path.clone());
             for &caller in graph.callers_of(*i) {
-                set.insert(caller as usize);
+                paths.insert(graph.nodes[caller as usize].path.clone());
             }
             for &callee in graph.callee_slice(*i) {
-                set.insert(callee as usize);
+                paths.insert(graph.nodes[callee as usize].path.clone());
             }
         }
-        set.into_iter()
-            .map(|i| graph.nodes[i].path.clone())
-            .collect()
+        paths.into_iter().collect()
     };
     scored.sort_by(|a, b| {
         b.0.partial_cmp(&a.0)
@@ -884,9 +866,8 @@ struct Walk {
     origins: Vec<usize>,
     /// The distance from the seed to the furthest visited node.
     depth: u32,
-    /// Communities and files from the complete walk, summarized before its step list is capped.
+    /// Communities from the complete walk, summarized before its step list is capped.
     areas: BTreeSet<u32>,
-    paths: BTreeSet<String>,
     label_stem: Option<String>,
     full_len: usize,
 }
@@ -994,7 +975,6 @@ fn walk(graph: &Graph, seed: u32, limits: &Limits, truncation: &mut Truncation) 
         origins: vec![seed as usize],
         depth: deepest,
         areas: BTreeSet::new(),
-        paths: BTreeSet::new(),
         label_stem: None,
         full_len: 0,
     }
@@ -1053,7 +1033,6 @@ fn flow(graph: &Graph, seeds: Vec<Seed>, walk: Walk, limits: Limits) -> Flow {
         class,
         seeds,
         steps,
-        all_paths: walk.paths,
         steps_omitted: (walk.full_len - listed) as u64,
         depth: walk.depth,
         communities: communities.len() as u64,
@@ -1093,7 +1072,70 @@ fn shared_stem(steps: &[Step]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Graph, Limits, Node, exceeds_retention_limit, rank_seeds};
+    use super::{
+        Graph, Limits, Node, RetainedWalks, Walk, exceeds_retention_limit, rank_seeds,
+    };
+
+    #[test]
+    fn retained_steps_use_a_right_sized_allocation() {
+        let walk = Walk {
+            visited: (0..80_000).collect(),
+            origins: vec![0],
+            depth: 10,
+            areas: Default::default(),
+            label_stem: None,
+            full_len: 80_000,
+        };
+        let limits = Limits {
+            max_steps_listed: 50,
+            max_retained_steps: 50,
+            ..Limits::default()
+        };
+        let mut retained = RetainedWalks::default();
+        let mut truncation = Default::default();
+        retained.admit([0; 32], 0, walk, limits, &mut truncation);
+
+        let steps = &retained.keyed[0].1.visited;
+        assert_eq!(steps.len(), 50);
+        assert!(
+            steps.capacity() <= 50,
+            "retained capacity: {}",
+            steps.capacity()
+        );
+    }
+
+    #[test]
+    fn duplicate_walks_fold_after_the_retention_budget_is_full() {
+        let walk = |seed| Walk {
+            visited: vec![10, 11],
+            origins: vec![seed],
+            depth: 1,
+            areas: Default::default(),
+            label_stem: None,
+            full_len: 2,
+        };
+        let limits = Limits {
+            max_steps_listed: 2,
+            max_retained_steps: 2,
+            ..Limits::default()
+        };
+        let mut retained = RetainedWalks::default();
+        let mut truncation = Default::default();
+
+        retained.admit([0; 32], 0, walk(0), limits, &mut truncation);
+        retained.admit([0; 32], 1, walk(1), limits, &mut truncation);
+        assert_eq!(retained.steps, 2);
+        assert_eq!(retained.keyed[0].0, [0, 1]);
+        assert_eq!(retained.keyed[0].1.origins, [0, 1]);
+        assert_eq!(truncation.dropped_retained, 0);
+
+        let mut distinct = walk(2);
+        distinct.visited.extend(12..350);
+        distinct.full_len = 340;
+        retained.admit([1; 32], 2, distinct, limits, &mut truncation);
+        assert_eq!(retained.keyed.len(), 1);
+        assert_eq!(truncation.dropped_retained, 340);
+    }
 
     #[test]
     fn retention_limit_rejects_steps_that_would_cross_the_global_cap() {
@@ -1103,6 +1145,41 @@ mod tests {
         };
         assert!(!exceeds_retention_limit(9_990, 10, limits));
         assert!(exceeds_retention_limit(9_990, 11, limits));
+    }
+
+    #[test]
+    fn candidate_freshness_covers_callees_past_the_walk_branching_cap() {
+        let mut nodes = vec![Node {
+            graph_node: 0,
+            name: "Root".to_string(),
+            path: "root.go".to_string(),
+            line: 1,
+            kind: "function".to_string(),
+            area: 0,
+            exported: false,
+        }];
+        nodes.extend((0..6).map(|i| Node {
+            graph_node: i + 1,
+            name: format!("Leaf{i}"),
+            path: format!("leaf{i}.go"),
+            line: 1,
+            kind: "function".to_string(),
+            area: 0,
+            exported: false,
+        }));
+        let graph = Graph {
+            nodes,
+            off: vec![0, 6, 6, 6, 6, 6, 6, 6],
+            dst: (1..=6).collect(),
+            callers_off: vec![0, 0, 1, 2, 3, 4, 5, 6],
+            callers_dst: vec![0; 6],
+            callees: vec![6, 0, 0, 0, 0, 0, 0],
+            callers: vec![0, 1, 1, 1, 1, 1, 1],
+        };
+        let (_, _, paths, _) = rank_seeds(&graph, Limits::default());
+        for i in 0..6 {
+            assert!(paths.iter().any(|path| path == &format!("leaf{i}.go")));
+        }
     }
 
     #[test]
