@@ -313,6 +313,8 @@ pub struct Root {
     stop: AtomicBool,
     #[cfg(test)]
     wakeups: AtomicU64,
+    #[cfg(test)]
+    wake_ack: Mutex<Option<Sender<()>>>,
     inner: Mutex<Inner>,
     cookie_seen: Condvar,
     used: Mutex<Instant>,
@@ -609,6 +611,8 @@ impl Root {
             stop: AtomicBool::new(false),
             #[cfg(test)]
             wakeups: AtomicU64::new(0),
+            #[cfg(test)]
+            wake_ack: Mutex::new(None),
             inner: Mutex::new(Inner {
                 queue,
                 native: None,
@@ -668,12 +672,23 @@ impl Root {
         self.establish(Instant::now());
         let mut wait = self.next_wakeup(Instant::now());
         while !self.stop.load(Ordering::Acquire) {
+            #[cfg(test)]
+            let mut wake_ack = false;
             match rx.recv_timeout(wait) {
                 Ok(_) if self.stop.load(Ordering::Acquire) => break,
                 Ok(ev) => {
+                    #[cfg(test)]
+                    if self.is_wake_ack(&ev) {
+                        wake_ack = true;
+                    } else {
+                        self.on_event(ev);
+                    }
+                    #[cfg(not(test))]
                     self.on_event(ev);
                     while !self.stop.load(Ordering::Acquire) {
                         match rx.try_recv() {
+                            #[cfg(test)]
+                            Ok(ev) if self.is_wake_ack(&ev) => wake_ack = true,
                             Ok(ev) => self.on_event(ev),
                             Err(_) => break,
                         }
@@ -691,7 +706,14 @@ impl Root {
             }
             wait = self.next_wakeup(Instant::now());
             #[cfg(test)]
-            self.wakeups.fetch_add(1, Ordering::Relaxed);
+            {
+                self.wakeups.fetch_add(1, Ordering::Relaxed);
+                if wake_ack {
+                    if let Some(ack) = lock(&self.wake_ack).take() {
+                        let _ = ack.send(());
+                    }
+                }
+            }
         }
         lock(&self.inner).native = None;
     }
@@ -1151,6 +1173,30 @@ impl Root {
         let wake = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
             .add_path(self.root.clone());
         let _ = self.tx.send(Ok(wake));
+    }
+
+    #[cfg(test)]
+    fn is_wake_ack(&self, event: &notify::Result<Event>) -> bool {
+        event
+            .as_ref()
+            .is_ok_and(|event| event.paths.iter().any(|path| path == &self.wake_ack_path()))
+    }
+
+    #[cfg(test)]
+    fn wake_ack_path(&self) -> PathBuf {
+        self.root.join(".xmustard-test-wake-ack")
+    }
+
+    #[cfg(test)]
+    fn wake_and_wait_for_recompute(&self) {
+        let (ack_tx, ack_rx) = mpsc::channel();
+        *lock(&self.wake_ack) = Some(ack_tx);
+        let event = Event::new(EventKind::Access(AccessKind::Close(AccessMode::Read)))
+            .add_path(self.wake_ack_path());
+        self.tx.send(Ok(event)).expect("queue wake handshake");
+        ack_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("watcher did not consume wake and recompute its deadline");
     }
 
     pub fn status(&self) -> Value {
@@ -1921,15 +1967,8 @@ mod tests {
             notices.load(Ordering::Relaxed) > 0,
             "initial due notification missing"
         );
-        let waits_before_take = root.wakeups.load(Ordering::Relaxed);
         let batch = root.take(true).batch.expect("startup batch");
-        let wake_deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < wake_deadline
-            && root.wakeups.load(Ordering::Relaxed) <= waits_before_take
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(root.wakeups.load(Ordering::Relaxed) > waits_before_take);
+        root.wake_and_wait_for_recompute();
         let done_at = Instant::now();
         assert!(root.done(batch.id, false, None));
         let retry_delay = super::super::refresh_queue::backoff(1);
@@ -1959,15 +1998,8 @@ mod tests {
             notices.load(Ordering::Relaxed) > 0,
             "initial due notification missing"
         );
-        let waits_before_take = root.wakeups.load(Ordering::Relaxed);
         let batch = root.take(true).batch.expect("startup batch");
-        let wake_deadline = Instant::now() + Duration::from_secs(1);
-        while Instant::now() < wake_deadline
-            && root.wakeups.load(Ordering::Relaxed) <= waits_before_take
-        {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(root.wakeups.load(Ordering::Relaxed) > waits_before_take);
+        root.wake_and_wait_for_recompute();
         let waits_before_event = root.wakeups.load(Ordering::Relaxed);
         let mut pending = Event::new(EventKind::Modify(ModifyKind::Any));
         pending.paths.push(root.root.join("pending.go"));
@@ -1981,7 +2013,7 @@ mod tests {
         }
         assert_eq!(lock(&root.inner).counters.paths, 1);
         assert!(root.wakeups.load(Ordering::Relaxed) > waits_before_event);
-        std::thread::sleep(Duration::from_millis(10));
+        root.wake_and_wait_for_recompute();
         assert!(root.done(batch.id, true, None));
         let due_deadline = Instant::now() + DEBOUNCE + Duration::from_millis(200);
         while Instant::now() < due_deadline && notices.load(Ordering::Relaxed) < 2 {
