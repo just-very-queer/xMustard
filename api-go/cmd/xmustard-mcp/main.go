@@ -23,6 +23,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"xmustard/api-go/internal/budget"
 	"xmustard/api-go/internal/mcpserver"
@@ -394,6 +395,20 @@ func (r *inflightRegistry) done(id string) {
 	r.mu.Unlock()
 }
 
+// cancelAll aborts every request still running when the stdio session ends.
+func (r *inflightRegistry) cancelAll() {
+	r.mu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(r.m))
+	for id, cancel := range r.m {
+		cancels = append(cancels, cancel)
+		delete(r.m, id)
+	}
+	r.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
 // cancel aborts the in-flight request with this id (no-op if already finished/unknown).
 func (r *inflightRegistry) cancel(id string) {
 	r.mu.Lock()
@@ -456,7 +471,16 @@ type stdioServer struct {
 	send     func(rpcResponse)
 	inflight *inflightRegistry
 	slots    chan struct{}
+	workerMu sync.Mutex
+	closing  bool
 	workers  sync.WaitGroup
+}
+
+func (s *stdioServer) cancelWorkers() {
+	s.workerMu.Lock()
+	s.closing = true
+	s.inflight.cancelAll()
+	s.workerMu.Unlock()
 }
 
 // serve handles one frame read under admission; scope holds its reservation until the
@@ -569,10 +593,18 @@ func (s *stdioServer) startWorker(m rpcMessage, scope *budget.Scope) {
 			Message: fmt.Sprintf("xmustard overloaded: %d requests already in flight; retry shortly", cap(s.slots))}})
 		return
 	}
+	s.workerMu.Lock()
+	if s.closing {
+		s.workerMu.Unlock()
+		<-s.slots
+		scope.Close()
+		return
+	}
 	ctx, cancel := context.WithCancel(withCallID(budget.WithScope(context.Background(), scope), m.ID))
 	idKey := string(m.ID)
 	s.inflight.add(idKey, cancel)
 	s.workers.Add(1)
+	s.workerMu.Unlock()
 	go func() {
 		defer s.workers.Done()
 		defer func() { <-s.slots }()
@@ -588,6 +620,24 @@ func (s *stdioServer) startWorker(m rpcMessage, scope *budget.Scope) {
 func (s *stdioServer) refuseUndecoded(probe []byte, rerr *rpcError) {
 	if resp := client.answerUndecoded(probe, rerr); resp != nil {
 		s.send(*resp)
+	}
+}
+
+// watchParent uses the caller's low-frequency interval to bound detection without
+// waking continuously while the client is alive.
+func watchParent(startPPID int, getPPID func() int, interval time.Duration, stop <-chan struct{}, onDeath func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			if getPPID() != startPPID {
+				onDeath()
+				return
+			}
+		}
 	}
 }
 
@@ -612,7 +662,28 @@ func main() {
 	client.send = write
 	client.mu.Unlock()
 	s := &stdioServer{send: func(resp rpcResponse) { write(resp) }, inflight: newInflight(), slots: make(chan struct{}, maxInflight())}
-	defer s.workers.Wait()
+	parentDone := make(chan struct{})
+	defer close(parentDone)
+	startPPID := os.Getppid()
+	var shutdownOnce sync.Once
+	shutdown := func() {
+		shutdownOnce.Do(func() {
+			s.cancelWorkers()
+			workersDone := make(chan struct{})
+			go func() { s.workers.Wait(); close(workersDone) }()
+			select {
+			case <-workersDone:
+			case <-time.After(2 * time.Second):
+			}
+			os.Exit(0)
+		})
+	}
+	if startPPID <= 1 {
+		shutdown()
+	}
+	stopParentSignal := watchParentDeathSignal(startPPID, shutdown)
+	defer stopParentSignal()
+	go watchParent(startPPID, os.Getppid, 5*time.Second, parentDone, shutdown)
 
 	for {
 		// Every frame is admitted against the shim's transient pool before it is
@@ -624,5 +695,15 @@ func main() {
 		if f.err != nil { // io.EOF or a read error: stop
 			break
 		}
+	}
+	s.cancelWorkers()
+	workersDone := make(chan struct{})
+	go func() {
+		s.workers.Wait()
+		close(workersDone)
+	}()
+	select {
+	case <-workersDone:
+	case <-time.After(2 * time.Second):
 	}
 }

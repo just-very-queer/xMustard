@@ -114,6 +114,8 @@ func TestLaunchdPlistIsAKeepAliveAgentWithoutCredentials(t *testing.T) {
 		"WorkingDirectory":  s.DataDir,
 		"Umask":             "63",
 		"ExitTimeOut":       "30",
+		"ThrottleInterval":  "60",
+		"ProcessType":       "Background",
 	} {
 		if p[k] != want {
 			t.Errorf("%s = %v, want %v", k, p[k], want)

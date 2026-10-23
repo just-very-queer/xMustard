@@ -4,11 +4,15 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -319,5 +323,78 @@ func TestSetupClientBindingFollowsMcpConfig(t *testing.T) {
 	}
 	if r, err := clientBinding("", "codex", api); err != nil || r.MCP != nil || r.MCPConfig != "" {
 		t.Fatalf("no --root: %+v %v", r, err)
+	}
+}
+
+func TestProbeDirectDoesNotFollowRedirects(t *testing.T) {
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"api-go"}`))
+	}))
+	defer target.Close()
+	redirect := httptest.NewServer(http.RedirectHandler(target.URL, http.StatusTemporaryRedirect))
+	defer redirect.Close()
+	if health, err := probeDirect(context.Background(), redirect.URL); err == nil {
+		t.Fatalf("redirect to healthy API was accepted: %+v", health)
+	}
+}
+
+func TestProbeDirectReusesConnectionsAcrossWait(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"other"}`))
+	}))
+	var connections atomic.Int32
+	server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	server.Start()
+	defer server.Close()
+
+	_, _ = daemon.WaitHealthy(context.Background(), probeDirect, server.URL, 900*time.Millisecond)
+	if got := connections.Load(); got > 1 {
+		t.Fatalf("repeated health probes opened %d connections, want reuse", got)
+	}
+	if got := connections.Load(); got == 0 {
+		t.Fatal("health probes opened no connections")
+	}
+}
+
+func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
+	e, out, errOut, _, home := lifecycleTest(t, "darwin", nil)
+	platform := daemon.Launchd{UID: 501}
+	spec := platform.Defaults(e.getenv, home)
+	if err := os.MkdirAll(spec.UnitDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, unit := range platform.Files(spec) {
+		if err := os.WriteFile(unit.Path, []byte(unit.Content), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	e.run = func(context.Context, string, ...string) (string, error) {
+		return "state = waiting\n", errors.New("not running")
+	}
+	e.probe = func(context.Context, string) (daemon.Health, error) {
+		return daemon.Health{Status: "ok", Service: "api-go"}, nil
+	}
+	if code := runDaemon(e, []string{"status", "--unit-dir", spec.UnitDir}); code != 0 {
+		t.Fatalf("status exit = %d: %s", code, errOut)
+	}
+	v := decodeOut(t, out)
+	if v["platform"] != "launchd" || v["label"] != spec.Label || v["api"] != spec.BaseURL() ||
+		v["notice"] != "launchd agent not running because another instance owns the port" {
+		t.Fatalf("status report fields were not preserved: %v", v)
+	}
+	if units := v["units"].([]any); len(units) != 1 || units[0] != platform.Files(spec)[0].Path {
+		t.Fatalf("status units were not preserved: %v", v["units"])
+	}
+	service, ok := v["service"].(map[string]any)
+	if !ok || service["manager"] != "launchd" || service["state"] != "not-loaded" {
+		t.Fatalf("status service was not preserved: %v", v["service"])
+	}
+	health, ok := v["health"].(map[string]any)
+	if !ok || health["status"] != "ok" || health["service"] != "api-go" {
+		t.Fatalf("status health was not preserved: %v", v["health"])
 	}
 }

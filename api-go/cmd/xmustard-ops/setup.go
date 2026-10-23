@@ -8,6 +8,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -56,7 +57,15 @@ type lifecycleEnv struct {
 func defaultLifecycleEnv() lifecycleEnv {
 	exe, _ := os.Executable()
 	return lifecycleEnv{opsEnv: defaultOpsEnv(), goos: runtime.GOOS, uid: os.Getuid(), run: daemon.ExecRunner,
-		probe: daemon.Probe, exe: exe, lookPath: exec.LookPath, now: time.Now}
+		probe: probeDirect, exe: exe, lookPath: exec.LookPath, now: time.Now}
+}
+
+// probeDirect keeps a health result tied to the requested listener.
+var directProbeClient = &http.Client{Timeout: 2 * time.Second, Transport: &http.Transport{Proxy: nil},
+	CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
+
+func probeDirect(ctx context.Context, base string) (daemon.Health, error) {
+	return daemon.ProbeWithClient(ctx, base, directProbeClient)
 }
 
 // lifecycleCommands are the subcommands this file adds to xmustard-ops.
@@ -288,6 +297,18 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 	},
 }
 
+func explainLaunchdDuplicate(ctx context.Context, report daemon.StatusReport, base string, probe func(context.Context, string) (daemon.Health, error)) any {
+	if report.Service.Manager == "launchd" && report.Service.PID == 0 && probe != nil {
+		if _, err := probe(ctx, base); err == nil {
+			return struct {
+				daemon.StatusReport
+				Notice string `json:"notice"`
+			}{StatusReport: report, Notice: "launchd agent not running because another instance owns the port"}
+		}
+	}
+	return report
+}
+
 func requireInstalled(in daemon.Installer, s daemon.Spec) error {
 	present, err := in.Installed(s)
 	if err == nil && len(present) == 0 {
@@ -314,6 +335,11 @@ func runDaemon(e lifecycleEnv, args []string) int {
 	out, err := act(context.Background(), e.installer(p, f.wait), spec)
 	if err != nil {
 		return e.fail(err)
+	}
+	if args[0] == "status" {
+		if report, ok := out.(daemon.StatusReport); ok {
+			out = explainLaunchdDuplicate(context.Background(), report, report.API, e.probe)
+		}
 	}
 	return e.emit(out)
 }

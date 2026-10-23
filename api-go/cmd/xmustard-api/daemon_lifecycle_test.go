@@ -6,8 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -19,6 +21,78 @@ import (
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/workspaceops"
 )
+
+func TestStoreStartLineAdvisesRestoreOnlyOnFault(t *testing.T) {
+	for _, tc := range []struct {
+		status string
+		want   bool
+	}{
+		{workspaceops.StoreInterrupted, false},
+		{workspaceops.StoreError, false},
+		{workspaceops.StoreCorrupt, true},
+		{workspaceops.StoreSchemaTooNew, true},
+		{workspaceops.StoreSchemaDrift, true},
+	} {
+		line := storeStartLine(workspaceops.StoreHealth{Status: tc.status, Detail: "check failed"})
+		if got := strings.Contains(line, "restore"); got != tc.want {
+			t.Errorf("%s: restore=%v; line %q", tc.status, got, line)
+		}
+	}
+	if line := storeStartLine(workspaceops.StoreHealth{Status: workspaceops.StoreInterrupted}); !strings.Contains(line, "reruns on next start") {
+		t.Errorf("interrupted line = %q", line)
+	}
+}
+
+func TestDuplicateAPIExecutableExitsSuccessfully(t *testing.T) {
+	dataDir := t.TempDir()
+	owner := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})
+	resp, err := testClient.Get(owner.base + "/api/health")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	if readErr != nil || resp.StatusCode != http.StatusOK || len(body) <= 4096 {
+		t.Fatalf("real API health response: status=%d bytes=%d err=%v", resp.StatusCode, len(body), readErr)
+	}
+	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
+		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": fmt.Sprint(owner.port),
+	})
+	if err := p.wait(t, 10*time.Second); err != nil {
+		t.Fatalf("duplicate API exit = %v, want success: %s", err, p.out)
+	}
+	if !strings.Contains(p.out.String(), "another instance owns this data directory; exiting") {
+		t.Fatalf("duplicate API log: %s", p.out)
+	}
+}
+
+func TestDataDirLockStopsSecondAPIOnAnotherPort(t *testing.T) {
+	dataDir := t.TempDir()
+	startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})
+	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
+		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": fmt.Sprint(freePort(t)),
+	})
+	if err := p.wait(t, 10*time.Second); err != nil {
+		t.Fatalf("second API exit = %v, want success: %s", err, p.out)
+	}
+	if !strings.Contains(p.out.String(), "another instance owns this data directory; exiting") {
+		t.Fatalf("second API log: %s", p.out)
+	}
+}
+
+func TestForeignPortHolderIsFatalDespiteOwnedDataDir(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"status":"ok","service":"api-go"}`))
+	}))
+	defer srv.Close()
+	_, port, _ := net.SplitHostPort(strings.TrimPrefix(srv.URL, "http://"))
+	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
+		"XMUSTARD_DATA_DIR": t.TempDir(), "XMUSTARD_API_PORT": port,
+	})
+	if err := p.wait(t, 10*time.Second); err == nil {
+		t.Fatalf("API exited successfully while an unrelated listener answered xMustard health on port %s: %s", port, p.out)
+	}
+}
 
 // daemonEnv is the environment a fixture API runs with: the caller's, minus every
 // xMustard setting and socket-activation variable, plus env.

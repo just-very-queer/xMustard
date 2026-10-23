@@ -55,7 +55,8 @@ func adoptActivatedSocket(cfg *serverConfig) (net.Listener, error) {
 	return ln, nil
 }
 
-// listen returns the activated socket, or binds cfg's address.
+// listen returns the activated socket, or binds cfg's address. The data-directory lock
+// is the sole duplicate-instance authority; a bind conflict here is a foreign listener.
 func listen(cfg serverConfig, activated net.Listener) (net.Listener, error) {
 	if activated != nil {
 		return activated, nil
@@ -63,16 +64,23 @@ func listen(cfg serverConfig, activated net.Listener) (net.Listener, error) {
 	return net.Listen("tcp", cfg.addr())
 }
 
-// checkStoreAtStart runs the governance store's startup check and logs the outcome.
-func checkStoreAtStart(ctx context.Context) {
-	h := workspaceops.CheckMemoryStore(ctx, dataDir())
+// storeStartLine formats the startup check result; restore is reserved for diagnosed faults.
+func storeStartLine(h workspaceops.StoreHealth) string {
 	switch h.Status {
 	case workspaceops.StoreOK:
-		log.Printf("store: governance store ok (schema v%d; migrated and quick_check passed in %d ms)", h.SchemaVersion, h.CheckMS)
+		return fmt.Sprintf("store: governance store ok (schema v%d; migrated and quick_check passed in %d ms)", h.SchemaVersion, h.CheckMS)
 	case workspaceops.StoreNone:
-		log.Printf("store: no governance store yet; the first memory write creates it")
+		return "store: no governance store yet; the first memory write creates it"
+	case workspaceops.StoreInterrupted:
+		return "store: governance store check interrupted; it reruns on next start"
+	case workspaceops.StoreCorrupt, workspaceops.StoreSchemaTooNew, workspaceops.StoreSchemaDrift:
+		return fmt.Sprintf("store: governance store %s: %s; memory calls fail until a backup is restored (xmustard-ops store restore)", strings.ToUpper(h.Status), h.Detail)
 	default:
-		log.Printf("store: governance store %s: %s; memory calls fail until a backup is restored (xmustard-ops store restore)",
-			strings.ToUpper(h.Status), h.Detail)
+		return fmt.Sprintf("store: governance store %s: %s", strings.ToUpper(h.Status), h.Detail)
 	}
+}
+
+// checkStoreAtStart runs the governance store's startup check and logs the outcome.
+func checkStoreAtStart(ctx context.Context) {
+	log.Print(storeStartLine(workspaceops.CheckMemoryStore(ctx, dataDir())))
 }

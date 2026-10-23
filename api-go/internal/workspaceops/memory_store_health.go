@@ -29,6 +29,7 @@ const (
 	StoreSchemaTooNew = "schema_too_new" // a newer build migrated the file; this one refuses it
 	StoreSchemaDrift  = "schema_drift"
 	StoreError        = "error"
+	StoreInterrupted  = "interrupted"
 )
 
 // storeFaultStates classify a failed check.
@@ -91,6 +92,10 @@ func checkStore(ctx context.Context, dataDir string) StoreHealth {
 		}
 	}
 	h := StoreHealth{Status: StoreError, Detail: err.Error(), CheckMS: time.Since(start).Milliseconds()}
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		h.Status = StoreInterrupted
+		return h
+	}
 	for _, f := range storeFaultStates {
 		if errors.Is(err, f.err) {
 			h.Status = f.state

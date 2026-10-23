@@ -6,10 +6,62 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"xmustard/api-go/internal/mcpserver"
 )
+
+func TestInflightCancelAll(t *testing.T) {
+	registry := newInflight()
+	cancelled := make(chan struct{}, 2)
+	registry.add("one", func() { cancelled <- struct{}{} })
+	registry.add("two", func() { cancelled <- struct{}{} })
+	registry.cancelAll()
+	for range 2 {
+		select {
+		case <-cancelled:
+		case <-time.After(time.Second):
+			t.Fatal("cancelAll did not cancel every request")
+		}
+	}
+	registry.mu.Lock()
+	remaining := len(registry.m)
+	registry.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("in-flight requests remain: %d", remaining)
+	}
+}
+
+func TestWatchParentStaysIdleWhileParentLives(t *testing.T) {
+	called := make(chan struct{}, 1)
+	stop := make(chan struct{})
+	go watchParent(10, func() int { return 10 }, 10*time.Millisecond, stop, func() { called <- struct{}{} })
+	select {
+	case <-called:
+		close(stop)
+		t.Fatal("parent watcher fired while the parent remained alive")
+	case <-time.After(50 * time.Millisecond):
+	}
+	close(stop)
+}
+
+func TestWatchParentCallsShutdownWhenParentChanges(t *testing.T) {
+	called := make(chan struct{}, 1)
+	var ppid atomic.Int64
+	ppid.Store(10)
+	stop := make(chan struct{})
+	go watchParent(10, func() int { return int(ppid.Load()) }, time.Millisecond, stop, func() { called <- struct{}{} })
+	ppid.Store(11)
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		close(stop)
+		t.Fatal("parent watcher did not initiate shutdown")
+	}
+	close(stop)
+}
 
 // The shim answers initialize through the shared session: a client naming no version
 // keeps the legacy answer, a current client gets its version and the instructions.

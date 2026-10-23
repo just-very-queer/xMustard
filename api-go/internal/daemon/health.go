@@ -26,11 +26,17 @@ const probeInterval = 200 * time.Millisecond
 // Probe asks base once whether the xMustard API answers there. Something else
 // listening on the port is an error, not a healthy daemon.
 func Probe(ctx context.Context, base string) (Health, error) {
+	return ProbeWithClient(ctx, base, healthClient)
+}
+
+// ProbeWithClient applies Probe's bounded health-document validation using a caller's
+// transport, for example when an API is configured with TLS.
+func ProbeWithClient(ctx context.Context, base string, client *http.Client) (Health, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, base+"/api/health", nil)
 	if err != nil {
 		return Health{}, err
 	}
-	resp, err := healthClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		return Health{}, err
 	}

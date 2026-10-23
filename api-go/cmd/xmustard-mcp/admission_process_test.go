@@ -29,6 +29,213 @@ func buildShim(t *testing.T) string {
 // Audit Go #5 (MCP calls): the stdio reader started one goroutine per request with no
 // admission limit. Beyond XMUSTARD_MCP_MAX_INFLIGHT outstanding calls, the shim must
 // answer at once with a protocol-correct JSON-RPC overload error.
+// TestShimParentHelper starts a shim on inherited, independently-owned pipes and
+// stays alive until the parent-death fixture terminates it.
+func TestShimParentHelper(t *testing.T) {
+	if os.Getenv("XMUSTARD_SHIM_PARENT_HELPER") != "1" {
+		return
+	}
+	stdin := os.Stdin
+	stdout := os.NewFile(3, "shim-stdout")
+	shimPath := os.Getenv("XMUSTARD_SHIM_PATH")
+	var cmd *exec.Cmd
+	if os.Getenv("XMUSTARD_SHIM_START_DELAY") == "1" {
+		cmd = exec.Command("/bin/sh", "-c", `sleep 0.2; exec "$1"`, "sh", shimPath)
+	} else {
+		cmd = exec.Command(shimPath)
+	}
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = stdin, stdout, os.Stderr
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	fmt.Println(cmd.Process.Pid)
+	if os.Getenv("XMUSTARD_SHIM_PARENT_EXIT_IMMEDIATELY") == "1" {
+		return
+	}
+	time.Sleep(time.Hour)
+}
+
+// A shim must exit when its client dies even if another process keeps stdin open.
+func TestShimExitsWhenParentDiesWhileStdinHeld(t *testing.T) {
+	shim := buildShim(t)
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childOutR, childOutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childOutR.Close()
+	defer childOutW.Close() // keep the shim's stdout pipe open after its helper exits
+	cmd := exec.Command(helper, "-test.run=^TestShimParentHelper$")
+	cmd.ExtraFiles = []*os.File{childOutW}
+	cmd.Env = append(os.Environ(), "XMUSTARD_SHIM_PARENT_HELPER=1", "XMUSTARD_SHIM_PATH="+shim,
+		"XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
+	stdinR, stdin, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdin = stdinR
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
+	_ = stdinR.Close()
+	var child *os.Process
+	defer func() {
+		_ = stdin.Close()
+		if child != nil {
+			_ = child.Kill()
+		}
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+	}()
+	var pid int
+	if _, err := fmt.Fscan(stdout, &pid); err != nil {
+		t.Fatalf("helper did not report shim pid: %v", err)
+	}
+	child, err = os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := make(chan string, 4)
+	go func() {
+		scanner := bufio.NewScanner(childOutR)
+		for scanner.Scan() {
+			lines <- scanner.Text()
+		}
+	}()
+	if _, err := fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case line := <-lines:
+		var resp map[string]any
+		if err := json.Unmarshal([]byte(line), &resp); err != nil || resp["id"] != float64(1) {
+			t.Fatalf("shim readiness response %q: %v", line, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("shim did not become ready before parent exit")
+	}
+	if err := cmd.Process.Kill(); err != nil {
+		t.Fatal(err)
+	}
+	_ = cmd.Wait()
+	if !waitForProcessExit(pid, 10*time.Second) {
+		t.Fatal("shim remained alive after its parent died; inherited pipes stayed open")
+	}
+}
+
+func waitForProcessExit(pid int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		state, err := exec.Command("ps", "-o", "stat=", "-p", strconv.Itoa(pid)).Output()
+		stateText := strings.TrimSpace(string(state))
+		if err != nil || stateText == "" || strings.HasPrefix(stateText, "Z") {
+			return true
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return false
+}
+
+func TestShimExitsWhenLauncherDiesBeforeWatcherStarts(t *testing.T) {
+	shim := buildShim(t)
+	helper, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	childOutR, childOutW, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer childOutR.Close()
+	defer childOutW.Close()
+	cmd := exec.Command(helper, "-test.run=^TestShimParentHelper$")
+	cmd.ExtraFiles = []*os.File{childOutW}
+	cmd.Env = append(os.Environ(), "XMUSTARD_SHIM_PARENT_HELPER=1", "XMUSTARD_SHIM_PATH="+shim,
+		"XMUSTARD_SHIM_PARENT_EXIT_IMMEDIATELY=1", "XMUSTARD_SHIM_START_DELAY=1",
+		"XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
+	stdinR, stdin, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd.Stdin = stdinR
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		_ = stdinR.Close()
+		_ = stdin.Close()
+		t.Fatal(err)
+	}
+	_ = stdinR.Close()
+	var pid int
+	if _, err := fmt.Fscan(stdout, &pid); err != nil {
+		_ = cmd.Process.Kill()
+		_ = cmd.Wait()
+		t.Fatalf("launcher did not report child pid: %v", err)
+	}
+	child, err := os.FindProcess(pid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = stdin.Close(); _ = child.Kill(); _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("launcher exit: %v", err)
+	}
+	if !waitForProcessExit(pid, 10*time.Second) {
+		t.Fatal("shim did not exit after starting already orphaned")
+	}
+}
+
+// EOF must cancel an in-flight backend request rather than waiting for its HTTP timeout.
+func TestShimExitsPromptlyOnEOFWithInflightCall(t *testing.T) {
+	started := make(chan struct{})
+	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		close(started)
+		<-r.Context().Done()
+	}))
+	defer api.Close()
+
+	cmd := exec.Command(buildShim(t))
+	cmd.Env = append(os.Environ(), "XMUSTARD_API_BASE="+api.URL, "XMUSTARD_MCP_STANDING_MEMORY=0", "XMUSTARD_MCP_AUTO_REGISTER=0")
+	stdin, err := cmd.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	_, _ = fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`)
+	_, _ = fmt.Fprintln(stdin, `{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"recall","arguments":{"workspace_id":"ws","q":"probe query"}}}`)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("recall did not reach blocked API")
+	}
+	_ = stdin.Close()
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("shim did not exit within 3s after EOF")
+	}
+}
+
 func TestShimRefusesCallsBeyondInflightLimit(t *testing.T) {
 	release := make(chan struct{})
 	api := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
