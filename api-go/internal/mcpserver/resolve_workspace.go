@@ -183,7 +183,8 @@ func (e fatalError) Unwrap() error { return e.error }
 
 func isFatal(err error) bool {
 	var f fatalError
-	return errors.As(err, &f) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	var authErr *authRefusalError
+	return errors.As(err, &f) || errors.As(err, &authErr) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 // byPathSignal maps a filesystem path (a root, the cwd, or an absolute path argument)
@@ -297,6 +298,9 @@ func (s *Session) register(ctx context.Context, repo string) error {
 		return fatalOn(fmt.Errorf("registering git repository %s: %w", repo, budget.ErrOverloaded))
 	}
 	if resp.Status >= 400 {
+		if isAuthFailure(resp.Status, resp.Body) {
+			return &authRefusalError{status: resp.Status, body: resp.Body}
+		}
 		// the API's message names the rule that refused it (a non-admin token
 		// registers only under the operator's XMUSTARD_REGISTER_ROOTS)
 		return fmt.Errorf("git repository %s is not registered and the API refused to register it (%s: %s)", repo, statusText(resp.Status), clip(apiErrorText(resp.Body), 200))
@@ -332,6 +336,9 @@ func (s *Session) listWorkspaces(ctx context.Context, refresh bool) (list []regi
 		return nil, false, fatalOn(fmt.Errorf("listing workspaces: %w", budget.ErrOverloaded))
 	}
 	if resp.Status != http.StatusOK {
+		if isAuthFailure(resp.Status, resp.Body) {
+			return nil, false, &authRefusalError{status: resp.Status, body: resp.Body}
+		}
 		return nil, false, fmt.Errorf("listing workspaces failed (%s: %s)", statusText(resp.Status), clip(resp.Body, 200))
 	}
 	if err := json.Unmarshal([]byte(resp.Body), &list); err != nil {

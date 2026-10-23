@@ -43,7 +43,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a request waits for a refusing API to come back (a daemon restart).
 const RESTART_GRACE: Duration = Duration::from_secs(10);
 const THREAD_STACK: usize = 256 << 10;
-const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Mint an agent token with `xmustard-api mint-token <id> agent`, set XMUSTARD_API_TOKEN for this client, and restart it. If the token is valid, check its role.";
+const AUTH_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Rotate the existing principal with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. Rotation preserves its role, workspace scope, identity, and lifetime policy.";
+const POLICY_FAILURE_MESSAGE: &str = "xMustard grounding is unavailable: the API refused this request because of its deployment policy. Check the API's allowed-host and route configuration; token rotation will not fix this refusal.";
 
 fn main() {
     let cfg = match Config::from_args(env::args().skip(1), |k| env::var(k).ok()) {
@@ -372,7 +373,9 @@ fn deliver(r: &mut Response, out: &Output, id: Option<&str>) {
         emit(out, &body);
     } else if let (Some(id), true) = (id, r.status >= 300) {
         let message = match r.status {
-            401 | 403 => AUTH_FAILURE_MESSAGE,
+            401 => AUTH_FAILURE_MESSAGE,
+            403 if is_auth_refusal(&body) => AUTH_FAILURE_MESSAGE,
+            403 => POLICY_FAILURE_MESSAGE,
             status => {
                 return emit(
                     out,
@@ -386,6 +389,16 @@ fn deliver(r: &mut Response, out: &Output, id: Option<&str>) {
         };
         emit(out, &rpc_error(id, -32603, message));
     }
+}
+
+fn is_auth_refusal(body: &str) -> bool {
+    [
+        r#""reason":"missing_role""#,
+        r#""reason":"presence_only_token""#,
+        r#""refusal":"token_scope""#,
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
 }
 
 fn rpc_error(id: &str, code: i32, message: &str) -> String {
@@ -757,12 +770,15 @@ mod tests {
     #[test]
     fn auth_http_refusals_name_the_grounding_repair_command() {
         for status in [401, 403] {
+            let body = if status == 401 {
+                br#"{"error":"authentication required"}"#.to_vec()
+            } else {
+                br#"{"reason":"missing_role","missing_role":"proposer"}"#.to_vec()
+            };
             let mut response = Response {
                 status,
                 headers: vec![("content-type".into(), "application/json".into())],
-                body: Box::new(io::Cursor::new(
-                    br#"{"error":"authentication required"}"#.to_vec(),
-                )),
+                body: Box::new(io::Cursor::new(body)),
             };
             let sink = Sink::default();
             let out: Output = Arc::new(Mutex::new(Box::new(sink.clone())));
@@ -773,7 +789,7 @@ mod tests {
                 "{status}: {answer}"
             );
             assert!(
-                answer.contains("xmustard-api mint-token"),
+                answer.contains("xmustard-api rotate-token"),
                 "{status}: {answer}"
             );
             assert!(answer.contains("XMUSTARD_API_TOKEN"), "{status}: {answer}");
@@ -782,6 +798,22 @@ mod tests {
                 "{status}: {answer}"
             );
         }
+    }
+
+    #[test]
+    fn policy_http_403_does_not_recommend_token_rotation() {
+        let mut response = Response {
+            status: 403,
+            headers: vec![("content-type".into(), "application/json".into())],
+            body: Box::new(io::Cursor::new(br#"{"error":"host_not_allowed"}"#.to_vec())),
+        };
+        let sink = Sink::default();
+        let out: Output = Arc::new(Mutex::new(Box::new(sink.clone())));
+        deliver(&mut response, &out, Some("9"));
+        let answer = lines(&sink).join("\n");
+        assert!(answer.contains("deployment policy"), "{answer}");
+        assert!(answer.contains("allowed-host"), "{answer}");
+        assert!(!answer.contains("rotate-token"), "{answer}");
     }
 
     #[test]

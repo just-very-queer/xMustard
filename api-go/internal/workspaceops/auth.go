@@ -367,6 +367,53 @@ func MintToken(dataDir, id, role string) (string, error) {
 	return MintTokenTTL(dataDir, id, role, 0)
 }
 
+// RotateTokenPreservingClaims replaces the secret for an existing principal without
+// changing its role, workspace scope, identity, or lifetime policy. Expiring tokens
+// receive the same lifetime from rotation time; malformed lifetime metadata fails closed.
+func RotateTokenPreservingClaims(dataDir, id string) (string, error) {
+	id = strings.TrimSpace(id)
+	if err := validateSafeID("token", id); err != nil {
+		return "", fmt.Errorf("token id must be alphanumeric/._-: %w", err)
+	}
+	unlock, err := lockTokenStore(dataDir)
+	if err != nil {
+		return "", err
+	}
+	defer unlock()
+	recs, err := loadTokenRecords(dataDir)
+	if err != nil {
+		return "", err
+	}
+	for _, rec := range recs {
+		if rec.ID != id {
+			continue
+		}
+		ttl := 0
+		if rec.ExpiresAt != "" {
+			created, createdErr := time.Parse(time.RFC3339Nano, rec.CreatedAt)
+			expires, expiresErr := time.Parse(time.RFC3339Nano, rec.ExpiresAt)
+			if createdErr != nil || expiresErr != nil || !expires.After(created) {
+				return "", fmt.Errorf("token %q has invalid expiry metadata", id)
+			}
+			seconds := int(expires.Sub(created).Seconds())
+			if seconds < 1 {
+				seconds = 1
+			}
+			ttl = seconds
+		}
+		role := rec.Role
+		if err := validateMintInputs(&id, &role, ttl); err != nil {
+			return "", fmt.Errorf("token %q cannot be safely rotated: %w", id, err)
+		}
+		identity, err := (TokenIdentity{Owner: rec.Owner, Kind: rec.Kind, PresenceOnly: rec.PresenceOnly}).normalize(id)
+		if err != nil {
+			return "", fmt.Errorf("token %q has invalid identity claims: %w", id, err)
+		}
+		return mintTokenLocked(dataDir, rec.ID, role, ttl, slices.Clone(rec.Workspaces), identity)
+	}
+	return "", fmt.Errorf("token %q does not exist", id)
+}
+
 // MintTokenTTL generates a token for (id, role), stores its hash, and returns the
 // raw token once. Re-minting for an existing id replaces its token. ttlSeconds > 0
 // sets an expiry (enforced in ResolveToken); 0 means the token never expires.

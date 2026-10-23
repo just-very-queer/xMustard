@@ -1,6 +1,7 @@
 package workspaceops
 
 import (
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -74,6 +75,83 @@ func TestMintTokenValidation(t *testing.T) {
 	}
 	if _, err := MintToken(dir, "ok", "admin"); err != nil {
 		t.Fatalf("valid admin mint should succeed: %v", err)
+	}
+}
+
+func TestLegacyTokenFixtureSurvivesStoreUpdate(t *testing.T) {
+	dir := t.TempDir()
+	raw := "xmt_legacy-token-fixture"
+	fixture := []tokenRecord{{
+		ID: "legacy", Role: "agent", TokenSHA256: hashToken(raw), CreatedAt: nowUTC(),
+	}}
+	if err := writeJSON(tokensPath(dir), fixture); err != nil {
+		t.Fatal(err)
+	}
+	if got := ResolveToken(dir, raw); got == nil || got.ID != "legacy" || got.Owner != "legacy" {
+		t.Fatalf("legacy token fixture did not resolve with backward-compatible identity: %+v", got)
+	}
+	if _, err := MintToken(dir, "new-agent", "agent"); err != nil {
+		t.Fatalf("update token store: %v", err)
+	}
+	if got := ResolveToken(dir, raw); got == nil || got.ID != "legacy" || got.Owner != "legacy" {
+		t.Fatalf("legacy token was lost after a store update: %+v", got)
+	}
+}
+
+func TestRotateTokenPreservesPrincipalClaims(t *testing.T) {
+	serverDir := t.TempDir()
+	clientDir := t.TempDir()
+	old, err := MintIdentityToken(serverDir, "scoped", "proposer", 3600, []string{"workspace-a"}, TokenIdentity{
+		Owner: "service-owner", Kind: PrincipalAgent,
+	})
+	if err != nil {
+		t.Fatalf("mint scoped token: %v", err)
+	}
+	originalRecords, err := loadTokenRecords(serverDir)
+	if err != nil || len(originalRecords) != 1 {
+		t.Fatalf("read original claims: records=%+v err=%v", originalRecords, err)
+	}
+	originalRecords[0].CreatedAt = time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	originalRecords[0].ExpiresAt = time.Now().UTC().Add(-time.Hour).Format(time.RFC3339Nano)
+	if err := writeJSON(tokensPath(serverDir), originalRecords); err != nil {
+		t.Fatal(err)
+	}
+	before := originalRecords[0].principal()
+	if ResolveToken(serverDir, old) != nil {
+		t.Fatal("expired recovery fixture unexpectedly resolves")
+	}
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chdir(clientDir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(workingDir)
+	rotated, err := RotateTokenPreservingClaims(serverDir, "scoped")
+	if err != nil {
+		t.Fatalf("rotate from client working directory: %v", err)
+	}
+	if ResolveToken(serverDir, old) != nil {
+		t.Fatal("old secret still resolves after rotation")
+	}
+	after := ResolveToken(serverDir, rotated)
+	if after == nil || after.Role != before.Role || after.Owner != before.Owner || after.Kind != before.Kind ||
+		len(after.Workspaces) != 1 || after.Workspaces[0] != "workspace-a" || after.AllowsWorkspace("workspace-b") {
+		t.Fatalf("rotation broadened or changed principal claims: record=%+v after=%+v", originalRecords[0], after)
+	}
+	recs, err := loadTokenRecords(serverDir)
+	if err != nil || len(recs) != 1 || recs[0].ExpiresAt == "" {
+		t.Fatalf("rotation did not retain expiring lifetime policy: records=%+v err=%v", recs, err)
+	}
+	oldCreated, oldErr := time.Parse(time.RFC3339Nano, originalRecords[0].CreatedAt)
+	oldExpires, oldExpiresErr := time.Parse(time.RFC3339Nano, originalRecords[0].ExpiresAt)
+	newCreated, newErr := time.Parse(time.RFC3339Nano, recs[0].CreatedAt)
+	newExpires, newExpiresErr := time.Parse(time.RFC3339Nano, recs[0].ExpiresAt)
+	if oldErr != nil || oldExpiresErr != nil || newErr != nil || newExpiresErr != nil ||
+		oldExpires.Sub(oldCreated)-newExpires.Sub(newCreated) > time.Second ||
+		newExpires.Sub(newCreated)-oldExpires.Sub(oldCreated) > time.Second {
+		t.Fatalf("rotation changed token lifetime policy: old=%+v new=%+v", originalRecords[0], recs[0])
 	}
 }
 

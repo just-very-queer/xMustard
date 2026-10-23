@@ -168,7 +168,7 @@ func TestMCPHTTPPrincipalPerConnection(t *testing.T) {
 		client := &mcpHTTPClient{t: t, url: srv.URL + "/mcp", token: token}
 		code, out := client.post(map[string]any{"jsonrpc": "2.0", "id": 0, "method": "initialize"})
 		msg, _ := out["error"].(string)
-		if code != http.StatusUnauthorized || !strings.Contains(msg, "grounding is unavailable") || !strings.Contains(msg, "xmustard-api mint-token") || !strings.Contains(msg, "XMUSTARD_API_TOKEN") {
+		if code != http.StatusUnauthorized || !strings.Contains(msg, "grounding is unavailable") || !strings.Contains(msg, "xmustard-api rotate-token") || !strings.Contains(msg, "running-api-data-dir") || !strings.Contains(msg, "XMUSTARD_API_TOKEN") {
 			t.Errorf("%s token response: status=%d body=%v", name, code, out)
 		}
 		if token != "" && strings.Contains(fmt.Sprint(out), token) {

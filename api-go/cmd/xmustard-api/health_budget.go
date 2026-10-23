@@ -38,18 +38,11 @@ type publicBudget struct {
 	Detail           string `json:"detail"`
 }
 
-// healthResponse is the /api/health body. Health stays public for liveness probes. The
-// full view (the budget block, the live pool and child counters, and mcp_usage) shows host-wide
-// activity: captures, hashed bytes, spawns, the owned tree and live external processes,
-// the stdio shims on the host, the heavy-slot owner and queue, and the worker's pid and
-// memory. Each uncached call also samples the process tree. So while authentication is
-// enforced (XMUSTARD_AUTH=required, or auto with credentials minted, as on every
-// non-loopback bind) only an operator sees it: an admin or other non-reader token with
-// no workspace scope. Everyone else (no token, a reader-only token, or a
-// workspace-scoped token of any role) sees the static limits, and nothing is sampled.
+// healthResponse keeps liveness public. Its auth block exposes no credential values; the
+// full budget view exposes host-wide activity and is limited to unscoped operators.
 func healthResponse(r *http.Request) map[string]any {
 	full, detail := healthBudgetView(r)
-	body := map[string]any{"status": "ok", "service": "api-go"}
+	body := map[string]any{"status": "ok", "service": "api-go", "auth": healthAuthState()}
 	// the governance store's startup check (WS-58), once the daemon ran it
 	store := workspaceops.MemoryStoreHealth(dataDir())
 	if !full {
@@ -72,6 +65,16 @@ func healthResponse(r *http.Request) map[string]any {
 	body["mcp_usage"] = mcpserver.Usage()
 	body["hook_usage"] = hookUsage() // the Claude Code hook service (WS-23)
 	return body
+}
+
+func healthAuthState() map[string]any {
+	mode := strings.ToLower(strings.TrimSpace(envDefault("XMUSTARD_AUTH", "auto")))
+	configured := workspaceops.HasAuthConfigured(dataDir())
+	return map[string]any{
+		"mode":                   mode,
+		"credentials_configured": configured,
+		"required":               mode == "required" || (mode != "off" && configured),
+	}
 }
 
 // healthBudgetView applies the auth middleware's rule (enforce when mode is required or

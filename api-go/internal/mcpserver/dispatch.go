@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
+	"xmustard/api-go/internal/workspaceops"
 )
 
 // callTool handles tools/call. A malformed request or an unknown tool is a protocol
@@ -172,6 +173,10 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 		if errors.Is(err, budget.ErrOverloaded) {
 			return nil, OverloadError(err)
 		}
+		var authErr *authRefusalError
+		if errors.As(err, &authErr) {
+			return TextResult(authFailureMessage(authErr.status, authErr.body), true), nil
+		}
 		return TextResult("xmustard: "+err.Error(), true), nil
 	}
 	args["workspace_id"] = ws.ID
@@ -215,7 +220,16 @@ func (s *Session) runTool(ctx context.Context, t *Tool, args map[string]string, 
 		return nil, OverloadError(budget.ErrOverloaded)
 	}
 	if isAuthFailure(resp.Status, resp.Body) {
-		return TextResult(authFailureMessage(resp.Status), true), nil
+		return TextResult(authFailureMessage(resp.Status, resp.Body), true), nil
+	}
+	if resp.Status == http.StatusOK && resp.Header.Get(DeliveryHeader) == DeliveryVersion {
+		var envelope struct {
+			Status     int    `json:"status"`
+			Projection string `json:"projection"`
+		}
+		if json.Unmarshal([]byte(resp.Body), &envelope) == nil && isAuthFailure(envelope.Status, envelope.Projection) {
+			return TextResult(authFailureMessage(envelope.Status, envelope.Projection), true), nil
+		}
 	}
 	var res map[string]any
 	if d := s.srv.opts.Delivery; d != nil {
@@ -251,22 +265,53 @@ func isAuthFailure(status int, body string) bool {
 	if status != http.StatusForbidden {
 		return false
 	}
-	var refusal struct {
-		Reason      string `json:"reason"`
-		MissingRole string `json:"missing_role"`
-		Refusal     string `json:"refusal"`
-		Error       string `json:"error"`
-	}
-	if err := json.Unmarshal([]byte(body), &refusal); err != nil {
-		return false
-	}
-	return refusal.MissingRole != "" || refusal.Reason == "missing_role" || refusal.Reason == "presence_only_token" ||
-		refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace ")
+	refusal, ok := parseAuthRefusal(body)
+	return ok && (refusal.MissingRole != "" || refusal.Reason == "missing_role" || refusal.Reason == "presence_only_token" ||
+		refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace "))
 }
 
-func authFailureMessage(status int) string {
-	return fmt.Sprintf("xmustard authentication or authorization failed (HTTP %d); grounding is unavailable. For a missing or expired token, run `xmustard-api mint-token <id> agent`, update XMUSTARD_API_TOKEN for this client, and restart it. For HTTP 403, also check that the token has the required role.", status)
+type authRefusal struct {
+	Reason      string `json:"reason"`
+	MissingRole string `json:"missing_role"`
+	Refusal     string `json:"refusal"`
+	Error       string `json:"error"`
 }
+
+func parseAuthRefusal(body string) (authRefusal, bool) {
+	var refusal authRefusal
+	if err := json.Unmarshal([]byte(body), &refusal); err != nil {
+		return authRefusal{}, false
+	}
+	return refusal, true
+}
+
+func authFailureMessage(status int, body string) string {
+	if status == http.StatusForbidden {
+		if refusal, ok := parseAuthRefusal(body); ok {
+			if refusal.MissingRole != "" {
+				if role, err := workspaceops.ParseRoleSpec(refusal.MissingRole); err == nil {
+					return fmt.Sprintf("xMustard grounding is unavailable: this token is missing the %q role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", role, tokenRotationCommand)
+				}
+			}
+			switch {
+			case refusal.Reason == "missing_role":
+				return fmt.Sprintf("xMustard grounding is unavailable: this token lacks a required role. Check the principal's configured role without broadening workspace scope or lifetime. If its secret is also expired, rotate it with %s; rotation does not change the role.", tokenRotationCommand)
+			case refusal.Refusal == "token_scope" || strings.HasPrefix(refusal.Error, "token not scoped to workspace "):
+				return fmt.Sprintf("xMustard grounding is unavailable: this token is not scoped to the requested workspace. Use a principal authorized for that workspace; do not replace it with an unrestricted token. If its secret is also expired, rotate it with %s; rotation preserves the current workspace scope.", tokenRotationCommand)
+			}
+		}
+	}
+	return fmt.Sprintf("xMustard grounding is unavailable: authentication failed (HTTP %d). For a missing or expired token, rotate its existing principal with %s, then update XMUSTARD_API_TOKEN for this client and restart it. This preserves the principal's role, workspace scope, identity, and lifetime policy. For authorization refusals, check the token's role and workspace scope.", status, tokenRotationCommand)
+}
+
+const tokenRotationCommand = "`xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`"
+
+type authRefusalError struct {
+	status int
+	body   string
+}
+
+func (e *authRefusalError) Error() string { return authFailureMessage(e.status, e.body) }
 
 // finish adds what every result carries: the workspace echo and any normalizations
 // in _meta; a one-line text echo the first time an implicitly resolved workspace is

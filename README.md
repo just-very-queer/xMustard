@@ -202,11 +202,11 @@ stdio bridge. `xmustard-ops mcp-config --root "$PWD" [--transport http|relay] [-
 [--mode readonly]` prints a ready `mcpServers` entry for either. The entry refers to
 `${XMUSTARD_API_TOKEN}` and never contains the token itself. The workspace id comes from the
 checkout's absolute path, so generate an entry per checkout. If an MCP transport or tool call reports
-an authentication error, grounding is unavailable until the client has a valid token. The HTTP
-endpoint returns an actionable 401; the stdio relay converts transport-level 401/403 refusals to a
-JSON-RPC error with the same recovery guidance. Mint one with
-`xmustard-api mint-token <id> agent`, update the `XMUSTARD_API_TOKEN` value in that client's
-environment, and restart it. Never paste a token into a config file shared with other clients.
+an authentication error, grounding is unavailable until the client can authenticate and is authorized. Rotate
+its existing principal with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, where the
+argument is the API process's configured data directory as an absolute path (not the client's working directory). Update that
+client's `XMUSTARD_API_TOKEN` and restart it. Rotation preserves role, workspace scope, identity, and
+lifetime policy. Never paste a token into a config file shared with other clients.
 The examples below use `$WS` from
 step 4 of the Quickstart.
 

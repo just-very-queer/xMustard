@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
@@ -24,6 +25,20 @@ import (
 )
 
 func main() {
+	// Recovery rotates the stored secret without changing the principal's claims.
+	if len(os.Args) > 1 && os.Args[1] == "rotate-token" {
+		if len(os.Args) != 5 || os.Args[3] != "--data-dir" || !filepath.IsAbs(strings.TrimSpace(os.Args[4])) {
+			fmt.Fprintln(os.Stderr, "usage: xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>")
+			os.Exit(2)
+		}
+		raw, err := workspaceops.RotateTokenPreservingClaims(os.Args[4], os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		fmt.Println(raw)
+		return
+	}
 	// `xmustard-api mint-token <id> [role]` mints a bearer token (local file access,
 	// no server needed) — the bootstrap path for the first admin token.
 	if len(os.Args) > 1 && os.Args[1] == "mint-token" {
@@ -542,7 +557,7 @@ func writeOverloaded(w http.ResponseWriter) {
 	writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": budget.ErrOverloaded.Error(), "overloaded": true})
 }
 
-const mcpAuthFailureMessage = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Mint an agent token with `xmustard-api mint-token <id> agent`, set XMUSTARD_API_TOKEN for this client, and restart it. If the token is valid, check its role."
+const mcpAuthFailureMessage = "xMustard grounding is unavailable: this client could not authenticate or is not authorized. Rotate the existing principal with `xmustard-api rotate-token <id> --data-dir <absolute-running-api-data-dir>`, update XMUSTARD_API_TOKEN for this client, and restart it. Rotation preserves its role, workspace scope, identity, and lifetime policy; authorization refusals require checking the role and workspace scope."
 
 func authMiddleware(dataDir, mode string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

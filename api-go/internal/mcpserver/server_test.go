@@ -1347,11 +1347,62 @@ func TestToolAuthFailuresGiveActionableGroundingError(t *testing.T) {
 			res, rerr := call(t, s, "ground", map[string]any{"workspace_id": "ws"})
 			message := text(res)
 			if rerr != nil || res["isError"] != true || !strings.Contains(message, "grounding is unavailable") ||
-				!strings.Contains(message, "xmustard-api mint-token") || !strings.Contains(message, "XMUSTARD_API_TOKEN") ||
 				strings.Contains(message, "private api refusal") {
 				t.Fatalf("auth refusal should be a safe, actionable tool error, got %v %v", res, rerr)
 			}
+			if tc.status == http.StatusUnauthorized &&
+				(!strings.Contains(message, "xmustard-api rotate-token") || !strings.Contains(message, "running-api-data-dir") || !strings.Contains(message, "XMUSTARD_API_TOKEN")) {
+				t.Fatalf("401 should name safe recovery: %s", message)
+			}
+			if tc.status == http.StatusForbidden && (!strings.Contains(message, `"proposer" role`) || !strings.Contains(message, "rotate-token") || !strings.Contains(message, "absolute-running-api-data-dir")) {
+				t.Fatalf("missing-role refusal should preserve required role: %s", message)
+			}
 		})
+	}
+
+	scopeAPI := &fakeAPI{handle: func(Request) *APIResponse {
+		return &APIResponse{Status: http.StatusForbidden, Body: `{"error":"token not scoped to workspace ws-b"}`}
+	}}
+	scopeSession := newSession(t, scopeAPI, Options{}, nil, "2025-06-18")
+	scopeResult, scopeErr := call(t, scopeSession, "ground", map[string]any{"workspace_id": "ws-b"})
+	if scopeErr != nil || !strings.Contains(text(scopeResult), "not scoped to the requested workspace") ||
+		!strings.Contains(text(scopeResult), "rotate-token") || strings.Contains(text(scopeResult), "private api refusal") {
+		t.Fatalf("scope refusal should give safe, scope-specific guidance: %v %v", scopeResult, scopeErr)
+	}
+	unsafeDetail := authFailureMessage(http.StatusForbidden, `{"reason":"missing_role","missing_role":"private api refusal"}`)
+	if !strings.Contains(unsafeDetail, "lacks a required role") || strings.Contains(unsafeDetail, "private api refusal") {
+		t.Fatalf("unallowlisted denial detail must not be echoed: %s", unsafeDetail)
+	}
+}
+
+func TestEvidenceEnvelopeAuthRefusalIsNormalized(t *testing.T) {
+	api := &fakeAPI{handle: func(Request) *APIResponse {
+		return &APIResponse{
+			Status: http.StatusOK,
+			Header: http.Header{DeliveryHeader: []string{DeliveryVersion}},
+			Body:   `{"tool":"recall","status":403,"is_error":true,"projection":"{\"error\":\"token not scoped to workspace ws-b\"}"}`,
+		}
+	}}
+	delivery := NewEvidence(api, nil)
+	s := newSession(t, api, Options{Delivery: delivery}, nil, "2025-06-18")
+	res, rerr := call(t, s, "recall", map[string]any{"workspace_id": "ws-b", "entry_id": "entry-a", "history": true})
+	message := text(res)
+	if rerr != nil || res["isError"] != true || !strings.Contains(message, "not scoped to the requested workspace") ||
+		strings.Contains(message, "token not scoped to workspace ws-b") {
+		t.Fatalf("embedded evidence auth refusal should be normalized safely: %v %v", res, rerr)
+	}
+}
+
+func TestWorkspaceResolutionAuthFailureIsActionableWithoutWorkspaceID(t *testing.T) {
+	repo := tempRepo(t)
+	api := &fakeAPI{handle: func(Request) *APIResponse {
+		return &APIResponse{Status: http.StatusUnauthorized, Body: `{"error":"authentication required"}`}
+	}}
+	s := newSession(t, api, Options{Cwd: repo}, nil, "2025-06-18")
+	res, rerr := call(t, s, "ground", map[string]any{})
+	message := text(res)
+	if rerr != nil || res["isError"] != true || !strings.Contains(message, "rotate-token") || !strings.Contains(message, "grounding is unavailable") {
+		t.Fatalf("workspace discovery auth refusal should be actionable: %v %v", res, rerr)
 	}
 }
 
