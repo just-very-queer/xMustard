@@ -490,12 +490,37 @@ func TestTheBatchedOwnerGuardCoversTheLastPartialPageOfAMultiPageQueue(t *testin
 	dir, ws := ownerPolicyDir(t, DistinctOwner), "ws"
 	h := humanApprover("bob", "bob")
 
-	// enough rows that the queue needs a second page, so the tail is a partial one
-	for i := 0; i < storeListPage; i++ {
-		proposeAs(t, dir, ws, ContextActor{ID: "author-" + strconv.Itoa(i)}, "the build uses make")
+	// Keep the full two-page queue, but insert its pending rows in one transaction. Remember
+	// rechecks every earlier proposal for duplicates, work this test does not exercise.
+	ctx := context.Background()
+	var tail govstore.Entry
+	if err := memoryUpdate(ctx, dir, ws, func(tx govstore.Tx) error {
+		for i := 0; i <= storeListPage; i++ {
+			author := "author-" + strconv.Itoa(i)
+			content := "the build uses make"
+			if i == storeListPage {
+				author = "bob-bot"
+				content = "bob's own, in the last page"
+			}
+			actor := govstore.Actor{Principal: author}
+			if author == "bob-bot" {
+				actor.Owner = "bob"
+			}
+			entry, err := tx.InsertEntry(ctx, govstore.NewEntry{
+				ID: fmt.Sprintf("ctx_owner_queue_%04d", i), WorkspaceID: ws, Title: "t",
+				Content: content, Permission: "readwrite", RequiredVerifications: 2,
+			}, actor)
+			if err != nil {
+				return err
+			}
+			if i == storeListPage {
+				tail = entry
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("insert owner-guard queue fixture: %v", err)
 	}
-	// the tail: bob owns its author, so only the owner-distinct guard can refuse it
-	tail := proposeAs(t, dir, ws, ContextActor{ID: "bob-bot", Owner: "bob"}, "bob's own, in the last page")
 
 	q, err := HumanApprovalQueue(dir, ws, h, 0, 0)
 	if err != nil {
