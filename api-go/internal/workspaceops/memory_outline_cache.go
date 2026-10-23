@@ -94,8 +94,9 @@ func markOutlineFileNow(root, rel string) (fileMark, bool) {
 	if !ok {
 		return fileMark{}, false
 	}
+	mark := fileMarkFromFile(f, info)
 	f.Close()
-	return fileMarkFromInfo(info), true
+	return mark, true
 }
 
 // readOutlineFile reads rel through the confined walk and returns its identity and its
@@ -118,7 +119,7 @@ func readOutlineFile(root, rel string, limit int64) (fileMark, string, bool) {
 	if err != nil || n > limit {
 		return fileMark{}, "", false
 	}
-	return fileMarkFromInfo(info), b.String(), true
+	return fileMarkFromFile(f, info), b.String(), true
 }
 
 // openOutlineFile opens rel beneath root through the symlink-refusing walk and returns it

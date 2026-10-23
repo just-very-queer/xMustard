@@ -204,10 +204,9 @@ func TestTheHeldTotalIsExactAcrossAReplacement(t *testing.T) {
 	}
 }
 
-// The mark carries a real inode and ctime, not only size and mtime: os.FileInfo.Sys()
-// returns *syscall.Stat_t, so an assertion to another stat type silently degrades the
-// mark and an atomic same-size replacement with a preserved mtime keeps its identity.
-// The fields are asserted directly, so a mark that lost them fails here.
+// The mark carries a real inode and ctime, not only size and mtime: an atomic same-size
+// replacement with a preserved mtime must still change its identity. The fields are asserted
+// directly, so a mark that lost them fails here.
 func TestAMarkCarriesItsInodeAndCtime(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o644); err != nil {
