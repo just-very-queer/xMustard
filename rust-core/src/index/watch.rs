@@ -171,6 +171,9 @@ impl Layout {
     /// Classify an absolute event path.
     pub fn classify(&self, abs: &Path) -> Class {
         for dir in &self.git_dirs {
+            if abs == dir.join("info") {
+                return Class::IgnoreFile;
+            }
             if let Ok(rel) = abs.strip_prefix(dir) {
                 return git_class(&rel.to_string_lossy());
             }
@@ -1285,7 +1288,9 @@ fn optional_git_auxiliary_dir(layout: &Layout, dir: &Path) -> bool {
 }
 
 fn optional_watch_dir(layout: &Layout, dir: &Path) -> bool {
-    optional_worktree_dir(layout, dir) || optional_git_auxiliary_dir(layout, dir)
+    // A linked worktree's Git root may be below the common Git directory.
+    !layout.git_dirs.iter().any(|git_dir| git_dir == dir)
+        && (optional_worktree_dir(layout, dir) || optional_git_auxiliary_dir(layout, dir))
 }
 
 fn register_required_git_dirs<I, F>(dirs: I, mut add: F) -> Result<(), NativeError>
@@ -1990,6 +1995,90 @@ mod tests {
             !watcher.vouches_git(),
             "failed startup cannot vouch for Git"
         );
+    }
+
+    #[test]
+    fn vanished_linked_worktree_git_root_is_required() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root = temp.path().join("worktree");
+        let common = temp.path().join(".git");
+        let linked = common.join("worktrees/one");
+        std::fs::create_dir_all(&root).expect("worktree root");
+        std::fs::create_dir_all(&common).expect("common Git directory");
+        let layout = Layout {
+            root: root.clone(),
+            git_dirs: vec![linked.clone(), common],
+            ignored: Some(BTreeSet::new()),
+        };
+
+        let registration = register_native_dirs(
+            &layout,
+            MAX_WATCH_DIRS,
+            recursive_native(),
+            |path, _| {
+                if path == linked {
+                    Err(WatchAddError::Vanished)
+                } else {
+                    Ok(())
+                }
+            },
+        );
+        let (watcher, _root_rx) = Root::new(root, None, MAX_WATCH_DIRS);
+        *lock(&watcher.layout) = Arc::new(layout);
+        let now = Instant::now();
+        let mut inner = lock(&watcher.inner);
+        inner.establishing = false;
+        watcher.degrade(
+            &mut inner,
+            registration.expect_err("linked Git root must be required"),
+            now,
+        );
+        assert_eq!(inner.rewatch_at, Some(now + REWATCH_AFTER));
+        drop(inner);
+        watcher.publish();
+
+        assert_eq!(watcher.state(), WatcherState::Degraded);
+        assert!(!watcher.vouches_git(), "failed startup cannot vouch for Git");
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn replacing_git_info_reloads_ignore_layout() {
+        let temp = tempfile::tempdir().expect("a temp dir");
+        let root_path = temp.path().join("worktree");
+        std::fs::create_dir_all(&root_path).expect("worktree root");
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "-q", root_path.to_str().expect("UTF-8 temp path")])
+                .status()
+                .expect("run git init")
+                .success(),
+            "git init must succeed"
+        );
+        let git_dir = root_path.join(".git");
+        let info = git_dir.join("info");
+        let ignored_dir = root_path.join("ignored");
+        std::fs::create_dir_all(&ignored_dir).expect("ignored directory");
+        std::fs::write(ignored_dir.join("file.rs"), "source").expect("ignored file");
+        std::fs::write(info.join("exclude"), "ignored/\n").expect("old exclude");
+        let layout = observe_layout(&root_path);
+        assert!(layout.ignored("ignored/file.rs"));
+        let (root, _rx) = Root::new(root_path.clone(), None, MAX_WATCH_DIRS);
+        *lock(&root.layout) = Arc::new(layout);
+        std::fs::rename(&info, git_dir.join("info-old")).expect("move old info directory");
+        std::fs::create_dir_all(&info).expect("replacement info directory");
+        std::fs::write(info.join("exclude"), "").expect("replacement exclude");
+        let mut event = Event::new(EventKind::Modify(ModifyKind::Name(
+            notify::event::RenameMode::Both,
+        )));
+        event.paths.push(info);
+
+        root.on_event(Ok(event));
+
+        assert!(lock(&root.inner).reload_ignored);
+        root.tick(Instant::now());
+        assert!(!root.layout().ignored("ignored/file.rs"));
+        assert!(lock(&root.inner).watched.contains(&ignored_dir));
     }
 
     #[test]
