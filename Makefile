@@ -7,6 +7,12 @@
 PREFIX ?= /usr/local
 BINDIR := $(PREFIX)/bin
 
+# The Cursor hook client starts once per Cursor event, and D-08 holds its peak RSS to
+# 2 MiB. On Linux it links glibc statically (about 1.5 MiB instead of 2.4 on the box), so
+# no loader runs and no shared library is mapped. cargo rustc gives the flag to that one
+# binary, so the core and the relay build as before; macOS keeps the default.
+CURSOR_RUSTC_FLAGS := $(if $(filter Linux,$(shell uname -s)),-C target-feature=+crt-static)
+
 .PHONY: build install relay backend backend-platform go-api frontend go-api-build rust-core-check \
 	rust-core-scan migration-check dev build-ui scan check check-backend check-frontend \
 	check-rss-lines
@@ -14,7 +20,8 @@ BINDIR := $(PREFIX)/bin
 .PHONY: release release-sums
 
 build:
-	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay --bin xmustard-cursor
+	cd rust-core && cargo build --release --bin xmustard-core --bin xmustard-relay
+	cd rust-core && cargo rustc --release --bin xmustard-cursor -- $(CURSOR_RUSTC_FLAGS)
 	cd api-go && go build -o bin/xmustard-api ./cmd/xmustard-api
 	cd api-go && go build -o bin/xmustard-mcp ./cmd/xmustard-mcp
 	cd api-go && go build -o bin/xmustard-ops ./cmd/xmustard-ops
@@ -35,11 +42,12 @@ install: build
 relay:
 	cd rust-core && cargo build --release --bin xmustard-relay
 
-# Release archive for this host: `make release VERSION=v0.2.0`. It builds the Rust core
-# and relay with cargo --locked and the Go binaries with -trimpath and CGO off (static, so
-# the platform profile's PTY terminals, which need cgo, are unavailable in them), checks
-# that the built binaries start, and writes $(DIST)/xmustard-<version>-<os>-<arch>.tar.gz
-# (the five binaries and LICENSE) with its .sha256, then SHA256SUMS (release-sums). The
+# Release archive for this host: `make release VERSION=v0.2.0`. It builds the Rust core,
+# relay and Cursor hook client with cargo --locked (the client static on Linux, see
+# CURSOR_RUSTC_FLAGS) and the Go binaries with -trimpath and CGO off (static, so the
+# platform profile's PTY terminals, which need cgo, are unavailable in them), checks that
+# the built binaries start, and writes $(DIST)/xmustard-<version>-<os>-<arch>.tar.gz
+# (the seven binaries and LICENSE) with its .sha256, then SHA256SUMS (release-sums). The
 # tag workflow (.github/workflows/release.yml) runs it once per platform. RUSTFLAGS and
 # CFLAGS (for the C in tree-sitter and SQLite) are replaced so the binaries hold no
 # build-machine paths (the checkout becomes ., CARGO_HOME /cargo), and every archive entry
@@ -58,12 +66,15 @@ release:
 	rm -rf "$(RELEASE_DIR)" "$(RELEASE_DIR).tar" "$(RELEASE_DIR).tar.gz" "$(RELEASE_DIR).tar.gz.sha256"
 	mkdir -p "$(RELEASE_DIR)"
 	cd rust-core && cargo_home=$${CARGO_HOME:-$$HOME/.cargo} && \
-		RUSTFLAGS="--remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$$cargo_home=/cargo" \
-		CFLAGS="-ffile-prefix-map=$(CURDIR)=. -ffile-prefix-map=$$cargo_home=/cargo" \
-		cargo build --release --locked $(RUST_BINS:%=--bin %)
+		export RUSTFLAGS="--remap-path-prefix=$(CURDIR)=. --remap-path-prefix=$$cargo_home=/cargo" \
+		CFLAGS="-ffile-prefix-map=$(CURDIR)=. -ffile-prefix-map=$$cargo_home=/cargo" && \
+		cargo build --release --locked --bin xmustard-core --bin xmustard-relay && \
+		cargo rustc --release --locked --bin xmustard-cursor -- $(CURSOR_RUSTC_FLAGS)
 	cp $(RUST_BINS:%=rust-core/target/release/%) LICENSE "$(RELEASE_DIR)/"
 	cd api-go && CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$(RELEASE_DIR)/" $(GO_BINS:%=./cmd/%)
 	"$(RELEASE_DIR)/xmustard-core" 2>&1 | grep -q usage
+	"$(RELEASE_DIR)/xmustard-cursor" --help 2>&1 | grep -q usage
+	$(if $(CURSOR_RUSTC_FLAGS),h=$$(readelf -l "$(RELEASE_DIR)/xmustard-cursor") && ! echo "$$h" | grep -q interpreter)
 	printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | "$(RELEASE_DIR)/xmustard-mcp" | grep -q '"remember"'
 	cd "$(RELEASE_DIR)" && chmod 0755 . $(RUST_BINS) $(GO_BINS) && chmod 0644 LICENSE && \
 		TZ=UTC0 touch -t $(or $(SOURCE_DATE),197001010000.00) . $(RELEASE_FILES)

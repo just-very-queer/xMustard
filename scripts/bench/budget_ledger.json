@@ -15,7 +15,7 @@
    {"exe": ["xmustard-mcp"], "component": "mcp_access", "class": "owned", "note": "stdio Go shim; transitional until WS-13 serves MCP over HTTP"},
    {"exe": ["xmustard-relay"], "component": "mcp_access", "class": "owned"},
    {"exe": ["xmustard-hook"], "component": "hook_client", "class": "owned"},
-   {"exe": ["xmustard-cursor"], "component": "hook_client", "class": "owned", "note": "the Cursor command hook client (WS-40c): Cursor spawns it per event, so it is the hook client the gate counts"},
+   {"exe": ["xmustard-cursor"], "component": "hook_client", "class": "owned", "note": "the Cursor command hook client (WS-40c): Cursor spawns it per event, so it is the hook client the gate counts. Linked statically on Linux (Makefile CURSOR_RUSTC_FLAGS) to meet D-08: about 1.5 MiB peak RSS on the build box against the 2 MiB line (about 2.4 MiB dynamic)"},
    {"exe": ["xmustard-ops", "xmustard-eval"], "component": "ops_cli", "class": "owned"},
    {"exe": ["xmustard-core"], "argv1": ["serve"], "component": "rust_index_service", "class": "owned"},
    {"exe": ["xmustard-core"], "component": "rust_core_per_call", "class": "owned", "note": "per-call core children today; the heavy-slot worker after WS-02/WS-14"},
