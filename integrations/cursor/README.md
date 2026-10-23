@@ -15,9 +15,12 @@ make build
 install -m 0755 rust-core/target/release/xmustard-cursor ~/.local/bin/
 ```
 
-On Linux `make build` links the client statically, which keeps a run against the local
-daemon under D-08's 2 MiB peak RSS: about 1.5 MiB on the build box, against about 2.4 MiB
-dynamic, since no loader runs and no shared library is mapped. A daemon named by a hostname
+On Linux `make build` links the client statically, which lowers its baseline: with small
+events against the local daemon it peaks at about 1.5 MiB on the build box, against about
+2.4 MiB dynamic, since no loader runs and no shared library is mapped. The client still
+reads the whole event before connecting, so a large event (tool output of several MiB, up
+to the 8 MiB input limit) raises the peak with it and exceeds D-08's 2 MiB line; full
+compliance needs the event streamed rather than buffered. A daemon named by a hostname
 rather than a numeric address is resolved through glibc's NSS, which in a static binary
 loads the host's NSS modules (about 3.3 MiB measured, and it needs a host glibc compatible
 with the build host's); the default numeric loopback address never touches NSS.

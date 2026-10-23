@@ -207,7 +207,7 @@ formula to it.
 | `xmustard-mcp` | Go | Deprecated stdio shim, kept for compatibility |
 | `xmustard-ops` | Go | Local operator CLI: approvals, merge attestations, `mcp-config`, `setup` and `uninstall`, `daemon status\|restart\|stop`, `store backup\|check\|restore` |
 | `xmustard-hook` | Go | The Claude Code plugin's static hook client (about 3.5 MB, under 5 MiB RSS) |
-| `xmustard-cursor` | Rust | Cursor's command hook client, one process per event; std-only, and on Linux linked statically, which keeps its peak RSS under D-08's 2 MiB (about 1.5 MiB) |
+| `xmustard-cursor` | Rust | Cursor's command hook client, one process per event; std-only, and on Linux linked statically: small events peak at about 1.5 MiB against D-08's 2 MiB line (about 2.4 MiB dynamic); the client buffers the whole event, so a multi-MiB event still exceeds the line |
 
 `make build` builds all seven from source, and `make install PREFIX=/usr/local` copies
 them into `$(PREFIX)/bin` (`Makefile`). `xmustard-hook` ships in the release archive
