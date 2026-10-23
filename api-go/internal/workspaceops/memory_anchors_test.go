@@ -150,6 +150,9 @@ func allocated(fn func()) uint64 {
 // Quote placement reads nothing when the proposal quotes no code, never reads a file
 // over its cap, and reads the rest one at a time only until each block is placed.
 func TestQuoteAnchorsReadLazilyWithinBounds(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation makes the large-file allocation and time bounds non-representative")
+	}
 	root := t.TempDir()
 	var big []string
 	for i := range maxQuoteFiles {

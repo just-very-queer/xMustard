@@ -206,6 +206,9 @@ func writeGenerated(t *testing.T, w *Writer, g io.Reader, rng *rand.Rand, sample
 // live heap by no more than its fixed buffers (sampled throughout), and allocates a
 // bounded amount whatever the input size or its density of secrets.
 func TestWriterMemoryIsBounded(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation inflates the allocation measurement for the 32 MiB stream")
+	}
 	if testing.Short() {
 		t.Skip("streams 32 MiB")
 	}

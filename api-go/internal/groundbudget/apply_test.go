@@ -604,6 +604,9 @@ func pairedOf(t *testing.T, narrow, wide []byte, req Request) int64 {
 }
 
 func TestApplyDoesNotCopyTheResult(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation distorts the allocation measurement")
+	}
 	req := Request{MaxChars: DefaultMaxChars}
 	narrow := mustJSON(groundResult(2000, 20000, 50, 5))
 	wide := mustJSON(groundResult(2000, 20000, 50, 5, allocPadBytes))

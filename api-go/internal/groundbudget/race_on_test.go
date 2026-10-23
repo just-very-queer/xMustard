@@ -1,0 +1,5 @@
+//go:build race
+
+package groundbudget
+
+const raceEnabled = true

@@ -1380,6 +1380,9 @@ func TestAdversarialInputsAreLinear(t *testing.T) {
 // working memory does not grow with the input or its density of trigger
 // literals. Before, String on 16 MiB of "hf_" allocated about 836 MiB.
 func TestOneShotMemoryIsBounded(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation inflates allocation and runtime beyond this memory-bound test's scope")
+	}
 	if testing.Short() {
 		t.Skip("allocates 16 MiB inputs")
 	}

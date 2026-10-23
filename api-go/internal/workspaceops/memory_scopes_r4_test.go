@@ -432,19 +432,43 @@ func TestGroundDeltaNamesNoAnotherPrincipalsConfinedEntry(t *testing.T) {
 	}
 }
 
-// proposeAtRisk writes a PROMOTED entry that declares a path, then marks it stale,
-// which is the only way an entry reaches the at-risk state readAtRisk lists: MarkStale
-// records drift against a declared anchor, and an anchor only exists once the entry was
-// promoted with one. scope is "" for the caller's own rows, which are workspace-scoped
-// and therefore visible, and ScopePrivate for another principal's, which is what makes
-// a row unreadable rather than merely older.
+// proposeAtRisk seeds a promoted entry with a path anchor and marks it stale in one write.
+// These tests exercise the at-risk read, not proposal deduping or vote handling.
 func proposeAtRisk(t *testing.T, dir, ws, author, title, content, scope string) string {
 	t.Helper()
-	e := promoted(t, dir, ws, author, content, func(r *RememberRequest) {
-		r.ProposeContextRequest.Paths = []string{"srv.go"}
-		r.ProposeContextRequest.Title = title
-		r.ProposeContextRequest.Visibility = scope
-	})
-	markAtRisk(t, dir, ws, e.ID)
-	return e.ID
+	ctx := context.Background()
+	id := "ctx_risk_" + govstore.Digest(author + "\x00" + title + "\x00" + content)[:16]
+	actor := govstore.Actor{Principal: author}
+	if err := memoryUpdate(ctx, dir, ws, func(tx govstore.Tx) error {
+		entry, err := tx.InsertEntry(ctx, govstore.NewEntry{
+			ID: id, WorkspaceID: ws, Scope: scope, Title: title, Content: content, Permission: "readwrite",
+			Paths: []string{"srv.go"}, RequiredVerifications: 2,
+		}, actor)
+		if err != nil {
+			return err
+		}
+		if _, err := tx.RecordVote(ctx, govstore.VoteInput{EntryID: entry.ID, Revision: 1, Verdict: govstore.VerdictApprove},
+			govstore.Actor{Principal: "peer-1"}); err != nil {
+			return err
+		}
+		if _, err := tx.RecordVote(ctx, govstore.VoteInput{EntryID: entry.ID, Revision: 1, Verdict: govstore.VerdictApprove},
+			govstore.Actor{Principal: "peer-2"}); err != nil {
+			return err
+		}
+		if _, err := tx.SetPromotion(ctx, entry.ID, govstore.Promotion{
+			Status: govstore.StatusVerified, Promoted: true, VerificationMode: govstore.ModePeerVerified,
+		}, actor); err != nil {
+			return err
+		}
+		n, err := tx.MarkStale(ctx, entry.ID,
+			[]govstore.AnchorRef{{Kind: govstore.AnchorPath, Value: "srv.go"}}, "c0ffee1",
+			govstore.Actor{Principal: "drift-bot"})
+		if err == nil && n == 0 {
+			err = errNoDriftMarked
+		}
+		return err
+	}); err != nil {
+		t.Fatalf("seed at-risk entry %s: %v", id, err)
+	}
+	return id
 }

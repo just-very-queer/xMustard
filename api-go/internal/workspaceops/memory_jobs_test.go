@@ -386,14 +386,12 @@ func TestClusterSpansAPageBoundary(t *testing.T) {
 	dir := singleAgentDir(t)
 	ws := "wsJobs11"
 	// More entries than one pass reads, then the pair on one anchor, so the two members sit
-	// either side of the point where one pass stops and the next resumes.
+	// either side of the point where one pass stops and the next resumes. Construct the filler
+	// in one store transaction so race instrumentation does not pay a durable commit per row.
 	filler := consolidationPage*consolidationPages + 10
-	for i := 0; i < filler; i++ {
-		proposeOn(t, dir, ws, "a", fmt.Sprintf("filler %d", i), "an unrelated thing",
-			fmt.Sprintf("src/filler%04d.go", i))
-	}
-	proposeOn(t, dir, ws, "a", "left of the boundary", "left thing", "src/boundary.go")
-	proposeOn(t, dir, ws, "b", "right of the boundary", "right thing", "src/boundary.go")
+	addConsolidationFixtureEntries(t, dir, ws, filler)
+	addConsolidationFixtureEntry(t, dir, ws, "ctx_boundary_left", "a", "left of the boundary", "left thing", "src/boundary.go")
+	addConsolidationFixtureEntry(t, dir, ws, "ctx_boundary_right", "b", "right of the boundary", "right thing", "src/boundary.go")
 
 	// The pair must be joined by a pass, not merely present in the store: prepare repeatedly,
 	// as a workspace larger than one pass is consolidated over several, and require the pair
@@ -442,9 +440,7 @@ func TestCursorFollowsInsertionOrderNotIdOrder(t *testing.T) {
 	}
 	// And a pass over a store with more entries than one page records the cursor it reached,
 	// so the next pass resumes rather than re-reading the first page.
-	for i := 0; i < consolidationPage+5; i++ {
-		proposeOn(t, dir, ws, "a", fmt.Sprintf("entry %d", i), "a thing", fmt.Sprintf("src/e%04d.go", i))
-	}
+	addConsolidationFixtureEntries(t, dir, ws, consolidationPage+5)
 	runConsolidation(t, dir, ws, "worker-1")
 	w := readWatermark(t, dir, ws, "entries")
 	if cursorOf(w.ReflectedThrough) <= 0 {
@@ -582,6 +578,54 @@ func TestPreparedInstructionsAskTheAgentToJudge(t *testing.T) {
 }
 
 // --- fixture helpers -------------------------------------------------------------
+
+// addConsolidationFixtureEntries inserts promoted, unrelated memories in one transaction.
+// Keeping the full page-sized fixture while amortizing commits makes it practical under -race.
+func addConsolidationFixtureEntries(t *testing.T, dir, ws string, count int) {
+	t.Helper()
+	ctx := context.Background()
+	if err := memoryUpdate(ctx, dir, ws, func(tx govstore.Tx) error {
+		for i := range count {
+			id := fmt.Sprintf("ctx_filler%04d", i)
+			actor := govstore.Actor{Principal: "a"}
+			entry, err := tx.InsertEntry(ctx, govstore.NewEntry{
+				ID: id, WorkspaceID: ws, Title: fmt.Sprintf("filler %d", i), Content: "an unrelated thing",
+				Permission: "readwrite", Anchors: []govstore.AnchorInput{{Kind: govstore.AnchorPath,
+					Value: fmt.Sprintf("src/filler%04d.go", i)}},
+			}, actor)
+			if err != nil {
+				return err
+			}
+			if _, err := tx.SetPromotion(ctx, entry.ID, govstore.Promotion{
+				Status: govstore.StatusVerified, Promoted: true, VerificationMode: govstore.ModeSingleAgent,
+			}, actor); err != nil {
+				return err
+			}
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("insert consolidation fixtures: %v", err)
+	}
+}
+
+func addConsolidationFixtureEntry(t *testing.T, dir, ws, id, author, title, content, path string) {
+	t.Helper()
+	ctx := context.Background()
+	actor := govstore.Actor{Principal: author}
+	if err := memoryUpdate(ctx, dir, ws, func(tx govstore.Tx) error {
+		entry, err := tx.InsertEntry(ctx, govstore.NewEntry{ID: id, WorkspaceID: ws, Title: title,
+			Content: content, Permission: "readwrite", Anchors: []govstore.AnchorInput{{Kind: govstore.AnchorPath, Value: path}}}, actor)
+		if err != nil {
+			return err
+		}
+		_, err = tx.SetPromotion(ctx, entry.ID, govstore.Promotion{
+			Status: govstore.StatusVerified, Promoted: true, VerificationMode: govstore.ModeSingleAgent,
+		}, actor)
+		return err
+	}); err != nil {
+		t.Fatalf("insert consolidation fixture %s: %v", id, err)
+	}
+}
 
 // proposeOn proposes a memory with a declared path anchor, so the fixture holds a real
 // anchor row: an extracted path anchor only survives when the file exists in a repository

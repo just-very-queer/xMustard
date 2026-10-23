@@ -267,6 +267,9 @@ func TestEvidencePagesReuseIdentityUntilTheRepositoryChanges(t *testing.T) {
 
 // Acceptance: expanding a 16 MiB-class original no longer spawns a process per page.
 func TestExpanding16MiBOriginalSpawnsNoProcessPerPage(t *testing.T) {
+	if raceEnabled {
+		t.Skip("race instrumentation can outlast the identity-cache TTL during 249 page reads")
+	}
 	// the default 24 MiB transient pool caps a request-scoped core output at about
 	// 7 MiB (rustcore.coreStdoutCap); a 16 MiB-class search result needs a pool of
 	// about 52 MiB (see evidence.DefaultMaxOriginal). Only a core-backed read binds
