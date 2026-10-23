@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/govstore"
 	"xmustard/api-go/internal/workspaceops"
 )
@@ -44,7 +43,7 @@ func TestStoreStartLineAdvisesRestoreOnlyOnFault(t *testing.T) {
 	}
 }
 
-func TestDuplicateAPIExecutableReturnsDistinctExitStatus(t *testing.T) {
+func TestDuplicateAPIExecutableExitsCleanly(t *testing.T) {
 	dataDir := t.TempDir()
 	owner := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dataDir})
 	resp, err := testClient.Get(owner.base + "/api/health")
@@ -58,12 +57,11 @@ func TestDuplicateAPIExecutableReturnsDistinctExitStatus(t *testing.T) {
 	}
 	p := runAPI(t, exec.Command(apiBinary(t)), map[string]string{
 		"XMUSTARD_DATA_DIR": dataDir, "XMUSTARD_API_PORT": fmt.Sprint(owner.port),
-		"XMUSTARD_LAUNCHD_DUPLICATE_EXIT": "1",
 	})
-	if err := p.wait(t, 10*time.Second); err == nil {
-		t.Fatal("duplicate API exited successfully; want its distinct exit status")
-	} else if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != daemon.DuplicateExitCode {
-		t.Fatalf("duplicate API exit = %v, want status %d: %s", err, daemon.DuplicateExitCode, p.out)
+	// A failed exit would make launchd (KeepAlive SuccessfulExit=false) relaunch the
+	// duplicate every ThrottleInterval for as long as the owner runs.
+	if err := p.wait(t, 10*time.Second); err != nil {
+		t.Fatalf("duplicate API exit = %v, want a clean exit: %s", err, p.out)
 	}
 	if !strings.Contains(p.out.String(), "another instance owns this data directory; exiting") {
 		t.Fatalf("duplicate API log: %s", p.out)

@@ -44,11 +44,10 @@ type plistEntry struct {
 
 // Files renders the agent's property list.
 func (l Launchd) Files(s Spec) []File {
-	env := make([]plistEntry, 0, 9)
+	env := make([]plistEntry, 0, 8)
 	for _, e := range s.Environ() {
 		env = append(env, plistEntry{e.Key, e.Value})
 	}
-	env = append(env, plistEntry{"XMUSTARD_LAUNCHD_DUPLICATE_EXIT", "1"})
 	doc := []plistEntry{
 		{"Label", s.Label},
 		{"ProgramArguments", []string{s.APIBin}},

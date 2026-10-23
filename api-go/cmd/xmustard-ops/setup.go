@@ -300,7 +300,9 @@ var daemonActions = map[string]func(context.Context, daemon.Installer, daemon.Sp
 func explainLaunchdDuplicate(report daemon.StatusReport, dataDir string, port int) any {
 	service := report.Service
 	if service.Manager == "launchd" && service.Loaded && service.PID == 0 &&
-		service.LastExitCode != nil && *service.LastExitCode == daemon.DuplicateExitCode &&
+		// A duplicate exits 0 (so launchd does not relaunch it): a loaded job that last
+		// exited cleanly while a live owner holds this data directory is that case.
+		service.LastExitCode != nil && *service.LastExitCode == 0 &&
 		report.Health != nil && report.Health.Status == "ok" && report.Health.Service == "api-go" &&
 		apiOwnerMatches(dataDir, port, report.Health.DataDirID) {
 		return struct {

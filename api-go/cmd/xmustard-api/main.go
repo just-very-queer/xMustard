@@ -18,7 +18,6 @@ import (
 	"time"
 
 	"xmustard/api-go/internal/budget"
-	"xmustard/api-go/internal/daemon"
 	"xmustard/api-go/internal/evidence"
 	"xmustard/api-go/internal/rustcore"
 	"xmustard/api-go/internal/workspaceops"
@@ -63,12 +62,10 @@ func main() {
 	}
 	unlockDataDir, err := lockAPIDataDir(cfg.dataDir, listenerPort)
 	if errors.Is(err, errAPIAlreadyRunning) {
+		// Exit cleanly: launchd's KeepAlive {SuccessfulExit: false} and systemd's
+		// Restart=on-failure relaunch only a failed exit, so a duplicate never loops.
 		log.Printf("another instance owns this data directory; exiting")
-		exitCode := 0
-		if os.Getenv("XMUSTARD_LAUNCHD_DUPLICATE_EXIT") == "1" {
-			exitCode = daemon.DuplicateExitCode
-		}
-		os.Exit(exitCode)
+		os.Exit(0)
 	}
 	if err != nil {
 		log.Fatal(err)

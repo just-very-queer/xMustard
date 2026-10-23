@@ -44,10 +44,6 @@ type Status struct {
 	Socket       string `json:"socket,omitempty"`
 }
 
-// DuplicateExitCode identifies an API process that declined startup because another
-// process already owns the same data directory.
-const DuplicateExitCode = 75
-
 // Runner runs a service manager command and returns its combined output.
 type Runner func(ctx context.Context, name string, args ...string) (string, error)
 

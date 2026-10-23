@@ -397,15 +397,17 @@ func TestRunDaemonStatusDoesNotUseLaterHealthProbeAsDuplicateEvidence(t *testing
 }
 
 func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
-	duplicateExit := daemon.DuplicateExitCode
-	cleanExit := 0
+	cleanExit, failedExit := 0, 1
 	for _, tc := range []struct {
 		name    string
 		service daemon.Status
+		want    bool
 	}{
 		{name: "absent job", service: daemon.Status{Manager: "launchd", State: "not-loaded"}},
-		{name: "stopped job with stale duplicate exit", service: daemon.Status{Manager: "launchd", State: "not-loaded", LastExitCode: &duplicateExit}},
-		{name: "healthy API without duplicate exit", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit}},
+		{name: "stopped job with a stale clean exit", service: daemon.Status{Manager: "launchd", State: "not-loaded", LastExitCode: &cleanExit}},
+		{name: "loaded job whose last exit failed", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &failedExit}},
+		{name: "loaded job with no recorded exit", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true}},
+		{name: "loaded job that exited cleanly beside a live owner", service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit}, want: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir, _ := filepath.Abs(t.TempDir())
@@ -430,9 +432,8 @@ func TestExplainLaunchdDuplicateRequiresRecordedHealthyStatus(t *testing.T) {
 				daemon.StatusReport
 				Notice string `json:"notice"`
 			})
-			wantNotice := false
-			if wrapped != wantNotice {
-				t.Fatalf("duplicate notice = %v, want %v: %#v", wrapped, wantNotice, got)
+			if wrapped != tc.want {
+				t.Fatalf("duplicate notice = %v, want %v: %#v", wrapped, tc.want, got)
 			}
 		})
 	}
@@ -465,9 +466,9 @@ func TestExplainLaunchdDuplicateRejectsStaleOwnerRecord(t *testing.T) {
 				}
 				t.Cleanup(func() { processIdentity = previousIdentity })
 			}
-			duplicateExit := daemon.DuplicateExitCode
+			cleanExit := 0
 			report := daemon.StatusReport{
-				Service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &duplicateExit},
+				Service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit},
 				Health:  &daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(dir)},
 			}
 			if _, wrapped := explainLaunchdDuplicate(report, dir, 8042).(struct {
@@ -491,9 +492,9 @@ func TestExplainLaunchdDuplicateDoesNotInferFromUnrelatedLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
-	duplicateExit := daemon.DuplicateExitCode
+	cleanExit := 0
 	report := daemon.StatusReport{
-		Service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &duplicateExit},
+		Service: daemon.Status{Manager: "launchd", State: "waiting", Loaded: true, LastExitCode: &cleanExit},
 		Health:  &daemon.Health{Status: "ok", Service: "api-go", DataDirID: dataDirID(dir)},
 	}
 	if _, wrapped := explainLaunchdDuplicate(report, dir, 8042).(struct {
@@ -673,7 +674,7 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 	}
 	defer func() { processIdentity = previousIdentity }()
 	e.run = func(context.Context, string, ...string) (string, error) {
-		return "state = waiting\nlast exit code = 75\n", nil
+		return "state = waiting\nlast exit code = 0\n", nil
 	}
 	probeCalls := 0
 	e.probe = func(context.Context, string) (daemon.Health, error) {
@@ -696,7 +697,7 @@ func TestRunDaemonStatusExplainsHealthyDuplicate(t *testing.T) {
 		t.Fatalf("status units were not preserved: %v", v["units"])
 	}
 	service, ok := v["service"].(map[string]any)
-	if !ok || service["manager"] != "launchd" || service["state"] != "waiting" || service["loaded"] != true || service["last_exit_code"] != float64(daemon.DuplicateExitCode) {
+	if !ok || service["manager"] != "launchd" || service["state"] != "waiting" || service["loaded"] != true || service["last_exit_code"] != float64(0) {
 		t.Fatalf("status service was not preserved: %v", v["service"])
 	}
 	health, ok := v["health"].(map[string]any)
