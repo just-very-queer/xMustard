@@ -66,6 +66,13 @@ option. It ships no NOTICE file and is a dependency of signal-hook, not a transl
 
 Design references (ideas only; no code, text or tests are copied from them):
 
+  Jevgrep (https://github.com/dzhng/jevgrep), licensed under the MIT License;
+  jegrep (https://github.com/can1357/jegrep), licensed under the MIT License; and
+  jgrep (https://github.com/keltokhy/jgrep), licensed under the MIT License.
+  Their public designs informed the proposed optional semantic/boolean search lane
+  in docs/plans/2026-10-23-jev-semantic-lane.md. No code, text, prompts or fixtures
+  are copied, and none is an xMustard runtime dependency.
+
   rust-core/src/gitindex/ (WS-RT18) reads Git's on-disk index and applies Git's
   ignore and status rules as Git documents them. Git (https://git-scm.com) is
   licensed under the GNU General Public License, version 2; its documentation was
