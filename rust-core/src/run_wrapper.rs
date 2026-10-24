@@ -980,7 +980,6 @@ fn basename(word: &str) -> &str {
     word.rsplit('/').next().unwrap_or(word)
 }
 
-
 /// What the server may learn of the command line to pick a reducer: the program's name
 /// and, when it is a plain word and the program is one whose subcommand selects a
 /// family, that argument (`git diff`). The rest of the line can hold tokens or
@@ -1010,7 +1009,7 @@ fn command_hint(argv: &[String]) -> String {
         // generic shell family — and the capture lost the test reduction entirely.
         Some(line) => shell_line_hint(line).unwrap_or_else(|| name.to_string()),
         None => match argv.first().map(|a| basename(a)).filter(|a| plain(a)) {
-            Some(first) => hint_for(first, &mut argv.iter().skip(1).map(String::as_str)),
+            Some(_) => family_hint(argv),
             None => name.to_string(),
         },
     }
@@ -1019,32 +1018,263 @@ fn command_hint(argv: &[String]) -> String {
 // The hint over a shell line's simple commands, by the registry's own rule
 // (`commandFamily`, registry.go:299): every simple command is classified and the most
 // specific wins, compared with a STRICT `>`, so the first of two equally specific
-// commands is the one kept. A package script outranks a plain program because the
-// registry reads a script's own family (`npm run test`) where a plain program's hint
-// is only its subcommand. A line of only rule-less commands (`cd`, `echo`, `ls`)
-// names the first one, which is the same answer a single such command gets.
+// commands is the one kept. Each command's hint is ranked like registry.go's argv
+// family, including the family derived from a package script.
 fn shell_line_hint(line: &str) -> Option<String> {
     let mut best: Option<(u8, String)> = None;
     for simple in split_simple_commands(line) {
-        let mut words = simple.split_whitespace();
-        let Some(first) = words.next().map(basename).filter(|w| plain(w)) else {
+        let words = command_words(simple);
+        let Some(_) = words
+            .first()
+            .map(|word| basename(word))
+            .filter(|w| plain(w))
+        else {
             continue;
         };
-        let rank = hint_rank(first);
+        let rank = argv_family_rank(&words);
         if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
-            best = Some((rank, hint_for(first, &mut words)));
+            best = Some((rank, family_hint(&words)));
         }
     }
     best.map(|(_, hint)| hint)
 }
 
-// The registry's dispatch order, as a rank, with 0 for a program no rule carries.
-// The program set is `HINT_RULES`' own.
-fn hint_rank(program: &str) -> u8 {
-    match HINT_RULES.iter().find(|(p, _)| p.contains(&program)) {
-        Some((_, Hint::RunScript)) => 3,
-        Some((_, Hint::Subcommand)) | Some((_, Hint::Keyword)) => 2,
-        None => 0,
+fn argv_family_rank(words: &[String]) -> u8 {
+    let Some(program) = words
+        .first()
+        .map(|word| basename(word).to_ascii_lowercase())
+    else {
+        return 0;
+    };
+    let sub = words
+        .get(1)
+        .map(|word| word.to_ascii_lowercase())
+        .unwrap_or_default();
+    const DIRECT_FAMILIES: [(&[&str], u8); 3] = [
+        (
+            &[
+                "pytest",
+                "py.test",
+                "jest",
+                "vitest",
+                "mocha",
+                "rspec",
+                "phpunit",
+                "ctest",
+                "tox",
+                "nox",
+                "ava",
+                "tap",
+                "karma",
+                "unittest",
+                "nosetests",
+                "playwright",
+                "cypress",
+            ],
+            10,
+        ),
+        (
+            &[
+                "eslint",
+                "golangci-lint",
+                "ruff",
+                "flake8",
+                "pylint",
+                "mypy",
+                "pyright",
+                "staticcheck",
+                "shellcheck",
+                "rubocop",
+                "stylelint",
+                "biome",
+                "oxlint",
+                "hadolint",
+                "markdownlint",
+                "revive",
+                "golint",
+                "tflint",
+                "yamllint",
+                "pycodestyle",
+                "pydocstyle",
+                "bandit",
+                "semgrep",
+            ],
+            8,
+        ),
+        (
+            &[
+                "tsc",
+                "gcc",
+                "g++",
+                "clang",
+                "clang++",
+                "javac",
+                "rustc",
+                "webpack",
+                "esbuild",
+                "rollup",
+                "cmake",
+                "ninja",
+                "bazel",
+                "msbuild",
+                "xcodebuild",
+                "swiftc",
+                "kotlinc",
+                "scalac",
+                "turbo",
+            ],
+            9,
+        ),
+    ];
+    if let Some((_, rank)) = DIRECT_FAMILIES
+        .iter()
+        .find(|(programs, _)| programs.contains(&program.as_str()))
+    {
+        return *rank;
+    }
+    match program.as_str() {
+        "go" => match sub.as_str() {
+            "test" => 10,
+            "vet" => 8,
+            "build" | "install" | "run" | "generate" | "mod" => 9,
+            _ => 0,
+        },
+        "cargo" => match sub.as_str() {
+            "test" | "nextest" => 10,
+            "clippy" | "build" | "check" | "run" | "install" | "doc" | "fmt" => 9,
+            _ => 0,
+        },
+        "npm" | "yarn" | "pnpm" | "bun" | "deno" => {
+            let script = if sub == "run" {
+                words
+                    .get(2)
+                    .map(|w| w.to_ascii_lowercase())
+                    .unwrap_or_default()
+            } else {
+                sub
+            };
+            match family_of(&script) {
+                Some("test") => 10,
+                Some("lint") => 8,
+                Some("build") => 9,
+                _ => 0,
+            }
+        }
+        "node" if words.iter().any(|w| w == "--test") => 10,
+        "make" | "just" | "task" | "rake" => {
+            if words
+                .iter()
+                .any(|w| w.contains("test") || w.contains("check"))
+            {
+                10
+            } else if words.iter().any(|w| w.contains("lint")) {
+                8
+            } else {
+                9
+            }
+        }
+        "mvn" | "gradle" | "gradlew" | "./gradlew" | "sbt" | "dotnet" | "swift" | "zig" | "mix" => {
+            if words.iter().any(|w| w.contains("test")) {
+                10
+            } else {
+                9
+            }
+        }
+        "git" => match sub.as_str() {
+            "diff" | "show" | "format-patch" => 7,
+            "log" if words.iter().any(|w| w == "-p" || w == "--patch") => 7,
+            "grep" => 6,
+            "ls-files" => 4,
+            _ => 2,
+        },
+        "diff" | "colordiff" => 7,
+        "docker" | "kubectl" | "podman" | "oc"
+            if sub == "logs" || words.iter().any(|w| w == "logs") =>
+        {
+            5
+        }
+        "docker" | "kubectl" | "podman" | "oc" if sub == "build" => 9,
+        "tail"
+            if words
+                .iter()
+                .any(|w| w == "-f" || w.starts_with("--follow") || w.ends_with(".log")) =>
+        {
+            5
+        }
+        "tail" => 1,
+        "rg" if words.iter().any(|w| w == "--files") => 4,
+        "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" | "ugrep" => 6,
+        "journalctl" | "dmesg" | "logcat" | "stern" => 5,
+        "find" | "fd" | "fdfind" | "locate" => 4,
+        "ls" | "tree" | "exa" | "eza" | "dir" | "lsd" => 3,
+        "cat" | "head" | "nl" | "bat" | "less" | "more" | "sed" | "awk" => 1,
+        _ => 0,
+    }
+}
+
+fn command_words(simple: &str) -> Vec<String> {
+    let mut words: Vec<String> = simple
+        .split_whitespace()
+        .map(|word| word.trim_matches(['\'', '"', '(', ')']).to_string())
+        .filter(|word| {
+            !word.is_empty()
+                && !word.starts_with(['>', '<'])
+                && !word.starts_with("2>")
+                && !word.starts_with("&>")
+        })
+        .collect();
+    loop {
+        let Some(word) = words.first().map(String::as_str) else {
+            break;
+        };
+        let skip = match word {
+            word if word.contains('=') && !word.starts_with('-') && !word.starts_with('=') => 1,
+            "sudo" | "time" | "env" | "nice" | "command" | "exec" | "npx" | "bunx" | "pnpx"
+            | "xargs" | "stdbuf" | "unbuffer" => 1,
+            "timeout" if words.len() > 1 => 2,
+            "uv" | "poetry" | "pipenv" | "rye" | "hatch" | "pdm"
+                if words.get(1).is_some_and(|arg| arg == "run") =>
+            {
+                2
+            }
+            word if (word == "python" || word == "python3" || word.starts_with("python3."))
+                && words.len() > 2
+                && words.get(1).is_some_and(|arg| arg == "-m") =>
+            {
+                2
+            }
+            _ => break,
+        };
+        words.drain(..skip);
+    }
+    words
+}
+
+fn family_hint(words: &[String]) -> String {
+    let Some(first) = words
+        .first()
+        .map(|word| basename(word))
+        .filter(|word| plain(word))
+    else {
+        return "bash".to_string();
+    };
+    let args = &words[1..];
+    match first {
+        "git"
+            if args.first().is_some_and(|word| word == "log")
+                && args.iter().any(|word| word == "-p" || word == "--patch") =>
+        {
+            "git diff".to_string()
+        }
+        "rg" if args.iter().any(|word| word == "--files") => "rg --files".to_string(),
+        "tail"
+            if args.iter().any(|word| {
+                word == "-f" || word.starts_with("--follow") || word.ends_with(".log")
+            }) =>
+        {
+            "tail --follow".to_string()
+        }
+        _ => hint_for(first, &mut args.iter().map(String::as_str)),
     }
 }
 
@@ -1069,7 +1299,7 @@ fn hint_for(first: &str, words: &mut dyn Iterator<Item = &str>) -> String {
 }
 
 // Split a shell line the way `splitCommand` does, outside quotes: on `;`, `&&`,
-// `||` and `|`. A quote, a redirect or a substitution is left alone, so a `&&`
+// `||`, `|` and newline. A quote, a redirect or a substitution is left alone, so a `&&`
 // inside a string does not split the line and no word that fails `plain` reaches
 // the hint.
 fn split_simple_commands(line: &str) -> Vec<&str> {
@@ -1092,27 +1322,44 @@ fn split_simple_commands(line: &str) -> Vec<&str> {
         }
         match c {
             b'\'' | b'"' => quote = c,
-            b';' => {
+            b'|' => {
                 parts.push(&line[start..i]);
                 start = i + 1;
+                if bytes.get(i + 1) == Some(&b'|') {
+                    i += 1;
+                    start = i + 1;
+                }
             }
-            b'&' | b'|' if bytes.get(i + 1) == Some(&c) => {
+            b'&' if bytes.get(i + 1) == Some(&b'&') => {
                 parts.push(&line[start..i]);
                 start = i + 2;
                 i += 1;
+            }
+            b'\n' => {
+                parts.push(&line[start..i]);
+                start = i + 1;
+            }
+            b';' => {
+                parts.push(&line[start..i]);
+                start = i + 1;
             }
             _ => {}
         }
         i += 1;
     }
     parts.push(&line[start..]);
-    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+    parts
+        .into_iter()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .collect()
 }
 
 fn plain(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
-        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
 }
 
 /// Programs the Go registry reads as a shell wrapping a `-c` string.
@@ -1132,10 +1379,16 @@ enum Hint {
 }
 
 const HINT_RULES: [(&[&str], Hint); 3] = [
-    (&["go", "git", "cargo", "kubectl", "docker"], Hint::Subcommand),
+    (
+        &["go", "git", "cargo", "kubectl", "docker"],
+        Hint::Subcommand,
+    ),
     (&["npm", "pnpm", "yarn", "bun", "deno"], Hint::RunScript),
     (
-        &["make", "just", "task", "rake", "mvn", "gradle", "gradlew", "sbt", "dotnet", "swift", "zig", "mix"],
+        &[
+            "make", "just", "task", "rake", "mvn", "gradle", "gradlew", "sbt", "dotnet", "swift",
+            "zig", "mix",
+        ],
         Hint::Keyword,
     ),
 ];
@@ -1156,9 +1409,9 @@ fn script_name(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
 }
 
 fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
-    let sub = subcommand(words)?;
+    let sub = words.next().filter(|word| !word.is_empty())?.to_string();
     if sub != "run" {
-        return Some(sub);
+        return family_of(&sub).map(str::to_string);
     }
     // The registry reads the script's name only to classify it (registry.go:
     // `HasPrefix(script, "test")`, and the same for lint and build), so the family
@@ -1183,21 +1436,21 @@ fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
 /// not (`tsc` is a build there, `jest` a test).
 fn family_of(script: &str) -> Option<&'static str> {
     let s = script.to_ascii_lowercase();
-    const TEST_PREFIX: [&str; 2] = ["test", "e2e"];
-    const TEST_EXACT: [&str; 3] = ["t", "vitest", "jest"];
-    const LINT_PREFIX: [&str; 1] = ["lint"];
-    const LINT_EXACT: [&str; 1] = ["eslint"];
-    const BUILD_PREFIX: [&str; 1] = ["build"];
-    const BUILD_EXACT: [&str; 5] = ["compile", "typecheck", "tsc", "install", "ci"];
-    if TEST_PREFIX.iter().any(|p| s.starts_with(p)) || TEST_EXACT.contains(&s.as_str()) {
-        Some("test")
-    } else if LINT_PREFIX.iter().any(|p| s.starts_with(p)) || LINT_EXACT.contains(&s.as_str()) {
-        Some("lint")
-    } else if BUILD_PREFIX.iter().any(|p| s.starts_with(p)) || BUILD_EXACT.contains(&s.as_str()) {
-        Some("build")
-    } else {
-        None
-    }
+    const FAMILIES: [(&str, &[&str], &[&str]); 3] = [
+        ("test", &["test", "e2e"], &["t", "vitest", "jest"]),
+        ("lint", &["lint"], &["eslint"]),
+        (
+            "build",
+            &["build"],
+            &["compile", "typecheck", "tsc", "install", "ci"],
+        ),
+    ];
+    FAMILIES
+        .iter()
+        .find(|(_, prefixes, exact)| {
+            prefixes.iter().any(|prefix| s.starts_with(prefix)) || exact.contains(&s.as_str())
+        })
+        .map(|(family, _, _)| *family)
 }
 
 /// The registry's own keywords, in its precedence order (test and check before lint).
@@ -1500,36 +1753,71 @@ mod tests {
             "go test"
         );
         // Every separator the registry splits on, and the precedence between them.
-        assert_eq!(command_hint(&a(&["bash", "-c", "cd a; npm run test"])), "npm run test");
-        assert_eq!(command_hint(&a(&["bash", "-c", "ls || go build ./..."])), "go build");
-        // Two rule-carrying commands. The registry keeps the MOST SPECIFIC
-        // (`familyRank`), and a package script's own family is more specific than a
-        // plain program's subcommand — so it wins in either order, measured against
-        // registry.go's dispatch on the box (logs/ws-44e-run-20261004T080850Z.log).
         assert_eq!(
-            command_hint(&a(&["bash", "-c", "go test && npm run build"])),
-            "npm run build"
+            command_hint(&a(&["bash", "-c", "cd a; npm run test"])),
+            "npm run test"
         );
         assert_eq!(
-            command_hint(&a(&["bash", "-c", "npm run build && go test"])),
-            "npm run build",
-            "and the same line the other way round keeps the script, not the subcommand"
+            command_hint(&a(&["bash", "-c", "ls || go build ./..."])),
+            "go build"
         );
-        // Two commands of the SAME rank: the registry's comparison is a strict `>`
-        // (registry.go:311), so the FIRST of equals is the one kept. Measured on the
-        // box against that comparison (logs/ws-44e-run-20261004T080925Z.log).
+        // The registry's familyRank decides the winner, with its strict `>` keeping the
+        // first equal-family command. The selected hint must classify to the same family.
+        for (line, expected_rank) in [
+            ("go test && npm run build", 10),
+            ("npm run build && go test", 10),
+            ("git diff && go test", 10),
+            ("cat main.go | grep func", 6),
+            ("cd sub\ngo test ./...", 10),
+            ("FOO=bar sudo timeout 5s python -m pytest -q", 10),
+            ("python3.11 -m pytest -q", 10),
+            ("/usr/bin/pytest -q", 10),
+            ("git log --patch", 7),
+            ("git status --short", 2),
+            ("git grep pattern", 6),
+            ("rg --files", 4),
+            ("tail -f service.log", 5),
+        ] {
+            let hint = command_hint(&a(&["bash", "-c", line]));
+            let want_rank = split_simple_commands(line)
+                .into_iter()
+                .map(|simple| argv_family_rank(&command_words(simple)))
+                .max()
+                .unwrap_or(0);
+            assert_eq!(want_rank, expected_rank, "registry family rank for {line}");
+            assert_eq!(
+                argv_family_rank(&command_words(&hint)),
+                want_rank,
+                "{line} -> {hint}"
+            );
+        }
+        // The registry keeps the first command when both have the same family.
         assert_eq!(
             command_hint(&a(&["bash", "-c", "go test && git diff"])),
             "go test"
         );
         assert_eq!(
             command_hint(&a(&["bash", "-c", "git diff && go test"])),
-            "git diff"
+            "go test"
         );
         assert_eq!(
-            command_hint(&a(&["bash", "-c", "git diff | head -50"])),
-            "git diff",
-            "a pipe is a separator too"
+            command_hint(&a(&["bash", "-c", "cat main.go | grep func"])),
+            "grep",
+            "a single pipe splits commands and grep outranks read"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "cd sub\ngo test ./..."])),
+            "go test",
+            "newline splits commands"
+        );
+        assert_eq!(
+            command_hint(&a(&[
+                "bash",
+                "-c",
+                "FOO=bar sudo timeout 5s python -m pytest -q"
+            ])),
+            "pytest",
+            "leading assignments and command wrappers are removed"
         );
         assert_eq!(
             command_hint(&a(&["bash", "-c", "echo hi && cd x"])),
@@ -1555,13 +1843,18 @@ mod tests {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         // The subcommand programs: argvFamily switches on argv0 and its subcommand,
         // so both words are what it needs.
-        for program in ["go", "git", "cargo", "npm", "docker"] {
+        for program in ["go", "git", "cargo", "docker"] {
             assert_eq!(
                 command_hint(&a(&["bash", "-c", &format!("{program} sub")])),
                 format!("{program} sub"),
                 "{program} sub"
             );
         }
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "npm sub"])),
+            "npm",
+            "an unknown package-manager command must not expose its argument"
+        );
         // Everything else: the first word is the whole hint. An argument is not a
         // family selector, and `echo hunter2` must not put hunter2 in the query.
         for (command, want) in [
@@ -1571,10 +1864,17 @@ mod tests {
             ("ls -la /home/user", "ls"),
             ("sed -i s/a/b/ f", "sed"),
         ] {
-            assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
+            assert_eq!(
+                command_hint(&a(&["bash", "-c", command])),
+                want,
+                "{command}"
+            );
         }
         // A word holding a redirect, a glob or a substitution is never a plain word.
-        assert_eq!(command_hint(&a(&["bash", "-c", "go test ./..."])), "go test");
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "go test ./..."])),
+            "go test"
+        );
         assert_eq!(command_hint(&a(&["bash", "-c", "go >out"])), "go");
     }
 
@@ -1582,7 +1882,10 @@ mod tests {
     fn command_hint_reads_a_dash_c_script_only_for_a_shell() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(command_hint(&a(&["python", "-c", "hunter2 = 1"])), "python");
-        assert_eq!(command_hint(&a(&["/usr/bin/node", "-c", "git diff"])), "node");
+        assert_eq!(
+            command_hint(&a(&["/usr/bin/node", "-c", "git diff"])),
+            "node"
+        );
         assert_eq!(command_hint(&a(&["zsh", "-c", "git diff"])), "git diff");
     }
 
@@ -1594,13 +1897,21 @@ mod tests {
             ("pnpm run lint --fix", "pnpm run lint"),
             ("npm run", "npm run"),
             ("npm test", "npm test"),
+            ("yarn test:unit", "yarn test"),
+            ("pnpm lint:fix", "pnpm lint"),
+            ("bun build:prod", "bun build"),
+            ("yarn deploy-hunter2", "yarn"),
             ("make test", "make test"),
             ("make -j4 check-backend", "make check"),
             ("make lint", "make lint"),
             ("make deploy-hunter2", "make"),
             ("gradle build", "gradle"),
         ] {
-            assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
+            assert_eq!(
+                command_hint(&a(&["bash", "-c", command])),
+                want,
+                "{command}"
+            );
         }
     }
 

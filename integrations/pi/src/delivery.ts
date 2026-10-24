@@ -684,6 +684,14 @@ export function carriesHandle(texts: readonly string[]): boolean {
 	return texts.some(lineHoldsTaggedHandle);
 }
 
+function isWrapperProjection(texts: readonly string[]): boolean {
+	const lastBlock = texts.at(-1);
+	if (lastBlock === undefined || texts.some((text) => /\[xmustard: (?:passed through unreduced|showing the last)\b/.test(text))) return false;
+	const withoutFinalNewline = lastBlock.replace(/\n$/, "");
+	const lastLine = withoutFinalNewline.slice(withoutFinalNewline.lastIndexOf("\n") + 1);
+	return lineHoldsTaggedHandle(lastLine);
+}
+
 function lineHoldsTaggedHandle(t: string): boolean {
 	HANDLE_TAG.lastIndex = 0;
 	for (let m = HANDLE_TAG.exec(t); m; m = HANDLE_TAG.exec(t)) {
@@ -735,7 +743,7 @@ export async function projectBuiltin(
 	// A wrapped result (the run wrapper's projection) is the reduced form of an
 	// original the wrapper already captured; capturing it again would point the
 	// visible handle at the projection instead of the command's own output.
-	if (wrapped && carriesHandle(texts)) return undefined;
+	if (wrapped && isWrapperProjection(texts)) return undefined;
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });
 	const paused = capturer.paused;
 	if (paused) return passthrough(`capture paused: ${paused}`);

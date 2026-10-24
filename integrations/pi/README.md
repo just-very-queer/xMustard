@@ -292,21 +292,14 @@ originals and the raw session entries kept (`get_entries`), a snapshot compactio
 RPC `compact` reaching the next model request with every summarized output
 recoverable from `details`, and a reader token not offered `remember`/`verify`.
 
-**Known failures: the e2e passes in part.** Nine tests of the first suite (3 to 8, 11,
-13 and 15: a large result projected at the source, repository mutation, hook delivery,
-concurrency, API restart, expiry, the projection deadline, an activated
-`xmustard_expand` whose endpoint fails, and auth) fail the same way with or without
-capture. Each needs a multi-page result from `impact` with no arguments, and since the
-automatic registration baseline (WS-22) a fresh fixture has no changes against its
-baseline, so that call returns about 400 bytes and issues no handle. The WS-24 suite
-passes 3 of 3; 9 of the 18 e2e tests pass in all.
-
-The "large-result fixture" above was assumed to be a missing test input. It is not, and
-the assumption was measured (WS-44e): those nine tests assert `raw_bytes > 3 * 64 KiB`,
-while `toolbudget.MaxMaxChars` is 64 KiB and `impact` does not page, so no fixture and no
-argument value can make one call exceed that. The tests need a decision about what they
-should claim (re-page through `impact`'s own cursor, raise the ceiling, or cover a
-built-in instead); see the followups file. Until then the 9 of 18 stands as recorded.
+**Known failures: the e2e passes in part.** Seven tests of the first suite (6 to 9, 12,
+14 and 16: hook delivery, concurrency, API restart, expiry, the projection deadline, an
+activated `xmustard_expand` whose endpoint fails, and auth) fail on a fresh fixture because
+the initial `impact` call returns about 400 bytes and issues no handle. The large-result
+case now exercises a wrapped `bash` built-in; the separate `impact` e2e checks only that
+delivery uses the source path. The repository-mutation case expands its unbound wrapper
+capture and expects unknown freshness. The WS-24 suite passes 3 of 3; 12 of the 19 e2e
+tests pass in all.
 
 `tool_call` input rewriting to wrap commands (PAR-ADP-09) is built here, since WS-41
 shipped the `xmustard-core run --` wrapper it needed. Set `XMUSTARD_PI_WRAP_BASH=1` and

@@ -271,7 +271,10 @@ describe("Pi adapter against the real xMustard API", () => {
 			env: { XMUSTARD_PI_WRAP_BASH: "0", XMUSTARD_PI_BUILTINS: "none", PATH: path },
 		});
 		assert.equal(native.code, 0, native.stderr);
+		assertModelSawResults(native);
 		const nativeBash = one(native, "bash");
+		assert.equal(nativeBash.isError, false);
+		assert.ok(textOf(nativeBash).length > 0, "native command produced output");
 		assert.equal(footerOf(textOf(nativeBash)), undefined, "without wrapping or built-in capture, no handle is issued");
 		const run = await pi(
 			"expand-wrapped-bash",
@@ -294,6 +297,8 @@ describe("Pi adapter against the real xMustard API", () => {
 		const footer = footerOf(textOf(bash)) ?? assert.fail(`no evidence footer: ${textOf(bash).slice(-400)}`);
 		assert.ok(footer.handle?.startsWith("xm1."), `bash footer: ${textOf(bash).slice(-400)}`);
 		assert.ok(footer.raw_bytes > 3 * PAGE, `original is multi-page (${footer.raw_bytes})`);
+		assert.equal(footer.raw_bytes, 262144);
+		assert.equal(footer.captured_identity, "unknown");
 		assert.ok(Buffer.byteLength(textOf(bash)) <= PAGE + 2048, "projection is bounded");
 		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "bash"));
 		assert.ok(!run.trace[idx - 1]?.active_tools.includes("xmustard_expand"));
@@ -303,11 +308,14 @@ describe("Pi adapter against the real xMustard API", () => {
 		let off = 0;
 		for (const p of pages) {
 			assert.equal(p.offset, off);
+			assert.equal(p.freshness, "unknown");
+			assert.equal(p.stale, true);
 			assert.ok(p.length <= PAGE);
 			off = p.next_offset;
 		}
 		const bytes = Buffer.concat(pages.map((p) => Buffer.from(p.data_base64, "base64")));
-		assert.equal(bytes.length, footer.raw_bytes);
+		assert.equal(bytes.length, 262144);
+		assert.deepEqual(bytes, Buffer.alloc(262144, 0x20), "expanded bytes equal the command output");
 		const rawSHA256 = pages[0]?.raw_sha256;
 		assert.ok(rawSHA256, "expanded pages carry the original digest");
 		assert.ok(pages.every((p) => p.raw_sha256 === rawSHA256), "every page names the same original");
@@ -317,23 +325,33 @@ describe("Pi adapter against the real xMustard API", () => {
 		record("expand_wrapped_bash", { raw_bytes: footer.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(bash)), pages: pages.length, captured_identity: footer.captured_identity, encodings: pages.map((p) => p.text_encoding) });
 	});
 
-	test("repository mutation: the old capture is served unchanged and labelled stale", async () => {
+	test("repository mutation: an unbound wrapper capture stays expandable with unknown freshness", async () => {
 		assert.ok(original);
+		const coreBin = process.env.XM_CORE_BIN;
+		assert.ok(coreBin, "the e2e runner supplies the release core executable");
+		const path = `${dirname(coreBin)}${delimiter}${process.env.PATH ?? ""}`;
 		appendFileSync(join(repo, "pkg", "handler_0001.go"), "\n// mutated by e2e\n");
-		const run = await pi("stale", [{ calls: [call("impact")] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], {
-			env: { XM_OLD_HANDLE: original.handle },
+		const run = await pi("stale", [
+			{ calls: [call("impact"), { name: "bash", args: { command: "printf '%262144s' ''" } }] },
+			{ calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] },
+			{ text: "done" },
+		], {
+			env: { XM_OLD_HANDLE: original.handle, XMUSTARD_PI_WRAP_BASH: "1", PATH: path },
 		});
 		assert.equal(run.code, 0, run.stderr);
-		const fresh = footerOf(textOf(one(run, "impact")));
-		assert.notEqual(fresh?.captured_key, original.footer.captured_key, "new capture has the mutated identity");
+		const currentImpact = one(run, "impact");
+		assert.equal(currentImpact.isError, false, textOf(currentImpact).slice(0, 300));
+		const currentBash = one(run, "bash");
+		assert.equal(currentBash.isError, false, textOf(currentBash).slice(0, 300));
+		assert.ok(footerOf(textOf(currentBash))?.handle, "the new wrapper result activates expand in this session");
 		const [page] = pagesOf(run, original.handle);
 		assert.ok(page, "old handle expanded");
-		assert.equal(page.freshness, "stale");
+		assert.equal(page.freshness, "unknown", "wrapper captures are not bound to repository identity");
 		assert.equal(page.stale, true);
 		assert.equal(page.captured_key, original.footer.captured_key);
-		assert.notEqual(page.current_key, page.captured_key);
+		assert.equal(page.current_key, "");
 		assert.deepEqual(Buffer.from(page.data_base64, "base64"), original.bytes.subarray(0, page.length), "captured bytes, not current content");
-		assert.match(pageHeaderOf(textOf(one(run, "xmustard_expand")))?.freshness ?? "", /stale/);
+		assert.match(pageHeaderOf(textOf(one(run, "xmustard_expand")))?.freshness ?? "", /unknown/);
 		record("stale", { captured_key: page.captured_key, current_key: page.current_key });
 	});
 

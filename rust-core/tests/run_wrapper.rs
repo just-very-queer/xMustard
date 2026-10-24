@@ -545,9 +545,9 @@ fn a_capture_prints_the_projection_and_handle_and_sends_only_a_command_hint() {
     // word for every wrapped command and left the reducer registry with nothing to
     // key on. The rest of the line still must not travel: the token is in argv and
     // the stderr redirect is not a plain word, so neither appears.
-    assert!(head.contains("command=echo"), "{head}");
+    assert!(head.contains("command=echo&exit_code="), "{head}");
     assert!(
-        !head.contains("hunter2") && !head.contains(">&2"),
+        !head.contains("hunter2") && !head.contains("out") && !head.contains("%3E%262"),
         "the command line leaked: {head}"
     );
 }
