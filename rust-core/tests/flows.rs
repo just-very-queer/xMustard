@@ -2145,6 +2145,60 @@ fn retained_branching_walks_stay_under_the_process_tree_line() {
     );
 }
 
+#[test]
+fn freshness_checks_ranked_seed_paths_before_alphabetical_dependencies() {
+    let mut files = vec![GO_MOD];
+    let imports = (0..60)
+        .map(|i| format!("\"example/a{i:02}\""))
+        .collect::<Vec<_>>();
+    let calls = (0..60)
+        .map(|i| format!("a{i:02}.Leaf();"))
+        .collect::<String>();
+    let import_block = imports
+        .iter()
+        .map(|path| format!("{path}\n"))
+        .collect::<String>();
+    let root = format!("package pkg\n\nimport (\n{import_block})\n\nfunc RunAll() {{ {calls} }}\n");
+    files.push(("pkg/z_root.go", Box::leak(root.into_boxed_str())));
+    let mut leaves = Vec::new();
+    for i in 0..60 {
+        leaves.push((
+            format!("a{i:02}/leaf.go"),
+            format!("package a{i:02}\n\nfunc Leaf() {{}}\n"),
+        ));
+    }
+    for (path, source) in &leaves {
+        files.push((
+            Box::leak(path.clone().into_boxed_str()),
+            Box::leak(source.clone().into_boxed_str()),
+        ));
+    }
+    let d = repo(&files);
+    build(d.path());
+    let before = flows(d.path(), &[]);
+    assert!(
+        read_seeds(&before)
+            .iter()
+            .any(|seed| seed.path == "pkg/z_root.go"),
+        "the high-ranked seed is present: {before:#}"
+    );
+    write(
+        d.path(),
+        "pkg/z_root.go",
+        &format!(
+            "package pkg\n\nimport (\n{import_block})\n\nfunc RunAll() {{ {calls} }}\nfunc Changed() {{}}\n"
+        ),
+    );
+    let after = flows(d.path(), &[]);
+    let dirty = after["freshness"]["dirty_paths_touching_result"]
+        .as_array()
+        .unwrap();
+    assert!(
+        dirty.iter().any(|path| path == "pkg/z_root.go"),
+        "the ranked seed remains in the freshness prefix: {dirty:?}"
+    );
+}
+
 /// The retained step set is bounded by ONE global cap, not by seeds x per-walk.
 ///
 /// `MAX_FLOWS` and `MAX_STEPS_LISTED` both bound what the answer LISTS and are applied
