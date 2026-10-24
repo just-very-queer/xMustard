@@ -694,9 +694,8 @@ fn collect_file_previews(
             Err(_) => {}
         }
     }
-    previews
-        .candidates
-        .sort_by(|left, right| left.id.cmp(&right.id));
+    // Previews keep the seed order (name, BM25, gated fuzzy, path): the per-query request cap
+    // sends batches in this order, so the strongest seeds are classified first.
     Ok(previews)
 }
 
@@ -2921,6 +2920,10 @@ mod tests {
                 .flatten()
                 .any(|candidate| candidate.id == "file:src/zz_gold.rs"),
             "the file with the strongest BM25 evidence was never previewed"
+        );
+        assert_eq!(
+            requests[0][0].id, "file:src/zz_gold.rs",
+            "batches must keep the seed order so a request cap sends the strongest seed first"
         );
         assert!(
             result
