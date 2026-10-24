@@ -66,6 +66,26 @@ func TestRepositoryTrustRejectsRepositoryControlledTrustFile(t *testing.T) {
 	}
 }
 
+func TestRepositoryTrustAcceptsRelativeDataDirOutsideRepository(t *testing.T) {
+	parent := t.TempDir()
+	root := initTrustRepo(t, filepath.Join(parent, "repo"))
+	t.Chdir(parent)
+	const dataDir = "operator-data"
+
+	if _, err := UpdateRepoTrust(dataDir, root, true); err != nil {
+		t.Fatalf("grant with relative data dir: %v", err)
+	}
+	if trusted, err := RepoTrusted(dataDir, root); err != nil || !trusted {
+		t.Fatalf("after grant trust=%v err=%v", trusted, err)
+	}
+	if _, err := UpdateRepoTrust(dataDir, root, false); err != nil {
+		t.Fatalf("revoke with relative data dir: %v", err)
+	}
+	if trusted, err := RepoTrusted(dataDir, root); err != nil || trusted {
+		t.Fatalf("after revoke trust=%v err=%v", trusted, err)
+	}
+}
+
 func TestRepositoryCannotHoldOrGrantItsOwnTrustFile(t *testing.T) {
 	root := initTrustRepo(t, filepath.Join(t.TempDir(), "repo"))
 	payload := `{"roots":["` + root + `"]}`

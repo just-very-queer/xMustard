@@ -140,11 +140,23 @@ func UpdateRepoTrust(dataDir, root string, grant bool) ([]string, error) {
 }
 
 func ensureTrustStoreOutsideRepo(dataDir, root string) error {
-	canonicalDataDir, err := filepath.EvalSymlinks(dataDir)
+	absoluteDataDir, err := filepath.Abs(dataDir)
 	if err != nil {
 		return err
 	}
-	relative, err := filepath.Rel(root, canonicalDataDir)
+	canonicalDataDir, err := filepath.EvalSymlinks(absoluteDataDir)
+	if err != nil {
+		return err
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return err
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(absoluteRoot)
+	if err != nil {
+		return err
+	}
+	relative, err := filepath.Rel(canonicalRoot, canonicalDataDir)
 	if err != nil {
 		return err
 	}
