@@ -680,31 +680,14 @@ impl Ignore {
         }
     }
 
-    /// Load ignore files named relative to `root`, shallow directories first so deeper
-    /// rules override. At each level `.xmustardignore` follows `.gitignore`.
-    pub fn load_files(&mut self, root: &Path, ignore_files: &[String]) {
-        self.load_named_files(root, ignore_files, &[".gitignore", XMUSTARD_IGNORE]);
-    }
-
-    /// Load `.xmustardignore` files named in `ignore_files` (paths relative to `root`),
-    /// plus the root one when present on disk.
+    /// Load `.xmustardignore` files named in `ignore_files` (paths relative to `root`,
+    /// e.g. from `git ls-files`), plus the root one when present on disk.
     pub fn load_xmustard(&mut self, root: &Path, ignore_files: &[String]) {
-        self.load_named_files(root, ignore_files, &[XMUSTARD_IGNORE]);
-    }
-
-    fn load_named_files(&mut self, root: &Path, ignore_files: &[String], names: &[&str]) {
-        let mut files: Vec<String> = ignore_files
-            .iter()
-            .filter(|path| {
-                names.contains(&path.rsplit('/').next().unwrap_or(path.as_str()))
-            })
-            .cloned()
-            .collect();
-        for name in names {
-            if !files.iter().any(|f| f == name) {
-                files.push(name.to_string());
-            }
+        let mut files: Vec<String> = ignore_files.to_vec();
+        if !files.iter().any(|f| f == XMUSTARD_IGNORE) {
+            files.push(XMUSTARD_IGNORE.to_string());
         }
+        // shallow directories first, so deeper files override.
         files.sort_by_key(|f| (f.matches('/').count(), f.clone()));
         files.dedup();
         for f in files {

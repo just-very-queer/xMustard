@@ -765,24 +765,25 @@ fn scan_git(
         ignore_listings.push(true);
     }
     for untracked in ignore_listings {
-        for name in [".gitignore", XMUSTARD_IGNORE] {
-            let named = Listing::Named { name, untracked };
-            crate::gitindex::list_using(root, setting, named, &mut |rec, _| {
-                if let Ok(p) = std::str::from_utf8(rec)
-                    && basename(p) == name
-                {
-                    if ignore_files.len() < MAX_IGNORE_FILES {
-                        ignore_files.push(p.to_string());
-                    } else {
-                        ignore_files_dropped += 1;
-                    }
+        let named = Listing::Named {
+            name: XMUSTARD_IGNORE,
+            untracked,
+        };
+        crate::gitindex::list_using(root, setting, named, &mut |rec, _| {
+            if let Ok(p) = std::str::from_utf8(rec)
+                && basename(p) == XMUSTARD_IGNORE
+            {
+                if ignore_files.len() < MAX_IGNORE_FILES {
+                    ignore_files.push(p.to_string());
+                } else {
+                    ignore_files_dropped += 1;
                 }
-            })
-            .map_err(|e| e.to_string())?;
-        }
+            }
+        })
+        .map_err(|e| e.to_string())?;
     }
     let mut ig = Ignore::with_defaults();
-    ig.load_files(root, &ignore_files);
+    ig.load_xmustard(root, &ignore_files);
 
     let mut col = Collector::new(root, cfg);
     let mut memo = DirMemo::default();

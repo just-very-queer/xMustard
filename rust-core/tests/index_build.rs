@@ -1131,12 +1131,8 @@ fn ignore_files_and_non_git_mode() {
         ("gen/out.ts", "export function generated() {}\n"),
         ("vendor/lib.go", "package lib\n\nfunc Vendored() {}\n"),
         ("third_party/x/y.go", "package y\n\nfunc Third() {}\n"),
-        (".gitignore", "ci/\n"),
         (".xmustardignore", "gen/\n!vendor/\n"),
     ]);
-    write(r.path(), "ci/private.ts", "export function privateCode() {}\n");
-    git(r.path(), &["add", "-f", "ci/private.ts"]);
-    commit_all(r.path());
     let rep = index("build", r.path(), &[]);
     let conn = db(&rep);
     let mut st = conn
@@ -1148,7 +1144,7 @@ fn ignore_files_and_non_git_mode() {
         .map(Result::unwrap)
         .collect();
     assert_eq!(paths, vec!["src/keep.ts", "vendor/lib.go"]);
-    assert_eq!(rep["coverage"]["ignored_files"], 3);
+    assert_eq!(rep["coverage"]["ignored_files"], 2);
 
     // outside Git: refused unless allowed; then .gitignore applies
     let plain = TempDir::new().unwrap();
