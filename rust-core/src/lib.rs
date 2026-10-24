@@ -17,7 +17,6 @@ pub mod index;
 pub mod indexcache;
 pub mod lsp;
 pub mod lsp_session;
-pub mod mcp_schema;
 pub mod ownership;
 pub mod passcount;
 pub mod repomap;

@@ -1,11 +1,49 @@
 package mcpserver
 
+import "xmustard/api-go/internal/workspaceops"
+
+// maxImpactDepth bounds max_depth for symbol= (PAR-IMP-04: 1 to 32, default 3); a
+// trace allows 30 and defaults to 10 (PAR-IMP-07), which the API checks.
+const maxImpactDepth = 32
+
 var impactTool = &Tool{
 	Name:        "impact",
 	Description: "Blast radius. symbol= → dependents by depth (d1 breaks), risk, completeness. Go/TS edges are resolved; other languages match names: leads, not proof. path= → a file's lexical referrers. from=&to= → shortest path, per-hop edges. No args → changes since baseline.",
-	Args:        impactArgs,
-	Advanced:    impactAdvancedArgs,
-	Doc:         impactDoc + "\n" + budgetSpec("impact").Markdown(),
+	Args: []Arg{
+		workspaceArg,
+		{Name: "symbol", Type: typeString, Desc: "name, Container.name, UID or path"},
+		{Name: "path", Type: typeString, MaxLen: maxPathArg, Desc: "a repo-relative file"},
+		{Name: "from", Type: typeString, Desc: "trace from here"},
+		{Name: "to", Type: typeString, Desc: "trace to here"},
+		{Name: "max_depth", Type: typeInteger, Min: 1, Max: maxImpactDepth, Desc: "hops (default 3; path= 4)"},
+	},
+	// Impact v2 (WS-35): typed filters, per-depth paging and diff-to-symbol scopes, and
+	// the output budget (WS-36), are accepted everywhere and listed only in the full
+	// schema profile; the docs resource documents them. cursor= continues a cut tier
+	// (WS-59e), and the two paging members are listed for the same reason.
+	Advanced: append([]Arg{
+		{Name: "op", Type: typeString, Enum: workspaceops.OccurrenceOps,
+			Desc: "symbol-level occurrences instead of the depth tiers: refs (every use), definition (what declares it), implementations (types implementing it)"},
+		{Name: "direction", Type: typeString, Enum: []string{"upstream", "downstream"}, Desc: "dependents (default) or dependencies"},
+		{Name: "relation_types", Type: typeString, List: true, Enum: workspaceops.RelationTypes, MaxLen: 128,
+			Desc: "edge kinds (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)"},
+		{Name: "min_confidence", Type: typeNumber, Min: 0, Max: 1, Desc: "skip edges below this confidence"},
+		{Name: "include_tests", Type: typeBoolean, Desc: "walk test files (default false)"},
+		{Name: "limit", Type: typeInteger, Min: 1, Max: 500, Desc: "items per depth tier (default 50), or per page with op="},
+		{Name: "offset", Type: typeInteger, Min: 0, Max: 50000, Desc: "items skipped per tier"},
+		{Name: "summary_only", Type: typeBoolean, Desc: "counts, risk, no items"},
+		{Name: "timeout_ms", Type: typeInteger, Min: 1, Max: 60000, Desc: "walk budget (default 10000)"},
+		{Name: "scope", Type: typeString, Enum: workspaceops.ChangeScopes, Desc: "symbols a diff touches, and dependents"},
+		{Name: "base", Type: typeString, MaxLen: 256, Desc: "scope=compare|range: base"},
+		{Name: "head", Type: typeString, MaxLen: 256, Desc: "scope=compare|commit|range: head"},
+		{Name: "worktree", Type: typeString, MaxLen: 4096, Desc: "another checkout to diff"},
+		// WS-59e: the tier cursor, declared here because budgetArgs omits it for a
+		// non-Paged budget tool. Advanced, documented at xmustard://docs/tools; an
+		// explicitly empty cursor= is refused by the API, which can see the parameter's
+		// presence in a way the schema cannot.
+		{Name: "cursor", Type: typeString, MaxLen: maxSearchCursorLen, Desc: "next_cursor of the previous page"},
+	}, budgetArgs("impact")...),
+	Doc: impactDoc + "\n" + budgetSpec("impact").Markdown(),
 	// depth is the API's query name; a UID goes where a symbol does
 	Aliases:     map[string]string{"depth": "max_depth", "uid": "symbol"},
 	PathArg:     "path",
