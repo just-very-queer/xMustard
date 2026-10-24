@@ -57,13 +57,15 @@ def refresh_peer(peer: dict[str, Any], api_root: str) -> dict[str, Any]:
     canonical_url = source["html_url"].rstrip("/")
     present = canonical_name.casefold() == repository.casefold()
     superseded_by = None if present else canonical_name.rsplit("/", 1)[-1]
-    commits, _ = get_json(
-        f"{api_root}/repos/{urllib.parse.quote(canonical_name, safe='/')}/commits?per_page=1"
-    )
-    last_commit_date = None
-    if commits:
-        commit = commits[0]["commit"]
-        last_commit_date = commit["committer"]["date"][:10]
+    last_commit_date = peer.get("last_commit_date")
+    if present:
+        commits, _ = get_json(
+            f"{api_root}/repos/{urllib.parse.quote(canonical_name, safe='/')}/commits?per_page=1"
+        )
+        last_commit_date = None
+        if commits:
+            commit = commits[0]["commit"]
+            last_commit_date = commit["committer"]["date"][:10]
 
     return {
         **peer,

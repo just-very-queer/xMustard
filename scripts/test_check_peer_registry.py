@@ -65,6 +65,20 @@ class PeerRegistryTest(unittest.TestCase):
         self.assertFalse(got["source_present"])
         self.assertEqual(got["superseded_by"], "letta-code")
         self.assertEqual(got["canonical_url"], "https://github.com/letta-ai/letta-code")
+        self.assertEqual(got["last_commit_date"], "2026-08-15")
+
+    def test_live_repository_uses_committer_date(self):
+        peer = {
+            "name": "Letta Code",
+            "repository": "letta-ai/letta-code",
+            "canonical_url": "https://github.com/letta-ai/letta-code",
+            "source_present": True,
+            "superseded_by": None,
+            "last_commit_date": "2026-09-24",
+        }
+        got = refresh_peer(peer, self.api_root)
+        self.assertTrue(got["source_present"])
+        self.assertIsNone(got["superseded_by"])
         self.assertEqual(got["last_commit_date"], "2026-10-22")
 
     def test_peer_without_a_public_repository_has_no_commit_date(self):
