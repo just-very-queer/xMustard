@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 
@@ -27,14 +28,18 @@ var toolRoutes = []routeSpec{
 }
 
 func search(w http.ResponseWriter, r *http.Request) {
+	q, err := strictQuery(r)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
 	query, ok := requireQuery(w, r, "q")
 	if !ok {
 		return
 	}
 	limit := queryInt(r, "limit", workspaceops.DefaultSearchLimit)
-	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
+	dd, ws := dataDir(), r.PathValue("workspace_id")
 	var result json.RawMessage
-	var err error
 	// `pattern` and `symbol` answer from their own surfaces, so they are dispatched
 	// first. The lexical modes share one request. A mode the tool does not advertise is
 	// bad input, not the hybrid by default.
@@ -75,14 +80,54 @@ func search(w http.ResponseWriter, r *http.Request) {
 		// ?seed=<symbol> activates the graph-proximity lane, ?lang= and ?path_glob=
 		// filter, ?mode=text answers from the body lane alone, ?mode=exact|regex scans
 		// the working tree's bytes, and ?cursor= continues a page (next_cursor).
+		maxLines, capErr := scanCap(q, "max_lines")
+		if capErr != nil {
+			respondError(w, capErr)
+			return
+		}
+		maxBytes, capErr := scanCap(q, "max_bytes")
+		if capErr != nil {
+			respondError(w, capErr)
+			return
+		}
+		timeoutMS, capErr := scanCap(q, "timeout_ms")
+		if capErr != nil {
+			respondError(w, capErr)
+			return
+		}
 		result, err = workspaceops.WorkspaceSearchPage(r.Context(), dd, ws, workspaceops.SearchRequest{
 			Query: query, Seed: q.Get("seed"), PathGlob: q.Get("path_glob"), Lang: q.Get("lang"),
 			Mode: q.Get("mode"), Cursor: q.Get("cursor"), Limit: limit,
-			ScanLines: queryInt(r, "max_lines", 0), ScanBytes: queryInt(r, "max_bytes", 0),
-			ScanTimeoutMS: queryInt(r, "timeout_ms", 0),
+			ScanLines: maxLines, ScanBytes: maxBytes, ScanTimeoutMS: timeoutMS,
 		})
 	}
 	reply(w, result, err, respondError)
+}
+
+// strictQuery is the request's query string, or a 400 when it does not parse. URL.Query()
+// drops a pair split by ';' or carrying a bad %-escape and discards the error, so a cap the
+// caller set would read as absent and the scan would run at its default.
+func strictQuery(r *http.Request) (url.Values, error) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("the query string does not parse (%v): %w", err, workspaceops.ErrInvalidInput)
+	}
+	return q, nil
+}
+
+func scanCap(q url.Values, name string) (int, error) {
+	values, present := q[name]
+	if !present {
+		return 0, nil
+	}
+	if len(values) != 1 {
+		return 0, fmt.Errorf("%s must be one non-negative integer: %w", name, workspaceops.ErrInvalidInput)
+	}
+	value, err := strconv.Atoi(values[0])
+	if err != nil || value < 0 {
+		return 0, fmt.Errorf("%s must be one non-negative integer: %w", name, workspaceops.ErrInvalidInput)
+	}
+	return value, nil
 }
 
 // explainPath explains one file (its explanation, outline and cluster) or a directory

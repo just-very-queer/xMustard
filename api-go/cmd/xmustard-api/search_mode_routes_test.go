@@ -196,6 +196,27 @@ func TestSearchRefusesAnUnknownMode(t *testing.T) {
 	}
 }
 
+func TestSearchRejectsInvalidScanCaps(t *testing.T) {
+	dir := t.TempDir()
+	seedCoreWorkspace(t, dir, "ws")
+	core := writeScript(t, "echo '{}'\n")
+	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core})
+
+	for _, tc := range []struct{ key, value string }{
+		{"max_lines", "nope"}, {"max_bytes", "1MB"}, {"timeout_ms", "-1"},
+	} {
+		q := url.Values{"mode": {"exact"}, "q": {"x"}, tc.key: {tc.value}}
+		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + q.Encode())
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s=%q: status %d, want 400", tc.key, tc.value, resp.StatusCode)
+		}
+	}
+}
+
 // The two scan modes reach the route and are answered, not refused (WS-59c): a mode the
 // tool advertises must not be a 400, and the answer carries the scan's own shape.
 func TestSearchRoutesTheScanModes(t *testing.T) {
@@ -219,6 +240,76 @@ func TestSearchRoutesTheScanModes(t *testing.T) {
 		}
 		if !strings.Contains(string(body), `"spans"`) {
 			t.Errorf("mode=%s must carry the scan's spans: %s", m, body)
+		}
+	}
+}
+
+// scanSpans is a scan answer the fake core prints for every call.
+const scanSpans = `{"workspace_id":"ws","query":"needle","total":1,"offset":0,"omitted":0,"hits":[],` +
+	`"spans":[{"path":"a.go","line":1,"column":1,"byte":0,"len":6}],"bytes_scanned":6}`
+
+// startSearchCore starts the API over a fake core that records its search argv in the
+// returned file, and answers every call with scanSpans.
+func startSearchCore(t *testing.T) (*apiProc, string) {
+	t.Helper()
+	dir := t.TempDir()
+	seedCoreWorkspace(t, dir, "ws")
+	argsFile := dir + "/args"
+	core := writeScript(t, "if [ \"$1\" = search ]; then printf '%s\\n' \"$@\" > "+argsFile+"; fi\ncat <<'EOF'\n"+scanSpans+"\nEOF\n")
+	return startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core}), argsFile
+}
+
+// A query string that does not parse is refused whole, on the plain and the budgeted
+// path. url.Values drops a pair split by ';' or carrying a bad %-escape, so a dropped
+// max_bytes would scan the 4 MiB default under a cap the caller believes is in force.
+// The raw strings are sent as written: url.Values.Encode() cannot produce them.
+func TestSearchRefusesAMalformedQueryString(t *testing.T) {
+	p, argsFile := startSearchCore(t)
+	for _, raw := range []string{
+		"q=needle&mode=exact&max_bytes=1;invalid",
+		"q=needle&mode=exact&max_bytes=%zz",
+		"q=nee%zzdle&mode=exact",
+		"q=needle&mode=exact&max_bytes=1&max_chars=4000;x",
+	} {
+		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusBadRequest {
+			t.Errorf("%s: status %d, want 400: %s", raw, resp.StatusCode, body)
+		}
+	}
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		raw, _ := os.ReadFile(argsFile)
+		t.Fatalf("a refused query must not reach the core: %v %q", err, raw)
+	}
+}
+
+// The controls: the same caps, well formed, reach the core as flags on both paths.
+func TestSearchPassesWellFormedScanCaps(t *testing.T) {
+	p, argsFile := startSearchCore(t)
+	for _, raw := range []string{
+		"q=needle&mode=exact&max_bytes=1",
+		"q=needle&mode=exact&max_bytes=1&max_chars=4000",
+	} {
+		_ = os.Remove(argsFile)
+		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + raw)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Fatalf("%s: status %d, want 200: %s; log:\n%s", raw, resp.StatusCode, body, p.stderr.String())
+		}
+		args, err := os.ReadFile(argsFile)
+		if err != nil {
+			t.Fatalf("%s: the core was not asked to search: %v", raw, err)
+		}
+		if !strings.Contains(string(args), "--max-bytes=1\n") {
+			t.Errorf("%s: missing --max-bytes=1 in core args %q", raw, args)
 		}
 	}
 }

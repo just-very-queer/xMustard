@@ -758,6 +758,45 @@ pub fn hybrid_search_for(
     )
 }
 
+fn scan_paths(
+    root: &Path,
+    paths: &[String],
+    pattern: &crate::exactscan::Pattern,
+    limits: &crate::exactscan::Limits,
+    scan_slice: Option<usize>,
+    deadline: &mut crate::exactscan::Deadline,
+) -> (crate::exactscan::Report, Vec<crate::exactscan::Loss>) {
+    let mut report = crate::exactscan::Report::default();
+    let mut budget = limits.max_bytes;
+    let mut losses = Vec::new();
+    // one matcher state for the whole scan: the lazy DFA's caches are reused across files
+    let mut scanner = pattern.scanner();
+    for (path_index, rel) in paths.iter().enumerate() {
+        let mut scan_file = match crate::exactscan::FileScan::open_with_slice(root, rel, scan_slice)
+        {
+            Ok(s) => s,
+            Err(loss) => {
+                report.files_skipped_unreadable += 1;
+                losses.push(loss);
+                continue;
+            }
+        };
+        let more = scan_file.scan(
+            &mut scanner,
+            limits,
+            &mut budget,
+            &mut report,
+            deadline,
+            path_index + 1 < paths.len(),
+        );
+        report.files_scanned += 1;
+        if !more {
+            break;
+        }
+    }
+    (report, losses)
+}
+
 /// The `mode=exact|regex` scan (WS-59c, PAR-RET-09): the query matched against the
 /// working tree's bytes, under three reported caps.
 ///
@@ -776,6 +815,16 @@ fn scan(
     query: &str,
     opts: &SearchOptions<'_>,
 ) -> SearchResult {
+    scan_with_report(root, workspace_id, identity_key, query, opts).0
+}
+
+fn scan_with_report(
+    root: &Path,
+    workspace_id: &str,
+    identity_key: Option<&str>,
+    query: &str,
+    opts: &SearchOptions<'_>,
+) -> (SearchResult, crate::exactscan::Report) {
     let source = symbolgraph::query_source_for(root, workspace_id, identity_key);
     // the scan reads the working tree and lists it from Git, so it needs the source's
     // coverage and freshness but not its graph
@@ -789,7 +838,33 @@ fn scan(
         match crate::exactscan::limits(opts.scan_lines, opts.scan_bytes, opts.scan_timeout_ms) {
             Ok(l) => l,
             Err(e) => {
-                return SearchResult {
+                return (
+                    SearchResult {
+                        workspace_id: workspace_id.to_string(),
+                        query: query.to_string(),
+                        total: 0,
+                        offset: opts.offset,
+                        omitted: 0,
+                        hits: Vec::new(),
+                        spans: Vec::new(),
+                        bytes_scanned: Some(0),
+                        truncated: true,
+                        cut: None,
+                        files_skipped: None,
+                        degradations: vec![e],
+                        coverage,
+                        freshness: Some(source.freshness([])),
+                        generated_at: now(),
+                    },
+                    crate::exactscan::Report::default(),
+                );
+            }
+        };
+    let pattern = match crate::exactscan::compile(query, opts.mode.matcher()) {
+        Ok(pattern) => pattern,
+        Err(e) => {
+            return (
+                SearchResult {
                     workspace_id: workspace_id.to_string(),
                     query: query.to_string(),
                     total: 0,
@@ -805,29 +880,9 @@ fn scan(
                     coverage,
                     freshness: Some(source.freshness([])),
                     generated_at: now(),
-                };
-            }
-        };
-    let matcher = match crate::exactscan::compile(query, opts.mode.matcher()) {
-        Ok(re) => re,
-        Err(e) => {
-            return SearchResult {
-                workspace_id: workspace_id.to_string(),
-                query: query.to_string(),
-                total: 0,
-                offset: opts.offset,
-                omitted: 0,
-                hits: Vec::new(),
-                spans: Vec::new(),
-                bytes_scanned: Some(0),
-                truncated: false,
-                cut: None,
-                files_skipped: None,
-                degradations: vec![e],
-                coverage,
-                freshness: Some(source.freshness([])),
-                generated_at: now(),
-            };
+                },
+                crate::exactscan::Report::default(),
+            );
         }
     };
 
@@ -848,19 +903,19 @@ fn scan(
     let admit = |p: &str| glob.as_ref().is_none_or(|g| g.matches(p.as_bytes())) && admits_lang(p);
 
     let started = std::time::Instant::now();
-    let mut report = crate::exactscan::Report::default();
-    let mut budget = limits.max_bytes;
-    let mut losses: Vec<crate::exactscan::Loss> = Vec::new();
     // The scan lists the TRACKED TREE, not the graph's files: the graph carries only the
     // files a language pack claims, and a grep that skipped `.md`, `.txt`, `.yaml` and a
     // `.env.example` would answer about code while claiming to answer about a repository.
-    let (listed, listed_paths) = match symbolgraph::tracked_paths(root) {
-        Ok(all) => (all.len() as u64, all),
+    let (listed, listed_paths, listing_failed) = match symbolgraph::tracked_paths(root) {
+        Ok(all) => (all.len() as u64, all, false),
         Err(e) => {
             // No listing means no answer can be complete, and saying so is the whole
             // point of this lane's `degradations`.
-            read_errors.push(("files", e));
-            (0, Vec::new())
+            read_errors.push(("files", e.clone()));
+            degradations.push(format!(
+                "the tracked tree could not be listed: {e}; nothing was searched"
+            ));
+            (0, Vec::new(), true)
         }
     };
     // `listed` counts what Git listed, BEFORE `admit`: `files_skipped` is a statement
@@ -869,25 +924,17 @@ fn scan(
     // Order is Git's own, so the same corpus produces the same bytes twice (the property
     // `search_hybrid`'s byte-identity test asserts for the hybrid).
     paths.sort();
-    for rel in &paths {
-        let mut scan_file =
-            match crate::exactscan::FileScan::open_with_slice(root, rel, opts.scan_slice) {
-                Ok(s) => s,
-                Err(loss) => {
-                    report.files_skipped_unreadable += 1;
-                    losses.push(loss);
-                    continue;
-                }
-            };
-        let more = scan_file.scan(&matcher, &limits, &mut budget, &mut report, started);
-        report.files_scanned += 1;
-        // No pass counter is noted for the scan's own reads: `bytes_hashed` counts bytes
-        // fed through a digest, and the scan never makes one (its own `bytes_scanned`
-        // is the count it reports); the stats it does make are noted by the open.
-        if !more {
-            break;
-        }
-    }
+    // The time cap counts from before the listing, so the listing's own time is spent
+    // from it.
+    let mut deadline = crate::exactscan::Deadline::wall(started, limits.timeout_ms);
+    let (mut report, losses) = scan_paths(
+        root,
+        &paths,
+        &pattern,
+        &limits,
+        opts.scan_slice,
+        &mut deadline,
+    );
     if report.cut.is_some() {
         // The corpus is not exhausted, so the files after this one were never opened.
         report.files_skipped = listed.saturating_sub(report.files_scanned as u64);
@@ -922,10 +969,16 @@ fn scan(
         ));
     }
 
-    if report.positions_lost > 0 {
+    // The file a cap stopped inside, and the byte its missing occurrences start from: the
+    // cut line above says only that later files were not searched.
+    if let Some(unconfirmed) = &report.unconfirmed {
+        degradations.push(unconfirmed.message());
+    }
+    if report.matches_cut > 0 {
         degradations.push(format!(
-            "{} match(es) were found but their line could not be resolved",
-            report.positions_lost
+            "{} match(es) exceeded the {}-byte match window; reported lengths were capped",
+            report.matches_cut,
+            crate::exactscan::MAX_MATCH_BYTES
         ));
     }
     // A page of a scan's spans, by the same `offset`/`limit` the ranked modes use, so one
@@ -945,25 +998,30 @@ fn scan(
         coverage.note_read_error(what, e);
     }
     let freshness = source.freshness(spans.iter().map(|s| s.path.as_str()));
-    SearchResult {
-        workspace_id: workspace_id.to_string(),
-        query: query.to_string(),
-        total,
-        offset: opts.offset,
-        omitted,
-        hits: Vec::new(),
-        spans,
-        bytes_scanned: Some(report.bytes_scanned),
-        truncated: report.cut.is_some()
-            || report.files_skipped_unreadable > 0
-            || report.positions_lost > 0,
-        cut: report.cut,
-        files_skipped: (report.files_skipped > 0).then_some(report.files_skipped),
-        degradations,
-        coverage,
-        freshness: Some(freshness),
-        generated_at: now(),
-    }
+    (
+        SearchResult {
+            workspace_id: workspace_id.to_string(),
+            query: query.to_string(),
+            total,
+            offset: opts.offset,
+            omitted,
+            hits: Vec::new(),
+            spans,
+            bytes_scanned: Some(report.bytes_scanned),
+            truncated: listing_failed
+                || report.cut.is_some()
+                || report.files_skipped_unreadable > 0
+                || report.matches_cut > 0
+                || report.unconfirmed.is_some(),
+            cut: report.cut,
+            files_skipped: (report.files_skipped > 0).then_some(report.files_skipped),
+            degradations,
+            coverage,
+            freshness: Some(freshness),
+            generated_at: now(),
+        },
+        report,
+    )
 }
 
 /// The full search: a page of the final order under `opts`. The two scan modes
@@ -4142,8 +4200,8 @@ mod scan_tests {
     }
 
     // A pattern the engine refuses is bad input, not a query matching nothing. The lane
-    // reports it and searches nothing, and the reported message carries the engine's own
-    // complaint so a caller can act on it.
+    // reports it as truncated so an empty span list cannot be mistaken for a completed scan,
+    // and the message carries the engine's own complaint so a caller can act on it.
     #[test]
     fn an_uncompilable_pattern_is_reported_and_searches_nothing() {
         let repo = git_repo(&[("a.txt", "some text\n")]);
@@ -4157,7 +4215,10 @@ mod scan_tests {
             "{:?}",
             res.degradations
         );
-        assert!(!res.truncated, "a refused query is not a truncated answer");
+        assert!(
+            res.truncated,
+            "a refused query is not a successful no-match result"
+        );
     }
 
     // The line cap is honoured and NAMED. The oracle is the fixture: with a cap of 1 and
@@ -4347,6 +4408,50 @@ mod scan_tests {
         );
     }
 
+    #[test]
+    fn a_failed_tracked_tree_listing_is_reported_as_truncated() {
+        let repo = TempDir::new().unwrap();
+        std::fs::write(repo.path().join("untracked.txt"), "needle\n").unwrap();
+        let res = scan_repo(&repo, "needle", SearchMode::Exact);
+        assert!(
+            res.truncated,
+            "a failed listing cannot mean no matches: {res:?}"
+        );
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("tracked tree could not be listed")),
+            "the reason for the incomplete answer is visible: {:?}",
+            res.degradations
+        );
+    }
+
+    #[test]
+    fn an_overlong_regex_match_is_a_visible_scan_degradation() {
+        let body = format!("a{}z", "x".repeat(crate::exactscan::MAX_MATCH_BYTES * 2));
+        let repo = git_repo(&[("a.txt", &body)]);
+        let res = search(
+            repo.path(),
+            "ws",
+            None,
+            "a.*",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Regex,
+                scan_slice: Some(64),
+                ..Default::default()
+            },
+        );
+        assert!(res.truncated, "the match length was capped: {res:?}");
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("match(es) exceeded"))
+        );
+        assert_eq!(res.spans.len(), 1);
+        assert_eq!(res.spans[0].len, crate::exactscan::MAX_MATCH_BYTES);
+    }
+
     // The scan lists the TRACKED TREE, not the files a language pack claims. `.txt` is not
     // in any pack, so a scan that took its file list from the symbol graph would find
     // nothing here — and a grep that cannot reach a README, a Makefile, a `.yaml` or a
@@ -4385,8 +4490,8 @@ mod scan_tests {
         assert_eq!(one.spans, two.spans, "the same corpus, the same spans");
     }
 
-    // The scan reads bytes without feeding them through a digest, so both hash counters
-    // remain zero. Its own bytes_scanned member is the read count for this lane.
+    // With only the scan loop inside the pass scope, FilesStatted measures the opens
+    // directly: one stat per admitted file, and one completed scan per open.
     #[test]
     fn its_pass_counters_show_it_stats_its_opens_and_hashes_nothing() {
         let repo = git_repo(&[
@@ -4394,27 +4499,42 @@ mod scan_tests {
             ("b.go", "needle\n"),
             ("c.txt", "needle\n"),
         ]);
+        let paths = vec!["a.go".to_string(), "b.go".to_string(), "c.txt".to_string()];
+        let pattern =
+            crate::exactscan::compile("needle", crate::exactscan::Matcher::Exact).unwrap();
+        let limits = crate::exactscan::Limits::default();
         let call = crate::passcount::Call::begin();
-        let r = scan_repo(&repo, "needle", SearchMode::Exact);
+        let (report, losses) = scan_paths(
+            repo.path(),
+            &paths,
+            &pattern,
+            &limits,
+            None,
+            &mut crate::exactscan::Deadline::never(),
+        );
         let counts = call.counts();
         drop(call);
-        assert_eq!(r.spans.len(), 3, "{:?}", r.spans);
+        assert!(losses.is_empty(), "all admitted files open: {losses:?}");
+        assert_eq!(report.files_scanned, paths.len());
+        assert_eq!(report.spans.len(), paths.len());
+        assert_eq!(
+            report.bytes_scanned, 21,
+            "three 7-byte files, each read once"
+        );
+        assert_eq!(
+            counts.get(crate::passcount::Pass::FilesStatted),
+            paths.len() as u64,
+            "one stat per admitted file: {counts:?}"
+        );
         assert_eq!(
             counts.get(crate::passcount::Pass::FilesHashed),
             0,
-            "the scan hashes nothing: {:?}",
-            counts
+            "the scan hashes nothing: {counts:?}"
         );
         assert_eq!(
             counts.get(crate::passcount::Pass::BytesHashed),
             0,
-            "the scan does not hold the hashing counters: {:?}",
-            counts
-        );
-        assert_eq!(
-            r.bytes_scanned,
-            Some(21),
-            "three 7-byte files, each read once"
+            "the scan does not hold the hashing counters: {counts:?}"
         );
     }
 
@@ -4445,5 +4565,186 @@ mod scan_tests {
         );
         let found: Vec<usize> = res.spans.iter().map(|s| s.byte).collect();
         assert_eq!(found, vec![0, 60], "each planted match is reported once");
+    }
+
+    /// One scan of `repo` in `mode` with the byte cap `scan_bytes`, and its report.
+    fn scan_capped(
+        repo: &TempDir,
+        query: &str,
+        mode: SearchMode,
+        scan_bytes: u64,
+    ) -> (SearchResult, crate::exactscan::Report) {
+        scan_with_report(
+            repo.path(),
+            "ws",
+            None,
+            query,
+            &SearchOptions {
+                limit: 50,
+                mode,
+                scan_bytes,
+                ..Default::default()
+            },
+        )
+    }
+
+    // batch43 #7 at the search level: a complete literal at the cutoff is listed at its
+    // full length, and nothing claims its length was capped.
+    #[test]
+    fn complete_literal_at_cutoff_is_not_length_capped_search_level() {
+        let repo = git_repo(&[("a.txt", "needlex")]);
+        let (res, report) = scan_capped(&repo, "needle", SearchMode::Exact, 6);
+        assert_eq!(res.spans.len(), 1, "{:?}", res.spans);
+        assert_eq!(res.spans[0].len, 6);
+        assert!(res.truncated, "the byte cap fired: {:?}", res.degradations);
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        assert!(
+            !res.degradations.iter().any(|d| d.contains("match window")),
+            "{:?}",
+            res.degradations
+        );
+        assert_eq!(report.matches_cut, 0);
+    }
+
+    // The byte cap stopping inside a file names the file and the byte its unlisted
+    // occurrences start from, beside the cut line that names the cap.
+    #[test]
+    fn the_byte_cap_inside_a_file_names_the_unconfirmed_offset() {
+        let repo = git_repo(&[("a.txt", &"needle ".repeat(400))]);
+        let (res, _) = scan_capped(&repo, "needle", SearchMode::Exact, 64);
+        let bytes: Vec<usize> = res.spans.iter().map(|s| s.byte).collect();
+        assert_eq!(bytes, (0..9).map(|k| k * 7).collect::<Vec<_>>());
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        assert!(res.truncated);
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("byte cap (64 bytes)")),
+            "{:?}",
+            res.degradations
+        );
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("a.txt") && d.contains("64 bytes") && d.contains("byte 62")),
+            "{:?}",
+            res.degradations
+        );
+    }
+
+    // A byte budget that ends exactly at a file's end decides that file: the later file is
+    // skipped and counted, and nothing in the first is unconfirmed.
+    #[test]
+    fn a_budget_ending_at_a_file_boundary_leaves_nothing_unconfirmed() {
+        let repo = git_repo(&[("a.txt", "needle\n"), ("b.txt", "needle\n")]);
+        let (res, report) = scan_capped(&repo, "needle", SearchMode::Exact, 7);
+        let listed: Vec<(&str, usize)> = res
+            .spans
+            .iter()
+            .map(|s| (s.path.as_str(), s.byte))
+            .collect();
+        assert_eq!(listed, [("a.txt", 0)]);
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        assert_eq!(report.unconfirmed, None);
+        assert!(
+            !res.degradations.iter().any(|d| d.contains("not confirmed")),
+            "{:?}",
+            res.degradations
+        );
+        assert_eq!(res.files_skipped, Some(1));
+    }
+
+    // batch34 #8 (b) and batch51 #1 at the search level: an empty answer cut inside a
+    // file is truncated and names the file and the byte it is unconfirmed from, so it is
+    // never presented as complete.
+    #[test]
+    fn an_empty_answer_cut_inside_a_file_names_that_file() {
+        let prefix = format!("a{}z", "x".repeat(70_000));
+        for (body, query, cap) in [(prefix.as_str(), "a.*z", 65_536), ("abc", "abc|b", 2)] {
+            let repo = git_repo(&[("a.txt", body)]);
+            let (res, _) = scan_capped(&repo, query, SearchMode::Regex, cap);
+            assert!(res.spans.is_empty(), "{query}: {:?}", res.spans);
+            assert!(res.truncated, "{query}");
+            assert!(
+                res.degradations
+                    .iter()
+                    .any(|d| d.contains("a.txt") && d.contains("byte 0")),
+                "{query}: {:?}",
+                res.degradations
+            );
+        }
+    }
+
+    // batch34 #3 at the search level: the one capped span makes the answer truncated and
+    // names the window.
+    #[test]
+    fn a_capped_unbounded_occurrence_is_named_at_the_search_level() {
+        let repo = git_repo(&[("a.txt", &"x".repeat(100_000))]);
+        let res = scan_repo(&repo, "x+", SearchMode::Regex);
+        assert_eq!(res.spans.len(), 1, "{:?}", res.spans);
+        assert_eq!(res.spans[0].len, crate::exactscan::MAX_MATCH_BYTES);
+        assert!(res.truncated);
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("exceeded the 4096-byte match window")),
+            "{:?}",
+            res.degradations
+        );
+    }
+
+    // An anchored pattern's automaton proves the unread rest cannot match, so a byte cap
+    // inside the only file cuts nothing.
+    #[test]
+    fn an_anchored_pattern_cut_by_the_byte_cap_is_complete() {
+        let repo = git_repo(&[("a.txt", &format!("needle{}", "x".repeat(70_000)))]);
+        let (res, report) = scan_capped(&repo, r"\Aneedle", SearchMode::Regex, 65_536);
+        let listed: Vec<(usize, usize)> = res.spans.iter().map(|s| (s.byte, s.len)).collect();
+        assert_eq!(listed, [(0, 6)]);
+        assert_eq!(res.cut, None);
+        assert!(!res.truncated, "{:?}", res.degradations);
+        assert_eq!(report.unconfirmed, None);
+    }
+
+    // An exact literal set past the lazy DFA's NFA limit is answered as the regex crate
+    // answers it, with a literal search: 100 words of 10 letters, two of them planted.
+    #[test]
+    fn a_literal_set_past_the_nfa_limit_is_searched() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut letter = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        };
+        let words: Vec<String> = (0..100)
+            .map(|_| (0..10).map(|_| letter()).collect())
+            .collect();
+        let body = format!("xx {} yy\n{}\n", words[7], words[93]);
+        let repo = git_repo(&[("a.txt", &body)]);
+        let res = scan_repo(&repo, &words.join("|"), SearchMode::Regex);
+        let listed: Vec<(usize, usize, usize)> =
+            res.spans.iter().map(|s| (s.line, s.byte, s.len)).collect();
+        assert_eq!(listed, [(1, 3, 10), (2, 17, 10)], "{:?}", res.degradations);
+        assert!(!res.truncated, "{:?}", res.degradations);
+        assert_eq!(res.cut, None);
+    }
+
+    // A Unicode word boundary is refused like any pattern the scan cannot answer: reported,
+    // nothing read, never an empty answer that reads as complete.
+    #[test]
+    fn a_unicode_word_boundary_is_refused_and_searches_nothing() {
+        let repo = git_repo(&[("a.txt", "foo\n")]);
+        let res = scan_repo(&repo, r"(?u)\bfoo", SearchMode::Regex);
+        assert!(res.spans.is_empty(), "{:?}", res.spans);
+        assert_eq!(res.bytes_scanned, Some(0), "nothing was read");
+        assert!(res.truncated);
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("not supported by the scan")),
+            "{:?}",
+            res.degradations
+        );
     }
 }
