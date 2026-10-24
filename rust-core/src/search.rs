@@ -1379,11 +1379,17 @@ pub fn search(
                                     bm25_rank: u32::MAX,
                                 });
                         evidence.name_score = evidence.name_score.max(candidate.name_score);
-                        evidence.fuzzy = evidence.fuzzy.max(candidate.fuzzy);
+                        // Only fuzzy evidence that passes the lane's gate counts, as in
+                        // `lane_key`: trigram noise below the gate must not rank a seed.
+                        let fuzzy = candidate.lane_key(Lane::Fuzzy).unwrap_or(0.0) as f32;
+                        evidence.fuzzy = evidence.fuzzy.max(fuzzy);
                         if let Some(rank) = candidate.code {
                             evidence.bm25_rank = evidence.bm25_rank.min(rank);
                         }
                     }
+                    // Seeds are ordered as the fusion weighs the lanes: name and BM25 (weight
+                    // 1.0) before gated fuzzy (0.5), then path, so the attempt cap keeps the
+                    // strongest deterministic evidence.
                     let mut seed_paths: Vec<&str> = seed_evidence.keys().copied().collect();
                     seed_paths.sort_by(|left, right| {
                         let left_evidence = seed_evidence[left];
@@ -1391,8 +1397,8 @@ pub fn search(
                         right_evidence
                             .name_score
                             .total_cmp(&left_evidence.name_score)
-                            .then_with(|| right_evidence.fuzzy.total_cmp(&left_evidence.fuzzy))
                             .then_with(|| left_evidence.bm25_rank.cmp(&right_evidence.bm25_rank))
+                            .then_with(|| right_evidence.fuzzy.total_cmp(&left_evidence.fuzzy))
                             .then_with(|| left.cmp(right))
                     });
                     for (attempt, path) in seed_paths.into_iter().enumerate() {
@@ -2558,6 +2564,82 @@ mod tests {
         assert!(result.hits.iter().any(|hit| {
             hit.name == "relevant_behavior" && hit.lanes_matched.contains(&"intent")
         }));
+    }
+
+    #[test]
+    fn bm25_evidence_outranks_ungated_fuzzy_noise_when_choosing_intent_seeds() {
+        // More noise files than the attempt cap, each named to share only trigrams with the
+        // query (fuzzy below the gate) and mentioning it once in a long body, and one gold
+        // file whose name shares nothing with the query but holds the strongest BM25
+        // evidence. The gold file sorts last by path, so an order that ranked raw fuzzy
+        // ahead of BM25 would spend every attempt on noise and never preview it.
+        let noise = crate::intent::MAX_CANDIDATE_FILES + 8;
+        let filler = "let unrelated_value = 1; ".repeat(40);
+        let mut files: Vec<(String, String)> = (0..noise)
+            .map(|index| {
+                (
+                    format!("src/n{index:03}.rs"),
+                    format!("pub fn neexyz_{index:03}() {{ {filler}needle(); }}\n"),
+                )
+            })
+            .collect();
+        files.push((
+            "src/zz_gold.rs".into(),
+            "pub fn gold_target() { needle(); needle(); needle(); needle(); }\n".into(),
+        ));
+        let query = name_vector("needle");
+        let gold_fuzzy = cosine(&query, &name_vector("gold_target"));
+        assert!(
+            (0..noise).all(|index| {
+                let fuzzy = cosine(&query, &name_vector(&format!("neexyz_{index:03}")));
+                fuzzy > gold_fuzzy && fuzzy < FUZZY_GATE
+            }),
+            "premise: every noise name carries more raw fuzzy evidence than the gold name, \
+             all of it below the gate"
+        );
+        let file_refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let repo = indexed_repo(&file_refs);
+        let provider = TargetProvider {
+            positive_ids: vec![
+                "file:src/zz_gold.rs".into(),
+                "decl:src/zz_gold.rs:1:gold_target".into(),
+            ],
+            requests: Mutex::new(Vec::new()),
+        };
+        let question = crate::intent::Question {
+            id: "q-bm25".into(),
+            text: "Does this implement the requested behavior?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 200,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .flatten()
+                .any(|candidate| candidate.id == "file:src/zz_gold.rs"),
+            "the file with the strongest BM25 evidence was never previewed"
+        );
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| { hit.name == "gold_target" && hit.lanes_matched.contains(&"intent") })
+        );
     }
 
     #[test]
