@@ -532,12 +532,18 @@ pub fn detect<G: Graph + ?Sized>(
             }
         })
         .collect();
-    out.unmapped_files = out
-        .changed_files
-        .iter()
-        .filter(|file| file.symbols == 0 && file.unparsed.is_none() && !file.binary)
-        .map(|file| file.path.clone())
-        .collect();
+    for (i, e) in list.iter().enumerate() {
+        if e.binary || !per_file.contains_key(&i) || per_file[&i].1.is_some() {
+            continue;
+        }
+        let Some(file_node) = g.file_node(&e.rel)? else {
+            out.unmapped_files.push(e.rel.clone());
+            continue;
+        };
+        if g.file_symbols(file_node)?.is_empty() {
+            out.unmapped_files.push(e.rel.clone());
+        }
+    }
     if !seeds.is_empty() {
         let mut walk = q.impact.clone();
         walk.direction = impact::Direction::Upstream;

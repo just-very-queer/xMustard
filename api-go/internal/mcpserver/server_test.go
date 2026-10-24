@@ -954,6 +954,21 @@ func TestOutputSchemasMatchRecordedResults(t *testing.T) {
 	}
 }
 
+func TestImpactStructuredContentPreservesNullCount(t *testing.T) {
+	result := `{"symbol":"Missing","impacted_count":null,"risk":"UNKNOWN"}`
+	got, err := structured(context.Background(), result, map[string]any{"workspace": Workspace{ID: "w", Source: SourceArgument}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatal(err)
+	}
+	if count, ok := body["impacted_count"]; !ok || count != nil {
+		t.Fatalf("MCP structuredContent coerced null impacted_count: %s", got)
+	}
+}
+
 // ground reports a count or flag it cannot determine as null (listed under
 // "unknown"), and the portable schema subset has no null type, so outputSchema
 // declares only ground members that can never be null: a client that validates

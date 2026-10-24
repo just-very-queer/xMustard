@@ -18,7 +18,7 @@ import (
 func TestImpactRoutePreservesNullImpactedCount(t *testing.T) {
 	srv, dir := newRouteServer(t)
 	core := filepath.Join(t.TempDir(), "xmustard-core")
-	if err := os.WriteFile(core, []byte("#!/bin/sh\nprintf '{\\\"symbol\\\":\\\"missing\\\",\\\"impacted_count\\\":null,\\\"risk\\\":\\\"UNKNOWN\\\"}'\n"), 0o755); err != nil {
+	if err := os.WriteFile(core, []byte("#!/bin/sh\necho '{\"symbol\":\"missing\",\"impacted_count\":null,\"risk\":\"UNKNOWN\"}'\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("XMUSTARD_CORE_BIN", core)
