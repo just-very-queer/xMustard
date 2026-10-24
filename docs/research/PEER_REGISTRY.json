@@ -1,0 +1,78 @@
+{
+  "schema_version": 1,
+  "as_of": "2026-10-03",
+  "peers": [
+    {
+      "name": "GitNexus",
+      "repository": "abhigyanpatwari/GitNexus",
+      "canonical_url": "https://github.com/abhigyanpatwari/GitNexus",
+      "source_present": true,
+      "superseded_by": null,
+      "last_commit_date": "2026-09-24"
+    },
+    {
+      "name": "Serena",
+      "repository": "oraios/serena",
+      "canonical_url": "https://github.com/oraios/serena",
+      "source_present": true,
+      "superseded_by": null,
+      "last_commit_date": "2026-09-23"
+    },
+    {
+      "name": "Augment Context Engine",
+      "repository": null,
+      "canonical_url": "https://docs.augmentcode.com/context-services/mcp/overview",
+      "source_present": false,
+      "superseded_by": null,
+      "last_commit_date": null
+    },
+    {
+      "name": "Sourcegraph",
+      "repository": "sourcegraph/sourcegraph",
+      "canonical_url": "https://github.com/sourcegraph/sourcegraph",
+      "source_present": true,
+      "superseded_by": null,
+      "last_commit_date": null
+    },
+    {
+      "name": "Mem0",
+      "repository": "mem0ai/mem0",
+      "canonical_url": "https://github.com/mem0ai/mem0",
+      "source_present": true,
+      "superseded_by": null,
+      "last_commit_date": "2026-09-23"
+    },
+    {
+      "name": "Letta (retired server)",
+      "repository": "letta-ai/letta",
+      "canonical_url": "https://github.com/letta-ai/letta",
+      "source_present": false,
+      "superseded_by": "letta-code",
+      "last_commit_date": "2026-08-15"
+    },
+    {
+      "name": "Letta Code",
+      "repository": "letta-ai/letta-code",
+      "canonical_url": "https://github.com/letta-ai/letta-code",
+      "source_present": true,
+      "superseded_by": null,
+      "last_commit_date": "2026-09-24"
+    },
+    {
+      "name": "Zep (hosted)",
+      "repository": null,
+      "canonical_url": "https://www.getzep.com/",
+      "source_present": false,
+      "superseded_by": null,
+      "last_commit_date": null
+    },
+    {
+      "name": "Graphiti",
+      "repository": "getzep/graphiti",
+      "canonical_url": "https://github.com/getzep/graphiti",
+      "source_present": true,
+      "superseded_by": null,
+      "last_commit_date": "2026-09-24"
+    }
+  ]
+}
