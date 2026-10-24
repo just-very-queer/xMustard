@@ -3,7 +3,8 @@
 // delivery state machine; the real Pi + Go behavior is covered by test/e2e.
 
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import http from "node:http";
 import type net from "node:net";
 import os from "node:os";
@@ -14,6 +15,7 @@ import { type AdapterConfig, loadConfig, PI_POLICY_TARGET } from "../src/config.
 import {
 	argsDigest,
 	CAPTURE_PAUSE_MS,
+	carriesHandle,
 	Capturer,
 	DELIVERY_HEADER,
 	expand,
@@ -29,6 +31,7 @@ import {
 	runTool,
 } from "../src/delivery.ts";
 import { callerTools, WorkspaceResolver } from "../src/workspace.ts";
+import { isLoopbackHttp, mutateBashInput, newWrappedCalls, recordWrappedCall, rememberWrapped, shellQuote, shouldActivateExpand, shouldWrapBash, wrapperEndpoint, wrapperOnPath, WRAPPER_DEFAULT_API } from "../src/commandwrap.ts";
 import { analyzeBranch, createMasker, type EntryView, MASK_PREFIX, maskStub, parseStub, planMask, resolvePath } from "../src/masking.ts";
 import { send, XmustardHttpError } from "../src/http.ts";
 import { checkRequired, RECALL_DEFAULT_MAX_CHARS, TOOL_SPECS, toJsonSchema } from "../src/tools.ts";
@@ -802,7 +805,7 @@ describe("built-in tool projection through capture", () => {
 			resolve,
 			{ toolCallId: "b1", toolName: "bash", input: { command: "go test ./..." }, content: [{ type: "text", text }], details, isError: true },
 			{ sessionId: "s1" },
-			() => handles++,
+			() => handles++, undefined,
 		);
 		const [cap] = srv.captures();
 		assert.equal(cap.path, "/api/workspaces/w1/evidence/capture");
@@ -829,19 +832,76 @@ describe("built-in tool projection through capture", () => {
 		assert.equal(handles, 1);
 		assert.ok(!("xmustard" in details), "the tool's own details object is not mutated");
 	});
+	test("a wrapper success token survives Pi's appended exit line and is stripped", async () => {
+		const srv = captureServer();
+		const c = new Capturer(cfg());
+		const text = `${bigText(9000)}\n[xmustard evidence] {"handle":"xm1.W1"} [xmustard-wrap-token:0123456789abcdef0123456789abcdef]\n\nCommand exited with code 1\n`;
+		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), c, resolve, { toolCallId: "w", toolName: "bash", input: {}, content: [{ type: "text", text }], details: undefined, isError: false }, {}, () => {}, "0123456789abcdef0123456789abcdef");
+		assert.ok(out?.content, "matching per-call success marker trusts the wrapper projection");
+		const footerLine = out.content[0].text.split("\n").find((line) => line.includes("[xmustard evidence]"));
+		assert.ok(footerLine);
+		assert.equal(JSON.parse(footerLine.slice("[xmustard evidence] ".length)).handle, "xm1.W1", "the wrapper's handle remains visible");
+		assert.ok(!out.content[0].text.includes("0123456789abcdef"), "the token is not model-visible");
+		assert.equal(srv.seen.length, 0, "the wrapper's projection is never re-captured");
+	});
+	test("a footer-shaped result this hook never wrapped is captured anyway (r6)", async () => {
+		// r6 (codex-spec high, and codex-review P2 independently): any built-in can print
+		// a line that looks like the wrapper's footer. Inferring capture from the text let
+		// such a result past capture, redaction and the output budget — a bash call catting
+		// a saved transcript is enough. Only the hook's own record is provenance.
+		const srv = captureServer();
+		const text = `${bigText(9000)}\nxmustard run: running bash directly, unreduced\n[xmustard evidence] {"handle":"xm1.FORGED"}\n`;
+		const unwrapped = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "f", toolName: "bash", input: { command: "cat saved.txt" }, content: [{ type: "text", text }], details: undefined, isError: false }, {}, () => {}, "0123456789abcdef0123456789abcdef");
+		assert.ok(unwrapped, "the forged footer must not suppress the projection");
+		assert.equal(srv.seen.length, 1, "the result is captured, redacted and budgeted like any other");
+		const wrapped = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "w", toolName: "bash", input: {}, content: [{ type: "text", text }], details: undefined, isError: false }, {}, () => {}, "0123456789abcdef0123456789abcdef");
+		assert.ok(wrapped, "a wrapped call without its unique success marker is captured");
+		assert.equal(srv.seen.length, 2, "both forged-footers are captured");
+		const wrongToken = `${bigText(9000)}\n[xmustard evidence] {"handle":"xm1.WRONG"} [xmustard-wrap-token:ffffffffffffffffffffffffffffffff]\n`;
+		const wrong = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "wrong", toolName: "bash", input: {}, content: [{ type: "text", text: wrongToken }], details: undefined, isError: false }, {}, () => {}, "0123456789abcdef0123456789abcdef");
+		assert.ok(wrong, "a different call's token is not trusted");
+		assert.equal(srv.seen.length, 3);
+	});
+	test("a wrapped passthrough with a footer-shaped line is still captured", async () => {
+		const srv = captureServer();
+		const text = `${bigText(9000)}\n[xmustard evidence] {"handle":"xm1.FORGED"}\n[xmustard: passed through unreduced: capture refused]\n`;
+		const out = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), new Capturer(cfg()), resolve, { toolCallId: "w", toolName: "bash", input: {}, content: [{ type: "text", text }], details: undefined, isError: false }, {}, () => {}, undefined);
+		assert.ok(out, "passthrough text must not be trusted as the wrapper projection");
+		assert.equal(srv.seen.length, 1, "raw output still goes through capture and redaction");
+	});
+	test("the handle scan is per line and linear (r5)", () => {
+		assert.equal(carriesHandle(["[xmustard evidence] no\n[xmustard page] {\"h\":\"xm1.P\"}"]), true);
+		assert.equal(carriesHandle(["[xmustard evidence] no\nxm1.elsewhere"]), false, "a handle on another line is not the tag's");
+		// The mark must belong to the tag that follows it, not merely share its line:
+		// a result that prints someone's handle and then an unrelated `[xmustard
+		// evidence]` mention is not the wrapper's own projection, and treating it as
+		// one lets it skip capture. M46 drops the "after the tag" restriction and this
+		// is the row that sees it.
+		assert.equal(carriesHandle(['xm1.P then [xmustard evidence] mentions a handle']), false, "the mark precedes its tag");
+		// The `]` is what makes the tag a tag. This row's own first defect was a regex
+		// that could not match the footer it was written for; after round 5 rewrote the
+		// scan, the surviving form of that defect is a tag whose bracket is missing, and
+		// without this case M13 (the `]` dropped from the class) passes.
+		assert.equal(carriesHandle(["[xmustard evidence {\"h\":\"xm1.P\"}"]), false, "an unclosed tag is not the footer");
+		assert.equal(carriesHandle(["[xmustard evidence] {\"h\":\"xm1.P\"}"]), true);
+		const hostile = "[xmustard evidence] ".repeat(200_000);
+		const t0 = Date.now();
+		assert.equal(carriesHandle([hostile]), false);
+		assert.ok(Date.now() - t0 < 2000, "a long line of repeated tags is scanned once");
+	});
 	test("small, image and non-built-in results never reach Go", async () => {
 		const srv = captureServer();
 		const c = new Capturer(cfg());
-		const small = await projectBuiltin(cfg(), c, resolve, { toolCallId: "s", toolName: "read", input: {}, content: [{ type: "text", text: "x".repeat(PI_POLICY_TARGET) }], details: undefined, isError: false }, {}, () => {});
+		const small = await projectBuiltin(cfg(), c, resolve, { toolCallId: "s", toolName: "read", input: {}, content: [{ type: "text", text: "x".repeat(PI_POLICY_TARGET) }], details: undefined, isError: false }, {}, () => {}, undefined);
 		const img = await projectBuiltin(
 			cfg(),
 			c,
 			resolve,
 			{ toolCallId: "i", toolName: "read", input: {}, content: [{ type: "text", text: bigText(9000) }, { type: "image", data: "AAAA", mimeType: "image/png" }], details: undefined, isError: false },
 			{},
-			() => {},
+			() => {}, undefined,
 		);
-		const other = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), c, resolve, { toolCallId: "o", toolName: "read", input: {}, content: [{ type: "text", text: bigText(9000) }], details: undefined, isError: false }, {}, () => {});
+		const other = await projectBuiltin(cfg({ builtins: new Set(["bash"]) }), c, resolve, { toolCallId: "o", toolName: "read", input: {}, content: [{ type: "text", text: bigText(9000) }], details: undefined, isError: false }, {}, () => {}, undefined);
 		assert.deepEqual([small, img, other], [undefined, undefined, undefined]);
 		assert.equal(srv.seen.length, 0);
 	});
@@ -850,45 +910,45 @@ describe("built-in tool projection through capture", () => {
 		const srv = captureServer(() => ({ status: 503, body: { reason: "redaction_unavailable", error: "capture is disabled until a streaming secret redactor is configured" } }));
 		const c = new Capturer(cfg(), () => now);
 		const ev = { toolCallId: "u", toolName: "bash", input: { command: "yes" }, content: [{ type: "text", text: bigText(9000) }], details: undefined, isError: false };
-		const out = await projectBuiltin(cfg(), c, resolve, ev, {}, () => assert.fail("no handle"));
+		const out = await projectBuiltin(cfg(), c, resolve, ev, {}, () => assert.fail("no handle"), undefined);
 		assert.equal(out?.content, undefined, "content untouched");
 		assert.match((out?.details as any).xmustard.reason, /503 redaction_unavailable/);
 		assert.equal(srv.captures().length, 1);
-		const again = await projectBuiltin(cfg(), c, resolve, ev, {}, () => {});
+		const again = await projectBuiltin(cfg(), c, resolve, ev, {}, () => {}, undefined);
 		assert.match((again?.details as any).xmustard.reason, /capture paused/);
 		assert.equal(srv.captures().length, 1, "paused: no second request");
 		now += CAPTURE_PAUSE_MS + 1;
-		await projectBuiltin(cfg(), c, resolve, ev, {}, () => {});
+		await projectBuiltin(cfg(), c, resolve, ev, {}, () => {}, undefined);
 		assert.equal(srv.captures().length, 2, "retried after the pause");
 		// a principal that may not capture (reader token) is not asked again either
 		const denied = captureServer(() => ({ status: 403, body: { reason: "forbidden", error: "role proposer required" } }));
 		const d = new Capturer(cfg(), () => now);
-		await projectBuiltin(cfg(), d, resolve, ev, {}, () => {});
-		await projectBuiltin(cfg(), d, resolve, ev, {}, () => {});
+		await projectBuiltin(cfg(), d, resolve, ev, {}, () => {}, undefined);
+		await projectBuiltin(cfg(), d, resolve, ev, {}, () => {}, undefined);
 		assert.equal(denied.captures().length, 1);
 		assert.match(d.paused ?? "", /403/);
 		// other refusals (quota, size) are per output: no pause
 		const quota = captureServer(() => ({ status: 507, body: { reason: "quota_full", error: "quota" } }));
 		const q = new Capturer(cfg(), () => now);
-		await projectBuiltin(cfg(), q, resolve, ev, {}, () => {});
-		await projectBuiltin(cfg(), q, resolve, ev, {}, () => {});
+		await projectBuiltin(cfg(), q, resolve, ev, {}, () => {}, undefined);
+		await projectBuiltin(cfg(), q, resolve, ev, {}, () => {}, undefined);
 		assert.equal(quota.captures().length, 2);
 		assert.equal(q.paused, undefined);
 	});
 	test("an unshapable capture or an unresolved workspace keeps Pi's result", async () => {
 		captureServer((s) => (s.path.endsWith("/capture") ? { body: observation({ shape: { client: "pi", shape: "pi.tool_result", mode: "fallback_original", reason: "status members" } }) } : undefined));
 		const ev = { toolCallId: "f", toolName: "grep", input: { pattern: "x" }, content: [{ type: "text", text: bigText(9000) }], details: { matchLimitReached: 100 }, isError: false };
-		const out = await projectBuiltin(cfg(), new Capturer(cfg()), resolve, ev, {}, () => assert.fail("no handle"));
+		const out = await projectBuiltin(cfg(), new Capturer(cfg()), resolve, ev, {}, () => assert.fail("no handle"), undefined);
 		assert.equal(out?.content, undefined);
 		assert.equal((out?.details as any).matchLimitReached, 100);
 		assert.match((out?.details as any).xmustard.reason, /fallback_original/);
-		const noWs = await projectBuiltin(cfg(), new Capturer(cfg()), async () => Promise.reject(new Error("no workspace resolved")), ev, {}, () => {});
+		const noWs = await projectBuiltin(cfg(), new Capturer(cfg()), async () => Promise.reject(new Error("no workspace resolved")), ev, {}, () => {}, undefined);
 		assert.equal(noWs?.content, undefined);
 		assert.match((noWs?.details as any).xmustard.reason, /no workspace resolved/);
 	});
 	test("a lowered projection target is sent to Go", async () => {
 		const srv = captureServer();
-		await projectBuiltin(cfg({ projectionTarget: 4096 }), new Capturer(cfg()), resolve, { toolCallId: "t", toolName: "ls", input: {}, content: [{ type: "text", text: bigText(600) }], details: undefined, isError: false }, {}, () => {});
+		await projectBuiltin(cfg({ projectionTarget: 4096 }), new Capturer(cfg()), resolve, { toolCallId: "t", toolName: "ls", input: {}, content: [{ type: "text", text: bigText(600) }], details: undefined, isError: false }, {}, () => {}, undefined);
 		assert.equal(srv.captures()[0].query.get("target"), "4096");
 	});
 	test("whoami scopes the nine tools; any failure keeps them all", async () => {
@@ -1254,5 +1314,387 @@ describe("session_before_compact snapshot", () => {
 		assert.match(reasons[1], /custom instructions/);
 		assert.equal(srv.seen.length, n, "no request for a focused compaction");
 		assert.equal(await createCompactor({ enabled: false, capturer: new Capturer(cfg()), resolveWorkspace: async () => "w1", onHandle: () => {} })({ preparation: prep, branchEntries: b.entries }, ctxOf(b)), undefined);
+	});
+});
+
+describe("bash command wrapping (WS-44e, PAR-ADP-09)", () => {
+	// The wrapped form Pi ends up executing. The oracle is bash itself, not this
+	// file's own template: `bash -c <quoted>` is what makes a pipeline, a redirect
+	// or `cd sub && make` survive, because the wrapper execs argv[0] directly rather
+	// than through a shell.
+	const WRAP_TOKEN = "0123456789abcdef0123456789abcdef";
+	const WRAPPED = (ws: string, command: string) => `XMUSTARD_WRAP_TOKEN='${WRAP_TOKEN}' xmustard-core run --workspace ${shellQuote(ws)} -- bash -c ${shellQuote(command)}`;
+	const wrapInput = (input: unknown, ws: string | undefined, enabled: boolean): unknown => {
+		const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: structuredClone(input) as Record<string, unknown> };
+		mutateBashInput(event, ws, enabled, WRAP_TOKEN);
+		return event.input;
+	};
+
+	// shRuns is the independent check that the wrapped argv still performs the
+	// model's command. It runs the wrapped command field through a real shell, the
+	// same way the wrapper's Command::new(&argv[0]) does. WS44E_TMP points the
+	// redirection cases at a temp path so no case writes into the package directory.
+	let shRunSeq = 0;
+	const shRuns = (argv: string): string => execFileSync("/bin/bash", ["-c", argv], {
+		encoding: "utf8",
+		env: { ...process.env, WS44E_TMP: path.join(os.tmpdir(), `ws44e-${process.pid}-${shRunSeq++}`) },
+	});
+
+	test("off by default: a bash command is byte-identical when the knob is unset", () => {
+		const input = { command: "ls -la /tmp" };
+		assert.deepEqual(wrapInput(input, "ws-1", false), input);
+		assert.equal(loadConfig({}).wrapBash, false, "XMUSTARD_PI_WRAP_BASH defaults off");
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "1" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "on" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "true" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "yes" }).wrapBash, true);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "ON" }).wrapBash, true, "the knob is case-insensitive");
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "0" }).wrapBash, false);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "off" }).wrapBash, false);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: "" }).wrapBash, false);
+		assert.equal(loadConfig({ XMUSTARD_PI_WRAP_BASH: " 1 " }).wrapBash, true, "surrounding space is trimmed");
+	});
+
+	test("a bash command is rewritten in place to the run wrapper, keeping timeout", () => {
+		assert.deepEqual(wrapInput({ command: "ls -la /tmp" }, "ws-1", true), { command: WRAPPED("ws-1", "ls -la /tmp") });
+		assert.deepEqual(wrapInput({ command: "go test ./...", timeout: 5000 }, "ws-1", true), { command: WRAPPED("ws-1", "go test ./..."), timeout: 5000 });
+	});
+
+	// The argv after `--` is exactly three fields: the shell, its -c flag, and one
+	// quoted string holding the model's command. Splitting on spaces would be wrong
+	// for a command that contains one, so a real shell does the splitting and prints
+	// each field on its own line.
+	const argvFields = (command: string): string[] => {
+		const wrapped = wrapInput({ command }, "ws-1", true) as { command: string };
+		const tail = wrapped.command.slice(wrapped.command.indexOf(" -- ") + 4);
+		assert.ok(tail.startsWith("bash -c "), `the wrapped form addresses a shell: ${tail}`);
+		const printed = shRuns(`set -- ${tail}; for f do printf '%s\\n' "$f"; done`);
+		return printed.split("\n").slice(0, -1);
+	};
+
+	test("the wrapped argv is exactly shell, -c, and one quoted command string", () => {
+		for (const command of ["ls", "cd sub && make", "a | b > out.txt", "printf 'x y'", "echo a  b"]) {
+			const argv = argvFields(command);
+			assert.deepEqual(argv, ["bash", "-c", command], `argv after -- for ${JSON.stringify(command)}`);
+		}
+	});
+
+	test("the wrapped command still does what the model asked, checked by bash itself", () => {
+		// Each case is one that a bare `Command::new(&argv[0])` would break: a
+		// pipeline needs a shell, `&&` needs a shell, redirection needs a shell, and
+		// an embedded quote must survive being nested inside the wrapper's own
+		// single-quoted argv. The expected values are what bash must produce,
+		// written out here rather than computed by the code under test. A case
+		// compared trimmed (the flag) has an output whose exact bytes depend on
+		// something outside the row: whether a pipe has a tty decides `wc`'s
+		// padding, and `printf %s` adds no trailing newline. What is asserted is
+		// that the command survives, not how a tool formats its count.
+		const cases: [string, string, boolean][] = [
+			["printf 'a\\nb\\n' | wc -l", "2", true],
+			["cd . && echo yes", "yes", false],
+			[`echo "it's here"`, "it's here", false],
+			["echo '$HOME'", "$HOME", false],
+			["echo x; echo y", "x\ny", false],
+			[`printf '%s' "a'b'c"`, "a'b'c", true],
+			["echo done > $WS44E_TMP && cat $WS44E_TMP", "done", false],
+			["echo one two three | tr ' ' '-'", "one-two-three", false],
+			// bash-only syntax, which the build box's /bin/sh (dash) refuses with
+			// exit 127 and exit 2 respectively. The interpreter is bash for this reason.
+			["[[ ab == a* ]] && echo match", "match", false],
+			["a=(x y); echo ${a[1]}", "y", false],
+		];
+		for (const [command, want, trim] of cases) {
+			const argv = argvFields(command);
+			// `bash -c <field>` is what the wrapper would exec. The field is
+			// re-quoted because it is interpolated into a shell string here, and an
+			// unquoted `|` would pipe the outer shell instead of reaching the inner one.
+			const got = shRuns(`bash -c ${shellQuote(argv[2])}`);
+			assert.equal(trim ? got.trim() : got, trim ? want : `${want}\n`, `must survive: ${command}`);
+		}
+	});
+
+	test("the interpreter is bash, because the tool being wrapped is Pi's bash", () => {
+		// Naming the tool `bash` and running it under dash is the round-2 finding:
+		// measured on the build box, /bin/sh -> dash, where `[[ ]]` exits 127.
+		const wrapped = wrapInput({ command: "[[ x == x ]]" }, "ws-1", true) as { command: string };
+		assert.match(wrapped.command, / -- bash -c /, "the argv's program is bash, not sh");
+		assert.doesNotMatch(wrapped.command, / -- sh -c /);
+	});
+
+	test("shellQuote escapes an embedded quote and leaves ordinary text readable", () => {
+		// The POSIX idiom is close-quote, escaped quote, reopen-quote. The literal is
+		// the shape a reviewer can check by eye; the round trip is the proof.
+		assert.equal(shellQuote("plain"), "'plain'");
+		assert.equal(shellQuote("it's"), `'it'"'"'s'`);
+		for (const raw of ["plain", "it's", "a'b'c", "''", "$(whoami)", "`id`", "a b", "a\nb", "\\", '"', "xm1.abc"]) {
+			assert.equal(shRuns(`printf '%s' ${shellQuote(raw)}`), raw, `must round-trip: ${JSON.stringify(raw)}`);
+		}
+	});
+
+	test("the workspace id is quoted too, so an id with a quote or space cannot break out", () => {
+		for (const ws of ["ws-1", "w s", "a'b", "$(id)"]) {
+			assert.deepEqual(wrapInput({ command: "ls" }, ws, true), { command: WRAPPED(ws, "ls") }, ws);
+		}
+	});
+
+	test("the mutation reaches the caller's object, which is how Pi applies it", () => {
+		const input = { command: "ls" };
+		const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input };
+		mutateBashInput(event, "ws-1", true, WRAP_TOKEN);
+		assert.equal(event.input.command, WRAPPED("ws-1", "ls"), "the same object Pi executes is rewritten");
+	});
+
+	test("a command that is empty, blank or already wrapped is left byte-identical", () => {
+		for (const command of ["", "   ", "\t\n", WRAPPED("ws-1", "ls"), "xmustard-core run -- ls", "/usr/local/bin/xmustard-core run -- ls"]) {
+			assert.deepEqual(wrapInput({ command }, "ws-1", true), { command }, `must not wrap: ${JSON.stringify(command)}`);
+		}
+	});
+
+	test("no resolved workspace means no wrap: the command runs natively", () => {
+		assert.deepEqual(wrapInput({ command: "ls" }, undefined, true), { command: "ls" });
+		assert.deepEqual(wrapInput({ command: "ls" }, "", true), { command: "ls" });
+		assert.deepEqual(wrapInput({ command: "ls" }, "   ", true), { command: "ls" }, "a whitespace-only id is no id");
+	});
+
+	test("only bash is wrapped; every other tool keeps byte-identical input", () => {
+		for (const toolName of ["read", "grep", "find", "ls", "edit", "write", "powershell", "ground", "search", "impact", "xmustard_expand", "my_custom_tool"]) {
+			const input = toolName === "read" || toolName === "edit" || toolName === "write" ? { path: "/a/b.go", command: "x" } : { command: "ls", path: "/a" };
+			const event = { type: "tool_call" as const, toolCallId: "c1", toolName, input: structuredClone(input) as Record<string, unknown> };
+			mutateBashInput(event as never, "ws-1", true);
+			assert.deepEqual(event.input, input, `${toolName} must not be wrapped`);
+		}
+	});
+
+	test("a non-object or commandless input is left alone rather than throwing", () => {
+		for (const input of [undefined, null, {}, { command: 7 }, { command: null }, []]) {
+			const event = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input } as never;
+			assert.doesNotThrow(() => mutateBashInput(event, "ws-1", true), JSON.stringify(input));
+		}
+		for (const event of [undefined, null, 7, "bash", [], { toolName: "bash" }, { toolName: 7, input: { command: "ls" } }]) {
+			assert.doesNotThrow(() => mutateBashInput(event, "ws-1", true), JSON.stringify(event));
+		}
+	});
+
+	test("wrapping is idempotent through the wrapper's own argv parser", () => {
+		// the wrapped form parses back to the same wrapper invocation, so a model that
+		// repeats a wrapped command does not nest two wrappers
+		const once = WRAPPED("ws-1", "ls -la");
+		assert.deepEqual(wrapInput({ command: once }, "ws-1", true), { command: once });
+		const twice = `xmustard-core run --workspace 'ws-1' -- ${once}`;
+		assert.deepEqual(wrapInput({ command: twice }, "ws-1", true), { command: twice });
+	});
+
+	// The hook's refusals, before any workspace lookup is paid for.
+	const bash = { type: "tool_call" as const, toolCallId: "c1", toolName: "bash", input: { command: "ls" } };
+	const BASE = "http://127.0.0.1:8077";
+	const ON = { enabled: true, wrapperAvailable: true, token: undefined, wrapperToken: undefined, wrapperApiBase: BASE, apiBase: BASE };
+
+	test("the hook wraps a bash call when the knob is on and no token is at stake", () => {
+		assert.equal(shouldWrapBash(bash, ON), true);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: BASE }), true, "the same base is not a conflict");
+	});
+
+	test("the hook refuses when the knob is off", () => {
+		assert.equal(shouldWrapBash(bash, { ...ON, enabled: false }), false);
+	});
+
+	test("the hook refuses every tool that is not bash", () => {
+		for (const toolName of ["read", "grep", "find", "ls", "edit", "write", "powershell", "ground", "search", "impact", "xmustard_expand", "my_custom_tool"]) {
+			assert.equal(shouldWrapBash({ ...bash, toolName }, ON), false, `${toolName} must not be wrapped`);
+		}
+		for (const event of [undefined, null, 7, "bash", [], {}, { toolName: 7 }, { toolName: "Bash" }, { toolName: "bash " }]) {
+			assert.equal(shouldWrapBash(event, ON), false, `must not be wrapped: ${JSON.stringify(event)}`);
+		}
+	});
+
+	test("the hook refuses unless the wrapper can authenticate with this process's own token", () => {
+		// The wrapper reads XMUSTARD_API_TOKEN from its own environment and a
+		// tool_call hook cannot change it, so a token this process cannot pass on
+		// means the wrapped command would fail inside the wrapper. It runs natively
+		// instead and projectBuiltin captures the result.
+		const authed = { ...ON, token: "secret" };
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: undefined }), false, "no wrapper token at all");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "" }), false, "an empty wrapper token is no token");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "   " }), false, "whitespace is not a token; the wrapper's nonblank() ignores it");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "other" }), false, "a different token would authenticate as somebody else");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: "secret" }), true, "the same token wraps");
+		assert.equal(shouldWrapBash(bash, { ...authed, wrapperToken: " secret " }), true, "padding is the same credential, since the adapter trims its own");
+		assert.equal(shouldWrapBash(bash, ON), true, "no token configured means nothing to pass");
+	});
+
+	test("the hook refuses a wrapper token the adapter does not hold (r4-2)", () => {
+		// The wrapper would capture with its token and xmustard_expand would then call
+		// with none and get a 401: the handle the model holds would be unusable.
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "t" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, token: "", wrapperToken: "t" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperToken: "  " }), true, "a blank wrapper token is no token");
+	});
+
+	test("the hook refuses when no executable wrapper is on PATH (r4-1)", () => {
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperAvailable: false }), false);
+		const dir = mkdtempSync(path.join(os.tmpdir(), "xm-wrap-"));
+		try {
+			assert.equal(wrapperOnPath(dir), false, "an empty directory holds no wrapper");
+			const asDir = path.join(dir, "d");
+			mkdirSync(path.join(asDir, "xmustard-core"), { recursive: true });
+			assert.equal(wrapperOnPath(asDir), false, "a directory named xmustard-core is not a wrapper");
+			assert.equal(wrapperOnPath(undefined), false);
+			assert.equal(wrapperOnPath(""), false, "an empty PATH holds no wrapper");
+			const bin = path.join(dir, "xmustard-core");
+			writeFileSync(bin, "#!/bin/sh\n", { mode: 0o644 });
+			assert.equal(wrapperOnPath(dir), false, "a non-executable file is not a wrapper");
+			chmodSync(bin, 0o755);
+			assert.equal(wrapperOnPath(`/nonexistent${path.delimiter}${dir}`), true);
+		} finally {
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	test("the hook refuses when the wrapper would reach a different API than this adapter", () => {
+		// The wrapper's effective endpoint, not only an explicit one. A different
+		// server means the capture lands outside the workspace the adapter resolved.
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: WRAPPER_DEFAULT_API }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "" }), false, "an empty base is the wrapper's default, not the adapter's");
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: BASE }), true);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: ` ${BASE}// ` }), true, "a trailing slash is the same server (r4-3)");
+	});
+
+	test("an unset wrapper base is the wrapper's own default, not agreement (r6)", () => {
+		// r6 P1: the rule compared only an explicit value, so a session pointed at a
+		// custom base with nothing set for the wrapper was allowed to wrap, and the
+		// wrapper captured on ITS default and issued a handle this adapter cannot spend.
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: undefined, apiBase: BASE }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "  ", apiBase: BASE }), false, "blank is unset, so the default applies");
+		assert.equal(
+			shouldWrapBash(bash, { ...ON, wrapperApiBase: undefined, apiBase: WRAPPER_DEFAULT_API }),
+			true,
+			"a session already on the wrapper's default needs nothing set",
+		);
+		assert.equal(wrapperEndpoint(undefined), WRAPPER_DEFAULT_API);
+		assert.equal(wrapperEndpoint("  "), WRAPPER_DEFAULT_API);
+		assert.equal(wrapperEndpoint(` ${BASE}// `), BASE);
+	});
+
+	test("the hook refuses an API the wrapper cannot reach at all (r6)", () => {
+		// The wrapper speaks plain http on loopback only and refuses any other host
+		// before it starts, so an https or remote adapter base means the promised
+		// projection can never happen and the wrap would only degrade to native output.
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077"), true);
+		assert.equal(isLoopbackHttp("http://localhost:8077"), true);
+		assert.equal(isLoopbackHttp("http://127.5.5.5:8077"), true, "the whole 127/8 is loopback");
+		assert.equal(isLoopbackHttp("http://[::1]:8077"), true);
+		assert.equal(isLoopbackHttp("https://127.0.0.1:8077"), false, "the wrapper has no TLS");
+		assert.equal(isLoopbackHttp("http://box.example:8077"), false, "a remote host is refused before the upload");
+		assert.equal(isLoopbackHttp("http://127.0.0.1.evil.example:8077"), false, "loopback is the host, not a prefix of it");
+		assert.equal(isLoopbackHttp("not a url"), false);
+		assert.equal(isLoopbackHttp(""), false);
+		// r7: the wrapper's split_api keeps the authority and drops the path, so equal
+		// strings can still address different endpoints: the adapter would send
+		// /xm/api/... and the wrapper would post to /api/... on the same host.
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/"), true, "a bare trailing slash is no path");
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/xm"), false, "a path prefix the wrapper discards");
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/xm/"), false);
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/?a=b"), false, "a query is not part of the wrapper's endpoint");
+		assert.equal(isLoopbackHttp("http://127.0.0.1:8077/#frag"), false);
+		// And the refusal reaches the decision, for both sides agreeing on the base.
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "https://box.example", apiBase: "https://box.example" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "http://box.example", apiBase: "http://box.example" }), false);
+		assert.equal(shouldWrapBash(bash, { ...ON, wrapperApiBase: "http://127.0.0.1:8077/xm", apiBase: "http://127.0.0.1:8077/xm" }), false, "r7: same string, different endpoint");
+	});
+
+	test("only a call the hook actually rewrote is recorded (r7)", () => {
+		// r7 (codex-spec high): the hook recorded the call unconditionally, so a
+		// command left alone — blank, malformed, or already wrapped — ran natively and
+		// its result's footer-shaped text was still trusted as a capture that never
+		// happened. mutateBashInput's own answer is the only honest record.
+		assert.equal(mutateBashInput(bash, "w1", true), true, "a real rewrite reports true");
+		assert.equal(mutateBashInput(bash, "w1", true), false, "the second pass sees it already wrapped");
+		assert.equal(mutateBashInput(bash, "   ", true), false, "no workspace resolved");
+		assert.equal(mutateBashInput(bash, undefined, true), false);
+		assert.equal(mutateBashInput(bash, "w1", false), false, "the knob is off");
+		const blank = { type: "tool_call" as const, toolCallId: "b", toolName: "bash", input: { command: "   " } };
+		assert.equal(mutateBashInput(blank, "w1", true), false, "a blank command is left native");
+		assert.equal(blank.input.command, "   ", "and is untouched");
+		const malformed = { type: "tool_call" as const, toolCallId: "m", toolName: "bash", input: { command: 7 } };
+		assert.equal(mutateBashInput(malformed, "w1", true), false, "a non-string command is left native");
+		const already = { type: "tool_call" as const, toolCallId: "a", toolName: "bash", input: { command: "xmustard-core run -- ls" } };
+		assert.equal(mutateBashInput(already, "w1", true), false, "an already wrapped command runs natively");
+		assert.equal(already.input.command, "xmustard-core run -- ls", "and is not wrapped twice");
+		// The record follows the hook's own rewrite answer, exercised through the
+		// function the hook calls rather than a re-pairing of the two at the test's
+		// own call site: a hook that recorded unconditionally would let a command the
+		// rewrite declined skip capture on a footer-shaped line, and M36 is the row
+		// that proves this assertion sees it.
+		const calls = newWrappedCalls();
+		assert.equal(recordWrappedCall(calls, blank, "w1", true), false, "nothing was rewritten");
+		assert.equal(calls.size, 0, "so nothing is recorded");
+		// A fresh fixture: the rewrite is in place, so the shared `bash` above is
+		// already wrapped by the time this line runs and would report false.
+		const fresh = { type: "tool_call" as const, toolCallId: "c2", toolName: "bash", input: { command: "ls" } };
+		assert.equal(recordWrappedCall(calls, fresh, "w1", true), true, "a real rewrite reports true");
+		assert.match(calls.get("c2") ?? "", /^[0-9a-f]{32}$/, "and the call's private token is recorded");
+		assert.equal(calls.size, 1, "one rewrite, one record");
+		// The refused path never records, so its result is captured rather than trusted.
+		assert.equal(recordWrappedCall(calls, already, "w1", true), false, "already wrapped");
+		assert.equal(calls.size, 1, "a declined rewrite adds no record");
+	});
+
+	test("only a call the hook rewrote is treated as already captured (r6)", () => {
+		// r6 (codex-spec high): an untrusted built-in result can print a footer-shaped
+		// line — a bash call catting a saved transcript — and inferring capture from the
+		// text let it skip capture, redaction and the output budget entirely.
+		const calls = newWrappedCalls();
+		rememberWrapped(calls, bash, "0123456789abcdef0123456789abcdef");
+		assert.match(calls.get("c1") ?? "", /^[0-9a-f]{32}$/);
+		assert.equal(calls.get("other"), undefined, "a call this hook never rewrote");
+		assert.equal(calls.size, 1);
+		// Capped, so a long session cannot grow it without bound.
+		const many = newWrappedCalls();
+		for (let i = 0; i < 300; i++) rememberWrapped(many, { toolCallId: `t${i}`, toolName: "bash" });
+		assert.equal(many.size, 256, "the oldest entries are pruned, the newest kept");
+		assert.equal(many.has("t299"), true);
+		assert.equal(many.has("t0"), false);
+	});
+});
+
+describe("a wrapper result activates expansion (WS-44e)", () => {
+	// The shape is the API's own footer (api-go/internal/evidence/capture_meta.go:
+	// "[xmustard evidence] " + json.Marshal of the footer map), which the Rust run
+	// wrapper appends verbatim (run_wrapper.rs project(): text.push_str(&footer)).
+	// json.Marshal writes no space after a colon, so the fixture does not either;
+	// writing it with JSON.stringify would not be the byte sequence Go emits.
+	const footer = (handle: string) =>
+		`[xmustard evidence] {"handle":"${handle}","workspace_id":"w1","raw_bytes":2000000,"projected_bytes":1200,"omissions":40,"search":"GET /api/workspaces/w1/evidence/search?handle=${handle}"}`;
+
+	test("a result carrying an xm1. handle in its footer counts as a handle", () => {
+		assert.equal(carriesHandle([footer("xm1.abc123")]), true);
+		assert.equal(carriesHandle(["ok", footer("xm1.abc123")]), true, "the handle may be in any block");
+		assert.equal(carriesHandle([`[xmustard masked: secret] ${footer("xm1.zz")}`]), true);
+		assert.equal(carriesHandle([`prefix\n${footer("xm1.zz")}\nsuffix`]), true, "not anchored to line start");
+	});
+
+	test("a result with no handle does not count", () => {
+		assert.equal(carriesHandle([]), false);
+		assert.equal(carriesHandle([""]), false);
+		assert.equal(carriesHandle(["total 40\ndrwxr-xr-x 2 root root 4096 Jan 1 00:00 ."]), false, "an ordinary bash result");
+		assert.equal(carriesHandle(["no handle here"]), false);
+		assert.equal(carriesHandle([footer("other-prefix.abc")]), false, "the handle must be xm1.-prefixed");
+		assert.equal(carriesHandle(['[xmustard evidence] {"handle":""}']), false, "an empty handle is not a handle");
+	});
+
+	test("a wrapper handle activates expansion whatever the built-ins set says", () => {
+		// The rule the tool_result hook applies to every result, before it decides
+		// anything else. It takes only the content, so the answer cannot depend on the
+		// tool or on XMUSTARD_PI_BUILTINS: the reduction already happened inside the
+		// wrapper, and whether the result is then projected is a separate decision.
+		const wrapped = [{ type: "text" as const, text: `projected output\n${footer("xm1.abc123")}` }];
+		const ordinary = [{ type: "text" as const, text: "total 4\ndrwxr-xr-x 2 root root 4096 ." }];
+		assert.equal(shouldActivateExpand(wrapped), true, "a wrapped result offers expansion");
+		assert.equal(shouldActivateExpand(ordinary), false, "an ordinary bash result does not");
+		assert.equal(shouldActivateExpand([{ type: "image", data: "x" }]), false, "a non-text block is never a handle");
+		assert.equal(shouldActivateExpand([]), false);
+		// A handle buried in a longer result, as it is when the wrapper's projection
+		// carries several blocks.
+		assert.equal(shouldActivateExpand([...ordinary, ...wrapped]), true, "not anchored to the first block");
 	});
 });

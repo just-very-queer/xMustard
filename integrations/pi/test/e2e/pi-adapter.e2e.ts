@@ -8,7 +8,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { appendFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { after, before, beforeEach, describe, test } from "node:test";
 import {
 	Api,
@@ -253,19 +253,55 @@ describe("Pi adapter against the real xMustard API", () => {
 		assert.ok(!run.trace.at(-1)?.active_tools.includes("xmustard_expand"), "no handle issued, so expand stays inactive");
 	});
 
-	test("a large result is projected at the source (bound identity); xmustard_expand activates and pages 64 KiB exactly", async () => {
-		const run = await pi("expand-source", [{ calls: [call("impact")] }, { expand_all: { workspace_id: "$WS" } }, { text: "done" }]);
+	test("impact is projected at its source", async () => {
+		const run = await pi("impact-source", [{ calls: [call("impact")] }, { text: "done" }]);
 		assert.equal(run.code, 0, run.stderr);
 		assertModelSawResults(run);
 		const impact = one(run, "impact");
-		const footer = footerOf(textOf(impact)) ?? assert.fail(`no evidence footer: ${textOf(impact).slice(-400)}`);
-		assert.ok(footer.handle?.startsWith("xm1."), `impact footer: ${textOf(impact).slice(-400)}`);
-		assert.equal(footer.captured_identity, "bound");
-		assert.ok(footer.raw_bytes > 3 * PAGE, `original is multi-page (${footer.raw_bytes})`);
-		assert.ok(Buffer.byteLength(textOf(impact)) <= PAGE + 2048, "projection is bounded");
+		assert.ok(Buffer.byteLength(textOf(impact)) <= PAGE + 2048, "impact response stays bounded");
 		assert.equal(impact.details?.path, "source");
-		// activation happens between the impact result and the next model request
-		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "impact"));
+	});
+
+	test("a large wrapped bash result is projected and pages 64 KiB exactly", async () => {
+		const coreBin = process.env.XM_CORE_BIN;
+		assert.ok(coreBin, "the e2e runner supplies the release core executable");
+		const command = "printf '%262144s' ''";
+		const path = `${dirname(coreBin)}${delimiter}${process.env.PATH ?? ""}`;
+		const native = await pi("expand-native-bash", [{ calls: [{ name: "bash", args: { command } }] }, { text: "done" }], {
+			env: { XMUSTARD_PI_WRAP_BASH: "0", XMUSTARD_PI_BUILTINS: "none", PATH: path },
+		});
+		assert.equal(native.code, 0, native.stderr);
+		assertModelSawResults(native);
+		const nativeBash = one(native, "bash");
+		assert.equal(nativeBash.isError, false);
+		assert.ok(textOf(nativeBash).length > 0, "native command produced output");
+		assert.equal(footerOf(textOf(nativeBash)), undefined, "without wrapping or built-in capture, no handle is issued");
+		const run = await pi(
+			"expand-wrapped-bash",
+			[
+				{ calls: [{ name: "bash", args: { command } }] },
+				{ expand_all: { workspace_id: "$WS" } },
+				{ text: "done" },
+			],
+			{
+				env: {
+					XMUSTARD_PI_WRAP_BASH: "1",
+					XMUSTARD_PI_BUILTINS: "none",
+					PATH: path,
+				},
+			},
+		);
+		assert.equal(run.code, 0, run.stderr);
+		assertModelSawResults(run);
+		const bash = one(run, "bash");
+		const footer = footerOf(textOf(bash)) ?? assert.fail(`no evidence footer: ${textOf(bash).slice(-400)}`);
+		assert.ok(!textOf(bash).includes("xmustard-wrap-token"), "private success token is stripped before model context");
+		assert.ok(footer.handle?.startsWith("xm1."), `bash footer: ${textOf(bash).slice(-400)}`);
+		assert.ok(footer.raw_bytes > 3 * PAGE, `original is multi-page (${footer.raw_bytes})`);
+		assert.equal(footer.raw_bytes, 262144);
+		assert.equal(footer.captured_identity, "unknown");
+		assert.ok(Buffer.byteLength(textOf(bash)) <= PAGE + 2048, "projection is bounded");
+		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "bash"));
 		assert.ok(!run.trace[idx - 1]?.active_tools.includes("xmustard_expand"));
 		assert.ok(run.trace[idx].active_tools.includes("xmustard_expand"));
 		const pages = pagesOf(run, footer.handle);
@@ -273,34 +309,63 @@ describe("Pi adapter against the real xMustard API", () => {
 		let off = 0;
 		for (const p of pages) {
 			assert.equal(p.offset, off);
+			assert.equal(p.freshness, "unknown");
+			assert.equal(p.stale, true);
 			assert.ok(p.length <= PAGE);
-			assert.equal(p.freshness, "current");
-			assert.equal(p.stale, false);
 			off = p.next_offset;
 		}
 		const bytes = Buffer.concat(pages.map((p) => Buffer.from(p.data_base64, "base64")));
-		assert.equal(bytes.length, footer.raw_bytes);
-		assert.equal(sha(bytes), footer.raw_sha256);
+		assert.equal(bytes.length, 262144);
+		assert.deepEqual(bytes, Buffer.alloc(262144, 0x20), "expanded bytes equal the command output");
+		const rawSHA256 = pages[0]?.raw_sha256;
+		assert.ok(rawSHA256, "expanded pages carry the original digest");
+		assert.ok(pages.every((p) => p.raw_sha256 === rawSHA256), "every page names the same original");
+		assert.equal(sha(bytes), rawSHA256);
 		for (const m of byName(run, "xmustard_expand")) assert.ok(pageHeaderOf(textOf(m)), "model sees a page header");
-		original = { handle: footer.handle, bytes, footer };
-		record("expand_source", { raw_bytes: footer.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(impact)), pages: pages.length, captured_identity: footer.captured_identity, encodings: pages.map((p) => p.text_encoding) });
+		original = { handle: footer.handle, bytes, footer: { ...footer, raw_sha256: rawSHA256, captured_key: pages[0].captured_key } };
+		record("expand_wrapped_bash", { raw_bytes: footer.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(bash)), pages: pages.length, captured_identity: footer.captured_identity, encodings: pages.map((p) => p.text_encoding) });
 	});
 
-	test("repository mutation: the old capture is served unchanged and labelled stale", async () => {
-		assert.ok(original);
+	test("repository mutation makes a bound source capture stale", async () => {
+		const source = await pi("bound-source-capture", [{ calls: [call("search", { q: "Handler", mode: "symbol", limit: "50", substring: "true", include_body: "true", include_info: "true" })] }, { text: "done" }]);
+		assert.equal(source.code, 0, source.stderr);
+		const search = one(source, "search");
+		assert.equal(search.details?.path, "source");
+		const delivery = search.details?.delivery;
+		const output = JSON.parse(textOf(search));
+		const handle = delivery?.handle ?? output.output_budget?.recover_handle ?? output.recover_handle;
+		assert.ok(handle, `source search issued a capture: ${textOf(search).slice(-400)}`);
+		const captured = await readAll(api, ws, handle);
+		assert.equal(captured.status, 200);
+		const capturedKey = captured.pages[0]?.captured_key;
+		assert.ok(capturedKey, "source capture has a captured key");
+		assert.equal(captured.pages[0]?.freshness, "current", "source capture is current before mutation");
+		original = { handle, bytes: captured.bytes, footer: { ...(delivery ?? {}), captured_key: capturedKey } };
+		assert.ok(original.footer.captured_key, "bound source capture has a captured key");
+		const coreBin = process.env.XM_CORE_BIN;
+		assert.ok(coreBin, "the e2e runner supplies the release core executable");
+		const path = `${dirname(coreBin)}${delimiter}${process.env.PATH ?? ""}`;
 		appendFileSync(join(repo, "pkg", "handler_0001.go"), "\n// mutated by e2e\n");
-		const run = await pi("stale", [{ calls: [call("impact")] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], {
-			env: { XM_OLD_HANDLE: original.handle },
+		const run = await pi("stale", [
+			{ calls: [call("impact"), { name: "bash", args: { command: "printf '%262144s' ''" } }] },
+			{ calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] },
+			{ text: "done" },
+		], {
+			env: { XM_OLD_HANDLE: original.handle, XMUSTARD_PI_WRAP_BASH: "1", PATH: path },
 		});
 		assert.equal(run.code, 0, run.stderr);
-		const fresh = footerOf(textOf(one(run, "impact")));
-		assert.notEqual(fresh?.captured_key, original.footer.captured_key, "new capture has the mutated identity");
+		const currentImpact = one(run, "impact");
+		assert.equal(currentImpact.isError, false, textOf(currentImpact).slice(0, 300));
+		const currentBash = one(run, "bash");
+		assert.equal(currentBash.isError, false, textOf(currentBash).slice(0, 300));
+		assert.ok(footerOf(textOf(currentBash))?.handle, "the new wrapper result activates expand in this session");
 		const [page] = pagesOf(run, original.handle);
 		assert.ok(page, "old handle expanded");
-		assert.equal(page.freshness, "stale");
+		assert.equal(page.freshness, "stale", "bound source capture is stale after the repository mutation");
 		assert.equal(page.stale, true);
+		assert.notEqual(page.captured_key, "", "the capture identity was bound");
+		assert.notEqual(page.current_key, page.captured_key, "repository mutation changes its identity");
 		assert.equal(page.captured_key, original.footer.captured_key);
-		assert.notEqual(page.current_key, page.captured_key);
 		assert.deepEqual(Buffer.from(page.data_base64, "base64"), original.bytes.subarray(0, page.length), "captured bytes, not current content");
 		assert.match(pageHeaderOf(textOf(one(run, "xmustard_expand")))?.freshness ?? "", /stale/);
 		record("stale", { captured_key: page.captured_key, current_key: page.current_key });
