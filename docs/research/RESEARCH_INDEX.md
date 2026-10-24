@@ -1,55 +1,54 @@
-# xMustard — Research Index (June 2026)
+# xMustard research index — verified 2026-10-24
 
-Two inputs feed this index:
-1. **Market scout** (`MARKET_SCOUT_2026-06.md`) — produced by a Sonnet agent run in tmux; it
-   drew on training knowledge (≈Aug 2025) because that session lacked live web.
-2. **Live web supplement** (below) — gathered with live web search in this session (June 2026)
-   to close the gap.
+This index records the projects named in the xMustard field-research reports dated 2026-10-03 and 2026-10-03b. Verification means checking the cited report attribution and source URL/docs during preparation of this index; it is not an endorsement, benchmark result, or claim that a repository is currently maintained. Unless a report provided an explicit activity date, project last activity remains **unknown**. Benchmarks below are cited as research inputs and are not xMustard product proof.
 
-The 12 most-relevant papers are downloaded under `papers/` (arXiv PDFs).
+## Project references
 
-## Live web supplement (June 2026)
+| Project | Source | Verification method (checked 2026-10-24) | Last activity |
+|---|---|---|---|
+| GitNexus | [GitHub](https://github.com/abhigyanpatwari/GitNexus) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Serena | [GitHub](https://github.com/oraios/serena) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| mem0 | [GitHub](https://github.com/mem0ai/mem0) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Graphiti | [GitHub](https://github.com/getzep/graphiti) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Letta Code | [GitHub](https://github.com/letta-ai/letta-code) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| OpenCode Review | [GitHub](https://github.com/alibaba/open-code-review) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Codex | [GitHub](https://github.com/openai/codex) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Pi | [GitHub](https://github.com/badlogic/pi-mono) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Cline | [GitHub](https://github.com/cline/cline) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| OpenCode | [GitHub](https://github.com/sst/opencode) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| OpenHands | [GitHub](https://github.com/All-Hands-AI/OpenHands) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| PR-Agent | [GitHub](https://github.com/qodo-ai/pr-agent) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| fallow | [GitHub](https://github.com/fallow-rs/fallow) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| ai-memory | [GitHub](https://github.com/akitaonrails/ai-memory) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| codebase-memory-mcp | [GitHub](https://github.com/DeusData/codebase-memory-mcp) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| code-review-graph | [GitHub](https://github.com/tirth8205/code-review-graph) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| ast-grep | [GitHub](https://github.com/ast-grep/ast-grep) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| cocoindex | [GitHub](https://github.com/cocoindex-io/cocoindex) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| reviewdog | [GitHub](https://github.com/reviewdog/reviewdog) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Basic Memory | [GitHub](https://github.com/basicmachines-co/basic-memory) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Cognee | [GitHub](https://github.com/topoteretes/cognee) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| LangMem | [GitHub](https://github.com/langchain-ai/langmem) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Letta (retired server) | [GitHub](https://github.com/letta-ai/letta) | Research report attribution; report notes retired repository and live-project pointer | Unknown; report records retirement |
+| SCIP | [GitHub](https://github.com/scip-code/scip) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| claude-context | [GitHub](https://github.com/zilliztech/claude-context) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| MCP Rust SDK (rmcp) | [GitHub](https://github.com/modelcontextprotocol/rust-sdk) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| SWE-bench harness | [GitHub](https://github.com/SWE-bench/SWE-bench) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| Agentless | [GitHub](https://github.com/OpenAutoCoder/Agentless) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| ContextBench | [GitHub](https://github.com/EuniAI/ContextBench), [paper](https://arxiv.org/abs/2602.05892) | Research report says repository docs/dataset were read; paper identifier and repository URL checked against report | Unknown |
+| SWE-ContextBench | [paper](https://arxiv.org/abs/2602.08316) | Research report citation and linked paper identifier | Unknown |
+| LongMemEval-V2 | [paper](https://arxiv.org/abs/2605.12493) | Research report citation and linked paper identifier | Unknown |
+| SWE-rebench | [Project site](https://swe-rebench.com/) | Research report citation and project URL | Unknown |
+| LongMemEval | [GitHub](https://github.com/xiaowu0162/LongMemEval) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| LoCoMo | [GitHub](https://github.com/snap-research/locomo) | Research report citation; report records last moved 2024-08-13 and labels it stale | 2024-08-13 (report) |
+| ChatDev | [GitHub](https://github.com/OpenBMB/ChatDev) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| crewAI | [GitHub](https://github.com/crewAIInc/crewAI) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| LangGraph | [GitHub](https://github.com/langchain-ai/langgraph) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| MetaGPT | [GitHub](https://github.com/geekan/MetaGPT) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| AutoGen | [GitHub](https://github.com/microsoft/autogen) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
+| goose | [GitHub](https://github.com/aaif-goose/goose) | Docs (research report/source documentation; checked 2026-10-24) | Unknown |
 
-Local serving / OpenAI-compatible endpoints (directly relevant to the new provider layer):
-- **Ollama 0.24** (May 2026) — added Codex App support, Gemma 4 MTP speculative decoding via the
-  MLX runner; positioned as the single-command bridge for local **or** cloud models into Codex
-  App / Claude Code / OpenCode. Confirms the value of xMustard's OpenAI-compatible provider layer.
-- **vLLM 0.21** — stabilized DeepSeek V4 on Blackwell (TOKENSPEED_MLA backend), speculative
-  decoding respects reasoning budgets.
-- **GLM-4.7 Thinking** — top open-weight coding model in 2026, available on Ollama/HF; alongside
-  DeepSeek-Coder-V2, Qwen2.5-Coder-32B, Llama-3.3-70B as the common local coding models.
-- **MCP is now table-stakes**: LangGraph, Hermes Agent, Ontheia and others are MCP-native across
-  stdio / SSE / streamable-HTTP. xMustard's 31-tool MCP server is on the right side of this.
+## Attribution and limits
 
-Sources: codersera local-AI-runtimes May 2026; langchain AI agent frameworks 2026; tech-insider
-vLLM vs Ollama 2026; whatllm best LLM for coding 2026.
+These are design references only unless the source report explicitly describes another relationship. No third-party code is represented as copied. License and attribution distinctions remain in the source reports and must be preserved in any future implementation or redistribution. The report's competitor claims and leaderboard values are not evidence of xMustard's own effectiveness.
 
-## Papers (downloaded under `papers/`)
-
-| # | Paper | arXiv | Maps to xMustard |
-|---|-------|-------|------------------|
-| 1 | SWE-bench: Resolve Real-World GitHub Issues | 2310.06770 | the benchmark our context engine + verification should be measured on |
-| 2 | SWE-agent: Agent-Computer Interfaces | 2405.15793 | minimal disciplined tool surface → informs our LSP + MCP tool API |
-| 3 | Agentless: Demystifying LLM SWE agents | 2407.01489 | locate→patch baseline; pressure-test that runtime memory earns its overhead |
-| 4 | OpenHands: Open Platform for AI Developers | 2407.16741 | sandboxed agents our MCP engine must serve cleanly |
-| 5 | RAPTOR: Tree-Organized Retrieval | 2401.18059 | multi-granularity (repo→file→symbol) retrieval, like our symbol graph |
-| 6 | HippoRAG: Long-Term Memory for LLMs | 2405.14831 | KG + PageRank associative retrieval ≈ Postgres knowledge layer + symbol graph |
-| 7 | CodeRAG-Bench: Retrieval-Augmented Code Gen | 2406.14497 | empirical case that dense+sparse hybrid (RRF) beats single retrievers for code |
-| 8 | RepoGraph: Repository-level Code Graph | 2410.14684 | tree-sitter module/call graph for context selection — validates our typed graph |
-| 9 | Multiagent Debate improves Factuality | 2305.14325 | foundation for multi-agent verification of shared context |
-| 10 | Judging LLM-as-a-Judge (MT-Bench/Arena) | 2306.05685 | calibration/bias of the verifier/judge in our governance gate |
-| 11 | MemGPT: LLMs as Operating Systems | 2310.08560 | tiered self-managed memory — ancestor of our runtime-memory design |
-| 12 | RAG for Knowledge-Intensive NLP | 2005.11401 | the retrieve-then-generate foundation our code-context loop specializes |
-
-## How the research validated the two new features
-
-The Sonnet scout independently surfaced two gaps that the features built this session fill:
-
-- **"Multi-agent debate targets *answers*, not *shared world-state*."** No framework ensures
-  concurrent agents act on a consistent snapshot. → xMustard's **context governance** (propose →
-  multi-agent verify → promote, with readonly permission and a require-multi-agent toggle) is the
-  "context consensus before action" layer. Grounded in papers #9 and #10.
-
-- **"Provider routing is latency/cost-blind to task semantics."** → xMustard's **OpenAI-compatible
-  provider layer** (Ollama/vLLM/LM Studio/OpenAI + VLM) is the seam where task-typed model routing
-  becomes possible. The next step (not yet built) is semantic routing by coding sub-task.
+The source reports are the 2026-10-03 field research and its 2026-10-03b wider pass; those working artifacts are not distributed in this repository.
