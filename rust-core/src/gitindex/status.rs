@@ -88,9 +88,10 @@ impl Repo {
         )
         .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
-        let mut ignore_case = false;
-        let mut invalid_symlinks = None;
-        let mut symlinks_value = true;
+        // Each boolean keeps its last occurrence, as Git's own parse does; an unparsable value is
+        // kept as the error, so the reader refuses rather than guessing.
+        let mut ignore_case: Result<bool, String> = Ok(false);
+        let mut symlinks: Result<bool, String> = Ok(true);
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let rec = String::from_utf8_lossy(rec);
             let rec = rec.as_ref();
@@ -101,34 +102,16 @@ impl Repo {
             let value = value.unwrap_or_default();
             match key {
                 "core.excludesfile" => excludes_file = Some(expand_home(value)),
-                "core.ignorecase" => {
-                    ignore_case = matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "true" | "yes" | "on" | "1" | ""
-                    )
-                }
-                "core.symlinks" => match (has_value, parse_git_bool(value)) {
-                    (false, _) => {
-                        symlinks_value = true;
-                        invalid_symlinks = None;
-                    }
-                    (true, Some(parsed)) => {
-                        symlinks_value = parsed;
-                        invalid_symlinks = None;
-                    }
-                    (_, None) => invalid_symlinks = Some(value.to_owned()),
-                },
+                "core.ignorecase" => ignore_case = git_bool(has_value, value),
+                "core.symlinks" => symlinks = git_bool(has_value, value),
                 _ => {}
             }
         }
-        let symlinks = match invalid_symlinks {
-            Some(value) => {
-                return Err(Refusal::Failed(format!(
-                    "git config: invalid core.symlinks value {value:?}"
-                )));
-            }
-            None => symlinks_value,
+        let invalid = |key: &str, value: String| {
+            Refusal::Failed(format!("git config: invalid {key} value {value:?}"))
         };
+        let ignore_case = ignore_case.map_err(|v| invalid("core.ignorecase", v))?;
+        let symlinks = symlinks.map_err(|v| invalid("core.symlinks", v))?;
         Ok(Repo {
             toplevel: PathBuf::from(top),
             git_dir: PathBuf::from(git_dir),
@@ -163,6 +146,16 @@ impl Repo {
             Err(e) => Err(Refusal::Failed(format!("git rev-parse HEAD^{{tree}}: {e}"))),
         }
     }
+}
+
+/// One Git boolean config entry. A key written without a value is true and an explicitly empty
+/// value is false, as Git's `git_parse_maybe_bool` reads them; a value this reader does not
+/// recognise is returned as the error, so the caller refuses instead of guessing.
+fn git_bool(has_value: bool, value: &str) -> Result<bool, String> {
+    if !has_value {
+        return Ok(true);
+    }
+    parse_git_bool(value).ok_or_else(|| value.to_owned())
 }
 
 fn parse_git_bool(value: &str) -> Option<bool> {
@@ -991,5 +984,52 @@ mod tests {
         .unwrap_err();
         assert!(matches!(refusal, Refusal::Submodule(message)
             if message.contains("submodule") && message.contains("rev-parse")));
+    }
+
+    #[test]
+    fn git_booleans_read_valueless_empty_and_unknown_values_as_git_does() {
+        use super::git_bool;
+        assert_eq!(git_bool(false, ""), Ok(true), "a key with no value is true");
+        assert_eq!(
+            git_bool(true, ""),
+            Ok(false),
+            "an explicitly empty value is false"
+        );
+        for v in ["true", "YES", "On", "1"] {
+            assert_eq!(git_bool(true, v), Ok(true), "{v}");
+        }
+        for v in ["false", "No", "OFF", "0"] {
+            assert_eq!(git_bool(true, v), Ok(false), "{v}");
+        }
+        assert_eq!(git_bool(true, "maybe"), Err("maybe".to_string()));
+    }
+
+    #[test]
+    fn repo_open_reads_ignorecase_as_a_git_boolean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["config", "core.ignorecase", ""]).status.success());
+        let opened = super::Repo::open(repo).unwrap();
+        assert!(
+            !opened.ignore_case,
+            "an explicitly empty core.ignorecase is false"
+        );
+        assert!(
+            git(&["config", "core.ignorecase", "maybe"])
+                .status
+                .success()
+        );
+        assert!(
+            super::Repo::open(repo).is_err(),
+            "an unparsable core.ignorecase is refused, as Git refuses it"
+        );
     }
 }
