@@ -26,7 +26,7 @@ func (s *stringSliceFlag) Set(value string) error {
 func main() {
 	args := os.Args[1:]
 	if len(args) == 0 {
-		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config|codex-hooks|cursor-hooks|shims|capture-fixture> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config|codex-hooks|cursor-hooks|shims|capture-fixture|trust> ...")
 	}
 	if run, ok := approvalCommands[args[0]]; ok { // the human-approval surface (approval.go)
 		os.Exit(run(defaultOpsEnv(), args[1:]))
@@ -58,8 +58,10 @@ func main() {
 		runShims(args[1:])
 	case "capture-fixture":
 		os.Exit(runCaptureFixture(args[1:]))
+	case "trust":
+		os.Exit(runTrust(args[1:]))
 	default:
-		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config|codex-hooks|cursor-hooks|shims|capture-fixture> ...")
+		fatalUsage("usage: xmustard-ops <diagnostics|semantic-index|postgres|runtime|workspace|mcp-config|codex-hooks|cursor-hooks|shims|capture-fixture|trust> ...")
 	}
 }
 

@@ -31,6 +31,18 @@ first release.
 
 `xmustard-ops shims --reap` sends SIGKILL only to classified orphaned or runaway `xmustard-mcp` processes. Linux uses a pidfd opened before identity validation, binding delivery to that process; if a pidfd cannot be opened, the target is left untouched. Darwin has no identity-bound kill primitive: the operator re-reads UID, start time and command immediately before signaling, but a residual PID-reuse race remains between that check and `kill`.
 
+## Repository-supplied configuration trust
+
+Repository-supplied configuration is not an authority to grant trust. Operators can
+explicitly grant or revoke trust with `xmustard-ops trust grant <path>` and
+`xmustard-ops trust revoke <path>`; `xmustard-ops trust list` displays the granted
+canonical roots. Trust records live in the operator data directory in a private
+`trusted-repositories.json` file (0600), never in the repository or through an API.
+A grant applies to the resolved repository root only; another clone or linked worktree
+at a different real path requires its own grant. The default is untrusted. This
+operator store is the trust primitive; it does not itself cause a repository config
+entry to execute.
+
 ## Authentication modes
 
 `XMUSTARD_AUTH` picks the mode. It is read at startup, and anything else stops the API.
