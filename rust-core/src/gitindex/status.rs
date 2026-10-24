@@ -88,28 +88,30 @@ impl Repo {
         )
         .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
-        let mut ignore_case = false;
-        let mut symlinks = true;
+        // Each boolean keeps its last occurrence, as Git's own parse does; an unparsable value is
+        // kept as the error, so the reader refuses rather than guessing.
+        let mut ignore_case: Result<bool, String> = Ok(false);
+        let mut symlinks: Result<bool, String> = Ok(true);
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let rec = String::from_utf8_lossy(rec);
-            let (key, value) = rec.split_once('\n').unwrap_or((&rec, ""));
+            let rec = rec.as_ref();
+            let (key, value) = rec
+                .split_once('\n')
+                .map_or((rec, None), |(key, value)| (key, Some(value)));
+            let has_value = value.is_some();
+            let value = value.unwrap_or_default();
             match key {
                 "core.excludesfile" => excludes_file = Some(expand_home(value)),
-                "core.ignorecase" => {
-                    ignore_case = matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "true" | "yes" | "on" | "1" | ""
-                    )
-                }
-                "core.symlinks" => {
-                    symlinks = !matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "false" | "no" | "off" | "0"
-                    )
-                }
+                "core.ignorecase" => ignore_case = git_bool(has_value, value),
+                "core.symlinks" => symlinks = git_bool(has_value, value),
                 _ => {}
             }
         }
+        let invalid = |key: &str, value: String| {
+            Refusal::Failed(format!("git config: invalid {key} value {value:?}"))
+        };
+        let ignore_case = ignore_case.map_err(|v| invalid("core.ignorecase", v))?;
+        let symlinks = symlinks.map_err(|v| invalid("core.symlinks", v))?;
         Ok(Repo {
             toplevel: PathBuf::from(top),
             git_dir: PathBuf::from(git_dir),
@@ -143,6 +145,24 @@ impl Repo {
             Err(crate::indexcache::GitRunError::Failed) => Ok(None),
             Err(e) => Err(Refusal::Failed(format!("git rev-parse HEAD^{{tree}}: {e}"))),
         }
+    }
+}
+
+/// One Git boolean config entry. A key written without a value is true and an explicitly empty
+/// value is false, as Git's `git_parse_maybe_bool` reads them; a value this reader does not
+/// recognise is returned as the error, so the caller refuses instead of guessing.
+fn git_bool(has_value: bool, value: &str) -> Result<bool, String> {
+    if !has_value {
+        return Ok(true);
+    }
+    parse_git_bool(value).ok_or_else(|| value.to_owned())
+}
+
+fn parse_git_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "false" | "no" | "off" | "0" => Some(false),
+        "true" | "yes" | "on" | "1" => Some(true),
+        _ => None,
     }
 }
 
@@ -568,7 +588,7 @@ fn submodule_dirty_with_head(
     let head = match head_probe(dir) {
         Ok(bytes) => Some(
             Oid::parse_hex(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
-                Refusal::Failed(format!(
+                Refusal::Submodule(format!(
                     "submodule {}: rev-parse returned an invalid HEAD",
                     dir.display()
                 ))
@@ -576,7 +596,7 @@ fn submodule_dirty_with_head(
         ),
         Err(crate::indexcache::GitRunError::Failed) => None,
         Err(error) => {
-            return Err(Refusal::Failed(format!(
+            return Err(Refusal::Submodule(format!(
                 "submodule {}: rev-parse: {error}",
                 dir.display()
             )));
@@ -585,7 +605,8 @@ fn submodule_dirty_with_head(
     if head.is_some_and(|head| head != *oid) {
         return Ok(true);
     }
-    let sub = Repo::open(dir)?;
+    let sub = Repo::open(dir)
+        .map_err(|e| Refusal::Submodule(format!("submodule {}: {e}", dir.display())))?;
     let mut dirty = false;
     let opts = Options {
         untracked: true,
@@ -595,7 +616,7 @@ fn submodule_dirty_with_head(
         dirty = true;
         ControlFlow::Break(())
     })
-    .map_err(|e| Refusal::Failed(format!("submodule {}: {e}", dir.display())))?;
+    .map_err(|e| Refusal::Submodule(format!("submodule {}: {e}", dir.display())))?;
     if !dirty {
         ensure_complete_submodule(dir, &outcome)?;
     }
@@ -604,7 +625,7 @@ fn submodule_dirty_with_head(
 
 fn ensure_complete_submodule(dir: &Path, outcome: &Outcome) -> Result<(), Refusal> {
     if let Some(reason) = &outcome.untracked_incomplete {
-        return Err(Refusal::Failed(format!(
+        return Err(Refusal::Submodule(format!(
             "submodule {}: untracked walk incomplete: {reason}",
             dir.display()
         )));
@@ -945,7 +966,7 @@ mod tests {
         };
         let refusal =
             ensure_complete_submodule(std::path::Path::new("child"), &outcome).unwrap_err();
-        assert!(matches!(refusal, Refusal::Failed(message)
+        assert!(matches!(refusal, Refusal::Submodule(message)
             if message.contains("child") && message.contains("walk exceeded its bound")));
     }
 
@@ -961,7 +982,54 @@ mod tests {
             Err(GitRunError::Spawn("shimmed spawn failure".into()))
         })
         .unwrap_err();
-        assert!(matches!(refusal, Refusal::Failed(message)
+        assert!(matches!(refusal, Refusal::Submodule(message)
             if message.contains("submodule") && message.contains("rev-parse")));
+    }
+
+    #[test]
+    fn git_booleans_read_valueless_empty_and_unknown_values_as_git_does() {
+        use super::git_bool;
+        assert_eq!(git_bool(false, ""), Ok(true), "a key with no value is true");
+        assert_eq!(
+            git_bool(true, ""),
+            Ok(false),
+            "an explicitly empty value is false"
+        );
+        for v in ["true", "YES", "On", "1"] {
+            assert_eq!(git_bool(true, v), Ok(true), "{v}");
+        }
+        for v in ["false", "No", "OFF", "0"] {
+            assert_eq!(git_bool(true, v), Ok(false), "{v}");
+        }
+        assert_eq!(git_bool(true, "maybe"), Err("maybe".to_string()));
+    }
+
+    #[test]
+    fn repo_open_reads_ignorecase_as_a_git_boolean() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .current_dir(repo)
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(git(&["init", "-q"]).status.success());
+        assert!(git(&["config", "core.ignorecase", ""]).status.success());
+        let opened = super::Repo::open(repo).unwrap();
+        assert!(
+            !opened.ignore_case,
+            "an explicitly empty core.ignorecase is false"
+        );
+        assert!(
+            git(&["config", "core.ignorecase", "maybe"])
+                .status
+                .success()
+        );
+        assert!(
+            super::Repo::open(repo).is_err(),
+            "an unparsable core.ignorecase is refused, as Git refuses it"
+        );
     }
 }

@@ -45,6 +45,9 @@ pub enum Refusal {
     /// The index or the worktree could not be read: a checksum mismatch, a truncated
     /// file, an I/O error, a Git child that failed.
     Failed(String),
+    /// A refusal while reading a nested repository; fallback from the parent could load
+    /// the nested repository's index without accounting for its cost.
+    Submodule(String),
 }
 
 impl Refusal {
@@ -52,7 +55,7 @@ impl Refusal {
     pub fn reason(&self) -> &'static str {
         match self {
             Refusal::Unsupported(_) => "git_index_unsupported",
-            Refusal::Failed(_) => "git_index_failed",
+            Refusal::Failed(_) | Refusal::Submodule(_) => "git_index_failed",
         }
     }
 }
@@ -61,7 +64,7 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::Unsupported(m) => write!(f, "Git index layout not supported: {m}"),
-            Refusal::Failed(m) => f.write_str(m),
+            Refusal::Failed(m) | Refusal::Submodule(m) => f.write_str(m),
         }
     }
 }
@@ -199,7 +202,11 @@ pub fn list_using(
         each(p, m)
     });
     match read {
-        Err(_) if listed == 0 && falls_back(setting, &repo.git_dir) => {
+        Err(error)
+            if !matches!(&error, Refusal::Submodule(_))
+                && listed == 0
+                && falls_back(setting, &repo.git_dir) =>
+        {
             list_git(root, listing, each)
         }
         Err(e) if listed > 0 => Err(Refusal::Failed(format!("{e} (after {listed} paths)"))),
@@ -291,7 +298,11 @@ pub fn head_changes_using(
     }
     let repo = status::Repo::open(root)?;
     match status::head_changes(&repo) {
-        Err(_) if falls_back(setting, &repo.git_dir) => head_changes_git(root),
+        Err(error)
+            if !matches!(&error, Refusal::Submodule(_)) && falls_back(setting, &repo.git_dir) =>
+        {
+            head_changes_git(root)
+        }
         other => other,
     }
 }

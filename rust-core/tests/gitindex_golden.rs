@@ -6,6 +6,7 @@ mod gitfix;
 
 use std::collections::BTreeSet;
 use std::fs;
+use std::io::Write;
 use std::ops::ControlFlow;
 use std::path::Path;
 
@@ -74,6 +75,43 @@ fn unborn_submodule_head_still_reports_its_untracked_worktree() {
 }
 
 #[test]
+fn auto_mode_does_not_fallback_through_a_submodule_refusal() {
+    let fx = clean();
+    let child = fx.root.join("child");
+    init(&child, &[]);
+    git(&child, &["config", "core.ignorecase", "true"]);
+    for i in 0..100_000 {
+        write(
+            &child,
+            &format!("tracked/file-{i:06}-abcdefghijklmnop.txt"),
+            b"tracked\n",
+        );
+    }
+    commit(&child, "large child index");
+    let oid = String::from_utf8(git(&child, &["rev-parse", "HEAD"]))
+        .unwrap()
+        .trim()
+        .to_owned();
+    git(
+        &fx.root,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            "160000",
+            &oid,
+            "child",
+        ],
+    );
+    let identity = xmustard_core::indexcache::source_identity(&fx.root);
+    assert!(!identity.identity_complete);
+    assert!(identity.limitations.iter().any(|limitation| {
+        limitation.detail.contains("submodule")
+            && limitation.detail.contains("case-folded index paths")
+    }));
+}
+
+#[test]
 fn submodule_with_incomplete_untracked_walk_refuses_parent_status() {
     let fx = clean();
     let child = fx.root.join("child");
@@ -100,7 +138,7 @@ fn submodule_with_incomplete_untracked_walk_refuses_parent_status() {
         fs::File::create(wide.join(format!("f{i}"))).unwrap();
     }
     let err = refusal(&fx.root);
-    assert!(matches!(err, Refusal::Failed(message)
+    assert!(matches!(err, Refusal::Submodule(message)
         if message.contains("submodule") && message.contains("untracked walk incomplete")));
 }
 
@@ -113,6 +151,47 @@ fn core_symlinks_false_compares_the_link_text_as_file_content() {
     fs::remove_file(fx.root.join("link")).unwrap();
     write(&fx.root, "link", b"target.txt");
     assert_same_view("core.symlinks=false", &fx.root);
+
+    let config = fx.root.join(".git/config");
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&config)
+        .unwrap()
+        .write_all(b"\n[core]\n\tsymlinks\n")
+        .unwrap();
+    assert_same_view("core.symlinks valueless true", &fx.root);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&config)
+        .unwrap()
+        .write_all(b"\n[core]\n\tsymlinks =\n")
+        .unwrap();
+    assert_same_view("core.symlinks empty false", &fx.root);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&config)
+        .unwrap()
+        .write_all(b"\n[core]\n\tsymlinks = maybe\n")
+        .unwrap();
+    assert!(Repo::open(&fx.root).is_err());
+}
+
+#[test]
+fn ignorecase_listing_does_not_walk_a_case_folded_sibling() {
+    let fx = clean();
+    git(&fx.root, &["config", "core.ignorecase", "true"]);
+    fs::create_dir_all(fx.root.join("src")).unwrap();
+    fs::create_dir_all(fx.root.join("Src")).unwrap();
+    write(&fx.root, "src/wanted.txt", b"wanted\n");
+    write(&fx.root, "Src/.gitignore", &vec![b'x'; 1 << 20 | 1]);
+    write(&fx.root, "Src/other.txt", b"other\n");
+    assert_eq!(Repo::open(&fx.root.join("src")).unwrap().prefix, b"src/");
+    let got: Vec<Vec<u8>> = reader_list(&fx.root.join("src"), Listing::Untracked)
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    assert_eq!(got, git_untracked(&fx.root.join("src")));
 }
 
 #[test]
