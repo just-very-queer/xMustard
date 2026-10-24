@@ -826,7 +826,7 @@ pub struct Impact {
     /// `resolved` (symbol edges), `lexical` (file edges), `mixed`, or `none` when no
     /// target was found.
     pub graph: &'static str,
-    pub impacted_count: usize,
+    pub impacted_count: Option<usize>,
     pub counts: Counts,
     pub by_depth: Vec<Tier>,
     /// Scored on upstream dependents; absent downstream.
@@ -1054,7 +1054,7 @@ fn run_lookup<G: Graph + ?Sized>(
             (false, true) => "lexical",
             (false, false) => "none",
         },
-        impacted_count: counts.total,
+        impacted_count: (!lookup.nodes.is_empty()).then_some(counts.total),
         counts,
         by_depth,
         risk,
@@ -1071,11 +1071,6 @@ fn run_lookup<G: Graph + ?Sized>(
 
 /// Risk and its note. Only upstream dependents are scored.
 fn score(q: &Query, lookup: &Lookup, c: &Counts, e: &Epistemic) -> (Option<Risk>, Option<String>) {
-    if q.direction == Direction::Downstream {
-        return (None, None);
-    }
-    let bounded = e.completeness != "exact";
-    let causes = || e.causes.keys().cloned().collect::<Vec<_>>().join(", ");
     if lookup.nodes.is_empty() {
         return (
             Some(Risk::Unknown),
@@ -1085,6 +1080,11 @@ fn score(q: &Query, lookup: &Lookup, c: &Counts, e: &Epistemic) -> (Option<Risk>
             )),
         );
     }
+    if q.direction == Direction::Downstream {
+        return (None, None);
+    }
+    let bounded = e.completeness != "exact";
+    let causes = || e.causes.keys().cloned().collect::<Vec<_>>().join(", ");
     if c.direct == 0 {
         let mut note = "no dependents found: the symbol may be unused, an entry point, or reached \
                         only through dynamic dispatch, reflection or code outside the graph"
