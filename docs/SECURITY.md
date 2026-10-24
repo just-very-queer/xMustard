@@ -799,6 +799,12 @@ pages, search inside it and the projection returned to the client therefore all 
 the redacted text. The route refuses a `client` it does not know with
 `400 invalid_client`.
 
+The separate operator fixture command is off unless `--enable` is supplied. It accepts
+an explicit JSON input file and writes a redacted fixture through the same secret
+redactor, with mode `0600`; it never captures traffic in the background. Captures are
+limited to 100 JSON files, 1 MiB per fixture and 10 MiB total in the selected directory.
+The operator remains responsible for reviewing sanitized fixtures before sharing them.
+
 In v0.1.0 no redactor was wired into `captureRedactor`
 (`api-go/cmd/xmustard-api/evidence_capture_routes.go`), so every capture answered
 `503 redaction_unavailable`: the Pi adapter's built-in reduction and compaction fell
