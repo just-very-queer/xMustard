@@ -87,35 +87,64 @@ func TestCursorConformanceFixturesThroughProductionRoute(t *testing.T) {
 		if code != http.StatusOK {
 			t.Fatalf("%s returned %d: %s", fixture.Input, code, out)
 		}
-		if fixture.Event == "preCompact" {
-			if len(out) != 0 {
-				t.Fatalf("preCompact is enqueue-mode silence, got %s", out)
-			}
-			continue
-		}
 		var response struct {
 			Context  string `json:"additional_context"`
 			Replaced string `json:"updated_mcp_tool_output"`
+		}
+		allowedKeys := map[string]map[string]bool{
+			"sessionStart": {"additional_context": true},
+			"preToolUse":   {},
+			"postToolUse":  {"additional_context": true, "updated_mcp_tool_output": true},
+			"preCompact":   {},
 		}
 		if len(out) != 0 {
 			if err := json.Unmarshal(out, &response); err != nil {
 				t.Fatalf("%s route response is invalid: %s: %v", fixture.Input, out, err)
 			}
-		}
-		if fixture.Event == "sessionStart" && response.Context == "" {
-			t.Fatalf("%s gave Cursor no model context", fixture.Input)
-		}
-		if fixture.Event == "postToolUse" {
-			// Cursor passes the replacement to its next model request when present;
-			// otherwise it keeps the original result from the recorded input.
-			modelOutput := source.ToolOutput
-			if response.Replaced != "" {
-				modelOutput = response.Replaced
+			var keys map[string]json.RawMessage
+			if err := json.Unmarshal(out, &keys); err != nil {
+				t.Fatal(err)
 			}
-			var modelResult map[string]json.RawMessage
-			if err := json.Unmarshal([]byte(modelOutput), &modelResult); err != nil || len(modelResult) == 0 {
-				t.Fatalf("client model result is not the original or a shaped replacement: %q", modelOutput)
+			for key := range keys {
+				if !allowedKeys[fixture.Event][key] {
+					t.Fatalf("%s returned unexpected key %q", fixture.Input, key)
+				}
 			}
+		}
+		checks := map[string]func(){
+			"sessionStart": func() {
+				if response.Context == "" {
+					t.Fatalf("%s gave Cursor no model context", fixture.Input)
+				}
+			},
+			// The fixture produces no hits or triggered memories, so there is nothing to
+			// say; writeHookAnswer's contract is "200 with an empty body when there is
+			// nothing to say" (hooks_routes.go).
+			"preToolUse": func() {
+				if len(out) != 0 {
+					t.Fatalf("%s expected no context, got %s", fixture.Input, out)
+				}
+			},
+			"postToolUse": func() {
+				modelOutput := source.ToolOutput
+				if response.Replaced != "" {
+					modelOutput = response.Replaced
+				}
+				var modelResult map[string]json.RawMessage
+				if err := json.Unmarshal([]byte(modelOutput), &modelResult); err != nil || len(modelResult) == 0 {
+					t.Fatalf("client model result is not the original or a shaped replacement: %q", modelOutput)
+				}
+			},
+			"preCompact": func() {
+				if len(out) != 0 {
+					t.Fatalf("preCompact is enqueue-mode silence, got %s", out)
+				}
+			},
+		}
+		if check := checks[fixture.Event]; check != nil {
+			check()
+		} else {
+			t.Fatalf("no conformance expectation for event %s", fixture.Event)
 		}
 	}
 }
@@ -276,9 +305,13 @@ func TestCursorHookReplacesAnMCPToolResult(t *testing.T) {
 		Content []struct {
 			Text string `json:"text"`
 		} `json:"content"`
+		IsError bool `json:"isError"`
 	}
 	if err := json.Unmarshal([]byte(replaced), &shaped); err != nil || len(shaped.Content) == 0 {
 		t.Fatalf("production capture/reduction lost the Cursor result shape: %s", replaced)
+	}
+	if !shaped.IsError {
+		t.Fatalf("production replacement lost top-level error state: %s", replaced)
 	}
 	modelResult := strings.SplitN(shaped.Content[0].Text, "\n[xmustard evidence]", 2)[0]
 	var original struct {
@@ -286,5 +319,35 @@ func TestCursorHookReplacesAnMCPToolResult(t *testing.T) {
 	}
 	if err := json.Unmarshal([]byte(modelResult), &original); err != nil || !original.IsError {
 		t.Fatalf("production capture/reduction lost the tool error state: %s", modelResult)
+	}
+}
+
+func TestCursorHookReplacementKeepsSuccessState(t *testing.T) {
+	f := newHookFixture(t)
+	result := `{"content":[{"type":"text","text":"` + strings.Repeat("x", 40000) + `"}],"isError":false}`
+	body, _ := json.Marshal(map[string]any{
+		"hook_event_name": "postToolUse",
+		"conversation_id": "cursor-success",
+		"tool_name":       "MCP:ci_logs",
+		"tool_output":     result,
+	})
+	code, out := f.postCursor(t, f.agent, "postToolUse", f.ws, string(body))
+	if code != http.StatusOK {
+		t.Fatalf("postToolUse: %d %s", code, out)
+	}
+	var response struct {
+		Replaced string `json:"updated_mcp_tool_output"`
+	}
+	if err := json.Unmarshal(out, &response); err != nil || response.Replaced == "" {
+		t.Fatalf("postToolUse gave no replacement: %s (%v)", out, err)
+	}
+	var shaped struct {
+		IsError *bool `json:"isError"`
+	}
+	if err := json.Unmarshal([]byte(response.Replaced), &shaped); err != nil {
+		t.Fatalf("successful result is invalid JSON: %v: %s", err, response.Replaced)
+	}
+	if shaped.IsError == nil || *shaped.IsError {
+		t.Fatalf("successful result has isError=%v: %s", shaped.IsError, response.Replaced)
 	}
 }

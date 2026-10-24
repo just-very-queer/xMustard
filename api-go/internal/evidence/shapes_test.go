@@ -74,6 +74,38 @@ func TestShapeValidatorsRejectMismatches(t *testing.T) {
 
 // --- hook body decoding ---
 
+func TestCursorEncodedResultErrorDetectionIsBounded(t *testing.T) {
+	cases := []struct {
+		name, output string
+		want         bool
+	}{
+		{"string", "plain text", false},
+		{"object error", `{"content":[],"isError":true}`, true},
+		{"object success", `{"content":[],"isError":false}`, false},
+		{"nested error flag", `{"content":{"isError":true},"isError":false}`, false},
+		{"non-json", `not { json`, false},
+		{"oversized", `{"isError":true,"content":[{"type":"text","text":"` + strings.Repeat("x", 1<<20) + `"}]}`, true},
+		{"error after oversized content", `{"content":[{"type":"text","text":"` + strings.Repeat("x", 1<<20) + `"}],"isError":true}`, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body, _ := json.Marshal(map[string]string{"hook_event_name": "postToolUse", "tool_output": tc.output})
+			hb, err := DecodeHookBody(FormatCursor, bytes.NewReader(body), io.Discard, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if hb.IsError != tc.want {
+				t.Fatalf("IsError = %v, want %v", hb.IsError, tc.want)
+			}
+		})
+	}
+	body, _ := json.Marshal(map[string]string{"hook_event_name": "postToolUse", "result_json": `{"isError":true}`})
+	hb, err := DecodeHookBody(FormatCursor, bytes.NewReader(body), io.Discard, nil)
+	if err != nil || !hb.IsError {
+		t.Fatalf("result_json IsError = %v, err %v; want true", hb != nil && hb.IsError, err)
+	}
+}
+
 func TestHookBodyStreamDecode(t *testing.T) {
 	input := `{"command":"go test ./...","description":"run \"tests\"","timeout":120000}`
 	// tool_response comes before tool_name: the decoder does not depend on key order

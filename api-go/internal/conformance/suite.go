@@ -52,13 +52,17 @@ func ReadCursorFixture(fixtureDir string, fixture Fixture) ([]byte, error) {
 		return nil, fmt.Errorf("read %s: %w", fixture.Input, err)
 	}
 	var event struct {
-		Name string `json:"hook_event_name"`
+		Name          string `json:"hook_event_name"`
+		CursorVersion string `json:"cursor_version"`
 	}
 	if err := json.Unmarshal(input, &event); err != nil {
 		return nil, fmt.Errorf("decode %s: %w", fixture.Input, err)
 	}
 	if event.Name != fixture.Event {
 		return nil, fmt.Errorf("%s event %q, want %q", fixture.Input, event.Name, fixture.Event)
+	}
+	if event.CursorVersion == "" || event.CursorVersion != manifest.CursorVersion {
+		return nil, fmt.Errorf("%s Cursor version %q, want manifest version %q", fixture.Input, event.CursorVersion, manifest.CursorVersion)
 	}
 	return input, nil
 }
