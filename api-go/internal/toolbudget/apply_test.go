@@ -786,6 +786,14 @@ func TestOmitRungsNameWhatTheyRemove(t *testing.T) {
 	if !slices.Contains(a.rep.Omitted, "symbol.content") || a.rep.DegradedStage != "no_content" {
 		t.Fatalf("report %+v", a.rep)
 	}
+	spec, _ := For("explain")
+	again, err := spec.Apply(a.raw, Request{MaxChars: 2000}, Page{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(a.raw) {
+		t.Fatalf("re-budgeting changed omitted-member accounting\nfirst:  %s\nsecond: %s", a.raw, again)
+	}
 }
 
 func TestStaleReportAndNonObjects(t *testing.T) {

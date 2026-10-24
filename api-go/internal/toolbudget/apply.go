@@ -402,6 +402,7 @@ type budgeter struct {
 	// the result itself.
 	priorLists   map[string]listReport
 	priorSignals map[string]int
+	priorOmitted []string
 
 	// sig is how far signal objects are reduced: sigFull, sigCounts or sigFlags.
 	sig      int
@@ -431,7 +432,7 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 		return result, nil
 	}
 	prev := prior(top)
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals}
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals, priorOmitted: prev.omitted}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
@@ -480,7 +481,7 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 		return result, nil
 	}
 	prev := prior(top)
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals}
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals, priorOmitted: prev.omitted}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
@@ -491,12 +492,13 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 }
 
 // priorReport is what an earlier pass recorded in the result's own output_budget: the
-// rungs, recovery, list counts and signal sizes recorded by the earlier pass.
+// rungs, recovery, omitted members, list counts and signal sizes recorded by the earlier pass.
 type priorReport struct {
 	stages   []string
 	recovery *Recovery
 	lists    map[string]listReport
 	signals  map[string]int
+	omitted  []string
 }
 
 func prior(top []kv) priorReport {
@@ -512,6 +514,7 @@ func prior(top []kv) priorReport {
 		out.stages = rep.Stages
 		out.lists = rep.Lists
 		out.signals = rep.Signals
+		out.omitted = rep.Omitted
 		if rep.RecoverURI != "" || rep.RecoverHandle != "" || rep.RecoverUnavailable != "" {
 			out.recovery = &Recovery{URI: rep.RecoverURI, Handle: rep.RecoverHandle, Unavailable: rep.RecoverUnavailable}
 		}
@@ -1118,10 +1121,17 @@ func (b *budgeter) report(used int) []byte {
 		}
 		rep.Lists[name] = lr
 	}
+	omitted := map[string]bool{}
 	for name, on := range b.omitted {
 		if on && b.present(name) {
-			rep.Omitted = append(rep.Omitted, name)
+			omitted[name] = true
 		}
+	}
+	for _, name := range b.priorOmitted {
+		omitted[name] = true
+	}
+	for name := range omitted {
+		rep.Omitted = append(rep.Omitted, name)
 	}
 	sort.Strings(rep.Omitted)
 	for _, m := range b.members {
