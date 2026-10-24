@@ -296,10 +296,11 @@ first-parent merge commit on `feat/parity-v2`.
   their answers equal the Git path's. A repository whose `core.ignorecase` is true is
   refused, which is what a case-insensitive volume (macOS) reports: **WS-RT18b** is the
   follow-up, and the gitindex tests cannot pass on a Mac until it lands.
-- **WS-FIX-20c** (`fe1d74db`): the run wrapper's signal relay. SIGHUP is relayed
-  whatever its origin, and a terminal Ctrl-C reaches the child **once** (the wrapper
-  relays only a signal a process sent), so a child that traps SIGINT does not run its
-  handler twice per keystroke.
+- **WS-FIX-20c** (`fe1d74db`): the run wrapper's signal relay. SIGHUP and SIGTERM are
+  relayed whatever their origin. SIGINT and SIGQUIT are relayed when a process sent them
+  or when the child is outside the wrapper's process group, so a terminal Ctrl-C, which
+  the terminal already delivers to the whole foreground group, reaches the child **once**
+  and a child that traps SIGINT does not run its handler twice per keystroke.
 - **WS-40c** (`990a40f7`): the Cursor adapter. The daemon answers Cursor's four events
   in Cursor's schema (`/api/hooks/cursor/<event>`, one gate row each), and the Rust
   command client `xmustard-cursor` posts to it, failing open: a stopped daemon, an
