@@ -442,11 +442,7 @@ impl Walk<'_> {
     /// Whether directory `path` (`dir/`) is reported or entered at all: it is under
     /// the prefix, or leads to it.
     fn in_scope(&self, path: &[u8]) -> bool {
-        path.starts_with(self.prefix)
-            || self.prefix.starts_with(path)
-            || (self.repo.ignore_case
-                && (starts_with_ascii_folded(path, self.prefix)
-                    || starts_with_ascii_folded(self.prefix, path)))
+        path.starts_with(self.prefix) || self.prefix.starts_with(path)
     }
 }
 

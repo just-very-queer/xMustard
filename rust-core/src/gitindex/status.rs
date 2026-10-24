@@ -51,6 +51,18 @@ pub struct Repo {
     pub symlinks: bool,
 }
 
+fn git_bool(root: &Path, key: &str) -> Result<bool, Refusal> {
+    let value = run_git_bounded(
+        root,
+        &["config", "--bool", "--get", key],
+        64 << 10,
+        git_timeout(),
+    )
+    .map_err(|error| Refusal::Failed(format!("git config: invalid {key} value: {error}")))?;
+    parse_git_bool(String::from_utf8_lossy(&value).trim())
+        .ok_or_else(|| Refusal::Failed(format!("git config: invalid {key} value")))
+}
+
 fn git_text(root: &Path, args: &[&str]) -> Result<String, Refusal> {
     run_git_bounded(root, args, 64 << 10, git_timeout())
         .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -89,7 +101,8 @@ impl Repo {
         .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
         let mut ignore_case = false;
-        let mut symlinks = true;
+        let mut symlinks_configured = false;
+        let mut invalid_symlinks = None;
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let rec = String::from_utf8_lossy(rec);
             let (key, value) = rec.split_once('\n').unwrap_or((&rec, ""));
@@ -102,14 +115,24 @@ impl Repo {
                     )
                 }
                 "core.symlinks" => {
-                    symlinks = !matches!(
-                        value.to_ascii_lowercase().as_str(),
-                        "false" | "no" | "off" | "0"
-                    )
+                    symlinks_configured = true;
+                    invalid_symlinks = match value.is_empty() || parse_git_bool(value).is_some() {
+                        true => None,
+                        false => Some(value.to_owned()),
+                    };
                 }
                 _ => {}
             }
         }
+        let symlinks = match invalid_symlinks {
+            Some(value) => {
+                return Err(Refusal::Failed(format!(
+                    "git config: invalid core.symlinks value {value:?}"
+                )));
+            }
+            None if symlinks_configured => git_bool(root, "core.symlinks")?,
+            None => true,
+        };
         Ok(Repo {
             toplevel: PathBuf::from(top),
             git_dir: PathBuf::from(git_dir),
@@ -143,6 +166,14 @@ impl Repo {
             Err(crate::indexcache::GitRunError::Failed) => Ok(None),
             Err(e) => Err(Refusal::Failed(format!("git rev-parse HEAD^{{tree}}: {e}"))),
         }
+    }
+}
+
+fn parse_git_bool(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "" | "false" | "no" | "off" | "0" => Some(false),
+        "true" | "yes" | "on" | "1" => Some(true),
+        _ => None,
     }
 }
 
@@ -585,7 +616,8 @@ fn submodule_dirty_with_head(
     if head.is_some_and(|head| head != *oid) {
         return Ok(true);
     }
-    let sub = Repo::open(dir)?;
+    let sub = Repo::open(dir)
+        .map_err(|e| Refusal::Failed(format!("submodule {}: {e}", dir.display())))?;
     let mut dirty = false;
     let opts = Options {
         untracked: true,
