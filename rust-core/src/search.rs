@@ -1346,6 +1346,7 @@ pub fn search(
                 };
                 let mut cap_exhausted = false;
                 let mut provider_failed = false;
+                let mut query_budget = crate::intent::QueryBudget::default();
                 let decision = opened.snapshot.with_unshared_text(|conn| {
                     conn.execute_batch("BEGIN")?;
                     let generation: String = conn.query_row(
@@ -1462,14 +1463,23 @@ pub fn search(
                     } else if file_candidates.is_empty() {
                         Err(crate::intent::ProviderError::CandidateMismatch)
                     } else {
-                        let batch =
-                            crate::intent::decide_batched(provider, question, &file_candidates);
-                        cap_exhausted |= !batch.complete;
+                        let batch = crate::intent::decide_batched_with_budget(
+                            provider,
+                            question,
+                            &file_candidates,
+                            &mut query_budget,
+                        );
+                        cap_exhausted |= batch.error.as_ref().is_some_and(|error| {
+                            matches!(
+                                error,
+                                crate::intent::ProviderError::BudgetLimited
+                                    | crate::intent::ProviderError::QuestionTooLarge
+                            )
+                        });
                         provider_failed |= batch.error.as_ref().is_some_and(|error| {
                             !matches!(
                                 error,
-                                crate::intent::ProviderError::InvalidCandidates
-                                    | crate::intent::ProviderError::InvalidQuestion
+                                crate::intent::ProviderError::BudgetLimited
                                     | crate::intent::ProviderError::QuestionTooLarge
                             )
                         });
@@ -1540,7 +1550,13 @@ pub fn search(
                             name_score: 0.0,
                             matched: 0,
                             fuzzy: 0.0,
-                            structural: inbound.get(path).copied().unwrap_or(0),
+                            structural: cands
+                                .iter()
+                                .filter(|candidate| candidate.path.as_ref() == path)
+                                .map(|candidate| candidate.structural)
+                                .max()
+                                .or_else(|| inbound.get(path).copied())
+                                .unwrap_or(0),
                             proximity: prox.get(path).copied().unwrap_or(0.0),
                             code: None,
                             doc: None,
@@ -1613,7 +1629,13 @@ pub fn search(
                                         name_score: 0.0,
                                         matched: 0,
                                         fuzzy: 0.0,
-                                        structural: inbound.get(path).copied().unwrap_or(0),
+                                        structural: cands
+                                            .iter()
+                                            .filter(|candidate| candidate.path.as_ref() == path)
+                                            .map(|candidate| candidate.structural)
+                                            .max()
+                                            .or_else(|| inbound.get(path).copied())
+                                            .unwrap_or(0),
                                         proximity: prox.get(path).copied().unwrap_or(0.0),
                                         code: None,
                                         doc: None,
@@ -1636,39 +1658,60 @@ pub fn search(
                         ));
                     }
                     if !declaration_candidates.is_empty() {
-                        let batch = crate::intent::decide_batched(
+                        let batch = crate::intent::decide_batched_with_budget(
                             provider,
                             question,
                             &declaration_candidates,
+                            &mut query_budget,
                         );
-                        cap_exhausted |= !batch.complete;
+                        cap_exhausted |= batch.error.as_ref().is_some_and(|error| {
+                            matches!(
+                                error,
+                                crate::intent::ProviderError::BudgetLimited
+                                    | crate::intent::ProviderError::QuestionTooLarge
+                            )
+                        });
                         provider_failed |= batch.error.as_ref().is_some_and(|error| {
                             !matches!(
                                 error,
-                                crate::intent::ProviderError::InvalidCandidates
-                                    | crate::intent::ProviderError::InvalidQuestion
+                                crate::intent::ProviderError::BudgetLimited
                                     | crate::intent::ProviderError::QuestionTooLarge
                             )
                         });
                         if batch.decision.probabilities.is_empty() {
-                            let error = batch
-                                .error
-                                .unwrap_or(crate::intent::ProviderError::CandidateMismatch);
-                            return Ok::<_, rusqlite::Error>((
-                                Err(error),
-                                file_targets,
-                                stale_excerpt,
-                                HashSet::new(),
-                            ));
-                        }
-                        stale_excerpt |= latest_generation_is_stale(
-                            &opened.snapshot,
-                            opened.snapshot.generation,
-                        ) || file_paths.values().any(|path| {
-                            !matches!(fts::file_identity_matches(conn, root, path), Ok(Ok(true)))
-                        });
-                        match stale_excerpt {
-                            true => {
+                            match batch.error {
+                                Some(
+                                    crate::intent::ProviderError::BudgetLimited
+                                    | crate::intent::ProviderError::QuestionTooLarge,
+                                ) => {}
+                                Some(error) => {
+                                    return Ok::<_, rusqlite::Error>((
+                                        Err(error),
+                                        file_targets,
+                                        stale_excerpt,
+                                        HashSet::new(),
+                                    ));
+                                }
+                                None => {
+                                    return Ok::<_, rusqlite::Error>((
+                                        Err(crate::intent::ProviderError::CandidateMismatch),
+                                        file_targets,
+                                        stale_excerpt,
+                                        HashSet::new(),
+                                    ));
+                                }
+                            }
+                        } else {
+                            stale_excerpt |= latest_generation_is_stale(
+                                &opened.snapshot,
+                                opened.snapshot.generation,
+                            ) || file_paths.values().any(|path| {
+                                !matches!(
+                                    fts::file_identity_matches(conn, root, path),
+                                    Ok(Ok(true))
+                                )
+                            });
+                            if stale_excerpt {
                                 return Ok::<_, rusqlite::Error>((
                                     Err(crate::intent::ProviderError::Fixture(
                                         "stale source".into(),
@@ -1678,7 +1721,7 @@ pub fn search(
                                     HashSet::new(),
                                 ));
                             }
-                            false => probabilities.extend(batch.decision.probabilities),
+                            probabilities.extend(batch.decision.probabilities);
                         }
                     }
                     file_targets.extend(declaration_targets);
@@ -1725,7 +1768,7 @@ pub fn search(
                     }
                     Ok((
                         Err(
-                            crate::intent::ProviderError::InvalidCandidates
+                            crate::intent::ProviderError::BudgetLimited
                             | crate::intent::ProviderError::QuestionTooLarge,
                         ),
                         _,
@@ -1765,6 +1808,7 @@ pub fn search(
             _ => degradations.push("semantic_unavailable".to_string()),
         }
     }
+    drop(prox);
 
     drop(shared_paths);
 
@@ -2338,13 +2382,8 @@ mod tests {
         assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
     }
 
-    #[test]
-    fn truncated_intent_excerpt_reports_incomplete_coverage() {
-        let contents = format!(
-            "pub fn reconcile() {{ let _data = \"{}\"; }}\n",
-            "x".repeat(crate::intent::MAX_EXCERPT_BYTES + 100)
-        );
-        let repo = indexed_repo(&[("src/lib.rs", &contents)]);
+    fn intent_excerpt_fixture(contents: &str) -> (SearchResult, RecordingProvider) {
+        let repo = indexed_repo(&[("src/reconcile.rs", contents)]);
         let provider = RecordingProvider::default();
         let question = crate::intent::Question {
             id: "q-truncated".into(),
@@ -2363,6 +2402,14 @@ mod tests {
                 ..Default::default()
             },
         );
+        (result, provider)
+    }
+
+    #[test]
+    fn oversized_file_preview_reports_incomplete_coverage_without_oversized_declaration() {
+        let prelude = format!("use crate::{}Thing;\n", "part::".repeat(2_000));
+        let contents = format!("{prelude}pub fn reconcile() {{}}\n");
+        let (result, provider) = intent_excerpt_fixture(&contents);
         assert!(
             result
                 .degradations
@@ -2370,15 +2417,39 @@ mod tests {
                 .any(|item| item == "semantic_budget")
         );
         let requests = provider.0.lock().unwrap();
-        for kind in [
-            crate::intent::CandidateKind::File,
-            crate::intent::CandidateKind::Declaration,
-        ] {
-            assert!(requests.iter().flatten().any(|candidate| {
-                candidate.kind == kind
-                    && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
-            }));
-        }
+        assert!(requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::File
+                && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+        }));
+        let has_oversized_declaration = requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::Declaration
+                && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+        });
+        assert!(!has_oversized_declaration);
+    }
+
+    #[test]
+    fn oversized_declaration_reports_incomplete_coverage_with_small_file_preview() {
+        let contents = format!(
+            "const SETUP: usize = 1;\n\npub fn reconcile() {{ let _data = \"{}\"; }}\n",
+            "x".repeat(crate::intent::MAX_EXCERPT_BYTES + 100)
+        );
+        let (result, provider) = intent_excerpt_fixture(&contents);
+        assert!(
+            result
+                .degradations
+                .iter()
+                .any(|item| item == "semantic_budget")
+        );
+        let requests = provider.0.lock().unwrap();
+        assert!(requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::File
+                && candidate.excerpt.len() < crate::intent::MAX_EXCERPT_BYTES
+        }));
+        assert!(requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::Declaration
+                && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+        }));
     }
 
     #[test]
@@ -2421,7 +2492,7 @@ mod tests {
                 .any(|d| d == "semantic_unavailable")
         );
         let state = provider.0.lock().unwrap();
-        assert!(state.1.len() > 2);
+        assert_eq!(state.1.len(), crate::intent::MAX_PROVIDER_REQUESTS);
         assert!(state.1.iter().all(|batch| {
             batch
                 .iter()
@@ -2438,7 +2509,7 @@ mod tests {
             result
                 .hits
                 .iter()
-                .any(|hit| { hit.path == first_file && hit.lanes_matched.contains(&"intent") })
+                .all(|hit| { hit.path != first_file || !hit.lanes_matched.contains(&"intent") })
         );
     }
 

@@ -11,6 +11,9 @@ pub const MAX_CANDIDATE_FILES: usize = 32;
 pub const MAX_DECLARATIONS: usize = 64;
 pub const MAX_EXCERPT_BYTES: usize = 8 * 1024;
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
+/// Maximum provider calls and serialized input bytes spent by one intent query.
+pub const MAX_PROVIDER_REQUESTS: usize = 2;
+pub const MAX_PROVIDER_BYTES: usize = MAX_BATCH_BYTES * MAX_PROVIDER_REQUESTS;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +56,7 @@ pub enum ProviderError {
     QuestionMismatch,
     CandidateMismatch,
     InvalidProbability,
+    BudgetLimited,
     Fixture(String),
 }
 
@@ -128,11 +132,40 @@ pub fn decide(
     Ok(decision)
 }
 
-/// Classifies bounded sequential batches, retaining valid decisions if later coverage fails.
+#[derive(Debug, Default)]
+pub struct QueryBudget {
+    requests: usize,
+    bytes: usize,
+}
+
+impl QueryBudget {
+    fn reserve(&mut self, bytes: usize) -> bool {
+        if self.requests >= MAX_PROVIDER_REQUESTS
+            || self.bytes.saturating_add(bytes) > MAX_PROVIDER_BYTES
+        {
+            return false;
+        }
+        self.requests += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        true
+    }
+}
+
+/// Classifies bounded sequential batches with a fresh per-query budget.
 pub fn decide_batched(
     provider: &dyn DecisionProvider,
     question: &Question,
     candidates: &[Candidate],
+) -> BatchDecision {
+    decide_batched_with_budget(provider, question, candidates, &mut QueryBudget::default())
+}
+
+/// Classifies batches while sharing request limits across stages of one query.
+pub fn decide_batched_with_budget(
+    provider: &dyn DecisionProvider,
+    question: &Question,
+    candidates: &[Candidate],
+    budget: &mut QueryBudget,
 ) -> BatchDecision {
     let mut batches = Vec::new();
     let mut batch = Vec::new();
@@ -146,6 +179,20 @@ pub fn decide_batched(
             },
             complete: false,
             error,
+        };
+    }
+    let mut ids = std::collections::HashSet::with_capacity(candidates.len());
+    if candidates
+        .iter()
+        .any(|candidate| !ids.insert(candidate.id.as_str()))
+    {
+        return BatchDecision {
+            decision: Decision {
+                question_id: question.id.clone(),
+                probabilities: BTreeMap::new(),
+            },
+            complete: false,
+            error: Some(ProviderError::InvalidCandidates),
         };
     }
     for candidate in candidates {
@@ -162,7 +209,7 @@ pub fn decide_batched(
             batch.push(candidate.clone());
         } else {
             complete = false;
-            error.get_or_insert(ProviderError::InvalidCandidates);
+            error.get_or_insert(ProviderError::BudgetLimited);
         }
     }
     if !batch.is_empty() {
@@ -171,11 +218,23 @@ pub fn decide_batched(
 
     let mut probabilities = BTreeMap::new();
     for batch in batches {
+        let request_bytes = serde_json::to_vec(&(question, &batch))
+            .map_or(MAX_BATCH_BYTES, |request| request.len());
+        if !budget.reserve(request_bytes) {
+            complete = false;
+            error.get_or_insert(ProviderError::BudgetLimited);
+            break;
+        }
         match decide(provider, question, &batch) {
             Ok(decision) => probabilities.extend(decision.probabilities),
             Err(failure) => {
                 complete = false;
-                error = Some(failure);
+                if failure == ProviderError::QuestionTooLarge {
+                    error.get_or_insert(ProviderError::BudgetLimited);
+                } else {
+                    error = Some(failure);
+                    probabilities.clear();
+                }
                 break;
             }
         }
@@ -436,6 +495,92 @@ mod tests {
     }
 
     #[test]
+    fn batched_duplicate_candidate_ids_refuse_stage_without_provider_call() {
+        let provider = CallCounter::default();
+        let outcome = decide_batched(&provider, &question(), &[candidate("a"), candidate("a")]);
+        assert!(!outcome.complete);
+        assert_eq!(outcome.error, Some(ProviderError::InvalidCandidates));
+        assert!(outcome.decision.probabilities.is_empty());
+        assert_eq!(*provider.0.lock().unwrap(), 0);
+    }
+
+    #[derive(Debug, Default)]
+    struct FailSecondCall(std::sync::Mutex<usize>);
+
+    impl DecisionProvider for FailSecondCall {
+        fn decide(
+            &self,
+            question: &Question,
+            candidates: &[Candidate],
+        ) -> Result<Decision, ProviderError> {
+            let mut calls = self.0.lock().unwrap();
+            *calls += 1;
+            if *calls == 2 {
+                return Err(ProviderError::Fixture("provider unavailable".into()));
+            }
+            Ok(Decision {
+                question_id: question.id.clone(),
+                probabilities: candidates
+                    .iter()
+                    .map(|candidate| (candidate.id.clone(), 0.9))
+                    .collect(),
+            })
+        }
+    }
+
+    #[test]
+    fn provider_failure_discards_prior_batch_decisions() {
+        let provider = FailSecondCall::default();
+        let candidates: Vec<Candidate> = (0..9)
+            .map(|index| Candidate {
+                id: format!("candidate-{index}"),
+                kind: CandidateKind::File,
+                excerpt: "x".repeat(7_300),
+            })
+            .collect();
+        let outcome = decide_batched(&provider, &question(), &candidates);
+        assert!(!outcome.complete);
+        assert_eq!(
+            outcome.error,
+            Some(ProviderError::Fixture("provider unavailable".into()))
+        );
+        assert!(outcome.decision.probabilities.is_empty());
+    }
+
+    #[test]
+    fn query_request_cap_marks_remaining_candidates_as_budget_limited() {
+        let provider = CallCounter::default();
+        let candidates: Vec<Candidate> = (0..24)
+            .map(|index| Candidate {
+                id: format!("candidate-{index}"),
+                kind: CandidateKind::File,
+                excerpt: "x".repeat(7_300),
+            })
+            .collect();
+        let outcome = decide_batched(&provider, &question(), &candidates);
+        assert!(!outcome.complete);
+        assert_eq!(outcome.error, Some(ProviderError::BudgetLimited));
+        assert_eq!(*provider.0.lock().unwrap(), MAX_PROVIDER_REQUESTS);
+        assert!(outcome.decision.probabilities.len() < candidates.len());
+    }
+
+    #[test]
+    fn query_budget_is_shared_across_stages() {
+        let provider = CallCounter::default();
+        let mut budget = QueryBudget::default();
+        let first =
+            decide_batched_with_budget(&provider, &question(), &[candidate("first")], &mut budget);
+        let second =
+            decide_batched_with_budget(&provider, &question(), &[candidate("second")], &mut budget);
+        let third =
+            decide_batched_with_budget(&provider, &question(), &[candidate("third")], &mut budget);
+        assert!(first.complete && second.complete);
+        assert!(!third.complete);
+        assert_eq!(third.error, Some(ProviderError::BudgetLimited));
+        assert_eq!(*provider.0.lock().unwrap(), MAX_PROVIDER_REQUESTS);
+    }
+
+    #[test]
     fn single_over_limit_candidate_is_rejected_without_provider_call() {
         let provider = CallCounter::default();
         let candidate = Candidate {
@@ -445,7 +590,7 @@ mod tests {
         };
         let outcome = decide_batched(&provider, &question(), &[candidate]);
         assert!(!outcome.complete);
-        assert_eq!(outcome.error, Some(ProviderError::InvalidCandidates));
+        assert_eq!(outcome.error, Some(ProviderError::BudgetLimited));
         assert_eq!(*provider.0.lock().unwrap(), 0);
     }
 
