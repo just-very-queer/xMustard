@@ -670,9 +670,47 @@ export function textBlocks(content: unknown[]): string[] | undefined {
 	return out;
 }
 
+// carriesHandle reports whether a result's text already names a recovery handle.
+// knownHandle (masking.ts) reads a handle out of structured details; the run
+// wrapper's projection puts its handle in the [xmustard evidence] footer of the
+// text instead, and that result reaches Pi with no details of our own, so the
+// footer is the only place the handle can come from.
+// The scan is linear in the text: each line is inspected once, from its first tag
+// to its end, so a long line of repeated tags cannot make it revisit the same span.
+const HANDLE_TAG = /\[xmustard (?:evidence|masked|page|search)\]/g;
+const HANDLE_MARK = "xm1.";
+
+export function carriesHandle(texts: readonly string[]): boolean {
+	return texts.some(lineHoldsTaggedHandle);
+}
+
+function lineHoldsTaggedHandle(t: string): boolean {
+	HANDLE_TAG.lastIndex = 0;
+	for (let m = HANDLE_TAG.exec(t); m; m = HANDLE_TAG.exec(t)) {
+		const nl = t.indexOf("\n", m.index);
+		const end = nl === -1 ? t.length : nl;
+		const at = t.indexOf(HANDLE_MARK, m.index + m[0].length);
+		if (at !== -1 && at < end) return true;
+		if (nl === -1) return false;
+		HANDLE_TAG.lastIndex = nl + 1;
+	}
+	return false;
+}
+
+// resultCarriesHandle is the one rule the tool_result hook applies to every result
+// before it decides anything else: does this text already name a recovery handle? It
+// is a named function rather than a line in the hook so the unit suite can reach it
+// without a live ExtensionAPI. A non-text block (an image) is not a handle.
+export function resultCarriesHandle(content: unknown[]): boolean {
+	return carriesHandle(textBlocks(content) ?? []);
+}
+
 // projectBuiltin is the tool_result handler for Pi's built-in tools. A text result
 // larger than the projection target is captured and replaced by its projection with
-// a recovery line; isError is never touched and details are kept. Every failure
+// a recovery line; isError is never touched and details are kept. A result that
+// already carries a handle activates expansion before the size check, because the
+// wrapper's own projection (WS-44e) reduces bash output before Pi ever sees it, so
+// it would otherwise leave here having activated nothing. Every failure
 // leaves Pi's result as it is (a reason goes into details.xmustard).
 export async function projectBuiltin(
 	cfg: AdapterConfig,
@@ -681,12 +719,23 @@ export async function projectBuiltin(
 	ev: BuiltinResultInput,
 	meta: { sessionId?: string; signal?: AbortSignal },
 	onHandle: () => void,
+	// Whether THIS call was rewritten to the run wrapper, recorded by the tool_call
+	// hook. It is the only trustworthy provenance for a handle: output text is not,
+	// because an untrusted built-in result can print a `[xmustard evidence]` line
+	// with an `xm1.` in it (a bash call catting a saved transcript), and inferring
+	// capture from the shape of the text let any such result skip capture, redaction
+	// and the output budget entirely.
+	wrapped: boolean,
 ): Promise<BuiltinResultOutput | undefined> {
 	if (!cfg.builtins.has(ev.toolName)) return undefined;
 	const texts = textBlocks(ev.content);
 	if (!texts) return undefined;
 	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
 	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
+	// A wrapped result (the run wrapper's projection) is the reduced form of an
+	// original the wrapper already captured; capturing it again would point the
+	// visible handle at the projection instead of the command's own output.
+	if (wrapped && carriesHandle(texts)) return undefined;
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });
 	const paused = capturer.paused;
 	if (paused) return passthrough(`capture paused: ${paused}`);

@@ -976,21 +976,239 @@ fn enc(s: &str) -> String {
     utf8_percent_encode(s, NON_ALPHANUMERIC).to_string()
 }
 
+fn basename(word: &str) -> &str {
+    word.rsplit('/').next().unwrap_or(word)
+}
+
+
 /// What the server may learn of the command line to pick a reducer: the program's name
-/// and, when it is a plain word, its first argument (`git diff`). The rest of the line
-/// can hold tokens or secrets, so it never leaves the process.
+/// and, when it is a plain word and the program is one whose subcommand selects a
+/// family, that argument (`git diff`). The rest of the line can hold tokens or
+/// secrets, so it never leaves the process.
+///
+/// A client that cannot replace a shell result rewrites the command into
+/// `<shell> -c <command>` (the Pi adapter's WS-44e wrap). The program is then the
+/// shell, which every command shares, so the hint has to come from the string the
+/// shell will run. `sh -c "git diff"` must still hint `git diff`, or the whole
+/// command-keyed reducer registry falls through to the generic shell reducer.
 fn command_hint(argv: &[String]) -> String {
-    let name = argv[0].rsplit('/').next().unwrap_or(&argv[0]);
-    let plain = |s: &String| {
-        !s.is_empty()
-            && s.bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
-            && !s.starts_with('-')
-    };
-    match argv.get(1).filter(|a| plain(a)) {
-        Some(sub) => format!("{name} {sub}"),
-        None => name.to_string(),
+    let name = basename(&argv[0]);
+    // A shell invocation's words come from the string the shell will run, so the
+    // hint describes the command and not the shell that every command shares. Only
+    // a program the Go side treats as a shell (registry.go: bash, sh, zsh, dash,
+    // ksh) is read that way: `python -c <script>` is a script, and none of its
+    // words may leave the process.
+    let script = SHELLS
+        .contains(&name)
+        .then(|| argv.get(1).filter(|f| *f == "-c").and(argv.get(2)))
+        .flatten();
+    match script {
+        // The registry classifies every simple command of the line
+        // (`commandFamily`: split on `;`, `&&`, `||`, `|`, most specific family
+        // wins), so `cd sub && go test ./...` is a test run there. Reading only the
+        // line's first word sent `cd`, which the registry also classifies — as the
+        // generic shell family — and the capture lost the test reduction entirely.
+        Some(line) => shell_line_hint(line).unwrap_or_else(|| name.to_string()),
+        None => match argv.first().map(|a| basename(a)).filter(|a| plain(a)) {
+            Some(first) => hint_for(first, &mut argv.iter().skip(1).map(String::as_str)),
+            None => name.to_string(),
+        },
     }
+}
+
+// The hint over a shell line's simple commands, by the registry's own rule
+// (`commandFamily`, registry.go:299): every simple command is classified and the most
+// specific wins, compared with a STRICT `>`, so the first of two equally specific
+// commands is the one kept. A package script outranks a plain program because the
+// registry reads a script's own family (`npm run test`) where a plain program's hint
+// is only its subcommand. A line of only rule-less commands (`cd`, `echo`, `ls`)
+// names the first one, which is the same answer a single such command gets.
+fn shell_line_hint(line: &str) -> Option<String> {
+    let mut best: Option<(u8, String)> = None;
+    for simple in split_simple_commands(line) {
+        let mut words = simple.split_whitespace();
+        let Some(first) = words.next().map(basename).filter(|w| plain(w)) else {
+            continue;
+        };
+        let rank = hint_rank(first);
+        if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
+            best = Some((rank, hint_for(first, &mut words)));
+        }
+    }
+    best.map(|(_, hint)| hint)
+}
+
+// The registry's dispatch order, as a rank, with 0 for a program no rule carries.
+// The program set is `HINT_RULES`' own.
+fn hint_rank(program: &str) -> u8 {
+    match HINT_RULES.iter().find(|(p, _)| p.contains(&program)) {
+        Some((_, Hint::RunScript)) => 3,
+        Some((_, Hint::Subcommand)) | Some((_, Hint::Keyword)) => 2,
+        None => 0,
+    }
+}
+
+// The hint for one simple command: its program, plus the one extra word the
+// registry's rule for that program reads. A program no rule carries is named
+// alone, which is what the registry's generic family reduces.
+fn hint_for(first: &str, words: &mut dyn Iterator<Item = &str>) -> String {
+    let rule = HINT_RULES
+        .iter()
+        .find(|(programs, _)| programs.contains(&first))
+        .map(|(_, rule)| *rule);
+    let tail = match rule {
+        Some(Hint::Subcommand) => subcommand(words),
+        Some(Hint::RunScript) => run_script(words),
+        Some(Hint::Keyword) => keyword(words),
+        None => None,
+    };
+    match tail {
+        Some(tail) => format!("{first} {tail}"),
+        None => first.to_string(),
+    }
+}
+
+// Split a shell line the way `splitCommand` does, outside quotes: on `;`, `&&`,
+// `||` and `|`. A quote, a redirect or a substitution is left alone, so a `&&`
+// inside a string does not split the line and no word that fails `plain` reaches
+// the hint.
+fn split_simple_commands(line: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let (mut start, mut quote, mut escaped) = (0usize, 0u8, false);
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        if quote != 0 {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' && quote == b'"' {
+                escaped = true;
+            } else if c == quote {
+                quote = 0;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'\'' | b'"' => quote = c,
+            b';' => {
+                parts.push(&line[start..i]);
+                start = i + 1;
+            }
+            b'&' | b'|' if bytes.get(i + 1) == Some(&c) => {
+                parts.push(&line[start..i]);
+                start = i + 2;
+                i += 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    parts.push(&line[start..]);
+    parts.into_iter().map(str::trim).filter(|p| !p.is_empty()).collect()
+}
+
+fn plain(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+}
+
+/// Programs the Go registry reads as a shell wrapping a `-c` string.
+const SHELLS: [&str; 5] = ["bash", "sh", "zsh", "dash", "ksh"];
+
+/// How much of a command line past the program the registry needs, per program
+/// family (registry.go argvFamily). Anything not listed sends its name only.
+#[derive(Clone, Copy)]
+enum Hint {
+    /// The second word selects the family (`git diff`).
+    Subcommand,
+    /// As Subcommand, plus the script name after `run` (`npm run test`).
+    RunScript,
+    /// The registry only asks whether the line contains test, check or lint, so
+    /// only that fixed keyword is sent, never the target's own name.
+    Keyword,
+}
+
+const HINT_RULES: [(&[&str], Hint); 3] = [
+    (&["go", "git", "cargo", "kubectl", "docker"], Hint::Subcommand),
+    (&["npm", "pnpm", "yarn", "bun", "deno"], Hint::RunScript),
+    (
+        &["make", "just", "task", "rake", "mvn", "gradle", "gradlew", "sbt", "dotnet", "swift", "zig", "mix"],
+        Hint::Keyword,
+    ),
+];
+
+fn subcommand(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
+    words.next().filter(|w| plain(w)).map(str::to_string)
+}
+
+// The script word, read without `plain`. `plain` is the disclosure rule and it is
+// still the right one for everything the hint sends, but the script's own name is
+// never sent — only the family word `family_of` derives from it — so a name that
+// `plain` would refuse may still be classified. npm's own naming uses a colon for
+// a variant (`test:unit`, `lint:fix`, `build:prod`), the registry classifies all
+// three by prefix, and reading them through `plain` sent a bare `npm run`, which
+// is the generic package-manager reducer: the capture landed in no family at all.
+fn script_name(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
+    words.next().filter(|w| !w.is_empty()).map(str::to_string)
+}
+
+fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
+    let sub = subcommand(words)?;
+    if sub != "run" {
+        return Some(sub);
+    }
+    // The registry reads the script's name only to classify it (registry.go:
+    // `HasPrefix(script, "test")`, and the same for lint and build), so the family
+    // word is what it needs and the name itself may be anything — a script called
+    // after a credential would otherwise put that word in the capture URL.
+    Some(match script_name(words).as_deref().and_then(family_of) {
+        Some(family) => format!("run {family}"),
+        None => sub,
+    })
+}
+
+/// The registry's own script families, in its precedence order (test before lint
+/// before build). A script matching none is not sent: the registry's fallback for
+/// an unknown npm script is the generic package-manager reducer, not a guess.
+///
+/// registry.go:491-495 verbatim, and the order is the registry's, because the
+/// classification has to agree with it exactly: a hint that disagrees routes the
+/// capture to a different reducer than the same command would have had unwrapped.
+/// Only `test`, `lint`, `build` and `e2e` are prefix tests there; `t`, `vitest`,
+/// `jest`, `eslint`, `compile`, `typecheck`, `tsc`, `install` and `ci` are exact
+/// matches, and `starts_with` on any of them would claim a family the registry does
+/// not (`tsc` is a build there, `jest` a test).
+fn family_of(script: &str) -> Option<&'static str> {
+    let s = script.to_ascii_lowercase();
+    const TEST_PREFIX: [&str; 2] = ["test", "e2e"];
+    const TEST_EXACT: [&str; 3] = ["t", "vitest", "jest"];
+    const LINT_PREFIX: [&str; 1] = ["lint"];
+    const LINT_EXACT: [&str; 1] = ["eslint"];
+    const BUILD_PREFIX: [&str; 1] = ["build"];
+    const BUILD_EXACT: [&str; 5] = ["compile", "typecheck", "tsc", "install", "ci"];
+    if TEST_PREFIX.iter().any(|p| s.starts_with(p)) || TEST_EXACT.contains(&s.as_str()) {
+        Some("test")
+    } else if LINT_PREFIX.iter().any(|p| s.starts_with(p)) || LINT_EXACT.contains(&s.as_str()) {
+        Some("lint")
+    } else if BUILD_PREFIX.iter().any(|p| s.starts_with(p)) || BUILD_EXACT.contains(&s.as_str()) {
+        Some("build")
+    } else {
+        None
+    }
+}
+
+/// The registry's own keywords, in its precedence order (test and check before lint).
+const FAMILY_KEYWORDS: [&str; 3] = ["test", "check", "lint"];
+
+fn keyword(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
+    let line: Vec<String> = words.map(str::to_ascii_lowercase).collect();
+    FAMILY_KEYWORDS
+        .iter()
+        .find(|k| line.iter().any(|w| w.contains(*k)))
+        .map(|k| k.to_string())
 }
 
 fn digest(argv: &[String]) -> String {
@@ -1251,6 +1469,190 @@ mod tests {
             "curl"
         );
         assert_eq!(command_hint(&a(&["curl", "https://h/?k=secret"])), "curl");
+    }
+
+    #[test]
+    fn command_hint_of_a_shell_invocation_names_the_command_not_the_shell() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(command_hint(&a(&["bash", "-c", "git diff"])), "git diff");
+        assert_eq!(command_hint(&a(&["sh", "-c", "go test ./..."])), "go test");
+        assert_eq!(
+            command_hint(&a(&["/bin/bash", "-c", "cargo clippy --all"])),
+            "cargo clippy"
+        );
+        // Nothing past the second word is taken, so a token later in the line never
+        // reaches the hint.
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "git diff --stat"])),
+            "git diff"
+        );
+        // The registry classifies EVERY simple command of the line
+        // (`commandFamily`: split on `;`, `&&`, `||`, `|`, most specific family
+        // wins), so a leading `cd` does not decide the hint. Reading only the first
+        // word sent `cd`, which has no family of its own, and the capture lost the
+        // reduction this whole path exists to enable.
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "cd sub && git diff"])),
+            "git diff"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "cd sub && go test ./..."])),
+            "go test"
+        );
+        // Every separator the registry splits on, and the precedence between them.
+        assert_eq!(command_hint(&a(&["bash", "-c", "cd a; npm run test"])), "npm run test");
+        assert_eq!(command_hint(&a(&["bash", "-c", "ls || go build ./..."])), "go build");
+        // Two rule-carrying commands. The registry keeps the MOST SPECIFIC
+        // (`familyRank`), and a package script's own family is more specific than a
+        // plain program's subcommand — so it wins in either order, measured against
+        // registry.go's dispatch on the box (logs/ws-44e-run-20261004T080850Z.log).
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "go test && npm run build"])),
+            "npm run build"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "npm run build && go test"])),
+            "npm run build",
+            "and the same line the other way round keeps the script, not the subcommand"
+        );
+        // Two commands of the SAME rank: the registry's comparison is a strict `>`
+        // (registry.go:311), so the FIRST of equals is the one kept. Measured on the
+        // box against that comparison (logs/ws-44e-run-20261004T080925Z.log).
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "go test && git diff"])),
+            "go test"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "git diff && go test"])),
+            "git diff"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "git diff | head -50"])),
+            "git diff",
+            "a pipe is a separator too"
+        );
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "echo hi && cd x"])),
+            "echo",
+            "a line of only rule-less commands names the first one, which is the \
+             same answer a single such command gets"
+        );
+        // A separator inside quotes is not a separator, so the line stays one
+        // command and no word that fails `plain` reaches the hint.
+        assert_eq!(
+            command_hint(&a(&["bash", "-c", "echo 'a && go test'"])),
+            "echo",
+            "a quoted && is text, not a separator"
+        );
+        assert_eq!(command_hint(&a(&["bash", "-c", "ls"])), "ls");
+        assert_eq!(command_hint(&a(&["bash", "-c", ""])), "bash");
+        assert_eq!(command_hint(&a(&["bash", "-c"])), "bash");
+        assert_eq!(command_hint(&a(&["bash"])), "bash");
+    }
+
+    #[test]
+    fn command_hint_sends_a_second_word_only_where_the_registry_dispatches_on_one() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // The subcommand programs: argvFamily switches on argv0 and its subcommand,
+        // so both words are what it needs.
+        for program in ["go", "git", "cargo", "npm", "docker"] {
+            assert_eq!(
+                command_hint(&a(&["bash", "-c", &format!("{program} sub")])),
+                format!("{program} sub"),
+                "{program} sub"
+            );
+        }
+        // Everything else: the first word is the whole hint. An argument is not a
+        // family selector, and `echo hunter2` must not put hunter2 in the query.
+        for (command, want) in [
+            ("echo hunter2", "echo"),
+            ("curl https://h/?k=secret", "curl"),
+            ("pytest -k secret", "pytest"),
+            ("ls -la /home/user", "ls"),
+            ("sed -i s/a/b/ f", "sed"),
+        ] {
+            assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
+        }
+        // A word holding a redirect, a glob or a substitution is never a plain word.
+        assert_eq!(command_hint(&a(&["bash", "-c", "go test ./..."])), "go test");
+        assert_eq!(command_hint(&a(&["bash", "-c", "go >out"])), "go");
+    }
+
+    #[test]
+    fn command_hint_reads_a_dash_c_script_only_for_a_shell() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(command_hint(&a(&["python", "-c", "hunter2 = 1"])), "python");
+        assert_eq!(command_hint(&a(&["/usr/bin/node", "-c", "git diff"])), "node");
+        assert_eq!(command_hint(&a(&["zsh", "-c", "git diff"])), "git diff");
+    }
+
+    #[test]
+    fn command_hint_keeps_what_the_registry_needs_for_scripts_and_targets() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for (command, want) in [
+            ("npm run test", "npm run test"),
+            ("pnpm run lint --fix", "pnpm run lint"),
+            ("npm run", "npm run"),
+            ("npm test", "npm test"),
+            ("make test", "make test"),
+            ("make -j4 check-backend", "make check"),
+            ("make lint", "make lint"),
+            ("make deploy-hunter2", "make"),
+            ("gradle build", "gradle"),
+        ] {
+            assert_eq!(command_hint(&a(&["bash", "-c", command])), want, "{command}");
+        }
+    }
+
+    #[test]
+    fn a_run_script_hint_carries_its_family_and_never_the_script_name() {
+        // r6 (codex-spec medium): the registry reads the script only to classify it
+        // (registry.go `HasPrefix(script, "test")`, and the same for lint and build), so
+        // the family word is all it needs. A script named after a secret must not reach
+        // the capture URL, which is what sending the name verbatim allowed.
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let hint = |command: &str| command_hint(&a(&["bash", "-c", command]));
+        for (command, want) in [
+            ("npm run test", "npm run test"),
+            ("npm run test:unit", "npm run test"),
+            ("npm run e2e", "npm run test"),
+            ("npm run vitest", "npm run test"),
+            ("npm run lint:fix", "npm run lint"),
+            ("npm run eslint", "npm run lint"),
+            ("npm run build", "npm run build"),
+            ("npm run tsc", "npm run build"),
+            // r7: only `test`, `e2e`, `lint` and `build` are prefix tests in the
+            // registry; the rest are exact, so a prefix match would claim a family the
+            // registry does not — `tsc` is a build there and `t` is not a prefix of it,
+            // while `jest` is a test there.
+            ("npm run jest", "npm run test"),
+            ("npm run tscheck", "npm run"),
+            // npm's own variant naming uses a colon, and the registry classifies these
+            // by prefix (`registry.go`: `HasPrefix(script, "test")`). Reading the script
+            // through `plain`, which refuses a colon, sent a bare `npm run` for all
+            // three — the generic package-manager reducer, so the capture landed in no
+            // family at all.
+            ("npm run build:prod", "npm run build"),
+            ("npm run lint:fix", "npm run lint"),
+            // A script in none of the registry's families sends nothing, because the
+            // registry's own fallback for an unknown script is the generic reducer.
+            ("npm run deploy", "npm run"),
+            ("npm run hunter2", "npm run"),
+            ("npm run TEST", "npm run test"),
+        ] {
+            assert_eq!(hint(command), want, "{command}");
+        }
+        // The shape a secret takes: a plain word that is not a family name.
+        assert!(!hint("npm run hunter2").contains("hunter2"));
+        assert!(!hint("npm run s3cret-token").contains("s3cret"));
+    }
+
+    #[test]
+    fn the_wrapper_default_api_is_the_one_the_adapter_refuses_against() {
+        // commandwrap.ts WRAPPER_DEFAULT_API is a second constant in another language.
+        // If the two drift, the adapter compares against an endpoint the wrapper does
+        // not use and wraps a call the wrapper sends somewhere else.
+        assert_eq!(DEFAULT_API, "http://127.0.0.1:8042");
     }
 
     #[test]
