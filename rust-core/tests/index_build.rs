@@ -1183,6 +1183,7 @@ fn path_status_matches_the_indexer_and_reports_ignore_sources() {
         ("src/keep.ts", "export function keep() {}\n"),
         ("force.ts", "export function force() {}\n"),
         ("excluded.ts", "export function excluded() {}\n"),
+        (".env.md", "secret documentation\n"),
         (".gitignore", "force.ts\nprivate-untracked.ts\n"),
         (".xmustardignore", "excluded.ts\n"),
     ]);
@@ -1226,6 +1227,9 @@ fn path_status_matches_the_indexer_and_reports_ignore_sources() {
         assert_eq!(result["indexed"], false);
     }
     assert_eq!(status("untracked.ts")["state"], "untracked");
+    let secret_doc = status(".env.md");
+    assert_eq!(secret_doc["state"], "not-indexed", "{secret_doc}");
+    assert_eq!(secret_doc["reason"], "secret_path", "{secret_doc}");
 }
 
 fn synthetic_file(i: usize) -> (String, String) {

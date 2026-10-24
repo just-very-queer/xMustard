@@ -283,9 +283,30 @@ pub fn layout(root: &Path, cfg: &IndexConfig) -> Result<Layout, String> {
 }
 
 pub fn scan(layout: &Layout, cfg: &IndexConfig) -> Result<Scan, String> {
+    scan_with_ignore_budget(
+        layout,
+        cfg,
+        super::ignore::MATCH_BUDGET,
+        super::ignore::PATH_ALLOWANCE,
+    )
+}
+
+pub(super) fn scan_with_ignore_budget(
+    layout: &Layout,
+    cfg: &IndexConfig,
+    budget: u64,
+    allowance: u64,
+) -> Result<Scan, String> {
     match &layout.git_dir {
-        Some(g) => scan_git(&layout.root, g.clone(), &layout.prefix, cfg),
-        None => Ok(scan_walk(&layout.root, cfg)),
+        Some(g) => scan_git(
+            &layout.root,
+            g.clone(),
+            &layout.prefix,
+            cfg,
+            budget,
+            allowance,
+        ),
+        None => Ok(scan_walk(&layout.root, cfg, budget, allowance)),
     }
 }
 
@@ -823,6 +844,8 @@ fn scan_git(
     git_dir: PathBuf,
     prefix: &str,
     cfg: &IndexConfig,
+    budget: u64,
+    allowance: u64,
 ) -> Result<Scan, String> {
     let started_ns = now_ns();
     let git_index = git_index_key(&git_dir);
@@ -858,7 +881,7 @@ fn scan_git(
     ig.load_xmustard(root, &ignore_files);
 
     let mut col = Collector::new(root, cfg);
-    let mut memo = DirMemo::default();
+    let mut memo = DirMemo::with_budget(budget, allowance);
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
     // `.gitmodules` sits at the top level and names top-level paths
@@ -943,13 +966,13 @@ fn scan_git(
     })
 }
 
-fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
+fn scan_walk(root: &Path, cfg: &IndexConfig, budget: u64, allowance: u64) -> Scan {
     let started_ns = now_ns();
     let mut col = Collector::new(root, cfg);
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
     let mut ig = Ignore::with_defaults();
-    let mut memo = DirMemo::default();
+    let mut memo = DirMemo::with_budget(budget, allowance);
     // .gitignore files are applied top-down as directories are entered.
     let mut it = walkdir::WalkDir::new(root)
         .follow_links(false)
