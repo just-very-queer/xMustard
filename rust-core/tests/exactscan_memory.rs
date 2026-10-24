@@ -1,7 +1,7 @@
 //! The exact scan's heap is bounded by its caps, measured on production code: one file's
 //! bytes, the lazy DFA's caches and the listed spans, never an entry per line
-//! (batch43 #1, batch51 #6). A 4 MiB file of newlines would cost about 32 MiB of line
-//! starts if positions were looked up rather than counted.
+//! (batch43 #1, batch51 #6), on each of the three engines. A 4 MiB file of newlines would
+//! cost about 32 MiB of line starts if positions were looked up rather than counted.
 //!
 //! The counting allocator is test code only (the library keeps `#![forbid(unsafe_code)]`),
 //! and this is the only test in its binary, so no other test's allocations reach the peak.
@@ -46,7 +46,24 @@ fn a_dense_newline_file_is_scanned_within_its_byte_cap_and_caches() {
     body.extend_from_slice(b"needle");
     std::fs::write(td.path().join("a.txt"), &body).unwrap();
     drop(body);
-    for (query, matcher) in [("needle", Matcher::Exact), ("ne+dle", Matcher::Regex)] {
+    // An exact set of 100 words and `needle`, past the lazy DFA's NFA limit, so it runs on
+    // Aho-Corasick.
+    let mut x = 0x9e37_79b9_7f4a_7c15u64;
+    let mut letter = || {
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        char::from(b'a' + (x % 26) as u8)
+    };
+    let words: Vec<String> = (0..100)
+        .map(|_| (0..10).map(|_| letter()).collect())
+        .collect();
+    let set = format!("{}|needle", words.join("|"));
+    for (query, matcher) in [
+        ("needle", Matcher::Exact),
+        ("ne+dle", Matcher::Regex),
+        (set.as_str(), Matcher::Regex),
+    ] {
         let pattern = compile(query, matcher).unwrap();
         let mut sc = pattern.scanner();
         let mut fs = FileScan::open(td.path(), "a.txt").unwrap();

@@ -2908,6 +2908,30 @@ mod scan_tests {
         assert_eq!(report.unconfirmed, None);
     }
 
+    // An exact literal set past the lazy DFA's NFA limit is answered as the regex crate
+    // answers it, with a literal search: 100 words of 10 letters, two of them planted.
+    #[test]
+    fn a_literal_set_past_the_nfa_limit_is_searched() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut letter = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            char::from(b'a' + (x % 26) as u8)
+        };
+        let words: Vec<String> = (0..100)
+            .map(|_| (0..10).map(|_| letter()).collect())
+            .collect();
+        let body = format!("xx {} yy\n{}\n", words[7], words[93]);
+        let repo = git_repo(&[("a.txt", &body)]);
+        let res = scan_repo(&repo, &words.join("|"), SearchMode::Regex);
+        let listed: Vec<(usize, usize, usize)> =
+            res.spans.iter().map(|s| (s.line, s.byte, s.len)).collect();
+        assert_eq!(listed, [(1, 3, 10), (2, 17, 10)], "{:?}", res.degradations);
+        assert!(!res.truncated, "{:?}", res.degradations);
+        assert_eq!(res.cut, None);
+    }
+
     // A Unicode word boundary is refused like any pattern the scan cannot answer: reported,
     // nothing read, never an empty answer that reads as complete.
     #[test]

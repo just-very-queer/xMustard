@@ -9,27 +9,36 @@
 //! the answer may list, the bytes the scan may read, and the wall-clock it may spend. A cap
 //! that fires sets `cut` with its name, so a partial answer never reads as a complete one.
 //!
-//! A file's answer is whole-file matching: exactly what `Pattern::re.find_iter` reports
-//! over its bytes (leftmost-first, non-overlapping, an empty match at the previous match's
-//! end skipped). A match may cross lines, and `^`/`$` anchor the file unless `(?m)` is
-//! set. When a cap stops the reads inside a file, an occurrence is listed only if it is
-//! final: whole-file matching reports exactly it, at that place, whatever the unread bytes
-//! hold. The first occurrence that cannot be shown final ends the file's list, and
-//! `Report::unconfirmed` names the byte from which its occurrences are not listed.
+//! A file's answer is whole-file matching: the pattern's leftmost-first, non-overlapping
+//! matches over its bytes, an empty match at the previous match's end skipped. That is the
+//! iteration `regex::bytes` documents, as regex-automata's PikeVM computes it with no
+//! literal optimisation, and the tests check the scan against that PikeVM. regex's own
+//! `find_iter` can start a match later than that: regex-automata 0.4.14's reverse suffix
+//! and inner strategies trust the first literal they find, for `(?:|ab.)c` among others.
+//! A match may cross lines, and `^`/`$` anchor the file unless `(?m)` is set. When a cap
+//! stops the reads inside a file, an occurrence is listed only if it is final: whole-file
+//! matching reports exactly it, at that place, whatever the unread bytes hold. The first
+//! occurrence that cannot be shown final ends the file's list, and `Report::unconfirmed`
+//! names the byte from which its occurrences are not listed.
 //!
-//! Nothing proportional to the corpus is held: one file's bytes (never more than the byte
-//! cap), the lazy DFA's two caches and the listed spans. A span's line and column are
-//! counted as it is listed, so no per-line state exists. The matcher steps one byte at a
-//! time and checks the deadline every `SCAN_STEP` transitions, so one expensive search
-//! step is interrupted rather than run to its end.
+//! A plain literal is found with memmem and every other pattern with a lazy DFA, except an
+//! exact literal set whose NFA is past the lazy DFA's limit: regex answers that with a
+//! literal search, and so does the scan, with Aho-Corasick. Nothing proportional to the
+//! corpus is held: one file's bytes (never more than the byte cap), the lazy DFA's two
+//! caches and the listed spans. A span's line and column are counted as it is listed, so
+//! no per-line state exists. The lazy DFA steps one byte at a time and checks the deadline
+//! every `SCAN_STEP` transitions, and the literal engines between `CHUNK_BYTES` windows,
+//! so one expensive search step is interrupted rather than run to its end.
 
 use std::ops::ControlFlow;
 
+use aho_corasick::{AhoCorasick, AhoCorasickKind};
 use memchr::memmem;
 use regex::bytes::{Regex, RegexBuilder};
 use regex_automata::nfa::thompson;
 use regex_automata::util::syntax;
 use regex_automata::{Anchored, Input, hybrid};
+use regex_syntax::hir::literal::{Extractor, Seq};
 use regex_syntax::hir::{Class, Hir, HirKind, Look};
 use serde::Serialize;
 
@@ -97,6 +106,14 @@ impl Matcher {
         match self {
             Matcher::Exact => "exact",
             Matcher::Regex => "regex",
+        }
+    }
+
+    /// The pattern `query` compiles to: escaped for `exact`, as written for `regex`.
+    fn pattern(self, query: &str) -> String {
+        match self {
+            Matcher::Exact => regex::escape(query),
+            Matcher::Regex => query.to_string(),
         }
     }
 }
@@ -345,14 +362,10 @@ impl<'d> Work<'d> {
     }
 }
 
-/// A compiled query: the regex crate's matcher, the engine the scan runs and what the
-/// pattern's shape proves at a cutoff.
+/// A compiled query: the engine the scan runs and what the pattern's shape proves at a
+/// cutoff.
 #[derive(Debug)]
 pub struct Pattern {
-    /// `regex::bytes` over the pattern with the lane's options. It validates the pattern
-    /// with the engine's own messages and is the oracle the tests compare the scan
-    /// against; production never searches with it.
-    pub re: Regex,
     engine: Engine,
     shape: Shape,
 }
@@ -361,6 +374,9 @@ pub struct Pattern {
 enum Engine {
     /// A non-empty literal, found with memmem.
     Literal(Box<memmem::Finder<'static>>),
+    /// An exact set of non-empty literals whose NFA is past the lazy DFA's limit, found
+    /// with leftmost-first Aho-Corasick.
+    Set(Box<AhoCorasick>),
     /// Everything else: a lazy DFA, forward leftmost-first and reverse for the start.
     Dfa(Box<hybrid::regex::Regex>),
 }
@@ -370,6 +386,7 @@ impl Pattern {
     pub fn scanner(&self) -> Scanner<'_> {
         let search = match &self.engine {
             Engine::Literal(finder) => Search::Literal(finder),
+            Engine::Set(set) => Search::Set(set),
             Engine::Dfa(re) => Search::Dfa {
                 re,
                 cache: Box::new(re.create_cache()),
@@ -389,10 +406,7 @@ impl Pattern {
 /// metacharacters (`.`, `*`, `(`) matches the bytes it names rather than being read as a
 /// pattern — which is what "exact" has to mean to differ from "regex".
 pub fn compile(query: &str, matcher: Matcher) -> Result<Pattern, String> {
-    let pattern = match matcher {
-        Matcher::Exact => regex::escape(query),
-        Matcher::Regex => query.to_string(),
-    };
+    let pattern = matcher.pattern(query);
     if pattern.len() > MAX_MATCH_BYTES {
         return Err(format!(
             "{} pattern is longer than the {MAX_MATCH_BYTES}-byte ceiling",
@@ -401,44 +415,60 @@ pub fn compile(query: &str, matcher: Matcher) -> Result<Pattern, String> {
     }
     let invalid =
         |e: &dyn std::fmt::Display| format!("{} pattern is not valid: {e}", matcher.name());
-    let re = RegexBuilder::new(&pattern)
+    // The regex crate's build is the validation, with its messages and its size limit;
+    // the scan never searches with it.
+    crate_regex(&pattern).map_err(|e| invalid(&e))?;
+    let hir = parse(&pattern).map_err(|e| invalid(&e))?;
+    let unsupported = |e: String| {
+        format!(
+            "{} pattern is not supported by the scan: {e}",
+            matcher.name()
+        )
+    };
+    let engine = match hir.kind() {
+        HirKind::Literal(lit) if !lit.0.is_empty() => {
+            Engine::Literal(Box::new(memmem::Finder::new(&*lit.0).into_owned()))
+        }
+        _ => match lazy_dfa(&pattern) {
+            Ok(re) => Engine::Dfa(Box::new(re)),
+            // regex answers an exact literal set with a literal search and builds no NFA
+            // for it, so a set past the lazy DFA's NFA limit is answered the same way
+            Err(e) => Engine::Set(Box::new(literal_set(&hir).ok_or_else(|| unsupported(e))?)),
+        },
+    };
+    Ok(Pattern {
+        engine,
+        shape: Shape::of(&hir),
+    })
+}
+
+/// `regex::bytes` over `pattern` with the lane's options.
+fn crate_regex(pattern: &str) -> Result<Regex, regex::Error> {
+    RegexBuilder::new(pattern)
         // `unicode(false)` is `index::lexical`'s choice for the same reason: the Unicode
         // classes compile to automata of several MiB, and this lane reads bytes.
         .unicode(false)
         .dfa_size_limit(DFA_CACHE_BYTES)
         .size_limit(MAX_MATCH_BYTES * 8)
         .build()
-        .map_err(|e| invalid(&e))?;
-    // The syntax options `regex::bytes` parsed with above, so the shape and the engine
-    // read the pattern the oracle runs.
-    let hir = regex_syntax::ParserBuilder::new()
+}
+
+/// `pattern` under the syntax options `regex::bytes` parses with, so the shape and the
+/// engine read the pattern the crate validated.
+fn parse(pattern: &str) -> Result<Hir, String> {
+    regex_syntax::ParserBuilder::new()
         .unicode(false)
         .utf8(false)
         .build()
-        .parse(&pattern)
-        .map_err(|e| invalid(&e))?;
-    let engine = match hir.kind() {
-        HirKind::Literal(lit) if !lit.0.is_empty() => {
-            Engine::Literal(Box::new(memmem::Finder::new(&*lit.0).into_owned()))
-        }
-        _ => Engine::Dfa(Box::new(lazy_dfa(&pattern).map_err(|e| {
-            format!(
-                "{} pattern is not supported by the scan: {e}",
-                matcher.name()
-            )
-        })?)),
-    };
-    Ok(Pattern {
-        re,
-        engine,
-        shape: Shape::of(&hir),
-    })
+        .parse(pattern)
+        .map_err(|e| e.to_string())
 }
 
 /// The lazy DFA for `pattern` under the lane's options. No captures, no prefilter, no
 /// quit bytes and no give-up count, so a search never fails; each cache is held to
-/// `DFA_CACHE_BYTES`, or the engine's minimum when that is larger. The one pattern it
-/// refuses is a Unicode word boundary, which a lazy DFA cannot evaluate.
+/// `DFA_CACHE_BYTES`, or the engine's minimum when that is larger. It refuses a Unicode
+/// word boundary, which a lazy DFA cannot evaluate, and an NFA past the limit regex holds
+/// its own to, which a pattern regex builds reaches only as an exact literal set.
 fn lazy_dfa(pattern: &str) -> Result<hybrid::regex::Regex, String> {
     hybrid::regex::Regex::builder()
         .syntax(syntax::Config::new().unicode(false).utf8(false))
@@ -459,6 +489,30 @@ fn lazy_dfa(pattern: &str) -> Result<hybrid::regex::Regex, String> {
             Some(cause) => format!("{e}: {cause}"),
             None => e.to_string(),
         })
+}
+
+/// Leftmost-first Aho-Corasick over the literals `hir` matches, when it matches exactly a
+/// finite set of non-empty strings and asserts nothing. regex-syntax guarantees that a
+/// preference-order search of such a set is a leftmost-first search of the pattern. The
+/// set is extracted and minimized as regex-automata's literal strategy extracts it, so
+/// every pattern regex answers with a literal search alone has one, and the extraction's
+/// limits (250 literals of at most 100 bytes) bound the automaton.
+fn literal_set(hir: &Hir) -> Option<AhoCorasick> {
+    if !hir.properties().look_set().is_empty() {
+        return None;
+    }
+    let mut seq = Seq::empty();
+    seq.union(&mut Extractor::new().extract(hir));
+    seq.optimize_for_prefix_by_preference();
+    let lits = seq.literals().filter(|_| seq.is_exact())?;
+    if lits.is_empty() || lits.iter().any(|lit| lit.is_empty()) {
+        return None;
+    }
+    AhoCorasick::builder()
+        .kind(Some(AhoCorasickKind::ContiguousNFA))
+        .match_kind(aho_corasick::MatchKind::LeftmostFirst)
+        .build(lits)
+        .ok()
 }
 
 /// What the pattern's syntax proves about an occurrence the bytes read cannot see past.
@@ -598,6 +652,7 @@ pub struct Scanner<'p> {
 
 enum Search<'p> {
     Literal(&'p memmem::Finder<'static>),
+    Set(&'p AhoCorasick),
     Dfa {
         re: &'p hybrid::regex::Regex,
         /// The forward and reverse caches, each at most `DFA_CACHE_BYTES` or the engine's
@@ -607,19 +662,33 @@ enum Search<'p> {
 }
 
 impl Scanner<'_> {
-    /// Heap bytes the lazy DFA's two caches hold; zero for a literal.
+    /// Heap bytes the lazy DFA's two caches hold; zero for a literal or a literal set,
+    /// whose searches keep no state.
     pub fn memory_usage(&self) -> usize {
         match &self.search {
-            Search::Literal(_) => 0,
+            Search::Literal(_) | Search::Set(_) => 0,
             Search::Dfa { cache, .. } => cache.memory_usage(),
         }
     }
 
     /// The next whole-file occurrence at or after `p`, as far as `buf` decides it.
     fn step(&mut self, buf: Buffer<'_>, p: usize, work: &mut Work<'_>) -> Result<Next, String> {
+        let shape = self.shape;
         match &mut self.search {
-            Search::Literal(finder) => Ok(literal_step(finder, buf, p, work)),
-            Search::Dfa { re, cache } => dfa_step(re, cache, self.shape, buf, p, work),
+            Search::Literal(finder) => {
+                let len = finder.needle().len();
+                literal_step(len, shape, buf, p, work, |q, end| {
+                    Ok(finder.find(&buf.hay[q..end]).map(|i| (q + i, q + i + len)))
+                })
+            }
+            Search::Set(set) => {
+                literal_step(set.max_pattern_len(), shape, buf, p, work, |q, end| {
+                    set.try_find(aho_corasick::Input::new(buf.hay).span(q..end))
+                        .map(|m| m.map(|m| (m.start(), m.end())))
+                        .map_err(|e| e.to_string())
+                })
+            }
+            Search::Dfa { re, cache } => dfa_step(re, cache, shape, buf, p, work),
         }
     }
 }
@@ -724,33 +793,48 @@ fn match_buffer(
     }
 }
 
-/// The literal's leftmost occurrence at or after `p`, searched `CHUNK_BYTES` starts at a
-/// time with a deadline check between windows. An occurrence found lies wholly inside the
-/// bytes read, so it is final at either ending.
+/// The leftmost-first occurrence of a literal or a literal set at or after `p`, searched
+/// `CHUNK_BYTES` starts at a time with a deadline check between windows. `find` searches
+/// the window `q..end`, which holds every literal starting in its first `CHUNK_BYTES`
+/// bytes. A literal found wholly inside the bytes read can still lose, at a cutoff, to a
+/// longer one preferred at or before its start, so the shape decides it there; a single
+/// literal's own length always settles it.
 fn literal_step(
-    finder: &memmem::Finder<'_>,
+    longest: usize,
+    shape: Shape,
     buf: Buffer<'_>,
     p: usize,
     work: &mut Work<'_>,
-) -> Next {
-    let (hay, len) = (buf.hay, finder.needle().len());
+    mut find: impl FnMut(usize, usize) -> Result<Option<(usize, usize)>, String>,
+) -> Result<Next, String> {
+    let n = buf.hay.len();
     let mut q = p;
     loop {
-        let end = hay.len().min(q + CHUNK_BYTES + len - 1);
+        let end = n.min(q + CHUNK_BYTES + longest - 1);
         work.units += (end - q) as u64;
-        if let Some(i) = finder.find(&hay[q..end]) {
-            return Next::Final(q + i, q + i + len);
+        match find(q, end)? {
+            // every literal starting at or before `s` fits in the window, or the window
+            // ends where the bytes read do
+            Some((s, e)) if s + longest <= end || end == n => {
+                let decided = buf.ending == Ending::Eof;
+                return Ok(if decided || shape.final_at(s, buf) {
+                    Next::Final(s, e)
+                } else {
+                    Next::Open
+                });
+            }
+            None if end == n => {
+                return Ok(match buf.ending {
+                    Ending::Eof => Next::None,
+                    Ending::Cutoff => Next::Open,
+                });
+            }
+            // no occurrence starts in the window's first `CHUNK_BYTES` bytes
+            _ => {}
         }
-        if end == hay.len() {
-            return match buf.ending {
-                Ending::Eof => Next::None,
-                Ending::Cutoff => Next::Open,
-            };
-        }
-        // no occurrence starts in the window just searched
         q += CHUNK_BYTES;
         if work.check() {
-            return Next::Interrupted;
+            return Ok(Next::Interrupted);
         }
     }
 }
@@ -1195,6 +1279,7 @@ impl Loss {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use regex_automata::nfa::thompson::pikevm::{self, PikeVM};
 
     /// No occurrence, typed for `assert_eq!`.
     const NOTHING: [(usize, usize); 0] = [];
@@ -1403,13 +1488,62 @@ mod tests {
         (listed, outcome)
     }
 
-    /// The whole-file answer: the regex crate's `find_iter`, as (start, end).
-    fn oracle(pattern: &Pattern, hay: &[u8]) -> Vec<(usize, usize)> {
-        pattern
-            .re
-            .find_iter(hay)
-            .map(|m| (m.start(), m.end()))
-            .collect()
+    /// The whole-file answer, as (start, end): regex-automata's PikeVM, leftmost-first
+    /// with no literal optimisation, under the options `regex::bytes` builds with.
+    struct Oracle {
+        vm: PikeVM,
+        cache: pikevm::Cache,
+    }
+
+    impl Oracle {
+        fn new(query: &str, matcher: Matcher) -> Oracle {
+            let vm = PikeVM::builder()
+                .syntax(syntax::Config::new().unicode(false).utf8(false))
+                .thompson(thompson::Config::new().utf8(false).nfa_size_limit(None))
+                .build(&matcher.pattern(query))
+                .unwrap();
+            let cache = vm.create_cache();
+            Oracle { vm, cache }
+        }
+
+        fn find_all(&mut self, hay: &[u8]) -> Vec<(usize, usize)> {
+            self.vm
+                .find_iter(&mut self.cache, hay)
+                .map(|m| (m.start(), m.end()))
+                .collect()
+        }
+    }
+
+    impl Engine {
+        /// The engine's name, for an assertion message.
+        fn name(&self) -> &'static str {
+            match self {
+                Engine::Literal(_) => "memmem",
+                Engine::Set(_) => "aho-corasick",
+                Engine::Dfa(_) => "the lazy DFA",
+            }
+        }
+    }
+
+    /// `query` on the literal-set engine whatever the size of its NFA, when it is an
+    /// exact literal set: the lazy DFA's patterns are the set engine's controls.
+    fn as_set(query: &str, matcher: Matcher) -> Option<Pattern> {
+        let hir = parse(&matcher.pattern(query)).unwrap();
+        Some(Pattern {
+            engine: Engine::Set(Box::new(literal_set(&hir)?)),
+            shape: Shape::of(&hir),
+        })
+    }
+
+    /// The engines `query` can run on: the one `compile` picks, then the literal-set
+    /// engine when the pattern is an exact literal set the compiled one is not.
+    fn engines(query: &str, matcher: Matcher) -> Vec<Pattern> {
+        let compiled = compile(query, matcher).unwrap();
+        let set = match compiled.engine {
+            Engine::Set(_) => None,
+            _ => as_set(query, matcher),
+        };
+        std::iter::once(compiled).chain(set).collect()
     }
 
     // Position bookkeeping is the production scan's own, tested through it at the
@@ -1616,7 +1750,8 @@ mod tests {
         let report = scan_fixture(&body, &needle, Matcher::Exact, None, DEFAULT_MAX_BYTES);
         let want: Vec<(usize, usize)> = (0..=135).map(|k| (k * 511, 511)).collect();
         assert_eq!(found(&report), want);
-        let whole: Vec<(usize, usize)> = oracle(&compile(&needle, Matcher::Exact).unwrap(), &body)
+        let whole: Vec<(usize, usize)> = Oracle::new(&needle, Matcher::Exact)
+            .find_all(&body)
             .into_iter()
             .map(|(s, e)| (s, e - s))
             .collect();
@@ -1834,8 +1969,8 @@ mod tests {
                 "{pattern}"
             );
         }
-        let whole = compile(r"needle\B", Matcher::Regex).unwrap();
-        assert_eq!(oracle(&whole, b"needlex"), [(0, 6)]);
+        let mut whole = Oracle::new(r"needle\B", Matcher::Regex);
+        assert_eq!(whole.find_all(b"needlex"), [(0, 6)]);
 
         let report = scan_fixture(b"needle\nx", "needle$", Matcher::Regex, Some(64), 7);
         assert_eq!(found(&report), NOTHING, "{report:?}");
@@ -2040,6 +2175,187 @@ mod tests {
         assert_eq!(report.unconfirmed, unconfirmed(0, 1, Why::TimeCap));
     }
 
+    // The literal engines check the deadline between `CHUNK_BYTES` windows: three reads
+    // and the check before the first step pass, and the check after the first window, the
+    // fifth, finds it passed.
+    #[test]
+    fn the_literal_engines_check_the_deadline_between_windows() {
+        let body = vec![b'x'; CHUNK_BYTES * 3];
+        for (query, matcher) in [
+            ("needle", Matcher::Exact),
+            ("needle|foo|abc", Matcher::Regex),
+        ] {
+            for pattern in engines(query, matcher) {
+                let longest = match &pattern.engine {
+                    Engine::Literal(finder) => finder.needle().len(),
+                    Engine::Set(set) => set.max_pattern_len(),
+                    Engine::Dfa(_) => continue,
+                };
+                let td = tempfile::tempdir().unwrap();
+                std::fs::write(td.path().join("a.txt"), &body).unwrap();
+                let mut fs = FileScan::open(td.path(), "a.txt").unwrap();
+                let limits = Limits::default();
+                let mut budget = limits.max_bytes;
+                let mut report = Report::default();
+                let mut deadline = Deadline::after_checks(4);
+                let more = fs.scan(
+                    &mut pattern.scanner(),
+                    &limits,
+                    &mut budget,
+                    &mut report,
+                    &mut deadline,
+                    false,
+                );
+                assert!(!more, "{query}");
+                assert_eq!(report.cut, Some(Cut::Time), "{query}");
+                assert_eq!(report.work, (CHUNK_BYTES + longest - 1) as u64, "{query}");
+                assert_eq!(
+                    report.unconfirmed,
+                    unconfirmed(0, body.len(), Why::TimeCap),
+                    "{query}"
+                );
+            }
+        }
+    }
+
+    // The regex crate answers an exact literal set with a literal search and builds no
+    // NFA for it, so a set past the lazy DFA's NFA limit (about 80 words of 10 letters) is
+    // answered on the set engine, not refused: every pattern here the crate builds, the
+    // scan answers.
+    #[test]
+    fn a_literal_set_past_the_nfa_limit_is_answered() {
+        let mut rng = Rng(0x5851_f42d_4c95_7f2d);
+        let shapes = [
+            (10, 10),
+            (60, 10),
+            (80, 10),
+            (100, 10),
+            (30, 20),
+            (60, 6),
+            (120, 6),
+            (200, 19),
+        ];
+        for (count, len) in shapes {
+            let words: Vec<String> = (0..count).map(|_| rng.word(len)).collect();
+            let set = words.join("|");
+            let planted = &words[count / 2];
+            for (query, body, at) in [
+                (set.clone(), format!("xx {planted} yy"), (3, len)),
+                (
+                    format!("(?:{set})!"),
+                    format!("xx {planted}! yy"),
+                    (3, len + 1),
+                ),
+                (
+                    format!("(?:{set})[!?]"),
+                    format!("xx {planted}? yy"),
+                    (3, len + 1),
+                ),
+            ] {
+                let builds = crate_regex(&query).is_ok();
+                let ctx = format!("{count} words of {len}, {} pattern bytes", query.len());
+                if query == set && count >= 80 {
+                    assert!(builds, "{ctx}: the regex crate builds this set");
+                    let engine = compile(&query, Matcher::Regex).map(|p| p.engine);
+                    assert!(matches!(engine, Ok(Engine::Set(_))), "{ctx}");
+                }
+                match compile(&query, Matcher::Regex) {
+                    Err(e) => assert!(!builds, "{ctx}: the regex crate builds it: {e}"),
+                    Ok(_) => {
+                        let report = scan_fixture(
+                            body.as_bytes(),
+                            &query,
+                            Matcher::Regex,
+                            None,
+                            DEFAULT_MAX_BYTES,
+                        );
+                        assert_eq!(found(&report), [at], "{ctx}");
+                        assert_eq!(report.unconfirmed, None, "{ctx}");
+                    }
+                }
+            }
+        }
+    }
+
+    // The set engine against the PikeVM where only it can answer: 200 words, every tenth
+    // also as its first three letters ahead of it (a shorter literal preferred) and, in the
+    // second set, as itself, a newline and `zz` (a literal that crosses lines). Files of
+    // those pieces, at the file's end and at every cutoff.
+    #[test]
+    fn the_set_engine_is_whole_file_matching_past_the_nfa_limit() {
+        let mut rng = Rng(0x3c6e_f372_fe94_f82b);
+        let words: Vec<String> = (0..200).map(|_| rng.word(6)).collect();
+        for crossing in [false, true] {
+            let mut alternatives = Vec::new();
+            for (i, word) in words.iter().enumerate() {
+                if i % 10 == 0 {
+                    alternatives.push(word[..3].to_string());
+                }
+                alternatives.push(word.clone());
+                if crossing && i % 10 == 5 {
+                    alternatives.push(format!(r"{word}\nzz"));
+                }
+            }
+            let query = alternatives.join("|");
+            let pattern = compile(&query, Matcher::Regex).unwrap();
+            assert!(
+                matches!(pattern.engine, Engine::Set(_)),
+                "crossing {crossing}"
+            );
+            assert_eq!(pattern.shape.line_local, !crossing);
+            let mut whole = Oracle::new(&query, Matcher::Regex);
+            let mut sc = pattern.scanner();
+            let mut pieces: Vec<String> = words.iter().step_by(5).cloned().collect();
+            pieces.extend(words.iter().take(20).map(|w| w[..4].to_string()));
+            pieces.extend([" ", "\n", "zz", "x"].map(String::from));
+            for _ in 0..32 {
+                let count = 1 + rng.below(10);
+                let file: Vec<u8> = (0..count)
+                    .flat_map(|_| pieces[rng.below(pieces.len())].bytes())
+                    .collect();
+                let label = format!("{} literals, crossing {crossing}", alternatives.len());
+                assert_eq!(
+                    run_buffer(&mut sc, &file, Ending::Eof).0,
+                    whole.find_all(&file),
+                    "{label} over {}",
+                    show(&file)
+                );
+                assert_final_at_every_cutoff(&mut sc, &mut whole, &label, &file, &mut rng);
+            }
+        }
+    }
+
+    // Whole-file matching is leftmost-first. The regex crate's own `find_iter` misses it
+    // for these (regex-automata 0.4.14's reverse suffix and inner strategies take the
+    // first literal they find): `ab.` matches `abc` at byte 2 and `c` follows, so the
+    // leftmost match is (2, 6), not (4, 5).
+    #[test]
+    fn whole_file_matching_is_leftmost_first_where_the_crates_literal_strategies_are_not() {
+        let mut rng = Rng(0x7f4a_7c15_9e37_79b9);
+        for (query, body, want) in [
+            ("(?:|ab.)c", &b"akabccabbab\rneedle"[..], &[(2, 6)][..]),
+            (
+                r"(?:\b|foo.)[\r\n]",
+                b"foo\r\naabk\r_x\r",
+                &[(0, 5), (9, 10), (12, 13)],
+            ),
+            (
+                r"(?:x|\b|\b{start}foo(?u:.))[\r\n]",
+                b"foo\r\n$\xc3\xa90za",
+                &[(0, 5)],
+            ),
+        ] {
+            let mut whole = Oracle::new(query, Matcher::Regex);
+            assert_eq!(whole.find_all(body), want, "{query}: the oracle");
+            let report = scan_fixture(body, query, Matcher::Regex, None, DEFAULT_MAX_BYTES);
+            let spans: Vec<(usize, usize)> = want.iter().map(|&(s, e)| (s, e - s)).collect();
+            assert_eq!(found(&report), spans, "{query}");
+            assert_eq!(report.unconfirmed, None, "{query}");
+            let pattern = compile(query, Matcher::Regex).unwrap();
+            assert_final_at_every_cutoff(&mut pattern.scanner(), &mut whole, query, body, &mut rng);
+        }
+    }
+
     /// Every shape the cutoff rules tell apart.
     const PROPERTY_PATTERNS: &[(&str, Matcher)] = &[
         ("needle", Matcher::Regex),
@@ -2072,12 +2388,28 @@ mod tests {
         ("(a|ab)(c|bcd)", Matcher::Regex),
         (r"a\nb", Matcher::Regex),
         ("(?m)^a.*$", Matcher::Regex),
+        ("(?:|ab.)c", Matcher::Regex),
+        (r"(?:\b|foo.)[\r\n]", Matcher::Regex),
+        (r"(?:x|\b|\b{start}foo(?u:.))[\r\n]", Matcher::Regex),
+        ("ab|abcd|b\nx|x", Matcher::Regex),
         ("ab", Matcher::Exact),
         ("a\nb", Matcher::Exact),
     ];
 
-    const TOKENS: [&[u8]; 10] = [
-        b"a", b"b", b"x", b"z", b" ", b"\n", b"$", b"needle", b"foo", b"abc",
+    const TOKENS: [&[u8]; 13] = [
+        b"a",
+        b"b",
+        b"x",
+        b"z",
+        b" ",
+        b"\n",
+        b"\r",
+        b"_",
+        b"$",
+        b"\xc3\xa9",
+        b"needle",
+        b"foo",
+        b"abc",
     ];
 
     /// A seeded xorshift64 stream: the same corpus on every run, without a crate.
@@ -2093,6 +2425,13 @@ mod tests {
 
         fn token(&mut self) -> &'static [u8] {
             TOKENS[self.below(TOKENS.len())]
+        }
+
+        /// A lowercase word of `len` letters.
+        fn word(&mut self, len: usize) -> String {
+            (0..len)
+                .map(|_| char::from(b'a' + self.below(26) as u8))
+                .collect()
         }
 
         /// `count` tokens.
@@ -2149,6 +2488,7 @@ mod tests {
     fn assert_scan_is_whole_file(
         dir: &std::path::Path,
         pattern: &Pattern,
+        whole: &mut Oracle,
         query: &str,
         body: &[u8],
         slice: Option<usize>,
@@ -2167,12 +2507,13 @@ mod tests {
             &mut Deadline::never(),
             false,
         );
-        let whole = oracle(pattern, body);
-        let listed = &whole[..whole.len().min(DEFAULT_MAX_LINES)];
+        let all = whole.find_all(body);
+        let listed = &all[..all.len().min(DEFAULT_MAX_LINES)];
         let want: Vec<Span> = listed.iter().map(|&(s, e)| span_at(body, s, e)).collect();
         let ctx = || {
             format!(
-                "{query:?} over {} ({} bytes, slice {slice:?})",
+                "{query:?} on {} over {} ({} bytes, slice {slice:?})",
+                pattern.engine.name(),
                 show(body),
                 body.len()
             )
@@ -2180,7 +2521,7 @@ mod tests {
         assert_eq!(report.spans, want, "{}", ctx());
         assert_eq!(
             report.cut,
-            (whole.len() > DEFAULT_MAX_LINES).then_some(Cut::Lines),
+            (all.len() > DEFAULT_MAX_LINES).then_some(Cut::Lines),
             "{}",
             ctx()
         );
@@ -2192,113 +2533,178 @@ mod tests {
         assert_eq!(report.matches_cut, capped as u64, "{}", ctx());
     }
 
-    // A differential check of the engine against the regex crate: at the file's end the
-    // scan is exactly `find_iter`, over small files of every shape and over files three
-    // read slices long.
+    /// The finality rule at every cutoff of `file`: what is listed is a prefix of
+    /// whole-file matching for any rest of the file, nothing that starts before the
+    /// unconfirmed offset is missing, and a complete answer is all of it.
+    fn assert_final_at_every_cutoff(
+        sc: &mut Scanner<'_>,
+        whole: &mut Oracle,
+        query: &str,
+        file: &[u8],
+        rng: &mut Rng,
+    ) {
+        for n in 1..file.len() {
+            let read = &file[..n];
+            let (listed, outcome) = run_buffer(sc, read, Ending::Cutoff);
+            let from = match &outcome {
+                Outcome::Complete => None,
+                Outcome::Unconfirmed { from } => Some(*from),
+                other => panic!("{query:?} over {}: {other:?}", show(read)),
+            };
+            assert!(
+                from.is_none_or(|f| f <= n + 1),
+                "{query:?} over {}: {outcome:?}",
+                show(read)
+            );
+            let tail = rng.tokens(8);
+            let rests: [&[u8]; 5] = [&file[n..], b"", b"\n", b"x", &tail];
+            for rest in rests {
+                let all = whole.find_all(&[read, rest].concat());
+                let ctx = || {
+                    format!(
+                        "{query:?}: read {}, rest {}: listed {listed:?}, whole file {all:?}, {outcome:?}",
+                        show(read),
+                        show(rest)
+                    )
+                };
+                assert!(all.starts_with(&listed), "{}", ctx());
+                match from {
+                    None => assert_eq!(listed, all, "{}", ctx()),
+                    Some(from) => assert!(
+                        all.iter().filter(|(s, _)| *s < from).count() <= listed.len(),
+                        "{}",
+                        ctx()
+                    ),
+                }
+            }
+        }
+    }
+
+    // A differential check of every engine against the PikeVM: at the file's end the scan
+    // is whole-file matching, over small files of every shape and over files three read
+    // slices long.
     #[test]
     fn eof_scans_equal_whole_file_matching() {
         let td = tempfile::tempdir().unwrap();
         let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
         let small: Vec<Vec<u8>> = (0..64).map(|_| rng.file(64)).collect();
         for &(query, matcher) in PROPERTY_PATTERNS {
-            let pattern = compile(query, matcher).unwrap();
-            for body in &small {
-                assert_scan_is_whole_file(td.path(), &pattern, query, body, None);
+            let mut whole = Oracle::new(query, matcher);
+            for pattern in engines(query, matcher) {
+                for body in &small {
+                    assert_scan_is_whole_file(td.path(), &pattern, &mut whole, query, body, None);
+                }
             }
         }
         let large: Vec<Vec<u8>> = (0..2).map(|_| rng.bytes(CHUNK_BYTES * 2 + 1000)).collect();
-        for query in ["needle", "x+", r"\b", "a.*z", r"\s+", "[^z]+"] {
-            let pattern = compile(query, Matcher::Regex).unwrap();
-            let mut sc = pattern.scanner();
-            for body in &large {
-                for slice in [None, Some(64)] {
-                    assert_scan_is_whole_file(td.path(), &pattern, query, body, slice);
+        for query in [
+            "needle",
+            "x+",
+            r"\b",
+            "a.*z",
+            r"\s+",
+            "[^z]+",
+            "abc|b|needle",
+        ] {
+            let mut whole = Oracle::new(query, Matcher::Regex);
+            for pattern in engines(query, Matcher::Regex) {
+                let mut sc = pattern.scanner();
+                for body in &large {
+                    for slice in [None, Some(64)] {
+                        assert_scan_is_whole_file(
+                            td.path(),
+                            &pattern,
+                            &mut whole,
+                            query,
+                            body,
+                            slice,
+                        );
+                    }
+                    // every occurrence, past the line cap
+                    let (listed, outcome) = run_buffer(&mut sc, body, Ending::Eof);
+                    assert_eq!(listed, whole.find_all(body), "{query:?}");
+                    assert_eq!(outcome, Outcome::Complete, "{query:?}");
                 }
-                // every occurrence, past the line cap
-                let (listed, outcome) = run_buffer(&mut sc, body, Ending::Eof);
-                assert_eq!(listed, oracle(&pattern, body), "{query:?}");
-                assert_eq!(outcome, Outcome::Complete, "{query:?}");
             }
         }
     }
 
-    // The finality rule, for every cutoff of every small file and every shape: what is
-    // listed is a prefix of whole-file matching for any rest of the file, nothing that
-    // starts before the unconfirmed offset is missing, and a complete answer is all of it.
+    // The finality rule, for every cutoff of every small file, every shape and every
+    // engine the shape can run on.
     #[test]
     fn cutoff_publishes_only_spans_final_for_every_remainder() {
         let mut rng = Rng(0x2545_f491_4f6c_dd1d);
         for &(query, matcher) in PROPERTY_PATTERNS {
-            let pattern = compile(query, matcher).unwrap();
-            let mut sc = pattern.scanner();
-            for _ in 0..64 {
-                let file = rng.file(48);
-                for n in 1..file.len() {
-                    let read = &file[..n];
-                    let (listed, outcome) = run_buffer(&mut sc, read, Ending::Cutoff);
-                    let from = match &outcome {
-                        Outcome::Complete => None,
-                        Outcome::Unconfirmed { from } => Some(*from),
-                        other => panic!("{query:?} over {}: {other:?}", show(read)),
-                    };
-                    assert!(
-                        from.is_none_or(|f| f <= n + 1),
-                        "{query:?} over {}: {outcome:?}",
-                        show(read)
-                    );
-                    let tail = rng.tokens(8);
-                    let rests: [&[u8]; 5] = [&file[n..], b"", b"\n", b"x", &tail];
-                    for rest in rests {
-                        let whole = oracle(&pattern, &[read, rest].concat());
-                        let ctx = || {
-                            format!(
-                                "{query:?}: read {}, rest {}: listed {listed:?}, whole file {whole:?}, {outcome:?}",
-                                show(read),
-                                show(rest)
-                            )
-                        };
-                        assert!(whole.starts_with(&listed), "{}", ctx());
-                        match from {
-                            None => assert_eq!(listed, whole, "{}", ctx()),
-                            Some(from) => assert!(
-                                whole.iter().filter(|(s, _)| *s < from).count() <= listed.len(),
-                                "{}",
-                                ctx()
-                            ),
-                        }
-                    }
+            let mut whole = Oracle::new(query, matcher);
+            for pattern in engines(query, matcher) {
+                let label = format!("{query} on {}", pattern.engine.name());
+                let mut sc = pattern.scanner();
+                for _ in 0..64 {
+                    let file = rng.file(48);
+                    assert_final_at_every_cutoff(&mut sc, &mut whole, &label, &file, &mut rng);
                 }
             }
         }
     }
 
-    // memmem and the lazy DFA answer the same literal identically, at the file's end and
-    // at every cutoff.
+    // memmem, Aho-Corasick and the lazy DFA answer the same literal identically, at the
+    // file's end and at every cutoff.
     #[test]
     fn literal_and_dfa_engines_agree() {
         let literal = compile("needle", Matcher::Exact).unwrap();
+        let set = as_set("needle", Matcher::Exact).unwrap();
         let dfa = compile("(needle)", Matcher::Regex).unwrap();
         assert!(matches!(literal.engine, Engine::Literal(_)));
         assert!(matches!(dfa.engine, Engine::Dfa(_)));
-        let (mut by_literal, mut by_dfa) = (literal.scanner(), dfa.scanner());
+        let mut scanners = [literal.scanner(), set.scanner(), dfa.scanner()];
         let mut rng = Rng(0x0123_4567_89ab_cdef);
         let mut files: Vec<(Vec<u8>, usize)> = (0..64).map(|_| (rng.file(48), 1)).collect();
         files.push((rng.bytes(CHUNK_BYTES * 2 + 1000), 997));
         for (file, stride) in &files {
-            assert_eq!(
-                run_buffer(&mut by_literal, file, Ending::Eof),
-                run_buffer(&mut by_dfa, file, Ending::Eof),
-                "{}",
-                show(file)
+            let ends = std::iter::once((file.len(), Ending::Eof)).chain(
+                (1..file.len())
+                    .step_by(*stride)
+                    .map(|n| (n, Ending::Cutoff)),
             );
-            for n in (1..file.len()).step_by(*stride) {
+            for (n, ending) in ends {
                 let read = &file[..n];
+                let [by_literal, by_set, by_dfa] =
+                    scanners.each_mut().map(|sc| run_buffer(sc, read, ending));
+                assert_eq!(by_literal, by_dfa, "{} {ending:?}", show(read));
+                assert_eq!(by_set, by_dfa, "{} {ending:?}", show(read));
+            }
+        }
+    }
+
+    // Where both can answer, the set engine gives the lazy DFA's answer at the file's end,
+    // and at a cutoff a prefix of it: the set decides finality by the shape alone, the lazy
+    // DFA also by its automaton dying on a byte read.
+    #[test]
+    fn the_set_engine_lists_a_prefix_of_the_lazy_dfas_answer() {
+        let mut rng = Rng(0x6a09_e667_f3bc_c908);
+        for query in ["abc|b", "ab|abcd|b\nx|x", "(a|ab)(c|bcd)", "needle|foo|abc"] {
+            let dfa = compile(query, Matcher::Regex).unwrap();
+            assert!(matches!(dfa.engine, Engine::Dfa(_)), "{query:?}");
+            let set = as_set(query, Matcher::Regex).unwrap();
+            let (mut by_dfa, mut by_set) = (dfa.scanner(), set.scanner());
+            for _ in 0..64 {
+                let file = rng.file(48);
                 assert_eq!(
-                    run_buffer(&mut by_literal, read, Ending::Cutoff),
-                    run_buffer(&mut by_dfa, read, Ending::Cutoff),
-                    "{}",
-                    show(read)
+                    run_buffer(&mut by_set, &file, Ending::Eof),
+                    run_buffer(&mut by_dfa, &file, Ending::Eof),
+                    "{query:?} over {}",
+                    show(&file)
                 );
+                for n in 1..file.len() {
+                    let read = &file[..n];
+                    let (set_listed, _) = run_buffer(&mut by_set, read, Ending::Cutoff);
+                    let (dfa_listed, _) = run_buffer(&mut by_dfa, read, Ending::Cutoff);
+                    assert!(
+                        dfa_listed.starts_with(&set_listed),
+                        "{query:?} over {}: set {set_listed:?}, lazy DFA {dfa_listed:?}",
+                        show(read)
+                    );
+                }
             }
         }
     }

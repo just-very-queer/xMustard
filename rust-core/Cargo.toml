@@ -42,9 +42,12 @@ streaming-iterator = "0.1"
 regex = "1.12"
 # The exact scan's engine (WS-59c): the lazy DFA is stepped one byte at a time, so a search
 # step observes the deadline, and the parsed HIR decides which occurrences are final at a
-# byte cutoff. All three are already regex's own dependencies at these versions.
+# byte cutoff. Aho-Corasick answers an exact literal set past the lazy DFA's NFA limit,
+# which regex answers the same way. All four are already regex's own dependencies at
+# these versions.
 regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "hybrid"] }
 regex-syntax = { version = "0.8", default-features = false, features = ["std"] }
+aho-corasick = { version = "1", default-features = false, features = ["std"] }
 memchr = "2"
 roxmltree = "0.20"
 serde = { version = "1.0", features = ["derive"] }
@@ -80,6 +83,9 @@ libc = "0.2"
 # `termios` was removed in round 4: the tests call `rustix::pty` and `rustix::process` and
 # nothing calls `rustix::termios` (codex-spec, round 4).
 rustix = { version = "1", features = ["pty"] }
+# exactscan's tests check the scan against regex-automata's PikeVM, which applies no literal
+# optimisation (a feature regex already enables).
+regex-automata = { version = "0.4", default-features = false, features = ["nfa-pikevm"] }
 
 [features]
 default = ["lang-all"]
