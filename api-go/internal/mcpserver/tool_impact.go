@@ -48,13 +48,14 @@ var impactTool = &Tool{
 	Aliases:     map[string]string{"depth": "max_depth", "uid": "symbol"},
 	PathArg:     "path",
 	Annotations: Annotations{Title: "Estimate change impact", ReadOnly: true},
-	// symbol=: symbol, impacted_count, by_depth, risk; path=: found, impacted_count
-	// (and impacted); from=&to=: found, length; scope= and no args: changed symbols and
-	// since. Every graph read carries the graph's freshness and coverage. Other members
+	// symbol=: symbol, by_depth, risk; nullable impacted_count is not listed.
+	// path=: found, impacted_count (and impacted); from=&to=: found, length; scope= and no
+	// args: changed symbols, unmapped_files and since. Graph reads carry freshness and coverage.
+	// Other members
 	// (counts, hops, affected) are returned but not listed, to keep tools/list within
 	// its cap. A paged form reports has_more and next_cursor.
 	Output: map[string]string{
-		"symbol": "string", "impacted_count": "integer", "by_depth": "array", "risk": "string",
+		"symbol": "string", "unmapped_files": "array", "by_depth": "array", "risk": "string",
 		"found": "boolean", "length": "integer", "since": "string",
 		"has_more": "boolean", "next_cursor": "string",
 		"freshness": "object", "coverage": "object",
@@ -90,11 +91,11 @@ var impactQuery = []string{"path", "symbol", "from", "to", "direction", "scope",
 	"timeout_ms", "cursor"}
 
 // impactDoc is the docs resource's paragraph on impact v2.
-const impactDoc = `symbol= accepts a name, Container.name, a UID or a file path; a class or interface is also seeded with its constructors and its file (upstream) or its members (downstream). Results group by depth: 1 WILL BREAK, 2 LIKELY AFFECTED, 3+ MAY NEED TESTING, each paged by limit and offset. risk (upstream only) is CRITICAL when direct dependents >= 30, modules >= 5 or impacted >= 200; HIGH at 15, 3, 100; MEDIUM at 5 direct or 30 impacted; LOW otherwise; UNKNOWN when no dependent is found. epistemic.completeness is exact only when no resolver drop, lexical edge, coverage loss or cap could hide a dependent; otherwise lower_bound with causes and boundaries. Arguments of another form (for example direction with from=&to=, or two of symbol=, path= and from=&to=) are refused.
+const impactDoc = `symbol= accepts a name, Container.name, a UID or a file path; a class or interface is also seeded with its constructors and its file (upstream) or its members (downstream). Results group by depth: 1 WILL BREAK, 2 LIKELY AFFECTED, 3+ MAY NEED TESTING, each paged by limit and offset. risk (upstream only) is CRITICAL when direct dependents >= 30, modules >= 5 or impacted >= 200; HIGH at 15, 3, 100; MEDIUM at 5 direct or 30 impacted; LOW otherwise; UNKNOWN when the target does not resolve (impacted_count is null) or an upstream walk finds no dependents. A resolved downstream request has no risk score. epistemic.completeness is exact only when no resolver drop, lexical edge, coverage loss or cap could hide a dependent; otherwise lower_bound with causes and boundaries. Arguments of another form (for example direction with from=&to=, or two of symbol=, path= and from=&to=) are refused.
 
 path= (WS-FIX-05) lists the files that reference a symbol the file defines, with their distance, over the file-level lexical graph: max_depth 1 to 4 (default 4), no filters or paging; found is false when the graph does not hold the file. For resolved tiers and risk from a file, pass it as symbol=.
 
-scope= reads a diff (system and global Git configuration ignored, every diff option pinned): unstaged (index to working tree), staged (HEAD to index), all or workspace (HEAD to working tree), compare (base to the working tree, or to head), commit (head's first parent to head, default HEAD), range (merge-base of base and head to head); a revision the scope does not take is refused. worktree, an absolute path, diffs another checkout of the repository. Working-tree scopes include untracked files. Each changed file is parsed on both sides, so spans are current; changed_symbols are added, modified or removed with contract_break on a signature change or a removed export, and affected is the upstream walk from all of them.
+scope= reads a diff (system and global Git configuration ignored, every diff option pinned): unstaged (index to working tree), staged (HEAD to index), all or workspace (HEAD to working tree), compare (base to the working tree, or to head), commit (head's first parent to head, default HEAD), range (merge-base of base and head to head); a revision the scope does not take is refused. worktree, an absolute path, diffs another checkout of the repository. Working-tree scopes include untracked files. Each changed file is parsed on both sides, so spans are current; changed_symbols are added, modified or removed with contract_break on a signature change or a removed export, and affected is the upstream walk from all of them; unmapped_files lists changed, parsed source files without graph-mapped symbols.
 
 from=&to= searches downstream (from depends on to), then upstream; max_depth defaults to 10 (at most 30), 200 edges per node, 5000 nodes per level, 50000 visited. Without a path it returns the furthest node reached and the caps hit.
 

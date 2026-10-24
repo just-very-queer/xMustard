@@ -398,9 +398,11 @@ type budgeter struct {
 	// origCursor is the result's own next_cursor (a producer-paged list).
 	origCursor string
 	more       bool
-	// priorLists is the per-list accounting an earlier pass recorded, carried into the
-	// rebuilt report for lists this pass does not reduce again (Settle).
-	priorLists map[string]listReport
+	// priorLists and priorSignals carry report details an earlier pass removed from
+	// the result itself.
+	priorLists   map[string]listReport
+	priorSignals map[string]int
+	priorOmitted []string
 
 	// sig is how far signal objects are reduced: sigFull, sigCounts or sigFlags.
 	sig      int
@@ -418,9 +420,9 @@ type budgeter struct {
 // report. The ladder is the first of the tool's ladders whose Match member the result
 // has. With page.Slice, the paged list is first cut to its page. Rungs run in order
 // until the result fits; a paged list that returns fewer items than its page holds
-// sets has_more and next_cursor at the first item not returned. When anything was
-// reduced, retain (when set) is called once and its Recovery named in the report.
-// A result that is not a JSON object is returned unchanged.
+// sets has_more and next_cursor at the first item not returned. When a result is reduced,
+// retain (when set) is called once unless an earlier pass already retained it; the report
+// names that recovery. A result that is not a JSON object is returned unchanged.
 func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recovery) ([]byte, error) {
 	if !json.Valid(result) {
 		return nil, errors.New(s.Tool + " result is not valid JSON")
@@ -429,18 +431,27 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 	if !ok {
 		return result, nil
 	}
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}}
+	prev := prior(top)
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals, priorOmitted: prev.omitted}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
 	if req.MaxChars <= 0 {
 		return b.render(nil), nil
 	}
+	b.applied = append(b.applied, prev.stages...)
+	b.recovery = prev.recovery
+	inheritedStages := len(b.applied)
 	b.fit()
-	if retain != nil && len(b.applied) > 0 {
-		rec := retain()
-		b.recovery = &rec
+	if retain != nil && len(b.applied) > inheritedStages {
+		recovery := b.recovery
+		if recovery == nil {
+			rec := retain()
+			recovery = &rec
+		}
 		b.reset()
+		b.applied = append(b.applied, prev.stages...)
+		b.recovery = recovery
 		b.fit()
 	}
 	return b.render(b.report), nil
@@ -475,7 +486,7 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 		return result, nil
 	}
 	prev := prior(top)
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists}
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals, priorOmitted: prev.omitted}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
@@ -486,11 +497,13 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 }
 
 // priorReport is what an earlier pass recorded in the result's own output_budget: the
-// rungs it ran, the recovery it kept and the per-list accounting it wrote.
+// rungs, recovery, omitted members, list counts and signal sizes recorded by the earlier pass.
 type priorReport struct {
 	stages   []string
 	recovery *Recovery
 	lists    map[string]listReport
+	signals  map[string]int
+	omitted  []string
 }
 
 func prior(top []kv) priorReport {
@@ -505,6 +518,8 @@ func prior(top []kv) priorReport {
 		}
 		out.stages = rep.Stages
 		out.lists = rep.Lists
+		out.signals = rep.Signals
+		out.omitted = rep.Omitted
 		if rep.RecoverURI != "" || rep.RecoverHandle != "" || rep.RecoverUnavailable != "" {
 			out.recovery = &Recovery{URI: rep.RecoverURI, Handle: rep.RecoverHandle, Unavailable: rep.RecoverUnavailable}
 		}
@@ -1111,10 +1126,17 @@ func (b *budgeter) report(used int) []byte {
 		}
 		rep.Lists[name] = lr
 	}
+	omitted := map[string]bool{}
 	for name, on := range b.omitted {
 		if on && b.present(name) {
-			rep.Omitted = append(rep.Omitted, name)
+			omitted[name] = true
 		}
+	}
+	for _, name := range b.priorOmitted {
+		omitted[name] = true
+	}
+	for name := range omitted {
+		rep.Omitted = append(rep.Omitted, name)
 	}
 	sort.Strings(rep.Omitted)
 	for _, m := range b.members {
@@ -1132,6 +1154,15 @@ func (b *budgeter) report(used int) []byte {
 				rep.Signals[m.key+"."+key] = n
 			}
 		}
+	}
+	for name, count := range b.priorSignals {
+		if _, exists := rep.Signals[name]; exists {
+			continue
+		}
+		if rep.Signals == nil {
+			rep.Signals = map[string]int{}
+		}
+		rep.Signals[name] = count
 	}
 	enc, _ := json.Marshal(rep)
 	return enc

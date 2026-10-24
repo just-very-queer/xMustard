@@ -355,6 +355,11 @@ pub struct Boundary {
 /// the legacy per-call graph (file nodes only).
 pub trait Graph {
     fn file_count(&self) -> u32;
+    /// Whether this graph has a symbol-bearing code-index snapshot rather than only
+    /// legacy file nodes.
+    fn has_symbol_snapshot(&self) -> bool {
+        true
+    }
     fn path(&self, file: u32) -> &str;
     /// The file a node belongs to.
     fn file_of(&self, node: u32) -> Result<u32, String>;
@@ -826,7 +831,7 @@ pub struct Impact {
     /// `resolved` (symbol edges), `lexical` (file edges), `mixed`, or `none` when no
     /// target was found.
     pub graph: &'static str,
-    pub impacted_count: usize,
+    pub impacted_count: Option<usize>,
     pub counts: Counts,
     pub by_depth: Vec<Tier>,
     /// Scored on upstream dependents; absent downstream.
@@ -1054,7 +1059,7 @@ fn run_lookup<G: Graph + ?Sized>(
             (false, true) => "lexical",
             (false, false) => "none",
         },
-        impacted_count: counts.total,
+        impacted_count: (!lookup.nodes.is_empty()).then_some(counts.total),
         counts,
         by_depth,
         risk,
@@ -1069,13 +1074,8 @@ fn run_lookup<G: Graph + ?Sized>(
     })
 }
 
-/// Risk and its note. Only upstream dependents are scored.
+/// Risk is scored upstream; a missing target is UNKNOWN for either direction.
 fn score(q: &Query, lookup: &Lookup, c: &Counts, e: &Epistemic) -> (Option<Risk>, Option<String>) {
-    if q.direction == Direction::Downstream {
-        return (None, None);
-    }
-    let bounded = e.completeness != "exact";
-    let causes = || e.causes.keys().cloned().collect::<Vec<_>>().join(", ");
     if lookup.nodes.is_empty() {
         return (
             Some(Risk::Unknown),
@@ -1085,6 +1085,11 @@ fn score(q: &Query, lookup: &Lookup, c: &Counts, e: &Epistemic) -> (Option<Risk>
             )),
         );
     }
+    if q.direction == Direction::Downstream {
+        return (None, None);
+    }
+    let bounded = e.completeness != "exact";
+    let causes = || e.causes.keys().cloned().collect::<Vec<_>>().join(", ");
     if c.direct == 0 {
         let mut note = "no dependents found: the symbol may be unused, an entry point, or reached \
                         only through dynamic dispatch, reflection or code outside the graph"
@@ -1252,6 +1257,10 @@ impl LegacyGraph {
 }
 
 impl Graph for LegacyGraph {
+    fn has_symbol_snapshot(&self) -> bool {
+        false
+    }
+
     fn file_count(&self) -> u32 {
         self.paths.len() as u32
     }
@@ -1327,6 +1336,24 @@ impl Graph for LegacyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_graph_has_no_symbol_snapshot() {
+        let graph = crate::symbolgraph::SymbolGraph {
+            workspace_id: "ws".into(),
+            file_count: 0,
+            symbol_count: 0,
+            edge_count: 0,
+            files: Vec::new(),
+            symbols: Vec::new(),
+            edges: Vec::new(),
+            flow_edges: Vec::new(),
+            flow_edge_count: 0,
+            coverage: Default::default(),
+            generated_at: String::new(),
+        };
+        assert!(!LegacyGraph::new(&graph).has_symbol_snapshot());
+    }
 
     fn m(direct: usize, modules: usize, impacted: usize) -> Metrics {
         Metrics {

@@ -39,6 +39,15 @@ SECTIONS = [
 MIB = 1 << 20
 
 
+def impact_count_median(answers):
+    counts = [
+        answer["impacted_count"]
+        for answer in answers
+        if isinstance(answer.get("impacted_count"), (int, float))
+    ]
+    return statistics.median(counts) if counts else None
+
+
 def rss(pid):
     out = subprocess.run(["ps", "-o", "rss=", "-p", str(pid)], capture_output=True, text=True).stdout
     return int(out.strip() or 0) * 1024
@@ -202,6 +211,7 @@ def main():
         steady = rss(s.p.pid)
         # answers arrive in completion order when overlapping: pick impact's by shape
         impact = [a for a in answers if "impacted_count" in a]
+        impact_total_p50 = impact_count_median(impact)
         # the swap: one file edited and brought in while the rounds go on
         with open(os.path.join(work, edit_path), "a") as f:
             f.write("\nexport function ws35BenchAdded(): number { return 1; }\n" if edit_path.endswith("ts")
@@ -240,7 +250,7 @@ def main():
             "queries": len(answers),
             "query_ms_p50": round(statistics.median(times), 2),
             "query_ms_p95": round(sorted(times)[int(len(times) * 0.95) - 1], 2),
-            "impact_total_p50": statistics.median(a.get("impacted_count", 0) for a in impact),
+            "impact_total_p50": impact_total_p50,
             # absent before WS-35 (a base binary answers the legacy file-level shape)
             "impact_lower_bound_share": round(sum(a.get("epistemic", {}).get("completeness") == "lower_bound"
                                                   for a in impact) / len(impact), 2),

@@ -126,6 +126,77 @@ func TestSmallResultIsReturnedInFull(t *testing.T) {
 	}
 }
 
+func TestSerializedEscapingFitsAndRebudgetingIsStable(t *testing.T) {
+	result := searchResult(8, 0)
+	for _, hit := range result["hits"].([]map[string]any) {
+		for _, window := range hit["snippet"].([]map[string]any) {
+			window["text"] = strings.Repeat("\"\\\n\x00", 120)
+		}
+	}
+	first := run(t, "search", result, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, nil)
+	if first.rep.OverBudget {
+		t.Fatalf("escaped result exceeds %d bytes: %d", MinMaxChars, len(first.raw))
+	}
+	spec, _ := For("search")
+	second, err := spec.Apply(first.raw, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != string(first.raw) {
+		t.Fatalf("re-budgeting changed the serialized result\nfirst:  %s\nsecond: %s", first.raw, second)
+	}
+}
+
+func TestRebudgetPreservesPriorStagesAndRecoveryHandle(t *testing.T) {
+	retained := 0
+	first := run(t, "search", searchResult(20, 250), Request{MaxChars: 4000}, Page{Cursor: cursorAt}, func() Recovery {
+		retained++
+		return Recovery{URI: "/recover/original", Handle: "original"}
+	})
+	if first.rep.RecoverHandle != "original" || len(first.rep.Stages) == 0 {
+		t.Fatalf("initial budget did not retain recovery: %+v", first.rep)
+	}
+	spec, _ := For("search")
+	secondRaw, err := spec.Apply(first.raw, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, func() Recovery {
+		retained++
+		return Recovery{URI: "/recover/rebudgeted", Handle: "rebudgeted"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second struct {
+		Budget report `json:"output_budget"`
+	}
+	if err := json.Unmarshal(secondRaw, &second); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 1 || second.Budget.RecoverHandle != "original" || second.Budget.RecoverURI != "/recover/original" {
+		t.Fatalf("rebudget replaced original recovery: retained=%d budget=%+v", retained, second.Budget)
+	}
+	for _, stage := range first.rep.Stages {
+		if !slices.Contains(second.Budget.Stages, stage) {
+			t.Fatalf("rebudget lost inherited stage %q: %v", stage, second.Budget.Stages)
+		}
+	}
+	if len(second.Budget.Stages) <= len(first.rep.Stages) {
+		t.Fatalf("rebudget did not record its additional reduction: first=%v second=%v", first.rep.Stages, second.Budget.Stages)
+	}
+}
+
+func TestTenThousandImpactRowsCountExactWireBytes(t *testing.T) {
+	items := make([]map[string]any, 10_000)
+	for i := range items {
+		items[i] = map[string]any{"name": fmt.Sprintf("caller_%05d", i), "path": fmt.Sprintf("pkg/nested/file_%05d.go", i), "line": i + 1}
+	}
+	result := map[string]any{"symbol": "Target", "by_depth": []any{map[string]any{
+		"depth": 1, "label": "WILL BREAK", "total": len(items), "offset": 0, "items": items,
+	}}, "counts": map[string]any{"total": len(items)}, "risk": "HIGH"}
+	out := run(t, "impact", result, Request{MaxChars: MaxMaxChars}, Page{}, nil)
+	if out.rep.OverBudget || out.rep.UsedChars != len(out.raw) {
+		t.Fatalf("budget reports %d bytes for a %d-byte wire result (over=%v)", out.rep.UsedChars, len(out.raw), out.rep.OverBudget)
+	}
+}
+
 // Every rung of the search ladder is reached, and named, as max_chars shrinks; the
 // stage never moves back up, and the signals survive every stage.
 func TestEachSearchStageIsReachedAndNamed(t *testing.T) {
@@ -642,8 +713,9 @@ func TestSettleKeepsThePerListAccountingOfThePageItSettled(t *testing.T) {
 	}
 }
 
-// The WS-35 scope shape: its dependents live in affected.by_depth, a nested list of
-// tiers, which keeps the same leading items per tier.
+// TestImpactScopeTrimsNestedTiers exercises the WS-35 scope shape: its dependents
+// live in affected.by_depth, a nested list of tiers, which keeps the same leading
+// items per tier.
 func TestImpactScopeTrimsNestedTiers(t *testing.T) {
 	items := make([]map[string]any, 60)
 	for i := range items {
@@ -750,6 +822,14 @@ func TestOmitRungsNameWhatTheyRemove(t *testing.T) {
 	}
 	if !slices.Contains(a.rep.Omitted, "symbol.content") || a.rep.DegradedStage != "no_content" {
 		t.Fatalf("report %+v", a.rep)
+	}
+	spec, _ := For("explain")
+	again, err := spec.Apply(a.raw, Request{MaxChars: 2000}, Page{}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(again) != string(a.raw) {
+		t.Fatalf("re-budgeting changed omitted-member accounting\nfirst:  %s\nsecond: %s", a.raw, again)
 	}
 }
 

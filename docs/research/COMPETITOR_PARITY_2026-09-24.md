@@ -24,6 +24,12 @@ Release dates below are publication dates. Commit dates are committer timestamps
 | Letta / Letta Code | Current runtime [v0.33.0](https://github.com/letta-ai/letta-code/releases/tag/v0.33.0), 2026-09-23 | [`549edb9d938d726cf5dcfcfbe399724fcddb3236`](https://github.com/letta-ai/letta-code/commit/549edb9d938d726cf5dcfcfbe399724fcddb3236), 2026-09-24 07:28:51 UTC. The [old Letta repository](https://github.com/letta-ai/letta) now points to `letta-code`; its V1 API is historical, on `archive`. |
 | Zep / Graphiti | Graphiti [v0.30.2](https://github.com/getzep/graphiti/releases/tag/v0.30.2), 2026-09-08 | Graphiti [`1980db200adca45de2a6fe2c6239ecdce3845a18`](https://github.com/getzep/graphiti/commit/1980db200adca45de2a6fe2c6239ecdce3845a18), 2026-09-24 01:10:43 UTC. This commit is a CLA record, not a feature shipment. Zep is a separate managed product. |
 
+## Peer source liveness
+
+The machine-readable peer list is [PEER_REGISTRY.json](PEER_REGISTRY.json). Each source record carries curated `source_present` and `superseded_by` fields, the canonical URL, and a last-commit date. The manual-only `peer-registry` workflow checks curated status and canonical URLs; commit-date drift is reported without failing the check. Refresh and review the registry with `python3 scripts/check_peer_registry.py --write`; check it with `python3 scripts/check_peer_registry.py --check`.
+
+The `letta-ai/letta` entry is intentionally retained as a curated tombstone with `source_present: false` and `superseded_by: letta-code`; the live repository is listed separately.
+
 ## Capabilities relevant to this product
 
 | Peer | Retrieval, symbols, impact, and freshness | Memory, provenance, and collaboration | Operational footprint and implication |

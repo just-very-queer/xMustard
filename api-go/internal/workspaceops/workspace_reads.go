@@ -198,6 +198,8 @@ type ImpactReport struct {
 	BaseRef             string                `json:"base_ref"`
 	SemanticStatus      any                   `json:"semantic_status,omitempty"`
 	ChangedFiles        []RepoChangeRecord    `json:"changed_files"`
+	UnmappedFiles       *[]string             `json:"unmapped_files,omitempty"`
+	UnmappedFilesTotal  *int                  `json:"unmapped_files_total,omitempty"`
 	ChangedSymbols      []ChangedSymbolRecord `json:"changed_symbols"`
 	LikelyAffectedFiles []ImpactPathRecord    `json:"likely_affected_files"`
 	LikelyAffectedTests []ImpactPathRecord    `json:"likely_affected_tests"`
@@ -327,6 +329,22 @@ func ReadImpact(dataDir string, workspaceID string, baseRef string) (*ImpactRepo
 		return nil, err
 	}
 	warnings = append(warnings, semanticWarnings...)
+	var unmappedFiles *[]string
+	var unmappedFilesTotal *int
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if raw, err := DetectChangesCtx(ctx, dataDir, workspaceID, map[string]string{"scope": "compare", "base": baseRef}); err != nil {
+		return nil, err
+	} else {
+		var report struct {
+			Files *[]string `json:"unmapped_files"`
+			Total *int      `json:"unmapped_files_total"`
+		}
+		if err := json.Unmarshal(raw, &report); err != nil {
+			return nil, fmt.Errorf("decode unmapped impact files: %w", err)
+		}
+		unmappedFiles, unmappedFilesTotal = report.Files, report.Total
+	}
 	confidence := "low"
 	if len(semanticImpact.ChangedSymbols) > 0 && (len(semanticImpact.LikelyAffectedFiles) > 0 || len(semanticImpact.LikelyAffectedTests) > 0) {
 		confidence = "high"
@@ -342,6 +360,8 @@ func ReadImpact(dataDir string, workspaceID string, baseRef string) (*ImpactRepo
 		WorkspaceID:         workspaceID,
 		BaseRef:             baseRef,
 		ChangedFiles:        changes,
+		UnmappedFiles:       unmappedFiles,
+		UnmappedFilesTotal:  unmappedFilesTotal,
 		ChangedSymbols:      convertRustChangedSymbols(semanticImpact.ChangedSymbols),
 		LikelyAffectedFiles: convertRustImpactPaths(semanticImpact.LikelyAffectedFiles),
 		LikelyAffectedTests: convertRustImpactPaths(semanticImpact.LikelyAffectedTests),
