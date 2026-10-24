@@ -134,6 +134,13 @@ pub struct Changes {
     #[serde(flatten)]
     pub scope: Resolved,
     pub changed_files: Vec<ChangedFile>,
+    /// Changed source files for which no symbols could be mapped. Absent when the
+    /// graph is the legacy file-only view rather than a code-index snapshot.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmapped_files: Option<Vec<String>>,
+    /// Number of changed source files for which no symbols could be mapped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unmapped_files_total: Option<usize>,
     pub changed_files_total: usize,
     /// Files changed outside the workspace root (the root is a repository subdirectory).
     #[serde(skip_serializing_if = "is_zero")]
@@ -445,9 +452,12 @@ pub fn detect<G: Graph + ?Sized>(
     let r = gitdiff::resolve(&dir, q.scope, q.base.as_deref(), q.head.as_deref())
         .map_err(DetectError::Refused)?;
     let prefix = gitdiff::prefix(&dir)?;
+    let has_symbol_snapshot = g.has_symbol_snapshot();
     let mut out = Changes {
         scope: r.clone(),
         changed_files: Vec::new(),
+        unmapped_files: has_symbol_snapshot.then(Vec::new),
+        unmapped_files_total: has_symbol_snapshot.then_some(0),
         changed_files_total: 0,
         outside_root: 0,
         changed_symbols: Vec::new(),
@@ -529,6 +539,25 @@ pub fn detect<G: Graph + ?Sized>(
             }
         })
         .collect();
+    if has_symbol_snapshot {
+        for (i, e) in list.iter().enumerate() {
+            if e.change == Change::Deleted
+                || e.binary
+                || !per_file.contains_key(&i)
+                || per_file[&i].1.is_some()
+            {
+                continue;
+            }
+            let unmapped = match g.file_node(&e.rel)? {
+                Some(file_node) => g.file_symbols(file_node)?.is_empty(),
+                None => true,
+            };
+            if unmapped && let Some(files) = &mut out.unmapped_files {
+                files.push(e.rel.clone());
+            }
+        }
+        out.unmapped_files_total = out.unmapped_files.as_ref().map(Vec::len);
+    }
     if !seeds.is_empty() {
         let mut walk = q.impact.clone();
         walk.direction = impact::Direction::Upstream;

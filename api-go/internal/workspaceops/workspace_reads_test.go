@@ -231,6 +231,9 @@ func TestGoRepoIntelligenceReadsImpactContextAndRetrieval(t *testing.T) {
 	if len(impact.ChangedFiles) == 0 || len(impact.ChangedSymbols) == 0 {
 		t.Fatalf("expected changed files and symbols, got %#v", impact)
 	}
+	if impact.UnmappedFiles == nil || impact.UnmappedFilesTotal == nil || *impact.UnmappedFilesTotal != len(*impact.UnmappedFiles) {
+		t.Fatalf("expected Rust unmapped-file fields with an exact total, got %#v", impact)
+	}
 	if impact.Confidence == "low" {
 		t.Fatalf("expected useful confidence, got %#v", impact)
 	}

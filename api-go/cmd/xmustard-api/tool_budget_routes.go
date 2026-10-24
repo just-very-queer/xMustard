@@ -30,7 +30,13 @@ func toolBudgetMiddleware(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
-		q := r.URL.Query()
+		// Refused before anything reads or re-encodes it: the RawQuery rewrite below would
+		// otherwise drop a malformed pair before the handler could see it.
+		q, err := strictQuery(r)
+		if err != nil {
+			respondError(w, err)
+			return
+		}
 		req, aerr := spec.ParseRequest(q)
 		if aerr != nil {
 			writeBudgetArgError(w, aerr)

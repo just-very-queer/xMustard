@@ -262,6 +262,66 @@ pub struct Snapshot {
     text: Mutex<Option<Connection>>,
 }
 
+/// Read exported flags from the segment's stored generation. `after_generation` is a
+/// deterministic test seam for a concurrent writer committing after the snapshot is pinned
+/// but before the flags query runs.
+fn read_exported_flags(
+    conn: &Connection,
+    generation: i64,
+    symbol_count: usize,
+    after_generation: impl FnOnce(),
+) -> rusqlite::Result<Result<Vec<bool>, String>> {
+    conn.execute_batch("BEGIN DEFERRED")?;
+    let result = (|| {
+        // This first read pins the SQLite snapshot used by both the check and the flags query.
+        let read_generation: String =
+            conn.query_row("SELECT value FROM meta WHERE key = 'generation'", [], |r| {
+                r.get(0)
+            })?;
+        if read_generation != generation.to_string() {
+            return Ok(Err(format!(
+                "store generation {read_generation} does not match the snapshot's {generation}"
+            )));
+        }
+        after_generation();
+        // Match csr::load_dense_tables: only admitted files, with symbols in id order. The
+        // segment can omit store rows, so checking the final count prevents positional drift.
+        let statuses = super::csr::indexed_status_list();
+        let mut out = vec![false; symbol_count];
+        let mut st = conn.prepare(&format!(
+            "SELECT s.exported FROM symbols s
+             JOIN files f ON f.id = s.file_id
+             WHERE f.parse_status IN ({statuses})
+             ORDER BY s.id"
+        ))?;
+        let mut rows = st.query([])?;
+        let mut i = 0usize;
+        let mut surplus = false;
+        while let Some(row) = rows.next()? {
+            if let Some(slot) = out.get_mut(i) {
+                *slot = row.get(0)?;
+            } else {
+                surplus = true;
+            }
+            i += 1;
+        }
+        drop(rows);
+        drop(st);
+        if surplus || i != out.len() {
+            return Ok(Err(format!(
+                "exported flags: store has {i} rows, segment {} symbols",
+                out.len()
+            )));
+        }
+        conn.execute_batch("COMMIT")?;
+        Ok(Ok(out))
+    })();
+    if !matches!(&result, Ok(Ok(_))) {
+        let _ = conn.execute_batch("ROLLBACK");
+    }
+    result
+}
+
 impl Snapshot {
     fn load(
         root: &Path,
@@ -338,60 +398,12 @@ impl Snapshot {
                 // `with_text` returns), so the SQLite layer is what is flattened here, and
                 // only it.
                 self.with_text(|conn: &rusqlite::Connection| {
-                    // A deferred read transaction pins the store view the check and the
-                    // query share. `query_row` on `meta` is the first statement, so the
-                    // snapshot is taken there; a concurrent build cannot move it afterwards.
-                    conn.execute_batch("BEGIN DEFERRED")?;
-                    let read_generation: String = conn.query_row(
-                        "SELECT value FROM meta WHERE key = 'generation'",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    if read_generation != self.generation.to_string() {
-                        // Roll the read transaction back before refusing: leaving it open on a
-                        // shared text connection would pin the store view for the next reader
-                        // of this snapshot, and the refusal is an answer, not a retry.
-                        let _ = conn.execute_batch("ROLLBACK");
-                        return Ok(Err(format!(
-                            "store generation {read_generation} does not match the snapshot's {}",
-                            self.generation
-                        )));
-                    }
-                    // The segment holds a SUBSET of the store's symbols — a file the
-                    // retention envelope skipped has no segment row — so a symbol's
-                    // position in a plain `SELECT ... ORDER BY id` is NOT its dense segment
-                    // index: the first gap shifts every later flag onto the wrong symbol,
-                    // which changes PAR-SYM-09's ×2 exported doubling and with it every
-                    // score. The segment's dense order is the store's symbols over the
-                    // segment's ADMITTED files, ordered by id (see `csr::load`, which fills
-                    // `seg_syms` with exactly that ORDER BY), so the flags are read with the
-                    // same restriction and the same ordering rather than consumed positionally.
-                    let statuses = super::csr::indexed_status_list();
-                    let mut out = vec![false; self.seg.counts().symbols as usize];
-                    // The same predicate and the same ordering the loader used for
-                    // `seg_files`/`seg_syms` (`csr::load_dense_tables`): the files whose
-                    // `parse_status` is indexed, and their symbols in id order. Reading the
-                    // flags through that restriction is what keeps a segment slot and a
-                    // store row in step.
-                    let mut st = conn.prepare(&format!(
-                        "SELECT s.exported FROM symbols s
-                         JOIN files f ON f.id = s.file_id
-                         WHERE f.parse_status IN ({statuses})
-                         ORDER BY s.id"
-                    ))?;
-                    let mut rows = st.query([])?;
-                    let mut i = 0usize;
-                    while let Some(row) = rows.next()? {
-                        let Some(slot) = out.get_mut(i) else { break };
-                        *slot = row.get(0)?;
-                        i += 1;
-                    }
-                    // The prepared statement is dropped before the COMMIT: SQLite refuses to
-                    // commit while a statement is still stepping.
-                    drop(rows);
-                    drop(st);
-                    conn.execute_batch("COMMIT")?;
-                    Ok(Ok(out))
+                    read_exported_flags(
+                        conn,
+                        self.generation,
+                        self.seg.counts().symbols as usize,
+                        || {},
+                    )
                 })
                 .and_then(|inner| inner)
             })
@@ -413,6 +425,21 @@ impl Snapshot {
         }
         let conn = text.as_ref().ok_or("index text connection unavailable")?;
         f(conn).map_err(sql)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_text_lock_available(&self) -> bool {
+        self.text.try_lock().is_ok()
+    }
+
+    /// Open a query-local text connection for work that may call an external classifier.
+    /// The shared snapshot text mutex must never be held across provider execution.
+    pub fn with_unshared_text<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> Result<R, String> {
+        let conn = super::fts::open(&self.db).map_err(sql)?;
+        f(&conn).map_err(sql)
     }
 
     /// Files declaring `symbol` (non-local declarations), in path order.
@@ -1390,5 +1417,108 @@ mod tests {
         assert_eq!(cov.languages.get("python"), Some(&python));
         let summary = crate::symbolgraph::CoverageSummary::from(&cov);
         assert_eq!(summary.languages.get("python"), Some(&python));
+    }
+
+    #[test]
+    fn deferred_transaction_pins_flags_across_an_in_place_update() {
+        use crate::index::{self, config::IndexConfig};
+        use std::path::Path;
+        use std::process::Command;
+
+        fn git(root: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("go.mod"), "module example\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(root.path().join("pkg")).unwrap();
+        fs::write(
+            root.path().join("pkg/main.go"),
+            "package pkg\n\nfunc Run() { Leaf() }\nfunc Leaf() {}\n",
+        )
+        .unwrap();
+        for i in 0..60 {
+            fs::write(
+                root.path().join(format!("pkg/extra{i:02}.go")),
+                format!("package pkg\n"),
+            )
+            .unwrap();
+        }
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "user.email", "t@t"]);
+        git(root.path(), &["config", "user.name", "t"]);
+        git(root.path(), &["add", "-A"]);
+        git(root.path(), &["commit", "-qm", "fixture"]);
+        index::build(root.path(), &IndexConfig::default()).unwrap();
+
+        let opened = open(root.path()).unwrap();
+        let snapshot = &opened.snapshot;
+        let current = Connection::open(&snapshot.db).unwrap();
+        let run_index: usize = current
+            .query_row(
+                "SELECT COUNT(*) FROM symbols s WHERE s.id < (SELECT s2.id FROM symbols s2 JOIN names n2 ON n2.id = s2.name_id WHERE n2.name = 'Run')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let initial_run_flag: i64 = current
+            .query_row(
+                "SELECT s.exported FROM symbols s JOIN names n ON n.id = s.name_id WHERE n.name = 'Run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial_run_flag, 1, "fixture starts with Run exported");
+        let flags = snapshot
+            .with_text(|conn| {
+                read_exported_flags(
+                    conn,
+                    snapshot.generation,
+                    snapshot.seg.counts().symbols as usize,
+                    || {
+                        fs::write(
+                            root.path().join("pkg/main.go"),
+                            "package pkg\n\nfunc Run() { Leaf(); _ = 1 }\nfunc Leaf() {}\n",
+                        )
+                        .unwrap();
+                        let report = index::update(root.path(), &IndexConfig::default(), None).unwrap();
+                        assert_eq!(report.mode, "incremental", "fixture uses the in-place writer: {report:?}");
+                        let writer = Connection::open(&snapshot.db).unwrap();
+                        writer.execute_batch(
+                            "UPDATE symbols SET exported = 0 WHERE name_id = (SELECT id FROM names WHERE name = 'Run');\n\
+                             UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'generation';",
+                        ).unwrap();
+                    },
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(flags.len(), snapshot.seg.counts().symbols as usize);
+        let run_flag: i64 = current
+            .query_row(
+                "SELECT s.exported FROM symbols s JOIN names n ON n.id = s.name_id WHERE n.name = 'Run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            flags.get(run_index),
+            Some(&true),
+            "pinned flags preserve Run's exported status: index={run_index}, flags={flags:?}, current={run_flag}"
+        );
+        assert_eq!(run_flag, 0, "writer committed the flipped status");
     }
 }

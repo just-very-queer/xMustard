@@ -35,6 +35,13 @@ const DOC_WEIGHTS: &str = "bm25(0.5, 2.0, 1.0)";
 thread_local! {
     /// Chunk-range reads (file opens) made on this thread; see [`chunk_reads`].
     static CHUNK_READS: Cell<u64> = const { Cell::new(0) };
+    #[cfg(test)]
+    static FILE_IDENTITY_READS: Cell<u64> = const { Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn file_identity_reads() -> u64 {
+    FILE_IDENTITY_READS.with(Cell::get)
 }
 
 /// File range reads the text lanes made on the calling thread so far (tests measure a
@@ -401,6 +408,89 @@ pub fn locate(
         Ok((decl, loc))
     })
     .optional()
+}
+
+/// The first indexed code chunk for a file, used for bounded file-level discovery.
+pub fn file_preview(conn: &Connection, path: &str) -> rusqlite::Result<Option<ChunkLoc>> {
+    conn.prepare_cached(
+        "SELECT c.id, c.start_line, c.end_line, c.start_byte, c.end_byte, c.content_hash
+         FROM files f JOIN chunks c ON c.file_id = f.id
+         WHERE f.path = ?1 ORDER BY c.start_line, c.id LIMIT 1",
+    )?
+    .query_row([path], |row| {
+        Ok(ChunkLoc {
+            id: row.get(0)?,
+            doc: false,
+            path: path.to_string(),
+            start_line: row.get(1)?,
+            end_line: row.get(2)?,
+            start_byte: row.get(3)?,
+            end_byte: row.get(4)?,
+            content_hash: row.get(5)?,
+        })
+    })
+    .optional()
+}
+
+/// Whether the current file content still matches the indexed source identity.
+pub fn file_identity_matches(
+    conn: &Connection,
+    root: &Path,
+    path: &str,
+) -> rusqlite::Result<Result<bool, TextMiss>> {
+    #[cfg(test)]
+    FILE_IDENTITY_READS.with(|reads| reads.set(reads.get().saturating_add(1)));
+    if crate::secretpath::is_secret_path(path) {
+        return Ok(Err(TextMiss::SecretPath));
+    }
+    let indexed: Option<String> = conn
+        .query_row(
+            "SELECT content_hash FROM files WHERE path = ?1",
+            [path],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(indexed) = indexed else {
+        return Ok(Ok(false));
+    };
+    let source = match crate::symbolgraph::read_source_beneath(
+        root,
+        Path::new(path),
+        super::config::DEFAULT_MAX_FILE_SIZE,
+    ) {
+        Ok(source) => source,
+        Err(crate::symbolgraph::SourceReadFailure::Oversized(_)) => {
+            return Ok(Err(TextMiss::TooLarge));
+        }
+        Err(_) => return Ok(Err(TextMiss::Changed)),
+    };
+    Ok(Ok(super::scan::blob_id(&source) == indexed))
+}
+
+/// Every indexed declaration in a file, in stable source order, with its indexed chunk.
+pub fn declarations(
+    conn: &Connection,
+    path: &str,
+    limit: usize,
+) -> rusqlite::Result<Vec<(Decl, Option<ChunkLoc>)>> {
+    let mut statement = conn.prepare_cached(
+        "SELECT n.name, s.name_line FROM files f
+         JOIN symbols s ON s.file_id = f.id
+         JOIN names n ON n.id = s.name_id
+         WHERE f.path = ?1 AND s.local = 0
+         ORDER BY s.start_line, s.name_line, n.name LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![path, limit.min(i64::MAX as usize) as i64], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))
+    })?;
+    let mut declarations = Vec::new();
+    for row in rows {
+        let (name, name_line) = row?;
+        if let Some(declaration) = locate(conn, path, &name, name_line)? {
+            declarations.push(declaration);
+        }
+    }
+    Ok(declarations)
 }
 
 /// Why a chunk's text is not available.

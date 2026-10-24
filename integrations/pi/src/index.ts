@@ -16,7 +16,8 @@ import { type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft, VE
 import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
-import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
+import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool, stripWrapperToken } from "./delivery.ts";
+import { mutateBashInput, newWrappedCalls, recordWrappedCall, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
 import { callerTools, WorkspaceResolver } from "./workspace.ts";
@@ -106,6 +107,10 @@ export default function xmustard(pi: ExtensionAPI): void {
 		if (!active.includes(EXPAND_TOOL)) pi.setActiveTools([...active, EXPAND_TOOL]);
 	};
 
+	// Which calls the tool_call hook rewrote, consumed once by tool_result. See
+	// commandwrap.ts for why the record and not the output text is the provenance.
+	const wrappedCalls = newWrappedCalls();
+
 	// Registered tools start active; expansion stays hidden until a handle is issued
 	// (or the resumed, reloaded or forked branch already names one), and xMustard tools
 	// this caller cannot use are deactivated, so they never reach the model
@@ -121,10 +126,52 @@ export default function xmustard(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		const meta = { sessionId: sessionIdOf(ctx), signal: ctx.signal };
 		if (TOOL_NAMES.has(event.toolName)) return projectResult(cfg, event, pending, meta, activateExpand);
+		// The tool_call hook's per-call success token is consumed once. A footer-shaped
+		// output alone is never provenance: an untrusted result can print one and must
+		// still pass through capture and redaction.
+		const wrapToken = wrappedCalls.get(event.toolCallId);
+		wrappedCalls.delete(event.toolCallId);
+		// A wrapper projection already carries its handle in the text and never reaches
+		// the capture path that would otherwise notice, so the rule is
+		// shouldActivateExpand's, applied before the built-ins guard: with
+		// XMUSTARD_PI_BUILTINS=none the wrapped call is still captured and still
+		// carries a handle, and the model needs xmustard_expand to use it. Whether the
+		// result is then projected remains that set's own decision.
+		if (shouldActivateExpand(event.content)) activateExpand();
+		if (wrapToken) {
+			const trusted = stripWrapperToken(event.content, wrapToken);
+			if (trusted) return trusted;
+		}
 		if (cfg.builtins.has(event.toolName)) {
-			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand);
+			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand, wrapToken);
 		}
 		return undefined; // other tools pass through untouched
+	});
+
+	// WS-44e (PAR-ADP-09): a bash call's command is rewritten to the run wrapper
+	// before Pi executes it, so its output is reduced server-side. The decision is
+	// shouldWrapBash's, so no other call pays for a workspace lookup and its deadline,
+	// and a session whose wrapper cannot reach this adapter's API with its credential
+	// keeps running natively, captured by the adapter instead.
+	pi.on("tool_call", async (event, ctx) => {
+		if (!shouldWrapBash(event, {
+			enabled: cfg.wrapBash,
+			wrapperAvailable: wrapperOnPath(process.env.PATH),
+			token: cfg.token,
+			wrapperToken: process.env.XMUSTARD_API_TOKEN,
+			wrapperApiBase: process.env.XMUSTARD_API_BASE,
+			apiBase: cfg.apiBase,
+		})) return undefined;
+		await resolveWorkspace(ctx.cwd, ctx.signal).then(
+			(ws) => {
+				// The record follows the rewrite's own answer: a command left alone
+				// (blank, malformed, already wrapped) ran natively, and its result must
+				// not be treated as the wrapper's projection (r7).
+				recordWrappedCall(wrappedCalls, event, ws, true);
+			},
+			() => mutateBashInput(event, undefined, true),
+		);
+		return undefined;
 	});
 
 	// masking returns the drafts earlier handlers proposed plus its context edits

@@ -555,6 +555,22 @@ fn impact_returns_resolved_edges_with_confidence_provenance_and_completeness() {
 }
 
 #[test]
+fn unresolved_impact_has_null_count_and_unknown_risk() {
+    let r = repo(&[(
+        "src/lib.ts",
+        "export function loner(): number { return 1; }\n",
+    )]);
+    index("build", r.path(), &[]);
+
+    let known = index("impact", r.path(), &["--symbol", "loner"]);
+    assert_eq!(known["impacted_count"], 0, "{known:#}");
+
+    let missing = index("impact", r.path(), &["--symbol", "notInGraph"]);
+    assert_eq!(missing["impacted_count"], Value::Null, "{missing:#}");
+    assert_eq!(missing["risk"], "UNKNOWN", "{missing:#}");
+}
+
+#[test]
 fn updates_re_resolve_only_the_dependents_of_changed_exports() {
     let r = fixture();
     index("build", r.path(), &[]);

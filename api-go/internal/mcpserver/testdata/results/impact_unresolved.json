@@ -1,0 +1,11 @@
+{
+  "arguments": {
+    "symbol": "Missing"
+  },
+  "result": {
+    "impacted_count": null,
+    "risk": "UNKNOWN",
+    "symbol": "Missing"
+  },
+  "tool": "impact"
+}

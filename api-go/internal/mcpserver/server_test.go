@@ -792,6 +792,45 @@ func TestCallToolMissingArg(t *testing.T) {
 
 // --- structured output ---
 
+func TestMCPWirePreservesExactBudgetedBodyBytes(t *testing.T) {
+	budget := 0
+	var encoded []byte
+	for {
+		body := map[string]any{
+			"hits":          []any{},
+			"output_budget": map[string]any{"used_chars": budget},
+		}
+		var err error
+		encoded, err = json.Marshal(body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(encoded) == budget {
+			break
+		}
+		budget = len(encoded)
+	}
+	api := &fakeAPI{handle: func(Request) *APIResponse {
+		return &APIResponse{Status: 200, Body: string(encoded)}
+	}}
+	s := newSession(t, api, Options{}, nil, "2025-06-18")
+	res, rerr := call(t, s, "search", map[string]any{"workspace_id": "ws", "q": "x"})
+	if rerr != nil {
+		t.Fatal(rerr)
+	}
+	if got := text(res); got != string(encoded) {
+		t.Fatalf("MCP content changed the budgeted body bytes: %q != %q", got, encoded)
+	}
+	var wireBody map[string]any
+	if err := json.Unmarshal([]byte(text(res)), &wireBody); err != nil {
+		t.Fatal(err)
+	}
+	got := int(wireBody["output_budget"].(map[string]any)["used_chars"].(float64))
+	if got != len(text(res)) {
+		t.Fatalf("budget reports %d bytes for %d bytes in MCP content text", got, len(text(res)))
+	}
+}
+
 // structuredContent is the JSON object of the first text block plus the reserved
 // _xmustard member; text stays for clients that read only content.
 func TestStructuredContentMirrorsText(t *testing.T) {
@@ -951,6 +990,21 @@ func TestOutputSchemasMatchRecordedResults(t *testing.T) {
 		if !covered[name] {
 			t.Errorf("no recorded result for %s", name)
 		}
+	}
+}
+
+func TestImpactStructuredContentPreservesNullCount(t *testing.T) {
+	result := `{"symbol":"Missing","impacted_count":null,"risk":"UNKNOWN"}`
+	got, err := structured(context.Background(), result, map[string]any{"workspace": Workspace{ID: "w", Source: SourceArgument}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var body map[string]any
+	if err := json.Unmarshal(got, &body); err != nil {
+		t.Fatal(err)
+	}
+	if count, ok := body["impacted_count"]; !ok || count != nil {
+		t.Fatalf("MCP structuredContent coerced null impacted_count: %s", got)
 	}
 }
 

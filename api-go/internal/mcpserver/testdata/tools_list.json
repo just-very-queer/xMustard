@@ -255,14 +255,15 @@
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default); see DocsURI",
+            "description": "see DocsURI",
             "enum": [
               "hybrid",
               "text",
               "exact",
               "regex",
               "pattern",
-              "symbol"
+              "symbol",
+              "intent"
             ],
             "type": "string"
           },
@@ -444,9 +445,6 @@
           "has_more": {
             "type": "boolean"
           },
-          "impacted_count": {
-            "type": "integer"
-          },
           "length": {
             "type": "integer"
           },
@@ -461,6 +459,9 @@
           },
           "symbol": {
             "type": "string"
+          },
+          "unmapped_files": {
+            "type": "array"
           }
         },
         "type": "object"

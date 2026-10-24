@@ -1731,26 +1731,27 @@ pub fn flows(
         ..Default::default()
     };
     let result = flows::flows_for(&opened.snapshot, limits)?;
-    // `total_paths`, not the listed steps: the answer's scores come from the entry points
-    // and its reachability from every visited step, including the steps past the listing
-    // cap and the flows dropped by MAX_FLOWS. Freshness computed from the listed rows alone
-    // would claim `current` while a file that shaped the answer had changed.
-    //
-    // `candidate_paths` rides beside it (WS-38c-b decision r4-4): a caller edge is the
-    // DENOMINATOR of a symbol's score, so an unselected caller's file shaped a score this
-    // answer reports. Without it, editing such a file leaves the answer reading `current`.
-    let paths: Vec<String> = result
-        .total_paths
-        .iter()
-        .cloned()
-        .chain(result.candidate_paths.iter().cloned())
-        .chain(
-            result
-                .flows
-                .iter()
-                .flat_map(|f| f.steps.iter().map(|s| s.path.clone())),
-        )
-        .collect();
+    // Check the files that form the answer before the rest of the scoring envelope: the
+    // bounded freshness prefix must include the highest-ranked seeds and their listed steps.
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for seed in &result.entry_points {
+        if seen.insert(seed.path.clone()) {
+            paths.push(seed.path.clone());
+        }
+    }
+    for flow in &result.flows {
+        for step in &flow.steps {
+            if seen.insert(step.path.clone()) {
+                paths.push(step.path.clone());
+            }
+        }
+    }
+    for path in &result.candidate_paths {
+        if seen.insert(path.clone()) {
+            paths.push(path.clone());
+        }
+    }
     let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
     v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
         .map_err(|e| e.to_string())?;

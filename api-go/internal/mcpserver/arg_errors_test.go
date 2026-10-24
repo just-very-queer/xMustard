@@ -33,8 +33,8 @@ func TestArgumentErrorsAreToolResultsTheAgentCanRead(t *testing.T) {
 		// `regex` became a real mode in WS-59c, so the invalid value here is one the
 		// advertised enum never held; the case still asserts that an enum refusal is a
 		// readable tool result naming every accepted value.
-		{"search", map[string]any{"workspace_id": "ws", "q": "x", "mode": "fuzzy"}, "must be one of: hybrid, text, exact, regex, pattern",
-			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|text|exact|regex|pattern|symbol), lang, seed, limit (1-50).",
+		{"search", map[string]any{"workspace_id": "ws", "q": "x", "mode": "fuzzy"}, "must be one of: hybrid, text, exact, regex, pattern, symbol, intent",
+			[]string{"Arguments of search: workspace_id, q (required), mode (hybrid|text|exact|regex|pattern|symbol|intent), lang, seed, limit (1-50).",
 				"Also accepted (see " + DocsURI + "): cursor, path_glob, kinds, depth, include_body, include_info, substring, max_lines, max_bytes, timeout_ms, max_chars."}},
 		{"recall", map[string]any{"workspace_id": "ws", "limit": 0}, "must be between", []string{"must be between 1 and 50 (got 0)"}},
 		{"search", map[string]any{"workspace_id": "ws"}, "required", []string{`missing required argument "q" for search.`, "q (required)"}},
