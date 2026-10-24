@@ -556,7 +556,10 @@ fn impact_returns_resolved_edges_with_confidence_provenance_and_completeness() {
 
 #[test]
 fn unresolved_impact_has_null_count_and_unknown_risk() {
-    let r = repo(&[("src/lib.ts", "export function loner(): number { return 1; }\n")]);
+    let r = repo(&[(
+        "src/lib.ts",
+        "export function loner(): number { return 1; }\n",
+    )]);
     index("build", r.path(), &[]);
 
     let known = index("impact", r.path(), &["--symbol", "loner"]);

@@ -501,10 +501,18 @@ fn trace_reports_hops_direction_furthest_and_caps() {
 #[test]
 fn changed_source_without_graph_symbols_is_reported_as_unmapped() {
     let r = changes_fixture();
-    write(r.path(), "src/notes.ts", "export function newlyAdded(): void {}\n");
+    write(
+        r.path(),
+        "src/notes.ts",
+        "export function newlyAdded(): void {}\n",
+    );
     commit(r.path(), "add source without indexed symbols");
     let v = changes(r.path(), &["--scope=commit"]);
-    assert_eq!(v["unmapped_files"], serde_json::json!(["src/notes.ts"]), "{v:#}");
+    assert_eq!(
+        v["unmapped_files"],
+        serde_json::json!(["src/notes.ts"]),
+        "{v:#}"
+    );
 }
 
 const SVC: &str = "export function greet(name: string): string {\n  return 'hi ' + name;\n}\n\nexport function other(): number {\n  return 2;\n}\n";
