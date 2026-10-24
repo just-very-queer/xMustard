@@ -147,6 +147,42 @@ func TestSerializedEscapingFitsAndRebudgetingIsStable(t *testing.T) {
 	}
 }
 
+func TestRebudgetPreservesPriorStagesAndRecoveryHandle(t *testing.T) {
+	retained := 0
+	first := run(t, "search", searchResult(20, 250), Request{MaxChars: 4000}, Page{Cursor: cursorAt}, func() Recovery {
+		retained++
+		return Recovery{URI: "/recover/original", Handle: "original"}
+	})
+	if first.rep.RecoverHandle != "original" || len(first.rep.Stages) == 0 {
+		t.Fatalf("initial budget did not retain recovery: %+v", first.rep)
+	}
+	spec, _ := For("search")
+	secondRaw, err := spec.Apply(first.raw, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, func() Recovery {
+		retained++
+		return Recovery{URI: "/recover/rebudgeted", Handle: "rebudgeted"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var second struct {
+		Budget report `json:"output_budget"`
+	}
+	if err := json.Unmarshal(secondRaw, &second); err != nil {
+		t.Fatal(err)
+	}
+	if retained != 1 || second.Budget.RecoverHandle != "original" || second.Budget.RecoverURI != "/recover/original" {
+		t.Fatalf("rebudget replaced original recovery: retained=%d budget=%+v", retained, second.Budget)
+	}
+	for _, stage := range first.rep.Stages {
+		if !slices.Contains(second.Budget.Stages, stage) {
+			t.Fatalf("rebudget lost inherited stage %q: %v", stage, second.Budget.Stages)
+		}
+	}
+	if len(second.Budget.Stages) <= len(first.rep.Stages) {
+		t.Fatalf("rebudget did not record its additional reduction: first=%v second=%v", first.rep.Stages, second.Budget.Stages)
+	}
+}
+
 func TestTenThousandImpactRowsCountExactWireBytes(t *testing.T) {
 	items := make([]map[string]any, 10_000)
 	for i := range items {
@@ -677,8 +713,9 @@ func TestSettleKeepsThePerListAccountingOfThePageItSettled(t *testing.T) {
 	}
 }
 
-// The WS-35 scope shape: its dependents live in affected.by_depth, a nested list of
-// tiers, which keeps the same leading items per tier.
+// TestImpactScopeTrimsNestedTiers exercises the WS-35 scope shape: its dependents
+// live in affected.by_depth, a nested list of tiers, which keeps the same leading
+// items per tier.
 func TestImpactScopeTrimsNestedTiers(t *testing.T) {
 	items := make([]map[string]any, 60)
 	for i := range items {

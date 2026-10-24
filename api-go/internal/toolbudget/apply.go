@@ -420,9 +420,9 @@ type budgeter struct {
 // report. The ladder is the first of the tool's ladders whose Match member the result
 // has. With page.Slice, the paged list is first cut to its page. Rungs run in order
 // until the result fits; a paged list that returns fewer items than its page holds
-// sets has_more and next_cursor at the first item not returned. When anything was
-// reduced, retain (when set) is called once and its Recovery named in the report.
-// A result that is not a JSON object is returned unchanged.
+// sets has_more and next_cursor at the first item not returned. When a result is reduced,
+// retain (when set) is called once unless an earlier pass already retained it; the report
+// names that recovery. A result that is not a JSON object is returned unchanged.
 func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recovery) ([]byte, error) {
 	if !json.Valid(result) {
 		return nil, errors.New(s.Tool + " result is not valid JSON")
@@ -444,9 +444,14 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 	inheritedStages := len(b.applied)
 	b.fit()
 	if retain != nil && len(b.applied) > inheritedStages {
-		rec := retain()
-		b.recovery = &rec
+		recovery := b.recovery
+		if recovery == nil {
+			rec := retain()
+			recovery = &rec
+		}
 		b.reset()
+		b.applied = append(b.applied, prev.stages...)
+		b.recovery = recovery
 		b.fit()
 	}
 	return b.render(b.report), nil
