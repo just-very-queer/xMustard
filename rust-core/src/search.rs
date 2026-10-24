@@ -2681,6 +2681,15 @@ mod tests {
             "src/zz_needle.rs".into(),
             "pub fn relevant_behavior() {}\n".into(),
         ));
+        files.push((
+            "src/caller.rs".into(),
+            "use crate::zz_needle::relevant_behavior;\npub fn call() { relevant_behavior(); }\n"
+                .into(),
+        ));
+        files.push((
+            "src/lib.rs".into(),
+            "pub mod zz_needle; mod caller;\n".into(),
+        ));
         let file_refs: Vec<(&str, &str)> = files
             .iter()
             .map(|(path, contents)| (path.as_str(), contents.as_str()))
@@ -2716,9 +2725,12 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.id == "file:src/zz_needle.rs")
         );
-        assert!(result.hits.iter().any(|hit| {
-            hit.name == "relevant_behavior" && hit.lanes_matched.contains(&"intent")
-        }));
+        let target = result
+            .hits
+            .iter()
+            .find(|hit| hit.name == "relevant_behavior" && hit.lanes_matched.contains(&"intent"))
+            .unwrap();
+        assert_eq!(target.scores["structural"], 2.0);
     }
 
     #[test]
