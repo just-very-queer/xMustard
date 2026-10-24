@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
 
@@ -27,14 +28,18 @@ var toolRoutes = []routeSpec{
 }
 
 func search(w http.ResponseWriter, r *http.Request) {
+	q, err := strictQuery(r)
+	if err != nil {
+		respondError(w, err)
+		return
+	}
 	query, ok := requireQuery(w, r, "q")
 	if !ok {
 		return
 	}
 	limit := queryInt(r, "limit", workspaceops.DefaultSearchLimit)
-	dd, ws, q := dataDir(), r.PathValue("workspace_id"), r.URL.Query()
+	dd, ws := dataDir(), r.PathValue("workspace_id")
 	var result json.RawMessage
-	var err error
 	// `pattern` and `symbol` answer from their own surfaces, so they are dispatched
 	// first. The lexical modes share one request. A mode the tool does not advertise is
 	// bad input, not the hybrid by default.
@@ -75,17 +80,17 @@ func search(w http.ResponseWriter, r *http.Request) {
 		// ?seed=<symbol> activates the graph-proximity lane, ?lang= and ?path_glob=
 		// filter, ?mode=text answers from the body lane alone, ?mode=exact|regex scans
 		// the working tree's bytes, and ?cursor= continues a page (next_cursor).
-		maxLines, capErr := scanCap(r, "max_lines")
+		maxLines, capErr := scanCap(q, "max_lines")
 		if capErr != nil {
 			respondError(w, capErr)
 			return
 		}
-		maxBytes, capErr := scanCap(r, "max_bytes")
+		maxBytes, capErr := scanCap(q, "max_bytes")
 		if capErr != nil {
 			respondError(w, capErr)
 			return
 		}
-		timeoutMS, capErr := scanCap(r, "timeout_ms")
+		timeoutMS, capErr := scanCap(q, "timeout_ms")
 		if capErr != nil {
 			respondError(w, capErr)
 			return
@@ -99,8 +104,19 @@ func search(w http.ResponseWriter, r *http.Request) {
 	reply(w, result, err, respondError)
 }
 
-func scanCap(r *http.Request, name string) (int, error) {
-	values, present := r.URL.Query()[name]
+// strictQuery is the request's query string, or a 400 when it does not parse. URL.Query()
+// drops a pair split by ';' or carrying a bad %-escape and discards the error, so a cap the
+// caller set would read as absent and the scan would run at its default.
+func strictQuery(r *http.Request) (url.Values, error) {
+	q, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		return nil, fmt.Errorf("the query string does not parse (%v): %w", err, workspaceops.ErrInvalidInput)
+	}
+	return q, nil
+}
+
+func scanCap(q url.Values, name string) (int, error) {
+	values, present := q[name]
 	if !present {
 		return 0, nil
 	}

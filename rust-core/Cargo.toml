@@ -40,6 +40,12 @@ tree-sitter-swift = { version = "0.7", optional = true }
 tree-sitter-bash = { version = "0.25", optional = true }
 streaming-iterator = "0.1"
 regex = "1.12"
+# The exact scan's engine (WS-59c): the lazy DFA is stepped one byte at a time, so a search
+# step observes the deadline, and the parsed HIR decides which occurrences are final at a
+# byte cutoff. All three are already regex's own dependencies at these versions.
+regex-automata = { version = "0.4", default-features = false, features = ["std", "syntax", "hybrid"] }
+regex-syntax = { version = "0.8", default-features = false, features = ["std"] }
+memchr = "2"
 roxmltree = "0.20"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"

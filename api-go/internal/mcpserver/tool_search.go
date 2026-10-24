@@ -97,7 +97,10 @@ const scanSearchDoc = "### mode=exact|regex\n\n`q` is matched against the workin
 	"that fires sets `truncated` and names itself in `cut` (`lines`, `bytes`, `time`) and in `degradations`, with " +
 	"`files_skipped` counting the files never opened. A secret path is never read: it appears in `degradations` and " +
 	"under `coverage.loss_counts`, never in `spans`. A pattern the engine refuses is reported, not answered as " +
-	"`no match`."
+	"`no match`; so is a Unicode word boundary (`(?u)\\b`), which the scan does not support. A match may span " +
+	"lines, and `^`/`$` anchor the file unless `(?m)` is set. When a cap stops the scan inside a file, every listed " +
+	"span is still the whole file's own, and `degradations` names that file and the byte from which its " +
+	"occurrences are not listed."
 
 // modesDoc carries what search's lean schema no longer has room for (WS-59c): the
 // per-mode gloss and the two caveats that distinguish the lanes from each other. The lean

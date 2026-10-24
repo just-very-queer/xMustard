@@ -666,14 +666,16 @@ pub fn hybrid_search_for(
 fn scan_paths(
     root: &Path,
     paths: &[String],
-    matcher: &regex::bytes::Regex,
+    pattern: &crate::exactscan::Pattern,
     limits: &crate::exactscan::Limits,
     scan_slice: Option<usize>,
-    started: std::time::Instant,
+    deadline: &mut crate::exactscan::Deadline,
 ) -> (crate::exactscan::Report, Vec<crate::exactscan::Loss>) {
     let mut report = crate::exactscan::Report::default();
     let mut budget = limits.max_bytes;
     let mut losses = Vec::new();
+    // one matcher state for the whole scan: the lazy DFA's caches are reused across files
+    let mut scanner = pattern.scanner();
     for (path_index, rel) in paths.iter().enumerate() {
         let mut scan_file = match crate::exactscan::FileScan::open_with_slice(root, rel, scan_slice)
         {
@@ -685,11 +687,11 @@ fn scan_paths(
             }
         };
         let more = scan_file.scan(
-            matcher,
+            &mut scanner,
             limits,
             &mut budget,
             &mut report,
-            started,
+            deadline,
             path_index + 1 < paths.len(),
         );
         report.files_scanned += 1;
@@ -763,8 +765,8 @@ fn scan_with_report(
                 );
             }
         };
-    let matcher = match crate::exactscan::compile(query, opts.mode.matcher()) {
-        Ok(re) => re,
+    let pattern = match crate::exactscan::compile(query, opts.mode.matcher()) {
+        Ok(pattern) => pattern,
         Err(e) => {
             return (
                 SearchResult {
@@ -827,8 +829,17 @@ fn scan_with_report(
     // Order is Git's own, so the same corpus produces the same bytes twice (the property
     // `search_hybrid`'s byte-identity test asserts for the hybrid).
     paths.sort();
-    let (mut report, losses) =
-        scan_paths(root, &paths, &matcher, &limits, opts.scan_slice, started);
+    // The time cap counts from before the listing, so the listing's own time is spent
+    // from it.
+    let mut deadline = crate::exactscan::Deadline::wall(started, limits.timeout_ms);
+    let (mut report, losses) = scan_paths(
+        root,
+        &paths,
+        &pattern,
+        &limits,
+        opts.scan_slice,
+        &mut deadline,
+    );
     if report.cut.is_some() {
         // The corpus is not exhausted, so the files after this one were never opened.
         report.files_skipped = listed.saturating_sub(report.files_scanned as u64);
@@ -863,17 +874,16 @@ fn scan_with_report(
         ));
     }
 
+    // The file a cap stopped inside, and the byte its missing occurrences start from: the
+    // cut line above says only that later files were not searched.
+    if let Some(unconfirmed) = &report.unconfirmed {
+        degradations.push(unconfirmed.message());
+    }
     if report.matches_cut > 0 {
         degradations.push(format!(
             "{} match(es) exceeded the {}-byte match window; reported lengths were capped",
             report.matches_cut,
             crate::exactscan::MAX_MATCH_BYTES
-        ));
-    }
-    if report.positions_lost > 0 {
-        degradations.push(format!(
-            "{} match(es) were found but their line could not be resolved",
-            report.positions_lost
         ));
     }
     // A page of a scan's spans, by the same `offset`/`limit` the ranked modes use, so one
@@ -907,7 +917,7 @@ fn scan_with_report(
                 || report.cut.is_some()
                 || report.files_skipped_unreadable > 0
                 || report.matches_cut > 0
-                || report.positions_lost > 0,
+                || report.unconfirmed.is_some(),
             cut: report.cut,
             files_skipped: (report.files_skipped > 0).then_some(report.files_skipped),
             degradations,
@@ -2692,17 +2702,17 @@ mod scan_tests {
             ("c.txt", "needle\n"),
         ]);
         let paths = vec!["a.go".to_string(), "b.go".to_string(), "c.txt".to_string()];
-        let matcher =
+        let pattern =
             crate::exactscan::compile("needle", crate::exactscan::Matcher::Exact).unwrap();
         let limits = crate::exactscan::Limits::default();
         let call = crate::passcount::Call::begin();
         let (report, losses) = scan_paths(
             repo.path(),
             &paths,
-            &matcher,
+            &pattern,
             &limits,
             None,
-            std::time::Instant::now(),
+            &mut crate::exactscan::Deadline::never(),
         );
         let counts = call.counts();
         drop(call);
@@ -2757,5 +2767,162 @@ mod scan_tests {
         );
         let found: Vec<usize> = res.spans.iter().map(|s| s.byte).collect();
         assert_eq!(found, vec![0, 60], "each planted match is reported once");
+    }
+
+    /// One scan of `repo` in `mode` with the byte cap `scan_bytes`, and its report.
+    fn scan_capped(
+        repo: &TempDir,
+        query: &str,
+        mode: SearchMode,
+        scan_bytes: u64,
+    ) -> (SearchResult, crate::exactscan::Report) {
+        scan_with_report(
+            repo.path(),
+            "ws",
+            None,
+            query,
+            &SearchOptions {
+                limit: 50,
+                mode,
+                scan_bytes,
+                ..Default::default()
+            },
+        )
+    }
+
+    // batch43 #7 at the search level: a complete literal at the cutoff is listed at its
+    // full length, and nothing claims its length was capped.
+    #[test]
+    fn complete_literal_at_cutoff_is_not_length_capped_search_level() {
+        let repo = git_repo(&[("a.txt", "needlex")]);
+        let (res, report) = scan_capped(&repo, "needle", SearchMode::Exact, 6);
+        assert_eq!(res.spans.len(), 1, "{:?}", res.spans);
+        assert_eq!(res.spans[0].len, 6);
+        assert!(res.truncated, "the byte cap fired: {:?}", res.degradations);
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        assert!(
+            !res.degradations.iter().any(|d| d.contains("match window")),
+            "{:?}",
+            res.degradations
+        );
+        assert_eq!(report.matches_cut, 0);
+    }
+
+    // The byte cap stopping inside a file names the file and the byte its unlisted
+    // occurrences start from, beside the cut line that names the cap.
+    #[test]
+    fn the_byte_cap_inside_a_file_names_the_unconfirmed_offset() {
+        let repo = git_repo(&[("a.txt", &"needle ".repeat(400))]);
+        let (res, _) = scan_capped(&repo, "needle", SearchMode::Exact, 64);
+        let bytes: Vec<usize> = res.spans.iter().map(|s| s.byte).collect();
+        assert_eq!(bytes, (0..9).map(|k| k * 7).collect::<Vec<_>>());
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        assert!(res.truncated);
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("byte cap (64 bytes)")),
+            "{:?}",
+            res.degradations
+        );
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("a.txt") && d.contains("64 bytes") && d.contains("byte 62")),
+            "{:?}",
+            res.degradations
+        );
+    }
+
+    // A byte budget that ends exactly at a file's end decides that file: the later file is
+    // skipped and counted, and nothing in the first is unconfirmed.
+    #[test]
+    fn a_budget_ending_at_a_file_boundary_leaves_nothing_unconfirmed() {
+        let repo = git_repo(&[("a.txt", "needle\n"), ("b.txt", "needle\n")]);
+        let (res, report) = scan_capped(&repo, "needle", SearchMode::Exact, 7);
+        let listed: Vec<(&str, usize)> = res
+            .spans
+            .iter()
+            .map(|s| (s.path.as_str(), s.byte))
+            .collect();
+        assert_eq!(listed, [("a.txt", 0)]);
+        assert_eq!(res.cut, Some(crate::exactscan::Cut::Bytes));
+        assert_eq!(report.unconfirmed, None);
+        assert!(
+            !res.degradations.iter().any(|d| d.contains("not confirmed")),
+            "{:?}",
+            res.degradations
+        );
+        assert_eq!(res.files_skipped, Some(1));
+    }
+
+    // batch34 #8 (b) and batch51 #1 at the search level: an empty answer cut inside a
+    // file is truncated and names the file and the byte it is unconfirmed from, so it is
+    // never presented as complete.
+    #[test]
+    fn an_empty_answer_cut_inside_a_file_names_that_file() {
+        let prefix = format!("a{}z", "x".repeat(70_000));
+        for (body, query, cap) in [(prefix.as_str(), "a.*z", 65_536), ("abc", "abc|b", 2)] {
+            let repo = git_repo(&[("a.txt", body)]);
+            let (res, _) = scan_capped(&repo, query, SearchMode::Regex, cap);
+            assert!(res.spans.is_empty(), "{query}: {:?}", res.spans);
+            assert!(res.truncated, "{query}");
+            assert!(
+                res.degradations
+                    .iter()
+                    .any(|d| d.contains("a.txt") && d.contains("byte 0")),
+                "{query}: {:?}",
+                res.degradations
+            );
+        }
+    }
+
+    // batch34 #3 at the search level: the one capped span makes the answer truncated and
+    // names the window.
+    #[test]
+    fn a_capped_unbounded_occurrence_is_named_at_the_search_level() {
+        let repo = git_repo(&[("a.txt", &"x".repeat(100_000))]);
+        let res = scan_repo(&repo, "x+", SearchMode::Regex);
+        assert_eq!(res.spans.len(), 1, "{:?}", res.spans);
+        assert_eq!(res.spans[0].len, crate::exactscan::MAX_MATCH_BYTES);
+        assert!(res.truncated);
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("exceeded the 4096-byte match window")),
+            "{:?}",
+            res.degradations
+        );
+    }
+
+    // An anchored pattern's automaton proves the unread rest cannot match, so a byte cap
+    // inside the only file cuts nothing.
+    #[test]
+    fn an_anchored_pattern_cut_by_the_byte_cap_is_complete() {
+        let repo = git_repo(&[("a.txt", &format!("needle{}", "x".repeat(70_000)))]);
+        let (res, report) = scan_capped(&repo, r"\Aneedle", SearchMode::Regex, 65_536);
+        let listed: Vec<(usize, usize)> = res.spans.iter().map(|s| (s.byte, s.len)).collect();
+        assert_eq!(listed, [(0, 6)]);
+        assert_eq!(res.cut, None);
+        assert!(!res.truncated, "{:?}", res.degradations);
+        assert_eq!(report.unconfirmed, None);
+    }
+
+    // A Unicode word boundary is refused like any pattern the scan cannot answer: reported,
+    // nothing read, never an empty answer that reads as complete.
+    #[test]
+    fn a_unicode_word_boundary_is_refused_and_searches_nothing() {
+        let repo = git_repo(&[("a.txt", "foo\n")]);
+        let res = scan_repo(&repo, r"(?u)\bfoo", SearchMode::Regex);
+        assert!(res.spans.is_empty(), "{:?}", res.spans);
+        assert_eq!(res.bytes_scanned, Some(0), "nothing was read");
+        assert!(res.truncated);
+        assert!(
+            res.degradations
+                .iter()
+                .any(|d| d.contains("not supported by the scan")),
+            "{:?}",
+            res.degradations
+        );
     }
 }
