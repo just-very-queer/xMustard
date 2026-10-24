@@ -307,7 +307,11 @@ each `bash` tool call's `command` is rewritten in place to
 `xmustard-core run --workspace <id> -- bash -c <quoted command>` before Pi runs it, so
 the output is reduced and retained server-side. Each rewritten call also gets a fresh private
 success token: the wrapper removes it from the child environment and only returns it after a
-successful capture; the extension validates and strips it before model context.
+successful capture; the extension validates and strips it before model context. The token
+stops the extension from trusting output the wrapper did not capture. It is not a boundary
+against a command that deliberately inspects its parent: the token is still in the wrapper's
+own environment and in the outer shell's argument list. Moving it to a file the wrapper reads
+and unlinks before spawning, and making the wrapper non-dumpable, is follow-up work.
 
 The `bash -c` matters. The wrapper executes the program after `--` directly rather than
 through a shell, so a command that is not one program name — a pipeline, a redirect,
