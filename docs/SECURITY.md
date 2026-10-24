@@ -39,9 +39,8 @@ explicitly grant or revoke trust with `xmustard-ops trust grant <path>` and
 canonical roots. Trust records live in the operator data directory in a private
 `trusted-repositories.json` file (0600), never in the repository or through an API.
 A grant applies to the resolved repository root only; another clone or linked worktree
-at a different real path requires its own grant. The default is untrusted. This
-operator store is the trust primitive; it does not itself cause a repository config
-entry to execute.
+at a different real path requires its own grant. The default is untrusted. The trust
+store exists, but no enforcement is wired yet (OQ-44c).
 
 ## Authentication modes
 
