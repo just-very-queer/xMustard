@@ -84,6 +84,33 @@ const MIN_INTENT_PROBABILITY: f64 = 0.5;
 /// Dimensions of the trigram sketch.
 const SKETCH_DIM: usize = 256;
 
+fn intent_degradations(
+    stale: bool,
+    provider_failed: bool,
+    budget_limited: bool,
+) -> &'static [&'static str] {
+    match (stale, provider_failed, budget_limited) {
+        (true, _, _) => &["semantic_stale"],
+        (false, true, true) => &["semantic_unavailable", "semantic_budget"],
+        (false, true, false) => &["semantic_unavailable"],
+        (false, false, true) => &["semantic_budget"],
+        (false, false, false) => &["semantic_unavailable"],
+    }
+}
+
+fn append_intent_degradations(
+    degradations: &mut Vec<String>,
+    stale: bool,
+    provider_failed: bool,
+    budget_limited: bool,
+) {
+    degradations.extend(
+        intent_degradations(stale, provider_failed, budget_limited)
+            .iter()
+            .map(|degradation| (*degradation).to_string()),
+    );
+}
+
 #[cfg(test)]
 struct UnsharedTextProvider<'a> {
     snapshot: &'a crate::index::reader::Snapshot,
@@ -1734,13 +1761,15 @@ pub fn search(
                     Ok((Ok(decision), targets, stale_excerpt, newly_discovered)) => {
                         if stale_excerpt {
                             cands.truncate(deterministic_len);
-                            degradations.push("semantic_stale".to_string());
+                            append_intent_degradations(&mut degradations, true, false, false);
                         } else {
-                            if provider_failed {
-                                degradations.push("semantic_unavailable".to_string());
-                            }
-                            if cap_exhausted {
-                                degradations.push("semantic_budget".to_string());
+                            if provider_failed || cap_exhausted {
+                                append_intent_degradations(
+                                    &mut degradations,
+                                    false,
+                                    provider_failed,
+                                    cap_exhausted,
+                                );
                             }
                             for (id, probability) in decision.probabilities {
                                 if probability >= MIN_INTENT_PROBABILITY
@@ -1776,40 +1805,54 @@ pub fn search(
                             | crate::intent::ProviderError::QuestionTooLarge,
                         ),
                         _,
-                        _,
+                        stale_excerpt,
                         _,
                     )) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_budget".to_string());
+                        append_intent_degradations(
+                            &mut degradations,
+                            stale_excerpt,
+                            provider_failed,
+                            true,
+                        );
                     }
-                    Ok((Err(crate::intent::ProviderError::InvalidQuestion), _, _, _)) => {
+                    Ok((
+                        Err(crate::intent::ProviderError::InvalidQuestion),
+                        _,
+                        stale_excerpt,
+                        _,
+                    )) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_unavailable".to_string());
+                        append_intent_degradations(
+                            &mut degradations,
+                            stale_excerpt,
+                            true,
+                            cap_exhausted,
+                        );
                     }
                     Ok((Err(_), _, true, _)) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_stale".to_string());
+                        append_intent_degradations(&mut degradations, true, false, false);
                     }
                     Ok((Err(_), _, false, _)) => {
                         cands.truncate(deterministic_len);
-                        if provider_failed {
-                            degradations.push("semantic_unavailable".to_string());
-                        }
-                        if cap_exhausted {
-                            degradations.push("semantic_budget".to_string());
-                        }
-                        if !provider_failed && !cap_exhausted {
-                            degradations.push("semantic_unavailable".to_string());
-                        }
+                        append_intent_degradations(
+                            &mut degradations,
+                            false,
+                            provider_failed,
+                            cap_exhausted,
+                        );
                     }
                     Err(_) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_stale".to_string());
+                        append_intent_degradations(&mut degradations, true, false, false);
                     }
                 }
             }
-            (Some(_), Some(_), None) => degradations.push("semantic_unavailable".to_string()),
-            _ => degradations.push("semantic_unavailable".to_string()),
+            (Some(_), Some(_), None) => {
+                append_intent_degradations(&mut degradations, false, false, false)
+            }
+            _ => append_intent_degradations(&mut degradations, false, false, false),
         }
     }
     drop(prox);
@@ -2359,6 +2402,28 @@ mod tests {
     }
 
     #[test]
+    fn intent_degradation_mapping_is_exact_and_stale_takes_priority() {
+        assert_eq!(
+            intent_degradations(false, false, false),
+            &["semantic_unavailable"]
+        );
+        assert_eq!(
+            intent_degradations(false, true, false),
+            &["semantic_unavailable"]
+        );
+        assert_eq!(
+            intent_degradations(false, false, true),
+            &["semantic_budget"]
+        );
+        assert_eq!(
+            intent_degradations(false, true, true),
+            &["semantic_unavailable", "semantic_budget"]
+        );
+        assert_eq!(intent_degradations(true, false, false), &["semantic_stale"]);
+        assert_eq!(intent_degradations(true, true, true), &["semantic_stale"]);
+    }
+
+    #[test]
     fn intent_score_keys_preserve_legacy_onnx_and_text_contracts() {
         assert_eq!(score_key(Lane::Fuzzy, "semantic"), "semantic");
         assert_eq!(score_key(Lane::Intent, "intent"), "intent");
@@ -2500,12 +2565,15 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
-        assert!(
-            result
-                .degradations
-                .iter()
-                .any(|d| d == "semantic_unavailable")
+        let semantic_degradations: Vec<&str> = result
+            .degradations
+            .iter()
+            .filter(|degradation| degradation.starts_with("semantic_"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            semantic_degradations,
+            ["semantic_unavailable", "semantic_budget"]
         );
         let state = provider.0.lock().unwrap();
         assert_eq!(state.1.len(), crate::intent::MAX_PROVIDER_REQUESTS);
@@ -2841,11 +2909,14 @@ mod tests {
                     .all(|lane| hit.scores.contains_key(lane))
             );
         }
-        assert!(
+        assert_eq!(
             intent
                 .degradations
                 .iter()
-                .any(|d| d == "semantic_unavailable")
+                .filter(|degradation| degradation.starts_with("semantic_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["semantic_unavailable"]
         );
     }
 
@@ -3438,11 +3509,14 @@ mod tests {
                     .all(|lane| hit.scores.contains_key(lane))
             );
         }
-        assert!(
+        assert_eq!(
             intent
                 .degradations
                 .iter()
-                .any(|d| d == "semantic_unavailable")
+                .filter(|degradation| degradation.starts_with("semantic_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["semantic_unavailable"]
         );
     }
 
