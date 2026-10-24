@@ -268,7 +268,7 @@ var impactLadders = []*Ladder{
 		// impact v2 (WS-35) scope=: the symbols a diff touches and their dependents
 		Shape: "diff scope (changed_symbols)", Match: "changed_symbols",
 		Lists: []List{
-			{Member: "changed_files", GroupBy: "change"}, {Member: "affected.affected_modules"}, {Member: "affected.by_depth"},
+			{Member: "changed_files", GroupBy: "change"}, {Member: "unmapped_files"}, {Member: "affected.affected_modules"}, {Member: "affected.by_depth"},
 			{Member: "changed_symbols", GroupBy: "path"},
 		},
 		Signals: envelope,
@@ -277,6 +277,8 @@ var impactLadders = []*Ladder{
 			signalCounts,
 			signalFlags,
 			{Name: "files_trimmed", Op: opFit, List: "changed_files", Doc: "fewer changed files (changed_files_total keeps the count)"},
+			{Name: "unmapped_trimmed", Op: opFit, List: "unmapped_files", Doc: "fewer changed source files without mapped symbols (unmapped_files_total keeps the count)"},
+			{Name: "unmapped_total", Op: opTotal, List: "unmapped_files", Doc: "only unmapped_files_total remains"},
 			{Name: "modules_trimmed", Op: opFit, List: "affected.affected_modules", Doc: "fewer affected modules"},
 			{Name: "tiers_trimmed", Op: opFitEach, List: "affected.by_depth", Each: "items", Doc: "each dependent tier keeps its first items (total keeps the count)"},
 			{Name: "files_counts", Op: opCount, List: "changed_files", Doc: "changed files become changed_files_by_change"},

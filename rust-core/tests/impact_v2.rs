@@ -513,6 +513,7 @@ fn changed_source_without_graph_symbols_is_reported_as_unmapped() {
         serde_json::json!(["src/notes.ts"]),
         "{v:#}"
     );
+    assert_eq!(v["unmapped_files_total"], 1, "{v:#}");
 }
 
 const SVC: &str = "export function greet(name: string): string {\n  return 'hi ' + name;\n}\n\nexport function other(): number {\n  return 2;\n}\n";

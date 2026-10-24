@@ -355,6 +355,11 @@ pub struct Boundary {
 /// the legacy per-call graph (file nodes only).
 pub trait Graph {
     fn file_count(&self) -> u32;
+    /// Whether this graph has a symbol-bearing code-index snapshot rather than only
+    /// legacy file nodes.
+    fn has_symbol_snapshot(&self) -> bool {
+        true
+    }
     fn path(&self, file: u32) -> &str;
     /// The file a node belongs to.
     fn file_of(&self, node: u32) -> Result<u32, String>;
@@ -1069,7 +1074,7 @@ fn run_lookup<G: Graph + ?Sized>(
     })
 }
 
-/// Risk and its note. Only upstream dependents are scored.
+/// Risk is scored upstream; a missing target is UNKNOWN for either direction.
 fn score(q: &Query, lookup: &Lookup, c: &Counts, e: &Epistemic) -> (Option<Risk>, Option<String>) {
     if lookup.nodes.is_empty() {
         return (
@@ -1252,6 +1257,10 @@ impl LegacyGraph {
 }
 
 impl Graph for LegacyGraph {
+    fn has_symbol_snapshot(&self) -> bool {
+        false
+    }
+
     fn file_count(&self) -> u32 {
         self.paths.len() as u32
     }
@@ -1327,6 +1336,24 @@ impl Graph for LegacyGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_graph_has_no_symbol_snapshot() {
+        let graph = crate::symbolgraph::SymbolGraph {
+            workspace_id: "ws".into(),
+            file_count: 0,
+            symbol_count: 0,
+            edge_count: 0,
+            files: Vec::new(),
+            symbols: Vec::new(),
+            edges: Vec::new(),
+            flow_edges: Vec::new(),
+            flow_edge_count: 0,
+            coverage: Default::default(),
+            generated_at: String::new(),
+        };
+        assert!(!LegacyGraph::new(&graph).has_symbol_snapshot());
+    }
 
     fn m(direct: usize, modules: usize, impacted: usize) -> Metrics {
         Metrics {
