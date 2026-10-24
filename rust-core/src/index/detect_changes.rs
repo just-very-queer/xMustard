@@ -548,16 +548,12 @@ pub fn detect<G: Graph + ?Sized>(
             {
                 continue;
             }
-            let Some(file_node) = g.file_node(&e.rel)? else {
-                if let Some(files) = &mut out.unmapped_files {
-                    files.push(e.rel.clone());
-                }
-                continue;
+            let unmapped = match g.file_node(&e.rel)? {
+                Some(file_node) => g.file_symbols(file_node)?.is_empty(),
+                None => true,
             };
-            if g.file_symbols(file_node)?.is_empty() {
-                if let Some(files) = &mut out.unmapped_files {
-                    files.push(e.rel.clone());
-                }
+            if unmapped && let Some(files) = &mut out.unmapped_files {
+                files.push(e.rel.clone());
             }
         }
         out.unmapped_files_total = out.unmapped_files.as_ref().map(Vec::len);
