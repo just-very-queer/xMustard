@@ -400,10 +400,12 @@ fn exceeds_retention_limit(retained: u64, steps: u64, limits: Limits) -> bool {
     retained + steps > limits.max_retained_steps
 }
 
+/// Copy only the prefix that can appear in the answer, with capacity bounded to its length.
 fn listed_steps(visited: &[usize], max_steps_listed: usize) -> Vec<usize> {
     visited[..visited.len().min(max_steps_listed)].to_vec()
 }
 
+/// Deduplicated walks retained under the answer's global listed-step budget.
 #[derive(Default)]
 struct RetainedWalks {
     steps: u64,
@@ -412,6 +414,8 @@ struct RetainedWalks {
 }
 
 impl RetainedWalks {
+    /// Fold duplicates before charging; otherwise retain a bounded step prefix or count the
+    /// rejected walk's full size so truncation explains all discarded resident data.
     fn admit(
         &mut self,
         key: [u8; 32],
@@ -427,6 +431,8 @@ impl RetainedWalks {
         }
 
         let retained_steps = walk.visited.len().min(limits.max_steps_listed) as u64;
+        // Reject only this new set; later seeds may fold into an already retained set without
+        // consuming budget, so filling the cap is not a reason to stop the seed loop.
         if exceeds_retention_limit(self.steps, retained_steps, limits) {
             truncation.dropped_retained += walk.visited.len() as u64;
             return;
@@ -510,11 +516,7 @@ pub fn flows_of(
     // allocation no larger than `MAX_STEPS_LISTED`; only those rows count against
     // `MAX_RETAINED_STEPS`. A walk that would exceed the remaining budget is dropped and
     // counted rather than silently shortening another flow's answer.
-    let seed_areas: BTreeSet<u32> = ranked
-        .iter()
-        .map(|&seed| graph.nodes[seed as usize].area)
-        .filter(|&area| area != UNCLASSIFIED)
-        .collect();
+    let seed_areas = ranked_seed_areas(&graph, &ranked);
     let mut retained = RetainedWalks::default();
     for (rank, &seed) in ranked.iter().enumerate() {
         let mut walk = walk(&graph, seed, &limits, &mut truncation);
@@ -761,6 +763,15 @@ fn build_graph(
     })
 }
 
+/// Communities whose nodes can become ranked flow origins, rather than every graph community.
+fn ranked_seed_areas(graph: &Graph, ranked: &[u32]) -> BTreeSet<u32> {
+    ranked
+        .iter()
+        .map(|&seed| graph.nodes[seed as usize].area)
+        .filter(|&area| area != UNCLASSIFIED)
+        .collect()
+}
+
 /// Count every community in the walk, retaining only ids a folded seed origin can add.
 fn area_summary(
     graph: &Graph,
@@ -812,9 +823,10 @@ fn rank_seeds(graph: &Graph, limits: Limits) -> (Vec<u32>, u64, Vec<String>, Tru
             })
     });
     let pool = scored.len();
-    // Freshness checks are bounded, so preserve ranked seed paths before appending the
-    // remaining files that shaped scores or walks. This keeps the highest-ranked results
-    // inside the checked prefix even when their dependency paths sort later alphabetically.
+    // Keep the complete scoring envelope deterministic for freshness checks after the
+    // answer's ranked seeds and listed flow steps have been prioritized by `index::flows`.
+    // The checked prefix is selected there; this list remains complete for callers and
+    // callees that shaped scores, including candidates beyond the output cap.
     let mut candidate_paths = Vec::new();
     let mut seen_paths = BTreeSet::new();
     for (_, i) in &scored {
@@ -884,10 +896,12 @@ struct Walk {
     depth: u32,
     /// Number of communities in the complete walk.
     area_count: usize,
-    /// Walk communities that any ranked seed can introduce as an origin. This is sufficient
-    /// to merge folded origins without retaining a traversal-sized community set per walk.
+    /// Walk communities in the ranked seed-area set, sufficient to merge origins without
+    /// retaining every community reached by this walk.
     areas: BTreeSet<u32>,
+    /// Shared label prefix computed over the complete walk before retention truncates it.
     label_stem: Option<String>,
+    /// Complete walk size, used to report omitted steps after retaining only its prefix.
     full_len: usize,
 }
 
@@ -1083,7 +1097,8 @@ fn shared_stem(steps: &[Step]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Graph, Limits, Node, RetainedWalks, Walk, area_summary, exceeds_retention_limit, rank_seeds,
+        Graph, Limits, Node, RetainedWalks, Walk, area_summary, exceeds_retention_limit,
+        rank_seeds, ranked_seed_areas,
     };
 
     #[test]
@@ -1107,7 +1122,9 @@ mod tests {
             callees: vec![0; 20_000],
             callers: vec![0; 20_000],
         };
-        let seed_areas = [19_999].into_iter().collect();
+        let seed_areas = ranked_seed_areas(&graph, &[19_999]);
+        assert_eq!(seed_areas, [19_999].into_iter().collect());
+        assert!(seed_areas.len() < graph.nodes.len());
         let (count, retained) = area_summary(&graph, &(0..20_000).collect::<Vec<_>>(), &seed_areas);
         assert_eq!(count, 20_000);
         assert_eq!(retained, seed_areas);

@@ -1345,75 +1345,6 @@ pub fn enable_resident(max_roots: usize) -> &'static Snapshots {
     RESIDENT.get_or_init(|| Snapshots::new(max_roots, GraphStorage::from_env()))
 }
 
-#[cfg(test)]
-mod exported_flag_generation_tests {
-    use super::read_exported_flags;
-    use crate::index::{self, config::IndexConfig, reader};
-    use std::fs;
-    use std::path::Path;
-    use std::process::Command;
-
-    fn git(root: &Path, args: &[&str]) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(args)
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "git {args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-
-    #[test]
-    fn deferred_transaction_pins_flags_across_a_real_build_between_reads() {
-        let root = tempfile::tempdir().unwrap();
-        fs::write(root.path().join("go.mod"), "module example\n\ngo 1.21\n").unwrap();
-        fs::create_dir_all(root.path().join("pkg")).unwrap();
-        fs::write(
-            root.path().join("pkg/main.go"),
-            "package pkg\n\nfunc Run() { Leaf() }\nfunc Leaf() {}\n",
-        )
-        .unwrap();
-        git(root.path(), &["init", "-q"]);
-        git(root.path(), &["config", "user.email", "t@t"]);
-        git(root.path(), &["config", "user.name", "t"]);
-        git(root.path(), &["add", "-A"]);
-        git(root.path(), &["commit", "-qm", "fixture"]);
-        index::build(root.path(), &IndexConfig::default()).unwrap();
-
-        let opened = reader::open(root.path()).unwrap();
-        let snapshot = &opened.snapshot;
-        let flags = snapshot
-            .with_text(|conn| {
-                read_exported_flags(
-                    conn,
-                    snapshot.generation,
-                    snapshot.seg.counts().symbols as usize,
-                    || {
-                        fs::write(
-                            root.path().join("pkg/main.go"),
-                            "package pkg\n\nfunc Run() { leaf() }\nfunc leaf() {}\n",
-                        )
-                        .unwrap();
-                        git(root.path(), &["add", "-A"]);
-                        git(root.path(), &["commit", "-qm", "next generation"]);
-                        index::build(root.path(), &IndexConfig::default()).unwrap();
-                    },
-                )
-            })
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(flags.len(), snapshot.seg.counts().symbols as usize);
-        assert_eq!(flags.iter().filter(|&&flag| flag).count(), 2);
-    }
-}
-
 pub fn resident() -> Option<&'static Snapshots> {
     RESIDENT.get()
 }
@@ -1456,5 +1387,108 @@ mod tests {
         assert_eq!(cov.languages.get("python"), Some(&python));
         let summary = crate::symbolgraph::CoverageSummary::from(&cov);
         assert_eq!(summary.languages.get("python"), Some(&python));
+    }
+
+    #[test]
+    fn deferred_transaction_pins_flags_across_an_in_place_update() {
+        use crate::index::{self, config::IndexConfig};
+        use std::path::Path;
+        use std::process::Command;
+
+        fn git(root: &Path, args: &[&str]) {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        fs::write(root.path().join("go.mod"), "module example\n\ngo 1.21\n").unwrap();
+        fs::create_dir_all(root.path().join("pkg")).unwrap();
+        fs::write(
+            root.path().join("pkg/main.go"),
+            "package pkg\n\nfunc Run() { Leaf() }\nfunc Leaf() {}\n",
+        )
+        .unwrap();
+        for i in 0..60 {
+            fs::write(
+                root.path().join(format!("pkg/extra{i:02}.go")),
+                format!("package pkg\n"),
+            )
+            .unwrap();
+        }
+        git(root.path(), &["init", "-q"]);
+        git(root.path(), &["config", "user.email", "t@t"]);
+        git(root.path(), &["config", "user.name", "t"]);
+        git(root.path(), &["add", "-A"]);
+        git(root.path(), &["commit", "-qm", "fixture"]);
+        index::build(root.path(), &IndexConfig::default()).unwrap();
+
+        let opened = open(root.path()).unwrap();
+        let snapshot = &opened.snapshot;
+        let current = Connection::open(&snapshot.db).unwrap();
+        let run_index: usize = current
+            .query_row(
+                "SELECT COUNT(*) FROM symbols s WHERE s.id < (SELECT s2.id FROM symbols s2 JOIN names n2 ON n2.id = s2.name_id WHERE n2.name = 'Run')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let initial_run_flag: i64 = current
+            .query_row(
+                "SELECT s.exported FROM symbols s JOIN names n ON n.id = s.name_id WHERE n.name = 'Run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(initial_run_flag, 1, "fixture starts with Run exported");
+        let flags = snapshot
+            .with_text(|conn| {
+                read_exported_flags(
+                    conn,
+                    snapshot.generation,
+                    snapshot.seg.counts().symbols as usize,
+                    || {
+                        fs::write(
+                            root.path().join("pkg/main.go"),
+                            "package pkg\n\nfunc Run() { Leaf(); _ = 1 }\nfunc Leaf() {}\n",
+                        )
+                        .unwrap();
+                        let report = index::update(root.path(), &IndexConfig::default(), None).unwrap();
+                        assert_eq!(report.mode, "incremental", "fixture uses the in-place writer: {report:?}");
+                        let writer = Connection::open(&snapshot.db).unwrap();
+                        writer.execute_batch(
+                            "UPDATE symbols SET exported = 0 WHERE name_id = (SELECT id FROM names WHERE name = 'Run');\n\
+                             UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'generation';",
+                        ).unwrap();
+                    },
+                )
+            })
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(flags.len(), snapshot.seg.counts().symbols as usize);
+        let run_flag: i64 = current
+            .query_row(
+                "SELECT s.exported FROM symbols s JOIN names n ON n.id = s.name_id WHERE n.name = 'Run'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            flags.get(run_index),
+            Some(&true),
+            "pinned flags preserve Run's exported status: index={run_index}, flags={flags:?}, current={run_flag}"
+        );
+        assert_eq!(run_flag, 0, "writer committed the flipped status");
     }
 }

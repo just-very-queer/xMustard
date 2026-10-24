@@ -1731,10 +1731,27 @@ pub fn flows(
         ..Default::default()
     };
     let result = flows::flows_for(&opened.snapshot, limits)?;
-    // The deduplicated candidate envelope contains every file that shaped a reported score
-    // and every walked node: each seed is a scored candidate, and every step is a callee of a
-    // scored candidate. It also covers callers of candidates whose files shaped their scores.
-    let paths = result.candidate_paths.clone();
+    // Check the files that form the answer before the rest of the scoring envelope: the
+    // bounded freshness prefix must include the highest-ranked seeds and their listed steps.
+    let mut paths = Vec::new();
+    let mut seen = BTreeSet::new();
+    for seed in &result.entry_points {
+        if seen.insert(seed.path.clone()) {
+            paths.push(seed.path.clone());
+        }
+    }
+    for flow in &result.flows {
+        for step in &flow.steps {
+            if seen.insert(step.path.clone()) {
+                paths.push(step.path.clone());
+            }
+        }
+    }
+    for path in &result.candidate_paths {
+        if seen.insert(path.clone()) {
+            paths.push(path.clone());
+        }
+    }
     let mut v = serde_json::to_value(result).map_err(|e| e.to_string())?;
     v["freshness"] = serde_json::to_value(opened.freshness(paths.iter().map(String::as_str)))
         .map_err(|e| e.to_string())?;

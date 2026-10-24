@@ -2069,6 +2069,10 @@ fn a_single_walk_larger_than_the_retention_cap_keeps_its_seed_flow() {
     let d = repo(&files);
     build(d.path());
     let answer = flows(d.path(), &[]);
+    assert!(
+        answer["symbols_considered"].as_u64().unwrap() > MAX_RETAINED_STEPS,
+        "fixture exceeds the retained-step cap in walked symbols: {answer:#}"
+    );
     let run_flow = read_flows(&answer)
         .into_iter()
         .find(|flow| flow.seeds.iter().any(|seed| seed == "RunAll"));
@@ -2129,15 +2133,14 @@ fn retained_branching_walks_stay_under_the_process_tree_line() {
     assert_eq!(answer["caps"]["max_retained_steps"], MAX_RETAINED_STEPS);
     let mib = memprobe::mib(peak);
     eprintln!("retained branching walks: wait4 ru_maxrss {mib:.1} MiB");
-    let retained_listed = answer["flows"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|flow| flow["steps"].as_array().unwrap().len() as u64)
-        .sum::<u64>();
+    // This fixture must produce omitted steps for the measured broad-walk shape to be meaningful.
     assert!(
-        retained_listed <= MAX_RETAINED_STEPS,
-        "the retained step rows fit the published global cap: {answer:#}"
+        truncation(&answer)
+            .get("truncated_step_lists")
+            .copied()
+            .unwrap_or(0)
+            > 0,
+        "the fixture exercises omitted steps while measuring retention: {answer:#}"
     );
     assert!(
         mib <= 95.4,
@@ -2150,28 +2153,47 @@ fn freshness_checks_ranked_seed_paths_before_alphabetical_dependencies() {
     let mut files = vec![GO_MOD];
     let imports = (0..60)
         .map(|i| format!("\"example/a{i:02}\""))
+        .chain(std::iter::once("\"example/zed\"".to_string()))
         .collect::<Vec<_>>();
-    let calls = (0..60)
-        .map(|i| format!("a{i:02}.Leaf();"))
-        .collect::<String>();
     let import_block = imports
         .iter()
         .map(|path| format!("{path}\n"))
         .collect::<String>();
-    let root = format!("package pkg\n\nimport (\n{import_block})\n\nfunc RunAll() {{ {calls} }}\n");
-    files.push(("pkg/z_root.go", Box::leak(root.into_boxed_str())));
-    let mut leaves = Vec::new();
+    let root = format!(
+        "package pkg\n\nimport (\n{import_block})\n\nfunc RunAll() {{ a00.Leaf(); a01.Leaf(); a02.Leaf(); zed.Leaf() }}\n"
+    );
+    let mut owned_files = vec![("pkg/z_root.go".to_string(), root)];
     for i in 0..60 {
-        leaves.push((
-            format!("a{i:02}/leaf.go"),
-            format!("package a{i:02}\n\nfunc Leaf() {{}}\n"),
+        let source = format!("package a{i:02}\n\nfunc Leaf() {{}}\n");
+        owned_files.push((format!("a{i:02}/leaf.go"), source));
+    }
+    owned_files.push((
+        "zed/leaf.go".to_string(),
+        "package zed\n\nfunc Leaf() {}\n".to_string(),
+    ));
+    for helper in 0..9 {
+        let start = 4 + helper * 6;
+        let end = start + 6;
+        let helper_imports = (start..end)
+            .map(|leaf| format!("\"example/a{leaf:02}\"\n"))
+            .collect::<String>();
+        let calls = (start..end)
+            .map(|leaf| format!("a{leaf:02}.Leaf(); "))
+            .collect::<String>();
+        owned_files.push((
+            format!("pkg/extra{helper:02}.go"),
+            format!(
+                "package pkg\n\nimport (\n{helper_imports})\n\nfunc helper{helper}() {{ {calls} }}\n"
+            ),
         ));
     }
-    for (path, source) in &leaves {
-        files.push((
-            Box::leak(path.clone().into_boxed_str()),
-            Box::leak(source.clone().into_boxed_str()),
-        ));
+    let envelope_predecessors = (4..58).count();
+    assert!(
+        envelope_predecessors > 50,
+        "54 callees of nine scored candidates precede zed alphabetically"
+    );
+    for (path, source) in &owned_files {
+        files.push((path.as_str(), source.as_str()));
     }
     let d = repo(&files);
     build(d.path());
@@ -2182,20 +2204,42 @@ fn freshness_checks_ranked_seed_paths_before_alphabetical_dependencies() {
             .any(|seed| seed.path == "pkg/z_root.go"),
         "the high-ranked seed is present: {before:#}"
     );
+    let top_flow = read_flows(&before)
+        .into_iter()
+        .find(|flow| flow.seeds.iter().any(|seed| seed == "RunAll"))
+        .expect("the high-ranked seed has a flow");
+    assert!(
+        top_flow
+            .steps
+            .iter()
+            .any(|(name, path)| name == "Leaf" && path == "zed/leaf.go"),
+        "the zed leaf is listed in the top flow: {top_flow:?}"
+    );
+    let answer_seed_paths = before["entry_points"].as_array().unwrap().len();
+    assert!(
+        answer_seed_paths < 50,
+        "seed paths leave room for listed flow steps"
+    );
+    let alphabetic_predecessors = (4..58)
+        .map(|leaf| format!("a{leaf:02}/leaf.go"))
+        .filter(|path| path.as_str() < "zed/leaf.go")
+        .count();
+    assert!(
+        alphabetic_predecessors > 50,
+        "more than 50 envelope paths precede the listed leaf alphabetically: {before:#}"
+    );
     write(
         d.path(),
-        "pkg/z_root.go",
-        &format!(
-            "package pkg\n\nimport (\n{import_block})\n\nfunc RunAll() {{ {calls} }}\nfunc Changed() {{}}\n"
-        ),
+        "zed/leaf.go",
+        "package zed\n\nfunc Leaf() { _ = 1 }\n",
     );
     let after = flows(d.path(), &[]);
     let dirty = after["freshness"]["dirty_paths_touching_result"]
         .as_array()
         .unwrap();
     assert!(
-        dirty.iter().any(|path| path == "pkg/z_root.go"),
-        "the ranked seed remains in the freshness prefix: {dirty:?}"
+        dirty.iter().any(|path| path == "zed/leaf.go"),
+        "the listed leaf stays in the freshness prefix: {dirty:?}"
     );
 }
 
@@ -2291,28 +2335,9 @@ fn a_duplicate_reachability_set_is_folded_rather_than_charged_to_the_cap() {
     );
 }
 
-/// The global cap fires, and says so, when the walks really do exceed it.
-///
-/// **CORRECTION (codex-spec r1-4): the cap CAN bite, and this row's first claim that it
-/// could not was wrong arithmetic.** `MAX_DEPTH` (10) bounds a walk's DEPTH, not the number
-/// of steps it visits — `MAX_BRANCHING` is 4, so one walk can visit hundreds of nodes inside
-/// depth 10. WS-38c's own record measured 340 steps for a 4-ary walk, so at
-/// `MAX_CANDIDATES` (200) seeds the retained sum can reach ~68,000, well past the 10,000
-/// `MAX_RETAINED_STEPS`. An earlier version of this comment computed `200 x 10 = 2,000` and
-/// declared the cap unreachable; that multiplication used depth as a step count.
-///
-/// What the four measured arms DID show is that CHAIN fixtures cannot reach it — a chain
-/// visits one step per level, so 230 seeds retain ~10 each
-/// (`logs/ws-38c-b-run-20261004T154513Z.log`). That is a property of the fixtures, not of the
-/// code.
-///
-/// So this test still does not drive the cap to fire, and the mutation that would
-/// (`u64::MAX` for the comparison) still SURVIVES it
-/// (`logs/ws-38c-b-run-20261004T163307Z.log`, M4). Closing that needs a branching fixture of
-/// the shape this file already builds elsewhere — 200 seeds each reaching its own 340-step
-/// 4-ary subtree — which is recorded as owed to the next session rather than claimed here.
-/// The sibling test covers what IS observable, that the cap is published and equals the
-/// product of the two existing caps, and its mutation (M5) IS killed.
+/// The default limits bound retained step prefixes by the product of the published flow and
+/// per-flow step limits. This small chain fixture confirms the cap is published and that a
+/// below-cap run reports no retention loss; large resident shapes are measured separately.
 #[test]
 fn a_walk_that_would_push_the_run_past_the_global_cap_is_dropped_and_counted() {
     // Two independent trunks of 40 steps each, so there are two reachability sets rather
@@ -2405,49 +2430,12 @@ fn a_callee_file_cut_by_branching_marks_the_answer_stale() {
     );
 }
 
-/// An unselected CALLER's file marks the answer stale, because it shaped a score.
-///
-/// A caller edge is the DENOMINATOR of a symbol's score, so a score moves when that symbol's
-/// callers change even though nothing about the symbol's own file did. Before this row the
-/// freshness envelope was built from the seeds' files and the walked steps, so an edit to
-/// the file of a caller that never became a seed left the answer claiming `current` while
-/// the scores it reports were computed against the old call graph.
-///
-/// **Which callers the envelope was already missing, and how that was found.** The first
-/// version of this fixture used `--limit=1` to drop the caller, and its mutation SURVIVED:
-/// removing `candidate_paths` from the dispatch's path set left the test green
-/// (`logs/ws-38c-b-run-20261004T154624Z.log`, M1). The reason is in `flows.rs`:
-/// `total_paths` is built from `ranked`, which is the scored pool AFTER the
-/// `MAX_CANDIDATES` (200) cut, so a candidate dropped by `--limit` — which lowers that same
-/// cap — is still inside the pool and its file is already in `total_paths`. The test was
-/// asserting something the old code already did.
-///
-/// What `candidate_paths` actually adds is the callers of scored candidates that fell
-/// OUTSIDE the 200-cap and so never became seeds at all. The fixture below is that shape,
-/// measured before it was written (`logs/ws-38c-b-run-20261004T154824Z.log`):
-///
-/// - 261 symbols score equally at 1.0 (`M0..M260`, a chain), so the 200-cap drops 61 of them
-///   and `dropped_candidates` is 63 in total;
-/// - `Low1` (four resolved callees, no callers, exported: score 8.0) stays a SEED, in
-///   `seed/seed.go`, so the answer reports a score this caller shaped;
-/// - `CallerLow` is the only CALLER of `Low1`. It lives in `caller/entry.go`, has no
-///   resolved callee of its own, and is reached by no walk, because a walk follows CALLEES.
-///
-/// The three properties matter together, and two earlier drafts got them wrong in ways only
-/// a mutation exposed. With `--limit=1`, the caller is still inside the 200-candidate pool,
-/// so `total_paths` already named its file (…T154624Z.log, M1 survived). With the caller and
-/// its own callers sharing `caller/entry.go`, the caller was a seed and `total_paths` named
-/// the file again (…T155419Z.log). With the caller's callers seeded from `bulk/bulk.go`, the
-/// flow seeded at them walked straight into the caller — walks follow CALLEES — and
-/// `total_paths` named it a third time (…T161855Z.log). What `candidate_paths` adds is a
-/// file that is neither a seed's file nor a walked step: reachable only as the CALLER of a
-/// reported seed.
-///
-/// The second half — a scored candidate's OWN file — is asserted at the end of this test, and
-/// its mutation (M7, removing `set.insert(*i as usize)`) SURVIVES. Both halves write into one
-/// `BTreeSet`, so where a candidate's file is also reachable as some candidate's caller, the
-/// path survives either removal. Recorded rather than retargeted; the row's next step names
-/// the fixture shape that separates them.
+/// `candidate_paths` contains caller files for scored candidates, even when those callers are
+/// neither seeds nor reached steps. The fixture puts `CallerLow` in that exact position: it is
+/// the only caller of the high-scoring `Low1`, has no callee of its own, and is reached by no
+/// flow walk. Editing its file must therefore mark the answer stale. The separate envelope
+/// also retains files of candidates excluded by the candidate cap because their call edges
+/// contributed to scores.
 #[test]
 fn an_unselected_callers_file_marks_the_answer_stale() {
     // 261 mid symbols, each scoring ABOVE the caller, so the 200-seed cap fills with them
@@ -2472,13 +2460,13 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
             "package seed\n\nfunc Low1() { A(); B(); C(); D() }\nfunc A() {}\nfunc B() {}\nfunc C() {}\nfunc D() {}\n",
         ),
         // The CALLER, in its own file, and the ONLY symbol in it. It calls the seed and
-        // nothing else, which is what keeps it out of `total_paths` by BOTH routes:
+        // nothing else, which is what keeps it out of `candidate_paths` by BOTH routes:
         //
         //  - no seed lives in this file (asserted below), and
         //  - no walk can reach it, because a walk follows CALLEES from a seed. An earlier
         //    draft gave the caller's own callers (`C1..C3`) a home in `bulk/bulk.go`, and
         //    `C1..C3` seed; the flow seeded at them walks straight into `CallerLow`, so
-        //    `caller/entry.go` came back through `total_paths`' flow steps and the mutation
+        //    `caller/entry.go` came back through `candidate_paths`' flow steps and the mutation
         //    survived (`logs/ws-38c-b-run-20261004T161855Z.log`, `KILLED=False`).
         //
         // So the caller's callers must themselves be non-seeds, or live where no seed points
@@ -2503,7 +2491,7 @@ fn an_unselected_callers_file_marks_the_answer_stale() {
         // (codex-spec r1-1, OCR). `CandidateLow` has one callee and four callers, so it is
         // scored and low. Its callers live in a SEPARATE file: in the same file they became
         // seeds themselves (each has one callee and no callers, scoring 2.0) and named the
-        // file through `total_paths`, which is why the mutation survived the first two
+        // file through `candidate_paths`, which is why the mutation survived the first two
         // attempts — the path was already on the list for a reason this code is not
         // responsible for.
         //
