@@ -1,10 +1,13 @@
 package mcpserver
 
 import (
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"xmustard/api-go/internal/evidence"
+	"xmustard/api-go/internal/toolbudget"
 	"xmustard/api-go/internal/workspaceops"
 )
 
@@ -42,5 +45,37 @@ func TestRecallBoundsAndKindsMirrorWorkspaceops(t *testing.T) {
 	}
 	if !slices.Equal(memoryKinds, workspaceops.MemoryKinds) {
 		t.Fatalf("memory kinds %v != workspaceops %v", memoryKinds, workspaceops.MemoryKinds)
+	}
+}
+
+// Impact's lean and full schemas duplicate vocabularies and bounds from the API
+// validators. Keep the published values pinned to those authorities.
+func TestImpactSchemaMirrorsWorkspaceopsAndToolbudget(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		want []string
+	}{
+		{"relation_types", workspaceops.RelationTypes},
+		{"op", workspaceops.OccurrenceOps},
+		{"scope", workspaceops.ChangeScopes},
+	} {
+		arg, ok := impactTool.arg(tc.name)
+		if !ok || !slices.Equal(arg.Enum, tc.want) {
+			t.Errorf("impact %s enum %v != validator values %v", tc.name, arg.Enum, tc.want)
+		}
+	}
+
+	arg, ok := impactTool.arg("max_chars")
+	if !ok {
+		t.Fatal("impact max_chars argument is missing")
+	}
+	budget := budgetSpec("impact")
+	if arg.Min != toolbudget.MinMaxChars || arg.Max != toolbudget.MaxMaxChars ||
+		!strings.Contains(arg.Desc, fmt.Sprint(budget.DefaultMaxChars)) {
+		t.Errorf("impact max_chars (%d..%d, %q) does not mirror toolbudget (%d..%d, default %d)",
+			arg.Min, arg.Max, arg.Desc, toolbudget.MinMaxChars, toolbudget.MaxMaxChars, budget.DefaultMaxChars)
+	}
+	if impactTool.Aliases["depth"] != "max_depth" || impactTool.Aliases["uid"] != "symbol" {
+		t.Errorf("impact aliases %v do not preserve depth and uid", impactTool.Aliases)
 	}
 }
