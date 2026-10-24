@@ -255,14 +255,15 @@
             "type": "integer"
           },
           "mode": {
-            "description": "hybrid (default); see DocsURI",
+            "description": "see DocsURI",
             "enum": [
               "hybrid",
               "text",
               "exact",
               "regex",
               "pattern",
-              "symbol"
+              "symbol",
+              "intent"
             ],
             "type": "string"
           },

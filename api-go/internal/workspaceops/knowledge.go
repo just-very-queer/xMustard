@@ -50,15 +50,16 @@ const (
 )
 
 // The lexical modes of search, the closed set the tool advertises and the route accepts
-// (WS-59b, WS-59c). `pattern` and `symbol` answer from other surfaces and are listed
-// with them. The two scan modes read the working tree's bytes and report spans; the two
-// ranked modes read the index. One closed set, one predicate, so the route, the request
-// validator and the core's flag all agree on which values exist.
+// (WS-59b, WS-59c, WS-N34). `pattern` and `symbol` answer from other surfaces and are
+// listed with them. The two scan modes read working-tree bytes and report spans; the three
+// ranked modes (hybrid, text and intent) read the index. One closed set, one predicate, so
+// the route, request validator and core flag agree on which values exist.
 const (
 	SearchModeHybrid = "hybrid"
 	SearchModeText   = "text"
 	SearchModeExact  = "exact"
 	SearchModeRegex  = "regex"
+	SearchModeIntent = "intent"
 )
 
 // searchModes is the closed set, as one table: §5.1 rule 10 (a closed set gets a table,
@@ -68,6 +69,7 @@ var searchModes = map[string]bool{
 	SearchModeText:   true,
 	SearchModeExact:  true,
 	SearchModeRegex:  true,
+	SearchModeIntent: true,
 }
 
 // IsSearchMode reports whether mode is one this search advertises. The empty string is
@@ -88,8 +90,9 @@ type SearchRequest struct {
 	// Empty admits every file; a name no file carries matches nothing.
 	Lang string
 	// Mode is `hybrid` (the default fusion), `text` (the body lane alone), `exact` (the
-	// query as written) or `regex` (the query as a pattern). It is a name here, not an
-	// enum, so the route decides which value reaches the core.
+	// query as written), `regex` (the query as a pattern) or `intent` (fixture-only intent
+	// ranking). It is a name here, not an enum, so the route decides which value reaches
+	// the core.
 	Mode string
 	// Cursor continues a previous page (next_cursor).
 	Cursor string
@@ -151,7 +154,7 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if utf8.RuneCountInString(req.Lang) > maxSearchLangLen {
 		return nil, fmt.Errorf("lang is longer than %d characters: %w", maxSearchLangLen, ErrInvalidInput)
 	}
-	// The mode is forwarded to the core as written once it is one of the four the tool
+	// The mode is forwarded to the core as written once it is one of the five modes the tool
 	// advertises. An unrecognised mode would otherwise be answered by the core's default,
 	// which is the hybrid, so it is refused here — this function is exported and its other
 	// callers do not pass through the route's guard.
@@ -185,7 +188,7 @@ func workspaceSearch(ctx context.Context, dataDir, workspaceID string, req Searc
 	if req.Lang != "" {
 		coreArgs = append(coreArgs, "--lang="+req.Lang)
 	}
-	// `hybrid` is the core's default, so only the other three are sent.
+	// `hybrid` is the core's default, so only the other four are sent.
 	if req.Mode != "" && req.Mode != SearchModeHybrid {
 		coreArgs = append(coreArgs, "--mode="+req.Mode)
 	}

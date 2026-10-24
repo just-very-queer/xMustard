@@ -60,6 +60,31 @@ func TestSearchTextModeReachesTheCoreAsItsOwnLane(t *testing.T) {
 	}
 }
 
+func TestSearchIntentModeReachesTheCore(t *testing.T) {
+	dir := t.TempDir()
+	seedCoreWorkspace(t, dir, "ws")
+	argsFile := dir + "/intent-args"
+	reply := `{"workspace_id":"ws","query":"behavior","total":0,"hits":[],"degradations":["semantic_unavailable"]}`
+	core := writeScript(t, "if [ \"$1\" = search ]; then printf '%s\\n' \"$@\" > "+argsFile+"; fi\ncat <<'EOF'\n"+reply+"\nEOF\n")
+	p := startAPIProc(t, map[string]string{"XMUSTARD_DATA_DIR": dir, "XMUSTARD_CORE_BIN": core})
+
+	resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?mode=intent&q=behavior")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("mode=intent: status %d; log:\n%s", resp.StatusCode, p.stderr.String())
+	}
+	args, err := os.ReadFile(argsFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(args), "--mode=intent\n") {
+		t.Fatalf("intent mode did not reach the core: %q", args)
+	}
+}
+
 // `lang` keeps the ast-grep hint in pattern mode: it is passed on, and an unknown
 // language is ast-grep's own refusal, not a silent empty answer.
 func TestSearchLangKeepsThePatternModeHint(t *testing.T) {
@@ -158,7 +183,7 @@ func TestSearchRefusesAnUnknownMode(t *testing.T) {
 
 	// `exact` and `regex` were on this list until WS-59c landed them; what is left is a
 	// mode no surface answers, and it must not silently answer hybrid.
-	for _, m := range []string{"semantic", "exacts", "Exact", "task", "commits"} {
+	for _, m := range []string{"semantic", "intents", "exacts", "Exact", "task", "commits"} {
 		q := url.Values{"mode": {m}, "q": {"x"}}
 		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + q.Encode())
 		if err != nil {

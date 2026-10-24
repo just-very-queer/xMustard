@@ -62,7 +62,7 @@ func search(w http.ResponseWriter, r *http.Request) {
 		// `lang`, so honouring one of them here would answer from a search that never
 		// applied it. Refuse rather than drop the filter silently. `mode=hybrid` is the
 		// default the flag need not carry, so it composes as it always did; every named
-		// mode (text, exact, regex) and any `lang` are refused.
+		// mode (text, exact, regex, intent) and any `lang` are refused.
 		if (q.Get("mode") != "" && q.Get("mode") != workspaceops.SearchModeHybrid) || q.Get("lang") != "" {
 			respondError(w, fmt.Errorf("rerank cannot be combined with %w: rerank does not apply the mode or language filter",
 				workspaceops.ErrInvalidInput))
