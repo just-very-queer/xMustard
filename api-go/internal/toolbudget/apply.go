@@ -398,9 +398,10 @@ type budgeter struct {
 	// origCursor is the result's own next_cursor (a producer-paged list).
 	origCursor string
 	more       bool
-	// priorLists is the per-list accounting an earlier pass recorded, carried into the
-	// rebuilt report for lists this pass does not reduce again (Settle).
-	priorLists map[string]listReport
+	// priorLists and priorSignals carry report details an earlier pass removed from
+	// the result itself.
+	priorLists   map[string]listReport
+	priorSignals map[string]int
 
 	// sig is how far signal objects are reduced: sigFull, sigCounts or sigFlags.
 	sig      int
@@ -429,15 +430,19 @@ func (s *Spec) Apply(result []byte, req Request, page Page, retain func() Recove
 	if !ok {
 		return result, nil
 	}
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}}
+	prev := prior(top)
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
 	if req.MaxChars <= 0 {
 		return b.render(nil), nil
 	}
+	b.applied = append(b.applied, prev.stages...)
+	b.recovery = prev.recovery
+	inheritedStages := len(b.applied)
 	b.fit()
-	if retain != nil && len(b.applied) > 0 {
+	if retain != nil && len(b.applied) > inheritedStages {
 		rec := retain()
 		b.recovery = &rec
 		b.reset()
@@ -475,7 +480,7 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 		return result, nil
 	}
 	prev := prior(top)
-	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists}
+	b := &budgeter{req: req, page: page, lists: map[string]*listState{}, priorLists: prev.lists, priorSignals: prev.signals}
 	b.ladder = s.ladderFor(top)
 	b.load(top)
 	b.reset()
@@ -486,11 +491,12 @@ func (s *Spec) Settle(result []byte, req Request, page Page) ([]byte, error) {
 }
 
 // priorReport is what an earlier pass recorded in the result's own output_budget: the
-// rungs it ran, the recovery it kept and the per-list accounting it wrote.
+// rungs, recovery, list counts and signal sizes recorded by the earlier pass.
 type priorReport struct {
 	stages   []string
 	recovery *Recovery
 	lists    map[string]listReport
+	signals  map[string]int
 }
 
 func prior(top []kv) priorReport {
@@ -505,6 +511,7 @@ func prior(top []kv) priorReport {
 		}
 		out.stages = rep.Stages
 		out.lists = rep.Lists
+		out.signals = rep.Signals
 		if rep.RecoverURI != "" || rep.RecoverHandle != "" || rep.RecoverUnavailable != "" {
 			out.recovery = &Recovery{URI: rep.RecoverURI, Handle: rep.RecoverHandle, Unavailable: rep.RecoverUnavailable}
 		}
@@ -1132,6 +1139,15 @@ func (b *budgeter) report(used int) []byte {
 				rep.Signals[m.key+"."+key] = n
 			}
 		}
+	}
+	for name, count := range b.priorSignals {
+		if _, exists := rep.Signals[name]; exists {
+			continue
+		}
+		if rep.Signals == nil {
+			rep.Signals = map[string]int{}
+		}
+		rep.Signals[name] = count
 	}
 	enc, _ := json.Marshal(rep)
 	return enc

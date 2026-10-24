@@ -126,6 +126,41 @@ func TestSmallResultIsReturnedInFull(t *testing.T) {
 	}
 }
 
+func TestSerializedEscapingFitsAndRebudgetingIsStable(t *testing.T) {
+	result := searchResult(8, 0)
+	for _, hit := range result["hits"].([]map[string]any) {
+		for _, window := range hit["snippet"].([]map[string]any) {
+			window["text"] = strings.Repeat("\"\\\n\x00", 120)
+		}
+	}
+	first := run(t, "search", result, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, nil)
+	if first.rep.OverBudget {
+		t.Fatalf("escaped result exceeds %d bytes: %d", MinMaxChars, len(first.raw))
+	}
+	spec, _ := For("search")
+	second, err := spec.Apply(first.raw, Request{MaxChars: MinMaxChars}, Page{Cursor: cursorAt}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != string(first.raw) {
+		t.Fatalf("re-budgeting changed the serialized result\nfirst:  %s\nsecond: %s", first.raw, second)
+	}
+}
+
+func TestTenThousandImpactRowsCountExactWireBytes(t *testing.T) {
+	items := make([]map[string]any, 10_000)
+	for i := range items {
+		items[i] = map[string]any{"name": fmt.Sprintf("caller_%05d", i), "path": fmt.Sprintf("pkg/nested/file_%05d.go", i), "line": i + 1}
+	}
+	result := map[string]any{"symbol": "Target", "by_depth": []any{map[string]any{
+		"depth": 1, "label": "WILL BREAK", "total": len(items), "offset": 0, "items": items,
+	}}, "counts": map[string]any{"total": len(items)}, "risk": "HIGH"}
+	out := run(t, "impact", result, Request{MaxChars: MaxMaxChars}, Page{}, nil)
+	if out.rep.OverBudget || out.rep.UsedChars != len(out.raw) {
+		t.Fatalf("budget reports %d bytes for a %d-byte wire result (over=%v)", out.rep.UsedChars, len(out.raw), out.rep.OverBudget)
+	}
+}
+
 // Every rung of the search ladder is reached, and named, as max_chars shrinks; the
 // stage never moves back up, and the signals survive every stage.
 func TestEachSearchStageIsReachedAndNamed(t *testing.T) {
