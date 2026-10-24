@@ -5,6 +5,7 @@
  *   exitpeak run <out_file> <timeout_s> <cmd> [args...]
  *     Runs cmd in its own process group with stdin inherited, stdout to out_file and
  *     stderr discarded. cmd is traced only to stop it at exit (PTRACE_O_TRACEEXIT),
+ *     and is killed if this tracer exits (PTRACE_O_EXITKILL),
  *     before the kernel frees its memory; there exitpeak reads VmHWM from
  *     /proc/<pid>/status. Prints one JSON line:
  *       {"rc": N | "timeout", "wall_s": X, "exit_hwm_kb": N, "maxrss_kb": N}
@@ -119,7 +120,14 @@ static int run(int argc, char **argv) {
            any other signal is passed on. */
         int sig = WSTOPSIG(status);
         if (!armed && sig == SIGTRAP) {
-            armed = ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)(long)PTRACE_O_TRACEEXIT) == 0;
+            long options = PTRACE_O_TRACEEXIT | PTRACE_O_EXITKILL;
+            if (ptrace(PTRACE_SETOPTIONS, pid, NULL, (void *)(long)options) != 0) {
+                perror("ptrace(PTRACE_SETOPTIONS)");
+                kill(-pid, SIGKILL);
+                waitpid(pid, NULL, 0);
+                return 2;
+            }
+            armed = 1;
             sig = 0;
         } else if (status >> 8 == (SIGTRAP | (PTRACE_EVENT_EXIT << 8))) {
             hwm = vm_hwm_kb(pid);

@@ -1,5 +1,7 @@
 import importlib.util
+import os
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -49,6 +51,25 @@ int main(void) {
 }
 """
 TOUCH_KIB = 4096
+
+TRACER_WITNESS = r"""
+#include <fcntl.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc != 2)
+        return 2;
+    char pid[32];
+    int n = snprintf(pid, sizeof pid, "%d", getpid());
+    int fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || write(fd, pid, (size_t)n) != n)
+        return 1;
+    close(fd);
+    for (;;)
+        pause();
+}
+"""
 
 
 class CursorClientRSSValidationTest(unittest.TestCase):
@@ -128,6 +149,59 @@ class CursorClientRSSMeasurementTest(unittest.TestCase):
         # A child started from Python would read Python's peak, about 12 MiB.
         stats, _ = self.run_witness(self.idle)
         self.assertLess(stats["peak_kb"], TOUCH_KIB, stats)
+
+    def test_killing_the_tracer_kills_its_witness(self):
+        import time
+
+        source = self.dir / "tracer-witness.c"
+        source.write_text(TRACER_WITNESS)
+        witness = self.compile_source("tracer-witness", source)
+        marker = self.dir / "witness.pid"
+        runner = subprocess.Popen(
+            [self.runner, "run", str(self.dir / "tracer-output"), "30", witness, str(marker)],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        witness_pid = None
+        try:
+            deadline = time.monotonic() + 5
+            while not marker.exists() and time.monotonic() < deadline:
+                if runner.poll() is not None:
+                    self.fail("exitpeak exited before its witness started")
+                time.sleep(0.01)
+            self.assertTrue(marker.exists(), "witness did not start within 5 seconds")
+            witness_pid = int(marker.read_text())
+            runner.kill()
+            runner.wait(timeout=5)
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline:
+                try:
+                    state = Path(f"/proc/{witness_pid}/stat").read_text().split()[2]
+                except FileNotFoundError:
+                    break
+                if state == "Z":
+                    break
+                time.sleep(0.01)
+            else:
+                self.fail("witness survived after its tracer was killed")
+        finally:
+            if runner.poll() is None:
+                runner.kill()
+                runner.wait(timeout=5)
+            if witness_pid is not None:
+                try:
+                    state = Path(f"/proc/{witness_pid}/stat").read_text().split()[2]
+                    if state != "Z":
+                        os.kill(witness_pid, signal.SIGKILL)
+                except FileNotFoundError:
+                    pass
+
+    @classmethod
+    def compile_source(cls, name, source):
+        path = cls.dir / name
+        subprocess.run(["cc", "-O2", "-o", str(path), str(source)], check=True, capture_output=True)
+        return str(path)
 
     def test_linkage_tells_a_static_build_from_a_dynamic_one(self):
         self.assertEqual(module.linkage(self.idle), "dynamic")
