@@ -312,6 +312,7 @@ export async function projectResult(
 		is_error: String(call.isError || ev.isError),
 		call_id: ev.toolCallId,
 		issuer: "pi",
+		client: "pi",
 		tool_version: ADAPTER_VERSION,
 		args_digest: call.argsDigest,
 		content_type: call.contentType,

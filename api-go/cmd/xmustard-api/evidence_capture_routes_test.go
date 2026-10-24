@@ -351,6 +351,28 @@ func TestCaptureRoutesAreCoreSurface(t *testing.T) {
 	}
 }
 
+func TestEvidencePostUsesClientProjectionTarget(t *testing.T) {
+	f := newEvidenceFixture(t, true)
+	body := bytes.Repeat([]byte("x"), 40<<10)
+	type result struct{ evidence.Delivery }
+	capture := func(query string) (int, result, string) {
+		code, raw, _ := f.do(t, "POST", "/api/workspaces/"+f.ws+"/evidence?tool=search&content_type=text/plain"+query, "", bytes.NewReader(body), nil)
+		var res result
+		if err := json.Unmarshal(raw, &res); err != nil {
+			t.Fatalf("decode evidence response: %v (%s)", err, raw)
+		}
+		return code, res, string(raw)
+	}
+	code, httpResult, raw := capture("")
+	if code != http.StatusOK || httpResult.Reduced || httpResult.Handle != "" {
+		t.Fatalf("default target should pass 40 KiB unchanged: %d %s", code, raw)
+	}
+	code, piResult, raw := capture("&client=pi")
+	if code != http.StatusOK || !piResult.Reduced || piResult.Handle == "" || piResult.ProjectedBytes > evidence.PolicyFor("pi").Target {
+		t.Fatalf("Pi target should reduce and retain 40 KiB: %d %s", code, raw)
+	}
+}
+
 // Existing evidence envelopes (nine-tool delivery and the Pi POST) carry
 // delivered_tokens_est; the projection itself is unchanged.
 func TestEvidenceEnvelopesCarryTokenEstimate(t *testing.T) {

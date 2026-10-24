@@ -172,6 +172,8 @@ type CaptureRequest struct {
 	Status       int
 	IsError      bool
 	ContentType  string
+	// Target lowers the store's projection target for this capture (0 keeps the store's).
+	Target int
 	// BeforeKey is the identity sampled before the tool executed (nil when unknown).
 	BeforeKey *Identity
 	// RepoKey returns the repository identity at capture time. It is asked only when
@@ -518,8 +520,12 @@ func (s *Store) Capture(ctx context.Context, sp *Spool, req CaptureRequest) (*De
 		IsError: req.IsError, ContentType: req.ContentType, RawBytes: sp.n, RawSHA256: sum, Reducer: ReducerVersion}
 	var proj string
 	rec := Record{Reducer: ReducerVersion, Mode: "retained", RawBytes: sp.n}
+	target := s.limits.ProjectionTarget
+	if req.Target > 0 && req.Target < target {
+		target = req.Target
+	}
 	if !req.Retain {
-		if proj, rec, err = Reduce(ctx, sp.f, sp.n, req.ContentType, s.limits.ProjectionTarget, s.limits.MaxProjection); err != nil {
+		if proj, rec, err = Reduce(ctx, sp.f, sp.n, req.ContentType, target, s.limits.MaxProjection); err != nil {
 			return nil, err
 		}
 	}
