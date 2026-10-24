@@ -84,6 +84,33 @@ const MIN_INTENT_PROBABILITY: f64 = 0.5;
 /// Dimensions of the trigram sketch.
 const SKETCH_DIM: usize = 256;
 
+fn intent_degradations(
+    stale: bool,
+    provider_failed: bool,
+    budget_limited: bool,
+) -> &'static [&'static str] {
+    match (stale, provider_failed, budget_limited) {
+        (true, _, _) => &["semantic_stale"],
+        (false, true, true) => &["semantic_unavailable", "semantic_budget"],
+        (false, true, false) => &["semantic_unavailable"],
+        (false, false, true) => &["semantic_budget"],
+        (false, false, false) => &["semantic_unavailable"],
+    }
+}
+
+fn append_intent_degradations(
+    degradations: &mut Vec<String>,
+    stale: bool,
+    provider_failed: bool,
+    budget_limited: bool,
+) {
+    degradations.extend(
+        intent_degradations(stale, provider_failed, budget_limited)
+            .iter()
+            .map(|degradation| (*degradation).to_string()),
+    );
+}
+
 #[cfg(test)]
 struct UnsharedTextProvider<'a> {
     snapshot: &'a crate::index::reader::Snapshot,
@@ -558,6 +585,283 @@ struct SeedEvidence {
     bm25_rank: u32,
 }
 
+fn intent_seed_paths(candidates: &[Cand]) -> Vec<&str> {
+    let mut evidence: HashMap<&str, SeedEvidence> = HashMap::new();
+    for candidate in candidates
+        .iter()
+        .filter(|candidate| candidate.kind != Kind::Doc)
+    {
+        let seed = evidence
+            .entry(candidate.path.as_ref())
+            .or_insert(SeedEvidence {
+                name_score: 0.0,
+                fuzzy: 0.0,
+                bm25_rank: u32::MAX,
+            });
+        seed.name_score = seed.name_score.max(candidate.name_score);
+        // Only gated fuzzy evidence counts, so trigram noise cannot rank a seed.
+        seed.fuzzy = seed
+            .fuzzy
+            .max(candidate.lane_key(Lane::Fuzzy, None).unwrap_or(0.0) as f32);
+        if let Some(rank) = candidate.code {
+            seed.bm25_rank = seed.bm25_rank.min(rank);
+        }
+    }
+    let mut paths: Vec<&str> = evidence.keys().copied().collect();
+    paths.sort_by(|left, right| {
+        let left_evidence = evidence[left];
+        let right_evidence = evidence[right];
+        right_evidence
+            .name_score
+            .total_cmp(&left_evidence.name_score)
+            .then_with(|| left_evidence.bm25_rank.cmp(&right_evidence.bm25_rank))
+            .then_with(|| right_evidence.fuzzy.total_cmp(&left_evidence.fuzzy))
+            .then_with(|| left.cmp(right))
+    });
+    paths
+}
+
+struct FilePreviews {
+    candidates: Vec<crate::intent::Candidate>,
+    targets: HashMap<String, Vec<usize>>,
+    paths: HashMap<String, String>,
+    stale: bool,
+    budget_limited: bool,
+}
+
+fn collect_file_previews(
+    conn: &Connection,
+    root: &Path,
+    candidates: &[Cand],
+    seed_paths: Vec<&str>,
+) -> rusqlite::Result<FilePreviews> {
+    let mut previews = FilePreviews {
+        candidates: Vec::new(),
+        targets: HashMap::new(),
+        paths: HashMap::new(),
+        stale: false,
+        budget_limited: false,
+    };
+    for (attempt, path) in seed_paths.into_iter().enumerate() {
+        if attempt >= crate::intent::MAX_CANDIDATE_FILES {
+            previews.budget_limited = true;
+            break;
+        }
+        match fts::file_identity_matches(conn, root, path)? {
+            Ok(true) => {}
+            Ok(false) | Err(fts::TextMiss::Changed) => {
+                previews.stale = true;
+                continue;
+            }
+            Err(fts::TextMiss::TooLarge) => {
+                previews.budget_limited = true;
+                continue;
+            }
+            Err(fts::TextMiss::SecretPath) => continue,
+        }
+        let loc = match fts::file_preview(conn, path) {
+            Ok(Some(loc)) => loc,
+            Ok(None) => continue,
+            Err(_) => {
+                previews.stale = true;
+                continue;
+            }
+        };
+        match fts::chunk_text(conn, root, &loc) {
+            Ok(excerpt) => {
+                if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
+                    previews.budget_limited = true;
+                }
+                let id = format!("file:{path}");
+                previews.candidates.push(crate::intent::Candidate {
+                    id: id.clone(),
+                    kind: crate::intent::CandidateKind::File,
+                    excerpt: bounded_excerpt(&crate::index::chunks::mask_secret_words(&excerpt)),
+                });
+                previews.paths.insert(id.clone(), path.to_string());
+                previews.targets.entry(id).or_default().extend(
+                    candidates
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, candidate)| {
+                            candidate.path.as_ref() == path && candidate.kind == Kind::File
+                        })
+                        .map(|(index, _)| index),
+                );
+            }
+            Err(fts::TextMiss::Changed) => previews.stale = true,
+            Err(fts::TextMiss::TooLarge) => previews.budget_limited = true,
+            Err(_) => {}
+        }
+    }
+    // Previews keep the seed order (name, BM25, gated fuzzy, path): the per-query request cap
+    // sends batches in this order, so the strongest seeds are classified first.
+    Ok(previews)
+}
+
+fn decide_file_previews(
+    provider: &dyn crate::intent::DecisionProvider,
+    question: &crate::intent::Question,
+    candidates: &[crate::intent::Candidate],
+    stale: bool,
+    query_budget: &mut crate::intent::QueryBudget,
+    budget_limited: &mut bool,
+    provider_failed: &mut bool,
+) -> Result<crate::intent::Decision, crate::intent::ProviderError> {
+    match (stale, candidates.is_empty()) {
+        (true, _) => Err(crate::intent::ProviderError::Fixture("stale source".into())),
+        (false, true) => Err(crate::intent::ProviderError::CandidateMismatch),
+        (false, false) => {
+            let batch = crate::intent::decide_batched_with_budget(
+                provider,
+                question,
+                candidates,
+                query_budget,
+            );
+            *budget_limited |= batch.error.as_ref().is_some_and(|error| {
+                matches!(
+                    error,
+                    crate::intent::ProviderError::BudgetLimited
+                        | crate::intent::ProviderError::QuestionTooLarge
+                )
+            });
+            *provider_failed |= batch.error.as_ref().is_some_and(|error| {
+                !matches!(
+                    error,
+                    crate::intent::ProviderError::BudgetLimited
+                        | crate::intent::ProviderError::QuestionTooLarge
+                )
+            });
+            if batch.decision.probabilities.is_empty() {
+                Err(batch
+                    .error
+                    .unwrap_or(crate::intent::ProviderError::CandidateMismatch))
+            } else {
+                Ok(batch.decision)
+            }
+        }
+    }
+}
+
+struct IntentOutcome {
+    decision: Result<crate::intent::Decision, crate::intent::ProviderError>,
+    targets: HashMap<String, Vec<usize>>,
+    stale_excerpt: bool,
+    newly_discovered: HashSet<usize>,
+}
+
+struct IntentCandidateContext<'a> {
+    root: &'a Path,
+    candidates: &'a mut Vec<Cand>,
+    shared_paths: &'a mut HashSet<Rc<str>>,
+    inbound: &'a HashMap<String, usize>,
+    proximity: &'a HashMap<String, f64>,
+    hotspots: &'a HashSet<String>,
+}
+
+struct DeclarationWork {
+    candidates: Vec<crate::intent::Candidate>,
+    targets: HashMap<String, Vec<usize>>,
+    newly_discovered: HashSet<usize>,
+    stale: bool,
+}
+
+fn discover_declarations(
+    conn: &Connection,
+    context: &mut IntentCandidateContext<'_>,
+    paths: &HashSet<String>,
+    budget_limited: &mut bool,
+) -> rusqlite::Result<DeclarationWork> {
+    let mut work = DeclarationWork {
+        candidates: Vec::new(),
+        targets: HashMap::new(),
+        newly_discovered: HashSet::new(),
+        stale: false,
+    };
+    let mut seen = HashSet::new();
+    let mut declaration_paths: Vec<&String> = paths.iter().collect();
+    declaration_paths.sort();
+    for path in declaration_paths {
+        let remaining = crate::intent::MAX_DECLARATIONS.saturating_sub(work.candidates.len());
+        let declarations = fts::declarations(conn, path, remaining.saturating_add(1))?;
+        if declarations.len() > remaining {
+            *budget_limited = true;
+        }
+        for (decl, loc) in declarations.into_iter().take(remaining) {
+            if !seen.insert(decl.uid.clone()) {
+                continue;
+            }
+            let Some(loc) = loc else { continue };
+            if work.candidates.len() >= crate::intent::MAX_DECLARATIONS {
+                *budget_limited = true;
+                break;
+            }
+            let excerpt = match fts::chunk_text(conn, context.root, &loc) {
+                Ok(excerpt) => excerpt,
+                Err(fts::TextMiss::Changed) => {
+                    work.stale = true;
+                    continue;
+                }
+                Err(fts::TextMiss::TooLarge) => {
+                    *budget_limited = true;
+                    continue;
+                }
+                Err(_) => continue,
+            };
+            let id = format!("decl:{}:{}:{}", path, decl.name_line, decl.name);
+            if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
+                *budget_limited = true;
+            }
+            work.candidates.push(crate::intent::Candidate {
+                id: id.clone(),
+                kind: crate::intent::CandidateKind::Declaration,
+                excerpt: bounded_excerpt(&crate::index::chunks::mask_secret_words(&excerpt)),
+            });
+            let existing = context.candidates.iter().position(|candidate| {
+                candidate.kind == Kind::Symbol
+                    && candidate.path.as_ref() == path
+                    && candidate.line == Some(decl.name_line)
+                    && candidate.name.as_ref() == decl.name
+            });
+            let target = match existing {
+                Some(index) => index,
+                None => {
+                    let index = context.candidates.len();
+                    let candidate_path = share_path(context.shared_paths, path);
+                    let structural = context
+                        .candidates
+                        .iter()
+                        .filter(|candidate| candidate.path.as_ref() == path)
+                        .map(|candidate| candidate.structural)
+                        .max()
+                        .or_else(|| context.inbound.get(path).copied())
+                        .unwrap_or(0);
+                    let proximity = context.proximity.get(path).copied().unwrap_or(0.0);
+                    let hotspot = context.hotspots.contains(path);
+                    context.candidates.push(Cand {
+                        kind: Kind::Symbol,
+                        name: decl.name.into(),
+                        path: candidate_path,
+                        line: Some(decl.name_line),
+                        name_score: 0.0,
+                        matched: 0,
+                        fuzzy: 0.0,
+                        structural,
+                        proximity,
+                        code: None,
+                        doc: None,
+                        hotspot,
+                    });
+                    work.newly_discovered.insert(index);
+                    index
+                }
+            };
+            work.targets.entry(id).or_default().push(target);
+        }
+    }
+    Ok(work)
+}
+
 /// One candidate of the fused pool. The pool can hold every symbol of a large
 /// repository (a common query token), so a candidate is kept compact: paths are
 /// shared, matched name tokens are a bit set, and hit strings are built only for the
@@ -579,13 +883,12 @@ struct Cand {
     /// Row of the docs lane (its rank).
     doc: Option<u32>,
     hotspot: bool,
-    semantic: Option<f64>,
 }
 
 impl Cand {
     /// The candidate's key in `lane` (larger ranks first), None when the lane does not
     /// rank it.
-    fn lane_key(&self, lane: Lane) -> Option<f64> {
+    fn lane_key(&self, lane: Lane, intent_score: Option<f64>) -> Option<f64> {
         let positive = |x: f64| (x > 0.0).then_some(x);
         match lane {
             Lane::Bm25 => self.code.map(|i| -f64::from(i)),
@@ -594,12 +897,12 @@ impl Cand {
             Lane::Fuzzy => (self.fuzzy >= FUZZY_GATE).then_some(f64::from(self.fuzzy)),
             Lane::Structural => positive(self.structural as f64),
             Lane::Proximity => positive(self.proximity),
-            Lane::Intent => self.semantic,
+            Lane::Intent => intent_score,
         }
     }
 
     /// The raw lane score reported in `scores`.
-    fn lane_score(&self, lane: Lane, text: &TextLanes) -> f64 {
+    fn lane_score(&self, lane: Lane, text: &TextLanes, intent_score: Option<f64>) -> f64 {
         match lane {
             Lane::Bm25 => self.code.map_or(0.0, |i| text.code[i as usize].bm25),
             Lane::Docs => self.doc.map_or(0.0, |i| text.docs[i as usize].bm25),
@@ -607,7 +910,7 @@ impl Cand {
             Lane::Fuzzy => f64::from(self.fuzzy),
             Lane::Structural => self.structural as f64,
             Lane::Proximity => self.proximity,
-            Lane::Intent => self.semantic.unwrap_or(0.0),
+            Lane::Intent => intent_score.unwrap_or(0.0),
         }
     }
 
@@ -1248,7 +1551,6 @@ pub fn search(
                 code,
                 doc: None,
                 hotspot: hotspots.contains(sym.path),
-                semantic: None,
             });
         }),
     );
@@ -1297,7 +1599,6 @@ pub fn search(
                 code: None,
                 doc: None,
                 hotspot: hotspots.contains(f.path),
-                semantic: None,
             });
         }),
     );
@@ -1329,7 +1630,6 @@ pub fn search(
             code: Some(i),
             doc: None,
             hotspot: hotspots.contains(&h.loc.path),
-            semantic: None,
         });
     }
     for (i, h) in text.docs.iter().enumerate() {
@@ -1346,7 +1646,6 @@ pub fn search(
             code: None,
             doc: Some(i as u32),
             hotspot: false,
-            semantic: None,
         });
     }
     drop(by_decl);
@@ -1393,6 +1692,7 @@ pub fn search(
         }
     }
 
+    let mut intent_scores: HashMap<usize, f64> = HashMap::new();
     if opts.mode == SearchMode::Intent {
         match (opts.intent_provider, opts.intent_question, index) {
             (Some(provider), Some(question), Some(opened)) => {
@@ -1404,425 +1704,336 @@ pub fn search(
                 };
                 let mut cap_exhausted = false;
                 let mut provider_failed = false;
-                let decision = opened.snapshot.with_unshared_text(|conn| {
-                    conn.execute_batch("BEGIN")?;
-                    let generation: String = conn.query_row(
-                        "SELECT value FROM meta WHERE key = 'generation'",
-                        [],
-                        |row| row.get(0),
-                    )?;
-                    if generation.parse::<i64>().ok() != Some(opened.snapshot.generation) {
-                        return Ok::<_, rusqlite::Error>((
-                            Err(crate::intent::ProviderError::Fixture(
-                                "stale generation".into(),
-                            )),
-                            HashMap::new(),
-                            true,
-                            HashSet::new(),
-                        ));
-                    }
-                    // Classify bounded file previews before opening declaration excerpts.
-                    let mut file_candidates = Vec::new();
-                    let mut file_targets: HashMap<String, Vec<usize>> = HashMap::new();
-                    let mut file_paths = HashMap::new();
-                    let mut stale_excerpt = false;
-                    let mut seed_evidence: HashMap<&str, SeedEvidence> = HashMap::new();
-                    for candidate in cands.iter().filter(|candidate| candidate.kind != Kind::Doc) {
-                        let evidence =
-                            seed_evidence
-                                .entry(candidate.path.as_ref())
-                                .or_insert(SeedEvidence {
-                                    name_score: 0.0,
-                                    fuzzy: 0.0,
-                                    bm25_rank: u32::MAX,
-                                });
-                        evidence.name_score = evidence.name_score.max(candidate.name_score);
-                        // Only fuzzy evidence that passes the lane's gate counts, as in
-                        // `lane_key`: trigram noise below the gate must not rank a seed.
-                        let fuzzy = candidate.lane_key(Lane::Fuzzy).unwrap_or(0.0) as f32;
-                        evidence.fuzzy = evidence.fuzzy.max(fuzzy);
-                        if let Some(rank) = candidate.code {
-                            evidence.bm25_rank = evidence.bm25_rank.min(rank);
-                        }
-                    }
-                    // Seeds are ordered as the fusion weighs the lanes: name and BM25 (weight
-                    // 1.0) before gated fuzzy (0.5), then path, so the attempt cap keeps the
-                    // strongest deterministic evidence.
-                    let mut seed_paths: Vec<&str> = seed_evidence.keys().copied().collect();
-                    seed_paths.sort_by(|left, right| {
-                        let left_evidence = seed_evidence[left];
-                        let right_evidence = seed_evidence[right];
-                        right_evidence
-                            .name_score
-                            .total_cmp(&left_evidence.name_score)
-                            .then_with(|| left_evidence.bm25_rank.cmp(&right_evidence.bm25_rank))
-                            .then_with(|| right_evidence.fuzzy.total_cmp(&left_evidence.fuzzy))
-                            .then_with(|| left.cmp(right))
-                    });
-                    for (attempt, path) in seed_paths.into_iter().enumerate() {
-                        if attempt >= crate::intent::MAX_CANDIDATE_FILES {
-                            cap_exhausted = true;
-                            break;
-                        }
-                        match fts::file_identity_matches(conn, root, path)? {
-                            Ok(true) => {}
-                            Ok(false) | Err(fts::TextMiss::Changed) => {
-                                stale_excerpt = true;
-                                continue;
-                            }
-                            Err(fts::TextMiss::TooLarge) => {
-                                cap_exhausted = true;
-                                continue;
-                            }
-                            Err(fts::TextMiss::SecretPath) => continue,
-                        }
-                        let loc = match fts::file_preview(conn, path) {
-                            Ok(Some(loc)) => loc,
-                            Ok(None) => continue,
-                            Err(_) => {
-                                stale_excerpt = true;
-                                continue;
-                            }
-                        };
-                        match fts::chunk_text(conn, root, &loc) {
-                            Ok(excerpt) => {
-                                if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
-                                    cap_exhausted = true;
-                                }
-                                let id = format!("file:{path}");
-                                file_candidates.push(crate::intent::Candidate {
-                                    id: id.clone(),
-                                    kind: crate::intent::CandidateKind::File,
-                                    excerpt: bounded_excerpt(
-                                        &crate::index::chunks::mask_secret_words(&excerpt),
-                                    ),
-                                });
-                                file_paths.insert(id.clone(), path.to_string());
-                                file_targets.entry(id).or_default().extend(
-                                    cands
-                                        .iter()
-                                        .enumerate()
-                                        .filter(|(_, candidate)| {
-                                            candidate.path.as_ref() == path
-                                                && candidate.kind == Kind::File
-                                        })
-                                        .map(|(index, _)| index),
-                                );
-                            }
-                            Err(fts::TextMiss::Changed) => stale_excerpt = true,
-                            Err(fts::TextMiss::TooLarge) => cap_exhausted = true,
-                            Err(_) => {}
-                        }
-                    }
-                    file_candidates.sort_by(|left, right| left.id.cmp(&right.id));
-                    let file_decision = if stale_excerpt {
-                        Err(crate::intent::ProviderError::Fixture("stale source".into()))
-                    } else if file_candidates.is_empty() {
-                        Err(crate::intent::ProviderError::CandidateMismatch)
-                    } else {
-                        let batch =
-                            crate::intent::decide_batched(provider, question, &file_candidates);
-                        cap_exhausted |= !batch.complete;
-                        provider_failed |= batch.error.as_ref().is_some_and(|error| {
-                            !matches!(
-                                error,
-                                crate::intent::ProviderError::InvalidCandidates
-                                    | crate::intent::ProviderError::InvalidQuestion
-                                    | crate::intent::ProviderError::QuestionTooLarge
-                            )
-                        });
-                        if batch.decision.probabilities.is_empty() {
-                            Err(batch
-                                .error
-                                .unwrap_or(crate::intent::ProviderError::CandidateMismatch))
-                        } else {
-                            Ok(batch.decision)
-                        }
-                    };
-                    // A provider may take time; discard its decision if any excerpt went stale meanwhile.
-                    stale_excerpt |=
-                        latest_generation_is_stale(&opened.snapshot, opened.snapshot.generation)
-                            || file_paths.values().any(|path| {
-                                !matches!(
-                                    fts::file_identity_matches(conn, root, path),
-                                    Ok(Ok(true))
-                                )
-                            });
-                    let file_decision = match file_decision {
-                        Ok(decision) => decision,
-                        Err(error) => {
-                            return Ok::<_, rusqlite::Error>((
-                                Err(error),
-                                file_targets,
-                                stale_excerpt,
-                                HashSet::new(),
-                            ));
-                        }
-                    };
-                    if stale_excerpt {
-                        return Ok::<_, rusqlite::Error>((
-                            Err(crate::intent::ProviderError::Fixture("stale source".into())),
-                            file_targets,
-                            true,
-                            HashSet::new(),
-                        ));
-                    }
-                    let positive_paths: HashSet<String> = file_decision
-                        .probabilities
-                        .iter()
-                        .filter(|(_, probability)| **probability >= MIN_INTENT_PROBABILITY)
-                        .filter_map(|(id, _)| file_paths.get(id).cloned())
-                        .collect();
-                    let mut probabilities = file_decision.probabilities;
-                    for (id, path) in &file_paths {
-                        if !positive_paths.contains(path) {
-                            continue;
-                        }
-                        let targets = file_targets.entry(id.clone()).or_default();
-                        if !targets.is_empty() {
-                            continue;
-                        }
-                        let Some(indexed_path) = cands
-                            .iter()
-                            .find(|candidate| candidate.path.as_ref() == path)
-                            .map(|candidate| candidate.path.clone())
-                        else {
-                            continue;
-                        };
-                        let index = cands.len();
-                        cands.push(Cand {
-                            kind: Kind::File,
-                            name: indexed_path.to_string().into(),
-                            path: indexed_path,
-                            line: None,
-                            name_score: 0.0,
-                            matched: 0,
-                            fuzzy: 0.0,
-                            structural: inbound.get(path).copied().unwrap_or(0),
-                            proximity: prox.get(path).copied().unwrap_or(0.0),
-                            code: None,
-                            doc: None,
-                            hotspot: hotspots.contains(path),
-                            semantic: None,
-                        });
-                        targets.push(index);
-                    }
-                    let mut declaration_candidates = Vec::new();
-                    let mut declaration_targets: HashMap<String, Vec<usize>> = HashMap::new();
-                    let mut newly_discovered = HashSet::new();
-                    let mut seen_declarations = HashSet::new();
-                    let mut declaration_paths: Vec<&String> = positive_paths.iter().collect();
-                    declaration_paths.sort();
-                    for path in declaration_paths {
-                        let remaining = crate::intent::MAX_DECLARATIONS
-                            .saturating_sub(declaration_candidates.len());
-                        let declarations =
-                            fts::declarations(conn, path, remaining.saturating_add(1))?;
-                        if declarations.len() > remaining {
-                            cap_exhausted = true;
-                        }
-                        for (decl, loc) in declarations.into_iter().take(remaining) {
-                            if !seen_declarations.insert(decl.uid.clone()) {
-                                continue;
-                            }
-                            let Some(loc) = loc else { continue };
-                            if declaration_candidates.len() >= crate::intent::MAX_DECLARATIONS {
-                                cap_exhausted = true;
-                                break;
-                            }
-                            let excerpt = match fts::chunk_text(conn, root, &loc) {
-                                Ok(excerpt) => excerpt,
-                                Err(fts::TextMiss::Changed) => {
-                                    stale_excerpt = true;
-                                    continue;
-                                }
-                                Err(fts::TextMiss::TooLarge) => {
-                                    cap_exhausted = true;
-                                    continue;
-                                }
-                                Err(_) => continue,
-                            };
-                            let id = format!("decl:{}:{}:{}", path, decl.name_line, decl.name);
-                            if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
-                                cap_exhausted = true;
-                            }
-                            declaration_candidates.push(crate::intent::Candidate {
-                                id: id.clone(),
-                                kind: crate::intent::CandidateKind::Declaration,
-                                excerpt: bounded_excerpt(&crate::index::chunks::mask_secret_words(
-                                    &excerpt,
+                let mut query_budget = crate::intent::QueryBudget::default();
+                let classify_intent =
+                    |conn: &Connection| {
+                        conn.execute_batch("BEGIN")?;
+                        let generation: String = conn.query_row(
+                            "SELECT value FROM meta WHERE key = 'generation'",
+                            [],
+                            |row| row.get(0),
+                        )?;
+                        if generation.parse::<i64>().ok() != Some(opened.snapshot.generation) {
+                            return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                decision: Err(crate::intent::ProviderError::Fixture(
+                                    "stale generation".into(),
                                 )),
+                                targets: HashMap::new(),
+                                stale_excerpt: true,
+                                newly_discovered: HashSet::new(),
                             });
-                            let existing = cands.iter().position(|candidate| {
-                                candidate.kind == Kind::Symbol
-                                    && candidate.path.as_ref() == path
-                                    && candidate.line == Some(decl.name_line)
-                                    && candidate.name.as_ref() == decl.name
-                            });
-                            let target = match existing {
-                                Some(index) => index,
-                                None => {
-                                    let index = cands.len();
-                                    cands.push(Cand {
-                                        kind: Kind::Symbol,
-                                        name: decl.name.into(),
-                                        path: share_path(&mut shared_paths, path),
-                                        line: Some(decl.name_line),
-                                        name_score: 0.0,
-                                        matched: 0,
-                                        fuzzy: 0.0,
-                                        structural: inbound.get(path).copied().unwrap_or(0),
-                                        proximity: prox.get(path).copied().unwrap_or(0.0),
-                                        code: None,
-                                        doc: None,
-                                        hotspot: hotspots.contains(path),
-                                        semantic: None,
-                                    });
-                                    newly_discovered.insert(index);
-                                    index
-                                }
-                            };
-                            declaration_targets.entry(id).or_default().push(target);
                         }
-                    }
-                    if stale_excerpt {
-                        return Ok::<_, rusqlite::Error>((
-                            Err(crate::intent::ProviderError::Fixture("stale source".into())),
-                            file_targets,
-                            true,
-                            HashSet::new(),
-                        ));
-                    }
-                    if !declaration_candidates.is_empty() {
-                        let batch = crate::intent::decide_batched(
+                        // Classify bounded file previews before opening declaration excerpts.
+                        let previews =
+                            collect_file_previews(conn, root, &cands, intent_seed_paths(&cands))?;
+                        cap_exhausted |= previews.budget_limited;
+                        let mut file_targets = previews.targets;
+                        let file_paths = previews.paths;
+                        let mut stale_excerpt = previews.stale;
+                        let file_candidates = previews.candidates;
+                        let file_decision = decide_file_previews(
                             provider,
                             question,
-                            &declaration_candidates,
+                            &file_candidates,
+                            stale_excerpt,
+                            &mut query_budget,
+                            &mut cap_exhausted,
+                            &mut provider_failed,
                         );
-                        cap_exhausted |= !batch.complete;
-                        provider_failed |= batch.error.as_ref().is_some_and(|error| {
-                            !matches!(
-                                error,
-                                crate::intent::ProviderError::InvalidCandidates
-                                    | crate::intent::ProviderError::InvalidQuestion
-                                    | crate::intent::ProviderError::QuestionTooLarge
-                            )
-                        });
-                        if batch.decision.probabilities.is_empty() {
-                            let error = batch
-                                .error
-                                .unwrap_or(crate::intent::ProviderError::CandidateMismatch);
-                            return Ok::<_, rusqlite::Error>((
-                                Err(error),
-                                file_targets,
-                                stale_excerpt,
-                                HashSet::new(),
-                            ));
-                        }
+                        // A provider may take time; discard its decision if any excerpt went stale meanwhile.
                         stale_excerpt |= latest_generation_is_stale(
                             &opened.snapshot,
                             opened.snapshot.generation,
                         ) || file_paths.values().any(|path| {
                             !matches!(fts::file_identity_matches(conn, root, path), Ok(Ok(true)))
                         });
-                        match stale_excerpt {
-                            true => {
-                                return Ok::<_, rusqlite::Error>((
-                                    Err(crate::intent::ProviderError::Fixture(
-                                        "stale source".into(),
-                                    )),
-                                    file_targets,
-                                    true,
-                                    HashSet::new(),
-                                ));
+                        let file_decision = match file_decision {
+                            Ok(decision) => decision,
+                            Err(error) => {
+                                return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                    decision: Err(error),
+                                    targets: file_targets,
+                                    stale_excerpt,
+                                    newly_discovered: HashSet::new(),
+                                });
                             }
-                            false => probabilities.extend(batch.decision.probabilities),
+                        };
+                        if stale_excerpt {
+                            return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                decision: Err(crate::intent::ProviderError::Fixture(
+                                    "stale source".into(),
+                                )),
+                                targets: file_targets,
+                                stale_excerpt: true,
+                                newly_discovered: HashSet::new(),
+                            });
                         }
-                    }
-                    file_targets.extend(declaration_targets);
-                    conn.execute_batch("COMMIT")?;
-                    Ok::<_, rusqlite::Error>((
-                        Ok(crate::intent::Decision {
-                            question_id: question.id.clone(),
-                            probabilities,
-                        }),
-                        file_targets,
+                        let positive_paths: HashSet<String> = file_decision
+                            .probabilities
+                            .iter()
+                            .filter(|(_, probability)| **probability >= MIN_INTENT_PROBABILITY)
+                            .filter_map(|(id, _)| file_paths.get(id).cloned())
+                            .collect();
+                        let mut probabilities = file_decision.probabilities;
+                        for (id, path) in &file_paths {
+                            if !positive_paths.contains(path) {
+                                continue;
+                            }
+                            let targets = file_targets.entry(id.clone()).or_default();
+                            if !targets.is_empty() {
+                                continue;
+                            }
+                            let Some(indexed_path) = cands
+                                .iter()
+                                .find(|candidate| candidate.path.as_ref() == path)
+                                .map(|candidate| candidate.path.clone())
+                            else {
+                                continue;
+                            };
+                            let index = cands.len();
+                            cands.push(Cand {
+                                kind: Kind::File,
+                                name: indexed_path.to_string().into(),
+                                path: indexed_path,
+                                line: None,
+                                name_score: 0.0,
+                                matched: 0,
+                                fuzzy: 0.0,
+                                structural: cands
+                                    .iter()
+                                    .filter(|candidate| candidate.path.as_ref() == path)
+                                    .map(|candidate| candidate.structural)
+                                    .max()
+                                    .or_else(|| inbound.get(path).copied())
+                                    .unwrap_or(0),
+                                proximity: prox.get(path).copied().unwrap_or(0.0),
+                                code: None,
+                                doc: None,
+                                hotspot: hotspots.contains(path),
+                            });
+                            targets.push(index);
+                        }
+                        let mut candidate_context = IntentCandidateContext {
+                            root,
+                            candidates: &mut cands,
+                            shared_paths: &mut shared_paths,
+                            inbound: &inbound,
+                            proximity: &prox,
+                            hotspots: &hotspots,
+                        };
+                        let declaration_work = discover_declarations(
+                            conn,
+                            &mut candidate_context,
+                            &positive_paths,
+                            &mut cap_exhausted,
+                        )?;
+                        stale_excerpt |= declaration_work.stale;
+                        let declaration_candidates = declaration_work.candidates;
+                        let declaration_targets = declaration_work.targets;
+                        let newly_discovered = declaration_work.newly_discovered;
+                        if stale_excerpt {
+                            return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                decision: Err(crate::intent::ProviderError::Fixture(
+                                    "stale source".into(),
+                                )),
+                                targets: file_targets,
+                                stale_excerpt: true,
+                                newly_discovered: HashSet::new(),
+                            });
+                        }
+                        if !declaration_candidates.is_empty() {
+                            let batch = crate::intent::decide_batched_with_budget(
+                                provider,
+                                question,
+                                &declaration_candidates,
+                                &mut query_budget,
+                            );
+                            cap_exhausted |= batch.error.as_ref().is_some_and(|error| {
+                                matches!(
+                                    error,
+                                    crate::intent::ProviderError::BudgetLimited
+                                        | crate::intent::ProviderError::QuestionTooLarge
+                                )
+                            });
+                            provider_failed |= batch.error.as_ref().is_some_and(|error| {
+                                !matches!(
+                                    error,
+                                    crate::intent::ProviderError::BudgetLimited
+                                        | crate::intent::ProviderError::QuestionTooLarge
+                                )
+                            });
+                            if batch.decision.probabilities.is_empty() {
+                                match batch.error {
+                                    Some(
+                                        crate::intent::ProviderError::BudgetLimited
+                                        | crate::intent::ProviderError::QuestionTooLarge,
+                                    ) => {}
+                                    Some(error) => {
+                                        return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                            decision: Err(error),
+                                            targets: file_targets,
+                                            stale_excerpt,
+                                            newly_discovered: HashSet::new(),
+                                        });
+                                    }
+                                    None => {
+                                        return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                            decision: Err(
+                                                crate::intent::ProviderError::CandidateMismatch,
+                                            ),
+                                            targets: file_targets,
+                                            stale_excerpt,
+                                            newly_discovered: HashSet::new(),
+                                        });
+                                    }
+                                }
+                            } else {
+                                stale_excerpt |= latest_generation_is_stale(
+                                    &opened.snapshot,
+                                    opened.snapshot.generation,
+                                ) || file_paths.values().any(|path| {
+                                    !matches!(
+                                        fts::file_identity_matches(conn, root, path),
+                                        Ok(Ok(true))
+                                    )
+                                });
+                                if stale_excerpt {
+                                    return Ok::<_, rusqlite::Error>(IntentOutcome {
+                                        decision: Err(crate::intent::ProviderError::Fixture(
+                                            "stale source".into(),
+                                        )),
+                                        targets: file_targets,
+                                        stale_excerpt: true,
+                                        newly_discovered: HashSet::new(),
+                                    });
+                                }
+                                probabilities.extend(batch.decision.probabilities);
+                            }
+                        }
+                        file_targets.extend(declaration_targets);
+                        conn.execute_batch("COMMIT")?;
+                        Ok::<_, rusqlite::Error>(IntentOutcome {
+                            decision: Ok(crate::intent::Decision {
+                                question_id: question.id.clone(),
+                                probabilities,
+                            }),
+                            targets: file_targets,
+                            stale_excerpt,
+                            newly_discovered,
+                        })
+                    };
+                let decision = opened.snapshot.with_unshared_text(classify_intent);
+                match decision {
+                    Ok(IntentOutcome {
+                        decision: Ok(decision),
+                        targets,
                         stale_excerpt,
                         newly_discovered,
-                    ))
-                });
-                match decision {
-                    Ok((Ok(decision), targets, stale_excerpt, newly_discovered)) => {
+                    }) => {
                         if stale_excerpt {
                             cands.truncate(deterministic_len);
-                            degradations.push("semantic_stale".to_string());
+                            append_intent_degradations(&mut degradations, true, false, false);
                         } else {
-                            if provider_failed {
-                                degradations.push("semantic_unavailable".to_string());
-                            }
-                            if cap_exhausted {
-                                degradations.push("semantic_budget".to_string());
+                            if provider_failed || cap_exhausted {
+                                append_intent_degradations(
+                                    &mut degradations,
+                                    false,
+                                    provider_failed,
+                                    cap_exhausted,
+                                );
                             }
                             for (id, probability) in decision.probabilities {
                                 if probability >= MIN_INTENT_PROBABILITY
                                     && let Some(indices) = targets.get(&id)
                                 {
                                     for &i in indices {
-                                        cands[i].semantic = Some(probability);
+                                        intent_scores.insert(i, probability);
                                     }
                                 }
                             }
                             let mut candidate_index = 0;
-                            cands.retain(|candidate| {
-                                let keep = !newly_discovered.contains(&candidate_index)
-                                    || candidate.semantic.is_some();
+                            let mut retained_index = 0;
+                            let mut retained_scores = HashMap::new();
+                            cands.retain(|_| {
+                                let old_index = candidate_index;
+                                let keep = !newly_discovered.contains(&old_index)
+                                    || intent_scores.contains_key(&old_index);
+                                if keep {
+                                    if let Some(score) = intent_scores.get(&old_index) {
+                                        retained_scores.insert(retained_index, *score);
+                                    }
+                                    retained_index += 1;
+                                }
                                 candidate_index += 1;
                                 keep
                             });
+                            intent_scores = retained_scores;
                         }
                     }
-                    Ok((
-                        Err(
-                            crate::intent::ProviderError::InvalidCandidates
-                            | crate::intent::ProviderError::QuestionTooLarge,
-                        ),
-                        _,
-                        _,
-                        _,
-                    )) => {
+                    Ok(IntentOutcome {
+                        decision:
+                            Err(
+                                crate::intent::ProviderError::BudgetLimited
+                                | crate::intent::ProviderError::QuestionTooLarge,
+                            ),
+                        stale_excerpt,
+                        ..
+                    }) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_budget".to_string());
+                        append_intent_degradations(
+                            &mut degradations,
+                            stale_excerpt,
+                            provider_failed,
+                            true,
+                        );
                     }
-                    Ok((Err(crate::intent::ProviderError::InvalidQuestion), _, _, _)) => {
+                    Ok(IntentOutcome {
+                        decision: Err(crate::intent::ProviderError::InvalidQuestion),
+                        stale_excerpt,
+                        ..
+                    }) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_unavailable".to_string());
+                        append_intent_degradations(
+                            &mut degradations,
+                            stale_excerpt,
+                            true,
+                            cap_exhausted,
+                        );
                     }
-                    Ok((Err(_), _, true, _)) => {
+                    Ok(IntentOutcome {
+                        decision: Err(_),
+                        stale_excerpt: true,
+                        ..
+                    }) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_stale".to_string());
+                        append_intent_degradations(&mut degradations, true, false, false);
                     }
-                    Ok((Err(_), _, false, _)) => {
+                    Ok(IntentOutcome {
+                        decision: Err(_),
+                        stale_excerpt: false,
+                        ..
+                    }) => {
                         cands.truncate(deterministic_len);
-                        if provider_failed {
-                            degradations.push("semantic_unavailable".to_string());
-                        }
-                        if cap_exhausted {
-                            degradations.push("semantic_budget".to_string());
-                        }
-                        if !provider_failed && !cap_exhausted {
-                            degradations.push("semantic_unavailable".to_string());
-                        }
+                        append_intent_degradations(
+                            &mut degradations,
+                            false,
+                            provider_failed,
+                            cap_exhausted,
+                        );
                     }
                     Err(_) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_stale".to_string());
+                        append_intent_degradations(&mut degradations, true, false, false);
                     }
                 }
             }
-            (Some(_), Some(_), None) => degradations.push("semantic_unavailable".to_string()),
-            _ => degradations.push("semantic_unavailable".to_string()),
+            (Some(_), Some(_), None) => {
+                append_intent_degradations(&mut degradations, false, false, false)
+            }
+            _ => append_intent_degradations(&mut degradations, false, false, false),
         }
     }
+    drop(prox);
 
     drop(shared_paths);
 
@@ -1837,7 +2048,10 @@ pub fn search(
         let mut ranked: Vec<(f64, u32)> = cands
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| c.lane_key(*lane).map(|k| (k, i as u32)))
+            .filter_map(|(i, c)| {
+                c.lane_key(*lane, intent_scores.get(&i).copied())
+                    .map(|k| (k, i as u32))
+            })
             .collect();
         ranked.sort_by(|a, b| {
             b.0.total_cmp(&a.0)
@@ -1893,6 +2107,7 @@ pub fn search(
         text: &text,
         seed: effective_seed.as_deref().unwrap_or(""),
         body_only,
+        intent_scores: &intent_scores,
     };
     let hits: Vec<SearchHit> = order
         .get(opts.offset..page_end)
@@ -1900,7 +2115,7 @@ pub fn search(
         .iter()
         .map(|&i| {
             let cx = ctx.remove(&i).unwrap_or_default();
-            render.hit(&cands[i], cx, (rrf[i], final_score[i]), in_lanes[i])
+            render.hit(i, &cands[i], cx, (rrf[i], final_score[i]), in_lanes[i])
         })
         .collect();
     let omitted = total.saturating_sub(page_end.max(opts.offset));
@@ -1989,12 +2204,20 @@ struct Render<'a> {
     /// `mode=text`: the bm25 lane read the body column, so a hit names `body` and says
     /// so, rather than claiming the whole-chunk bm25 it did not run.
     body_only: bool,
+    intent_scores: &'a HashMap<usize, f64>,
 }
 
 impl Render<'_> {
     /// Build the returned hit of one candidate from its context, its (fused, final)
     /// scores and the lanes that ranked it.
-    fn hit(&self, c: &Cand, cx: Ctx, (rrf, score): (f64, f64), lanes: u8) -> SearchHit {
+    fn hit(
+        &self,
+        index: usize,
+        c: &Cand,
+        cx: Ctx,
+        (rrf, score): (f64, f64),
+        lanes: u8,
+    ) -> SearchHit {
         let (qtokens, text, seed) = (self.qtokens, self.text, self.seed);
         let decl_name = cx
             .decl
@@ -2041,7 +2264,7 @@ impl Render<'_> {
                 }),
                 Lane::Intent => Some(format!(
                     "intent_probability: {:.2}",
-                    c.semantic.unwrap_or(0.0)
+                    self.intent_scores.get(&index).copied().unwrap_or(0.0)
                 )),
                 // the fuzzy lane ranks most candidates; it is a reason only when it alone
                 // brought the hit in
@@ -2073,7 +2296,7 @@ impl Render<'_> {
             .map(|l| {
                 (
                     score_key(l, self.lane_name(l)),
-                    round6(c.lane_score(l, text)),
+                    round6(c.lane_score(l, text, self.intent_scores.get(&index).copied())),
                 )
             })
             .collect();
@@ -2357,6 +2580,28 @@ mod tests {
     }
 
     #[test]
+    fn intent_degradation_mapping_is_exact_and_stale_takes_priority() {
+        assert_eq!(
+            intent_degradations(false, false, false),
+            &["semantic_unavailable"]
+        );
+        assert_eq!(
+            intent_degradations(false, true, false),
+            &["semantic_unavailable"]
+        );
+        assert_eq!(
+            intent_degradations(false, false, true),
+            &["semantic_budget"]
+        );
+        assert_eq!(
+            intent_degradations(false, true, true),
+            &["semantic_unavailable", "semantic_budget"]
+        );
+        assert_eq!(intent_degradations(true, false, false), &["semantic_stale"]);
+        assert_eq!(intent_degradations(true, true, true), &["semantic_stale"]);
+    }
+
+    #[test]
     fn intent_score_keys_preserve_legacy_onnx_and_text_contracts() {
         assert_eq!(score_key(Lane::Fuzzy, "semantic"), "semantic");
         assert_eq!(score_key(Lane::Intent, "intent"), "intent");
@@ -2396,13 +2641,8 @@ mod tests {
         assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
     }
 
-    #[test]
-    fn truncated_intent_excerpt_reports_incomplete_coverage() {
-        let contents = format!(
-            "pub fn reconcile() {{ let _data = \"{}\"; }}\n",
-            "x".repeat(crate::intent::MAX_EXCERPT_BYTES + 100)
-        );
-        let repo = indexed_repo(&[("src/lib.rs", &contents)]);
+    fn intent_excerpt_fixture(contents: &str) -> (SearchResult, RecordingProvider) {
+        let repo = indexed_repo(&[("src/reconcile.rs", contents)]);
         let provider = RecordingProvider::default();
         let question = crate::intent::Question {
             id: "q-truncated".into(),
@@ -2421,6 +2661,14 @@ mod tests {
                 ..Default::default()
             },
         );
+        (result, provider)
+    }
+
+    #[test]
+    fn oversized_file_preview_reports_incomplete_coverage_without_oversized_declaration() {
+        let prelude = format!("use crate::{}Thing;\n", "part::".repeat(2_000));
+        let contents = format!("{prelude}pub fn reconcile() {{}}\n");
+        let (result, provider) = intent_excerpt_fixture(&contents);
         assert!(
             result
                 .degradations
@@ -2428,15 +2676,39 @@ mod tests {
                 .any(|item| item == "semantic_budget")
         );
         let requests = provider.0.lock().unwrap();
-        for kind in [
-            crate::intent::CandidateKind::File,
-            crate::intent::CandidateKind::Declaration,
-        ] {
-            assert!(requests.iter().flatten().any(|candidate| {
-                candidate.kind == kind
-                    && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
-            }));
-        }
+        assert!(requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::File
+                && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+        }));
+        let has_oversized_declaration = requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::Declaration
+                && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+        });
+        assert!(!has_oversized_declaration);
+    }
+
+    #[test]
+    fn oversized_declaration_reports_incomplete_coverage_with_small_file_preview() {
+        let contents = format!(
+            "const SETUP: usize = 1;\n\npub fn reconcile() {{ let _data = \"{}\"; }}\n",
+            "x".repeat(crate::intent::MAX_EXCERPT_BYTES + 100)
+        );
+        let (result, provider) = intent_excerpt_fixture(&contents);
+        assert!(
+            result
+                .degradations
+                .iter()
+                .any(|item| item == "semantic_budget")
+        );
+        let requests = provider.0.lock().unwrap();
+        assert!(requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::File
+                && candidate.excerpt.len() < crate::intent::MAX_EXCERPT_BYTES
+        }));
+        assert!(requests.iter().flatten().any(|candidate| {
+            candidate.kind == crate::intent::CandidateKind::Declaration
+                && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+        }));
     }
 
     #[test]
@@ -2471,15 +2743,18 @@ mod tests {
                 ..Default::default()
             },
         );
-        assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
-        assert!(
-            result
-                .degradations
-                .iter()
-                .any(|d| d == "semantic_unavailable")
+        let semantic_degradations: Vec<&str> = result
+            .degradations
+            .iter()
+            .filter(|degradation| degradation.starts_with("semantic_"))
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            semantic_degradations,
+            ["semantic_unavailable", "semantic_budget"]
         );
         let state = provider.0.lock().unwrap();
-        assert!(state.1.len() > 2);
+        assert_eq!(state.1.len(), crate::intent::MAX_PROVIDER_REQUESTS);
         assert!(state.1.iter().all(|batch| {
             batch
                 .iter()
@@ -2496,7 +2771,7 @@ mod tests {
             result
                 .hits
                 .iter()
-                .any(|hit| { hit.path == first_file && hit.lanes_matched.contains(&"intent") })
+                .all(|hit| { hit.path != first_file || !hit.lanes_matched.contains(&"intent") })
         );
     }
 
@@ -2584,6 +2859,15 @@ mod tests {
             "src/zz_needle.rs".into(),
             "pub fn relevant_behavior() {}\n".into(),
         ));
+        files.push((
+            "src/caller.rs".into(),
+            "use crate::zz_needle::relevant_behavior;\npub fn call() { relevant_behavior(); }\n"
+                .into(),
+        ));
+        files.push((
+            "src/lib.rs".into(),
+            "pub mod zz_needle; mod caller;\n".into(),
+        ));
         let file_refs: Vec<(&str, &str)> = files
             .iter()
             .map(|(path, contents)| (path.as_str(), contents.as_str()))
@@ -2619,9 +2903,12 @@ mod tests {
                 .iter()
                 .any(|candidate| candidate.id == "file:src/zz_needle.rs")
         );
-        assert!(result.hits.iter().any(|hit| {
-            hit.name == "relevant_behavior" && hit.lanes_matched.contains(&"intent")
-        }));
+        let target = result
+            .hits
+            .iter()
+            .find(|hit| hit.name == "relevant_behavior" && hit.lanes_matched.contains(&"intent"))
+            .unwrap();
+        assert_eq!(target.scores["structural"], 2.0);
     }
 
     #[test]
@@ -2691,6 +2978,10 @@ mod tests {
                 .flatten()
                 .any(|candidate| candidate.id == "file:src/zz_gold.rs"),
             "the file with the strongest BM25 evidence was never previewed"
+        );
+        assert_eq!(
+            requests[0][0].id, "file:src/zz_gold.rs",
+            "batches must keep the seed order so a request cap sends the strongest seed first"
         );
         assert!(
             result
@@ -2812,11 +3103,14 @@ mod tests {
                     .all(|lane| hit.scores.contains_key(lane))
             );
         }
-        assert!(
+        assert_eq!(
             intent
                 .degradations
                 .iter()
-                .any(|d| d == "semantic_unavailable")
+                .filter(|degradation| degradation.starts_with("semantic_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["semantic_unavailable"]
         );
     }
 
@@ -3409,11 +3703,14 @@ mod tests {
                     .all(|lane| hit.scores.contains_key(lane))
             );
         }
-        assert!(
+        assert_eq!(
             intent
                 .degradations
                 .iter()
-                .any(|d| d == "semantic_unavailable")
+                .filter(|degradation| degradation.starts_with("semantic_"))
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["semantic_unavailable"]
         );
     }
 
