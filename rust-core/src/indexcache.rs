@@ -1008,7 +1008,7 @@ fn identity_listing(
     match via_reader() {
         Ok(listed) => Ok(listed),
         Err(error)
-            if !crate::gitindex::is_submodule_refusal(&error)
+            if !matches!(&error, crate::gitindex::Refusal::Submodule(_))
                 && crate::gitindex::falls_back(setting, &layout.git_dir) =>
         {
             via_git()

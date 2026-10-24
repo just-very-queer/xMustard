@@ -442,7 +442,48 @@ impl Walk<'_> {
     /// Whether directory `path` (`dir/`) is reported or entered at all: it is under
     /// the prefix, or leads to it.
     fn in_scope(&self, path: &[u8]) -> bool {
-        path.starts_with(self.prefix) || self.prefix.starts_with(path)
+        path_in_scope(
+            &self.repo.toplevel,
+            self.prefix,
+            self.repo.ignore_case,
+            path,
+            same_directory,
+        )
+    }
+}
+
+fn path_in_scope(
+    root: &Path,
+    prefix: &[u8],
+    ignore_case: bool,
+    path: &[u8],
+    same_directory: impl Fn(&Path, &Path) -> bool,
+) -> bool {
+    if path.starts_with(prefix) || prefix.starts_with(path) {
+        return true;
+    }
+    if !ignore_case {
+        return false;
+    }
+    if starts_with_ascii_folded(path, prefix) {
+        return same_directory(
+            &root.join(path_from_bytes(&path[..prefix.len()])),
+            &root.join(path_from_bytes(prefix)),
+        );
+    }
+    if starts_with_ascii_folded(prefix, path) {
+        return same_directory(
+            &root.join(path_from_bytes(path)),
+            &root.join(path_from_bytes(&prefix[..path.len()])),
+        );
+    }
+    false
+}
+
+fn same_directory(left: &Path, right: &Path) -> bool {
+    match (fs::canonicalize(left), fs::canonicalize(right)) {
+        (Ok(left), Ok(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -592,9 +633,41 @@ pub(crate) fn untracked(
 
 #[cfg(test)]
 mod tests {
-    use super::{MAX_FOLDED_INDEX_BYTES, remember_folded_path};
+    use super::{MAX_FOLDED_INDEX_BYTES, path_in_scope, remember_folded_path, same_directory};
     use crate::gitindex::Refusal;
     use std::collections::BTreeSet;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn case_folded_scope_accepts_an_alias_of_the_requested_directory() {
+        use std::os::unix::fs::symlink;
+
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root =
+            std::env::temp_dir().join(format!("xmustard-scope-{}-{unique}", std::process::id()));
+        fs::create_dir_all(root.join("src")).unwrap();
+        symlink(root.join("src"), root.join("Src")).unwrap();
+
+        assert!(path_in_scope(
+            &root,
+            b"src/",
+            true,
+            b"Src/child/",
+            same_directory,
+        ));
+        assert!(!path_in_scope(
+            &root,
+            b"src/",
+            true,
+            b"Src/child/",
+            |_, _| false,
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn folded_index_membership_refuses_paths_over_its_bound() {

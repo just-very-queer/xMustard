@@ -51,18 +51,6 @@ pub struct Repo {
     pub symlinks: bool,
 }
 
-fn git_bool(root: &Path, key: &str) -> Result<bool, Refusal> {
-    let value = run_git_bounded(
-        root,
-        &["config", "--bool", "--get", key],
-        64 << 10,
-        git_timeout(),
-    )
-    .map_err(|error| Refusal::Failed(format!("git config: invalid {key} value: {error}")))?;
-    parse_git_bool(String::from_utf8_lossy(&value).trim())
-        .ok_or_else(|| Refusal::Failed(format!("git config: invalid {key} value")))
-}
-
 fn git_text(root: &Path, args: &[&str]) -> Result<String, Refusal> {
     run_git_bounded(root, args, 64 << 10, git_timeout())
         .map(|b| String::from_utf8_lossy(&b).into_owned())
@@ -101,11 +89,16 @@ impl Repo {
         .map_err(|e| Refusal::Failed(format!("git config: {e}")))?;
         let mut excludes_file = default_excludes_file();
         let mut ignore_case = false;
-        let mut symlinks_configured = false;
         let mut invalid_symlinks = None;
+        let mut symlinks_value = true;
         for rec in config.split(|b| *b == 0).filter(|r| !r.is_empty()) {
             let rec = String::from_utf8_lossy(rec);
-            let (key, value) = rec.split_once('\n').unwrap_or((&rec, ""));
+            let rec = rec.as_ref();
+            let (key, value) = rec
+                .split_once('\n')
+                .map_or((rec, None), |(key, value)| (key, Some(value)));
+            let has_value = value.is_some();
+            let value = value.unwrap_or_default();
             match key {
                 "core.excludesfile" => excludes_file = Some(expand_home(value)),
                 "core.ignorecase" => {
@@ -114,13 +107,17 @@ impl Repo {
                         "true" | "yes" | "on" | "1" | ""
                     )
                 }
-                "core.symlinks" => {
-                    symlinks_configured = true;
-                    invalid_symlinks = match value.is_empty() || parse_git_bool(value).is_some() {
-                        true => None,
-                        false => Some(value.to_owned()),
-                    };
-                }
+                "core.symlinks" => match (has_value, parse_git_bool(value)) {
+                    (false, _) => {
+                        symlinks_value = true;
+                        invalid_symlinks = None;
+                    }
+                    (true, Some(parsed)) => {
+                        symlinks_value = parsed;
+                        invalid_symlinks = None;
+                    }
+                    (_, None) => invalid_symlinks = Some(value.to_owned()),
+                },
                 _ => {}
             }
         }
@@ -130,8 +127,7 @@ impl Repo {
                     "git config: invalid core.symlinks value {value:?}"
                 )));
             }
-            None if symlinks_configured => git_bool(root, "core.symlinks")?,
-            None => true,
+            None => symlinks_value,
         };
         Ok(Repo {
             toplevel: PathBuf::from(top),
@@ -599,7 +595,7 @@ fn submodule_dirty_with_head(
     let head = match head_probe(dir) {
         Ok(bytes) => Some(
             Oid::parse_hex(&String::from_utf8_lossy(&bytes)).ok_or_else(|| {
-                Refusal::Failed(format!(
+                Refusal::Submodule(format!(
                     "submodule {}: rev-parse returned an invalid HEAD",
                     dir.display()
                 ))
@@ -607,7 +603,7 @@ fn submodule_dirty_with_head(
         ),
         Err(crate::indexcache::GitRunError::Failed) => None,
         Err(error) => {
-            return Err(Refusal::Failed(format!(
+            return Err(Refusal::Submodule(format!(
                 "submodule {}: rev-parse: {error}",
                 dir.display()
             )));
@@ -617,7 +613,7 @@ fn submodule_dirty_with_head(
         return Ok(true);
     }
     let sub = Repo::open(dir)
-        .map_err(|e| Refusal::Failed(format!("submodule {}: {e}", dir.display())))?;
+        .map_err(|e| Refusal::Submodule(format!("submodule {}: {e}", dir.display())))?;
     let mut dirty = false;
     let opts = Options {
         untracked: true,
@@ -627,7 +623,7 @@ fn submodule_dirty_with_head(
         dirty = true;
         ControlFlow::Break(())
     })
-    .map_err(|e| Refusal::Failed(format!("submodule {}: {e}", dir.display())))?;
+    .map_err(|e| Refusal::Submodule(format!("submodule {}: {e}", dir.display())))?;
     if !dirty {
         ensure_complete_submodule(dir, &outcome)?;
     }
@@ -636,7 +632,7 @@ fn submodule_dirty_with_head(
 
 fn ensure_complete_submodule(dir: &Path, outcome: &Outcome) -> Result<(), Refusal> {
     if let Some(reason) = &outcome.untracked_incomplete {
-        return Err(Refusal::Failed(format!(
+        return Err(Refusal::Submodule(format!(
             "submodule {}: untracked walk incomplete: {reason}",
             dir.display()
         )));
@@ -977,7 +973,7 @@ mod tests {
         };
         let refusal =
             ensure_complete_submodule(std::path::Path::new("child"), &outcome).unwrap_err();
-        assert!(matches!(refusal, Refusal::Failed(message)
+        assert!(matches!(refusal, Refusal::Submodule(message)
             if message.contains("child") && message.contains("walk exceeded its bound")));
     }
 
@@ -993,7 +989,7 @@ mod tests {
             Err(GitRunError::Spawn("shimmed spawn failure".into()))
         })
         .unwrap_err();
-        assert!(matches!(refusal, Refusal::Failed(message)
+        assert!(matches!(refusal, Refusal::Submodule(message)
             if message.contains("submodule") && message.contains("rev-parse")));
     }
 }

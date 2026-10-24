@@ -45,6 +45,9 @@ pub enum Refusal {
     /// The index or the worktree could not be read: a checksum mismatch, a truncated
     /// file, an I/O error, a Git child that failed.
     Failed(String),
+    /// A refusal while reading a nested repository; fallback from the parent could load
+    /// the nested repository's index without accounting for its cost.
+    Submodule(String),
 }
 
 impl Refusal {
@@ -52,7 +55,7 @@ impl Refusal {
     pub fn reason(&self) -> &'static str {
         match self {
             Refusal::Unsupported(_) => "git_index_unsupported",
-            Refusal::Failed(_) => "git_index_failed",
+            Refusal::Failed(_) | Refusal::Submodule(_) => "git_index_failed",
         }
     }
 }
@@ -61,7 +64,7 @@ impl std::fmt::Display for Refusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Refusal::Unsupported(m) => write!(f, "Git index layout not supported: {m}"),
-            Refusal::Failed(m) => f.write_str(m),
+            Refusal::Failed(m) | Refusal::Submodule(m) => f.write_str(m),
         }
     }
 }
@@ -135,11 +138,6 @@ pub fn falls_back(setting: Setting, git_dir: &Path) -> bool {
         && loaded_entries(git_dir).is_some_and(|n| predicted_git_bytes(n) <= GIT_LINE_BYTES)
 }
 
-// A parent index's budget cannot authorize a fallback that loads a child index.
-pub(crate) fn is_submodule_refusal(error: &Refusal) -> bool {
-    error.to_string().contains("submodule ")
-}
-
 /// A listing of the opened directory, as `git ls-files` run there gives it.
 #[derive(Debug, Clone, Copy)]
 pub enum Listing<'a> {
@@ -205,8 +203,7 @@ pub fn list_using(
     });
     match read {
         Err(error)
-            if setting == Setting::Auto
-                && !is_submodule_refusal(&error)
+            if !matches!(&error, Refusal::Submodule(_))
                 && listed == 0
                 && falls_back(setting, &repo.git_dir) =>
         {
@@ -302,9 +299,7 @@ pub fn head_changes_using(
     let repo = status::Repo::open(root)?;
     match status::head_changes(&repo) {
         Err(error)
-            if setting == Setting::Auto
-                && !is_submodule_refusal(&error)
-                && falls_back(setting, &repo.git_dir) =>
+            if !matches!(&error, Refusal::Submodule(_)) && falls_back(setting, &repo.git_dir) =>
         {
             head_changes_git(root)
         }

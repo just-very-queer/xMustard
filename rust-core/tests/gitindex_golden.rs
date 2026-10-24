@@ -138,7 +138,7 @@ fn submodule_with_incomplete_untracked_walk_refuses_parent_status() {
         fs::File::create(wide.join(format!("f{i}"))).unwrap();
     }
     let err = refusal(&fx.root);
-    assert!(matches!(err, Refusal::Failed(message)
+    assert!(matches!(err, Refusal::Submodule(message)
         if message.contains("submodule") && message.contains("untracked walk incomplete")));
 }
 
