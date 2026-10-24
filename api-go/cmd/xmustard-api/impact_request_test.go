@@ -15,6 +15,39 @@ import (
 	"xmustard/api-go/internal/workspaceops"
 )
 
+func TestImpactRoutePreservesNullImpactedCount(t *testing.T) {
+	srv, dir := newRouteServer(t)
+	core := filepath.Join(t.TempDir(), "xmustard-core")
+	if err := os.WriteFile(core, []byte("#!/bin/sh\nprintf '{\\\"symbol\\\":\\\"missing\\\",\\\"impacted_count\\\":null,\\\"risk\\\":\\\"UNKNOWN\\\"}'\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("XMUSTARD_CORE_BIN", core)
+	ws, root := "wsNullImpact", t.TempDir()
+	snap, _ := json.Marshal(map[string]any{"workspace": map[string]any{"workspace_id": ws, "root_path": root}})
+	if err := os.MkdirAll(filepath.Join(dir, "workspaces", ws), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "workspaces", ws, "snapshot.json"), snap, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	resp, err := http.Get(srv.URL + "/api/workspaces/" + ws + "/changes/since-index?symbol=missing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status %d: %s", resp.StatusCode, body)
+	}
+	var result map[string]json.RawMessage
+	if err := json.Unmarshal(body, &result); err != nil {
+		t.Fatal(err)
+	}
+	if string(result["impacted_count"]) != "null" || string(result["risk"]) != `"UNKNOWN"` {
+		t.Fatalf("null impact contract was coerced: %s", body)
+	}
+}
+
 // A request mixing impact forms, or out of range, is a 400 before any core runs.
 func TestImpactRouteRefusesMixedFormsBeforeRunningTheCore(t *testing.T) {
 	srv, dir := newRouteServer(t)
