@@ -134,6 +134,8 @@ pub struct Changes {
     #[serde(flatten)]
     pub scope: Resolved,
     pub changed_files: Vec<ChangedFile>,
+    /// Changed source files for which no symbols could be mapped.
+    pub unmapped_files: Vec<String>,
     pub changed_files_total: usize,
     /// Files changed outside the workspace root (the root is a repository subdirectory).
     #[serde(skip_serializing_if = "is_zero")]
@@ -448,6 +450,7 @@ pub fn detect<G: Graph + ?Sized>(
     let mut out = Changes {
         scope: r.clone(),
         changed_files: Vec::new(),
+        unmapped_files: Vec::new(),
         changed_files_total: 0,
         outside_root: 0,
         changed_symbols: Vec::new(),
@@ -528,6 +531,12 @@ pub fn detect<G: Graph + ?Sized>(
                 unparsed: why,
             }
         })
+        .collect();
+    out.unmapped_files = out
+        .changed_files
+        .iter()
+        .filter(|file| file.symbols == 0 && file.unparsed.is_none() && !file.binary)
+        .map(|file| file.path.clone())
         .collect();
     if !seeds.is_empty() {
         let mut walk = q.impact.clone();
