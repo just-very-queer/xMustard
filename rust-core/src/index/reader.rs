@@ -415,6 +415,11 @@ impl Snapshot {
         f(conn).map_err(sql)
     }
 
+    #[cfg(test)]
+    pub(crate) fn shared_text_lock_available(&self) -> bool {
+        self.text.try_lock().is_ok()
+    }
+
     /// Open a query-local text connection for work that may call an external classifier.
     /// The shared snapshot text mutex must never be held across provider execution.
     pub fn with_unshared_text<R>(

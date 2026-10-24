@@ -477,7 +477,8 @@ pub fn declarations(
         "SELECT n.name, s.name_line FROM files f
          JOIN symbols s ON s.file_id = f.id
          JOIN names n ON n.id = s.name_id
-         WHERE f.path = ?1 ORDER BY s.start_line, s.name_line, n.name LIMIT ?2",
+         WHERE f.path = ?1 AND s.local = 0
+         ORDER BY s.start_line, s.name_line, n.name LIMIT ?2",
     )?;
     let rows = statement.query_map(params![path, limit.min(i64::MAX as usize) as i64], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, u32>(1)?))

@@ -11,7 +11,6 @@ pub const MAX_CANDIDATE_FILES: usize = 32;
 pub const MAX_DECLARATIONS: usize = 64;
 pub const MAX_EXCERPT_BYTES: usize = 8 * 1024;
 pub const MAX_BATCH_BYTES: usize = 64 * 1024;
-pub const MAX_IN_FLIGHT_REQUESTS: usize = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -39,9 +38,17 @@ pub struct Decision {
     pub probabilities: BTreeMap<String, f64>,
 }
 
+#[derive(Debug)]
+pub struct BatchDecision {
+    pub decision: Decision,
+    pub complete: bool,
+    pub error: Option<ProviderError>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProviderError {
     InvalidQuestion,
+    QuestionTooLarge,
     InvalidCandidates,
     QuestionMismatch,
     CandidateMismatch,
@@ -121,6 +128,68 @@ pub fn decide(
     Ok(decision)
 }
 
+/// Classifies bounded sequential batches, retaining valid decisions if later coverage fails.
+pub fn decide_batched(
+    provider: &dyn DecisionProvider,
+    question: &Question,
+    candidates: &[Candidate],
+) -> BatchDecision {
+    let mut batches = Vec::new();
+    let mut batch = Vec::new();
+    let mut complete = true;
+    let mut error = validate_request(question, &[]).err();
+    if error.is_some() {
+        return BatchDecision {
+            decision: Decision {
+                question_id: question.id.clone(),
+                probabilities: BTreeMap::new(),
+            },
+            complete: false,
+            error,
+        };
+    }
+    for candidate in candidates {
+        let mut proposed = batch.clone();
+        proposed.push(candidate.clone());
+        if validate_request(question, &proposed).is_ok() {
+            batch = proposed;
+            continue;
+        }
+        if !batch.is_empty() {
+            batches.push(std::mem::take(&mut batch));
+        }
+        if validate_request(question, std::slice::from_ref(candidate)).is_ok() {
+            batch.push(candidate.clone());
+        } else {
+            complete = false;
+            error.get_or_insert(ProviderError::InvalidCandidates);
+        }
+    }
+    if !batch.is_empty() {
+        batches.push(batch);
+    }
+
+    let mut probabilities = BTreeMap::new();
+    for batch in batches {
+        match decide(provider, question, &batch) {
+            Ok(decision) => probabilities.extend(decision.probabilities),
+            Err(failure) => {
+                complete = false;
+                error = Some(failure);
+                break;
+            }
+        }
+    }
+    BatchDecision {
+        decision: Decision {
+            question_id: question.id.clone(),
+            probabilities,
+        },
+        complete,
+        error,
+    }
+}
+
 /// Refuses incomplete, mismatched, or out-of-range provider output before it can be used.
 pub fn validate_decision(
     question: &Question,
@@ -152,11 +221,11 @@ pub fn validate_request(
     question: &Question,
     candidates: &[Candidate],
 ) -> Result<(), ProviderError> {
-    if question.id.is_empty()
-        || question.id.len().saturating_add(question.text.len()) > MAX_BATCH_BYTES
-        || question.text.trim().is_empty()
-    {
+    if question.id.is_empty() || question.text.trim().is_empty() {
         return Err(ProviderError::InvalidQuestion);
+    }
+    if question.id.len().saturating_add(question.text.len()) > MAX_BATCH_BYTES {
+        return Err(ProviderError::QuestionTooLarge);
     }
     if candidates.len() > MAX_CANDIDATE_FILES + MAX_DECLARATIONS {
         return Err(ProviderError::InvalidCandidates);
@@ -302,6 +371,84 @@ mod tests {
         );
     }
 
+    #[derive(Debug)]
+    struct InvalidResponseProvider(Decision);
+
+    impl DecisionProvider for InvalidResponseProvider {
+        fn decide(
+            &self,
+            _question: &Question,
+            _candidates: &[Candidate],
+        ) -> Result<Decision, ProviderError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    #[test]
+    fn shared_decide_validates_non_fixture_provider_responses() {
+        let candidates = [candidate("a")];
+        for (decision, expected) in [
+            (
+                Decision {
+                    question_id: "wrong".into(),
+                    probabilities: BTreeMap::from([("a".into(), 0.5)]),
+                },
+                ProviderError::QuestionMismatch,
+            ),
+            (
+                Decision {
+                    question_id: "q1".into(),
+                    probabilities: BTreeMap::from([("extra".into(), 0.5)]),
+                },
+                ProviderError::CandidateMismatch,
+            ),
+            (
+                Decision {
+                    question_id: "q1".into(),
+                    probabilities: BTreeMap::from([("a".into(), 1.5)]),
+                },
+                ProviderError::InvalidProbability,
+            ),
+        ] {
+            let provider = InvalidResponseProvider(decision);
+            assert_eq!(decide(&provider, &question(), &candidates), Err(expected));
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct CallCounter(std::sync::Mutex<usize>);
+
+    impl DecisionProvider for CallCounter {
+        fn decide(
+            &self,
+            question: &Question,
+            candidates: &[Candidate],
+        ) -> Result<Decision, ProviderError> {
+            *self.0.lock().unwrap() += 1;
+            Ok(Decision {
+                question_id: question.id.clone(),
+                probabilities: candidates
+                    .iter()
+                    .map(|candidate| (candidate.id.clone(), 0.9))
+                    .collect(),
+            })
+        }
+    }
+
+    #[test]
+    fn single_over_limit_candidate_is_rejected_without_provider_call() {
+        let provider = CallCounter::default();
+        let candidate = Candidate {
+            id: "a".into(),
+            kind: CandidateKind::File,
+            excerpt: "x".repeat(MAX_EXCERPT_BYTES + 1),
+        };
+        let outcome = decide_batched(&provider, &question(), &[candidate]);
+        assert!(!outcome.complete);
+        assert_eq!(outcome.error, Some(ProviderError::InvalidCandidates));
+        assert_eq!(*provider.0.lock().unwrap(), 0);
+    }
+
     #[test]
     fn candidate_bounds_and_duplicate_ids_are_refused() {
         let provider = FixtureProvider::from_json("{}").unwrap();
@@ -353,7 +500,7 @@ mod tests {
             .map(|i| Candidate {
                 id: format!("json-{i}"),
                 kind: CandidateKind::File,
-                excerpt: "\\\"".repeat(7_000),
+                excerpt: "\"".repeat(4_100),
             })
             .collect();
         assert_eq!(

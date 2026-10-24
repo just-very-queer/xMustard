@@ -157,7 +157,7 @@ func TestSearchRefusesAnUnknownModeBelowTheRoute(t *testing.T) {
 	argsFile := fakeSearchCore(t, searchPageBody)
 	ctx := context.Background()
 
-	for _, mode := range []string{"Text", "TEXT", "exacts", "regexes"} {
+	for _, mode := range []string{"Text", "TEXT", "exacts", "regexes", "semantic", "intents"} {
 		if _, err := WorkspaceSearchPage(ctx, dir, ws, SearchRequest{Query: "q", Mode: mode}); !errors.Is(err, ErrInvalidInput) {
 			t.Errorf("mode=%q must be invalid input, got %v", mode, err)
 		}

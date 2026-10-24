@@ -17,7 +17,7 @@
 //! - `structural`: inbound reference weight of the hit's file.
 //! - `proximity`: graph distance to a seed symbol (explicit, or the exact name match).
 //! - `intent`: opt-in typed decisions over bounded, fresh index excerpts; its probability
-//!   is exposed as `scores.semantic`, distinct from the ONNX `semantic` lane.
+//!   is exposed as `scores.intent`.
 //!
 //! Fusion: a candidate scores the sum of weight/(RRF_K + rank) over the lanes that rank
 //! it. RRF_K = 60 is a deliberate choice: the constant of Cormack, Clarke and Buettcher
@@ -46,7 +46,7 @@
 
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 use std::rc::Rc;
 
@@ -83,6 +83,36 @@ const MAX_NAME_TOKENS: usize = 128;
 const MIN_INTENT_PROBABILITY: f64 = 0.5;
 /// Dimensions of the trigram sketch.
 const SKETCH_DIM: usize = 256;
+
+#[cfg(test)]
+struct UnsharedTextProvider<'a> {
+    snapshot: &'a crate::index::reader::Snapshot,
+    inner: &'a dyn crate::intent::DecisionProvider,
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for UnsharedTextProvider<'_> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("UnsharedTextProvider")
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(test)]
+impl crate::intent::DecisionProvider for UnsharedTextProvider<'_> {
+    fn decide(
+        &self,
+        question: &crate::intent::Question,
+        candidates: &[crate::intent::Candidate],
+    ) -> Result<crate::intent::Decision, crate::intent::ProviderError> {
+        assert!(
+            self.snapshot.shared_text_lock_available(),
+            "intent provider called while the shared snapshot text mutex is held"
+        );
+        self.inner.decide(question, candidates)
+    }
+}
 
 fn now() -> String {
     Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
@@ -336,15 +366,9 @@ impl Lane {
     }
 }
 
-fn score_key(
-    lane: Lane,
-    intent_mode: bool,
-    fuzzy_is_semantic: bool,
-    lane_name: &'static str,
-) -> &'static str {
+fn score_key(lane: Lane, lane_name: &'static str) -> &'static str {
     match lane {
-        Lane::Intent => "semantic",
-        Lane::Fuzzy if fuzzy_is_semantic && intent_mode => "embedding",
+        Lane::Intent => "intent",
         _ => lane_name,
     }
 }
@@ -524,6 +548,14 @@ pub struct SearchOptions<'a> {
     pub intent_provider: Option<&'a dyn crate::intent::DecisionProvider>,
     /// The one bounded yes/no question for the intent call.
     pub intent_question: Option<&'a crate::intent::Question>,
+}
+
+/// The strongest deterministic evidence for one file's intent-preview priority.
+#[derive(Clone, Copy)]
+struct SeedEvidence {
+    name_score: f64,
+    fuzzy: f32,
+    bm25_rank: u32,
 }
 
 /// One candidate of the fused pool. The pool can hold every symbol of a large
@@ -1280,8 +1312,8 @@ pub fn search(
                 .ok()
         })
     };
+    let mut prox: HashMap<String, f64> = HashMap::new();
     if let Some(impact) = seed_impact {
-        let mut prox: HashMap<String, f64> = HashMap::new();
         // The proximity map is keyed by path and read straight off the seed's blast
         // radius, so it must go through `admit` like every other lane: a `lang` or a
         // `path_glob` filter that left it out would rank a hit the filter excluded.
@@ -1307,7 +1339,13 @@ pub fn search(
         match (opts.intent_provider, opts.intent_question, index) {
             (Some(provider), Some(question), Some(opened)) => {
                 let deterministic_len = cands.len();
+                #[cfg(test)]
+                let provider = &UnsharedTextProvider {
+                    snapshot: &opened.snapshot,
+                    inner: provider,
+                };
                 let mut cap_exhausted = false;
+                let mut provider_failed = false;
                 let decision = opened.snapshot.with_unshared_text(|conn| {
                     conn.execute_batch("BEGIN")?;
                     let generation: String = conn.query_row(
@@ -1330,18 +1368,38 @@ pub fn search(
                     let mut file_targets: HashMap<String, Vec<usize>> = HashMap::new();
                     let mut file_paths = HashMap::new();
                     let mut stale_excerpt = false;
-                    let mut attempted_files = 0usize;
-                    let seed_paths: BTreeSet<&str> = cands
-                        .iter()
-                        .filter(|candidate| candidate.kind != Kind::Doc)
-                        .map(|candidate| candidate.path.as_ref())
-                        .collect();
-                    for path in seed_paths {
-                        if attempted_files >= crate::intent::MAX_CANDIDATE_FILES {
+                    let mut seed_evidence: HashMap<&str, SeedEvidence> = HashMap::new();
+                    for candidate in cands.iter().filter(|candidate| candidate.kind != Kind::Doc) {
+                        let evidence =
+                            seed_evidence
+                                .entry(candidate.path.as_ref())
+                                .or_insert(SeedEvidence {
+                                    name_score: 0.0,
+                                    fuzzy: 0.0,
+                                    bm25_rank: u32::MAX,
+                                });
+                        evidence.name_score = evidence.name_score.max(candidate.name_score);
+                        evidence.fuzzy = evidence.fuzzy.max(candidate.fuzzy);
+                        if let Some(rank) = candidate.code {
+                            evidence.bm25_rank = evidence.bm25_rank.min(rank);
+                        }
+                    }
+                    let mut seed_paths: Vec<&str> = seed_evidence.keys().copied().collect();
+                    seed_paths.sort_by(|left, right| {
+                        let left_evidence = seed_evidence[left];
+                        let right_evidence = seed_evidence[right];
+                        right_evidence
+                            .name_score
+                            .total_cmp(&left_evidence.name_score)
+                            .then_with(|| right_evidence.fuzzy.total_cmp(&left_evidence.fuzzy))
+                            .then_with(|| left_evidence.bm25_rank.cmp(&right_evidence.bm25_rank))
+                            .then_with(|| left.cmp(right))
+                    });
+                    for (attempt, path) in seed_paths.into_iter().enumerate() {
+                        if attempt >= crate::intent::MAX_CANDIDATE_FILES {
                             cap_exhausted = true;
                             break;
                         }
-                        attempted_files += 1;
                         match fts::file_identity_matches(conn, root, path)? {
                             Ok(true) => {}
                             Ok(false) | Err(fts::TextMiss::Changed) => {
@@ -1362,10 +1420,6 @@ pub fn search(
                                 continue;
                             }
                         };
-                        if file_candidates.len() >= crate::intent::MAX_CANDIDATE_FILES {
-                            cap_exhausted = true;
-                            break;
-                        }
                         match fts::chunk_text(conn, root, &loc) {
                             Ok(excerpt) => {
                                 if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
@@ -1402,7 +1456,24 @@ pub fn search(
                     } else if file_candidates.is_empty() {
                         Err(crate::intent::ProviderError::CandidateMismatch)
                     } else {
-                        crate::intent::decide(provider, question, &file_candidates)
+                        let batch =
+                            crate::intent::decide_batched(provider, question, &file_candidates);
+                        cap_exhausted |= !batch.complete;
+                        provider_failed |= batch.error.as_ref().is_some_and(|error| {
+                            !matches!(
+                                error,
+                                crate::intent::ProviderError::InvalidCandidates
+                                    | crate::intent::ProviderError::InvalidQuestion
+                                    | crate::intent::ProviderError::QuestionTooLarge
+                            )
+                        });
+                        if batch.decision.probabilities.is_empty() {
+                            Err(batch
+                                .error
+                                .unwrap_or(crate::intent::ProviderError::CandidateMismatch))
+                        } else {
+                            Ok(batch.decision)
+                        }
                     };
                     // A provider may take time; discard its decision if any excerpt went stale meanwhile.
                     stale_excerpt |=
@@ -1463,18 +1534,17 @@ pub fn search(
                             name_score: 0.0,
                             matched: 0,
                             fuzzy: 0.0,
-                            structural: 0,
-                            proximity: 0.0,
+                            structural: inbound.get(path).copied().unwrap_or(0),
+                            proximity: prox.get(path).copied().unwrap_or(0.0),
                             code: None,
                             doc: None,
-                            hotspot: false,
+                            hotspot: hotspots.contains(path),
                             semantic: None,
                         });
                         targets.push(index);
                     }
                     let mut declaration_candidates = Vec::new();
                     let mut declaration_targets: HashMap<String, Vec<usize>> = HashMap::new();
-                    let mut declaration_locs = Vec::new();
                     let mut newly_discovered = HashSet::new();
                     let mut seen_declarations = HashSet::new();
                     let mut declaration_paths: Vec<&String> = positive_paths.iter().collect();
@@ -1512,7 +1582,6 @@ pub fn search(
                             if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
                                 cap_exhausted = true;
                             }
-                            declaration_locs.push(loc.clone());
                             declaration_candidates.push(crate::intent::Candidate {
                                 id: id.clone(),
                                 kind: crate::intent::CandidateKind::Declaration,
@@ -1538,11 +1607,11 @@ pub fn search(
                                         name_score: 0.0,
                                         matched: 0,
                                         fuzzy: 0.0,
-                                        structural: 0,
-                                        proximity: 0.0,
+                                        structural: inbound.get(path).copied().unwrap_or(0),
+                                        proximity: prox.get(path).copied().unwrap_or(0.0),
                                         code: None,
                                         doc: None,
-                                        hotspot: false,
+                                        hotspot: hotspots.contains(path),
                                         semantic: None,
                                     });
                                     newly_discovered.insert(index);
@@ -1561,21 +1630,39 @@ pub fn search(
                         ));
                     }
                     if !declaration_candidates.is_empty() {
-                        let decision =
-                            crate::intent::decide(provider, question, &declaration_candidates);
+                        let batch = crate::intent::decide_batched(
+                            provider,
+                            question,
+                            &declaration_candidates,
+                        );
+                        cap_exhausted |= !batch.complete;
+                        provider_failed |= batch.error.as_ref().is_some_and(|error| {
+                            !matches!(
+                                error,
+                                crate::intent::ProviderError::InvalidCandidates
+                                    | crate::intent::ProviderError::InvalidQuestion
+                                    | crate::intent::ProviderError::QuestionTooLarge
+                            )
+                        });
+                        if batch.decision.probabilities.is_empty() {
+                            let error = batch
+                                .error
+                                .unwrap_or(crate::intent::ProviderError::CandidateMismatch);
+                            return Ok::<_, rusqlite::Error>((
+                                Err(error),
+                                file_targets,
+                                stale_excerpt,
+                                HashSet::new(),
+                            ));
+                        }
                         stale_excerpt |= latest_generation_is_stale(
                             &opened.snapshot,
                             opened.snapshot.generation,
                         ) || file_paths.values().any(|path| {
                             !matches!(fts::file_identity_matches(conn, root, path), Ok(Ok(true)))
-                        }) || declaration_locs.iter().any(|loc| {
-                            !matches!(
-                                fts::file_identity_matches(conn, root, &loc.path),
-                                Ok(Ok(true))
-                            )
                         });
-                        match decision {
-                            Ok(_) if stale_excerpt => {
+                        match stale_excerpt {
+                            true => {
                                 return Ok::<_, rusqlite::Error>((
                                     Err(crate::intent::ProviderError::Fixture(
                                         "stale source".into(),
@@ -1585,20 +1672,7 @@ pub fn search(
                                     HashSet::new(),
                                 ));
                             }
-                            Ok(decision) => probabilities.extend(decision.probabilities),
-                            Err(error) => {
-                                let error = if stale_excerpt {
-                                    crate::intent::ProviderError::Fixture("stale source".into())
-                                } else {
-                                    error
-                                };
-                                return Ok::<_, rusqlite::Error>((
-                                    Err(error),
-                                    file_targets,
-                                    stale_excerpt,
-                                    HashSet::new(),
-                                ));
-                            }
+                            false => probabilities.extend(batch.decision.probabilities),
                         }
                     }
                     file_targets.extend(declaration_targets);
@@ -1619,6 +1693,9 @@ pub fn search(
                             cands.truncate(deterministic_len);
                             degradations.push("semantic_stale".to_string());
                         } else {
+                            if provider_failed {
+                                degradations.push("semantic_unavailable".to_string());
+                            }
                             if cap_exhausted {
                                 degradations.push("semantic_budget".to_string());
                             }
@@ -1642,8 +1719,8 @@ pub fn search(
                     }
                     Ok((
                         Err(
-                            crate::intent::ProviderError::InvalidQuestion
-                            | crate::intent::ProviderError::InvalidCandidates,
+                            crate::intent::ProviderError::InvalidCandidates
+                            | crate::intent::ProviderError::QuestionTooLarge,
                         ),
                         _,
                         _,
@@ -1652,17 +1729,25 @@ pub fn search(
                         cands.truncate(deterministic_len);
                         degradations.push("semantic_budget".to_string());
                     }
+                    Ok((Err(crate::intent::ProviderError::InvalidQuestion), _, _, _)) => {
+                        cands.truncate(deterministic_len);
+                        degradations.push("semantic_unavailable".to_string());
+                    }
                     Ok((Err(_), _, true, _)) => {
                         cands.truncate(deterministic_len);
                         degradations.push("semantic_stale".to_string());
                     }
                     Ok((Err(_), _, false, _)) => {
                         cands.truncate(deterministic_len);
-                        degradations.push(if cap_exhausted {
-                            "semantic_budget".to_string()
-                        } else {
-                            "semantic_unavailable".to_string()
-                        });
+                        if provider_failed {
+                            degradations.push("semantic_unavailable".to_string());
+                        }
+                        if cap_exhausted {
+                            degradations.push("semantic_budget".to_string());
+                        }
+                        if !provider_failed && !cap_exhausted {
+                            degradations.push("semantic_unavailable".to_string());
+                        }
                     }
                     Err(_) => {
                         cands.truncate(deterministic_len);
@@ -1670,7 +1755,7 @@ pub fn search(
                     }
                 }
             }
-            (Some(_), Some(_), None) => degradations.push("semantic_stale".to_string()),
+            (Some(_), Some(_), None) => degradations.push("semantic_unavailable".to_string()),
             _ => degradations.push("semantic_unavailable".to_string()),
         }
     }
@@ -1744,7 +1829,6 @@ pub fn search(
         text: &text,
         seed: effective_seed.as_deref().unwrap_or(""),
         body_only,
-        intent_mode: opts.mode == SearchMode::Intent,
     };
     let hits: Vec<SearchHit> = order
         .get(opts.offset..page_end)
@@ -1841,7 +1925,6 @@ struct Render<'a> {
     /// `mode=text`: the bm25 lane read the body column, so a hit names `body` and says
     /// so, rather than claiming the whole-chunk bm25 it did not run.
     body_only: bool,
-    intent_mode: bool,
 }
 
 impl Render<'_> {
@@ -1892,12 +1975,12 @@ impl Render<'_> {
                         format!("name: matched {}", names.join("+"))
                     }
                 }),
-                // the fuzzy lane ranks most candidates; it is a reason only when it alone
-                // brought the hit in
                 Lane::Intent => Some(format!(
                     "intent_probability: {:.2}",
                     c.semantic.unwrap_or(0.0)
                 )),
+                // the fuzzy lane ranks most candidates; it is a reason only when it alone
+                // brought the hit in
                 Lane::Fuzzy => (c.name_score <= 0.0 && c.code.is_none() && c.doc.is_none())
                     .then(|| format!("{}: name similarity {:.2}", lane.name(), c.fuzzy)),
                 Lane::Structural => Some(format!(
@@ -1925,12 +2008,7 @@ impl Render<'_> {
             .filter(|l| lanes & l.bit() != 0)
             .map(|l| {
                 (
-                    score_key(
-                        l,
-                        self.intent_mode,
-                        fuzzy_lane() == "semantic",
-                        self.lane_name(l),
-                    ),
+                    score_key(l, self.lane_name(l)),
                     round6(c.lane_score(l, text)),
                 )
             })
@@ -1988,6 +2066,35 @@ mod tests {
             candidates: &[crate::intent::Candidate],
         ) -> Result<crate::intent::Decision, crate::intent::ProviderError> {
             self.0.lock().unwrap().push(candidates.to_vec());
+            Ok(crate::intent::Decision {
+                question_id: question.id.clone(),
+                probabilities: candidates
+                    .iter()
+                    .map(|candidate| (candidate.id.clone(), 0.9))
+                    .collect(),
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct FailSecondBatchProvider(Mutex<(usize, Vec<Vec<crate::intent::Candidate>>)>);
+
+    impl crate::intent::DecisionProvider for FailSecondBatchProvider {
+        fn decide(
+            &self,
+            question: &crate::intent::Question,
+            candidates: &[crate::intent::Candidate],
+        ) -> Result<crate::intent::Decision, crate::intent::ProviderError> {
+            let mut state = self.0.lock().unwrap();
+            let call = state.0;
+            state.0 += 1;
+            state.1.push(candidates.to_vec());
+            drop(state);
+            if call == 1 {
+                return Err(crate::intent::ProviderError::Fixture(
+                    "later batch failed".into(),
+                ));
+            }
             Ok(crate::intent::Decision {
                 question_id: question.id.clone(),
                 probabilities: candidates
@@ -2187,10 +2294,9 @@ mod tests {
 
     #[test]
     fn intent_score_keys_preserve_legacy_onnx_and_text_contracts() {
-        assert_eq!(score_key(Lane::Fuzzy, false, true, "semantic"), "semantic");
-        assert_eq!(score_key(Lane::Fuzzy, true, true, "semantic"), "embedding");
-        assert_eq!(score_key(Lane::Intent, true, true, "intent"), "semantic");
-        assert_eq!(score_key(Lane::Bm25, false, false, "body"), "body");
+        assert_eq!(score_key(Lane::Fuzzy, "semantic"), "semantic");
+        assert_eq!(score_key(Lane::Intent, "intent"), "intent");
+        assert_eq!(score_key(Lane::Bm25, "body"), "body");
     }
 
     #[test]
@@ -2227,7 +2333,50 @@ mod tests {
     }
 
     #[test]
-    fn oversized_candidate_batch_is_refused_before_any_provider_call() {
+    fn truncated_intent_excerpt_reports_incomplete_coverage() {
+        let contents = format!(
+            "pub fn reconcile() {{ let _data = \"{}\"; }}\n",
+            "x".repeat(crate::intent::MAX_EXCERPT_BYTES + 100)
+        );
+        let repo = indexed_repo(&[("src/lib.rs", &contents)]);
+        let provider = RecordingProvider::default();
+        let question = crate::intent::Question {
+            id: "q-truncated".into(),
+            text: "Does this reconcile state?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "reconcile",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        assert!(
+            result
+                .degradations
+                .iter()
+                .any(|item| item == "semantic_budget")
+        );
+        let requests = provider.0.lock().unwrap();
+        for kind in [
+            crate::intent::CandidateKind::File,
+            crate::intent::CandidateKind::Declaration,
+        ] {
+            assert!(requests.iter().flatten().any(|candidate| {
+                candidate.kind == kind
+                    && candidate.excerpt.len() == crate::intent::MAX_EXCERPT_BYTES
+            }));
+        }
+    }
+
+    #[test]
+    fn oversized_candidate_stage_batches_partial_coverage() {
         let contents = format!(
             "pub fn local_work() {{ let _data = \"{}\"; }}\n",
             "x".repeat(crate::intent::MAX_EXCERPT_BYTES + 100)
@@ -2240,7 +2389,7 @@ mod tests {
             .map(|(path, contents)| (path.as_str(), contents.as_str()))
             .collect();
         let repo = indexed_repo(&file_refs);
-        let provider = RecordingProvider::default();
+        let provider = FailSecondBatchProvider::default();
         let question = crate::intent::Question {
             id: "q-bytes".into(),
             text: "Does this implement the requested behavior?".into(),
@@ -2258,10 +2407,33 @@ mod tests {
                 ..Default::default()
             },
         );
-        let baseline = hybrid_search(repo.path(), "ws", "needle", 20, None);
-        assert_eq!(result.hits, baseline.hits);
-        assert!(provider.0.lock().unwrap().is_empty());
         assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
+        assert!(
+            result
+                .degradations
+                .iter()
+                .any(|d| d == "semantic_unavailable")
+        );
+        let state = provider.0.lock().unwrap();
+        assert!(state.1.len() > 2);
+        assert!(state.1.iter().all(|batch| {
+            batch
+                .iter()
+                .all(|candidate| candidate.excerpt.len() <= crate::intent::MAX_EXCERPT_BYTES)
+        }));
+        let first_file = state.1[0]
+            .iter()
+            .find(|candidate| candidate.kind == crate::intent::CandidateKind::File)
+            .unwrap()
+            .id
+            .strip_prefix("file:")
+            .unwrap();
+        assert!(
+            result
+                .hits
+                .iter()
+                .any(|hit| { hit.path == first_file && hit.lanes_matched.contains(&"intent") })
+        );
     }
 
     #[test]
@@ -2302,6 +2474,36 @@ mod tests {
     }
 
     #[test]
+    fn intent_declaration_discovery_excludes_nested_local_functions() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn outer() { fn nested_local() {} }\n")]);
+        let provider = RecordingProvider::default();
+        let question = crate::intent::Question {
+            id: "q-nested".into(),
+            text: "Does this implement the requested behavior?".into(),
+        };
+        let _ = search(
+            repo.path(),
+            "ws",
+            None,
+            "outer",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+        let requests = provider.0.lock().unwrap();
+        assert!(
+            !requests
+                .iter()
+                .flatten()
+                .any(|candidate| { candidate.id.contains("nested_local") })
+        );
+    }
+
+    #[test]
     fn path_seed_is_previewed_even_when_its_chunk_is_outside_bm25_window() {
         let mut files: Vec<(String, String)> = (0..BM25_K)
             .map(|index| {
@@ -2315,7 +2517,7 @@ mod tests {
             })
             .collect();
         files.push((
-            "src/a_needle.rs".into(),
+            "src/zz_needle.rs".into(),
             "pub fn relevant_behavior() {}\n".into(),
         ));
         let file_refs: Vec<(&str, &str)> = files
@@ -2325,8 +2527,8 @@ mod tests {
         let repo = indexed_repo(&file_refs);
         let provider = TargetProvider {
             positive_ids: vec![
-                "file:src/a_needle.rs".into(),
-                "decl:src/a_needle.rs:1:relevant_behavior".into(),
+                "file:src/zz_needle.rs".into(),
+                "decl:src/zz_needle.rs:1:relevant_behavior".into(),
             ],
             requests: Mutex::new(Vec::new()),
         };
@@ -2351,7 +2553,7 @@ mod tests {
         assert!(
             requests[0]
                 .iter()
-                .any(|candidate| candidate.id == "file:src/a_needle.rs")
+                .any(|candidate| candidate.id == "file:src/zz_needle.rs")
         );
         assert!(result.hits.iter().any(|hit| {
             hit.name == "relevant_behavior" && hit.lanes_matched.contains(&"intent")
@@ -2391,7 +2593,7 @@ mod tests {
             .find(|hit| hit.name == "reconcile_workspace_registration")
             .expect("positive declaration discovered from its positive file");
         assert!(declaration.lanes_matched.contains(&"intent"));
-        assert_eq!(declaration.scores["semantic"], 0.95);
+        assert_eq!(declaration.scores["intent"], 0.95);
     }
 
     #[test]
@@ -2456,6 +2658,20 @@ mod tests {
             },
         );
         assert_eq!(intent.hits, regular.hits);
+        for hit in &regular.hits {
+            assert!(
+                hit.lanes_matched
+                    .iter()
+                    .all(|lane| hit.scores.contains_key(lane))
+            );
+        }
+        for hit in &intent.hits {
+            assert!(
+                hit.lanes_matched
+                    .iter()
+                    .all(|lane| hit.scores.contains_key(lane))
+            );
+        }
         assert!(
             intent
                 .degradations
@@ -2497,7 +2713,12 @@ mod tests {
             .find(|hit| hit.path == "src/lib.rs")
             .unwrap();
         assert!(hit.lanes_matched.contains(&"intent"));
-        assert_eq!(hit.scores["semantic"], 0.9);
+        assert_eq!(hit.scores["intent"], 0.9);
+        assert!(
+            hit.lanes_matched
+                .iter()
+                .all(|lane| hit.scores.contains_key(lane))
+        );
         assert!(
             hit.reasons
                 .iter()
@@ -2537,7 +2758,7 @@ mod tests {
         );
         let hit = result.hits.iter().find(|hit| hit.kind == "file").unwrap();
         assert!(hit.lanes_matched.contains(&"intent"));
-        assert_eq!(hit.scores["semantic"], 0.9);
+        assert_eq!(hit.scores["intent"], 0.9);
     }
 
     #[test]
@@ -3034,6 +3255,20 @@ mod tests {
             },
         );
         assert_eq!(intent.hits, regular.hits);
+        for hit in &regular.hits {
+            assert!(
+                hit.lanes_matched
+                    .iter()
+                    .all(|lane| hit.scores.contains_key(lane))
+            );
+        }
+        for hit in &intent.hits {
+            assert!(
+                hit.lanes_matched
+                    .iter()
+                    .all(|lane| hit.scores.contains_key(lane))
+            );
+        }
         assert!(
             intent
                 .degradations

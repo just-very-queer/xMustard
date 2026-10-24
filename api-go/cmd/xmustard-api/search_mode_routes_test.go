@@ -183,7 +183,7 @@ func TestSearchRefusesAnUnknownMode(t *testing.T) {
 
 	// `exact` and `regex` were on this list until WS-59c landed them; what is left is a
 	// mode no surface answers, and it must not silently answer hybrid.
-	for _, m := range []string{"intents", "exacts", "Exact", "task", "commits"} {
+	for _, m := range []string{"semantic", "intents", "exacts", "Exact", "task", "commits"} {
 		q := url.Values{"mode": {m}, "q": {"x"}}
 		resp, err := testClient.Get(p.base + "/api/workspaces/ws/search?" + q.Encode())
 		if err != nil {
