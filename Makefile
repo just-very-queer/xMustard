@@ -138,6 +138,7 @@ scan:
 check: check-backend check-frontend
 
 check-backend:
+	python3 scripts/test_check_peer_registry.py
 	@out=$$(gofmt -l api-go) || { echo "check-backend: gofmt failed"; exit 1; }; \
 	if [ -n "$$out" ]; then \
 		echo "check-backend: gofmt drift in:"; echo "$$out"; exit 1; \

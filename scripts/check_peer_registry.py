@@ -32,12 +32,7 @@ def get_json(url: str, timeout: float = 20.0) -> tuple[Any, str]:
 def refresh_peer(peer: dict[str, Any], api_root: str) -> dict[str, Any]:
     repository = peer.get("repository")
     if repository is None:
-        return {
-            **peer,
-            "source_present": False,
-            "superseded_by": None,
-            "last_commit_date": None,
-        }
+        return peer
 
     api_root = api_root.rstrip("/")
     encoded = urllib.parse.quote(repository, safe="/")
@@ -46,32 +41,21 @@ def refresh_peer(peer: dict[str, Any], api_root: str) -> dict[str, Any]:
     except urllib.error.HTTPError as error:
         if error.code != 404:
             raise
-        return {
-            **peer,
-            "source_present": False,
-            "superseded_by": None,
-            "last_commit_date": None,
-        }
+        return peer
 
     canonical_name = source["full_name"]
     canonical_url = source["html_url"].rstrip("/")
-    present = canonical_name.casefold() == repository.casefold()
-    superseded_by = None if present else canonical_name.rsplit("/", 1)[-1]
-    last_commit_date = peer.get("last_commit_date")
-    if present:
-        commits, _ = get_json(
-            f"{api_root}/repos/{urllib.parse.quote(canonical_name, safe='/')}/commits?per_page=1"
-        )
-        last_commit_date = None
-        if commits:
-            commit = commits[0]["commit"]
-            last_commit_date = commit["committer"]["date"][:10]
+    commits, _ = get_json(
+        f"{api_root}/repos/{urllib.parse.quote(canonical_name, safe='/')}/commits?per_page=1"
+    )
+    last_commit_date = None
+    if commits:
+        commit = commits[0]["commit"]
+        last_commit_date = commit["committer"]["date"][:10]
 
     return {
         **peer,
         "canonical_url": canonical_url,
-        "source_present": present,
-        "superseded_by": superseded_by,
         "last_commit_date": last_commit_date,
     }
 
@@ -85,6 +69,26 @@ def refreshed_registry(registry: dict[str, Any], api_root: str) -> dict[str, Any
 
 def render(value: Any) -> str:
     return json.dumps(value, indent=2, ensure_ascii=False) + "\n"
+
+
+def registry_check_view(registry: dict[str, Any]) -> dict[str, Any]:
+    peers = []
+    for peer in registry["peers"]:
+        peers.append({
+            key: peer.get(key)
+            for key in ("repository", "canonical_url", "source_present", "superseded_by")
+            if key in peer
+        })
+    return {"peers": peers}
+
+
+def date_drift_messages(current: dict[str, Any], updated: dict[str, Any]) -> list[str]:
+    return [
+        f"commit date drift for {before.get('repository')}: "
+        f"{before.get('last_commit_date')} -> {after.get('last_commit_date')}"
+        for before, after in zip(current["peers"], updated["peers"])
+        if before.get("last_commit_date") != after.get("last_commit_date")
+    ]
 
 
 def main() -> int:
@@ -103,16 +107,19 @@ def main() -> int:
         args.registry.write_text(output, encoding="utf-8")
         return 0
 
-    original = render(current)
-    if original == output:
-        print("peer registry is current")
+    original = render(registry_check_view(current))
+    refreshed = render(registry_check_view(updated))
+    for message in date_drift_messages(current, updated):
+        print(message)
+    if original == refreshed:
+        print("peer registry canonical fields are current")
         return 0
     sys.stderr.writelines(
         difflib.unified_diff(
             original.splitlines(keepends=True),
-            output.splitlines(keepends=True),
+            refreshed.splitlines(keepends=True),
             fromfile=str(args.registry),
-            tofile="refreshed peer registry",
+            tofile="refreshed peer registry canonical fields",
         )
     )
     print("refresh with scripts/check_peer_registry.py --write", file=sys.stderr)

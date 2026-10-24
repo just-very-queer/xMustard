@@ -26,9 +26,9 @@ Release dates below are publication dates. Commit dates are committer timestamps
 
 ## Peer source liveness
 
-The machine-readable peer list is [PEER_REGISTRY.json](PEER_REGISTRY.json). Each source record carries `source_present`, `superseded_by`, `last_commit_date` and its canonical URL; `null` is used when a hosted peer has no public repository or its commit date was not established in the research snapshot. The weekly `peer-registry` workflow checks these fields against GitHub and reports refreshed values when a repository changes or redirects. Refresh and review the registry with `python3 scripts/check_peer_registry.py --write`.
+The machine-readable peer list is [PEER_REGISTRY.json](PEER_REGISTRY.json). Each source record carries curated `source_present` and `superseded_by` fields, the canonical URL, and a last-commit date. The manual-only `peer-registry` workflow checks curated status and canonical URLs; commit-date drift is reported without failing the check. Refresh and review the registry with `python3 scripts/check_peer_registry.py --write`; check it with `python3 scripts/check_peer_registry.py --check`.
 
-The retired `letta-ai/letta` entry is intentionally retained with `source_present: false` and `superseded_by: letta-code`; the live repository is listed separately.
+The `letta-ai/letta` entry is intentionally retained as a curated tombstone with `source_present: false` and `superseded_by: letta-code`; the live repository is listed separately.
 
 ## Capabilities relevant to this product
 
