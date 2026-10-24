@@ -23,8 +23,11 @@
 //! the user's tool call proceeds with its own output. The warning goes to stderr,
 //! which Cursor logs but the agent never sees.
 
-use std::io::{self, Read, Write};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use xmustard_core::cursorhook::{self, FAIL_OPEN_EXIT};
@@ -34,6 +37,8 @@ const MAX_BODY: usize = 8 << 20;
 /// Largest answer read back (the daemon's hook reply carries a projection plus a
 /// handle, both of which cap far below this).
 const MAX_ANSWER: usize = 1 << 20;
+/// Bound each socket write so posting never buffers the event in memory.
+const POST_CHUNK: usize = 256 << 10;
 /// The whole budget: connect, post and read together.
 const BUDGET: Duration = Duration::from_millis(200);
 
@@ -57,13 +62,26 @@ fn run(args: impl Iterator<Item = String>, stdin: &mut dyn Read, stdout: &mut dy
         }
     };
     let started = Instant::now();
-    let mut event = String::new();
-    if let Err(msg) = read_event(stdin, &mut event) {
-        warn(&msg);
+    let mut event = match read_event(stdin) {
+        Ok(event) => event,
+        Err(msg) => {
+            warn(&msg);
+            return FAIL_OPEN_EXIT;
+        }
+    };
+    let roots_payload = match read_roots_payload(&mut event.file) {
+        Ok(payload) => payload,
+        Err(msg) => {
+            warn(&msg);
+            return FAIL_OPEN_EXIT;
+        }
+    };
+    if let Err(e) = event.file.seek(SeekFrom::Start(0)) {
+        warn(&format!("rewinding the event spool failed: {e}"));
         return FAIL_OPEN_EXIT;
     }
     let env = cursorhook::read_env(cursorhook::process_env());
-    let pin = match cursorhook::workspace_pin(&env, &event, cfg.workspace.as_deref()) {
+    let pin = match cursorhook::workspace_pin(&env, &roots_payload, cfg.workspace.as_deref()) {
         Some(pin) => pin,
         // Fail-closed on binding, fail-open on the user's action: nothing is posted
         // and Cursor keeps its own output.
@@ -75,7 +93,7 @@ fn run(args: impl Iterator<Item = String>, stdin: &mut dyn Read, stdout: &mut dy
             return 0;
         }
     };
-    let reply = match post(&cfg, &pin, &event, started) {
+    let reply = match post(&cfg, &pin, &mut event, started) {
         Ok(Some(reply)) => reply,
         // The daemon was reached and declined to answer: not a failure. Cursor keeps
         // its own output whether the client wrote nothing or wrote an answer.
@@ -236,30 +254,242 @@ fn parse_base(url: &str) -> Result<(String, u16), String> {
     }
 }
 
-/// Reads the event from stdin, refusing an empty or oversized one.
-fn read_event(stdin: &mut dyn Read, out: &mut String) -> Result<(), String> {
-    let mut raw = Vec::with_capacity(4096);
-    let mut chunk = [0u8; 8192];
-    loop {
-        match stdin
-            .read(&mut chunk)
-            .map_err(|e| format!("reading the event failed: {e}"))?
+/// Maximum bytes retained for workspace binding, independent of event size.
+const MAX_ROOTS_VALUE: usize = 64 << 10;
+const SPOOL_CREATE_ATTEMPTS: usize = 32;
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+struct EventBody {
+    file: File,
+    len: usize,
+}
+
+fn spool_path(directory: &Path, pid: u32, nanos: u128, sequence: u64) -> PathBuf {
+    directory.join(format!("xmustard-cursor-{pid}-{nanos}-{sequence}.tmp"))
+}
+
+fn event_file_in(directory: &Path, pid: u32, nanos: u128, sequence: u64) -> Result<File, String> {
+    for attempt in 0..SPOOL_CREATE_ATTEMPTS {
+        let path = spool_path(directory, pid, nanos, sequence.wrapping_add(attempt as u64));
+        let mut options = OpenOptions::new();
+        options.write(true).read(true).create_new(true);
+        #[cfg(unix)]
         {
-            0 => break,
-            n => {
-                if raw.len() + n > MAX_BODY {
-                    return Err("the event is larger than this client posts".into());
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        match options.open(&path) {
+            Ok(file) => {
+                if let Err(e) = fs::remove_file(&path) {
+                    drop(file);
+                    let _ = fs::remove_file(&path);
+                    return Err(format!("unlinking the event spool failed: {e}"));
                 }
-                raw.extend_from_slice(&chunk[..n]);
+                return Ok(file);
+            }
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("creating the event spool failed: {e}")),
+        }
+    }
+    Err("creating the event spool failed: too many name collisions".into())
+}
+
+fn event_file() -> Result<File, String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| format!("getting the event spool timestamp failed: {e}"))?
+        .as_nanos();
+    let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    event_file_in(&std::env::temp_dir(), std::process::id(), nanos, sequence)
+}
+
+/// Spools stdin in bounded chunks and refuses empty, invalid UTF-8 or oversized events.
+fn read_event(stdin: &mut dyn Read) -> Result<EventBody, String> {
+    let mut file = event_file()?;
+    let mut len = 0usize;
+    let mut chunk = [0u8; 8192];
+    let mut carry = Vec::with_capacity(4);
+    let mut nonblank = false;
+    loop {
+        let n = stdin
+            .read(&mut chunk)
+            .map_err(|e| format!("reading the event failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        if len + n > MAX_BODY {
+            return Err("the event is larger than this client posts".into());
+        }
+        len += n;
+        nonblank |= chunk[..n]
+            .iter()
+            .any(|b| !matches!(b, b' ' | b'\t' | b'\r' | b'\n'));
+        let mut check = Vec::with_capacity(carry.len() + n);
+        check.extend_from_slice(&carry);
+        check.extend_from_slice(&chunk[..n]);
+        match std::str::from_utf8(&check) {
+            Ok(_) => carry.clear(),
+            Err(e) if e.error_len().is_none() => {
+                carry.clear();
+                carry.extend_from_slice(&check[e.valid_up_to()..]);
+            }
+            Err(_) => return Err("the event was empty or not valid UTF-8".into()),
+        }
+        file.write_all(&chunk[..n])
+            .map_err(|e| format!("spooling the event failed: {e}"))?;
+    }
+    if !carry.is_empty() || !nonblank {
+        return Err("the event was empty or not valid UTF-8".into());
+    }
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewinding the event spool failed: {e}"))?;
+    Ok(EventBody { file, len })
+}
+
+fn read_json_byte(reader: &mut impl BufRead) -> Result<Option<u8>, String> {
+    let byte = reader
+        .fill_buf()
+        .map_err(|e| format!("reading the event spool failed: {e}"))?
+        .first()
+        .copied();
+    if byte.is_some() {
+        reader.consume(1);
+    }
+    Ok(byte)
+}
+
+fn next_json_byte(reader: &mut impl BufRead) -> Result<Option<u8>, String> {
+    loop {
+        match read_json_byte(reader)? {
+            Some(b' ' | b'\t' | b'\r' | b'\n') => continue,
+            byte => return Ok(byte),
+        }
+    }
+}
+
+/// Reads one JSON value, optionally retaining at most `limit` bytes of its source.
+fn read_json_value(
+    reader: &mut impl BufRead,
+    first: u8,
+    limit: Option<usize>,
+) -> Result<(Vec<u8>, bool), String> {
+    let mut value = Vec::new();
+    let mut overflow = false;
+    let mut keep = |byte| {
+        if limit.is_some_and(|max| value.len() < max) {
+            value.push(byte);
+        } else if limit.is_some() {
+            overflow = true;
+        }
+    };
+    keep(first);
+    if first == b'"' {
+        let mut escaped = false;
+        loop {
+            let byte = read_json_byte(reader)?
+                .ok_or_else(|| "the event JSON ended inside a string".to_string())?;
+            keep(byte);
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                return Ok((value, overflow));
             }
         }
     }
-    match String::from_utf8(raw) {
-        Ok(s) if !s.trim().is_empty() => {
-            *out = s;
-            Ok(())
+    if matches!(first, b'{' | b'[') {
+        let mut depth = 1usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while depth != 0 {
+            let byte = read_json_byte(reader)?
+                .ok_or_else(|| "the event JSON ended inside a value".to_string())?;
+            keep(byte);
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match byte {
+                    b'"' => in_string = true,
+                    b'{' | b'[' => depth += 1,
+                    b'}' | b']' => depth -= 1,
+                    _ => {}
+                }
+            }
         }
-        _ => Err("the event was empty or not valid UTF-8".into()),
+        return Ok((value, overflow));
+    }
+    loop {
+        let (count, delimiter) = {
+            let bytes = reader
+                .fill_buf()
+                .map_err(|e| format!("reading the event spool failed: {e}"))?;
+            let count = bytes
+                .iter()
+                .position(|b| matches!(b, b',' | b'}' | b']' | b' ' | b'\t' | b'\r' | b'\n'))
+                .unwrap_or(bytes.len());
+            (count, bytes.get(count).copied())
+        };
+        for _ in 0..count {
+            let byte = read_json_byte(reader)?.expect("buffered byte exists");
+            keep(byte);
+        }
+        if count == 0 || delimiter.is_some() {
+            return Ok((value, overflow));
+        }
+    }
+}
+
+/// Extracts the first top-level workspace_roots array without retaining the event.
+/// Large roots arrays fail open so binding memory stays bounded.
+fn read_roots_payload(file: &mut File) -> Result<String, String> {
+    file.seek(SeekFrom::Start(0))
+        .map_err(|e| format!("rewinding the event spool failed: {e}"))?;
+    let mut reader = BufReader::new(file);
+    if next_json_byte(&mut reader)? != Some(b'{') {
+        return Err("the event was not a JSON object".into());
+    }
+    loop {
+        let Some(first) = next_json_byte(&mut reader)? else {
+            return Err("the event JSON ended before its object closed".into());
+        };
+        if first == b'}' {
+            return Ok("{}".into());
+        }
+        if first != b'"' {
+            return Err("the event JSON has an invalid object key".into());
+        }
+        let (key, _) = read_json_value(&mut reader, first, Some(1024))?;
+        if next_json_byte(&mut reader)? != Some(b':') {
+            return Err("the event JSON has an invalid object member".into());
+        }
+        let value_start = next_json_byte(&mut reader)?
+            .ok_or_else(|| "the event JSON ended before a member value".to_string())?;
+        if key == br#""workspace_roots""# {
+            if value_start != b'[' {
+                return Ok("{}".into());
+            }
+            let (roots, overflow) =
+                read_json_value(&mut reader, value_start, Some(MAX_ROOTS_VALUE))?;
+            if overflow {
+                return Err("workspace_roots exceeds the client's bounded binding limit".into());
+            }
+            let roots = String::from_utf8(roots)
+                .map_err(|_| "workspace_roots was not valid UTF-8".to_string())?;
+            return Ok(format!("{{\"workspace_roots\":{roots}}}"));
+        }
+        let _ = read_json_value(&mut reader, value_start, None)?;
+        match next_json_byte(&mut reader)? {
+            Some(b',') => continue,
+            Some(b'}') => return Ok("{}".into()),
+            _ => return Err("the event JSON has an invalid object separator".into()),
+        }
     }
 }
 
@@ -267,7 +497,12 @@ fn read_event(stdin: &mut dyn Read, out: &mut String) -> Result<(), String> {
 ///
 /// Ok(None) means the daemon was reached and declined to answer, which is not an
 /// error: Cursor keeps its own output either way.
-fn post(cfg: &Config, pin: &str, event: &str, started: Instant) -> Result<Option<String>, String> {
+fn post(
+    cfg: &Config,
+    pin: &str,
+    event: &mut EventBody,
+    started: Instant,
+) -> Result<Option<String>, String> {
     let budget = started
         .checked_add(BUDGET)
         .map(|d| d.saturating_duration_since(Instant::now()))
@@ -287,13 +522,13 @@ fn post(cfg: &Config, pin: &str, event: &str, started: Instant) -> Result<Option
         .set_read_timeout(Some(budget))
         .and_then(|()| stream.set_write_timeout(Some(budget)))
         .map_err(|e| format!("setting the deadline failed: {e}"))?;
-    let mut request = String::with_capacity(event.len() + 256);
+    let mut request = String::with_capacity(256);
     request.push_str(&format!(
         "POST {} HTTP/1.1\r\nHost: {}:{}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
         cursorhook::route(&cfg.event),
         cfg.host,
         cfg.port,
-        event.len()
+        event.len
     ));
     request.push_str("Connection: close\r\n");
     if let Some(token) = &cfg.token {
@@ -305,8 +540,20 @@ fn post(cfg: &Config, pin: &str, event: &str, started: Instant) -> Result<Option
     request.push_str("\r\n");
     stream
         .write_all(request.as_bytes())
-        .and_then(|()| stream.write_all(event.as_bytes()))
         .map_err(|e| format!("posting the event failed: {e}"))?;
+    let mut chunk = [0u8; POST_CHUNK];
+    loop {
+        let n = event
+            .file
+            .read(&mut chunk)
+            .map_err(|e| format!("reading the event spool failed: {e}"))?;
+        if n == 0 {
+            break;
+        }
+        stream
+            .write_all(&chunk[..n])
+            .map_err(|e| format!("posting the event failed: {e}"))?;
+    }
     parse_reply(&mut stream)
 }
 
@@ -518,28 +765,96 @@ mod tests {
     }
 
     #[test]
+    fn workspace_roots_are_found_after_large_tool_output() {
+        let mut body =
+            String::from("{\"nested\":{\"workspace_roots\":[\"/wrong\"]},\"tool_output\":\"");
+        body.push_str(&"x".repeat(80 << 10));
+        body.push_str(r#"","workspace_roots":["/repo"]}"#);
+        let mut file = event_file().expect("create anonymous spool");
+        file.write_all(body.as_bytes()).expect("write event");
+        let payload = read_roots_payload(&mut file).expect("extract roots");
+        assert_eq!(
+            cursorhook::json_string_array(&payload, "workspace_roots"),
+            vec!["/repo"]
+        );
+    }
+
+    #[test]
+    fn oversized_workspace_roots_fail_open_without_growing_memory_unbounded() {
+        let mut body = String::from("{\"workspace_roots\":[\"");
+        body.push_str(&"x".repeat(MAX_ROOTS_VALUE));
+        body.push_str(r#""]}"#);
+        let mut file = event_file().expect("create anonymous spool");
+        file.write_all(body.as_bytes()).expect("write event");
+        assert!(read_roots_payload(&mut file).is_err());
+    }
+
+    #[test]
+    fn an_incomplete_workspace_roots_value_is_refused() {
+        let mut file = event_file().expect("create anonymous spool");
+        file.write_all(br#"{"workspace_roots":["/repo""#)
+            .expect("write event");
+        assert!(read_roots_payload(&mut file).is_err());
+    }
+
+    #[test]
     fn an_empty_event_is_not_posted() {
-        let mut out = String::new();
         let mut input = io::Cursor::new(b"   ".to_vec());
         assert!(
-            read_event(&mut input, &mut out).is_err(),
+            read_event(&mut input).is_err(),
             "Cursor sends JSON, never blanks"
         );
     }
 
     #[test]
-    fn an_event_is_read_whole() {
-        let mut out = String::new();
-        let mut input = io::Cursor::new(b"{\"a\":1}".to_vec());
-        assert!(read_event(&mut input, &mut out).is_ok());
-        assert_eq!(out, "{\"a\":1}");
+    fn a_spool_name_collision_retries_without_replacing_the_existing_file() {
+        let directory = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let pid = std::process::id();
+        let sequence = TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let first = spool_path(&directory, pid, nanos, sequence);
+        fs::write(&first, b"keep me").expect("reserve first candidate");
+        let file = event_file_in(&directory, pid, nanos, sequence).expect("retry collision");
+        assert_eq!(fs::read(&first).expect("read collision file"), b"keep me");
+        assert!(file.metadata().expect("anonymous file metadata").is_file());
+        assert!(
+            !spool_path(&directory, pid, nanos, sequence + 1).exists(),
+            "the successful retry is unlinked immediately"
+        );
+        fs::remove_file(first).expect("remove collision fixture");
     }
 
     #[test]
+    fn an_event_is_spooled_without_changing_its_bytes() {
+        let mut input = io::Cursor::new(b"{\"a\":1}".to_vec());
+        let mut event = read_event(&mut input).expect("valid input spools");
+        let mut body = String::new();
+        event.file.read_to_string(&mut body).expect("read spool");
+        assert_eq!(body, "{\"a\":1}");
+        assert_eq!(event.len, body.len());
+    }
+
+    #[test]
+    fn utf8_split_across_input_chunks_is_preserved() {
+        let mut bytes = vec![b'a'; 8191];
+        bytes.extend_from_slice("é".as_bytes());
+        let mut input = io::Cursor::new(bytes);
+        let event = read_event(&mut input).expect("UTF-8 may cross a read boundary");
+        assert_eq!(event.len, 8193);
+    }
+    #[test]
     fn an_event_that_is_not_utf8_is_refused() {
-        let mut out = String::new();
         let mut input = io::Cursor::new(vec![0xff, 0xfe]);
-        assert!(read_event(&mut input, &mut out).is_err());
+        assert!(read_event(&mut input).is_err());
+    }
+
+    #[test]
+    fn the_input_limit_is_enforced_while_spooling() {
+        let mut input = io::Cursor::new(vec![b'x'; MAX_BODY + 1]);
+        assert!(read_event(&mut input).is_err());
     }
 
     #[test]
