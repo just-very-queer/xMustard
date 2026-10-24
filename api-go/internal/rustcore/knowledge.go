@@ -23,7 +23,8 @@ func RunSyntaxCheck(ctx context.Context, args ...string) ([]byte, error) {
 	return runCore(ctx, "syntax-check", args...)
 }
 
-// RunIndex runs `xmustard-core index <build|update|stats> <root> [flags]`, the code
+// RunIndex runs `xmustard-core index <build|update|stats|path-status> <root> [flags]`, the code
+// index worker. It is one-shot by design: its parse and write peak runs in a transient
 // index worker. It is one-shot by design: its parse and write peak runs in a transient
 // process under the heavy slot, never in the resident worker, which only reads the
 // graph segment the update writes.

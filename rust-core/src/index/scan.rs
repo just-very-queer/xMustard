@@ -289,6 +289,78 @@ pub fn scan(layout: &Layout, cfg: &IndexConfig) -> Result<Scan, String> {
     }
 }
 
+/// Explain an ignore decision using the same rules and Git semantics as the indexer.
+pub fn ignored_by(
+    layout: &Layout,
+    cfg: &IndexConfig,
+    path: &str,
+    tracked: bool,
+) -> Result<Option<super::ignore::IgnoreMatch>, String> {
+    let mut ignores = Ignore::with_defaults();
+    if layout.git_dir.is_some() {
+        if !tracked {
+            let args = ["check-ignore", "-v", "-z", "--stdin"];
+            match crate::indexcache::run_git_bounded_input(
+                &layout.root,
+                &args,
+                format!("{path}\0").into_bytes(),
+                64 << 10,
+                git_timeout(),
+            ) {
+                Ok(output) => {
+                    let fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+                    if fields.len() >= 3 {
+                        let file = String::from_utf8_lossy(fields[0]).into_owned();
+                        let line = String::from_utf8_lossy(fields[1]).parse().unwrap_or(0);
+                        let pattern = String::from_utf8_lossy(fields[2]).into_owned();
+                        return Ok(Some(super::ignore::IgnoreMatch {
+                            file,
+                            line,
+                            pattern,
+                        }));
+                    }
+                }
+                Err(crate::indexcache::GitRunError::Failed) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let mut files = Vec::new();
+        let mut untracked_listings = vec![false];
+        if cfg.include_untracked {
+            untracked_listings.push(true);
+        }
+        for untracked in untracked_listings {
+            crate::gitindex::list_using(
+                &layout.root,
+                crate::gitindex::Setting::from_env(),
+                Listing::Named {
+                    name: XMUSTARD_IGNORE,
+                    untracked,
+                },
+                &mut |record, _| {
+                    if let Ok(file) = std::str::from_utf8(record)
+                        && basename(file) == XMUSTARD_IGNORE
+                        && files.len() < MAX_IGNORE_FILES
+                    {
+                        files.push(file.to_string());
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        ignores.load_xmustard(&layout.root, &files);
+    } else {
+        load_dir_ignores(&layout.root, "", &mut ignores);
+        let mut parent = PathBuf::new();
+        let components: Vec<_> = Path::new(path).components().collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(component.as_os_str());
+            load_dir_ignores(&layout.root, &parent.to_string_lossy(), &mut ignores);
+        }
+    }
+    Ok(ignores.ignored_by(path, false))
+}
+
 /// The Git dir and the root's prefix below the top level, or None outside a worktree.
 fn git_layout(root: &Path) -> Option<(PathBuf, String)> {
     let out = run_git_bounded(

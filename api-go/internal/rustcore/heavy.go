@@ -38,7 +38,7 @@ const (
 var heavyCoreOps = map[string]map[string]int64{
 	"symbolgraph": {"build": heavyBuildBytes},
 	"changetrack": {"index": heavyBuildBytes},
-	"index":       {"build": heavyIndexBytes, "update": heavyIndexBytes},
+	"index":       {"build": heavyIndexBytes, "update": heavyIndexBytes, "path-status": heavyIndexBytes},
 }
 
 // heavyCoreOp reports whether sub with args is heavy work, with its heavy-slot owner

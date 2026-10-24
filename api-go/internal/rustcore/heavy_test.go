@@ -107,6 +107,7 @@ func TestHeavyCoreOpClassification(t *testing.T) {
 		{[]string{"changetrack", "index", "/d", "/r", "ws"}, "rust:changetrack/index", heavyBuildBytes},
 		{[]string{"index", "build", "/r"}, "rust:index/build", heavyIndexBytes},
 		{[]string{"index", "update", "/r", "--paths", "a.go"}, "rust:index/update", heavyIndexBytes},
+		{[]string{"index", "path-status", "/r", "--path", "a.go"}, "rust:index/path-status", heavyIndexBytes},
 		{[]string{"index", "stats", "/r"}, "", 0},
 		{[]string{"symbolgraph", "impact", "/r", "ws", "X", "2"}, "", 0},
 		{[]string{"changetrack", "drift", "/d", "/r", "ws"}, "", 0},

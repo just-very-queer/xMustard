@@ -1,5 +1,5 @@
 //! Per-workspace code index store (PAR-STORE-03) and its transient worker
-//! (`xmustard-core index build|update|stats|impact`, PAR-RT-02).
+//! (`xmustard-core index build|update|stats|path-status|impact`, PAR-RT-02).
 //!
 //! One SQLite file, `<git-dir>/xmustard-cache/index-v3/<scope>/index.db`, holds files,
 //! symbols with nested qualified names and stable UIDs, references (never from comments
@@ -1829,6 +1829,106 @@ pub fn areas(root: &Path, cfg: &IndexConfig, seed: u64) -> Result<serde_json::Va
     Ok(v)
 }
 
+/// Inspect one path using the indexer's current scan and ignore decisions.
+pub fn path_status(
+    root: &Path,
+    cfg: &IndexConfig,
+    path: &str,
+) -> Result<serde_json::Value, String> {
+    use std::path::Component;
+
+    let rel = Path::new(path);
+    if rel.as_os_str().is_empty()
+        || rel.is_absolute()
+        || rel
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("path must be a repository-relative file path".into());
+    }
+    let path = rel
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let layout = scan::layout(root, cfg)?;
+    let tracked = if layout.git_dir.is_some() {
+        let pathspec = format!(":(literal){path}");
+        let output = crate::indexcache::run_git_bounded(
+            &layout.root,
+            &["ls-files", "-z", "--", pathspec.as_str()],
+            64 << 10,
+            crate::indexcache::git_timeout(),
+        )
+        .map_err(|error| error.to_string())?;
+        output
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == path.as_bytes())
+    } else {
+        false
+    };
+    let scan = scan::scan(&layout, cfg)?;
+    let path_loss = scan
+        .beyond_sample
+        .iter()
+        .find(|(sample, _)| sample == &path)
+        .map(|(_, loss)| loss.clone());
+    let ignored_by = if path_loss.as_deref() == Some("ignore_budget") {
+        None
+    } else {
+        scan::ignored_by(&layout, cfg, &path, tracked)?
+    };
+    let candidate = scan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == path);
+    let doc = scan.docs.iter().any(|doc| doc.path == path);
+    let (state, reason, indexed) = if let Some(rule) = &ignored_by {
+        (
+            "ignored",
+            Some(format!("{}:{}: {}", rule.file, rule.line, rule.pattern)),
+            false,
+        )
+    } else if let Some(candidate) = candidate {
+        match candidate.loss {
+            Some(loss) => ("not-indexed", Some(loss.to_string()), false),
+            None => ("indexed", None, true),
+        }
+    } else if doc {
+        ("indexed", None, true)
+    } else if let Some(loss) = path_loss {
+        ("not-indexed", Some(loss), false)
+    } else if layout.git_dir.is_some() && !tracked {
+        (
+            "untracked",
+            Some("not listed as a tracked or eligible untracked path".into()),
+            false,
+        )
+    } else if !layout.root.join(&path).is_file() {
+        (
+            "not-indexed",
+            Some("path is not a regular file in the worktree".into()),
+            false,
+        )
+    } else {
+        (
+            "not-indexed",
+            Some("not eligible or outside the index envelope".into()),
+            false,
+        )
+    };
+    Ok(serde_json::json!({
+        "command": "path-status",
+        "path": path,
+        "state": state,
+        "indexed": indexed,
+        "ignored": ignored_by.is_some(),
+        "tracked": tracked,
+        "reason": reason,
+        "ignore_rule": ignored_by,
+    }))
+}
+
 /// `index stats`: the stored index's identity, freshness inputs and coverage; with
 /// `digest`, its content digest. Read-only: it never takes the writer lock and never
 /// opens the store for writing.
@@ -1882,8 +1982,8 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-const USAGE: &str = "xmustard-core index <build|update|stats|impact|areas|flows> <root> \
-    [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
+const USAGE: &str = "xmustard-core index <build|update|stats|path-status|impact|areas|flows> <root> \
+    [--path RELATIVE_PATH] [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
     [--identity-key KEY [--identity-limitations N]] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
@@ -1950,6 +2050,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut identity: Option<String> = None;
     let mut limitations: Option<usize> = None;
     let mut symbol: Option<String> = None;
+    let mut path: Option<String> = None;
     let mut impact_flags: Vec<String> = Vec::new();
     let mut flow_limit = flows::MAX_CANDIDATES;
     let mut seed: u64 = areas::DEFAULT_SEED;
@@ -1993,6 +2094,10 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
             }
             "--symbol" => {
                 symbol = args.get(i + 1).cloned();
+                2
+            }
+            "--path" if sub == "path-status" => {
+                path = args.get(i + 1).cloned();
                 2
             }
             "--depth" => {
@@ -2049,6 +2154,12 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
         "build" => to_value(stamped(build(&root, &cfg))),
         "update" => to_value(stamped(update(&root, &cfg, paths.as_deref()))),
         "stats" => stats(&root, &cfg, digest),
+        "path-status" => {
+            let Some(path) = path.as_deref() else {
+                return Err(CmdError::usage(USAGE));
+            };
+            path_status(&root, &cfg, path)
+        }
         "impact" => {
             let Some(sym) = symbol.as_deref() else {
                 return Err(CmdError::usage(USAGE));
