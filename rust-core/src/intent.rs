@@ -109,6 +109,18 @@ impl DecisionProvider for FixtureProvider {
     }
 }
 
+/// Validates both sides of the provider boundary for every implementation.
+pub fn decide(
+    provider: &dyn DecisionProvider,
+    question: &Question,
+    candidates: &[Candidate],
+) -> Result<Decision, ProviderError> {
+    validate_request(question, candidates)?;
+    let decision = provider.decide(question, candidates)?;
+    validate_decision(question, candidates, &decision)?;
+    Ok(decision)
+}
+
 /// Refuses incomplete, mismatched, or out-of-range provider output before it can be used.
 pub fn validate_decision(
     question: &Question,

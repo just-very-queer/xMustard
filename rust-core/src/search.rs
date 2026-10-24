@@ -336,6 +336,19 @@ impl Lane {
     }
 }
 
+fn score_key(
+    lane: Lane,
+    intent_mode: bool,
+    fuzzy_is_semantic: bool,
+    lane_name: &'static str,
+) -> &'static str {
+    match lane {
+        Lane::Intent => "semantic",
+        Lane::Fuzzy if fuzzy_is_semantic && intent_mode => "embedding",
+        _ => lane_name,
+    }
+}
+
 /// What a hit is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum Kind {
@@ -587,6 +600,21 @@ struct Ctx {
     miss: Option<TextMiss>,
     features: Features,
     snippet: Vec<Snippet>,
+}
+
+fn generation_is_stale(conn: &Connection, expected: i64) -> rusqlite::Result<bool> {
+    let generation: String = conn.query_row(
+        "SELECT value FROM meta WHERE key = 'generation'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(generation.parse::<i64>().ok() != Some(expected))
+}
+
+fn latest_generation_is_stale(snapshot: &crate::index::reader::Snapshot, expected: i64) -> bool {
+    snapshot
+        .with_unshared_text(|conn| generation_is_stale(conn, expected))
+        .unwrap_or(true)
 }
 
 fn bounded_excerpt(text: &str) -> String {
@@ -1280,19 +1308,52 @@ pub fn search(
             (Some(provider), Some(question), Some(opened)) => {
                 let deterministic_len = cands.len();
                 let mut cap_exhausted = false;
-                let decision = opened.snapshot.with_text(|conn| {
+                let decision = opened.snapshot.with_unshared_text(|conn| {
+                    conn.execute_batch("BEGIN")?;
+                    let generation: String = conn.query_row(
+                        "SELECT value FROM meta WHERE key = 'generation'",
+                        [],
+                        |row| row.get(0),
+                    )?;
+                    if generation.parse::<i64>().ok() != Some(opened.snapshot.generation) {
+                        return Ok::<_, rusqlite::Error>((
+                            Err(crate::intent::ProviderError::Fixture(
+                                "stale generation".into(),
+                            )),
+                            HashMap::new(),
+                            true,
+                            HashSet::new(),
+                        ));
+                    }
                     // Classify bounded file previews before opening declaration excerpts.
                     let mut file_candidates = Vec::new();
                     let mut file_targets: HashMap<String, Vec<usize>> = HashMap::new();
                     let mut file_paths = HashMap::new();
-                    let mut file_locs = Vec::new();
                     let mut stale_excerpt = false;
+                    let mut attempted_files = 0usize;
                     let seed_paths: BTreeSet<&str> = cands
                         .iter()
                         .filter(|candidate| candidate.kind != Kind::Doc)
                         .map(|candidate| candidate.path.as_ref())
                         .collect();
                     for path in seed_paths {
+                        if attempted_files >= crate::intent::MAX_CANDIDATE_FILES {
+                            cap_exhausted = true;
+                            break;
+                        }
+                        attempted_files += 1;
+                        match fts::file_identity_matches(conn, root, path)? {
+                            Ok(true) => {}
+                            Ok(false) | Err(fts::TextMiss::Changed) => {
+                                stale_excerpt = true;
+                                continue;
+                            }
+                            Err(fts::TextMiss::TooLarge) => {
+                                cap_exhausted = true;
+                                continue;
+                            }
+                            Err(fts::TextMiss::SecretPath) => continue,
+                        }
                         let loc = match fts::file_preview(conn, path) {
                             Ok(Some(loc)) => loc,
                             Ok(None) => continue,
@@ -1307,6 +1368,9 @@ pub fn search(
                         }
                         match fts::chunk_text(conn, root, &loc) {
                             Ok(excerpt) => {
+                                if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
+                                    cap_exhausted = true;
+                                }
                                 let id = format!("file:{path}");
                                 file_candidates.push(crate::intent::Candidate {
                                     id: id.clone(),
@@ -1315,7 +1379,6 @@ pub fn search(
                                         &crate::index::chunks::mask_secret_words(&excerpt),
                                     ),
                                 });
-                                file_locs.push(loc);
                                 file_paths.insert(id.clone(), path.to_string());
                                 file_targets.entry(id).or_default().extend(
                                     cands
@@ -1329,6 +1392,7 @@ pub fn search(
                                 );
                             }
                             Err(fts::TextMiss::Changed) => stale_excerpt = true,
+                            Err(fts::TextMiss::TooLarge) => cap_exhausted = true,
                             Err(_) => {}
                         }
                     }
@@ -1338,21 +1402,17 @@ pub fn search(
                     } else if file_candidates.is_empty() {
                         Err(crate::intent::ProviderError::CandidateMismatch)
                     } else {
-                        crate::intent::validate_request(question, &file_candidates)
-                            .and_then(|_| provider.decide(question, &file_candidates))
-                            .and_then(|decision| {
-                                crate::intent::validate_decision(
-                                    question,
-                                    &file_candidates,
-                                    &decision,
-                                )
-                                .map(|_| decision)
-                            })
+                        crate::intent::decide(provider, question, &file_candidates)
                     };
                     // A provider may take time; discard its decision if any excerpt went stale meanwhile.
-                    stale_excerpt |= file_locs
-                        .iter()
-                        .any(|loc| fts::chunk_text(conn, root, loc).is_err());
+                    stale_excerpt |=
+                        latest_generation_is_stale(&opened.snapshot, opened.snapshot.generation)
+                            || file_paths.values().any(|path| {
+                                !matches!(
+                                    fts::file_identity_matches(conn, root, path),
+                                    Ok(Ok(true))
+                                )
+                            });
                     let file_decision = match file_decision {
                         Ok(decision) => decision,
                         Err(error) => {
@@ -1360,6 +1420,7 @@ pub fn search(
                                 Err(error),
                                 file_targets,
                                 stale_excerpt,
+                                HashSet::new(),
                             ));
                         }
                     };
@@ -1368,6 +1429,7 @@ pub fn search(
                             Err(crate::intent::ProviderError::Fixture("stale source".into())),
                             file_targets,
                             true,
+                            HashSet::new(),
                         ));
                     }
                     let positive_paths: HashSet<String> = file_decision
@@ -1413,6 +1475,7 @@ pub fn search(
                     let mut declaration_candidates = Vec::new();
                     let mut declaration_targets: HashMap<String, Vec<usize>> = HashMap::new();
                     let mut declaration_locs = Vec::new();
+                    let mut newly_discovered = HashSet::new();
                     let mut seen_declarations = HashSet::new();
                     let mut declaration_paths: Vec<&String> = positive_paths.iter().collect();
                     declaration_paths.sort();
@@ -1439,9 +1502,16 @@ pub fn search(
                                     stale_excerpt = true;
                                     continue;
                                 }
+                                Err(fts::TextMiss::TooLarge) => {
+                                    cap_exhausted = true;
+                                    continue;
+                                }
                                 Err(_) => continue,
                             };
                             let id = format!("decl:{}:{}:{}", path, decl.name_line, decl.name);
+                            if excerpt.len() > crate::intent::MAX_EXCERPT_BYTES {
+                                cap_exhausted = true;
+                            }
                             declaration_locs.push(loc.clone());
                             declaration_candidates.push(crate::intent::Candidate {
                                 id: id.clone(),
@@ -1475,6 +1545,7 @@ pub fn search(
                                         hotspot: false,
                                         semantic: None,
                                     });
+                                    newly_discovered.insert(index);
                                     index
                                 }
                             };
@@ -1486,24 +1557,23 @@ pub fn search(
                             Err(crate::intent::ProviderError::Fixture("stale source".into())),
                             file_targets,
                             true,
+                            HashSet::new(),
                         ));
                     }
                     if !declaration_candidates.is_empty() {
                         let decision =
-                            crate::intent::validate_request(question, &declaration_candidates)
-                                .and_then(|_| provider.decide(question, &declaration_candidates))
-                                .and_then(|decision| {
-                                    crate::intent::validate_decision(
-                                        question,
-                                        &declaration_candidates,
-                                        &decision,
-                                    )
-                                    .map(|_| decision)
-                                });
-                        stale_excerpt |= file_locs
-                            .iter()
-                            .chain(&declaration_locs)
-                            .any(|loc| fts::chunk_text(conn, root, loc).is_err());
+                            crate::intent::decide(provider, question, &declaration_candidates);
+                        stale_excerpt |= latest_generation_is_stale(
+                            &opened.snapshot,
+                            opened.snapshot.generation,
+                        ) || file_paths.values().any(|path| {
+                            !matches!(fts::file_identity_matches(conn, root, path), Ok(Ok(true)))
+                        }) || declaration_locs.iter().any(|loc| {
+                            !matches!(
+                                fts::file_identity_matches(conn, root, &loc.path),
+                                Ok(Ok(true))
+                            )
+                        });
                         match decision {
                             Ok(_) if stale_excerpt => {
                                 return Ok::<_, rusqlite::Error>((
@@ -1512,6 +1582,7 @@ pub fn search(
                                     )),
                                     file_targets,
                                     true,
+                                    HashSet::new(),
                                 ));
                             }
                             Ok(decision) => probabilities.extend(decision.probabilities),
@@ -1525,11 +1596,13 @@ pub fn search(
                                     Err(error),
                                     file_targets,
                                     stale_excerpt,
+                                    HashSet::new(),
                                 ));
                             }
                         }
                     }
                     file_targets.extend(declaration_targets);
+                    conn.execute_batch("COMMIT")?;
                     Ok::<_, rusqlite::Error>((
                         Ok(crate::intent::Decision {
                             question_id: question.id.clone(),
@@ -1537,10 +1610,11 @@ pub fn search(
                         }),
                         file_targets,
                         stale_excerpt,
+                        newly_discovered,
                     ))
                 });
                 match decision {
-                    Ok((Ok(decision), targets, stale_excerpt)) => {
+                    Ok((Ok(decision), targets, stale_excerpt, newly_discovered)) => {
                         if stale_excerpt {
                             cands.truncate(deterministic_len);
                             degradations.push("semantic_stale".to_string());
@@ -1557,6 +1631,13 @@ pub fn search(
                                     }
                                 }
                             }
+                            let mut candidate_index = 0;
+                            cands.retain(|candidate| {
+                                let keep = !newly_discovered.contains(&candidate_index)
+                                    || candidate.semantic.is_some();
+                                candidate_index += 1;
+                                keep
+                            });
                         }
                     }
                     Ok((
@@ -1566,17 +1647,22 @@ pub fn search(
                         ),
                         _,
                         _,
+                        _,
                     )) => {
                         cands.truncate(deterministic_len);
                         degradations.push("semantic_budget".to_string());
                     }
-                    Ok((Err(_), _, true)) => {
+                    Ok((Err(_), _, true, _)) => {
                         cands.truncate(deterministic_len);
                         degradations.push("semantic_stale".to_string());
                     }
-                    Ok((Err(_), _, false)) => {
+                    Ok((Err(_), _, false, _)) => {
                         cands.truncate(deterministic_len);
-                        degradations.push("semantic_unavailable".to_string());
+                        degradations.push(if cap_exhausted {
+                            "semantic_budget".to_string()
+                        } else {
+                            "semantic_unavailable".to_string()
+                        });
                     }
                     Err(_) => {
                         cands.truncate(deterministic_len);
@@ -1658,6 +1744,7 @@ pub fn search(
         text: &text,
         seed: effective_seed.as_deref().unwrap_or(""),
         body_only,
+        intent_mode: opts.mode == SearchMode::Intent,
     };
     let hits: Vec<SearchHit> = order
         .get(opts.offset..page_end)
@@ -1754,6 +1841,7 @@ struct Render<'a> {
     /// `mode=text`: the bm25 lane read the body column, so a hit names `body` and says
     /// so, rather than claiming the whole-chunk bm25 it did not run.
     body_only: bool,
+    intent_mode: bool,
 }
 
 impl Render<'_> {
@@ -1836,12 +1924,15 @@ impl Render<'_> {
             .into_iter()
             .filter(|l| lanes & l.bit() != 0)
             .map(|l| {
-                let name = match l {
-                    Lane::Intent => "semantic",
-                    Lane::Fuzzy if fuzzy_lane() == "semantic" => "embedding",
-                    _ => self.lane_name(l),
-                };
-                (name, round6(c.lane_score(l, text)))
+                (
+                    score_key(
+                        l,
+                        self.intent_mode,
+                        fuzzy_lane() == "semantic",
+                        self.lane_name(l),
+                    ),
+                    round6(c.lane_score(l, text)),
+                )
             })
             .collect();
         scores.insert("rrf", round6(rrf));
@@ -1883,7 +1974,8 @@ impl Render<'_> {
 mod tests {
     use super::*;
     use std::process::Command;
-    use std::sync::Mutex;
+    use std::sync::{Mutex, mpsc};
+    use std::time::Duration;
     use tempfile::TempDir;
 
     #[derive(Debug, Default)]
@@ -1964,6 +2056,68 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct GenerationChangingProvider {
+        db_path: std::path::PathBuf,
+        changed: Mutex<bool>,
+    }
+
+    impl crate::intent::DecisionProvider for GenerationChangingProvider {
+        fn decide(
+            &self,
+            question: &crate::intent::Question,
+            candidates: &[crate::intent::Candidate],
+        ) -> Result<crate::intent::Decision, crate::intent::ProviderError> {
+            let mut changed = self.changed.lock().unwrap();
+            if !*changed {
+                let conn = Connection::open(&self.db_path)
+                    .map_err(|error| crate::intent::ProviderError::Fixture(error.to_string()))?;
+                conn.execute(
+                    "UPDATE meta SET value = CAST(value AS INTEGER) + 1 WHERE key = 'generation'",
+                    [],
+                )
+                .map_err(|error| crate::intent::ProviderError::Fixture(error.to_string()))?;
+                *changed = true;
+            }
+            Ok(crate::intent::Decision {
+                question_id: question.id.clone(),
+                probabilities: candidates
+                    .iter()
+                    .map(|candidate| (candidate.id.clone(), 0.9))
+                    .collect(),
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct LateMutatingProvider {
+        path: std::path::PathBuf,
+        updated_source: String,
+        changed: Mutex<bool>,
+    }
+
+    impl crate::intent::DecisionProvider for LateMutatingProvider {
+        fn decide(
+            &self,
+            question: &crate::intent::Question,
+            candidates: &[crate::intent::Candidate],
+        ) -> Result<crate::intent::Decision, crate::intent::ProviderError> {
+            let mut changed = self.changed.lock().unwrap();
+            if !*changed {
+                std::fs::write(&self.path, &self.updated_source)
+                    .map_err(|error| crate::intent::ProviderError::Fixture(error.to_string()))?;
+                *changed = true;
+            }
+            Ok(crate::intent::Decision {
+                question_id: question.id.clone(),
+                probabilities: candidates
+                    .iter()
+                    .map(|candidate| (candidate.id.clone(), 0.9))
+                    .collect(),
+            })
+        }
+    }
+
     fn git_repo(files: &[(&str, &str)]) -> TempDir {
         let dir = TempDir::new().unwrap();
         for (rel, content) in files {
@@ -1995,6 +2149,48 @@ mod tests {
         let cfg = crate::index::config::IndexConfig::load(dir.path()).unwrap();
         crate::index::build(dir.path(), &cfg).unwrap();
         dir
+    }
+
+    #[test]
+    fn query_local_text_connection_does_not_wait_for_the_shared_snapshot_lock() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn reconcile() {}\n")]);
+        let opened = crate::index::reader::open(repo.path()).unwrap();
+        let snapshot = opened.snapshot.clone();
+        let (locked_tx, locked_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            snapshot
+                .with_text(|_| {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        locked_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the shared connection should be locked");
+
+        let (reader_tx, reader_rx) = mpsc::channel();
+        let snapshot = opened.snapshot.clone();
+        let reader = std::thread::spawn(move || {
+            let succeeded = snapshot.with_unshared_text(|_| Ok(())).is_ok();
+            reader_tx.send(succeeded).unwrap();
+        });
+        let progressed_during_lock = reader_rx.recv_timeout(Duration::from_millis(200));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        reader.join().unwrap();
+
+        assert!(progressed_during_lock.is_ok_and(|progressed| progressed));
+    }
+
+    #[test]
+    fn intent_score_keys_preserve_legacy_onnx_and_text_contracts() {
+        assert_eq!(score_key(Lane::Fuzzy, false, true, "semantic"), "semantic");
+        assert_eq!(score_key(Lane::Fuzzy, true, true, "semantic"), "embedding");
+        assert_eq!(score_key(Lane::Intent, true, true, "intent"), "semantic");
+        assert_eq!(score_key(Lane::Bm25, false, false, "body"), "body");
     }
 
     #[test]
@@ -2196,6 +2392,44 @@ mod tests {
             .expect("positive declaration discovered from its positive file");
         assert!(declaration.lanes_matched.contains(&"intent"));
         assert_eq!(declaration.scores["semantic"], 0.95);
+    }
+
+    #[test]
+    fn rejected_new_declaration_does_not_enter_the_result_pool() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn needle() {}\npub fn unrelated() {}\n")]);
+        let provider = TargetProvider {
+            positive_ids: vec!["file:src/lib.rs".into()],
+            requests: Mutex::new(Vec::new()),
+        };
+        let question = crate::intent::Question {
+            id: "q".into(),
+            text: "Does this implement the requested behavior?".into(),
+        };
+        let baseline = hybrid_search(repo.path(), "ws", "needle", 10, None);
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.total, baseline.total + 1);
+        assert!(result.hits.iter().any(|hit| hit.name == "needle"));
+        assert!(result.hits.iter().all(|hit| hit.name != "unrelated"));
+        let requests = provider.requests.lock().unwrap();
+        assert!(
+            requests
+                .iter()
+                .flatten()
+                .any(|candidate| candidate.id == "decl:src/lib.rs:2:unrelated")
+        );
     }
 
     #[test]
@@ -2457,6 +2691,134 @@ mod tests {
     }
 
     #[test]
+    fn intent_file_read_cap_bounds_attempts_when_candidates_are_stale() {
+        let files: Vec<(String, String)> = (0..40)
+            .map(|index| {
+                (
+                    format!("src/needle{index:02}.rs"),
+                    format!("pub fn work_{index:02}() {{}}\n"),
+                )
+            })
+            .collect();
+        let file_refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(path, contents)| (path.as_str(), contents.as_str()))
+            .collect();
+        let repo = indexed_repo(&file_refs);
+        for (path, _) in &files {
+            std::fs::write(repo.path().join(path), "pub fn changed() {}\n").unwrap();
+        }
+        let before = crate::index::fts::file_identity_reads();
+        let question = crate::intent::Question {
+            id: "q-read-cap".into(),
+            text: "Does this implement the requested behavior?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 50,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&RecordingProvider::default()),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            crate::index::fts::file_identity_reads() - before,
+            crate::intent::MAX_CANDIDATE_FILES as u64
+        );
+        assert!(result.degradations.iter().any(|d| d == "semantic_stale"));
+    }
+
+    #[test]
+    fn oversized_file_preview_is_reported_with_other_candidates_classified() {
+        let huge = format!(
+            "pub fn huge() {{ let value = \"{}\"; }}\n",
+            "x".repeat(crate::index::fts::MAX_CHUNK_READ as usize + 1)
+        );
+        let repo = indexed_repo(&[
+            ("src/needle_huge.rs", &huge),
+            ("src/needle_small.rs", "pub fn small() {}\n"),
+        ]);
+        let provider = RecordingProvider::default();
+        let question = crate::intent::Question {
+            id: "q-oversized-file".into(),
+            text: "Does this implement the requested behavior?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+
+        assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
+        let requests = provider.0.lock().unwrap();
+        assert!(
+            requests[0]
+                .iter()
+                .any(|candidate| candidate.id == "file:src/needle_small.rs")
+        );
+    }
+
+    #[test]
+    fn oversized_declaration_excerpt_is_reported_with_other_candidates_classified() {
+        let mut source = String::from("pub fn seed() {\n");
+        for _ in 0..160 {
+            source.push_str("    let value = 0;\n");
+        }
+        source.push_str("}\npub fn needle() {}\n");
+        source.push_str(&format!(
+            "pub fn huge() {{ let value = \"{}\"; }}\n",
+            "x".repeat(crate::index::fts::MAX_CHUNK_READ as usize + 1)
+        ));
+        let repo = indexed_repo(&[("src/needle.rs", &source)]);
+        let provider = RecordingProvider::default();
+        let question = crate::intent::Question {
+            id: "q-oversized-decl".into(),
+            text: "Does this implement the requested behavior?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "needle",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+
+        assert!(result.degradations.iter().any(|d| d == "semantic_budget"));
+        let requests = provider.0.lock().unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests[1]
+                .iter()
+                .any(|candidate| candidate.id == "decl:src/needle.rs:1:seed")
+        );
+        assert!(
+            !requests[1]
+                .iter()
+                .any(|candidate| candidate.id.contains(":huge"))
+        );
+    }
+
+    #[test]
     fn intent_declaration_cap_reports_partial_discovery() {
         let source = (0..=crate::intent::MAX_DECLARATIONS)
             .map(|index| format!("pub fn indexed_work_{index:02}() {{}}\n"))
@@ -2562,6 +2924,91 @@ mod tests {
                 ..Default::default()
             },
         );
+        assert!(result.degradations.iter().any(|d| d == "semantic_stale"));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| !hit.lanes_matched.contains(&"intent"))
+        );
+    }
+
+    #[test]
+    fn generation_change_during_provider_call_discards_intent_decisions() {
+        let repo = indexed_repo(&[("src/lib.rs", "pub fn reconcile() {}\n")]);
+        let baseline = hybrid_search(repo.path(), "ws", "reconcile", 10, None);
+        let cfg = crate::index::config::IndexConfig::load(repo.path()).unwrap();
+        let git_dir = repo.path().join(".git");
+        let db_path =
+            crate::index::index_dir(repo.path(), Some(&git_dir), &cfg).join(crate::index::DB_FILE);
+        let provider = GenerationChangingProvider {
+            db_path,
+            changed: Mutex::new(false),
+        };
+        let question = crate::intent::Question {
+            id: "q-generation".into(),
+            text: "Does this reconcile state?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "reconcile",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(result.hits, baseline.hits);
+        assert!(result.degradations.iter().any(|d| d == "semantic_stale"));
+        assert!(
+            result
+                .hits
+                .iter()
+                .all(|hit| !hit.lanes_matched.contains(&"intent"))
+        );
+    }
+
+    #[test]
+    fn changes_beyond_the_preview_window_invalidate_file_identity() {
+        let mut source = String::from("pub fn reconcile() {\n");
+        for line in 0..220 {
+            if line == 200 {
+                source.push_str("    let changed_late_window = 0;\n");
+            } else {
+                source.push_str(&format!("    let stable_value_{line} = {line};\n"));
+            }
+        }
+        source.push_str("}\n");
+        let updated_source = source.replace("changed_late_window", "mutated_late_window");
+        let repo = indexed_repo(&[("src/lib.rs", &source)]);
+        let provider = LateMutatingProvider {
+            path: repo.path().join("src/lib.rs"),
+            updated_source,
+            changed: Mutex::new(false),
+        };
+        let question = crate::intent::Question {
+            id: "q-late-source".into(),
+            text: "Does this reconcile state?".into(),
+        };
+        let result = search(
+            repo.path(),
+            "ws",
+            None,
+            "reconcile",
+            &SearchOptions {
+                limit: 10,
+                mode: SearchMode::Intent,
+                intent_provider: Some(&provider),
+                intent_question: Some(&question),
+                ..Default::default()
+            },
+        );
+
         assert!(result.degradations.iter().any(|d| d == "semantic_stale"));
         assert!(
             result

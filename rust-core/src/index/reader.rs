@@ -415,6 +415,16 @@ impl Snapshot {
         f(conn).map_err(sql)
     }
 
+    /// Open a query-local text connection for work that may call an external classifier.
+    /// The shared snapshot text mutex must never be held across provider execution.
+    pub fn with_unshared_text<R>(
+        &self,
+        f: impl FnOnce(&Connection) -> rusqlite::Result<R>,
+    ) -> Result<R, String> {
+        let conn = super::fts::open(&self.db).map_err(sql)?;
+        f(&conn).map_err(sql)
+    }
+
     /// Files declaring `symbol` (non-local declarations), in path order.
     fn defining_files(&self, symbol: &str) -> Result<BTreeSet<u32>, String> {
         let Some(n) = self.seg.name_id(symbol)? else {
