@@ -283,10 +283,103 @@ pub fn layout(root: &Path, cfg: &IndexConfig) -> Result<Layout, String> {
 }
 
 pub fn scan(layout: &Layout, cfg: &IndexConfig) -> Result<Scan, String> {
+    scan_with_ignore_budget(
+        layout,
+        cfg,
+        super::ignore::MATCH_BUDGET,
+        super::ignore::PATH_ALLOWANCE,
+    )
+}
+
+pub(super) fn scan_with_ignore_budget(
+    layout: &Layout,
+    cfg: &IndexConfig,
+    budget: u64,
+    allowance: u64,
+) -> Result<Scan, String> {
     match &layout.git_dir {
-        Some(g) => scan_git(&layout.root, g.clone(), &layout.prefix, cfg),
-        None => Ok(scan_walk(&layout.root, cfg)),
+        Some(g) => scan_git(
+            &layout.root,
+            g.clone(),
+            &layout.prefix,
+            cfg,
+            budget,
+            allowance,
+        ),
+        None => Ok(scan_walk(&layout.root, cfg, budget, allowance)),
     }
+}
+
+/// Explain an ignore decision using the same rules and Git semantics as the indexer.
+pub fn ignored_by(
+    layout: &Layout,
+    cfg: &IndexConfig,
+    path: &str,
+    tracked: bool,
+) -> Result<Option<super::ignore::IgnoreMatch>, String> {
+    let mut ignores = Ignore::with_defaults();
+    if layout.git_dir.is_some() {
+        if !tracked {
+            let args = ["check-ignore", "-v", "-z", "--stdin"];
+            match crate::indexcache::run_git_bounded_input(
+                &layout.root,
+                &args,
+                format!("{path}\0").into_bytes(),
+                64 << 10,
+                git_timeout(),
+            ) {
+                Ok(output) => {
+                    let fields: Vec<&[u8]> = output.split(|byte| *byte == 0).collect();
+                    if fields.len() >= 3 {
+                        let file = String::from_utf8_lossy(fields[0]).into_owned();
+                        let line = String::from_utf8_lossy(fields[1]).parse().unwrap_or(0);
+                        let pattern = String::from_utf8_lossy(fields[2]).into_owned();
+                        return Ok(Some(super::ignore::IgnoreMatch {
+                            file,
+                            line,
+                            pattern,
+                        }));
+                    }
+                }
+                Err(crate::indexcache::GitRunError::Failed) => {}
+                Err(error) => return Err(error.to_string()),
+            }
+        }
+        let mut files = Vec::new();
+        let mut untracked_listings = vec![false];
+        if cfg.include_untracked {
+            untracked_listings.push(true);
+        }
+        for untracked in untracked_listings {
+            crate::gitindex::list_using(
+                &layout.root,
+                crate::gitindex::Setting::from_env(),
+                Listing::Named {
+                    name: XMUSTARD_IGNORE,
+                    untracked,
+                },
+                &mut |record, _| {
+                    if let Ok(file) = std::str::from_utf8(record)
+                        && basename(file) == XMUSTARD_IGNORE
+                        && files.len() < MAX_IGNORE_FILES
+                    {
+                        files.push(file.to_string());
+                    }
+                },
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        ignores.load_xmustard(&layout.root, &files);
+    } else {
+        load_dir_ignores(&layout.root, "", &mut ignores);
+        let mut parent = PathBuf::new();
+        let components: Vec<_> = Path::new(path).components().collect();
+        for component in components.iter().take(components.len().saturating_sub(1)) {
+            parent.push(component.as_os_str());
+            load_dir_ignores(&layout.root, &parent.to_string_lossy(), &mut ignores);
+        }
+    }
+    Ok(ignores.ignored_by(path, false))
 }
 
 /// The Git dir and the root's prefix below the top level, or None outside a worktree.
@@ -751,6 +844,8 @@ fn scan_git(
     git_dir: PathBuf,
     prefix: &str,
     cfg: &IndexConfig,
+    budget: u64,
+    allowance: u64,
 ) -> Result<Scan, String> {
     let started_ns = now_ns();
     let git_index = git_index_key(&git_dir);
@@ -786,7 +881,7 @@ fn scan_git(
     ig.load_xmustard(root, &ignore_files);
 
     let mut col = Collector::new(root, cfg);
-    let mut memo = DirMemo::default();
+    let mut memo = DirMemo::with_budget(budget, allowance);
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
     // `.gitmodules` sits at the top level and names top-level paths
@@ -871,13 +966,13 @@ fn scan_git(
     })
 }
 
-fn scan_walk(root: &Path, cfg: &IndexConfig) -> Scan {
+fn scan_walk(root: &Path, cfg: &IndexConfig, budget: u64, allowance: u64) -> Scan {
     let started_ns = now_ns();
     let mut col = Collector::new(root, cfg);
     let mut ignored = 0usize;
     let mut invalid_paths = 0usize;
     let mut ig = Ignore::with_defaults();
-    let mut memo = DirMemo::default();
+    let mut memo = DirMemo::with_budget(budget, allowance);
     // .gitignore files are applied top-down as directories are entered.
     let mut it = walkdir::WalkDir::new(root)
         .follow_links(false)

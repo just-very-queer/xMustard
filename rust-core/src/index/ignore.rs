@@ -23,6 +23,7 @@
 
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
 /// Directory names skipped by default, anywhere in a path. The single list shared by the
 /// legacy scanner, the repo map and the index, so all three agree on what is vendored or
@@ -494,12 +495,22 @@ impl Glob {
 struct Rule {
     /// Directory of the ignore file, relative to the index root ("" at the root).
     base: String,
+    file: Arc<str>,
+    line: usize,
+    pattern: String,
     glob: Glob,
     negate: bool,
     dir_only: bool,
     /// Pattern contains a slash (other than trailing): matched against the path
     /// relative to `base` rather than against any single name.
     anchored: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct IgnoreMatch {
+    pub file: String,
+    pub line: usize,
+    pub pattern: String,
 }
 
 /// One ignore-file line.
@@ -620,7 +631,7 @@ impl Ignore {
         for d in DEFAULT_EXCLUDED_RELATIVE_DIRS {
             defaults.push_str(&format!("/{d}/\n"));
         }
-        ig.add_file("", &defaults);
+        ig.add_file_from("", "built-in defaults", &defaults);
         ig
     }
 
@@ -631,8 +642,13 @@ impl Ignore {
 
     /// Add the rules of one ignore file located in directory `base` (relative).
     pub fn add_file(&mut self, base: &str, content: &str) {
+        self.add_file_from(base, "<unknown>", content);
+    }
+
+    fn add_file_from(&mut self, base: &str, file: &str, content: &str) {
+        let file: Arc<str> = Arc::from(file);
         let mut kept = 0usize;
-        for line in content.lines() {
+        for (line_number, line) in content.lines().enumerate() {
             match parse_line(line) {
                 Line::NotARule => {}
                 Line::TooLong => self.dropped_rules += 1,
@@ -652,6 +668,9 @@ impl Ignore {
                     self.pattern_bytes += pattern.len();
                     self.rules.push(Rule {
                         base: base.trim_matches('/').to_string(),
+                        file: Arc::clone(&file),
+                        line: line_number + 1,
+                        pattern: line.to_string(),
                         glob: Glob::compile(pattern.as_bytes()),
                         negate,
                         dir_only,
@@ -674,7 +693,7 @@ impl Ignore {
             return;
         }
         match crate::symbolgraph::read_repo_bytes_beneath_capped(root, rel, MAX_IGNORE_FILE_BYTES) {
-            Ok(bytes) => self.add_file(base, &String::from_utf8_lossy(&bytes)),
+            Ok(bytes) => self.add_file_from(base, rel, &String::from_utf8_lossy(&bytes)),
             Err(e) if e.kind() == std::io::ErrorKind::InvalidInput => self.dropped_rules += 1,
             Err(_) => {}
         }
@@ -728,18 +747,56 @@ impl Ignore {
         Some(hit)
     }
 
-    /// Last matching rule for exactly this path (not its parents): `Some(ignored)`,
-    /// `None` when no rule matches, `Err` once the budget is spent.
-    fn decide(&self, path: &str, is_dir: bool, budget: &mut u64) -> Result<Option<bool>, ()> {
+    fn decide_with_rule(
+        &self,
+        path: &str,
+        is_dir: bool,
+        budget: &mut u64,
+    ) -> Result<Option<(bool, &Rule)>, ()> {
         let name = path.rsplit('/').next().unwrap_or(path);
         for r in self.rules.iter().rev() {
             match Self::rule_matches(r, path, name, is_dir, budget) {
                 None => return Err(()),
-                Some(true) => return Ok(Some(!r.negate)),
+                Some(true) => return Ok(Some((!r.negate, r))),
                 Some(false) => {}
             }
         }
         Ok(None)
+    }
+
+    /// Last matching rule for exactly this path (not its parents): `Some(ignored)`,
+    /// `None` when no rule matches, `Err` once the budget is spent.
+    fn decide(&self, path: &str, is_dir: bool, budget: &mut u64) -> Result<Option<bool>, ()> {
+        self.decide_with_rule(path, is_dir, budget)
+            .map(|decision| decision.map(|(ignored, _)| ignored))
+    }
+
+    /// Return the rule that excludes `rel`, including an ignored parent directory.
+    pub fn ignored_by(&self, rel: &str, is_dir: bool) -> Option<IgnoreMatch> {
+        let rel = rel.trim_matches('/');
+        if self.check(&mut DirMemo::default(), rel, is_dir) != Verdict::Ignored {
+            return None;
+        }
+        let mut budget = u64::MAX;
+        let mut end = 0;
+        while end < rel.len() {
+            let next = rel[end..]
+                .find('/')
+                .map_or(rel.len(), |offset| end + offset);
+            let path = &rel[..next];
+            let component_is_dir = next < rel.len() || is_dir;
+            if let Ok(Some((true, rule))) =
+                self.decide_with_rule(path, component_is_dir, &mut budget)
+            {
+                return Some(IgnoreMatch {
+                    file: rule.file.to_string(),
+                    line: rule.line,
+                    pattern: rule.pattern.clone(),
+                });
+            }
+            end = next + 1;
+        }
+        None
     }
 
     /// Whether `rel` (a file path relative to the index root) is ignored: its own last

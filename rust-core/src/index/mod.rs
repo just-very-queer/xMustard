@@ -1,5 +1,5 @@
 //! Per-workspace code index store (PAR-STORE-03) and its transient worker
-//! (`xmustard-core index build|update|stats|impact`, PAR-RT-02).
+//! (`xmustard-core index build|update|stats|path-status|impact`, PAR-RT-02).
 //!
 //! One SQLite file, `<git-dir>/xmustard-cache/index-v3/<scope>/index.db`, holds files,
 //! symbols with nested qualified names and stable UIDs, references (never from comments
@@ -1830,6 +1830,129 @@ pub fn areas(root: &Path, cfg: &IndexConfig, seed: u64) -> Result<serde_json::Va
     Ok(v)
 }
 
+/// Inspect one path using the indexer's current scan and ignore decisions.
+pub fn path_status(
+    root: &Path,
+    cfg: &IndexConfig,
+    path: &str,
+) -> Result<serde_json::Value, String> {
+    use std::path::Component;
+
+    let rel = Path::new(path);
+    if rel.as_os_str().is_empty()
+        || rel.is_absolute()
+        || rel
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        return Err("path must be a repository-relative file path".into());
+    }
+    let path = rel
+        .components()
+        .map(|part| part.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    let layout = scan::layout(root, cfg)?;
+    let tracked = if layout.git_dir.is_some() {
+        let pathspec = format!(":(literal){path}");
+        let output = crate::indexcache::run_git_bounded(
+            &layout.root,
+            &["ls-files", "-z", "--", pathspec.as_str()],
+            64 << 10,
+            crate::indexcache::git_timeout(),
+        )
+        .map_err(|error| error.to_string())?;
+        output
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == path.as_bytes())
+    } else {
+        false
+    };
+    let scan = scan::scan(&layout, cfg)?;
+    path_status_from_scan(&layout, cfg, &path, tracked, scan)
+}
+
+fn path_status_from_scan(
+    layout: &Layout,
+    cfg: &IndexConfig,
+    path: &str,
+    tracked: bool,
+    scan: Scan,
+) -> Result<serde_json::Value, String> {
+    let path_loss = scan
+        .beyond_sample
+        .iter()
+        .find(|(sample, _)| sample == path)
+        .map(|(_, loss)| loss.clone());
+    let ignored_by = if path_loss.as_deref() == Some("ignore_budget") {
+        None
+    } else {
+        scan::ignored_by(layout, cfg, path, tracked)?
+    };
+    let candidate = scan
+        .candidates
+        .iter()
+        .find(|candidate| candidate.path == path);
+    let doc = scan.docs.iter().find(|doc| doc.path == path);
+    let ignore_budget_exhausted = scan.beyond.get("ignore_budget").copied().unwrap_or(0) > 0
+        && candidate.is_none()
+        && doc.is_none()
+        && path_loss.is_none();
+    let (state, reason, indexed) = if let Some(rule) = &ignored_by {
+        let reason = format!("{}:{}: {}", rule.file, rule.line, rule.pattern);
+        let reason = if ignore_budget_exhausted {
+            format!(
+                "{reason} (the scan's ignore budget ran out; the indexer's own decision for this path was not retained)"
+            )
+        } else {
+            reason
+        };
+        ("ignored", Some(reason), false)
+    } else if let Some(candidate) = candidate {
+        match candidate.loss {
+            Some(loss) => ("not-indexed", Some(loss.to_string()), false),
+            None => ("indexed", None, true),
+        }
+    } else if let Some(doc) = doc {
+        match doc.loss {
+            Some(loss) => ("not-indexed", Some(loss.to_string()), false),
+            None => ("indexed", None, true),
+        }
+    } else if ignore_budget_exhausted {
+        ("not-indexed", Some("ignore_budget".into()), false)
+    } else if let Some(loss) = path_loss {
+        ("not-indexed", Some(loss), false)
+    } else if layout.git_dir.is_some() && !tracked {
+        (
+            "untracked",
+            Some("not listed as a tracked or eligible untracked path".into()),
+            false,
+        )
+    } else if !layout.root.join(path).is_file() {
+        (
+            "not-indexed",
+            Some("path is not a regular file in the worktree".into()),
+            false,
+        )
+    } else {
+        (
+            "not-indexed",
+            Some("not eligible or outside the index envelope".into()),
+            false,
+        )
+    };
+    Ok(serde_json::json!({
+        "command": "path-status",
+        "path": path,
+        "state": state,
+        "indexed": indexed,
+        "ignored": ignored_by.is_some(),
+        "tracked": tracked,
+        "reason": reason,
+        "ignore_rule": ignored_by,
+    }))
+}
+
 /// `index stats`: the stored index's identity, freshness inputs and coverage; with
 /// `digest`, its content digest. Read-only: it never takes the writer lock and never
 /// opens the store for writing.
@@ -1883,8 +2006,8 @@ pub fn stats(root: &Path, cfg: &IndexConfig, digest: bool) -> Result<serde_json:
     Ok(v)
 }
 
-const USAGE: &str = "xmustard-core index <build|update|stats|impact|areas|flows> <root> \
-    [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
+const USAGE: &str = "xmustard-core index <build|update|stats|path-status|impact|areas|flows> <root> \
+    [--path RELATIVE_PATH] [--content-retention full|symbol|none] [--max-file-size N] [--max-files N] \
     [--max-symbols N] [--max-total-bytes N] [--max-parse-bytes N] [--index-dir DIR] \
     [--allow-non-git] [--include-untracked] [--no-cache] [--paths P ...] [--digest] \
     [--identity-key KEY [--identity-limitations N]] [--symbol NAME|QUALIFIED|UID|PATH] [--depth N] [--direction=D] \
@@ -1951,6 +2074,7 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
     let mut identity: Option<String> = None;
     let mut limitations: Option<usize> = None;
     let mut symbol: Option<String> = None;
+    let mut path: Option<String> = None;
     let mut impact_flags: Vec<String> = Vec::new();
     let mut flow_limit = flows::MAX_CANDIDATES;
     let mut seed: u64 = areas::DEFAULT_SEED;
@@ -1994,6 +2118,10 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
             }
             "--symbol" => {
                 symbol = args.get(i + 1).cloned();
+                2
+            }
+            "--path" if sub == "path-status" => {
+                path = args.get(i + 1).cloned();
                 2
             }
             "--depth" => {
@@ -2050,6 +2178,12 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
         "build" => to_value(stamped(build(&root, &cfg))),
         "update" => to_value(stamped(update(&root, &cfg, paths.as_deref()))),
         "stats" => stats(&root, &cfg, digest),
+        "path-status" => {
+            let Some(path) = path.as_deref() else {
+                return Err(CmdError::usage(USAGE));
+            };
+            path_status(&root, &cfg, path)
+        }
         "impact" => {
             let Some(sym) = symbol.as_deref() else {
                 return Err(CmdError::usage(USAGE));
@@ -2070,6 +2204,65 @@ pub fn run(args: crate::dispatch::Args) -> crate::dispatch::CmdResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn undecided_paths_beyond_the_sample_report_ignore_budget() {
+        use std::process::Command;
+
+        let root = tempfile::TempDir::new().unwrap();
+        let count = meta::MAX_LOSS_ENTRIES + 1;
+        let target = format!("z{:03}.ts", count - 1);
+        for i in 0..count {
+            fs::write(
+                root.path().join(format!("z{i:03}.ts")),
+                "export const value = 1;\n",
+            )
+            .unwrap();
+        }
+        fs::write(
+            root.path().join("zz-ignore.ts"),
+            "export const ignored = 1;\n",
+        )
+        .unwrap();
+        fs::write(root.path().join(".xmustardignore"), "zz-ignore.ts\n").unwrap();
+        for args in [["init", "-q"], ["add", "-A"]] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(root.path())
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        let cfg = IndexConfig::default();
+        let layout = scan::layout(root.path(), &cfg).unwrap();
+        let scan = scan::scan_with_ignore_budget(&layout, &cfg, 0, 0).unwrap();
+        assert!(scan.beyond.get("ignore_budget").copied().unwrap_or(0) > 0);
+        assert!(!scan.beyond_sample.iter().any(|(path, _)| path == &target));
+
+        let status = path_status_from_scan(&layout, &cfg, &target, true, scan).unwrap();
+        assert_eq!(status["state"], "not-indexed", "{status}");
+        assert_eq!(status["reason"], "ignore_budget", "{status}");
+        assert_eq!(status["indexed"], false, "{status}");
+
+        let scan = scan::scan_with_ignore_budget(&layout, &cfg, 0, 0).unwrap();
+        assert!(
+            !scan
+                .beyond_sample
+                .iter()
+                .any(|(path, _)| path == "zz-ignore.ts")
+        );
+        let ignored = path_status_from_scan(&layout, &cfg, "zz-ignore.ts", true, scan).unwrap();
+        assert_eq!(ignored["state"], "ignored", "{ignored}");
+        assert!(ignored["reason"]
+            .as_str()
+            .unwrap()
+            .contains("the scan's ignore budget ran out; the indexer's own decision for this path was not retained"));
+    }
 
     #[test]
     fn a_stat_key_inside_fat_timestamp_granularity_is_racy() {

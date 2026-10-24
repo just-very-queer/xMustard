@@ -1131,8 +1131,16 @@ fn ignore_files_and_non_git_mode() {
         ("gen/out.ts", "export function generated() {}\n"),
         ("vendor/lib.go", "package lib\n\nfunc Vendored() {}\n"),
         ("third_party/x/y.go", "package y\n\nfunc Third() {}\n"),
+        (".gitignore", "ci/\n"),
         (".xmustardignore", "gen/\n!vendor/\n"),
     ]);
+    write(
+        r.path(),
+        "ci/private.ts",
+        "export function privateCode() {}\n",
+    );
+    git(r.path(), &["add", "-f", "ci/private.ts"]);
+    commit_all(r.path());
     let rep = index("build", r.path(), &[]);
     let conn = db(&rep);
     let mut st = conn
@@ -1143,7 +1151,7 @@ fn ignore_files_and_non_git_mode() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    assert_eq!(paths, vec!["src/keep.ts", "vendor/lib.go"]);
+    assert_eq!(paths, vec!["ci/private.ts", "src/keep.ts", "vendor/lib.go"]);
     assert_eq!(rep["coverage"]["ignored_files"], 2);
 
     // outside Git: refused unless allowed; then .gitignore applies
@@ -1167,6 +1175,61 @@ fn ignore_files_and_non_git_mode() {
     );
     assert_eq!(rep["repo_mode"], "non-git");
     assert_eq!(rep["coverage"]["indexed_files"], 1);
+}
+
+#[test]
+fn path_status_matches_the_indexer_and_reports_ignore_sources() {
+    let r = repo(&[
+        ("src/keep.ts", "export function keep() {}\n"),
+        ("force.ts", "export function force() {}\n"),
+        ("excluded.ts", "export function excluded() {}\n"),
+        (".env.md", "secret documentation\n"),
+        (".gitignore", "force.ts\nprivate-untracked.ts\n"),
+        (".xmustardignore", "excluded.ts\n"),
+    ]);
+    git(r.path(), &["add", "-f", "force.ts"]);
+    commit_all(r.path());
+    write(
+        r.path(),
+        "private-untracked.ts",
+        "export function secret() {}\n",
+    );
+    write(r.path(), "untracked.ts", "export function untracked() {}\n");
+
+    let report = index("build", r.path(), &[]);
+    let conn = db(&report);
+    let mut query = conn
+        .prepare("SELECT path FROM files ORDER BY path")
+        .unwrap();
+    let indexed: Vec<String> = query
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(indexed, vec!["force.ts", "src/keep.ts"]);
+
+    let status = |path: &str| {
+        let root = r.path().to_str().unwrap();
+        let out = run(&["index", "path-status", root, "--path", path]);
+        ok_json(&out)
+    };
+    for path in ["force.ts", "src/keep.ts"] {
+        assert_eq!(status(path)["indexed"], true, "{path}");
+        assert!(indexed.iter().any(|indexed_path| indexed_path == path));
+    }
+    for (path, expected_file) in [
+        ("excluded.ts", ".xmustardignore"),
+        ("private-untracked.ts", ".gitignore"),
+    ] {
+        let result = status(path);
+        assert_eq!(result["state"], "ignored", "{path}: {result}");
+        assert_eq!(result["ignore_rule"]["file"], expected_file, "{result}");
+        assert_eq!(result["indexed"], false);
+    }
+    assert_eq!(status("untracked.ts")["state"], "untracked");
+    let secret_doc = status(".env.md");
+    assert_eq!(secret_doc["state"], "not-indexed", "{secret_doc}");
+    assert_eq!(secret_doc["reason"], "secret_path", "{secret_doc}");
 }
 
 fn synthetic_file(i: usize) -> (String, String) {
