@@ -684,12 +684,21 @@ export function carriesHandle(texts: readonly string[]): boolean {
 	return texts.some(lineHoldsTaggedHandle);
 }
 
-function isWrapperProjection(texts: readonly string[]): boolean {
+function isWrapperProjection(texts: readonly string[], token: string): boolean {
 	const lastBlock = texts.at(-1);
-	if (lastBlock === undefined || texts.some((text) => /\[xmustard: (?:passed through unreduced|showing the last)\b/.test(text))) return false;
-	const withoutFinalNewline = lastBlock.replace(/\n$/, "");
-	const lastLine = withoutFinalNewline.slice(withoutFinalNewline.lastIndexOf("\n") + 1);
-	return lineHoldsTaggedHandle(lastLine);
+	if (lastBlock === undefined) return false;
+	const marker = `[xmustard-wrap-token:${token}]`;
+	return lastBlock.split("\n").some((line) => line.includes("[xmustard evidence]") && line.endsWith(` ${marker}`));
+}
+
+export function stripWrapperToken(content: unknown[], token: string): BuiltinResultOutput | undefined {
+	const texts = textBlocks(content);
+	if (!texts || !isWrapperProjection(texts, token)) return undefined;
+	const marker = ` [xmustard-wrap-token:${token}]`;
+	return { content: content.map((block) => {
+		const text = (block as { text: string }).text;
+		return { type: "text" as const, text: text.replace(marker, "") };
+	}) };
 }
 
 function lineHoldsTaggedHandle(t: string): boolean {
@@ -728,22 +737,23 @@ export async function projectBuiltin(
 	meta: { sessionId?: string; signal?: AbortSignal },
 	onHandle: () => void,
 	// Whether THIS call was rewritten to the run wrapper, recorded by the tool_call
-	// hook. It is the only trustworthy provenance for a handle: output text is not,
-	// because an untrusted built-in result can print a `[xmustard evidence]` line
-	// with an `xm1.` in it (a bash call catting a saved transcript), and inferring
-	// capture from the shape of the text let any such result skip capture, redaction
-	// and the output budget entirely.
-	wrapped: boolean,
+	// hook. The private per-call token proves the wrapper reached the accepted-capture
+	// path; output shape alone is not provenance because untrusted output can print a
+	// `[xmustard evidence]` line and must still be captured and redacted.
+	wrapToken: string | undefined,
 ): Promise<BuiltinResultOutput | undefined> {
 	if (!cfg.builtins.has(ev.toolName)) return undefined;
 	const texts = textBlocks(ev.content);
 	if (!texts) return undefined;
+	if (wrapToken !== undefined) {
+		const trusted = stripWrapperToken(ev.content, wrapToken);
+		if (trusted) return trusted;
+	}
 	const bytes = texts.reduce((n, t) => n + Buffer.byteLength(t, "utf8"), 0);
 	if (bytes <= cfg.projectionTarget) return undefined; // Go would pass it through unchanged
 	// A wrapped result (the run wrapper's projection) is the reduced form of an
 	// original the wrapper already captured; capturing it again would point the
 	// visible handle at the projection instead of the command's own output.
-	if (wrapped && isWrapperProjection(texts)) return undefined;
 	const passthrough = (reason: string): BuiltinResultOutput => ({ details: withEvidence(ev.details, { path: "passthrough", reason }) });
 	const paused = capturer.paused;
 	if (paused) return passthrough(`capture paused: ${paused}`);

@@ -16,7 +16,7 @@ import { type ExtensionAPI, type ExtensionContext, type SessionBoundaryDraft, VE
 import { type TSchema, Type } from "typebox";
 import { branchHoldsHandle, createCompactor } from "./compaction.ts";
 import { loadConfig } from "./config.ts";
-import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool } from "./delivery.ts";
+import { Capturer, EXPAND_TOOL, expand, PAGE_SIZE, PendingCalls, projectBuiltin, projectResult, runTool, stripWrapperToken } from "./delivery.ts";
 import { mutateBashInput, newWrappedCalls, recordWrappedCall, shouldActivateExpand, shouldWrapBash, wrapperOnPath } from "./commandwrap.ts";
 import { createMasker, type EntryView } from "./masking.ts";
 import { allArgs, TOOL_NAMES, TOOL_SPECS, type ToolArgs, type ToolSpec } from "./tools.ts";
@@ -126,11 +126,11 @@ export default function xmustard(pi: ExtensionAPI): void {
 	pi.on("tool_result", async (event, ctx) => {
 		const meta = { sessionId: sessionIdOf(ctx), signal: ctx.signal };
 		if (TOOL_NAMES.has(event.toolName)) return projectResult(cfg, event, pending, meta, activateExpand);
-		// The tool_call hook's own record of which call it rewrote, consumed once.
-		// Output text cannot stand in for it: an untrusted result can print a
-		// footer-shaped line, and a handle inferred from text let such a result skip
-		// capture, redaction and the output budget.
-		const wrapped = wrappedCalls.delete(event.toolCallId) === true;
+		// The tool_call hook's per-call success token is consumed once. A footer-shaped
+		// output alone is never provenance: an untrusted result can print one and must
+		// still pass through capture and redaction.
+		const wrapToken = wrappedCalls.get(event.toolCallId);
+		wrappedCalls.delete(event.toolCallId);
 		// A wrapper projection already carries its handle in the text and never reaches
 		// the capture path that would otherwise notice, so the rule is
 		// shouldActivateExpand's, applied before the built-ins guard: with
@@ -138,8 +138,12 @@ export default function xmustard(pi: ExtensionAPI): void {
 		// carries a handle, and the model needs xmustard_expand to use it. Whether the
 		// result is then projected remains that set's own decision.
 		if (shouldActivateExpand(event.content)) activateExpand();
+		if (wrapToken) {
+			const trusted = stripWrapperToken(event.content, wrapToken);
+			if (trusted) return trusted;
+		}
 		if (cfg.builtins.has(event.toolName)) {
-			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand, wrapped);
+			return projectBuiltin(cfg, capturer, (signal) => resolveWorkspace(ctx.cwd, signal), event, meta, activateExpand, wrapToken);
 		}
 		return undefined; // other tools pass through untouched
 	});

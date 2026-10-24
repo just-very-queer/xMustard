@@ -61,6 +61,7 @@ struct Target {
     workspace: Option<String>,
     api: String,
     token: Option<String>,
+    wrap_token: Option<String>,
 }
 
 /// Sizes the wrapper works within (overridable by tests through `run_with`).
@@ -98,10 +99,14 @@ pub fn run_with(args: Args, env: &dyn Fn(&str) -> Option<String>, limits: Limits
         // Fail open without that risk: become the command, so every signal reaches it
         // directly and its output is native (WS-FIX-20-r4-2).
         eprintln!("xmustard run: running {} directly, unreduced", argv[0]);
-        return not_started(&argv, Command::new(&argv[0]).args(&argv[1..]).exec());
+        let mut direct = Command::new(&argv[0]);
+        direct.args(&argv[1..]);
+        remove_wrap_token(&mut direct);
+        return not_started(&argv, direct.exec());
     }
     let mut child = Command::new(&argv[0]);
     child.args(&argv[1..]);
+    remove_wrap_token(&mut child);
     let (read_end, write_end) = rustix::pipe::pipe().map_err(|e| io_failed("pipe")(e.into()))?;
     let dup = write_end.try_clone().map_err(io_failed("pipe"))?;
     child
@@ -150,6 +155,7 @@ fn parse(
         workspace: nonblank(env("XMUSTARD_WORKSPACE_ID")),
         api: nonblank(env("XMUSTARD_API_BASE")).unwrap_or_else(|| DEFAULT_API.to_string()),
         token: nonblank(env("XMUSTARD_API_TOKEN")),
+        wrap_token: nonblank(env("XMUSTARD_WRAP_TOKEN")),
     };
     loop {
         match args.next().as_deref() {
@@ -164,6 +170,10 @@ fn parse(
         return Err(CmdError::usage(USAGE));
     }
     Ok((target, argv))
+}
+
+fn remove_wrap_token(command: &mut Command) {
+    command.env_remove("XMUSTARD_WRAP_TOKEN");
 }
 
 fn nonblank(v: Option<String>) -> Option<String> {
@@ -915,11 +925,16 @@ fn capture(
     conn.take(REPLY_CAP)
         .read_to_end(&mut reply)
         .map_err(|e| format!("the API reply failed ({e})"))?;
-    project(&reply)
+    project_with_token(&reply, target.wrap_token.as_deref())
 }
 
 /// The projection text of a 200 reply; any other status is the refusal reason.
+#[cfg(test)]
 fn project(reply: &[u8]) -> Result<String, String> {
+    project_with_token(reply, None)
+}
+
+fn project_with_token(reply: &[u8], wrap_token: Option<&str>) -> Result<String, String> {
     let split = reply
         .windows(4)
         .position(|w| w == b"\r\n\r\n")
@@ -944,6 +959,9 @@ fn project(reply: &[u8]) -> Result<String, String> {
     let footer = field("footer");
     if !footer.is_empty() {
         text.push_str(&footer);
+        if let Some(token) = wrap_token.filter(|_| footer.starts_with("[xmustard evidence] ")) {
+            text.push_str(&format!(" [xmustard-wrap-token:{token}]"));
+        }
         text.push('\n');
     }
     Ok(text)
@@ -1031,185 +1049,397 @@ fn shell_line_hint(line: &str) -> Option<String> {
         else {
             continue;
         };
-        let rank = argv_family_rank(&words);
+        let Some((rank, hint)) = family_selection(&words) else {
+            continue;
+        };
         if best.as_ref().is_none_or(|(best_rank, _)| rank > *best_rank) {
-            best = Some((rank, family_hint(&words)));
+            best = Some((rank, hint));
         }
     }
     best.map(|(_, hint)| hint)
 }
 
+#[derive(Clone, Copy)]
+enum FamilyMatch {
+    Any,
+    Subcommand(&'static [&'static str]),
+    Contains(&'static [&'static str]),
+    Script(&'static str),
+    NodeTest,
+    Git,
+    Container,
+    Tail,
+    RgFiles,
+}
+
+#[derive(Clone, Copy)]
+enum FamilyHint {
+    Program,
+    Keyword,
+    Word(&'static str),
+}
+
+struct FamilyRule {
+    programs: &'static [&'static str],
+    matcher: FamilyMatch,
+    rank: u8,
+    hint: FamilyHint,
+}
+
+// Mirrors api-go/internal/evidence/registry.go:354-356 and argvFamily at 455-555. Keep each
+// predicate, its specificity rank and the safe family hint together so their
+// selection cannot drift. Arguments are lowercased once and argv0 is excluded
+// from the registry's lowercased `rest` matching.
+const FAMILY_RULES: &[FamilyRule] = &[
+    FamilyRule {
+        programs: &[
+            "pytest",
+            "py.test",
+            "jest",
+            "vitest",
+            "mocha",
+            "rspec",
+            "phpunit",
+            "ctest",
+            "tox",
+            "nox",
+            "ava",
+            "tap",
+            "karma",
+            "unittest",
+            "nosetests",
+            "playwright",
+            "cypress",
+        ],
+        matcher: FamilyMatch::Any,
+        rank: 10,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &[
+            "eslint",
+            "golangci-lint",
+            "ruff",
+            "flake8",
+            "pylint",
+            "mypy",
+            "pyright",
+            "staticcheck",
+            "shellcheck",
+            "rubocop",
+            "stylelint",
+            "biome",
+            "oxlint",
+            "hadolint",
+            "markdownlint",
+            "revive",
+            "golint",
+            "tflint",
+            "yamllint",
+            "pycodestyle",
+            "pydocstyle",
+            "bandit",
+            "semgrep",
+        ],
+        matcher: FamilyMatch::Any,
+        rank: 8,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &[
+            "tsc",
+            "gcc",
+            "g++",
+            "clang",
+            "clang++",
+            "javac",
+            "rustc",
+            "webpack",
+            "esbuild",
+            "rollup",
+            "cmake",
+            "ninja",
+            "bazel",
+            "msbuild",
+            "xcodebuild",
+            "swiftc",
+            "kotlinc",
+            "scalac",
+            "turbo",
+        ],
+        matcher: FamilyMatch::Any,
+        rank: 9,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["go"],
+        matcher: FamilyMatch::Subcommand(&["test"]),
+        rank: 10,
+        hint: FamilyHint::Word("test"),
+    },
+    FamilyRule {
+        programs: &["go"],
+        matcher: FamilyMatch::Subcommand(&["vet"]),
+        rank: 8,
+        hint: FamilyHint::Word("vet"),
+    },
+    FamilyRule {
+        programs: &["go"],
+        matcher: FamilyMatch::Subcommand(&["build", "install", "run", "generate", "mod"]),
+        rank: 9,
+        hint: FamilyHint::Word("build"),
+    },
+    FamilyRule {
+        programs: &["cargo"],
+        matcher: FamilyMatch::Subcommand(&["test", "nextest"]),
+        rank: 10,
+        hint: FamilyHint::Word("test"),
+    },
+    FamilyRule {
+        programs: &["cargo"],
+        matcher: FamilyMatch::Subcommand(&["clippy"]),
+        rank: 9,
+        hint: FamilyHint::Word("clippy"),
+    },
+    FamilyRule {
+        programs: &["cargo"],
+        matcher: FamilyMatch::Subcommand(&["build", "check", "run", "install", "doc", "fmt"]),
+        rank: 9,
+        hint: FamilyHint::Word("build"),
+    },
+    FamilyRule {
+        programs: &["npm", "yarn", "pnpm", "bun", "deno"],
+        matcher: FamilyMatch::Script("test"),
+        rank: 10,
+        hint: FamilyHint::Word("test"),
+    },
+    FamilyRule {
+        programs: &["npm", "yarn", "pnpm", "bun", "deno"],
+        matcher: FamilyMatch::Script("lint"),
+        rank: 8,
+        hint: FamilyHint::Word("lint"),
+    },
+    FamilyRule {
+        programs: &["npm", "yarn", "pnpm", "bun", "deno"],
+        matcher: FamilyMatch::Script("build"),
+        rank: 9,
+        hint: FamilyHint::Word("build"),
+    },
+    FamilyRule {
+        programs: &["npm", "yarn", "pnpm", "bun", "deno"],
+        matcher: FamilyMatch::Subcommand(&["run"]),
+        rank: 0,
+        hint: FamilyHint::Word("run"),
+    },
+    FamilyRule {
+        programs: &["node"],
+        matcher: FamilyMatch::NodeTest,
+        rank: 10,
+        hint: FamilyHint::Word("--test"),
+    },
+    FamilyRule {
+        programs: &["make", "just", "task", "rake"],
+        matcher: FamilyMatch::Contains(&["test", "check"]),
+        rank: 10,
+        hint: FamilyHint::Keyword,
+    },
+    FamilyRule {
+        programs: &["make", "just", "task", "rake"],
+        matcher: FamilyMatch::Contains(&["lint"]),
+        rank: 8,
+        hint: FamilyHint::Word("lint"),
+    },
+    FamilyRule {
+        programs: &["make", "just", "task", "rake"],
+        matcher: FamilyMatch::Any,
+        rank: 9,
+        hint: FamilyHint::Word("build"),
+    },
+    FamilyRule {
+        programs: &[
+            "mvn",
+            "gradle",
+            "gradlew",
+            "./gradlew",
+            "sbt",
+            "dotnet",
+            "swift",
+            "zig",
+            "mix",
+        ],
+        matcher: FamilyMatch::Contains(&["test"]),
+        rank: 10,
+        hint: FamilyHint::Word("test"),
+    },
+    FamilyRule {
+        programs: &[
+            "mvn",
+            "gradle",
+            "gradlew",
+            "./gradlew",
+            "sbt",
+            "dotnet",
+            "swift",
+            "zig",
+            "mix",
+        ],
+        matcher: FamilyMatch::Any,
+        rank: 9,
+        hint: FamilyHint::Word("build"),
+    },
+    FamilyRule {
+        programs: &["git"],
+        matcher: FamilyMatch::Git,
+        rank: 7,
+        hint: FamilyHint::Word("diff"),
+    },
+    FamilyRule {
+        programs: &["git"],
+        matcher: FamilyMatch::Subcommand(&["grep"]),
+        rank: 6,
+        hint: FamilyHint::Word("grep"),
+    },
+    FamilyRule {
+        programs: &["git"],
+        matcher: FamilyMatch::Subcommand(&["ls-files"]),
+        rank: 4,
+        hint: FamilyHint::Word("ls-files"),
+    },
+    FamilyRule {
+        programs: &["git"],
+        matcher: FamilyMatch::Any,
+        rank: 2,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["diff", "colordiff"],
+        matcher: FamilyMatch::Any,
+        rank: 7,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["docker", "kubectl", "podman", "oc"],
+        matcher: FamilyMatch::Container,
+        rank: 5,
+        hint: FamilyHint::Word("logs"),
+    },
+    FamilyRule {
+        programs: &["docker", "kubectl", "podman", "oc"],
+        matcher: FamilyMatch::Subcommand(&["build"]),
+        rank: 9,
+        hint: FamilyHint::Word("build"),
+    },
+    FamilyRule {
+        programs: &["tail"],
+        matcher: FamilyMatch::Tail,
+        rank: 5,
+        hint: FamilyHint::Word("--follow"),
+    },
+    FamilyRule {
+        programs: &["tail"],
+        matcher: FamilyMatch::Any,
+        rank: 1,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["rg"],
+        matcher: FamilyMatch::RgFiles,
+        rank: 4,
+        hint: FamilyHint::Word("--files"),
+    },
+    FamilyRule {
+        programs: &["grep", "egrep", "fgrep", "rg", "ag", "ack", "ugrep"],
+        matcher: FamilyMatch::Any,
+        rank: 6,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["journalctl", "dmesg", "logcat", "stern"],
+        matcher: FamilyMatch::Any,
+        rank: 5,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["find", "fd", "fdfind", "locate"],
+        matcher: FamilyMatch::Any,
+        rank: 4,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["ls", "tree", "exa", "eza", "dir", "lsd"],
+        matcher: FamilyMatch::Any,
+        rank: 3,
+        hint: FamilyHint::Program,
+    },
+    FamilyRule {
+        programs: &["cat", "head", "nl", "bat", "less", "more", "sed", "awk"],
+        matcher: FamilyMatch::Any,
+        rank: 1,
+        hint: FamilyHint::Program,
+    },
+];
+
+#[cfg(test)]
 fn argv_family_rank(words: &[String]) -> u8 {
-    let Some(program) = words
-        .first()
-        .map(|word| basename(word).to_ascii_lowercase())
-    else {
-        return 0;
-    };
-    let sub = words
-        .get(1)
-        .map(|word| word.to_ascii_lowercase())
-        .unwrap_or_default();
-    const DIRECT_FAMILIES: [(&[&str], u8); 3] = [
-        (
-            &[
-                "pytest",
-                "py.test",
-                "jest",
-                "vitest",
-                "mocha",
-                "rspec",
-                "phpunit",
-                "ctest",
-                "tox",
-                "nox",
-                "ava",
-                "tap",
-                "karma",
-                "unittest",
-                "nosetests",
-                "playwright",
-                "cypress",
-            ],
-            10,
-        ),
-        (
-            &[
-                "eslint",
-                "golangci-lint",
-                "ruff",
-                "flake8",
-                "pylint",
-                "mypy",
-                "pyright",
-                "staticcheck",
-                "shellcheck",
-                "rubocop",
-                "stylelint",
-                "biome",
-                "oxlint",
-                "hadolint",
-                "markdownlint",
-                "revive",
-                "golint",
-                "tflint",
-                "yamllint",
-                "pycodestyle",
-                "pydocstyle",
-                "bandit",
-                "semgrep",
-            ],
-            8,
-        ),
-        (
-            &[
-                "tsc",
-                "gcc",
-                "g++",
-                "clang",
-                "clang++",
-                "javac",
-                "rustc",
-                "webpack",
-                "esbuild",
-                "rollup",
-                "cmake",
-                "ninja",
-                "bazel",
-                "msbuild",
-                "xcodebuild",
-                "swiftc",
-                "kotlinc",
-                "scalac",
-                "turbo",
-            ],
-            9,
-        ),
-    ];
-    if let Some((_, rank)) = DIRECT_FAMILIES
+    family_selection(words).map_or(0, |(rank, _)| rank)
+}
+
+fn family_selection(words: &[String]) -> Option<(u8, String)> {
+    let program = basename(words.first()?).to_ascii_lowercase();
+    let args = words
         .iter()
-        .find(|(programs, _)| programs.contains(&program.as_str()))
-    {
-        return *rank;
-    }
-    match program.as_str() {
-        "go" => match sub.as_str() {
-            "test" => 10,
-            "vet" => 8,
-            "build" | "install" | "run" | "generate" | "mod" => 9,
-            _ => 0,
-        },
-        "cargo" => match sub.as_str() {
-            "test" | "nextest" => 10,
-            "clippy" | "build" | "check" | "run" | "install" | "doc" | "fmt" => 9,
-            _ => 0,
-        },
-        "npm" | "yarn" | "pnpm" | "bun" | "deno" => {
+        .skip(1)
+        .map(|word| word.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    let rest = args.join(" ");
+    let sub = args.first().map(String::as_str).unwrap_or_default();
+    let matches = |matcher: FamilyMatch| match matcher {
+        FamilyMatch::Any => true,
+        FamilyMatch::Subcommand(choices) => choices.contains(&sub),
+        FamilyMatch::Contains(words) => words.iter().any(|word| rest.contains(word)),
+        FamilyMatch::Script(family) => {
             let script = if sub == "run" {
-                words
-                    .get(2)
-                    .map(|w| w.to_ascii_lowercase())
-                    .unwrap_or_default()
+                args.get(1).map(String::as_str).unwrap_or_default()
             } else {
                 sub
             };
-            match family_of(&script) {
-                Some("test") => 10,
-                Some("lint") => 8,
-                Some("build") => 9,
-                _ => 0,
-            }
+            family_of(script) == Some(family)
         }
-        "node" if words.iter().any(|w| w == "--test") => 10,
-        "make" | "just" | "task" | "rake" => {
-            if words
-                .iter()
-                .any(|w| w.contains("test") || w.contains("check"))
-            {
-                10
-            } else if words.iter().any(|w| w.contains("lint")) {
-                8
-            } else {
-                9
-            }
+        FamilyMatch::NodeTest => rest.contains("--test"),
+        FamilyMatch::Git => {
+            matches!(sub, "diff" | "show" | "format-patch")
+                || (sub == "log" && (rest.contains(" -p ") || rest.contains("--patch")))
         }
-        "mvn" | "gradle" | "gradlew" | "./gradlew" | "sbt" | "dotnet" | "swift" | "zig" | "mix" => {
-            if words.iter().any(|w| w.contains("test")) {
-                10
-            } else {
-                9
-            }
+        FamilyMatch::Container => rest.contains(" logs ") || sub == "logs",
+        FamilyMatch::Tail => {
+            rest.contains(" -f ") || rest.contains("--follow") || rest.contains(".log")
         }
-        "git" => match sub.as_str() {
-            "diff" | "show" | "format-patch" => 7,
-            "log" if words.iter().any(|w| w == "-p" || w == "--patch") => 7,
-            "grep" => 6,
-            "ls-files" => 4,
-            _ => 2,
-        },
-        "diff" | "colordiff" => 7,
-        "docker" | "kubectl" | "podman" | "oc"
-            if sub == "logs" || words.iter().any(|w| w == "logs") =>
-        {
-            5
-        }
-        "docker" | "kubectl" | "podman" | "oc" if sub == "build" => 9,
-        "tail"
-            if words
-                .iter()
-                .any(|w| w == "-f" || w.starts_with("--follow") || w.ends_with(".log")) =>
-        {
-            5
-        }
-        "tail" => 1,
-        "rg" if words.iter().any(|w| w == "--files") => 4,
-        "grep" | "egrep" | "fgrep" | "rg" | "ag" | "ack" | "ugrep" => 6,
-        "journalctl" | "dmesg" | "logcat" | "stern" => 5,
-        "find" | "fd" | "fdfind" | "locate" => 4,
-        "ls" | "tree" | "exa" | "eza" | "dir" | "lsd" => 3,
-        "cat" | "head" | "nl" | "bat" | "less" | "more" | "sed" | "awk" => 1,
-        _ => 0,
-    }
+        FamilyMatch::RgFiles => rest.contains(" --files ") || rest.ends_with("--files"),
+    };
+    FAMILY_RULES
+        .iter()
+        .find(|rule| rule.programs.contains(&program.as_str()) && matches(rule.matcher))
+        .map(|rule| {
+            let hint = match rule.hint {
+                FamilyHint::Program => program.clone(),
+                FamilyHint::Keyword => {
+                    let word = ["test", "check", "lint"]
+                        .into_iter()
+                        .find(|word| rest.contains(word))
+                        .unwrap_or("build");
+                    format!("{program} {word}")
+                }
+                FamilyHint::Word(word) => {
+                    if matches!(rule.matcher, FamilyMatch::Script(_)) && sub == "run" {
+                        format!("{program} run {word}")
+                    } else {
+                        format!("{program} {word}")
+                    }
+                }
+            };
+            (rule.rank, hint)
+        })
+        .or(Some((0, program)))
 }
 
 fn command_words(simple: &str) -> Vec<String> {
@@ -1251,51 +1481,15 @@ fn command_words(simple: &str) -> Vec<String> {
 }
 
 fn family_hint(words: &[String]) -> String {
-    let Some(first) = words
-        .first()
-        .map(|word| basename(word))
-        .filter(|word| plain(word))
-    else {
-        return "bash".to_string();
-    };
-    let args = &words[1..];
-    match first {
-        "git"
-            if args.first().is_some_and(|word| word == "log")
-                && args.iter().any(|word| word == "-p" || word == "--patch") =>
-        {
-            "git diff".to_string()
-        }
-        "rg" if args.iter().any(|word| word == "--files") => "rg --files".to_string(),
-        "tail"
-            if args.iter().any(|word| {
-                word == "-f" || word.starts_with("--follow") || word.ends_with(".log")
-            }) =>
-        {
-            "tail --follow".to_string()
-        }
-        _ => hint_for(first, &mut args.iter().map(String::as_str)),
-    }
-}
-
-// The hint for one simple command: its program, plus the one extra word the
-// registry's rule for that program reads. A program no rule carries is named
-// alone, which is what the registry's generic family reduces.
-fn hint_for(first: &str, words: &mut dyn Iterator<Item = &str>) -> String {
-    let rule = HINT_RULES
-        .iter()
-        .find(|(programs, _)| programs.contains(&first))
-        .map(|(_, rule)| *rule);
-    let tail = match rule {
-        Some(Hint::Subcommand) => subcommand(words),
-        Some(Hint::RunScript) => run_script(words),
-        Some(Hint::Keyword) => keyword(words),
-        None => None,
-    };
-    match tail {
-        Some(tail) => format!("{first} {tail}"),
-        None => first.to_string(),
-    }
+    family_selection(words).map_or_else(
+        || {
+            words
+                .first()
+                .map(|word| basename(word).to_ascii_lowercase())
+                .unwrap_or_else(|| "bash".to_string())
+        },
+        |(_, hint)| hint,
+    )
 }
 
 // Split a shell line the way `splitCommand` does, outside quotes: on `;`, `&&`,
@@ -1359,69 +1553,11 @@ fn plain(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"._-+".contains(&b))
 }
 
 /// Programs the Go registry reads as a shell wrapping a `-c` string.
 const SHELLS: [&str; 5] = ["bash", "sh", "zsh", "dash", "ksh"];
-
-/// How much of a command line past the program the registry needs, per program
-/// family (registry.go argvFamily). Anything not listed sends its name only.
-#[derive(Clone, Copy)]
-enum Hint {
-    /// The second word selects the family (`git diff`).
-    Subcommand,
-    /// As Subcommand, plus the script name after `run` (`npm run test`).
-    RunScript,
-    /// The registry only asks whether the line contains test, check or lint, so
-    /// only that fixed keyword is sent, never the target's own name.
-    Keyword,
-}
-
-const HINT_RULES: [(&[&str], Hint); 3] = [
-    (
-        &["go", "git", "cargo", "kubectl", "docker"],
-        Hint::Subcommand,
-    ),
-    (&["npm", "pnpm", "yarn", "bun", "deno"], Hint::RunScript),
-    (
-        &[
-            "make", "just", "task", "rake", "mvn", "gradle", "gradlew", "sbt", "dotnet", "swift",
-            "zig", "mix",
-        ],
-        Hint::Keyword,
-    ),
-];
-
-fn subcommand(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
-    words.next().filter(|w| plain(w)).map(str::to_string)
-}
-
-// The script word, read without `plain`. `plain` is the disclosure rule and it is
-// still the right one for everything the hint sends, but the script's own name is
-// never sent — only the family word `family_of` derives from it — so a name that
-// `plain` would refuse may still be classified. npm's own naming uses a colon for
-// a variant (`test:unit`, `lint:fix`, `build:prod`), the registry classifies all
-// three by prefix, and reading them through `plain` sent a bare `npm run`, which
-// is the generic package-manager reducer: the capture landed in no family at all.
-fn script_name(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
-    words.next().filter(|w| !w.is_empty()).map(str::to_string)
-}
-
-fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
-    let sub = words.next().filter(|word| !word.is_empty())?.to_string();
-    if sub != "run" {
-        return family_of(&sub).map(str::to_string);
-    }
-    // The registry reads the script's name only to classify it (registry.go:
-    // `HasPrefix(script, "test")`, and the same for lint and build), so the family
-    // word is what it needs and the name itself may be anything — a script called
-    // after a credential would otherwise put that word in the capture URL.
-    Some(match script_name(words).as_deref().and_then(family_of) {
-        Some(family) => format!("run {family}"),
-        None => sub,
-    })
-}
 
 /// The registry's own script families, in its precedence order (test before lint
 /// before build). A script matching none is not sent: the registry's fallback for
@@ -1435,7 +1571,7 @@ fn run_script(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
 /// matches, and `starts_with` on any of them would claim a family the registry does
 /// not (`tsc` is a build there, `jest` a test).
 fn family_of(script: &str) -> Option<&'static str> {
-    let s = script.to_ascii_lowercase();
+    let s = script;
     const FAMILIES: [(&str, &[&str], &[&str]); 3] = [
         ("test", &["test", "e2e"], &["t", "vitest", "jest"]),
         ("lint", &["lint"], &["eslint"]),
@@ -1448,20 +1584,9 @@ fn family_of(script: &str) -> Option<&'static str> {
     FAMILIES
         .iter()
         .find(|(_, prefixes, exact)| {
-            prefixes.iter().any(|prefix| s.starts_with(prefix)) || exact.contains(&s.as_str())
+            prefixes.iter().any(|prefix| s.starts_with(prefix)) || exact.contains(&s)
         })
         .map(|(family, _, _)| *family)
-}
-
-/// The registry's own keywords, in its precedence order (test and check before lint).
-const FAMILY_KEYWORDS: [&str; 3] = ["test", "check", "lint"];
-
-fn keyword(words: &mut dyn Iterator<Item = &str>) -> Option<String> {
-    let line: Vec<String> = words.map(str::to_ascii_lowercase).collect();
-    FAMILY_KEYWORDS
-        .iter()
-        .find(|k| line.iter().any(|w| w.contains(*k)))
-        .map(|k| k.to_string())
 }
 
 fn digest(argv: &[String]) -> String {
@@ -1476,6 +1601,56 @@ fn digest(argv: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wrapper_token_is_removed_from_the_child_environment() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let mut child = Command::new("env");
+        child.env("XMUSTARD_WRAP_TOKEN", token);
+        remove_wrap_token(&mut child);
+        let output = child.output().unwrap();
+        assert!(output.status.success());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains(token), "private token reached child output");
+        assert!(
+            !text.contains("XMUSTARD_WRAP_TOKEN="),
+            "private token reached child's environment"
+        );
+    }
+
+    #[test]
+    fn per_call_token_is_added_only_to_the_accepted_evidence_footer() {
+        let token = "0123456789abcdef0123456789abcdef";
+        let accepted = concat!(
+            "HTTP/1.0 200 OK\r\n\r\n",
+            "{\"projection\":\"p\",",
+            "\"footer\":\"[xmustard evidence] {\\\"handle\\\":\\\"xm1.H1\\\"}\"}"
+        )
+        .as_bytes();
+        assert_eq!(
+            project_with_token(accepted, Some(token)).unwrap(),
+            format!(
+                "p\n[xmustard evidence] {{\"handle\":\"xm1.H1\"}} [xmustard-wrap-token:{token}]\n"
+            )
+        );
+        let native_lookalike = concat!(
+            "HTTP/1.0 200 OK\r\n\r\n",
+            "{\"projection\":\"[xmustard evidence] {\\\"handle\\\":\\\"xm1.FAKE\\\"}\",",
+            "\"footer\":\"\"}"
+        )
+        .as_bytes();
+        assert!(
+            !project_with_token(native_lookalike, Some(token))
+                .unwrap()
+                .contains(token)
+        );
+        let refused = b"HTTP/1.0 503 Unavailable\r\n\r\n{\"reason\":\"redaction_failed\"}";
+        assert!(
+            !project_with_token(refused, Some(token))
+                .unwrap_err()
+                .contains(token)
+        );
+    }
 
     /// WS-FIX-20-r1-10: a TERM that reaches the wrapper before the child's pid is known
     /// must not take the default action (ending the wrapper and orphaning the child); it is
@@ -1777,6 +1952,13 @@ mod tests {
             ("git grep pattern", 6),
             ("rg --files", 4),
             ("tail -f service.log", 5),
+            ("node --test tests/*.js", 10),
+            ("docker compose logs -f api", 5),
+            ("podman logs api", 5),
+            ("oc logs pod", 5),
+            ("kubectl -n ns logs pod", 5),
+            ("g++ main.cpp", 9),
+            ("clang++ main.cpp", 9),
         ] {
             let hint = command_hint(&a(&["bash", "-c", line]));
             let want_rank = split_simple_commands(line)
@@ -1790,6 +1972,17 @@ mod tests {
                 want_rank,
                 "{line} -> {hint}"
             );
+        }
+        for (line, want) in [
+            ("node --test tests/*.js", "node --test"),
+            ("docker compose logs -f api", "docker logs"),
+            ("podman logs api", "podman logs"),
+            ("oc logs pod", "oc logs"),
+            ("kubectl -n ns logs pod", "kubectl logs"),
+            ("g++ main.cpp", "g++"),
+            ("clang++ main.cpp", "clang++"),
+        ] {
+            assert_eq!(command_hint(&a(&["bash", "-c", line])), want, "{line}");
         }
         // The registry keeps the first command when both have the same family.
         assert_eq!(
@@ -1839,14 +2032,19 @@ mod tests {
     }
 
     #[test]
-    fn command_hint_sends_a_second_word_only_where_the_registry_dispatches_on_one() {
+    fn command_hint_sends_only_words_needed_to_preserve_the_registry_family() {
         let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
-        // The subcommand programs: argvFamily switches on argv0 and its subcommand,
-        // so both words are what it needs.
-        for program in ["go", "git", "cargo", "docker"] {
+        // Unknown subcommands are omitted; only the registry's recognized family is
+        // carried in the hint, not a possible target or secret argument.
+        for (program, want) in [
+            ("go", "go"),
+            ("git", "git"),
+            ("cargo", "cargo"),
+            ("docker", "docker"),
+        ] {
             assert_eq!(
                 command_hint(&a(&["bash", "-c", &format!("{program} sub")])),
-                format!("{program} sub"),
+                want,
                 "{program} sub"
             );
         }
@@ -1904,8 +2102,8 @@ mod tests {
             ("make test", "make test"),
             ("make -j4 check-backend", "make check"),
             ("make lint", "make lint"),
-            ("make deploy-hunter2", "make"),
-            ("gradle build", "gradle"),
+            ("make deploy-hunter2", "make build"),
+            ("gradle build", "gradle build"),
         ] {
             assert_eq!(
                 command_hint(&a(&["bash", "-c", command])),

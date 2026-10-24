@@ -295,6 +295,7 @@ describe("Pi adapter against the real xMustard API", () => {
 		assertModelSawResults(run);
 		const bash = one(run, "bash");
 		const footer = footerOf(textOf(bash)) ?? assert.fail(`no evidence footer: ${textOf(bash).slice(-400)}`);
+		assert.ok(!textOf(bash).includes("xmustard-wrap-token"), "private success token is stripped before model context");
 		assert.ok(footer.handle?.startsWith("xm1."), `bash footer: ${textOf(bash).slice(-400)}`);
 		assert.ok(footer.raw_bytes > 3 * PAGE, `original is multi-page (${footer.raw_bytes})`);
 		assert.equal(footer.raw_bytes, 262144);
@@ -325,8 +326,22 @@ describe("Pi adapter against the real xMustard API", () => {
 		record("expand_wrapped_bash", { raw_bytes: footer.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(bash)), pages: pages.length, captured_identity: footer.captured_identity, encodings: pages.map((p) => p.text_encoding) });
 	});
 
-	test("repository mutation: an unbound wrapper capture stays expandable with unknown freshness", async () => {
-		assert.ok(original);
+	test("repository mutation makes a bound source capture stale", async () => {
+		const source = await pi("bound-source-capture", [{ calls: [call("search", { q: "Handler", mode: "symbol", limit: "50", substring: "true", include_body: "true", include_info: "true" })] }, { text: "done" }]);
+		assert.equal(source.code, 0, source.stderr);
+		const search = one(source, "search");
+		assert.equal(search.details?.path, "source");
+		const delivery = search.details?.delivery;
+		const output = JSON.parse(textOf(search));
+		const handle = delivery?.handle ?? output.output_budget?.recover_handle ?? output.recover_handle;
+		assert.ok(handle, `source search issued a capture: ${textOf(search).slice(-400)}`);
+		const captured = await readAll(api, ws, handle);
+		assert.equal(captured.status, 200);
+		const capturedKey = captured.pages[0]?.captured_key;
+		assert.ok(capturedKey, "source capture has a captured key");
+		assert.equal(captured.pages[0]?.freshness, "current", "source capture is current before mutation");
+		original = { handle, bytes: captured.bytes, footer: { ...(delivery ?? {}), captured_key: capturedKey } };
+		assert.ok(original.footer.captured_key, "bound source capture has a captured key");
 		const coreBin = process.env.XM_CORE_BIN;
 		assert.ok(coreBin, "the e2e runner supplies the release core executable");
 		const path = `${dirname(coreBin)}${delimiter}${process.env.PATH ?? ""}`;
@@ -346,12 +361,13 @@ describe("Pi adapter against the real xMustard API", () => {
 		assert.ok(footerOf(textOf(currentBash))?.handle, "the new wrapper result activates expand in this session");
 		const [page] = pagesOf(run, original.handle);
 		assert.ok(page, "old handle expanded");
-		assert.equal(page.freshness, "unknown", "wrapper captures are not bound to repository identity");
+		assert.equal(page.freshness, "stale", "bound source capture is stale after the repository mutation");
 		assert.equal(page.stale, true);
+		assert.notEqual(page.captured_key, "", "the capture identity was bound");
+		assert.notEqual(page.current_key, page.captured_key, "repository mutation changes its identity");
 		assert.equal(page.captured_key, original.footer.captured_key);
-		assert.equal(page.current_key, "");
 		assert.deepEqual(Buffer.from(page.data_base64, "base64"), original.bytes.subarray(0, page.length), "captured bytes, not current content");
-		assert.match(pageHeaderOf(textOf(one(run, "xmustard_expand")))?.freshness ?? "", /unknown/);
+		assert.match(pageHeaderOf(textOf(one(run, "xmustard_expand")))?.freshness ?? "", /stale/);
 		record("stale", { captured_key: page.captured_key, current_key: page.current_key });
 	});
 

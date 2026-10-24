@@ -23,6 +23,7 @@
 // the shell in place of the model's command.
 
 import { accessSync, constants, statSync } from "node:fs";
+import { randomBytes } from "node:crypto";
 import { delimiter, join } from "node:path";
 import { normalizeApiBase } from "./config.ts";
 import { resultCarriesHandle } from "./delivery.ts";
@@ -59,7 +60,7 @@ export function shellQuote(s: string): string {
 // rewrite's own answer rather than the hook's assumption: a command that was blank,
 // malformed or already wrapped ran natively, and recording it as wrapped would let
 // its result's text stand in for a capture that never happened.
-export function mutateBashInput(event: unknown, workspaceId: string | undefined, enabled: boolean): boolean {
+export function mutateBashInput(event: unknown, workspaceId: string | undefined, enabled: boolean, token?: string): boolean {
 	if (!enabled) return false;
 	if (!isRecord(event) || event.toolName !== "bash") return false;
 	const input = event.input;
@@ -67,8 +68,10 @@ export function mutateBashInput(event: unknown, workspaceId: string | undefined,
 	const ws = workspaceId?.trim();
 	if (!ws) return false;
 	const command = input.command;
-	if (command.trim() === "" || ALREADY_WRAPPED.test(command.trim())) return false;
-	input.command = `${WRAPPER} --workspace ${shellQuote(ws)} -- ${SHELL} ${SHELL_FLAG} ${shellQuote(command)}`;
+	const candidate = command.trim().replace(/^XMUSTARD_WRAP_TOKEN='[0-9a-f]{32}'\s+/, "");
+	if (candidate === "" || ALREADY_WRAPPED.test(candidate)) return false;
+	const wrapToken = token ?? randomBytes(16).toString("hex");
+	input.command = `XMUSTARD_WRAP_TOKEN=${shellQuote(wrapToken)} ${WRAPPER} --workspace ${shellQuote(ws)} -- ${SHELL} ${SHELL_FLAG} ${shellQuote(command)}`;
 	return true;
 }
 
@@ -79,8 +82,9 @@ export function mutateBashInput(event: unknown, workspaceId: string | undefined,
 // the rewrite declined skip capture on the strength of a footer-shaped line, and a test
 // that re-paired the two at its own call site could not see that.
 export function recordWrappedCall(calls: WrappedCalls, event: unknown, workspaceId: string | undefined, enabled: boolean): boolean {
-	if (!mutateBashInput(event, workspaceId, enabled)) return false;
-	rememberWrapped(calls, event);
+	const token = randomBytes(16).toString("hex");
+	if (!mutateBashInput(event, workspaceId, enabled, token)) return false;
+	rememberWrapped(calls, event, token);
 	return true;
 }
 
@@ -92,24 +96,24 @@ export function recordWrappedCall(calls: WrappedCalls, event: unknown, workspace
 // recorded (a resumed session, a hook registered mid-batch), which reads as unwrapped
 // and so captures. The map is therefore capped and prunes the oldest entry, rather
 // than growing with a long session.
-export type WrappedCalls = Map<string, true>;
+export type WrappedCalls = Map<string, string>;
 
 const WRAPPED_CALL_LIMIT = 256;
 
 export function newWrappedCalls(): WrappedCalls {
-	return new Map<string, true>();
+	return new Map<string, string>();
 }
 
 // rememberWrapped records one rewritten call. It is a named function so the tool_call
 // hook stays a sequence of decisions and a unit test can reach the bookkeeping without
 // an ExtensionAPI.
-export function rememberWrapped(calls: WrappedCalls, event: unknown): void {
+export function rememberWrapped(calls: WrappedCalls, event: unknown, token = ""): void {
 	if (!isRecord(event) || typeof event.toolCallId !== "string") return;
 	if (calls.size >= WRAPPED_CALL_LIMIT) {
 		const oldest = calls.keys().next();
 		if (!oldest.done) calls.delete(oldest.value);
 	}
-	calls.set(event.toolCallId, true);
+	calls.set(event.toolCallId, token);
 }
 
 function isRecord(v: unknown): v is Record<string, unknown> {

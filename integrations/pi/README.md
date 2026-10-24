@@ -297,15 +297,17 @@ recoverable from `details`, and a reader token not offered `remember`/`verify`.
 activated `xmustard_expand` whose endpoint fails, and auth) fail on a fresh fixture because
 the initial `impact` call returns about 400 bytes and issues no handle. The large-result
 case now exercises a wrapped `bash` built-in; the separate `impact` e2e checks only that
-delivery uses the source path. The repository-mutation case expands its unbound wrapper
-capture and expects unknown freshness. The WS-24 suite passes 3 of 3; 12 of the 19 e2e
-tests pass in all.
+delivery uses the source path. The repository-mutation case seeds a bound source capture,
+then verifies that a repository change marks its pages stale. The WS-24 suite passes 3 of 3;
+12 of the 19 e2e tests pass in all.
 
 `tool_call` input rewriting to wrap commands (PAR-ADP-09) is built here, since WS-41
 shipped the `xmustard-core run --` wrapper it needed. Set `XMUSTARD_PI_WRAP_BASH=1` and
 each `bash` tool call's `command` is rewritten in place to
 `xmustard-core run --workspace <id> -- bash -c <quoted command>` before Pi runs it, so
-the output is reduced and retained server-side.
+the output is reduced and retained server-side. Each rewritten call also gets a fresh private
+success token: the wrapper removes it from the child environment and only returns it after a
+successful capture; the extension validates and strips it before model context.
 
 The `bash -c` matters. The wrapper executes the program after `--` directly rather than
 through a shell, so a command that is not one program name — a pipeline, a redirect,
