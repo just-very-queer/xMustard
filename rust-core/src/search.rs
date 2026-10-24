@@ -579,13 +579,12 @@ struct Cand {
     /// Row of the docs lane (its rank).
     doc: Option<u32>,
     hotspot: bool,
-    semantic: Option<f64>,
 }
 
 impl Cand {
     /// The candidate's key in `lane` (larger ranks first), None when the lane does not
     /// rank it.
-    fn lane_key(&self, lane: Lane) -> Option<f64> {
+    fn lane_key(&self, lane: Lane, intent_score: Option<f64>) -> Option<f64> {
         let positive = |x: f64| (x > 0.0).then_some(x);
         match lane {
             Lane::Bm25 => self.code.map(|i| -f64::from(i)),
@@ -594,12 +593,12 @@ impl Cand {
             Lane::Fuzzy => (self.fuzzy >= FUZZY_GATE).then_some(f64::from(self.fuzzy)),
             Lane::Structural => positive(self.structural as f64),
             Lane::Proximity => positive(self.proximity),
-            Lane::Intent => self.semantic,
+            Lane::Intent => intent_score,
         }
     }
 
     /// The raw lane score reported in `scores`.
-    fn lane_score(&self, lane: Lane, text: &TextLanes) -> f64 {
+    fn lane_score(&self, lane: Lane, text: &TextLanes, intent_score: Option<f64>) -> f64 {
         match lane {
             Lane::Bm25 => self.code.map_or(0.0, |i| text.code[i as usize].bm25),
             Lane::Docs => self.doc.map_or(0.0, |i| text.docs[i as usize].bm25),
@@ -607,7 +606,7 @@ impl Cand {
             Lane::Fuzzy => f64::from(self.fuzzy),
             Lane::Structural => self.structural as f64,
             Lane::Proximity => self.proximity,
-            Lane::Intent => self.semantic.unwrap_or(0.0),
+            Lane::Intent => intent_score.unwrap_or(0.0),
         }
     }
 
@@ -1190,7 +1189,6 @@ pub fn search(
                 code,
                 doc: None,
                 hotspot: hotspots.contains(sym.path),
-                semantic: None,
             });
         }),
     );
@@ -1239,7 +1237,6 @@ pub fn search(
                 code: None,
                 doc: None,
                 hotspot: hotspots.contains(f.path),
-                semantic: None,
             });
         }),
     );
@@ -1271,7 +1268,6 @@ pub fn search(
             code: Some(i),
             doc: None,
             hotspot: hotspots.contains(&h.loc.path),
-            semantic: None,
         });
     }
     for (i, h) in text.docs.iter().enumerate() {
@@ -1288,7 +1284,6 @@ pub fn search(
             code: None,
             doc: Some(i as u32),
             hotspot: false,
-            semantic: None,
         });
     }
     drop(by_decl);
@@ -1335,6 +1330,7 @@ pub fn search(
         }
     }
 
+    let mut intent_scores: HashMap<usize, f64> = HashMap::new();
     if opts.mode == SearchMode::Intent {
         match (opts.intent_provider, opts.intent_question, index) {
             (Some(provider), Some(question), Some(opened)) => {
@@ -1382,7 +1378,7 @@ pub fn search(
                         evidence.name_score = evidence.name_score.max(candidate.name_score);
                         // Only fuzzy evidence that passes the lane's gate counts, as in
                         // `lane_key`: trigram noise below the gate must not rank a seed.
-                        let fuzzy = candidate.lane_key(Lane::Fuzzy).unwrap_or(0.0) as f32;
+                        let fuzzy = candidate.lane_key(Lane::Fuzzy, None).unwrap_or(0.0) as f32;
                         evidence.fuzzy = evidence.fuzzy.max(fuzzy);
                         if let Some(rank) = candidate.code {
                             evidence.bm25_rank = evidence.bm25_rank.min(rank);
@@ -1561,7 +1557,6 @@ pub fn search(
                             code: None,
                             doc: None,
                             hotspot: hotspots.contains(path),
-                            semantic: None,
                         });
                         targets.push(index);
                     }
@@ -1640,7 +1635,6 @@ pub fn search(
                                         code: None,
                                         doc: None,
                                         hotspot: hotspots.contains(path),
-                                        semantic: None,
                                     });
                                     newly_discovered.insert(index);
                                     index
@@ -1753,17 +1747,27 @@ pub fn search(
                                     && let Some(indices) = targets.get(&id)
                                 {
                                     for &i in indices {
-                                        cands[i].semantic = Some(probability);
+                                        intent_scores.insert(i, probability);
                                     }
                                 }
                             }
                             let mut candidate_index = 0;
-                            cands.retain(|candidate| {
-                                let keep = !newly_discovered.contains(&candidate_index)
-                                    || candidate.semantic.is_some();
+                            let mut retained_index = 0;
+                            let mut retained_scores = HashMap::new();
+                            cands.retain(|_| {
+                                let old_index = candidate_index;
+                                let keep = !newly_discovered.contains(&old_index)
+                                    || intent_scores.contains_key(&old_index);
+                                if keep {
+                                    if let Some(score) = intent_scores.get(&old_index) {
+                                        retained_scores.insert(retained_index, *score);
+                                    }
+                                    retained_index += 1;
+                                }
                                 candidate_index += 1;
                                 keep
                             });
+                            intent_scores = retained_scores;
                         }
                     }
                     Ok((
@@ -1823,7 +1827,10 @@ pub fn search(
         let mut ranked: Vec<(f64, u32)> = cands
             .iter()
             .enumerate()
-            .filter_map(|(i, c)| c.lane_key(*lane).map(|k| (k, i as u32)))
+            .filter_map(|(i, c)| {
+                c.lane_key(*lane, intent_scores.get(&i).copied())
+                    .map(|k| (k, i as u32))
+            })
             .collect();
         ranked.sort_by(|a, b| {
             b.0.total_cmp(&a.0)
@@ -1879,6 +1886,7 @@ pub fn search(
         text: &text,
         seed: effective_seed.as_deref().unwrap_or(""),
         body_only,
+        intent_scores: &intent_scores,
     };
     let hits: Vec<SearchHit> = order
         .get(opts.offset..page_end)
@@ -1886,7 +1894,7 @@ pub fn search(
         .iter()
         .map(|&i| {
             let cx = ctx.remove(&i).unwrap_or_default();
-            render.hit(&cands[i], cx, (rrf[i], final_score[i]), in_lanes[i])
+            render.hit(i, &cands[i], cx, (rrf[i], final_score[i]), in_lanes[i])
         })
         .collect();
     let omitted = total.saturating_sub(page_end.max(opts.offset));
@@ -1975,12 +1983,20 @@ struct Render<'a> {
     /// `mode=text`: the bm25 lane read the body column, so a hit names `body` and says
     /// so, rather than claiming the whole-chunk bm25 it did not run.
     body_only: bool,
+    intent_scores: &'a HashMap<usize, f64>,
 }
 
 impl Render<'_> {
     /// Build the returned hit of one candidate from its context, its (fused, final)
     /// scores and the lanes that ranked it.
-    fn hit(&self, c: &Cand, cx: Ctx, (rrf, score): (f64, f64), lanes: u8) -> SearchHit {
+    fn hit(
+        &self,
+        index: usize,
+        c: &Cand,
+        cx: Ctx,
+        (rrf, score): (f64, f64),
+        lanes: u8,
+    ) -> SearchHit {
         let (qtokens, text, seed) = (self.qtokens, self.text, self.seed);
         let decl_name = cx
             .decl
@@ -2027,7 +2043,7 @@ impl Render<'_> {
                 }),
                 Lane::Intent => Some(format!(
                     "intent_probability: {:.2}",
-                    c.semantic.unwrap_or(0.0)
+                    self.intent_scores.get(&index).copied().unwrap_or(0.0)
                 )),
                 // the fuzzy lane ranks most candidates; it is a reason only when it alone
                 // brought the hit in
@@ -2059,7 +2075,7 @@ impl Render<'_> {
             .map(|l| {
                 (
                     score_key(l, self.lane_name(l)),
-                    round6(c.lane_score(l, text)),
+                    round6(c.lane_score(l, text, self.intent_scores.get(&index).copied())),
                 )
             })
             .collect();
