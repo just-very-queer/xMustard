@@ -468,10 +468,14 @@ type strDest struct {
 	discard  bool
 	overflow bool
 	n        int64
+	encoded  *encodedErrorScan
 }
 
 func (s *strDest) write(p []byte) error {
 	s.n += int64(len(p))
+	if s.encoded != nil {
+		s.encoded.write(p)
+	}
 	switch {
 	case s.discard:
 		return nil
@@ -1027,6 +1031,156 @@ func failingStatus(key string, raw []byte) bool {
 	return false
 }
 
+// encodedErrorScan walks only the top-level structure of an embedded JSON result.
+// It retains only bounded member names and an error token, never output values.
+type encodedErrorScan struct {
+	state      byte
+	key        []byte
+	isErrorKey bool
+	depth      int
+	inString   bool
+	escaped    bool
+	value      []byte
+	isError    bool
+}
+
+func (s *encodedErrorScan) write(p []byte) {
+	if s.isError || s.state == 8 {
+		return
+	}
+	for _, c := range p {
+		switch s.state {
+		case 0: // opening object
+			if c == '{' {
+				s.state = 1
+			} else if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+				s.state = 8
+			}
+		case 1: // next member or object end
+			switch c {
+			case ' ', '\n', '\r', '\t', ',':
+			case '}':
+				s.state = 8
+			case '"':
+				s.key = s.key[:0]
+				s.state = 2
+			default:
+				s.state = 8
+			}
+		case 2: // member name
+			if s.escaped {
+				if len(s.key) < maxHookKey {
+					s.key = append(s.key, '\\', c)
+				}
+				s.escaped = false
+				continue
+			}
+			if c == '\\' {
+				s.escaped = true
+				continue
+			}
+			if c == '"' {
+				var key string
+				s.isErrorKey = false
+				if json.Unmarshal(append(append([]byte{'"'}, s.key...), '"'), &key) == nil {
+					s.isErrorKey = key == "isError"
+				}
+				s.state = 3
+			} else if len(s.key) < maxHookKey {
+				s.key = append(s.key, c)
+			} else {
+				s.state = 8
+			}
+		case 3: // colon
+			if c == ':' {
+				s.state = 4
+			} else if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+				s.state = 8
+			}
+		case 4: // value start
+			if c == ' ' || c == '\n' || c == '\r' || c == '\t' {
+				continue
+			}
+			s.depth, s.inString, s.escaped = 0, false, false
+			s.value = s.value[:0]
+			switch c {
+			case '{', '[':
+				s.depth, s.state = 1, 6
+			case '"':
+				s.state = 7
+			default:
+				s.state = 5
+				s.addValue(c)
+			}
+		case 5: // primitive value
+			if c == ',' || c == '}' {
+				s.finishValue()
+				if c == '}' {
+					s.state = 8
+				} else {
+					s.state = 1
+				}
+			} else {
+				s.addValue(c)
+			}
+		case 6: // nested value
+			if s.inString {
+				if s.escaped {
+					s.escaped = false
+				} else if c == '\\' {
+					s.escaped = true
+				} else if c == '"' {
+					s.inString = false
+				}
+				continue
+			}
+			if c == '"' {
+				s.inString = true
+			} else if c == '{' || c == '[' {
+				s.depth++
+			} else if c == '}' || c == ']' {
+				s.depth--
+				if s.depth == 0 {
+					s.finishValue()
+					s.state = 1
+				}
+			}
+		case 7: // string scalar
+			if s.escaped {
+				s.escaped = false
+			} else if c == '\\' {
+				s.escaped = true
+			} else if c == '"' {
+				s.finishValue()
+				s.state = 1
+			}
+		}
+	}
+}
+
+func (s *encodedErrorScan) addValue(c byte) {
+	if !s.isErrorKey {
+		return
+	}
+	if len(s.value) < len("true") {
+		if c != "true"[len(s.value)] {
+			s.isErrorKey = false
+			return
+		}
+		s.value = append(s.value, c)
+		return
+	}
+	if c != ' ' && c != '\n' && c != '\r' && c != '\t' {
+		s.isErrorKey = false
+	}
+}
+
+func (s *encodedErrorScan) finishValue() {
+	if s.isErrorKey && strings.TrimSpace(string(s.value)) == "true" {
+		s.isError = true
+	}
+}
+
 // walk reads one response value at path (key is its member key), streaming output
 // strings into sections and building the skeleton.
 func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
@@ -1043,7 +1197,11 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 	}
 	switch c {
 	case '"':
-		dst := &strDest{d: d, limit: maxHookSmall, name: path}
+		var encoded *encodedErrorScan
+		if d.body.Format == FormatCursor && (key == "tool_output" || key == "result_json") {
+			encoded = &encodedErrorScan{}
+		}
+		dst := &strDest{d: d, limit: maxHookSmall, name: path, encoded: encoded}
 		switch {
 		case dropKeys[key]:
 			dst.discard = true
@@ -1055,6 +1213,9 @@ func (d *hookDecoder) walk(key, path string, depth int) (*Node, error) {
 		}
 		if err := d.readString(dst); err != nil {
 			return nil, err
+		}
+		if encoded != nil && encoded.isError {
+			d.body.IsError = true
 		}
 		switch {
 		case dst.discard:

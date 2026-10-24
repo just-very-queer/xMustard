@@ -1,6 +1,6 @@
 {
   "derivation": "source-derived",
-  "note": "Each input body is built from Cursor's own event schemas in the installed bundle's workbench.desktop.main.js (agent.v1.SessionStartRequestQuery, PreToolUseRequestQuery, PostToolUseRequestQuery, PreCompactRequestQuery) plus the common base schema. No live session was recorded: that needs an interactive Cursor session and a model call, which this workstream does not make.",
+  "note": "Current fixtures are source-derived from Cursor 3.22.7's event schemas in workbench.desktop.main.js; they are not live-recorded. Owner-assisted recording: run an interactive Cursor 3.22.7 session with xMustard hooks installed, trigger each event, save only its POST body to the matching *.in.json file, omit headers/tokens, scrub secrets and personal/local identifiers, then inspect every body before committing. Capture the model request that follows postToolUse to confirm whether updated_mcp_tool_output was honored. After review, set derivation=live-recorded, update the bundle hash, and update the version pin in api-go/internal/conformance/suite.go if needed. Redaction and credentials are deliberately not automated for interactive recording.",
   "cursor_version": "3.22.7",
   "bundle_path": "out/vs/workbench/workbench.desktop.main.js",
   "bundle_sha256": "a9157bf9054d3f27a2a6910c855e028bd5e38896fa74405ca2f766abff590cb8",

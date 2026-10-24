@@ -3841,6 +3841,9 @@ No Cursor is installed on the build box or the Mac, and no Cursor source is clon
 
 **Collision risk.** xmustard-ops main.go (add subcommand files only). repo_config_routes.go exists in cmd/xmustard-api and must be reconciled.
 
+
+
+
 ### WS-44a — `xmustard-ops cursor-hooks config`: the Cursor hook client's install
 
 **Goal.** Write the file that installs the Cursor hook client, so the adapter WS-40c merged can be used rather than only read. WS-40c's client half was parked and its follow-up named the install as the last thing missing: "the recorded fixtures `r1-12` asks for need a live Cursor session (`xmustard-ops setup --client cursor`, WS-44's territory)". This row is that install for Cursor, in the shape the Codex client already has (`xmustard-ops codex-hooks config`).
@@ -3859,6 +3862,10 @@ No Cursor is installed on the build box or the Mac, and no Cursor source is clon
 - **Deviations.** (1) The command is `cursor-hooks config`, not `setup --client cursor`: `setup` installs the **daemon** as a service (WS-58) and its `--client` only prints an MCP binding, so folding the hook install into it would mix two installations. `setup --client cursor` remains the one-command form WS-44's acceptance names, and this row is the piece it needs. (2) The pin is written into the command as `--workspace <id>`, the flag the client already takes and validates; the client's own refusal when the roots and the project directory disagree is what keeps a pinned file naming one repository.
 - **Checks.** `go test ./...` (25 packages, green), `go vet -tags review` (green), `gofmt -l api-go` (empty), `cargo test` (the Rust side is unchanged by this row and green). Not run: `RET`, `BUD`, `PI`, `CAPS`, `SECDOC`, `GOLD` — no ranking, resident structure, Pi source, projection or `tools/list` byte changed.
 - **Follow-ups.** (a) The **MCP** binding for Cursor is still `mcp-config --client cursor` (the JSON `mcpServers` form every client but Codex and OpenCode takes); the one-command form WS-44's acceptance names, `xmustard-ops setup --client cursor`, is WS-44's own row: `setup` installs the **daemon** today and its `--client` only prints an MCP binding, so folding the hook install into it would mix two installations. (b) Cursor's hook trust model has no `codex app-server` to ask, so there is no `trust` command: Cursor loads a project hook file when the project is trusted, which is the operator's decision. (c) The recorded fixtures `r1-12` asks for need a live Cursor session and a model call.
+
+### WS-44b — Pinned Cursor conformance replay
+
+**Implementation record (branch parity/ap-parity-44b, 2026-10-24).** Source-derived replay through production routes; live recording pending owner. The inputs carry `cursor_version`, which the suite checks against the manifest and its 3.22.7 pin. The manifest documents owner-assisted capture of live fixtures and the following model request.
 
 ### WS-45 — Opt-in LSP pool wiring into explain, impact and diagnostics
 
