@@ -2,58 +2,18 @@ package conformance
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
-	"os"
 	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 
 	"xmustard/api-go/internal/evidence"
-	"xmustard/api-go/internal/hooks"
 )
 
 func TestPinnedCursorFixtures(t *testing.T) {
 	fixtureDir := filepath.Join("..", "..", "..", "integrations", "cursor", "testdata")
 	if err := RunCursorFixtures(fixtureDir); err != nil {
 		t.Fatal(err)
-	}
-}
-
-func TestCursorReplacementPreservesToolError(t *testing.T) {
-	fixturePath := filepath.Join("..", "..", "..", "integrations", "cursor", "testdata", "03-postToolUse-mcp.in.json")
-	input, err := os.ReadFile(fixturePath)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var event struct {
-		Output string `json:"tool_output"`
-	}
-	if err := json.Unmarshal(input, &event); err != nil {
-		t.Fatal(err)
-	}
-	// Successful fixture data alone would not catch a replacement that always clears isError.
-	failed := strings.Replace(event.Output, `"isError":false`, `"isError":true`, 1)
-	var output json.RawMessage
-	if err := json.Unmarshal([]byte(failed), &output); err != nil {
-		t.Fatal(err)
-	}
-	got := hooks.Cursor.Reply(hooks.CursorEvents[2], hooks.Result{Updated: output})
-	if got == nil {
-		t.Fatal("error result was not replaced")
-	}
-	var reply struct {
-		Updated string `json:"updated_mcp_tool_output"`
-	}
-	if err := json.Unmarshal(got.Body, &reply); err != nil {
-		t.Fatal(err)
-	}
-	var result struct {
-		IsError bool `json:"isError"`
-	}
-	if err := json.Unmarshal([]byte(reply.Updated), &result); err != nil || !result.IsError {
-		t.Fatalf("replacement lost the error state: %s", reply.Updated)
 	}
 }
 
