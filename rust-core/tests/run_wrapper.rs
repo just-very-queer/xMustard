@@ -1093,9 +1093,9 @@ const COUNTER_CHILD: &str = concat!(
     "/tests/testdata/counter_child.py"
 );
 
-/// The other half of the contract, on the same harness: a signal a **process** sent is still
-/// relayed, which is WS-41 deviation (2) proper — a client timeout and `kill <pid>` reach
-/// the wrapper alone, and the pty test above proves a terminal one no longer is.
+/// The other half of the contract, on the same harness: a process-sent SIGINT is relayed even
+/// when the child shares the wrapper's foreground group. Only the sender rule permits this
+/// `UnlessGroup` signal to be forwarded.
 #[test]
 fn a_signal_a_process_sent_still_reaches_the_child() {
     let _g = serial_terminal();
@@ -1103,14 +1103,13 @@ fn a_signal_a_process_sent_still_reaches_the_child() {
     let (mut wrapper, _master) = terminal_job(dir.path());
     await_child(&dir.path().join("ready"), dir.path());
     Command::new("kill")
-        .args(["-TERM", &wrapper.id().to_string()])
+        .args(["-INT", &wrapper.id().to_string()])
         .status()
         .unwrap();
-    let log = await_seen(dir.path(), "TERM");
-    assert!(
-        log.contains("TERM"),
-        "a sent TERM was not relayed to the child: {log:?}"
-    );
+    let log = await_seen(dir.path(), "INT");
+    assert_eq!(log, "INT 1\n", "a process-sent SIGINT must be relayed once");
+    await_report(dir.path(), std::time::Instant::now() + ACK_TIMEOUT);
+    assert_eq!(decision(dir.path()), "SIGINT forwarded to the child");
     release(dir.path());
     let status = wait_within(&mut wrapper, 10).expect("the wrapper never ended");
     assert_eq!(status.code(), Some(0), "wrapper status {status:?}");
@@ -1333,8 +1332,8 @@ fn is_nonblocking(fd: &std::fs::File) -> bool {
 /// 1. **A report that blocks must never sit between the decision and the delivery.** The
 ///    delivery is `kill_process`; the report only describes it. So the delivery goes out first.
 /// 2. **A report must not block at all** (codex-review P1), because there is one watcher
-///    thread: a blocked write parks it and every LATER signal goes unforwarded. So `report`
-///    writes through its own non-blocking descriptor.
+///    thread: a blocked write parks it and every LATER signal goes unforwarded. Reports are
+///    queued to a reporter thread, never written by the watcher.
 ///
 /// A third hazard the earlier version of this test had: it read the child's log at the instant
 /// it saw the report, which races the CHILD's trap scheduling rather than the wrapper's

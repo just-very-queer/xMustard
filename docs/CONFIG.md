@@ -37,24 +37,20 @@ Two behaviours the design must respect, both measured:
 
 | Key | Type and default | Environment override | Notes |
 |---|---|---|---|
-| `schema` | `lean` \| `full`, default `lean` (the tool profile) | `XMUSTARD_MCP_SCHEMA` | the stdio shim reads the override (`cmd/xmustard-mcp/main.go:82`); the HTTP `/mcp` endpoint reads the request's `schema` query parameter instead and, blank, serves lean without consulting the override (`cmd/xmustard-api/mcp_routes.go:69`). The code row proposes making the absent-parameter fallback read the configured value, so `config check` reports what every session uses (round-3 finding r3-3) |
 | `tools_disabled` | list of tool names, default `[]` | `XMUSTARD_DISABLED_TOOLS` | narrows only: a name the server does not know is refused |
 | `search_text_lanes` | `on` \| `off`, default `on` | `XMUSTARD_SEARCH_TEXT_LANES` | `off` is the kill switch; `on` is the default, so the file cannot widen |
 
 ### `[engine.hooks.<client>]` — file-settable, per client
 
-One sub-table per client, starting with `claude` and `codex` (the clients `internal/hooks` serves today); adding a client is one table entry. `<CLIENT>` in the overrides is the upper-case client name. These keys are per-repository client behaviour, which is what a repository file is for.
+One sub-table per enforceable client, starting with `codex` and `cursor`; Claude's v1 hook events provide no static-client enforcement point for `fail`, so that key is invalid for Claude and config check refuses or warns on it. `<CLIENT>` in the overrides is the upper-case client name. `enabled` and `timeout_ms` are operator-only: repository content must never disable a guard or lower its response budget. These settings may be supplied by the environment; they are not accepted from `xmustard.toml`.
 
 | Key | Type and default | Environment override | Notes |
 |---|---|---|---|
-| `enabled` | bool, default `true` | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_ENABLED` | `false` refuses the client's hook events at the daemon and makes the client exit without posting |
-| `fail` | `open` \| `closed`, default `open` | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_FAIL` | what happens when the daemon is unreachable or the budget runs out; `open` is today's behaviour (`cmd/xmustard-hook/main.go:11`), `closed` denies the tool call the hook guards |
-| `timeout_ms` | int, default 200 | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_TIMEOUT_MS` | per-event client budget; the file may lower it, not raise it |
+| `fail` | `open` \| `closed`, default `open` | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_FAIL` | what happens when an enforceable static client cannot reach the daemon or exhausts its budget; `closed` denies the guarded tool call. This setting is defined for Codex and Cursor; Claude has no fail-policy enforcement point in v1, so config check refuses or warns on it |
 
-**What `fail=closed` can and cannot promise** (round-2 finding r2-1). The policy is enforced only where an xmustard component sits in the path:
+**What `fail=closed` can and cannot promise** (round-2 finding r2-1). In v1 `fail` is meaningful only for Codex and Cursor static-client events that guard tool calls. Claude's static events (`SessionStart` and `WorktreeRemove`) do not guard a tool call, and `WorktreeRemove` must remain silent; Claude `fail` is therefore refused or warned on by config check. Claude Code's HTTP-hook events (for example `PreToolUse`) go straight to the daemon. When the daemon is unreachable, the event never reaches xmustard and there is no offline enforcement point; what Claude Code then does is Claude Code's own hook policy. The spec does not promise `closed` for these events, and the code row must not implement one silently.
 
-- **Static-client events** (Claude Code's `SessionStart` and `WorktreeRemove`; every Codex event): the client reads its own repository copy of the file, or its environment override, before it dials anything, so `closed` is enforceable offline. A missing file is not an error: no policy means the defaults. An unparsable file is refused, not silently defaulted (round-3 finding r3-1): the client surfaces the error and exits non-zero instead of applying defaults, so corrupting the file cannot silently turn a configured `closed` policy into `open` — except for `WorktreeRemove`, whose failure must stay silent (`cmd/xmustard-hook/main.go:3`), which exits 0. The daemon independently refuses a disabled client's events at the route, so `enabled=false` holds even for a client that never reads the file.
-- **Claude Code's HTTP-hook events** (for example `PreToolUse`): these go from Claude Code straight to the daemon. When the daemon is unreachable, the event never reaches xmustard and there is no offline enforcement point; what Claude Code then does is Claude Code's own hook policy. The spec does not promise `closed` for these events, and the code row must not implement one silently.
+The `enabled` and `timeout_ms` settings are operator-only. In particular, if the operator sets a client's `fail=closed`, a committed file cannot set `enabled=false` or lower `timeout_ms`; neither may be accepted from repository content. `XMUSTARD_HOOK_TIMEOUT_MS` remains the all-client timeout override; `XMUSTARD_ENGINE_HOOKS_<CLIENT>_TIMEOUT_MS` overrides it for that client. Invalid values of existing environment variables retain their current ignore-and-default behavior; validation of new variables does not reinterpret the old variables.
 
 In v1 the policy is per client, not per event (owner question OQ-2). `WorktreeRemove` stays fail-open in v1 either way, because a failing hook there blocks the removal; a per-event carve-out is the owner's call.
 
@@ -71,6 +67,9 @@ These never come from `xmustard.toml`. The file loader refuses each of them wher
 
 | Key | Environment override | Default | `settings.json` today |
 |---|---|---|---|
+| `schema` | `XMUSTARD_MCP_SCHEMA` | `lean` | — |
+| `engine.hooks.<client>.enabled` | `XMUSTARD_ENGINE_HOOKS_<CLIENT>_ENABLED` | `true` | — |
+| `engine.hooks.<client>.timeout_ms` | `XMUSTARD_HOOK_TIMEOUT_MS` (all-client override); `XMUSTARD_ENGINE_HOOKS_<CLIENT>_TIMEOUT_MS` (per-client override) | 200 ms | — |
 | `profile` | `XMUSTARD_PROFILE` | `core` | — |
 | `read_only` | `XMUSTARD_READ_ONLY` | `false` | — |
 | `core_bin` | `XMUSTARD_CORE_BIN` | empty (PATH) | — |
@@ -93,7 +92,7 @@ The index eligibility keys (content retention, max files, non-Git, untracked) ar
 
 ### Precedence
 
-Proposed: environment variable over `xmustard.toml` over `settings.json` over the compiled default, one winner per key — the same file-then-env order the index loader already uses (`config.rs:263`), with `settings.json` between file and default for the keys it owns. Two invariants sit above the chain: the file narrows and never widens or raises; and an operator-only key never comes from the file at all. `xmustard-ops config check` prints, for every key, its effective value and the source it came from (`default`, `file`, `env`, or `settings`). Whether `settings.json` — which the admin API writes at runtime — should outrank the repository file for the keys the file may carry is owner question OQ-3; the proposed order puts the repository file above it so a committed config is the operator's statement of record.
+There are no keys that `xmustard.toml` may set and `settings.json` currently owns, so no present-day file-over-settings precedence case exists. The proposed chain is environment variable over file over `settings.json` over the compiled default for a future key only if both surfaces own it; environment precedence and the one-winner/no-union rule still apply. Two invariants sit above the chain: the file narrows and never widens or raises; and an operator-only key never comes from the file at all. `xmustard-ops config check` prints, for every key, its effective value and the source it came from (`default`, `file`, `env`, or `settings`). OQ-3 asks which source wins only if a future key is added to both surfaces.
 
 ### `xmustard-ops config check`
 
@@ -114,22 +113,22 @@ It changes nothing; it is a read-only validator and report. It runs against the 
 
 ## Open questions for the owner
 
-- **OQ-1** Malformed configuration: refuse startup (proposed) or log and continue with defaults.
+- **OQ-1** Malformed configuration: the static hook client's refusal behavior is invariant — a malformed file is never silently replaced by defaults there (except `WorktreeRemove`, which must stay silent). For other startup paths, refuse startup (proposed) or log and continue with defaults?
 - **OQ-2** Hook failure policy per client (proposed for v1) or per event; whether any event may be `closed`, given `WorktreeRemove` must stay silent; and whether the daemon should grow a closed mode of its own for handler failures (proposed: not in v1; the HTTP-hook offline gap is a stated limitation, not something to build around).
-- **OQ-3** Precedence between `xmustard.toml` and `settings.json` for the keys the file may carry (proposed: file above settings; trust and posture keys are settled — never from the file).
-- **OQ-4** File location: the workspace root (proposed) or an additional install-level path. Settled by round 1: the static hook client reads its own repository copy, so `fail=closed` is enforceable for static-client events without the daemon.
+- **OQ-3** If a future key is added to both `xmustard.toml` and `settings.json`, which source wins (proposed: file above settings; trust and posture keys remain settled as operator-only).
+- **OQ-4** File location: the workspace root (proposed) or an additional install-level path. The static hook client reads its own repository copy; whether an install-level path is also supported remains open.
 - **OQ-5** Whether the `.xmustard.json` `index` section should migrate into `xmustard.toml` (`[engine.index]`) in a later row. Proposed: not in the code row; the two files keep distinct jobs (TOML: switches; `.xmustard.*`: guidance and index eligibility).
 
 ## Tests the code row runs
 
 - `config check` refuses an unknown key and an out-of-range value, naming the key and the file.
-- One test per precedence boundary: environment over file, file over `settings.json`, `settings.json` over the compiled default, with the printed source asserted.
-- The file narrows: a lowered quota or timeout is accepted; a raised one is ignored and the default kept (the loader clamps, as the index loader does), with `config check` reporting the effective value and source.
-- Operator-only keys are refused from the file, one test per class: executable path (`core_bin`), posture (`profile`, `read_only`, `worker`), registration (`register.*`), daemon deployment (`hook.budget_ms`, `hook.socket`), reserved switches, memory trust and standing memory.
+- One test per precedence boundary: environment over file, `settings.json` over the compiled default, with the printed source asserted; no file-over-settings test applies today because no file-settable key is in `settings.json`. If a future key overlaps, add a file-over-settings test when OQ-3 is decided.
+- The file narrows: a lowered quota is accepted; a raised one is ignored and the default kept (the loader clamps, as the index loader does), with `config check` reporting the effective value and source. Hook `timeout_ms` is operator-only, so a repository attempt to lower it is rejected rather than applied.
+- With the environment setting Codex `fail=closed`, a file setting `enabled=false` is rejected and the closed policy remains effective; test the refusal and effective policy. Operator-only keys are refused from the file, one test per class: tool schema, hook enablement and timeout, executable path (`core_bin`), posture (`profile`, `read_only`, `worker`), registration (`register.*`), daemon deployment (`hook.budget_ms`, `hook.socket`), reserved switches, memory trust and standing memory.
 - `trusted_run_key_principals` unset everywhere keeps WS-29b's refusal; an environment-set list behaves exactly like a `settings.json`-set list; the sources are never unioned.
-- A disabled hook client takes its refusal path; the fail-open default is pinned, with the `WorktreeRemove` must-stay-silent case asserted; an unparsable file is refused by the client rather than silently defaulted (WorktreeRemove excepted); `fail=closed` is tested only at the enforcement points the spec names (static client before dialing), and no offline closed path exists for HTTP-hook events.
-- The `schema` flip (`lean`/`full`) stays inside the code `TestToolsListStaysWithinByteCaps` exercises; the `CAPS` gate covers it; the absent query-parameter fallback on the HTTP `/mcp` endpoint reads the configured value, so `config check` and the sessions agree.
+- Operator-configured disabled hooks take their refusal path; repository attempts to set `enabled=false` or lower the timeout are refused, and the environment `fail=closed` plus file `enabled=false` regression above proves the closed policy cannot be weakened. The fail-open default is pinned, with the `WorktreeRemove` must-stay-silent case asserted; an unparsable file is refused by the client rather than silently defaulted (WorktreeRemove excepted); `fail=closed` is tested only at the enforcement points the spec names, and no offline closed path exists for Claude HTTP-hook events.
+- The `XMUSTARD_MCP_SCHEMA` override flip (`lean`/`full`) stays inside the code `TestToolsListStaysWithinByteCaps` exercises; the `CAPS` gate covers it; the absent query-parameter fallback on the HTTP `/mcp` endpoint reads the configured value, so `config check` and the sessions agree.
 - The reserved `semantic` and `lsp` overrides parse and change nothing.
-- Every new environment variable has a reader test and a documentation line.
+- The hook timeout reader maps `XMUSTARD_HOOK_TIMEOUT_MS` to the all-client value and lets `XMUSTARD_ENGINE_HOOKS_<CLIENT>_TIMEOUT_MS` take precedence for that client; assert both precedence and the legacy ignore-and-default behavior for invalid values of existing variables.
 
 Gate for the code row: `MAC`/`BOXALL` per its row, plus `CAPS` (the tool profile flip), and `SECDOC` only if a route or gate row changes. Nothing resident changes, so `BUD` is not owed unless the code row makes it so.

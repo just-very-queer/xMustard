@@ -432,6 +432,11 @@ impl Reporter {
         if !self.flush(deadline) {
             return;
         }
+        self.state_loss(deadline);
+    }
+
+    /// States the accumulated loss only after its notice is queued.
+    fn state_loss(&self, deadline: std::time::Instant) {
         let lost = self.lost.load(Ordering::SeqCst);
         if lost == 0 {
             return;
@@ -642,6 +647,9 @@ impl Forwarder {
                 else {
                     continue;
                 };
+                // Hold the reporter before any early return: the exit-path drain must wait even
+                // when reaping races a signal that was already received.
+                let _deciding = reporter().deciding();
                 if reaped.load(Ordering::SeqCst) || has_ended(child) {
                     // The child is reaped and there is nothing left to tell it, so the
                     // signal means what it would have meant without any forwarding at all:
@@ -651,9 +659,6 @@ impl Forwarder {
                     let _ = signal_hook::low_level::emulate_default_handler(raw);
                     return;
                 }
-                // Held until the line below is queued, so an exit-path drain that runs because
-                // this delivery ended the child waits for the line (codex-review, round 8).
-                let _deciding = reporter().deciding();
                 // Whether to relay is `DELIVERIES`' decision, not this loop's: a signal the
                 // terminal or the kernel generated is skipped only where a group delivery
                 // would already have reached the child, and a hangup or a timer is never
@@ -1189,6 +1194,49 @@ mod tests {
         assert_eq!(
             text,
             "kept\nxmustard run: 1 decision report(s) not written to stderr\n"
+        );
+    }
+
+    /// A full queue prevents the loss notice from being queued; the bounded worker wait keeps a
+    /// broken enqueue from hanging the test thread.
+    #[test]
+    fn a_drain_keeps_loss_until_its_notice_is_queued() {
+        let (sink, entered, release, out) = gated_sink();
+        let reporter = Arc::new(Reporter::new(sink, 1));
+        reporter.send("writer-held\n".into());
+        entered
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the writer never started the held line");
+        reporter.send("queue-full\n".into());
+        reporter.send("lost\n".into());
+        assert_eq!(reporter.lost.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                reporter.lines.try_send(Report {
+                    line: "probe\n".into(),
+                    ack: false,
+                }),
+                Err(mpsc::TrySendError::Full(_))
+            ),
+            "the writer queue was not full while its first write was held"
+        );
+
+        let (done, finished) = mpsc::channel();
+        let stating = Arc::clone(&reporter);
+        thread::spawn(move || {
+            stating.state_loss(std::time::Instant::now() + Duration::from_millis(100));
+            let _ = done.send(());
+        });
+        let waited = finished.recv_timeout(Duration::from_secs(10));
+        release.send(()).unwrap();
+        waited.expect("state_loss blocked past its deadline");
+        assert_eq!(reporter.lost.load(Ordering::SeqCst), 1);
+
+        reporter.drain(Duration::from_secs(10));
+        let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.ends_with("xmustard run: 1 decision report(s) not written to stderr\n"),
+            "the later drain did not state the retained loss count: {text:?}"
         );
     }
 

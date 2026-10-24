@@ -89,13 +89,17 @@ func outlineHashKey(workspaceID, root, rel string) string {
 // It is a var so a test can move the moment a file changes; production never replaces it.
 var markOutlineFile = markOutlineFileNow
 
+// afterOutlineFileRead is a test seam for a rewrite between the read and its final stat.
+var afterOutlineFileRead = func() {}
+
 func markOutlineFileNow(root, rel string) (fileMark, bool) {
 	f, info, ok := openOutlineFile(root, rel)
 	if !ok {
 		return fileMark{}, false
 	}
+	mark := fileMarkFromFile(f, info)
 	f.Close()
-	return fileMarkFromInfo(info), true
+	return mark, true
 }
 
 // readOutlineFile reads rel through the confined walk and returns its identity and its
@@ -114,11 +118,17 @@ func readOutlineFile(root, rel string, limit int64) (fileMark, string, bool) {
 	}
 	var b strings.Builder
 	b.Grow(int(info.Size()))
+	before := fileMarkFromFile(f, info)
 	n, err := io.Copy(&b, io.LimitReader(f, limit+1))
 	if err != nil || n > limit {
 		return fileMark{}, "", false
 	}
-	return fileMarkFromInfo(info), b.String(), true
+	afterOutlineFileRead()
+	after := fileMarkFromFile(f, info)
+	if before != after {
+		return fileMark{}, "", false
+	}
+	return before, b.String(), true
 }
 
 // openOutlineFile opens rel beneath root through the symlink-refusing walk and returns it

@@ -40,6 +40,39 @@ func setOutlineTrustWindow(t *testing.T, d time.Duration) {
 // trustOutlineCache closes the racy window, so a fixture's own files count as old enough.
 func trustOutlineCache(t *testing.T) { setOutlineTrustWindow(t, 0) }
 
+func TestRewriteBetweenOutlineReadAndFinalMarkIsRejected(t *testing.T) {
+	resetOutlineCache(t)
+	trustOutlineCache(t)
+	f := newInvalidationFixture(t)
+	clearOutlineHashes()
+	orig := afterOutlineFileRead
+	t.Cleanup(func() { afterOutlineFileRead = orig })
+	edited := strings.Replace(srvSource, "return 8081", "return 9090", 1)
+	changed := false
+	afterOutlineFileRead = func() {
+		if changed {
+			return
+		}
+		changed = true
+		writeRepoFile(t, f.root, "srv.go", edited)
+	}
+
+	session := newRehashSession(context.Background(), f.root, f.ws)
+	read := session.text("srv.go")
+	if !changed {
+		t.Fatal("the test rewrite did not run between the read and final mark")
+	}
+	if read.ok || read.text != "" {
+		t.Fatalf("a read paired old text with the rewritten file mark: %+v", read)
+	}
+	if got := session.text("srv.go"); got.ok || got.text != "" {
+		t.Fatalf("the session retained text from the mismatched read: %+v", got)
+	}
+	if n := outlineHashEntries(); n != 0 {
+		t.Fatalf("a mismatched read populated %d cache entries", n)
+	}
+}
+
 // A file that changes between the read and the store must not be cached: the hash came
 // from the old text, so storing it under the new mark would let a later pass serve that
 // stale hash as current and the edit would never be marked. The outline rewrite is
@@ -204,10 +237,9 @@ func TestTheHeldTotalIsExactAcrossAReplacement(t *testing.T) {
 	}
 }
 
-// The mark carries a real inode and ctime, not only size and mtime: os.FileInfo.Sys()
-// returns *syscall.Stat_t, so an assertion to another stat type silently degrades the
-// mark and an atomic same-size replacement with a preserved mtime keeps its identity.
-// The fields are asserted directly, so a mark that lost them fails here.
+// The mark carries a real inode and ctime, not only size and mtime: an atomic same-size
+// replacement with a preserved mtime must still change its identity. The fields are asserted
+// directly, so a mark that lost them fails here.
 func TestAMarkCarriesItsInodeAndCtime(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "a.go"), []byte("package a\n"), 0o644); err != nil {
