@@ -228,6 +228,58 @@ class Mcp:
                 self.proc.kill()
 
 
+class HttpMcp:
+    """One authenticated Streamable HTTP MCP client session."""
+
+    def __init__(self, api_base, workspace, token, readonly=True):
+        mode = "readonly" if readonly else "full"
+        self.url = f"{api_base}/mcp?workspace={workspace}&mode={mode}"
+        self.token = token
+        self.session_id = ""
+        self.next_id = 1
+
+    def post(self, message):
+        headers = {"Content-Type": "application/json", "Accept": "application/json",
+                   "Authorization": "Bearer " + self.token}
+        if self.session_id:
+            headers["Mcp-Session-Id"] = self.session_id
+        req = urllib.request.Request(self.url, data=json.dumps(message).encode(), method="POST", headers=headers)
+        try:
+            with urllib.request.urlopen(req, timeout=120) as response:
+                body = response.read()
+                self.session_id = response.headers.get("Mcp-Session-Id", self.session_id)
+        except urllib.error.HTTPError as error:
+            body = error.read()
+            raise RuntimeError(f"MCP HTTP {error.code}: {body[:512]!r}") from error
+        return json.loads(body) if body else {}
+
+    def initialize(self):
+        result = self.post({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {
+            "protocolVersion": "2024-11-05", "capabilities": {}, "clientInfo": {"name": "ocr-contract", "version": "1"}}})
+        if not self.session_id or "result" not in result:
+            raise RuntimeError(f"MCP initialize did not open a session: {result}")
+        self.post({"jsonrpc": "2.0", "method": "notifications/initialized"})
+        return result
+
+    def tool(self, name, arguments):
+        call_id = self.next_id
+        self.next_id += 1
+        return self.post({"jsonrpc": "2.0", "id": call_id, "method": "tools/call",
+                          "params": {"name": name, "arguments": arguments}})
+
+    def close(self):
+        if not self.session_id:
+            return
+        req = urllib.request.Request(self.url, method="DELETE", headers={
+            "Authorization": "Bearer " + self.token, "Mcp-Session-Id": self.session_id})
+        try:
+            with urllib.request.urlopen(req, timeout=5):
+                pass
+        except (OSError, urllib.error.URLError):
+            pass
+        self.session_id = ""
+
+
 def build_binaries(out_dir):
     """Build the Go API and shim from this checkout; resolve the Rust core binary."""
     os.makedirs(out_dir, exist_ok=True)
