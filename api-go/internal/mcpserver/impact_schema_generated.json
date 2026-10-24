@@ -1,0 +1,25 @@
+{
+  "args": [
+    {"name":"workspace_id","type":"string","advanced":false,"desc":"workspace id; auto-resolved if omitted"},
+    {"name":"symbol","type":"string","advanced":false,"desc":"name, Container.name, UID or path"},
+    {"name":"path","type":"string","max_len":4096,"advanced":false,"desc":"a repo-relative file"},
+    {"name":"from","type":"string","advanced":false,"desc":"trace from here"},
+    {"name":"to","type":"string","advanced":false,"desc":"trace to here"},
+    {"name":"max_depth","type":"integer","min":1,"max":32,"advanced":false,"desc":"hops (default 3; path= 4)"},
+    {"name":"op","type":"string","enum":["refs","definition","implementations"],"advanced":true,"desc":"symbol-level occurrences instead of the depth tiers: refs (every use), definition (what declares it), implementations (types implementing it)"},
+    {"name":"direction","type":"string","enum":["upstream","downstream"],"advanced":true,"desc":"dependents (default) or dependencies"},
+    {"name":"relation_types","type":"string","enum":["CALLS","IMPORTS","EXTENDS","IMPLEMENTS","USES","ACCESSES","HAS_METHOD","HAS_PROPERTY"],"max_len":128,"list":true,"advanced":true,"desc":"edge kinds (default CALLS,IMPORTS,EXTENDS,IMPLEMENTS)"},
+    {"name":"min_confidence","type":"number","min":0,"max":1,"advanced":true,"desc":"skip edges below this confidence"},
+    {"name":"include_tests","type":"boolean","advanced":true,"desc":"walk test files (default false)"},
+    {"name":"limit","type":"integer","min":1,"max":500,"advanced":true,"desc":"items per depth tier (default 50), or per page with op="},
+    {"name":"offset","type":"integer","min":0,"max":50000,"advanced":true,"desc":"items skipped per tier"},
+    {"name":"summary_only","type":"boolean","advanced":true,"desc":"counts, risk, no items"},
+    {"name":"timeout_ms","type":"integer","min":1,"max":60000,"advanced":true,"desc":"walk budget (default 10000)"},
+    {"name":"scope","type":"string","enum":["unstaged","staged","all","workspace","compare","commit","range"],"advanced":true,"desc":"symbols a diff touches, and dependents"},
+    {"name":"base","type":"string","max_len":256,"advanced":true,"desc":"scope=compare|range: base"},
+    {"name":"head","type":"string","max_len":256,"advanced":true,"desc":"scope=compare|commit|range: head"},
+    {"name":"worktree","type":"string","max_len":4096,"advanced":true,"desc":"another checkout to diff"},
+    {"name":"cursor","type":"string","max_len":64,"advanced":true,"desc":"next_cursor of the previous page"},
+    {"name":"max_chars","type":"integer","min":2000,"max":65536,"advanced":true,"desc":"result budget (default 8000)"}
+  ]
+}
