@@ -45,6 +45,11 @@ use crate::symbolgraph::{
 
 /// Bump when the cached graph/feature layout or extraction semantics change.
 pub const INDEX_FORMAT_VERSION: &str = "xm-index-2";
+/// Bump when cache interpretation changes without changing the graph layout. Keep
+/// this separate from the format version so semantic invalidation is explicit.
+pub const CACHE_MANIFEST_VERSION: u32 = 1;
+/// Producer semantics for graph, feature and wiki caches; bump when their meaning changes.
+pub const CACHE_PRODUCER_VERSION: &str = "xm-cache-producer-1";
 
 /// Total bytes `source_identity` hashes per call. Tracked dirty files are hashed first;
 /// entries past the budget become `identity_budget` limitations.
@@ -1332,7 +1337,7 @@ impl CacheScope {
 
     /// Load the graph snapshot stored for `key`.
     pub fn load_graph(&self, key: &str) -> Option<SymbolGraph> {
-        load_json(&self.graph_file(key))
+        load_json(&self.graph_file(key)).ok()
     }
 
     /// Store a graph snapshot for `key` (best effort), keep the newest few, and sweep
@@ -1348,7 +1353,7 @@ impl CacheScope {
 
     /// Load the per-file feature cache (streamed; None if absent or unreadable).
     pub fn load_features<T: serde::de::DeserializeOwned>(&self) -> Option<T> {
-        load_json(&self.features_file())
+        load_json(&self.features_file()).ok()
     }
 
     /// Store the per-file feature cache, streamed (best effort). Returns stale temps
@@ -1453,16 +1458,44 @@ pub(crate) fn lock_file(path: &Path, timeout: Duration) -> (Option<BuildLock>, L
     }
 }
 
-/// Stream a JSON value from `path` (no whole-file buffer).
-fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Option<T> {
-    let f = fs::File::open(path).ok()?;
-    serde_json::from_reader(std::io::BufReader::new(f)).ok()
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMissReason {
+    Unavailable,
+    Invalid,
+    ManifestVersion,
+    ProducerVersion,
 }
 
-/// Stream a JSON value into `path` atomically.
+#[derive(Serialize, Deserialize)]
+struct CacheManifest<T> {
+    manifest_version: u32,
+    producer_version: String,
+    payload: T,
+}
+
+/// Stream a version-checked cache payload from `path`; incompatible files are misses.
+fn load_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, CacheMissReason> {
+    let f = fs::File::open(path).map_err(|_| CacheMissReason::Unavailable)?;
+    let manifest: CacheManifest<T> = serde_json::from_reader(std::io::BufReader::new(f))
+        .map_err(|_| CacheMissReason::Invalid)?;
+    if manifest.manifest_version != CACHE_MANIFEST_VERSION {
+        return Err(CacheMissReason::ManifestVersion);
+    }
+    if manifest.producer_version != CACHE_PRODUCER_VERSION {
+        return Err(CacheMissReason::ProducerVersion);
+    }
+    Ok(manifest.payload)
+}
+
+/// Stream a versioned cache value into `path` atomically.
 fn store_json<T: Serialize>(path: &Path, value: &T) -> std::io::Result<()> {
+    let manifest = CacheManifest {
+        manifest_version: CACHE_MANIFEST_VERSION,
+        producer_version: CACHE_PRODUCER_VERSION.to_string(),
+        payload: value,
+    };
     atomic_write_with(path, |w| {
-        serde_json::to_writer(w, value).map_err(std::io::Error::from)
+        serde_json::to_writer(w, &manifest).map_err(std::io::Error::from)
     })
 }
 
@@ -1499,16 +1532,20 @@ pub fn wiki_cache_path(root: &Path, workspace_id: &str) -> PathBuf {
     legacy_cache_dir(root).join(format!("wiki-{workspace_id}.json"))
 }
 
-/// Load the raw wiki-cache bytes (caller deserializes), or None if absent.
+/// Load the versioned wiki-cache payload, or None when absent or incompatible.
 pub fn load_wiki_cache_bytes(root: &Path, workspace_id: &str) -> Option<Vec<u8>> {
-    fs::read(wiki_cache_path(root, workspace_id)).ok()
+    let value: serde_json::Value = load_json(&wiki_cache_path(root, workspace_id)).ok()?;
+    serde_json::to_vec(&value).ok()
 }
 
-/// Persist the wiki-cache bytes (best-effort).
+/// Persist the wiki-cache payload in the versioned manifest (best-effort).
 pub fn store_wiki_cache_bytes(root: &Path, workspace_id: &str, bytes: &[u8]) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return;
+    };
     let dir = legacy_cache_dir(root);
     if fs::create_dir_all(&dir).is_ok() {
-        let _ = atomic_write(&wiki_cache_path(root, workspace_id), bytes);
+        let _ = store_json(&wiki_cache_path(root, workspace_id), &value);
     }
 }
 
@@ -1548,6 +1585,37 @@ mod tests {
         git(dir.path(), &["add", "-A"]);
         git(dir.path(), &["commit", "-qm", "c"]);
         dir
+    }
+
+    #[test]
+    fn cache_manifest_rejects_missing_and_incompatible_versions() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("features.json");
+        fs::write(&path, br#"{"answer":42}"#).unwrap();
+        assert_eq!(
+            load_json::<serde_json::Value>(&path),
+            Err(CacheMissReason::Invalid)
+        );
+
+        for (manifest, reason) in [
+            (
+                serde_json::json!({"manifest_version": 0, "producer_version": CACHE_PRODUCER_VERSION, "payload": {"answer": 42}}),
+                CacheMissReason::ManifestVersion,
+            ),
+            (
+                serde_json::json!({"manifest_version": CACHE_MANIFEST_VERSION, "producer_version": "future-producer", "payload": {"answer": 42}}),
+                CacheMissReason::ProducerVersion,
+            ),
+        ] {
+            fs::write(&path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+            assert_eq!(load_json::<serde_json::Value>(&path), Err(reason));
+        }
+
+        store_json(&path, &serde_json::json!({"answer": 42})).unwrap();
+        assert_eq!(
+            load_json::<serde_json::Value>(&path).unwrap(),
+            serde_json::json!({"answer": 42})
+        );
     }
 
     #[test]
