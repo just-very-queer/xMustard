@@ -544,6 +544,7 @@ describe("hook delivery", () => {
 		assert.equal(query.get("is_error"), "true");
 		assert.equal(query.get("status"), "500");
 		assert.equal(query.get("issuer"), "pi");
+		assert.equal(query.get("client"), "pi");
 		assert.equal(query.get("call_id"), "c4");
 		assert.equal(query.get("session_id"), "s1");
 		assert.equal(out?.isError, true);

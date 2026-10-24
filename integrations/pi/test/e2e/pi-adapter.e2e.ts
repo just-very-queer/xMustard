@@ -57,6 +57,20 @@ async function loadWorkspace(a: Api): Promise<string> {
 	return r.body.workspace.workspace_id as string;
 }
 
+async function seedLargeCaptureEntry(a: Api, token?: string): Promise<string> {
+	const r = await a.json("POST", `/api/workspaces/${ws}/context`, {
+		title: "Context anchor inventory",
+		content: "This fixture records ordinary component ownership for repository navigation.",
+		kind: "gotcha",
+		paths: capturePaths,
+		require_verification: true,
+	}, token);
+	assert.equal(r.status, 200, `large capture memory: ${r.text.slice(0, 300)}`);
+	assert.equal(typeof r.body?.id, "string", `large capture memory id: ${r.text.slice(0, 300)}`);
+	assert.equal(r.body.status, "pending", "the large source fixture must not enter default recall");
+	return r.body.id as string;
+}
+
 // seedDataDir gives another API instance the already-scanned workspace record (a scan
 // of the 1500-file fixture takes about two minutes); the repository is the same.
 function seedDataDir(dir: string): void {
@@ -98,6 +112,10 @@ function pi(name: string, steps: Step[], o: PiOpts = {}): Promise<PiRun> {
 }
 
 const call = (name: string, args: Record<string, unknown> = {}) => ({ name, args: { workspace_id: "$WS", ...args } });
+let capturePaths: string[] = [];
+let largeEntryID = "";
+// recall by entry_id is unbudgeted; anchored long paths make its result multi-page.
+const largeCapture = () => call("recall", { entry_id: largeEntryID });
 const byName = (run: PiRun, name: string) => toolResultMessages(run, name);
 const one = (run: PiRun, name: string) => {
 	const m = byName(run, name);
@@ -138,6 +156,18 @@ async function readAll(a: Api, w: string, handle: string, token?: string): Promi
 		if (r.body.eof) return { status: 200, bytes: Buffer.concat(parts), pages };
 		off = r.body.next_offset;
 	}
+}
+
+// Long names make the recalled entry large without storing large file contents.
+function seedLargeCaptureFiles(root: string): string[] {
+	const parts = ["capture-long", "d".repeat(250), "e".repeat(250), "f".repeat(150)];
+	const dir = join(root, ...parts);
+	mkdirSync(dir, { recursive: true });
+	return Array.from({ length: 300 }, (_, i) => {
+		const name = `capture_${String(i).padStart(3, "0")}.txt`;
+		writeFileSync(join(dir, name), "Pi e2e capture path baseline\n");
+		return [...parts, name].join("/");
+	});
 }
 
 before(async () => {
@@ -254,18 +284,20 @@ describe("Pi adapter against the real xMustard API", () => {
 	});
 
 	test("a large result is projected at the source (bound identity); xmustard_expand activates and pages 64 KiB exactly", async () => {
-		const run = await pi("expand-source", [{ calls: [call("impact")] }, { expand_all: { workspace_id: "$WS" } }, { text: "done" }]);
+		capturePaths = seedLargeCaptureFiles(repo);
+		largeEntryID = await seedLargeCaptureEntry(api);
+		const run = await pi("expand-source", [{ calls: [largeCapture()] }, { expand_all: { workspace_id: "$WS" } }, { text: "done" }]);
 		assert.equal(run.code, 0, run.stderr);
 		assertModelSawResults(run);
-		const impact = one(run, "impact");
-		const footer = footerOf(textOf(impact)) ?? assert.fail(`no evidence footer: ${textOf(impact).slice(-400)}`);
-		assert.ok(footer.handle?.startsWith("xm1."), `impact footer: ${textOf(impact).slice(-400)}`);
+		const captured = one(run, "recall");
+		const footer = footerOf(textOf(captured)) ?? assert.fail(`no evidence footer: ${textOf(captured).slice(-400)}`);
+		assert.ok(footer.handle?.startsWith("xm1."), `recall footer: ${textOf(captured).slice(-400)}`);
 		assert.equal(footer.captured_identity, "bound");
 		assert.ok(footer.raw_bytes > 3 * PAGE, `original is multi-page (${footer.raw_bytes})`);
-		assert.ok(Buffer.byteLength(textOf(impact)) <= PAGE + 2048, "projection is bounded");
-		assert.equal(impact.details?.path, "source");
-		// activation happens between the impact result and the next model request
-		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "impact"));
+		assert.ok(Buffer.byteLength(textOf(captured)) <= PAGE + 2048, "projection is bounded");
+		assert.equal(captured.details?.path, "source");
+		// activation happens between the captured recall result and the next model request
+		const idx = run.trace.findIndex((l) => l.tool_results.some((r) => r.toolName === "recall"));
 		assert.ok(!run.trace[idx - 1]?.active_tools.includes("xmustard_expand"));
 		assert.ok(run.trace[idx].active_tools.includes("xmustard_expand"));
 		const pages = pagesOf(run, footer.handle);
@@ -283,17 +315,17 @@ describe("Pi adapter against the real xMustard API", () => {
 		assert.equal(sha(bytes), footer.raw_sha256);
 		for (const m of byName(run, "xmustard_expand")) assert.ok(pageHeaderOf(textOf(m)), "model sees a page header");
 		original = { handle: footer.handle, bytes, footer };
-		record("expand_source", { raw_bytes: footer.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(impact)), pages: pages.length, captured_identity: footer.captured_identity, encodings: pages.map((p) => p.text_encoding) });
+		record("expand_source", { raw_bytes: footer.raw_bytes, projected_text_bytes: Buffer.byteLength(textOf(captured)), pages: pages.length, captured_identity: footer.captured_identity, encodings: pages.map((p) => p.text_encoding) });
 	});
 
 	test("repository mutation: the old capture is served unchanged and labelled stale", async () => {
 		assert.ok(original);
 		appendFileSync(join(repo, "pkg", "handler_0001.go"), "\n// mutated by e2e\n");
-		const run = await pi("stale", [{ calls: [call("impact")] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], {
+		const run = await pi("stale", [{ calls: [largeCapture()] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], {
 			env: { XM_OLD_HANDLE: original.handle },
 		});
 		assert.equal(run.code, 0, run.stderr);
-		const fresh = footerOf(textOf(one(run, "impact")));
+		const fresh = footerOf(textOf(one(run, "recall")));
 		assert.notEqual(fresh?.captured_key, original.footer.captured_key, "new capture has the mutated identity");
 		const [page] = pagesOf(run, original.handle);
 		assert.ok(page, "old handle expanded");
@@ -310,17 +342,19 @@ describe("Pi adapter against the real xMustard API", () => {
 		const proxy = new StallProxy(api.base, () => false);
 		await proxy.start();
 		try {
-			const run = await pi("hook", [{ calls: [call("impact"), call("why_failed", { run_id: "missing-run" })] }, { expand_all: { workspace_id: "$WS" } }, { text: "done" }], {
+			const run = await pi("hook", [{ calls: [largeCapture(), call("why_failed", { run_id: "missing-run" })] }, { expand_all: { workspace_id: "$WS" } }, { text: "done" }], {
 				apiBase: proxy.base,
 				env: { XMUSTARD_PI_DELIVERY: "hook" },
 			});
 			assert.equal(run.code, 0, run.stderr);
 			assertModelSawResults(run);
-			const impact = one(run, "impact");
-			assert.equal(impact.details?.path, "hook");
-			const footer = footerOf(textOf(impact));
-			assert.equal(footer?.captured_identity, "unknown");
-			const pages = pagesOf(run, footer?.handle);
+			const captured = one(run, "recall");
+			assert.equal(captured.details?.path, "hook");
+			const footer = footerOf(textOf(captured));
+			assert.ok(footer && footer.handle?.startsWith("xm1."), "large explain capture issues a handle");
+			assert.ok(footer.raw_bytes > (32 << 10), `capture exceeds Pi's target (${footer.raw_bytes})`);
+			assert.equal(footer.captured_identity, "unknown");
+			const pages = pagesOf(run, footer.handle);
 			assert.ok(pages.length > 1);
 			for (const p of pages) {
 				assert.equal(p.freshness, "unknown");
@@ -338,12 +372,12 @@ describe("Pi adapter against the real xMustard API", () => {
 	});
 
 	test("concurrency: two concurrent Pi processes, four calls per turn, get distinct, exact originals", async () => {
-		const steps: Step[] = [{ calls: [call("impact"), call("impact"), call("impact"), call("impact")] }, { text: "done" }];
+		const steps: Step[] = [{ calls: [largeCapture(), largeCapture(), largeCapture(), largeCapture()] }, { text: "done" }];
 		const [a, b] = await Promise.all([pi("concurrent-a", steps), pi("concurrent-b", steps)]);
 		const footers = [a, b].flatMap((r) => {
 			assert.equal(r.code, 0, r.stderr);
 			assertModelSawResults(r);
-			return byName(r, "impact").map((m) => {
+			return byName(r, "recall").map((m) => {
 				assert.equal(m.isError, false, textOf(m).slice(0, 300));
 				return footerOf(textOf(m));
 			});
@@ -361,7 +395,7 @@ describe("Pi adapter against the real xMustard API", () => {
 	test("API restart: a handle issued before restart still expands to the same bytes", async () => {
 		assert.ok(original);
 		await api.restart();
-		const run = await pi("restart", [{ calls: [call("impact")] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: PAGE })] }, { text: "done" }], {
+		const run = await pi("restart", [{ calls: [largeCapture()] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: PAGE })] }, { text: "done" }], {
 			env: { XM_OLD_HANDLE: original.handle },
 		});
 		assert.equal(run.code, 0, run.stderr);
@@ -377,14 +411,16 @@ describe("Pi adapter against the real xMustard API", () => {
 		seedDataDir(join(T, "data-expiry"));
 		const api2 = new Api({ dataDir: join(T, "data-expiry"), logFile: join(T, "api-expiry.log"), extraEnv: { XMUSTARD_EVIDENCE_RETENTION_SECONDS: "2" } });
 		await api2.start();
+		const previousCaptureID = largeEntryID;
+		largeEntryID = await seedLargeCaptureEntry(api2);
 		try {
 			const ws2 = ws;
-			const run = await pi("expiry", [{ calls: [call("impact")] }, { delay_ms: 3000, calls: [call("xmustard_expand", { handle: "$HANDLE", offset: 0 })] }, { text: "done" }], {
+			const run = await pi("expiry", [{ calls: [largeCapture()] }, { delay_ms: 3000, calls: [call("xmustard_expand", { handle: "$HANDLE", offset: 0 })] }, { text: "done" }], {
 				apiBase: api2.base,
 				ws: ws2,
 			});
 			assert.equal(run.code, 0, run.stderr);
-			const handle = footerOf(textOf(one(run, "impact")))?.handle;
+			const handle = footerOf(textOf(one(run, "recall")))?.handle;
 			assert.ok(handle);
 			const exp = one(run, "xmustard_expand");
 			assert.equal(exp.isError, true);
@@ -394,6 +430,7 @@ describe("Pi adapter against the real xMustard API", () => {
 			assert.equal(again.body?.data, undefined);
 			record("expiry", { first: textOf(exp).slice(0, 160), again: again.status });
 		} finally {
+			largeEntryID = previousCaptureID;
 			await api2.stop();
 		}
 	});
@@ -445,18 +482,18 @@ describe("Pi adapter against the real xMustard API", () => {
 		const proxy = new StallProxy(api.base, (req) => req.method === "POST" && (req.url ?? "").split("?")[0].endsWith("/evidence"));
 		await proxy.start();
 		try {
-			const run = await pi("projection-timeout", [{ calls: [call("impact"), call("recall")] }, { text: "done" }], {
+			const run = await pi("projection-timeout", [{ calls: [largeCapture(), call("ground")] }, { text: "done" }], {
 				apiBase: proxy.base,
 				env: { XMUSTARD_PI_DELIVERY: "hook", XMUSTARD_PI_PROJECTION_TIMEOUT_MS: "1000" },
 			});
 			assert.equal(run.code, 0, run.stderr);
 			assertModelSawResults(run);
-			const big = one(run, "impact");
+			const big = one(run, "recall");
 			assert.equal(big.isError, true);
 			assert.match(textOf(big), /inline limit.*timed out after 1000 ms/);
-			const small = one(run, "recall");
+			const small = one(run, "ground");
 			assert.equal(small.isError, false);
-			assert.ok(Array.isArray(JSON.parse(textOf(small)).entries), "original recall JSON preserved");
+			assert.equal(JSON.parse(textOf(small)).workspace_id, ws, "original ground JSON preserved");
 			assert.match(small.details?.projection_error ?? "", /timed out after 1000 ms/);
 			assert.equal(proxy.stalledClosed, 2, "both projection requests were closed at the deadline");
 			record("projection_timeout", { big: textOf(big).slice(0, 200), small_preserved: true });
@@ -495,7 +532,7 @@ describe("Pi adapter against the real xMustard API", () => {
 			const run = await pi(
 				"expand-endpoint-failure",
 				[
-					{ calls: [call("impact")] },
+					{ calls: [largeCapture()] },
 					{ calls: [call("xmustard_expand", { handle: "$HANDLE", offset: 0 })] },
 					{ calls: [call("xmustard_expand", { handle: "$HANDLE", offset: 0 })] },
 					{ calls: [call("xmustard_expand", { handle: "$HANDLE", offset: 0 })] },
@@ -505,8 +542,8 @@ describe("Pi adapter against the real xMustard API", () => {
 			);
 			assert.equal(run.code, 0, run.stderr);
 			assertModelSawResults(run);
-			const handle = footerOf(textOf(one(run, "impact")))?.handle;
-			assert.ok(handle, "impact issued a handle");
+			const handle = footerOf(textOf(one(run, "recall")))?.handle;
+			assert.ok(handle, "explain issued a handle");
 			const expands = byName(run, "xmustard_expand");
 			assert.equal(expands.length, 3);
 			// every expand call was made while the tool was active (activated by the handle)
@@ -566,6 +603,8 @@ describe("Pi adapter against the real xMustard API", () => {
 		const b = mintToken(dir, "agent-b");
 		const api3 = new Api({ dataDir: dir, logFile: join(T, "api-auth.log"), extraEnv: { XMUSTARD_AUTH: "required" } });
 		await api3.start();
+		const previousCaptureID = largeEntryID;
+		largeEntryID = await seedLargeCaptureEntry(api3, a1);
 		const secrets = [admin, a1, b];
 		const runs: PiRun[] = [];
 		try {
@@ -582,8 +621,8 @@ describe("Pi adapter against the real xMustard API", () => {
 			assert.equal(one(anon, "ground").isError, true);
 			assert.match(textOf(one(anon, "ground")), /401/);
 
-			const ra = await go("auth-a", [{ calls: [call("impact")] }, { expand_all: { workspace_id: "$WS" }, max_pages: 1 }, { text: "done" }], a1);
-			const fa = footerOf(textOf(one(ra, "impact")));
+			const ra = await go("auth-a", [{ calls: [largeCapture()] }, { expand_all: { workspace_id: "$WS" }, max_pages: 1 }, { text: "done" }], a1);
+			const fa = footerOf(textOf(one(ra, "recall")));
 			assert.ok(fa?.handle);
 			assert.equal(pagesOf(ra, fa.handle).length, 1);
 
@@ -591,10 +630,10 @@ describe("Pi adapter against the real xMustard API", () => {
 			secrets.push(a2);
 			const stale = await go("auth-a-old", [{ calls: [call("ground")] }, { text: "done" }], a1);
 			assert.equal(one(stale, "ground").isError, true, "rotated-out token is refused");
-			const rotated = await go("auth-a-rotated", [{ calls: [call("impact")] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], a2, { XM_OLD_HANDLE: fa.handle });
+			const rotated = await go("auth-a-rotated", [{ calls: [largeCapture()] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], a2, { XM_OLD_HANDLE: fa.handle });
 			assert.equal(one(rotated, "xmustard_expand").isError, false, textOf(one(rotated, "xmustard_expand")).slice(0, 200));
 
-			const other = await go("auth-b", [{ calls: [call("impact")] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], b, { XM_OLD_HANDLE: fa.handle });
+			const other = await go("auth-b", [{ calls: [largeCapture()] }, { calls: [call("xmustard_expand", { handle: "$ENV:XM_OLD_HANDLE", offset: 0 })] }, { text: "done" }], b, { XM_OLD_HANDLE: fa.handle });
 			const denied = one(other, "xmustard_expand");
 			assert.equal(denied.isError, true);
 			assert.match(textOf(denied), /403|denied/);
@@ -611,6 +650,7 @@ describe("Pi adapter against the real xMustard API", () => {
 			for (const r of runs) for (const s of secrets) assert.ok(!r.stdout.includes(s) && !r.stderr.includes(s) && !JSON.stringify(r.trace).includes(s), "token leaked into Pi output");
 			record("auth", { anonymous: textOf(one(anon, "ground")).slice(0, 120), rotated_old: textOf(one(stale, "ground")).slice(0, 120), other_principal: textOf(denied).slice(0, 160) });
 		} finally {
+			largeEntryID = previousCaptureID;
 			await api3.stop();
 		}
 	});

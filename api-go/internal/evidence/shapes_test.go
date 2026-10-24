@@ -571,6 +571,27 @@ func TestOtherClientShapes(t *testing.T) {
 	}
 }
 
+func TestRawPiCaptureUsesPiProjectionTarget(t *testing.T) {
+	s, _ := testStore(t, nil)
+	raw := strings.Repeat("x", PolicyFor("pi").Target+1)
+	res, err := s.Observe(context.Background(), nil, ObservationInput{
+		WorkspaceID: "ws", Format: FormatRaw, Body: strings.NewReader(raw),
+		Meta: CaptureMeta{Client: "pi", Tool: "ground", ContentType: "text/plain"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.TargetBytes != 32<<10 || res.Policy.Client != "pi" || res.Policy.Target != 32<<10 {
+		t.Fatalf("Pi profile not selected: target=%d policy=%+v", res.TargetBytes, res.Policy)
+	}
+	if res.Shape == nil || res.Shape.Client != "pi" || res.Shape.Shape != "pi.tool_result" {
+		t.Fatalf("Pi output shape not selected: %+v", res.Shape)
+	}
+	if res.Handle == "" {
+		t.Fatal("raw output above the Pi projection target must issue a recovery handle")
+	}
+}
+
 func TestRawCaptureForAnyTool(t *testing.T) {
 	s, _ := testStore(t, nil)
 	two := 2

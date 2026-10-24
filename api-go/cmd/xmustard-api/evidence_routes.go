@@ -231,7 +231,7 @@ func evidenceDeliveryMiddleware(store *evidence.Store, next http.Handler) http.H
 				WorkspaceID: ws, RepoScope: scope, Actor: actor, AuthEnforced: enforced, Issuer: issuer,
 				SessionID: r.Header.Get("X-Xmustard-Session-Id"), CallID: r.Header.Get("X-Xmustard-Call-Id"),
 				Tool: tool, ToolVersion: toolVersion, ArgsDigest: hex.EncodeToString(argsHash.Sum(nil)),
-				Status: status, IsError: status >= 400, ContentType: contentType,
+				Status: status, IsError: status >= 400, ContentType: contentType, Target: evidence.PolicyFor(issuer).Target,
 				BeforeKey: before, RepoKey: afterKey,
 			}
 		}
@@ -391,13 +391,14 @@ func registerEvidenceRoutes(mux routeRegistrar, store *evidence.Store) {
 		if issuer == "" {
 			issuer = "http"
 		}
+		target := evidence.PolicyFor(q.Get("client")).Target
 		d, err := store.Capture(r.Context(), sp, evidence.CaptureRequest{
 			WorkspaceID: ws, RepoScope: scope, Actor: actor, AuthEnforced: enforced, Issuer: issuer,
 			SessionID: q.Get("session_id"), CallID: q.Get("call_id"), Tool: tool,
 			ToolVersion: q.Get("tool_version"), ArgsDigest: q.Get("args_digest"),
 			// A result posted after the fact was produced at an unknown repository state:
 			// no identity is sampled or attached, so its freshness is always "unknown".
-			Status: status, IsError: isError, ContentType: ct,
+			Status: status, IsError: isError, ContentType: ct, Target: target,
 		})
 		if err != nil {
 			writeEvidenceError(w, err)
