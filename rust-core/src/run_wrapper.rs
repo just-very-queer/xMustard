@@ -1197,8 +1197,10 @@ mod tests {
         );
     }
 
+    /// A full queue prevents the loss notice from being queued; the bounded worker wait keeps a
+    /// broken enqueue from hanging the test thread.
     #[test]
-    fn a_loss_notice_that_cannot_be_queued_keeps_its_count() {
+    fn a_drain_keeps_loss_until_its_notice_is_queued() {
         let (sink, entered, release, out) = gated_sink();
         let reporter = Arc::new(Reporter::new(sink, 1));
         reporter.send("writer-held\n".into());
@@ -1207,14 +1209,35 @@ mod tests {
             .expect("the writer never started the held line");
         reporter.send("queue-full\n".into());
         reporter.send("lost\n".into());
+        assert_eq!(reporter.lost.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(
+                reporter.lines.try_send(Report {
+                    line: "probe\n".into(),
+                    ack: false,
+                }),
+                Err(mpsc::TrySendError::Full(_))
+            ),
+            "the writer queue was not full while its first write was held"
+        );
 
-        reporter.state_loss(std::time::Instant::now() + Duration::from_millis(100));
+        let (done, finished) = mpsc::channel();
+        let stating = Arc::clone(&reporter);
+        thread::spawn(move || {
+            stating.state_loss(std::time::Instant::now() + Duration::from_millis(100));
+            let _ = done.send(());
+        });
+        let waited = finished.recv_timeout(Duration::from_secs(10));
+        release.send(()).unwrap();
+        waited.expect("state_loss blocked past its deadline");
         assert_eq!(reporter.lost.load(Ordering::SeqCst), 1);
 
-        release.send(()).unwrap();
         reporter.drain(Duration::from_secs(10));
         let text = String::from_utf8(out.lock().unwrap().clone()).unwrap();
-        assert!(text.ends_with("xmustard run: 1 decision report(s) not written to stderr\n"));
+        assert!(
+            text.ends_with("xmustard run: 1 decision report(s) not written to stderr\n"),
+            "the later drain did not state the retained loss count: {text:?}"
+        );
     }
 
     /// A drain that runs out of time before it can queue the loss notice keeps the count, so a
