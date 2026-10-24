@@ -1,6 +1,7 @@
 import json
 import threading
 import unittest
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from check_peer_registry import refresh_peer, refreshed_registry
@@ -40,6 +41,12 @@ class RegistryHandler(BaseHTTPRequestHandler):
 
 
 class PeerRegistryTest(unittest.TestCase):
+    def test_refresh_workflow_is_manual(self):
+        workflow = Path(__file__).parents[1] / ".github/workflows/peer-registry.yml"
+        workflow_text = workflow.read_text(encoding="utf-8")
+        self.assertIn("on:\n  workflow_dispatch:\n", workflow_text)
+        self.assertNotIn("schedule:", workflow_text)
+
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), RegistryHandler)
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
